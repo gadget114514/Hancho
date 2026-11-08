@@ -1,0 +1,3 @@
+{"type":"step_start","timestamp":1792491038000}
+{"type":"tool_use","timestamp":1792491038100,"part":{"type":"tool","tool":"bash","state":{"input":{"command":"Get-Date"}}}}
+{"type":"text","timestamp":1792491038200,"part":{"type":"text","text":"DONE"}}

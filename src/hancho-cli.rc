@@ -1,0 +1,2 @@
+#define PC_CLI
+#include "version_info.rc2"

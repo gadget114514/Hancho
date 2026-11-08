@@ -1,0 +1,46 @@
+{
+  "id": "feature-x",
+  "summary": "Build, test, and fix feature X",
+  "intent": "Make feature X build and pass tests without changing public APIs.",
+  "taskqueue": "bt-feature-x",
+  "state": "waitingForLlm",
+  "nodeRuns": 5,
+  "limits": { "maxNodeRuns": 200, "maxWallSec": 21600 },
+  "vars": { "target": "Release", "errFile": "src/a.cpp" },
+  "createdAt": "2026-11-08T10:00:00",
+  "updatedAt": "2026-11-08T10:42:00",
+  "root": {
+    "type": "sequence",
+    "status": { "state": "running" },
+    "children": [
+      { "type": "retry", "max": 3, "id": "build-loop",
+        "status": { "state": "succeeded", "runs": 2 },
+        "child": {
+          "type": "fallback",
+          "status": { "state": "succeeded", "runs": 2 },
+          "children": [
+            { "type": "job", "id": "build", "summary": "Build ${target}",
+              "command": "cmake --build build --config ${target}", "timeoutSec": 1800,
+              "status": { "state": "succeeded", "runs": 2, "jobs": ["feature-x-1", "feature-x-3"] } },
+            { "type": "sequence",
+              "status": { "state": "failed", "runs": 1, "detail": "fail node" },
+              "children": [
+                { "type": "worker", "id": "fix", "engine": "agy", "model": "gemini-4-argon-high",
+                  "summary": "Fix build error in ${errFile}",
+                  "prompt": "Fix the build error in ${errFile}.", "timeoutSec": 3600,
+                  "status": { "state": "succeeded", "runs": 1, "jobs": ["feature-x-2"] } },
+                { "type": "fail", "status": { "state": "failed", "runs": 1 } }
+              ] }
+          ] } },
+      { "type": "job", "id": "test", "summary": "Run tests",
+        "command": "ctest --test-dir build -C ${target}", "timeoutSec": 1800,
+        "status": { "state": "succeeded", "runs": 1, "jobs": ["feature-x-4"] } },
+      { "type": "if",
+        "status": { "state": "running" },
+        "cond": { "type": "jsonValue", "file": "out/result.json", "path": "status", "eq": "needs_review",
+                  "status": { "state": "succeeded" } },
+        "then": { "type": "escalate", "id": "review", "question": "Approve the result of feature X?",
+                  "expect": ["approve", "reject"], "status": { "state": "running" } } }
+    ]
+  }
+}
