@@ -9,10 +9,10 @@ The console client `hancho-cli.exe` communicates with the running GUI Dashboard 
 ## Version (`--version` / `-V` / `version`)
 
 ```powershell
-hancho-cli.exe --version              # hancho-cli 0.9.0
-hancho-cli.exe version --json         # {"ok":true,"program":"hancho-cli","version":"0.9.0"}
-Hancho.exe --version   # Hancho 0.9.0
-Hancho.exe version --json  # {"ok":true,"program":"Hancho","version":"0.9.0"}
+hancho-cli.exe --version              # hancho-cli 0.9.1
+hancho-cli.exe version --json         # {"ok":true,"program":"hancho-cli","version":"0.9.1"}
+Hancho.exe --version   # Hancho 0.9.1
+Hancho.exe version --json  # {"ok":true,"program":"Hancho","version":"0.9.1"}
 ```
 
 The version also appears in the first line of both help outputs, as `version` in `hancho-cli.exe help --json`, and as `serverInfo.version` in the MCP `initialize` response.

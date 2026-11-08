@@ -9,10 +9,10 @@ CLI コマンドは Named Pipe (`\\.\pipe\Hancho_IPC_v1`) を通じて起動中�
 ## バージョン確認（`--version` / `-V` / `version`）
 
 ```powershell
-hancho-cli.exe --version              # hancho-cli 0.9.0
-hancho-cli.exe version --json         # {"ok":true,"program":"hancho-cli","version":"0.9.0"}
-Hancho.exe --version   # Hancho 0.9.0
-Hancho.exe version --json  # {"ok":true,"program":"Hancho","version":"0.9.0"}
+hancho-cli.exe --version              # hancho-cli 0.9.1
+hancho-cli.exe version --json         # {"ok":true,"program":"hancho-cli","version":"0.9.1"}
+Hancho.exe --version   # Hancho 0.9.1
+Hancho.exe version --json  # {"ok":true,"program":"Hancho","version":"0.9.1"}
 ```
 
 バージョンは両方の help の 1 行目、`hancho-cli.exe help --json` の `version`、MCP の `initialize` 応答の `serverInfo.version` にも出力されます。

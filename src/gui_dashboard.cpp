@@ -8478,7 +8478,7 @@ static LRESULT CALLBACK DashboardWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPA
             }
             HWND hTaskHeader = ListView_GetHeader(st->hwndTaskList);
             if (hTaskHeader) {
-                for (int i = 0; i < 9; ++i) {
+                for (int i = 0; i < kTaskListColumns; ++i) {
                     HDITEMW hdi = {};
                     hdi.mask = HDI_FORMAT;
                     if (Header_GetItem(hTaskHeader, i, &hdi)) {

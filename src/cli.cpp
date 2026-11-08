@@ -788,8 +788,8 @@ void PrintCliUsageJson() {
       "args": ["mcp"],
       "auto_install": {
         "description": "Writes or updates the MCP server entry automatically. Recommended for LLM agents.",
-        "argv": [")" << guiExe << R"(", "mcp", "install"],
-        "command": ")" << guiExe << R"( mcp install",
+        "argv": ["hancho-cli.exe", "mcp", "install"],
+        "command": "hancho-cli.exe mcp install",
         "clients": {
           "claude": {"default_path": ".mcp.json", "container": "mcpServers"},
           "opencode": {"default_path": "opencode.json", "container": "mcp"}

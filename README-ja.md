@@ -4,7 +4,7 @@
 
 **Hancho** は、Claude Code や各種自動化スクリプトから複数のサブプロセス・対話型 CLI エージェント（`opencode`, `claude`, PowerShell, cmd, Git Bash 等）を並列起動・監視・制御し、**状況をひと目で把握できる Native Win32 + Direct2D マルチターミナルダッシュボード GUI** を備えたプロセスマネージャです。
 
-バージョンは `hancho-cli.exe --version` で確認できます（現在: 0.9.0）。
+バージョンは `hancho-cli.exe --version` で確認できます（現在: 0.9.1）。
 
 ### 対象ユーザー
 
@@ -22,8 +22,8 @@
 
 ## Express
 
-- [Hancho-v0.9.0-win64-setup.exe](https://github.com/gadget114514/Hancho/releases/download/v0.9.0/Hancho-v0.9.0-win64-setup.exe) をダウンロードしてインストール
-  （ポータブル版: [Hancho-v0.9.0-win64.zip](https://github.com/gadget114514/Hancho/releases/download/v0.9.0/Hancho-v0.9.0-win64.zip)、全バージョン: [Releases](https://github.com/gadget114514/Hancho/releases)）
+- [Hancho-v0.9.1-win64-setup.exe](https://github.com/gadget114514/Hancho/releases/download/v0.9.1/Hancho-v0.9.1-win64-setup.exe) をダウンロードしてインストール
+  （ポータブル版: [Hancho-v0.9.1-win64.zip](https://github.com/gadget114514/Hancho/releases/download/v0.9.1/Hancho-v0.9.1-win64.zip)、全バージョン: [Releases](https://github.com/gadget114514/Hancho/releases)）
 - LLM に「PATH から hancho を探して、help を読んで使い方を把握して」と伝える
 - LLM に「タスクを作成して、hancho 経由で (opencode|claude|agy|codex) に実行させて」と伝える
 - 以上
@@ -113,6 +113,10 @@ MCP ツール `run_worker` は、1つのタスクをワーカーの LLM CLI に�
 （以下の help 本文は英語です）
 
 ## リリースノート
+
+### v0.9.1
+- **修正: リソース列のヘッダ色**: タスク一覧の「リソース」列のヘッダが、ほかの列と同じテーマ色（オーナードロー）で描画されます。これまではネイティブの既定色でした。
+- **修正: `help --json` の MCP 自動登録コマンド**: `setup.mcp.auto_install` が `hancho-cli.exe mcp install` を案内するようになりました。以前は `Hancho.exe mcp install` と表示され、設定を書かずに MCP サーバーが起動していました。
 
 ### v0.9.0
 - **ProcessCommander 2.9.x から Hancho 0.9.0 へ改名**: 製品名、実行ファイル（`Hancho.exe`）、GUI ウィンドウクラス、Named Pipe / ミューテックス名、既定のデータフォルダ（`.hancho`）、MCP サーバー名（`hancho`）、環境変数 `HANCHO_LOG_DIR` を Hancho に変更しました。コンソールクライアントは `pcder.exe` から `hancho-cli.exe` に改名しました。旧 `.processcommander` のデータや旧パイプ・ミューテックス名は自動移行しません。必要に応じて `--data-dir` で新しく作成してください。
@@ -208,7 +212,7 @@ MCP ツール `run_worker` は、1つのタスクをワーカーの LLM CLI に�
 ## 付録: `Hancho.exe --help` の出力
 
 ```text
-Hancho 0.9.0 - Native Win32 Multi-LLM Process & ConPTY Manager + Live GUI Dashboard
+Hancho 0.9.1 - Native Win32 Multi-LLM Process & ConPTY Manager + Live GUI Dashboard
 
 USAGE:
   Hancho.exe [gui] [--data-dir <path>]
@@ -337,7 +341,7 @@ MCP SERVER SETUP:
 ## 付録: `hancho-cli.exe help` の出力
 
 ```text
-hancho-cli 0.9.0 - Hancho console client
+hancho-cli 0.9.1 - Hancho console client
 
 USAGE:
   hancho-cli [--json] <command> [options]

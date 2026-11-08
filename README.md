@@ -4,7 +4,7 @@
 
 **Hancho** is a native Win32 C++ Multi-Terminal ConPTY Process Manager and Dashboard designed for orchestrating, monitoring, and interacting with multiple parallel CLI agents (`claude`, `opencode`, build scripts, and interactive shells) via both **Model Context Protocol (MCP)** and **CLI commands**.
 
-Check the version with `hancho-cli.exe --version` (current: 0.9.0).
+Check the version with `hancho-cli.exe --version` (current: 0.9.1).
 
 ### Who is this for?
 
@@ -25,8 +25,8 @@ The dashboard has an **execution monitor pane** below the process and task lists
 
 ## Express
 
-- Download and install [Hancho-v0.9.0-win64-setup.exe](https://github.com/gadget114514/Hancho/releases/download/v0.9.0/Hancho-v0.9.0-win64-setup.exe)
-  (portable: [Hancho-v0.9.0-win64.zip](https://github.com/gadget114514/Hancho/releases/download/v0.9.0/Hancho-v0.9.0-win64.zip), all versions: [Releases](https://github.com/gadget114514/Hancho/releases))
+- Download and install [Hancho-v0.9.1-win64-setup.exe](https://github.com/gadget114514/Hancho/releases/download/v0.9.1/Hancho-v0.9.1-win64-setup.exe)
+  (portable: [Hancho-v0.9.1-win64.zip](https://github.com/gadget114514/Hancho/releases/download/v0.9.1/Hancho-v0.9.1-win64.zip), all versions: [Releases](https://github.com/gadget114514/Hancho/releases))
 - In your llm, "find hancho in PATH, then read help to use it" 
 - In your llm, "create task and use (opencode|claude|agy|codex) to execute the task via hancho" 
 - That's all
@@ -109,6 +109,10 @@ What stays the same: each step is still a normal task-queue job with its own tim
 ---
 
 ## Release Notes
+
+### v0.9.1
+- **Fix: Resources column header color**: the `Resources` column header in the task list now uses the same themed owner-drawn color as the other columns instead of the native default.
+- **Fix: `help --json` MCP auto-register command**: `setup.mcp.auto_install` now recommends `hancho-cli.exe mcp install`. Previously it showed `Hancho.exe mcp install`, which launched the MCP stdio server instead of writing the client config.
 
 ### v0.9.0
 - **Renamed from ProcessCommander 2.9.x to Hancho 0.9.0**: the product, executable (`Hancho.exe`), GUI window classes, Named Pipe / mutex names, default data folder (`.hancho`), MCP server name (`hancho`) and the `HANCHO_LOG_DIR` environment variable were renamed. The console client was renamed from `pcder.exe` to `hancho-cli.exe`. Old `.processcommander` data and the old pipe/mutex names are not reused or migrated automatically; create a fresh data directory with `--data-dir`.
@@ -204,7 +208,7 @@ Older versions: [Releases](https://github.com/gadget114514/Hancho/releases)
 ## Appendix: `Hancho.exe --help`
 
 ```text
-Hancho 0.9.0 - Native Win32 Multi-LLM Process & ConPTY Manager + Live GUI Dashboard
+Hancho 0.9.1 - Native Win32 Multi-LLM Process & ConPTY Manager + Live GUI Dashboard
 
 USAGE:
   Hancho.exe [gui] [--data-dir <path>]
@@ -333,7 +337,7 @@ MCP SERVER SETUP:
 ## Appendix: `hancho-cli.exe help` output
 
 ```text
-hancho-cli 0.9.0 - Hancho console client
+hancho-cli 0.9.1 - Hancho console client
 
 USAGE:
   hancho-cli [--json] <command> [options]
