@@ -405,6 +405,102 @@ Statistics computed from L1. Not stored; built from the index on read.
 - Most common failure classes and their trend.
 - Tokens and cost per attempt.
 
+### 3.6.1 Long-term LLM usage aggregation (monthly)
+
+**Current state**
+
+- `src/llm_stream.cpp` creates an `LlmUsagePoint` for every LLM step and keeps it in `g_usageHistory` in memory.
+- Retention is `kUsageRetentionSec = 24 * 60 * 60` (24 hours), with a cap of `kMaxUsagePoints = 200000`. Points older than 24 hours are dropped on load and on add.
+- Persistence is the `restore_usage_graph` setting (off by default). Even when on, it only appends to `logs/usage_history.jsonl` and trims to 24 hours on load. The file itself never shrinks.
+- So today nothing accumulates over a month. Anything older than 24 hours is gone from memory, and even if it is still in the file, it is never read.
+
+**Goals**
+
+- Keep the 24-hour live graph as it is.
+- Report daily, monthly, and yearly usage per engine / model, with token types and cost.
+- Keep 12 months of data under roughly 1 MB.
+- Fix the division of roles: raw points are short-lived, aggregates are long-lived.
+
+**Design**
+
+Split into layers.
+
+| Layer | Granularity | Retention | Use |
+|---|---|---|---|
+| U0 raw points | one LLM step | 24 hours in memory (optionally 7 days on disk) | Live graph, today's breakdown |
+| U1 daily rollup | day × engine × model | 24 months | Monthly and yearly views, CSV export |
+| U2 monthly rollup | month × engine × model | indefinite (optional) | Fast display, auditing |
+
+U1 record:
+
+```json
+{
+  "schema": "hancho.usage.day/1",
+  "date": "2026-11-10",
+  "tzOffsetMin": 540,
+  "engine": "claude",
+  "model": "claude-opus-5-5",
+  "inputTokens": 1200000,
+  "outputTokens": 340000,
+  "thinkingTokens": 210000,
+  "cacheReadTokens": 8800000,
+  "cacheWriteTokens": 410000,
+  "totalTokens": 10960000,
+  "costUsd": 12.34,
+  "runs": 184,
+  "firstEpochSec": 1762746131,
+  "lastEpochSec": 1762832599
+}
+```
+
+- `date` is the **local date**. `tzOffsetMin` is kept with it so it can be converted to UTC later. The day boundary is 00:00 local time.
+- One record is about 250 B. 12 months × 31 days × 10 models = 3,720 records, about 0.9 MB. Even with 100 models it is about 9 MB.
+- Monthly figures are just sums of U1, so U2 is not required. Keep it only if display is slow.
+
+**Writing**
+
+- When a raw point is written, update the U1 entry for that point's local date.
+- Use an append log: append `{date, engine, model, delta...}` to `usage/daily/2026-11.jsonl`, and sum entries with the same key on read. A crash midway does not corrupt it.
+- Compact at month rollover and with `hancho-cli usage compact`: merge a month of deltas into one line per day × engine × model, write to a temporary file, and replace.
+- If raw points are also kept on disk, rewrite `logs/usage_history.jsonl` without lines older than 7 days (ending today's append-only behavior).
+
+**Aggregation API**
+
+| MCP | CLI | Behavior |
+|---|---|---|
+| `usage_stats` | `hancho-cli usage stats` | Returns totals by `since` / `until` / `groupBy` (`day` / `month` / `engine` / `model`) |
+| `usage_export` | `hancho-cli usage export` | Exports as CSV / JSON |
+
+- The existing `get_usage_history` (IPC) stays for U0. Add `get_usage_daily` for U1.
+- Returned values: `inputTokens`, `outputTokens`, `thinkingTokens`, `cacheReadTokens`, `cacheWriteTokens`, `totalTokens`, `costUsd`, `runs`. Engines that do not report `costUsd` get `costKnown: false`.
+- Extend the GUI range selector to 24h / 7d / 30d / 12m. 12m is drawn by summing U1 by month.
+
+**Why the data does not explode**
+
+- Only U1 grows, by one line per day per model. Keeping raw points for 30 days would be 20,000 points a day × 30 = 600,000 points (about 120 MB); U1 for 30 days is 300 lines (about 75 KB).
+- Raw points are dropped after 24 hours (7 days if needed). Only aggregates are kept long.
+- Stopping the unbounded growth of `usage_history.jsonl` is a prerequisite. Without that fix, disk use keeps growing even with U1 added.
+
+**Steps**
+
+| Step | Content |
+|---|---|
+| U1 | U1 appends and in-month display, `usage stats --group-by day` |
+| U2 | 12-month display, CSV export, compaction command |
+| U3 | U2 monthly rollup, aggregation per project (data directory) |
+
+**Non-goals**
+
+- Reconciling with each provider's bills. Hancho only holds the estimates the CLIs report.
+- Storing prompt or response text. Aggregates hold only token counts and cost.
+- Aggregation across a distributed setup. Everything stays within one data directory.
+
+**Open questions**
+
+- Whether the day boundary is local time or UTC (display in local time, store UTC plus offset is the safe choice).
+- Whether to report totals across data directories (keeping them per project is safer).
+- Whether to estimate cost from a price table for engines that do not report `costUsd`.
+
 ### 3.7 Storage
 
 ```
@@ -703,6 +799,8 @@ To make leaving painless, keep the following:
 | v0.12 | Section 3 M1–M2 (run records, notes, search, injection) |
 | v1.0 | Section 2 step B (headless on Linux), section 1 step 4, section 3 M3, section 4 step 3 |
 | After v1.0 | Section 2 step C (remote), section 3 M4 |
+
+U1 (daily rollup) from 3.6.1 needs only small changes to the existing usage path, so it can go ahead in v0.11. U2 and later move to v0.12 or later.
 
 ---
 
