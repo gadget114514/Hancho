@@ -116,3 +116,20 @@ Pros/Cons of the alternatives that overlap most with Hancho. Each list describes
 - Tied to one SDK/vendor; arbitrary third-party CLI agents need custom wrappers.
 
 **vs. Hancho:** The SDKs build orchestration into an application; Hancho runs existing CLI agents and tools as observable OS processes without new code. They combine well: start SDK- or `claude -p`-based scripts as Hancho jobs to gain dependencies, retries, persistence, and the dashboard.
+
+### Hierarchical Memory (LangChain-style)
+
+**Pros**
+- Keeps a long conversation inside the model's window: a short-term buffer plus summaries, entity/knowledge stores and vector retrieval decide what to include on each turn.
+- Memory lives in the agent loop, so the LLM reads and writes it without extra files or external tooling.
+- Each layer can be tuned on its own (buffer size, summarization threshold, retrieval count), and many implementations are reusable library components.
+- Runs in-process and cross-platform; no external supervisor is needed.
+
+**Cons**
+- Memory belongs to one application and one conversation. Another process, session or model cannot see it, and it dies with the app unless a persistent store is wired up.
+- Summaries and retrieval are lossy and non-deterministic: the same history can produce different context, so runs are hard to reproduce.
+- It stores what the model said, not what the system did. Exit codes, logs, file changes and job state must be described back to the model.
+- Token cost and latency grow with summarization and retrieval; a badly tuned hierarchy either forgets key facts or floods the window.
+- Requires writing and maintaining orchestration code, and there is no dashboard or human view of what the agent remembers.
+
+**vs. Hancho:** Hancho does not manage an LLM's context. It keeps orchestration state outside every model, in the data directory: the task queue, behavior-tree state, per-job logs and `.done` markers, plus origin metadata recording which session added each job. Any worker, session or restart reads the same state, and what each model sees is decided by that worker's own CLI. Use hierarchical memory when one long-lived conversation must carry facts across turns; use Hancho when state must be shared across processes, survive restarts and be inspected by a human. They combine: let the worker keep its own memory and let Hancho hold the durable, cross-session facts.
