@@ -83,3 +83,5 @@ That framing is also the main criticism: Hancho controls only the shell around t
 - Richer, semantic memory on top of durable job state.
 - Better failure analysis: why a job failed, not just that it did.
 - Clear guidance on when a harness-native feature has made Hancho unnecessary.
+
+The detailed design for these is in [Hancho v3 Design](design-v3-en.md).

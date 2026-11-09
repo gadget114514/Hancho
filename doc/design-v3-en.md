@@ -1,0 +1,716 @@
+# Hancho v3 Design: Detailing the Directions for Growth
+
+**[English](design-v3-en.md) | [日本語 (Japanese)](design-v3.md)**
+
+This document takes the five items under "What Would Make It Stronger" in the [critical comparison](critical-comparison.md) and works them out to a level that can be implemented. For each item it covers the current state, the goal, the design, the steps, and the non-goals. It targets the code as of v0.9.1.
+
+Back to [README](../README.md).
+
+---
+
+## 0. Scope
+
+### 0.1 What does not change
+
+Hancho stays an **out-of-process control plane for CLI agents**. The agent loop (model calls, prompts, tools, permissions, context) stays inside the CLI that Hancho launches. v3 does not widen this definition; it fixes the weak spots inside it.
+
+| Weakness (from the critical comparison) | Item |
+|---|---|
+| Worker internals are opaque; formats beyond the four supported ones fall back to raw logs | 1. First-class adapters and a stable event schema |
+| Windows-only, desktop-only | 2. Cross-platform core, headless, remote |
+| Durable job state is not semantic memory | 3. Semantic memory |
+| You only learn that a job failed | 4. Failure analysis |
+| Harnesses absorb its features and it goes stale | 5. Guidance for when Hancho is no longer needed |
+
+### 0.2 Dependencies between items
+
+```
+1. Event schema ──► 4. Failure analysis ──► 3. Semantic memory
+                          │                       ▲
+                          └───────────────────────┘ (failure class goes into the record)
+2. Cross-platform   … independent. The normalized events from 1 are what IPC carries
+5. Exit guidance    … documentation only; can ship first
+```
+
+Without normalized events, both the reason for a failure and the content of memory end up as per-agent interpretations. So item 1 comes first.
+
+### 0.3 Current structure (code referenced)
+
+| Area | Files | Main types and functions |
+|---|---|---|
+| Stream parsing | `src/llm_stream.h`, `src/llm_stream.cpp` | `LlmStreamEvent`, `LlmAgentState`, `LlmStreamTracker`, `DetectAgentType`, `DescribeLlmActivity` |
+| Per-agent parsers | `src/llm_stream_{claude,codex,opencode,agy}.cpp`, `src/llm_stream_internal.h` | `ParseClaudeLines`, `ParseOpenCodeLines`, `ParseCodexLines`, `ParseAgyLine` |
+| Engine definitions | `src/worker_engines.h` | `WorkerEngineRegistry`, `WorkerEngineDef` (engines.json) |
+| Task queue | `src/taskqueue.h`, `src/taskqueue.cpp` | `TaskQueueJob`, `TaskQueueAttempt`, `TaskQueueDefer`, `TaskQueueOrigin`, `ApplyAttemptOutcome` |
+| Behavior trees | `src/behavior_tree*.cpp`, `src/bt_manager*.cpp` | `escalate` node |
+| Processes | `src/process_manager.cpp` | ConPTY, Job Objects |
+| Communication | `src/ipc_server.cpp`, `src/ipc_client.cpp`, `src/mcp_server.cpp` | Named Pipes, MCP |
+| GUI | `src/gui_dashboard.cpp` | Direct2D dashboard, Execution Monitor pane |
+
+---
+
+## 1. First-class adapters and a stable event schema for arbitrary CLIs
+
+### 1.1 Current state
+
+- `LlmStreamEvent.type` is a free-form string (`"tool_call"`, `"tool_result"`, `"thinking"`, ...). Fields have grown to suit individual agents (`rateLimitType`, `permissionDenials`, `taskStatus`, ...; many are Claude-specific).
+- Only the four formats built into C++ (`claude`, `agy`, `opencode`, `codex`) are parsed. Any other CLI becomes a raw log and shows nothing in the monitor pane.
+- The agent type is guessed from the command line by `DetectAgentType`.
+- Consumers (GUI, MCP `get_worker_stream`, BT conditions) read `LlmStreamEvent` directly, so internal changes become external compatibility problems.
+
+### 1.2 Goals
+
+- Separate the **format promised to the outside** from **internal parsing**. Only a versioned schema goes out.
+- Support for a new CLI can be added without writing C++.
+- The correctness of that support can be checked by tests.
+
+### 1.3 Hancho Event Schema v1
+
+JSONL, one event per line. The schema name is `hancho.event/1`.
+
+```json
+{
+  "schema": "hancho.event/1",
+  "seq": 1842,
+  "ts": "2026-11-10T09:12:33.120Z",
+  "source": { "processId": 12, "jobId": "j_7f3a", "attempt": 2, "btId": "bt_main", "node": "build" },
+  "agent": { "type": "claude", "model": "claude-opus-5-5", "sessionId": "…", "agentId": "", "parentAgentId": "" },
+  "kind": "tool.call",
+  "data": { "toolUseId": "toolu_01…", "tool": "Edit", "activity": "edit", "target": "src/a.cpp", "input": { "…": "…" } },
+  "raw": { "file": "proc_12_build_stream.jsonl", "line": 931 }
+}
+```
+
+`kind` is a closed enumeration.
+
+| kind | Meaning | Required `data` fields | Optional fields |
+|---|---|---|---|
+| `run.started` | Agent run starts | — | `cwd`, `toolsOffered`, `permissionMode` |
+| `turn.started` | One model call starts | — | `messageId` |
+| `tool.call` | Tool call | `tool`, `activity` | `toolUseId`, `target`, `input`, `note` |
+| `tool.result` | Tool result | `ok` | `toolUseId`, `error`, `summary` |
+| `thought` | Thinking | `text` | `truncated` |
+| `message` | Reply text | `text` | `truncated` |
+| `plan` | TODO update | `items[]` (`content`, `status`) | — |
+| `usage` | Tokens and cost | at least one token count | `costUsd`, `cumulative` |
+| `rate_limit` | Rate limit state | `status` | `window`, `utilization`, `resetsAt` |
+| `subagent.started` | Sub-agent starts | `agentId` | `type`, `description`, `toolUseId` |
+| `subagent.ended` | Sub-agent ends | `agentId`, `status` | `tokens`, `toolUses`, `durationMs` |
+| `run.ended` | Run ends | `status` (`completed` / `error` / `cancelled`) | `stopReason`, `numTurns`, `durationMs`, `permissionDenials` |
+| `error` | Error reported by the agent | `message` | `code`, `retryable` |
+| `raw` | A line that could not be interpreted | `text` | — |
+
+`activity` reuses the existing `DescribeLlmActivity` kinds (`read`, `edit`, `search`, `command`, `web`, `subagent`, `plan`, `tool`).
+
+**Compatibility rules**
+
+- Adding fields happens within the same version (minor). Consumers ignore fields they do not know.
+- Changing the meaning of a field or removing it makes a new version (`hancho.event/2`). The old version is emitted alongside for at least one release.
+- A consumer that receives an unknown `kind` treats it as `raw`.
+- The schema itself ships as `doc/schema/hancho.event.v1.json` (JSON Schema).
+
+**Storage**: normalized events are written to `logs/proc_<id>_<name>.events.jsonl`. The existing `.stream.jsonl` (the CLI's raw lines) stays, reachable through `raw`.
+
+### 1.4 Adapter tiers
+
+| Tier | How it is written | Fits |
+|---|---|---|
+| Tier 0 | none | Raw log and exit code only. Same as unsupported CLIs today |
+| Tier 1 declarative | `<data-dir>/adapters/<name>.json` | CLIs that print one JSON object per line. Enough for most |
+| Tier 2 built-in | C++ (`llm_stream_<name>.cpp`) | Complex formats: one line splits into several events, stateful parsing. The existing four |
+| Tier 3 external process | any language | Custom formats. Raw lines on stdin, `hancho.event` lines on stdout |
+
+**Tier 1 example**
+
+```json
+{
+  "adapter": "mycli",
+  "match": { "field": "/type" },
+  "rules": [
+    { "when": { "/type": "tool_start" }, "kind": "tool.call",
+      "map": { "tool": "/name", "target": "/args/path", "toolUseId": "/id" },
+      "activity": { "from": "/name", "table": { "read_file": "read", "write_file": "edit", "shell": "command" }, "default": "tool" } },
+    { "when": { "/type": "tool_end" }, "kind": "tool.result",
+      "map": { "toolUseId": "/id", "ok": "!/error", "error": "/error" } },
+    { "when": { "/type": "usage" }, "kind": "usage",
+      "map": { "inputTokens": "/in", "outputTokens": "/out" } },
+    { "when": { "/type": "done" }, "kind": "run.ended",
+      "map": { "status": "/status" } }
+  ]
+}
+```
+
+- Values in `map` are JSON Pointers. `!` negates a boolean.
+- A line that matches no rule becomes `raw`.
+- Anything the declarative form cannot express goes to Tier 3; the declarative language is kept from growing too far.
+
+**A path for CLIs to emit events themselves**: wrapper scripts and home-grown tools can write `hancho.event` lines straight to `HANCHO_EVENT_PIPE` (a pipe name Hancho passes at launch). By hand, use `hancho-cli event emit --kind message --text "…"`. This lets even shell-script jobs report what they are doing now.
+
+### 1.5 Extending engine definitions
+
+Add an adapter name and declared capabilities to engines.json (`WorkerEngineDef`).
+
+```json
+{
+  "engines": {
+    "mycli": {
+      "command": "mycli run --json {prompt} {model}",
+      "adapter": "mycli",
+      "capabilities": {
+        "jsonStream": true,
+        "resume": false,
+        "reportsUsage": true,
+        "reportsSubagents": false,
+        "permissionModes": ["default", "auto"]
+      }
+    }
+  }
+}
+```
+
+Guessing with `DetectAgentType` becomes the fallback when `adapter` is not given. The monitor pane also uses the capabilities, for example to show "this CLI does not report token counts".
+
+### 1.6 Conformance tests
+
+- For each adapter, keep pairs of recorded input (`*.input.jsonl`) and expected events (`*.expected.jsonl`) under `tests/adapters/<name>/`.
+- `hancho-cli adapter test <name>` compares them and prints the differences.
+- When a CLI release changes its format, add recordings to catch the regression.
+
+### 1.7 Consumers
+
+The GUI monitor pane, MCP `get_worker_stream`, BT conditions, failure analysis (section 4), and memory (section 3) all read only normalized events. `LlmStreamEvent` becomes an internal type.
+
+### 1.8 Steps
+
+1. Document the schema and map the output of the existing four parsers onto v1. Write `.events.jsonl`.
+2. Expose v1 through MCP and the CLI (`get_worker_stream --schema v1`).
+3. Tier 1 and Tier 3, `HANCHO_EVENT_PIPE`, conformance tests.
+4. Stop exposing the old format (`type` strings).
+
+### 1.9 Non-goals
+
+- Inferring the CLI's internal reasoning. Nothing beyond the emitted events can be known.
+- Building in support for every CLI.
+
+---
+
+## 2. A cross-platform core, or a remote/headless mode
+
+### 2.1 Current state
+
+- Built on ConPTY, Job Objects, Named Pipes, and named mutexes.
+- The core (`process_manager`, `taskqueue`, `bt_manager`, `ipc_server`) and the Direct2D GUI live together in `Hancho.exe`. There is no way to run the core without the GUI.
+- `hancho-cli` is a client over a Named Pipe.
+
+### 2.2 Goals
+
+- Run queues and BTs where there is no screen (CI, servers, scheduled runs).
+- Run the core on Linux and macOS.
+- Watch and control workers running on another machine from your own.
+
+### 2.3 Step A: headless (still Windows)
+
+- `Hancho.exe --headless`: runs the core without creating a window or tray icon. Later split out as a separate `hanchod`.
+- The GUI becomes an IPC client of the core. Closing the GUI does not stop jobs, and the GUI can reconnect later.
+- One-shot run for CI:
+
+```powershell
+hancho-cli run --file queue.json --exit-on-drain --report junit.xml
+```
+
+  - Exits when every job in the queue is finished. Exit code: 0 if all succeeded, 1 if any failed, 2 if cancelled or interrupted.
+  - `--report` writes JUnit-style results, with each job's failure reason (section 4) in `<failure message>`.
+
+### 2.4 Step B: platform abstraction layer
+
+Put the OS-dependent parts behind these boundaries.
+
+| Boundary | Windows | Linux / macOS |
+|---|---|---|
+| `IPty` | ConPTY | `forkpty` |
+| `IProcessTree` (kill a tree, sum memory and CPU) | Job Object | process group via `setsid`; cgroup v2 on Linux when available |
+| `IIpcTransport` | Named Pipe | Unix domain socket |
+| `IInstanceLock` (one instance per data directory) | named mutex | `flock` |
+| `IShellQuote` (argument quoting, `QuoteCommandArg`) | Windows rules | POSIX rules |
+
+- First, find every place that calls Win32 directly and move it inside a boundary. The core logic (queue, BT, stream parsing) does not depend on the OS and can be shared as is.
+- Officially supported on Linux / macOS: **the headless core and the CLI**. For now the only screen is a simple terminal view (`hancho-cli top`).
+- ChainGuard and the ww scripts assume PowerShell, so they get a separate rule set for POSIX shells.
+
+### 2.5 Step C: remote
+
+- Carry IPC requests and responses over TCP (WebSocket) in the same shape as over the Named Pipe.
+- Listen on localhost only by default. For outside access, token authentication is required and an SSH tunnel is recommended. TLS is left to the tunnel.
+- Add `host` to jobs. A job with `host` runs on that host's `hanchod`.
+
+```json
+{ "name": "linux-test", "host": "buildbox", "command": "make test", "timeoutSec": 1800 }
+```
+
+- Hosts are registered in `<data-dir>/hosts.json` (name, address, where the token comes from). The token itself is not written to the file; it is read from the Windows Credential Manager or an environment variable.
+- Resource locks are per host. The same path on different hosts does not conflict.
+- Logs, events (section 1), and `.done` files are fetched over the protocol. The local GUI shows remote jobs in the same list.
+
+### 2.6 Non-goals
+
+- Cluster scheduling (picking a free host, autoscaling).
+- Multi-tenant isolation and sandboxing. Permissions stay the responsibility of each CLI and the OS.
+- A GUI dashboard on Linux / macOS.
+
+---
+
+## 3. Richer, semantic memory on top of durable job state
+
+### 3.1 Purpose and scope
+
+**Current state**: `processes_state.json`, `taskqueues/<name>.json` (the `TaskQueueAttempt` history), `.stream.jsonl`, BT state, and `TaskQueueOrigin` are kept. The facts are there, but they cannot be searched and there is no way to hand them to the next job. What one attempt learned does not reach the worker of the next attempt.
+
+**Questions memory answers** (examples)
+
+- Why did this job fail last time? How was it fixed then?
+- Which jobs touched this file recently? Did they succeed?
+- How long does this build usually take (to set a timeout)?
+- What is the success rate of this kind of work on this engine and model?
+- Did a previous worker leave a caveat ("this test fails when run in parallel")?
+
+**Division of labor**: the same line as in the [Pros/Cons section on hierarchical memory](pros-cons-comparison.md).
+
+| Where | What |
+|---|---|
+| Each harness's memory | Facts carried within one conversation or session, conversation summaries |
+| Hancho's memory | **Facts about the work** that last across sessions, workers, restarts, and engines: what ran, how it went, what was learned |
+
+Hancho does not manage LLM context. What a worker sees is still decided by its CLI. Hancho only hands over short, relevant records when asked.
+
+### 3.2 Layers
+
+```
+L3 Project knowledge   facts approved by a person. Committed to git
+   ▲ promotion (by a person)
+L2 Notes               short facts written explicitly by agents, people, or Hancho. With sources
+   ▲ cites
+L1 Run records         one per attempt. Built deterministically from events
+   ▲ generated from
+L0 Events              .events.jsonl from section 1
+```
+
+Lower layers are larger and mechanical; higher layers are smaller and involve human judgment. Higher layers always cite lower layers as sources.
+
+### 3.3 L1 run records (RunRecord)
+
+One per attempt, built deterministically without an LLM. The same events always give the same record, so records can be rebuilt at any time.
+
+```json
+{
+  "schema": "hancho.memory.run/1",
+  "id": "rr_j_7f3a_2",
+  "jobId": "j_7f3a",
+  "taskqueue": "main",
+  "jobName": "build",
+  "bt": { "id": "bt_main", "node": "build", "run": 3 },
+  "attempt": 2,
+  "origin": { "client": "claude-code 2.4.0", "session": "…", "cwd": "D:/wsgit/app" },
+  "engine": "claude",
+  "model": "claude-opus-5-5",
+  "sessionId": "…",
+  "goal": "Get the Release build passing. Leave warnings alone",
+  "cwd": "D:/wsgit/app",
+  "commandHash": "sha256:9b1c…",
+  "start": "2026-11-10T09:02:11Z",
+  "end": "2026-11-10T09:14:40Z",
+  "durationSec": 749,
+  "outcome": "failed",
+  "failure": { "class": "success_check_failed", "summary": "filesNewer: build/Release/app.exe was not updated" },
+  "exitCode": 0,
+  "filesRead": ["CMakeLists.txt", "src/net.cpp"],
+  "filesEdited": ["src/net.cpp"],
+  "commands": ["cmake --build build --config Release"],
+  "errors": ["LNK2019: unresolved external symbol __imp_strerror (x3)"],
+  "todos": { "done": 3, "total": 5 },
+  "finalMessage": "Fixed the link error in net.cpp, but libfoo is built with /MD so…",
+  "usage": { "totalTokens": 182340, "costUsd": 1.42 },
+  "subagents": { "count": 1, "types": ["general-purpose"] },
+  "sources": { "eventsFile": "proc_12_build.events.jsonl", "seqRange": [1, 2210], "logFile": "proc_12_build_20261110_090211.log" },
+  "createdAt": "2026-11-10T09:14:41Z"
+}
+```
+
+**Where each field comes from**
+
+| Field | Source |
+|---|---|
+| `goal` | `TaskQueueJob.summary` and the head of `instructions` (up to 300 characters) |
+| `outcome`, `exitCode`, `start`, `end` | `TaskQueueAttempt` |
+| `failure` | The diagnosis from section 4 |
+| `filesRead`, `filesEdited` | `target` of `tool.call` events whose `activity` is `read` / `edit`. Made relative to `cwd`, deduplicated, up to 50 each |
+| `commands` | Events whose `activity` is `command`. Up to 20, favoring the first and the last |
+| `errors` | `error` of `tool.result`, `error` events, error lines at the end of the log. Counted after masking numbers and paths, top 10 by count |
+| `todos` | The last `plan` event |
+| `finalMessage` | The last `message`, cut at 2KB |
+| `usage` | Sum of `usage` events |
+
+Jobs without a JSON stream (plain commands) still get `goal`, `outcome`, `exitCode`, times, and `errors` (from the end of the log).
+
+### 3.4 L2 notes
+
+Short facts written explicitly by agents, people, or Hancho itself.
+
+```json
+{
+  "schema": "hancho.memory.note/1",
+  "id": "nt_01JC9Z…",
+  "text": "libfoo is built with /MD. It will not link until it is rebuilt with /MT",
+  "tags": ["build", "link"],
+  "scope": "job:build",
+  "author": { "type": "agent", "origin": { "client": "claude-code 2.4.0", "session": "…" } },
+  "sources": ["rr_j_7f3a_2"],
+  "status": "active",
+  "supersedes": null,
+  "expiresAt": null,
+  "createdAt": "2026-11-10T09:14:52Z"
+}
+```
+
+- `scope` says what the note concerns: `project`, `taskqueue:<name>`, `job:<name>`, `file:<path>`, or `engine:<name>`. It is used for search and injection (3.8).
+- `status` is `active`, `superseded` (replaced by a newer note), or `retracted`.
+- `text` is up to 1KB. Longer explanations go in a file, and the note points to its path.
+
+**Rules per author**
+
+| Author | How | Sources |
+|---|---|---|
+| Agent | MCP `memory_note`, or the `notes` field of a BT worker's structured output | Required. The RunRecord of its own attempt is attached automatically |
+| Person | GUI, `hancho-cli memory note` | Optional |
+| Hancho | Automatic, rule-based (below) | Required |
+
+**Notes Hancho writes automatically** (deterministic rules)
+
+- The same job name failed with the same failure class 3 times in a row: "`build` failed the last 3 times with `success_check_failed` (filesNewer)".
+- Attempts keep taking more than 80% of the timeout: "`test` runs close to its timeout (p90 1650 s / limit 1800 s)".
+- A success follows a failure: the difference in `filesEdited` between the failed and the successful attempt is recorded as "files that may have fixed it".
+
+### 3.5 L3 project knowledge
+
+Notes approved by a person. They get `approvedBy` and `approvedAt` and move to `knowledge.jsonl`. This file is meant to be committed to git and shared with the team.
+
+- Only people can promote (`hancho-cli memory approve <id>`, or the GUI). Agents cannot.
+- L3 content has the highest priority in injection (3.8).
+
+### 3.6 Stats
+
+Statistics computed from L1. Not stored; built from the index on read.
+
+- Success rate per job name, engine, and model.
+- Median and p90 duration (for estimating timeouts).
+- Most common failure classes and their trend.
+- Tokens and cost per attempt.
+
+### 3.7 Storage
+
+```
+<data-dir>/memory/
+  records/2026-11.jsonl   L1. One file per month. Append only
+  notes.jsonl             L2. Append-only log of create / supersede / retract. Replay to get current state
+  knowledge.jsonl         L3. Committed to git
+  index/                  Derived (keyword, file, job name indexes). Rebuildable. Not in git
+```
+
+- **Retention**: L1 defaults to 90 days (`hancho-cli memory prune` removes old month files). L2 until `expiresAt` (no expiry by default). L3 forever.
+- **Size limit**: a configured limit for all of `memory/`; when exceeded, the oldest L1 is removed first. L2 and L3 are never removed automatically; a warning is shown near the limit.
+- **Single writer**: only the core process writes. The CLI and MCP ask through IPC. Separation per data directory stays as it is.
+- **Rebuild**: `hancho-cli memory rebuild` rebuilds L1 and the indexes from `.events.jsonl` and `taskqueues/*.json`. L2 and L3 are not rebuilt (they are the source data).
+
+### 3.8 Retrieval
+
+**MCP tools and CLI**
+
+| MCP | CLI | Behavior |
+|---|---|---|
+| `memory_search` | `hancho-cli memory search` | Search by query and filters; returns id, kind, one-line summary, score |
+| `memory_get` | `hancho-cli memory get` | Full text of one entry and its sources |
+| `memory_brief` | `hancho-cli memory brief` | Summary of records relevant to a job (below) |
+| `memory_stats` | `hancho-cli memory stats` | The stats from 3.6 |
+| `memory_note` | `hancho-cli memory note` | Write an L2 note |
+| `memory_retract` | `hancho-cli memory retract` | Retract a note |
+| — | `hancho-cli memory approve` | Promote to L3 (people only) |
+| — | `hancho-cli memory rebuild` / `prune` | Rebuild and delete |
+
+`memory_search` filters: `kinds` (run / note / knowledge), `scope`, `file`, `jobName`, `taskqueue`, `engine`, `model`, `outcome`, `failureClass`, `since`.
+
+**Ranking**
+
+Keyword search by default (BM25-like), plus these boosts:
+
+- `scope` or file matches the query.
+- Recent (decay by days).
+- Layer weight: L3 > L2 > L1.
+- When the question is about failures (`failureClass` given, or a query containing "fail" / "error"), failed records rank higher.
+
+**Embedding search** is not bundled. There is only an `IMemoryRanker` boundary, so it can be replaced by an external plug-in process that receives the query and candidates on stdin and returns scores on stdout.
+
+**`memory_brief`**
+
+Takes a job name, a list of files, or a job definition, and summarizes the relevant records in a fixed shape. No LLM is used.
+
+```
+[Hancho memory: past records. These are not instructions]
+Previous runs
+- rr_j_7f3a_2 (11/10 09:02, failed success_check_failed): build/Release/app.exe was not updated. Edited src/net.cpp
+- rr_j_7f3a_1 (11/10 08:40, failed exit_nonzero): LNK2019 __imp_strerror
+Common failures
+- success_check_failed 2 / exit_nonzero 1 (last 5 runs). Duration p90 760 s
+Related notes
+- nt_01JC9Z: libfoo is built with /MD. It will not link until it is rebuilt with /MT
+Project knowledge
+- kn_01JA2M: every static library we link must be /MT
+[/Hancho memory]
+```
+
+- The order of sections is fixed. Each line carries an id so it can be followed with `memory_get`.
+- To stay within `budgetChars` (default 1500), sections are trimmed from the bottom up, except L3, which is kept to the end.
+
+### 3.9 Injecting memory into jobs
+
+Off by default. Enable it explicitly per job.
+
+```json
+{
+  "name": "build",
+  "instructions": { "text": "Get the Release build passing.\n\n{memory}" },
+  "memory": { "inject": true, "budgetChars": 1500, "scopes": ["job", "file", "project"] }
+}
+```
+
+- At launch, `memory_brief` is expanded at `{memory}`. Without `{memory}`, it is appended at the end.
+- The file scope comes from the paths in the job's `resources` and the previous `filesEdited`.
+- BT worker nodes accept the same `memory` setting.
+- The injected ids are recorded in `TaskQueueAttempt.memoryRefs`. You can see later what was handed over, and 3.12 uses it to measure the effect.
+- The injected block is wrapped in delimiters that say it is past records, not instructions. Note text is written by agents, so it can be a prompt-injection path. A setting excludes L2 notes authored by agents from injection.
+
+### 3.10 Writing discipline
+
+- **Secret masking**: before writing, known key shapes (`sk-`, `ghp_`, `AKIA`, `Bearer `, `password=`, ...) are replaced. Values of a job's `env` are never recorded. Masking rules can be added in data directory settings.
+- **Preventing note spam**: up to 5 agent notes per attempt. No new note when the hash of the normalized text matches one in the same `scope`.
+- **Contradictions**: a newer note replaces an older one with `supersedes`. Both are kept; the older becomes `superseded`.
+- **Source checks**: an agent note whose `sources` point to ids that do not exist is rejected.
+
+### 3.11 Display
+
+- **"Past runs" tab in task details**: RunRecords of jobs with the same name, stats, failure-class trend, related notes.
+- **Memory list dialog**: search, retract notes, promote to L3. Filter by author type (agent / human / hancho).
+- **Execution Monitor pane**: if memory was injected, show its ids under "Goal".
+
+### 3.12 Measuring the effect
+
+More memory is not always better. Injection adds tokens, and old records can mislead a worker. So compare:
+
+- Retry success rate with and without injection.
+- Recurrence rate of the same failure class.
+- Tokens and cost added by injection.
+
+`hancho-cli memory stats --compare-inject` computes this from `memoryRefs` and L1. Until an effect shows, injection stays off by default.
+
+### 3.13 Steps
+
+| Step | Content |
+|---|---|
+| M1 | L1 generation, `rebuild`, keyword search, `memory_search` / `memory_get` / `memory_stats` |
+| M2 | L2 notes, masking, `memory_brief`, `{memory}` injection and `memoryRefs`, Hancho's automatic notes |
+| M3 | L3 promotion, GUI (past runs tab, memory list) |
+| M4 | Plug-in boundary for embedding search |
+
+### 3.14 Non-goals
+
+- Replacing a harness's conversation context or hierarchical memory.
+- Always running LLM summarization (when needed, do it explicitly through a BT `escalate` or an ordinary job).
+- Bundling a vector database or embedding model.
+
+---
+
+## 4. Better failure analysis
+
+### 4.1 Current state
+
+- Attempts keep `TaskQueueAttempt.reason`, `exitCode`, `lastLinesFile`, and `checkDetail`.
+- The stream gives `toolError`, `permissionDenials`, `rateLimitType` / `rateLimitStatus` / `rateLimitResetsAtSec`, and `stopReason`.
+- Exit code 75 defers a job (`TaskQueueDefer`).
+- But nothing combines these into a "why". Users read logs and decide. Retries also run the same way up to `maxAttempts`, whatever the reason.
+
+### 4.2 Failure classes
+
+| Class | Evidence | Default action |
+|---|---|---|
+| `launch_error` | The process did not start | No retry (`fix_spec`) |
+| `timeout` | `timeoutSec` exceeded | Suggest `raise_timeout`. Retry once |
+| `idle_stall` | Both output and CPU stopped | Retry |
+| `exit_nonzero` | Non-zero exit code matching no other class | Retry |
+| `crash` | Ended by an exception (`0xC0000005`, ...) | Retry; `human` if it repeats |
+| `success_check_failed` | A success condition (`exitCode` / `filesNewer` / `outputRegex`) not met; which one goes in `detail` | Retry |
+| `rate_limited` | A `rate_limit` event with `status` `rejected`, or an equivalent error | `retry_after` (wait until reset; does not use up `maxAttempts`) |
+| `auth_error` | An authentication `error` event or known wording | No retry (`human`) |
+| `permission_denied` | Many `permissionDenials` and no result | No retry (`fix_spec`: review the permission settings) |
+| `turn_or_context_limit` | `stopReason` is the max-turn or context limit | `escalate`, or split the work |
+| `tool_error_loop` | The same tool failing repeatedly in a short span | `escalate` |
+| `incomplete` | Ended normally, but TODOs remain and the success condition is not met | Retry |
+| `killed` | Stopped by a person or a higher-level operation | No retry |
+| `dependency_blocked` | A job it depends on failed | See that job's diagnosis |
+| `resource_conflict` | Stopped acquiring a resource lock | Wait |
+| `unknown` | Matches nothing | Retry. Suggest `escalate` |
+
+### 4.3 Diagnosis record
+
+Each attempt gets one diagnosis.
+
+```json
+{
+  "class": "rate_limited",
+  "confidence": "high",
+  "summary": "Rejected by the five_hour rate limit. Resets at 14:00",
+  "detail": { "window": "five_hour", "resetsAt": "2026-11-10T14:00:00+09:00" },
+  "evidence": [
+    { "events": "proc_12_build.events.jsonl", "seq": 2207 },
+    { "log": "proc_12_build_20261110_090211.log", "line": 4410 }
+  ],
+  "lastActivity": { "activity": "command", "target": "cmake --build build", "sinceSec": 12 },
+  "suggestedAction": "retry_after",
+  "retryAt": "2026-11-10T14:00:30+09:00"
+}
+```
+
+- `confidence` is `high` / `medium` / `low`: `high` when a rule is decided by direct evidence, `medium` or `low` when inferred from circumstances.
+- `evidence` always points to the original events or log lines. The diagnosis is a summary; the evidence is the source data.
+- `lastActivity` is what the agent was doing just before the failure. "Timed out in the middle of `cmake --build`" is more useful than "timed out".
+- `suggestedAction` is one of `retry`, `retry_after`, `raise_timeout`, `fix_spec`, `escalate`, `human`.
+
+### 4.4 Classifier
+
+- An ordered list of rules, evaluated top down; the first match wins. Deterministic: the same input gives the same diagnosis.
+- Inputs are the attempt (exit code, times, success-condition results), the normalized events from section 1, and the end of the log.
+- Besides the built-in rules, `failure-rules.json` in the data directory can add or override rules.
+
+```json
+{
+  "rules": [
+    { "class": "auth_error", "when": { "logRegex": "(?i)(invalid api key|401 unauthorized)" },
+      "confidence": "high", "action": "human" },
+    { "class": "exit_nonzero", "when": { "exitCode": [2], "jobName": "lint" },
+      "summary": "lint reported findings", "action": "fix_spec" }
+  ]
+}
+```
+
+- When the rules do not decide (`unknown` or `low`), you can optionally ask an LLM for an opinion through the existing BT `escalate`, passing only the evidence (tail of events, tail of log, attempt info). The LLM's opinion is kept in a separate field as a `confidence: low` reference and is never used for automatic retry decisions.
+
+### 4.5 Retry policy
+
+Retries can depend on the class.
+
+```json
+{
+  "maxAttempts": 3,
+  "retry": {
+    "on": ["idle_stall", "exit_nonzero", "crash", "success_check_failed", "incomplete"],
+    "never": ["auth_error", "permission_denied", "launch_error"],
+    "waitForRateLimit": true
+  }
+}
+```
+
+- With `waitForRateLimit`, `rate_limited` waits until the reset time before retrying and does not use up `maxAttempts`, just like the current `TaskQueueDefer`.
+- Without `retry`, jobs retry regardless of reason, as today.
+
+### 4.6 Display
+
+- **GUI**: a "Why it failed" field in task and process details, with `summary`, `lastActivity`, and links to the evidence (click to jump to the event or log line). The task list's status column shows the class briefly.
+- **CLI**: `hancho-cli taskqueue why <jobId>` shows the last attempt's diagnosis and the sequence of classes across earlier attempts.
+- **MCP**: the results of `taskqueue_get` and `taskqueue_wait` include the diagnosis, so a higher-level agent can choose its next move without reading logs.
+- **BT**: conditions can refer to `failure.class` and `failure.suggestedAction`.
+
+```json
+{ "type": "selector", "children": [
+  { "type": "condition", "expr": "failure.class == 'rate_limited'", "then": "wait_and_retry" },
+  { "type": "condition", "expr": "failure.class == 'turn_or_context_limit'", "then": "split_task" }
+]}
+```
+
+- **Aggregates**: breakdown of failure classes per queue, engine, and model. Since L1 in section 3 keeps the class, trends are visible too.
+
+### 4.7 Steps
+
+1. Classifier and diagnosis records (built-in rules). `taskqueue why`, additions to MCP.
+2. Class-based retry policy. GUI display.
+3. `failure-rules.json`, BT conditions, optional LLM opinion.
+
+---
+
+## 5. Clear guidance on when a harness-native feature has made Hancho unnecessary
+
+### 5.1 Approach
+
+Hancho fills gaps in harnesses. When a harness can do the same thing, the right call is to stop using Hancho for that use. This section turns that call into explicit criteria instead of leaving it entirely to users.
+
+### 5.2 Reasons Hancho is needed
+
+If you need any of these, Hancho is worth using. If you need none, do not use it.
+
+1. **Durability**: jobs and their state survive restarts of the harness, terminal, or PC.
+2. **Heterogeneity**: several CLIs or engines (Claude, Codex, OpenCode, ordinary build commands) run in one plan.
+3. **Visibility**: a person watches many parallel jobs in one place and stops them or types into them.
+4. **Deterministic control**: order, dependencies, timeouts, success conditions, and retries happen reliably without LLM judgment.
+5. **Coordination on one machine**: resource locks and parallelism keep jobs on the same machine from colliding.
+
+### 5.3 Feature mapping
+
+For each Hancho feature, the replacement candidates and the condition under which replacing it is fine. This table is reviewed every release.
+
+| Hancho feature | Harness-side candidate | OK to replace when |
+|---|---|---|
+| Running long builds and tests in the background | Harness background execution | It keeps running after the harness exits, and you can reliably learn later that it finished |
+| Task queue (dependencies, retries) | Harness task features, agent teams | Dependencies and retries can be written declaratively and survive across sessions |
+| Behavior trees | Agent SDK, workflow features | Control is versioned as code and decision nodes can go back to an LLM |
+| Monitor pane, dashboard | Harness UI, session lists | Jobs from different CLIs appear on the same screen |
+| Sub-agent tracking | The harness's own display | Sub-agent state and tokens are visible |
+| Scheduled runs | Harness scheduled tasks, OS Task Scheduler | Retries and notifications on failure exist |
+| Resource locks | none (today) | — |
+| Failure analysis (section 4) | Harness diagnostics | Failure classes and evidence are shown |
+| Semantic memory (section 3) | Harness memory features | Shared across sessions and engines |
+| Running in CI (section 2) | CI, cloud orchestrators | No need to run it locally |
+
+If you use only one harness and every condition above holds, you do not need Hancho.
+
+### 5.4 How to leave
+
+To make leaving painless, keep the following:
+
+- **Data stays in open formats**: queues, BTs, events, and memory are all JSON / JSONL, readable without Hancho.
+- **Export**: `hancho-cli export` writes a queue as a script in dependency order or a CI workflow skeleton, a BT as a runbook (Markdown), and L3 knowledge as Markdown (ready to paste into `CLAUDE.md` and the like).
+- **Cleanup**: add new commands that undo `mcp install` and `agent install-template` (`hancho-cli mcp uninstall` removes the MCP configuration, `agent uninstall-template` removes templates such as `hancho-runner`). Whether to keep or delete the data directory is the user's choice.
+
+### 5.5 How Hancho itself is run
+
+- Review the table in 5.3 every release and reflect it in the [critical comparison](critical-comparison.md).
+- Mark features that overlap with harnesses as "compatibility" and stop investing in them. Remove them only after the replacement meets the conditions in 5.3.
+- Keep the core small. New features must strengthen one of the five reasons in 5.2.
+
+---
+
+## 6. Roadmap
+
+| Version | Content |
+|---|---|
+| v0.10 | Section 1 steps 1–2 (schema, `.events.jsonl`, MCP exposure), section 2 step A (headless, `run --exit-on-drain`), section 5 documentation |
+| v0.11 | Section 4 steps 1–2 (classifier, diagnosis, retry policy, GUI), section 1 step 3 (Tier 1 / Tier 3, `HANCHO_EVENT_PIPE`) |
+| v0.12 | Section 3 M1–M2 (run records, notes, search, injection) |
+| v1.0 | Section 2 step B (headless on Linux), section 1 step 4, section 3 M3, section 4 step 3 |
+| After v1.0 | Section 2 step C (remote), section 3 M4 |
+
+---
+
+## 7. Open questions
+
+- How strict to make the event schema's JSON Schema file (constrain the types inside `data`?).
+- Whether the Linux / macOS screen stays a simple terminal view only.
+- Whether to make RunRecords for plain processes without a JSON stream (those started outside a queue).
+- Whether to let something other than a person (specific workers) promote to L3.
+- Whether to extend remote authentication beyond tokens (reusing SSH keys, for example).
+- Where to draw the line between the `incomplete` and `success_check_failed` classes.
