@@ -3,6 +3,7 @@
 > **関連資料:**
 > - [ビヘイビアツリーガイド (日本語版)](behavior-tree-ja.md) / [English Guide](behavior-tree.md): 利用者・LLM 向け総合ガイド
 > - [トークン消費削減ガイド](behavior-tree-token-optimization-ja.md): BT によるトークン削減設計とベストプラクティス
+> - [English version](behavior-tree-plan-en.md)
 
 ## 1. 目的
 

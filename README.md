@@ -88,7 +88,7 @@ What stays the same: each step is still a normal task-queue job with its own tim
 
 - **[Behavior Trees Guide](doc/behavior-tree.md)** ([日本語版](doc/behavior-tree-ja.md)): Comprehensive guide covering JSON definition format, node types, variables, worker engines, escalate decision packets, and complete examples.
 - **[Token Optimization Guide](doc/behavior-tree-token-optimization.md)** ([日本語版](doc/behavior-tree-token-optimization-ja.md)): Token-saving principles, `compact: true` in `bt_wait`, escalation line/byte limits, preview truncation, and authoring best practices.
-- **[Architecture & Design Plan](doc/behavior-tree-plan.md)**: Original design specification, execution model, safety limits, and integration with the task queue and dashboard.
+- **[Architecture & Design Plan](doc/behavior-tree-plan-en.md)** ([日本語版](doc/behavior-tree-plan.md)): Original design specification, execution model, safety limits, and integration with the task queue and dashboard.
 
 ## Documentation
 
@@ -100,10 +100,11 @@ What stays the same: each step is still a normal task-queue job with its own tim
 | [Task Queue](doc/taskqueue.md) | Ordered jobs, dependencies, job fields, states, ChainGuard |
 | [Behavior Trees](doc/behavior-tree.md) | BT format, node types, variables, worker engines, escalate, examples |
 | [BT Token Optimization](doc/behavior-tree-token-optimization.md) | Token-saving architecture, `compact: true`, lightweight escalation packets |
-| [BT Design Plan](doc/behavior-tree-plan.md) | Architecture and implementation plan for the BT engine |
+| [BT Design Plan](doc/behavior-tree-plan-en.md) | Architecture and implementation plan for the BT engine |
 | [MCP Server](doc/mcp.md) | MCP registration and the MCP tools |
 | [Data Directory](doc/data-directory.md) | Project-local, git-managed `--data-dir` |
 | [Pros/Cons](doc/pros-cons-comparison.md) | When to use Hancho vs. sub-agents and alternatives |
+| [Critical Comparison](doc/critical-comparison.md) | A skeptical look at Hancho's limits and when not to use it |
 | [tools/ww](tools/ww/README-ww.md) | Optional, independent task-card runner template (not part of Hancho) |
 
 ---

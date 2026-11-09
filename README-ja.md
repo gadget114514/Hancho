@@ -88,7 +88,7 @@ MCP ツール `run_worker` は、1つのタスクをワーカーの LLM CLI に�
 
 - **[ビヘイビアツリーガイド](doc/behavior-tree-ja.md)** ([English](doc/behavior-tree.md)): JSON 定義形式、全ノード種類、変数展開、ワーカーエンジン、`escalate` 判断パケット、完全なサンプル 3 例を含む総合ガイド。
 - **[トークン消費削減ガイド](doc/behavior-tree-token-optimization-ja.md)** ([English](doc/behavior-tree-token-optimization.md)): 中間ステップのトークン消費ゼロ化、`compact: true` による応答軽量化、`escalate` の行数・サイズ制限など、トークン効率を最大化する設計とベストプラクティス。
-- **[設計・実装計画書](doc/behavior-tree-plan.md)**: ビヘイビアツリーの設計思想、状態マシンとタスクキューの統合、GUI 連携計画をまとめた設計書。
+- **[設計・実装計画書](doc/behavior-tree-plan.md)** ([English](doc/behavior-tree-plan-en.md)): ビヘイビアツリーの設計思想、状態マシンとタスクキューの統合、GUI 連携計画をまとめた設計書。
 
 ---
 
@@ -106,6 +106,7 @@ MCP ツール `run_worker` は、1つのタスクをワーカーの LLM CLI に�
 | [MCP サーバー](doc/mcp-ja.md) | MCP 登録と MCP ツール |
 | [データディレクトリ](doc/data-directory-ja.md) | プロジェクト内・git 管理の `--data-dir` |
 | [Pros/Cons](doc/pros-cons-comparison-ja.md) | サブエージェント等との使い分け |
+| [批判的比較](doc/critical-comparison-ja.md) | Hancho の限界と使うべきでないケースを辛口に整理 |
 | [tools/ww](tools/ww/README-ww.md) | 任意・独立のタスクカード実行テンプレート（Hancho の一部ではない） |
 
 ---

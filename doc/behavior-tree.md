@@ -4,7 +4,7 @@ Hancho Behavior Trees (BTs) let an LLM agent declare a complete multi-step workf
 
 > **Related Documents:**
 > - [Token Optimization Guide](behavior-tree-token-optimization.md): How BTs eliminate token overhead, `compact: true`, and payload tuning
-> - [Architecture & Design Plan](behavior-tree-plan.md): Architectural design, execution model, and safety limits
+> - [Architecture & Design Plan](behavior-tree-plan-en.md) ([日本語版](behavior-tree-plan.md)): Architectural design, execution model, and safety limits
 > - [日本語ガイド (Japanese Guide)](behavior-tree-ja.md)
 
 ---
