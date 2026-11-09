@@ -176,7 +176,7 @@ What stays the same: each step is still a normal task-queue job with its own tim
 - **Streams**: Claude partial messages (`--include-partial-messages`) and `codex exec --json` events are parsed.
 - **Toolbar**: added a refresh icon button to the left of the clock.
 - **Settings**: the number of stream events kept per process is configurable (default 2000; -1 keeps them until memory runs out).
-- **Tools**: added `hancho-cli worker install-template` (pc-runner agent), `-Agent` / `WW_AGENT` for ww-run and ww-watch, and `tools/ww-unity`.
+- **Tools**: added `hancho-cli worker install-template` (hancho-runner agent), `-Agent` / `WW_AGENT` for ww-run and ww-watch, and `tools/ww-unity`.
 - **Lists**: updates pause while a list scrollbar is held, and the task list keeps its scroll position when it refreshes.
 - **Tokens**: Claude usage is counted once per message, and the result line adds only what the messages did not report.
 

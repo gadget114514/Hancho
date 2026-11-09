@@ -13,7 +13,7 @@ namespace pc {
 
 namespace {
 
-// pc-runner.md, embedded from tools/agents/pc-runner.md (src/agent_template.rc).
+// hancho-runner.md, embedded from tools/agents/hancho-runner.md (src/agent_template.rc).
 constexpr WORD kRunnerTemplateResourceId = 101;
 
 bool LoadRunnerTemplate(std::string& outText) {
@@ -28,7 +28,7 @@ bool LoadRunnerTemplate(std::string& outText) {
 }
 
 // hancho-cli agent install-template [--path <dir>] [--dry-run] [--json]
-// Writes <dir>\.claude\agents\pc-runner.md (default dir: the current directory). An existing file
+// Writes <dir>\.claude\agents\hancho-runner.md (default dir: the current directory). An existing file
 // is never overwritten.
 int RunAgentInstallTemplate(const std::vector<std::string>& args, size_t startIdx, bool jsonOutput) {
     std::string dir = ".";
@@ -47,11 +47,11 @@ int RunAgentInstallTemplate(const std::vector<std::string>& args, size_t startId
         return 1;
     };
 
-    std::filesystem::path target = std::filesystem::path(Utf8ToWide(dir)) / L".claude" / L"agents" / L"pc-runner.md";
+    std::filesystem::path target = std::filesystem::path(Utf8ToWide(dir)) / L".claude" / L"agents" / L"hancho-runner.md";
     const std::string targetUtf8 = WideToUtf8(target.wstring());
 
     std::string text;
-    if (!LoadRunnerTemplate(text)) return fail("pc-runner template is not embedded in this build");
+    if (!LoadRunnerTemplate(text)) return fail("hancho-runner template is not embedded in this build");
 
     std::error_code ec;
     if (std::filesystem::exists(target, ec)) {
@@ -365,7 +365,7 @@ COMMANDS:
       Update supervisor notes or goal for an ongoing worker.
 
   agent install-template [--path <dir>] [--dry-run]
-      Write the pc-runner subagent to <dir>\.claude\agents\pc-runner.md (default: the current
+      Write the hancho-runner subagent to <dir>\.claude\agents\hancho-runner.md (default: the current
       directory). It runs long commands through Hancho and returns a short summary.
       An existing file is not overwritten.
 
@@ -734,14 +734,14 @@ void PrintCliUsageJson() {
         {"name": "status", "usage": "hancho-cli worker status <id>", "description": "Display current worker status, model, active tool, thoughts, message, supervisor context, and Claude sub-agents (subagents array)."},
         {"name": "stream", "usage": "hancho-cli worker stream <id> [--tail <n>] [--type <type>] [--since <seq>] [--summary]", "description": "View captured JSON streaming events from <log>.stream.jsonl (parsed tool_call/tool_result/thinking/message, subagent_start/subagent_end with parent_tool_use_id and agent_id)."},
         {"name": "info", "usage": "hancho-cli worker info <id> [--notes <notes>] [--goal <goal>]", "description": "Update supervisor instructions, notes, or goals."},
-        {"name": "install-template", "usage": "hancho-cli worker install-template [--path <dir>] [--dry-run] [--json]", "description": "Write .claude/agents/pc-runner.md (a Claude Code subagent that runs long commands through Hancho) under <dir>. Default: the current directory. An existing file is not overwritten."}
+        {"name": "install-template", "usage": "hancho-cli worker install-template [--path <dir>] [--dry-run] [--json]", "description": "Write .claude/agents/hancho-runner.md (a Claude Code subagent that runs long commands through Hancho) under <dir>. Default: the current directory. An existing file is not overwritten."}
       ],
       "options": [
         {"name": "--tail", "value": "<n>", "description": "For stream: number of recent events."},
         {"name": "--type", "value": "<type>", "description": "For stream: filter by event type (tool_call/tool_result/thinking/message/...)."},
         {"name": "--since", "value": "<seq>", "description": "For stream: only events with seq > N."},
         {"name": "--summary", "description": "For stream: show summary view."},
-        {"name": "--path", "value": "<dir>", "description": "For install-template: project directory that receives .claude/agents/pc-runner.md. Default: current directory."},
+        {"name": "--path", "value": "<dir>", "description": "For install-template: project directory that receives .claude/agents/hancho-runner.md. Default: current directory."},
         {"name": "--dry-run", "description": "For install-template: print the target without writing it."},
         {"name": "--notes", "value": "<text>", "description": "For info: supervisor notes."},
         {"name": "--goal", "value": "<text>", "description": "For info: supervisor goal."}

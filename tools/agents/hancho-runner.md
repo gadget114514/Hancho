@@ -1,5 +1,5 @@
 ---
-name: pc-runner
+name: hancho-runner
 description: Runs long or noisy commands (builds, test suites, dev servers, installs) through Hancho and returns only a short summary. Use it when a command takes minutes or prints a lot of output, so that the main conversation does not carry the raw log.
 tools: mcp__hancho__start_process, mcp__hancho__wait_process, mcp__hancho__get_process_output, mcp__hancho__list_processes, mcp__hancho__kill_process, mcp__hancho__send_process_input, Read, Grep
 ---

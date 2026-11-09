@@ -262,7 +262,7 @@ Tools\ww\ww-watch.cmd <card-id> [-Engine agy|opencode|claude|codex] [-Model <mod
   children), `ww-watch` expands it depth-first and runs the leaves in name order.
 - `-Engine` — agent: `agy` (default), `opencode`, `claude` or `codex` (see [Agents](#agents-engines)). Also `WW_ENGINE`.
 - `-Model` — model for the agent; agy defaults to `gemini-3.8-flash-medium`, the others use their own default. Also `WW_MODEL`.
-- `-Agent <name>` — Claude Code agent (`.claude\agents\<name>.md`) to run with `-Engine claude`; passed as `claude --agent <name>`. Other engines refuse it. Also `WW_AGENT`, which `ww-watch` passes on too. `-Jobs` writes it into each hancho-cli job. Example: `ww-run.cmd 012 -Engine claude -Agent pc-runner`.
+- `-Agent <name>` — Claude Code agent (`.claude\agents\<name>.md`) to run with `-Engine claude`; passed as `claude --agent <name>`. Other engines refuse it. Also `WW_AGENT`, which `ww-watch` passes on too. `-Jobs` writes it into each hancho-cli job. Example: `ww-run.cmd 012 -Engine claude -Agent hancho-runner`.
 - `-Root` — project root (default: git top level of the current directory). Also `WW_ROOT`.
 - `-DryRun` — print the expansion tree and each leaf's splittable status; run nothing.
 

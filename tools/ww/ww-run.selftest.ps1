@@ -353,16 +353,16 @@ Check ((Get-EngineCommand -Engine codex) -notmatch '--model') "codex command has
 Check ((Get-EngineCommand -Engine agy) -match "gemini-3\.8-flash-medium") "agy keeps its default model"
 
 Write-Host "`n== 6b. -Agent (Claude Code agent) ==" -ForegroundColor Cyan
-Check ((Get-EngineCommand -Engine claude -Agent pc-runner) -match ' --agent pc-runner$') "claude command passes --agent"
+Check ((Get-EngineCommand -Engine claude -Agent hancho-runner) -match ' --agent hancho-runner$') "claude command passes --agent"
 Check ((Get-EngineCommand -Engine claude) -notmatch '--agent') "claude command has no --agent when none is given"
 $agentThrew = $false
-try { Get-EngineCommand -Engine agy -Agent pc-runner | Out-Null } catch { $agentThrew = $true }
+try { Get-EngineCommand -Engine agy -Agent hancho-runner | Out-Null } catch { $agentThrew = $true }
 Check $agentThrew "-Agent with a non-claude engine is refused"
 $badAgentThrew = $false
 try { Get-EngineCommand -Engine claude -Agent 'x; rm' | Out-Null } catch { $badAgentThrew = $true }
 Check $badAgentThrew "an agent name with shell characters is refused"
-$agentJob = New-HanchoCliJob -Task "908" -Root "C:\my proj" -RunCmd "C:\my proj\tools\ww\ww-run.cmd" -Engine claude -Agent pc-runner
-Check ($agentJob.command -match ' -Agent pc-runner( |$)') "job command carries -Agent"
+$agentJob = New-HanchoCliJob -Task "908" -Root "C:\my proj" -RunCmd "C:\my proj\tools\ww\ww-run.cmd" -Engine claude -Agent hancho-runner
+Check ($agentJob.command -match ' -Agent hancho-runner( |$)') "job command carries -Agent"
 Check (-not ((New-HanchoCliJob -Task "909" -Root "C:\my proj" -RunCmd "C:\my proj\tools\ww\ww-run.cmd" -Engine claude).command -match '-Agent')) "job without -Agent has no -Agent"
 
 Write-Host "`n== 7. card estimate parsing ==" -ForegroundColor Cyan

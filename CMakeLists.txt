@@ -112,9 +112,9 @@ add_executable(hancho-cli
     src/agent_template.rc
 )
 
-# Rebuild the embedded template when pc-runner.md changes.
+# Rebuild the embedded template when hancho-runner.md changes.
 set_source_files_properties(src/agent_template.rc PROPERTIES
-    OBJECT_DEPENDS "${CMAKE_CURRENT_SOURCE_DIR}/tools/agents/pc-runner.md")
+    OBJECT_DEPENDS "${CMAKE_CURRENT_SOURCE_DIR}/tools/agents/hancho-runner.md")
 
 add_dependencies(hancho-cli Hancho)
 

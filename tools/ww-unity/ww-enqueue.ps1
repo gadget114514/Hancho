@@ -25,7 +25,7 @@ $root = $paths.Root
 $data = $paths.DataDir
 # Tool folder as the job command must name it, e.g. Tools\ww-unity.
 $toolRel = "Tools\" + (Split-Path -Leaf $PSScriptRoot)
-$hanchoCli = if ($env:WW_HANCHO_CLI) { $env:WW_HANCHO_CLI } else { Join-Path $env:LOCALAPPDATA "Programs\Hancho\hancho-cli.exe" }
+$hanchoCli = if ($env:HANCHO_CLI) { $env:HANCHO_CLI } else { Join-Path $env:LOCALAPPDATA "Programs\Hancho\hancho-cli.exe" }
 
 # The text under a "## <heading>" line, up to the next "## " line. $Heading is a regex.
 function Get-CardSection([string]$Text, [string]$Heading) {

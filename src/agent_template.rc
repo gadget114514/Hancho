@@ -1,5 +1,5 @@
-// Embeds the pc-runner subagent definition for `hancho-cli agent install-template` (src/cli.cpp).
+// Embeds the hancho-runner subagent definition for `hancho-cli agent install-template` (src/cli.cpp).
 // The resource id must match kRunnerTemplateResourceId there.
-#define IDR_PC_RUNNER_TEMPLATE 101
+#define IDR_HANCHO_RUNNER_TEMPLATE 101
 
-IDR_PC_RUNNER_TEMPLATE RCDATA "../tools/agents/pc-runner.md"
+IDR_HANCHO_RUNNER_TEMPLATE RCDATA "../tools/agents/hancho-runner.md"

@@ -61,8 +61,8 @@ Hancho 経由で Claude Code のサブエージェントを追跡・活用でき
 
 ## 段階 2: 委譲（エージェント定義）
 
-1. `tools/agents/pc-runner.md` を追加する。ビルド、テスト、サーバーなど長時間の処理を MCP の `start_process` と `wait_process` / `get_process_output` で実行し、要約だけを返す Claude Code エージェント定義。
-2. `hancho-cli agent install-template [--path <dir>] [--dry-run] [--json]` を追加する。既定で `.claude/agents/pc-runner.md` に書き、既存ファイルは上書きしない。テンプレートは exe に埋め込む。
+1. `tools/agents/hancho-runner.md` を追加する。ビルド、テスト、サーバーなど長時間の処理を MCP の `start_process` と `wait_process` / `get_process_output` で実行し、要約だけを返す Claude Code エージェント定義。
+2. `hancho-cli agent install-template [--path <dir>] [--dry-run] [--json]` を追加する。既定で `.claude/agents/hancho-runner.md` に書き、既存ファイルは上書きしない。テンプレートは exe に埋め込む。
 3. CLI のヘルプと JSON スキーマ（`src/cli.cpp`）を更新する。
 
 ## 段階 3: 並列実行（`ww-run` / タスクキュー）

@@ -180,7 +180,7 @@ MCP ツール `run_worker` は、1つのタスクをワーカーの LLM CLI に�
 - **ストリーム**: Claude の部分メッセージ（`--include-partial-messages`）と `codex exec --json` のイベントを解析します。
 - **ツールバー**: 時計の左に更新アイコンボタンを追加しました。
 - **設定**: プロセスごとに保持するストリームイベント数を変更できます（既定 2000、-1 でメモリが尽きるまで保持）。
-- **ツール**: `hancho-cli worker install-template`（pc-runner エージェント）、ww-run と ww-watch の `-Agent` / `WW_AGENT`、`tools/ww-unity` を追加しました。
+- **ツール**: `hancho-cli worker install-template`（hancho-runner エージェント）、ww-run と ww-watch の `-Agent` / `WW_AGENT`、`tools/ww-unity` を追加しました。
 - **リスト**: スクロールバーを押さえている間は更新を止め、タスクリストは更新してもスクロール位置を保ちます。
 - **トークン**: Claude の使用量をメッセージごとに1回だけ数え、result 行ではメッセージに出なかった分だけを足します。
 

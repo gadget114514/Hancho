@@ -13,7 +13,7 @@ param(
 )
 
 $ErrorActionPreference = "Stop"
-$hanchoCli = if ($env:WW_HANCHO_CLI) { $env:WW_HANCHO_CLI } else { Join-Path $env:LOCALAPPDATA "Programs\Hancho\hancho-cli.exe" }
+$hanchoCli = if ($env:HANCHO_CLI) { $env:HANCHO_CLI } else { Join-Path $env:LOCALAPPDATA "Programs\Hancho\hancho-cli.exe" }
 
 # True when a pending job can never start: a dependency is missing, failed or cancelled, or
 # is itself such a job. $Path holds the ids on the current walk so a cycle cannot loop forever.
