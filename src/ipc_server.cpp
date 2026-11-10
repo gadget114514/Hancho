@@ -1,6 +1,7 @@
 #include "ipc_server.h"
 #include "bt_manager.h"
 #include "chain_guard.h"
+#include "event_schema.h"
 #include "llm_stream.h"
 #include "nlohmann/json.hpp"
 #include <ctime>
@@ -426,6 +427,28 @@ std::string IpcServer::HandleRequestJson(const std::string& reqJson) {
         if (typeFilter.empty()) typeFilter = JsonGetString(reqJson, "filter", "");
         uint64_t sinceSeq = static_cast<uint64_t>(JsonGetInt(reqJson, "since_seq", 0));
         std::string format = JsonGetString(reqJson, "format", "json");
+        std::string schema = JsonGetString(reqJson, "schema", "");
+
+        if (schema == "v1" || schema == "hancho.event/1") {
+            ProcessSnapshot snap;
+            if (!pm_.GetSnapshot(id, snap)) {
+                return "{\"ok\":false,\"error\":\"Agent stream not found for process ID " + std::to_string(id) + "\"}";
+            }
+            std::string eventsPath = HanchoEventsFilePathForStream(snap.streamFilePath);
+            auto normalized = ReadHanchoEventsFile(eventsPath, tail > 0 ? static_cast<size_t>(tail) : 0,
+                                                   typeFilter, sinceSeq);
+            oss << "{\"ok\":true,\"schema\":\"hancho.event/1\",\"id\":" << id
+                << ",\"agent_type\":\"" << JsonEscape(snap.agentType) << "\""
+                << ",\"status\":\"" << JsonEscape(snap.agentStatus) << "\""
+                << ",\"events_file\":\"" << JsonEscape(eventsPath) << "\""
+                << ",\"events\":[";
+            for (size_t i = 0; i < normalized.size(); ++i) {
+                if (i) oss << ",";
+                oss << normalized[i].dump(-1, ' ', false, nlohmann::json::error_handler_t::replace);
+            }
+            oss << "]}";
+            return oss.str();
+        }
 
         std::vector<LlmStreamEvent> events;
         LlmAgentState state;

@@ -106,7 +106,15 @@ int main() {
                     "defaultModel": "corp-v1",
                     "stream": "claude",
                     "permissionArgs": "--auto-approve",
-                    "models": ["corp-v1", "corp-v2"]
+                    "models": ["corp-v1", "corp-v2"],
+                    "adapter": "mycli",
+                    "capabilities": {
+                        "jsonStream": true,
+                        "resume": false,
+                        "reportsUsage": true,
+                        "reportsSubagents": false,
+                        "permissionModes": ["default", "auto"]
+                    }
                 }
             }
         })";
@@ -126,6 +134,25 @@ int main() {
         Check(reg.Knows("custom-cli", "corp-v2", err), "custom-cli accepts allowed model corp-v2");
         Check(!reg.Knows("custom-cli", " disallowed-model ", err) && !err.empty(), "custom-cli rejects unlisted model");
         Check(!reg.BuildCommand("unknown-engine", "", "hi", 60, cmd, stream, err), "BuildCommand rejects unknown engine");
+
+        // adapter and capabilities from engines.json
+        const WorkerEngineDef* def = reg.Find("custom-cli");
+        Check(def && def->adapter == "mycli", "engine keeps the adapter name");
+        Check(def && def->capabilities.jsonStream && !def->capabilities.resume &&
+                  def->capabilities.reportsUsage && !def->capabilities.reportsSubagents,
+              "engine keeps capability booleans");
+        Check(def && def->capabilities.permissionModes.size() == 2 &&
+                  def->capabilities.permissionModes[1] == "auto",
+              "engine keeps capability permission modes");
+        std::string adapterOut;
+        Check(reg.BuildCommand("custom-cli", "", "hi", 60, cmd, stream, err, &adapterOut) &&
+                  adapterOut == "mycli",
+              "BuildCommand reports the adapter name");
+        Check(reg.BuildCommand("claude", "", "hi", 60, cmd, stream, err, &adapterOut) && adapterOut.empty(),
+              "BuildCommand reports an empty adapter when none is set");
+
+        std::string badCaps = R"({"engines":{"x":{"command":"x {prompt}","capabilities":{"resume":"yes"}}}})";
+        Check(!reg.LoadFromJson(badCaps, err) && !err.empty(), "capabilities booleans are validated");
     }
 
     // 5. ValidateOutput (required and type)

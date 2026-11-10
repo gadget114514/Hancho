@@ -53,8 +53,7 @@ static std::wstring ResolveCommandLineForWin32(const std::string& rawCmdUtf8) {
     return cmd;
 }
 
-static std::vector<wchar_t> BuildChildEnvironment(const std::wstring& cwd, const std::map<std::string, std::string>& extra) {
-    std::vector<wchar_t> block;
+static std::vector<wchar_t> BuildChildEnvironment(const std::wstring& cwd, const std::map<std::string, std::string>& extra) {    std::vector<wchar_t> block;
     auto append = [&block](const std::wstring& entry) {
         block.insert(block.end(), entry.begin(), entry.end());
         block.push_back(L'\0');
@@ -103,6 +102,19 @@ static std::vector<wchar_t> BuildChildEnvironment(const std::wstring& cwd, const
     return block;
 }
 
+static std::wstring MakeEventPipeName() {
+    static std::atomic<uint64_t> counter{0};
+    return L"\\\\.\\pipe\\HanchoEvent_" + std::to_wstring(GetCurrentProcessId()) + L"_" +
+           std::to_wstring(GetNowTickMs()) + L"_" + std::to_wstring(counter.fetch_add(1));
+}
+
+static HANDLE CreateEventPipeServer(const std::wstring& name) {
+    return CreateNamedPipeW(name.c_str(),
+                            PIPE_ACCESS_INBOUND | FILE_FLAG_FIRST_PIPE_INSTANCE,
+                            PIPE_TYPE_BYTE | PIPE_READMODE_BYTE | PIPE_WAIT,
+                            1, 64 * 1024, 64 * 1024, 0, nullptr);
+}
+
 ProcessManager::ManagedProcess::~ManagedProcess() {
     if (hStdinWrite) {
         CloseHandle(hStdinWrite);
@@ -111,6 +123,16 @@ ProcessManager::ManagedProcess::~ManagedProcess() {
     if (hStdoutRead) {
         CloseHandle(hStdoutRead);
         hStdoutRead = nullptr;
+    }
+    eventPipeStop = true;
+    if (eventPipeThread.joinable()) {
+        CancelSynchronousIo(eventPipeThread.native_handle());
+        eventPipeThread.join();
+    }
+    eventTracker.store(nullptr);
+    if (hEventPipe) {
+        CloseHandle(hEventPipe);
+        hEventPipe = nullptr;
     }
     if (readerThread.joinable()) {
         readerThread.join();
@@ -188,7 +210,23 @@ int ProcessManager::StartProcess(const StartProcessRequest& req, std::string& ou
 
     std::wstring cwdWide = ResolveAbsolutePathWide(Utf8ToWide(req.workingDir));
     const wchar_t* cwdPtr = cwdWide.c_str();
-    std::vector<wchar_t> childEnv = BuildChildEnvironment(cwdWide, req.env);
+
+    // HANCHO_EVENT_PIPE: a per-process named pipe that the CLI (or a wrapper) can write
+    // hancho.event/1 lines to. Only pipe-mode workers with streaming get one.
+    std::map<std::string, std::string> childEnvVars = req.env;
+    std::wstring eventPipeName;
+    HANDLE hEventPipe = nullptr;
+    if (req.mode == ExecMode::Pipe && (req.jsonStream || !req.agentType.empty()) &&
+        req.env.find("HANCHO_EVENT_PIPE") == req.env.end()) {
+        eventPipeName = MakeEventPipeName();
+        hEventPipe = CreateEventPipeServer(eventPipeName);
+        if (hEventPipe) {
+            childEnvVars["HANCHO_EVENT_PIPE"] = WideToUtf8(eventPipeName);
+        } else {
+            eventPipeName.clear();
+        }
+    }
+    std::vector<wchar_t> childEnv = BuildChildEnvironment(cwdWide, childEnvVars);
 
     // Create Win32 Job Object with KILL_ON_JOB_CLOSE
     HANDLE hJob = CreateJobObjectW(nullptr, nullptr);
@@ -202,6 +240,11 @@ int ProcessManager::StartProcess(const StartProcessRequest& req, std::string& ou
     SetInformationJobObject(hJob, JobObjectExtendedLimitInformation, &jeli, sizeof(jeli));
 
     auto proc = std::make_shared<ManagedProcess>();
+    proc->hEventPipe = hEventPipe;
+    proc->eventPipeName = eventPipeName;
+    if (proc->hEventPipe) {
+        proc->eventPipeThread = std::thread([proc] { EventPipeThreadFunc(proc); });
+    }
     proc->commandLine = req.commandLine;
     proc->workingDir = WideToUtf8(cwdWide);
     proc->mode = req.mode;
@@ -470,7 +513,11 @@ int ProcessManager::StartProcess(const StartProcessRequest& req, std::string& ou
                     if (end > after) defaultModel = cl.substr(after, end - after);
                 }
             }
-            proc->streamTracker->Init(proc->id, proc->agentType, WideToUtf8(streamPathW), proc->supervisorNotes, proc->supervisorGoal, defaultModel);
+            proc->streamTracker->Init(proc->id, proc->agentType, WideToUtf8(streamPathW), proc->supervisorNotes,
+                                      proc->supervisorGoal, defaultModel,
+                                      proc->jobId > 0 ? std::to_string(proc->jobId) : std::string(),
+                                      proc->attemptN);
+            proc->eventTracker.store(proc->streamTracker.get());
         }
 
         {
@@ -526,6 +573,61 @@ int ProcessManager::StartProcess(const StartProcessRequest& req, std::string& ou
     }
     SaveState();
     return proc->id;
+}
+
+void ProcessManager::EventPipeThreadFunc(std::shared_ptr<ManagedProcess> proc) {
+    if (!proc || !proc->hEventPipe) return;
+    std::string buffer;
+    std::vector<std::string> backlog;
+
+    auto flushBacklog = [&](LlmStreamTracker* tracker) {
+        if (!tracker || backlog.empty()) return;
+        for (const auto& line : backlog) tracker->IngestExternalEventLine(line);
+        backlog.clear();
+    };
+
+    while (!proc->eventPipeStop.load()) {
+        LlmStreamTracker* tracker = proc->eventTracker.load();
+        flushBacklog(tracker);
+
+        if (!proc->eventPipeConnected) {
+            BOOL ok = ConnectNamedPipe(proc->hEventPipe, nullptr);
+            DWORD err = ok ? ERROR_SUCCESS : GetLastError();
+            if (ok || err == ERROR_PIPE_CONNECTED) {
+                proc->eventPipeConnected = true;
+            } else {
+                if (proc->eventPipeStop.load()) break;
+                Sleep(20);
+                continue;
+            }
+        }
+
+        char chunk[4096];
+        DWORD bytesRead = 0;
+        if (!ReadFile(proc->hEventPipe, chunk, sizeof(chunk), &bytesRead, nullptr) || bytesRead == 0) {
+            DisconnectNamedPipe(proc->hEventPipe);
+            proc->eventPipeConnected = false;
+            if (proc->eventPipeStop.load()) break;
+            continue;
+        }
+        buffer.append(chunk, bytesRead);
+        size_t pos;
+        while ((pos = buffer.find('\n')) != std::string::npos) {
+            std::string line = buffer.substr(0, pos);
+            buffer.erase(0, pos + 1);
+            if (!line.empty() && line.back() == '\r') line.pop_back();
+            if (line.empty()) continue;
+            tracker = proc->eventTracker.load();
+            if (tracker) {
+                flushBacklog(tracker);
+                tracker->IngestExternalEventLine(line);
+            } else if (backlog.size() < 1000) {
+                backlog.push_back(std::move(line));
+            }
+        }
+        constexpr size_t kMaxEventPipeBuffer = 1024 * 1024;
+        if (buffer.size() > kMaxEventPipeBuffer) buffer.clear();
+    }
 }
 
 void ProcessManager::ReaderThreadFunc(std::shared_ptr<ManagedProcess> proc) {

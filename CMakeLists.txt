@@ -24,6 +24,8 @@ add_executable(Hancho
     src/llm_stream_opencode.cpp
     src/llm_stream_agy.cpp
     src/llm_stream_codex.cpp
+    src/event_schema.cpp
+    src/event_adapter.cpp
     src/activity_tree.cpp
     src/bt_debug_view.cpp
     src/behavior_tree.cpp
@@ -107,6 +109,7 @@ add_executable(hancho-cli
     src/cli_main.cpp
     src/cli.cpp
     src/ipc_client.cpp
+    src/event_adapter.cpp
     src/common.cpp
     src/hancho-cli.rc
     src/agent_template.rc
@@ -147,6 +150,8 @@ add_executable(taskqueue_smoke
     src/llm_stream_opencode.cpp
     src/llm_stream_agy.cpp
     src/llm_stream_codex.cpp
+    src/event_schema.cpp
+    src/event_adapter.cpp
     src/common.cpp
     src/Terminal/src/ConPtySession.cpp
     src/Terminal/src/ImageManager.cpp
@@ -202,6 +207,8 @@ add_executable(llm_stream_smoke
     src/llm_stream_opencode.cpp
     src/llm_stream_agy.cpp
     src/llm_stream_codex.cpp
+    src/event_schema.cpp
+    src/event_adapter.cpp
     src/common.cpp
 )
 
@@ -216,6 +223,8 @@ add_executable(activity_tree_smoke
     src/llm_stream_opencode.cpp
     src/llm_stream_agy.cpp
     src/llm_stream_codex.cpp
+    src/event_schema.cpp
+    src/event_adapter.cpp
     src/common.cpp
 )
 
@@ -251,6 +260,136 @@ if(MSVC)
 endif()
 
 target_link_libraries(llm_stream_smoke PRIVATE
+    user32
+    gdi32
+    comctl32
+    shell32
+    advapi32
+    psapi
+    ole32
+    shlwapi
+    imm32
+    winmm
+    "${CMAKE_CURRENT_SOURCE_DIR}/lib/libsixel.lib"
+)
+
+# Headless smoke test for the hancho.event/1 normalizer and the .events.jsonl writer.
+add_executable(event_schema_smoke
+    tests/event_schema_smoke.cpp
+    src/event_schema.cpp
+    src/event_adapter.cpp
+    src/llm_stream.cpp
+    src/llm_stream_claude.cpp
+    src/llm_stream_opencode.cpp
+    src/llm_stream_agy.cpp
+    src/llm_stream_codex.cpp
+    src/common.cpp
+)
+
+# Headless smoke test for the Tier 1 declarative adapters (src/event_adapter.cpp).
+add_executable(event_adapter_smoke
+    tests/event_adapter_smoke.cpp
+    src/event_adapter.cpp
+    src/event_schema.cpp
+    src/llm_stream.cpp
+    src/llm_stream_claude.cpp
+    src/llm_stream_opencode.cpp
+    src/llm_stream_agy.cpp
+    src/llm_stream_codex.cpp
+    src/common.cpp
+)
+
+target_include_directories(event_adapter_smoke PRIVATE
+    src
+    include
+)
+
+if(MSVC)
+    target_compile_options(event_adapter_smoke PRIVATE /W4 /utf-8 /EHsc)
+endif()
+
+target_link_libraries(event_adapter_smoke PRIVATE
+    user32
+    gdi32
+    comctl32
+    shell32
+    advapi32
+    psapi
+    ole32
+    shlwapi
+    imm32
+    winmm
+    "${CMAKE_CURRENT_SOURCE_DIR}/lib/libsixel.lib"
+)
+
+# Headless smoke test for HANCHO_EVENT_PIPE (src/process_manager.cpp + the event writer).
+add_executable(event_pipe_smoke
+    tests/event_pipe_smoke.cpp
+    src/process_manager.cpp
+    src/llm_stream.cpp
+    src/llm_stream_claude.cpp
+    src/llm_stream_opencode.cpp
+    src/llm_stream_agy.cpp
+    src/llm_stream_codex.cpp
+    src/event_schema.cpp
+    src/event_adapter.cpp
+    src/common.cpp
+    src/Terminal/src/ConPtySession.cpp
+    src/Terminal/src/ImageManager.cpp
+    src/Terminal/src/TerminalBuffer.cpp
+    src/Terminal/src/TerminalEmulator.cpp
+    src/Terminal/src/TerminalView.cpp
+)
+
+target_include_directories(event_pipe_smoke PRIVATE
+    src
+    include
+    src/Terminal/include
+    src/Terminal/src
+)
+
+if(MSVC)
+    target_compile_options(event_pipe_smoke PRIVATE /W4 /utf-8 /EHsc)
+endif()
+
+target_link_libraries(event_pipe_smoke PRIVATE
+    user32
+    gdi32
+    comctl32
+    shell32
+    advapi32
+    psapi
+    ole32
+    shlwapi
+    imm32
+    winmm
+    d2d1
+    dwrite
+    dwmapi
+    windowscodecs
+    "${CMAKE_CURRENT_SOURCE_DIR}/lib/libsixel.lib"
+)
+
+add_custom_command(TARGET event_pipe_smoke POST_BUILD
+    COMMAND ${CMAKE_COMMAND} -E copy_if_different
+        "${CMAKE_CURRENT_SOURCE_DIR}/lib/conpty.dll"
+        "$<TARGET_FILE_DIR:event_pipe_smoke>/conpty.dll"
+    COMMAND ${CMAKE_COMMAND} -E copy_if_different
+        "${CMAKE_CURRENT_SOURCE_DIR}/lib/OpenConsole.exe"
+        "$<TARGET_FILE_DIR:event_pipe_smoke>/OpenConsole.exe"
+    COMMENT "Copying lib/conpty.dll and lib/OpenConsole.exe for event_pipe_smoke"
+)
+
+target_include_directories(event_schema_smoke PRIVATE
+    src
+    include
+)
+
+if(MSVC)
+    target_compile_options(event_schema_smoke PRIVATE /W4 /utf-8 /EHsc)
+endif()
+
+target_link_libraries(event_schema_smoke PRIVATE
     user32
     gdi32
     comctl32
@@ -370,6 +509,8 @@ add_executable(bt_integration_smoke
     src/llm_stream_opencode.cpp
     src/llm_stream_agy.cpp
     src/llm_stream_codex.cpp
+    src/event_schema.cpp
+    src/event_adapter.cpp
     src/common.cpp
     src/Terminal/src/ConPtySession.cpp
     src/Terminal/src/ImageManager.cpp
@@ -431,6 +572,8 @@ add_executable(bt_ipc_smoke
     src/llm_stream_opencode.cpp
     src/llm_stream_agy.cpp
     src/llm_stream_codex.cpp
+    src/event_schema.cpp
+    src/event_adapter.cpp
     src/common.cpp
     src/Terminal/src/ConPtySession.cpp
     src/Terminal/src/ImageManager.cpp

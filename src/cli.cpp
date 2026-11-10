@@ -1,5 +1,6 @@
 #include "cli.h"
 #include "common.h"
+#include "event_adapter.h"
 #include "ipc_client.h"
 #include "nlohmann/json.hpp"
 #include <iostream>
@@ -74,6 +75,226 @@ int RunAgentInstallTemplate(const std::vector<std::string>& args, size_t startId
         std::cout << (dryRun ? "Would write " : "Wrote ") << targetUtf8 << " (" << text.size() << " bytes)\n";
     }
     return 0;
+}
+
+// hancho-cli event emit --kind <kind> [--text <text>] [--tool <name>] [--activity <a>]
+//                       [--target <t>] [--status <s>] [--data <json-object>] [--pipe <name>]
+// Writes one hancho.event/1 line to HANCHO_EVENT_PIPE (or --pipe). Used by wrapper scripts.
+int RunEventCommand(const std::vector<std::string>& args, size_t startIdx, bool jsonOutput) {
+    std::string op = (startIdx < args.size() && args[startIdx][0] != '-') ? args[startIdx] : "emit";
+    auto fail = [&](const std::string& message) {
+        if (jsonOutput) {
+            std::cout << "{\"ok\":false,\"error\":\"" << JsonEscape(message) << "\"}\n";
+        } else {
+            std::cerr << "Error: " << message << "\n";
+        }
+        return 1;
+    };
+    if (op != "emit") return fail("unknown event command: " + op + " (emit)");
+
+    std::string kind, text, tool, activity, target, status, pipeName;
+    nlohmann::json data = nlohmann::json::object();
+    for (size_t i = startIdx + 1; i < args.size(); ++i) {
+        const std::string& a = args[i];
+        if (i + 1 >= args.size()) continue;
+        const std::string& v = args[i + 1];
+        if (a == "--kind") { kind = v; ++i; }
+        else if (a == "--text") { text = v; ++i; }
+        else if (a == "--tool") { tool = v; ++i; }
+        else if (a == "--activity") { activity = v; ++i; }
+        else if (a == "--target") { target = v; ++i; }
+        else if (a == "--status") { status = v; ++i; }
+        else if (a == "--pipe") { pipeName = v; ++i; }
+        else if (a == "--data") {
+            auto parsed = nlohmann::json::parse(v, nullptr, false);
+            if (!parsed.is_object()) return fail("--data must be a JSON object");
+            for (auto it = parsed.begin(); it != parsed.end(); ++it) data[it.key()] = it.value();
+            ++i;
+        }
+    }
+    if (kind.empty()) return fail("--kind is required");
+
+    if (!text.empty()) data["text"] = text;
+    if (!tool.empty()) data["tool"] = tool;
+    if (!activity.empty()) data["activity"] = activity;
+    if (!target.empty()) data["target"] = target;
+    if (!status.empty()) data["status"] = status;
+
+    if (pipeName.empty()) {
+        DWORD needed = GetEnvironmentVariableW(L"HANCHO_EVENT_PIPE", nullptr, 0);
+        if (needed > 0) {
+            std::wstring buffer(needed, L'\0');
+            DWORD written = GetEnvironmentVariableW(L"HANCHO_EVENT_PIPE", &buffer[0], needed);
+            if (written > 0) {
+                buffer.resize(written);
+                pipeName = WideToUtf8(buffer);
+            }
+        }
+    }
+    if (pipeName.empty()) {
+        return fail("HANCHO_EVENT_PIPE is not set (run this inside a Hancho worker or pass --pipe)");
+    }
+
+    std::wstring fullPipe = Utf8ToWide(pipeName);
+    if (fullPipe.rfind(L"\\\\.\\pipe\\", 0) != 0) fullPipe = L"\\\\.\\pipe\\" + fullPipe;
+    HANDLE h = CreateFileW(fullPipe.c_str(), GENERIC_WRITE, 0, nullptr, OPEN_EXISTING, 0, nullptr);
+    if (h == INVALID_HANDLE_VALUE) {
+        return fail("cannot open event pipe " + pipeName + " (Win32 error " + std::to_string(GetLastError()) + ")");
+    }
+    nlohmann::json event;
+    event["schema"] = "hancho.event/1";
+    event["kind"] = kind;
+    event["data"] = data;
+    std::string line = event.dump(-1, ' ', false, nlohmann::json::error_handler_t::replace) + "\n";
+    DWORD bytesWritten = 0;
+    BOOL ok = WriteFile(h, line.data(), static_cast<DWORD>(line.size()), &bytesWritten, nullptr);
+    DWORD lastError = ok ? ERROR_SUCCESS : GetLastError();
+    CloseHandle(h);
+    if (!ok) return fail("cannot write to event pipe (Win32 error " + std::to_string(lastError) + ")");
+
+    if (jsonOutput) {
+        std::cout << "{\"ok\":true,\"kind\":\"" << JsonEscape(kind) << "\",\"bytes\":" << bytesWritten << "}\n";
+    } else {
+        std::cout << "Emitted " << kind << " to " << pipeName << "\n";
+    }
+    return 0;
+}
+
+// hancho-cli adapter test <name> [--file <adapter.json>] [--dir <test-dir>]
+// Compares normalized {kind, data} pairs against tests/adapters/<name>/*.expected.jsonl.
+int RunAdapterCommand(const std::vector<std::string>& args, size_t startIdx, bool jsonOutput) {
+    std::string op = (startIdx < args.size() && args[startIdx][0] != '-') ? args[startIdx] : "test";
+    auto fail = [&](const std::string& message) {
+        if (jsonOutput) {
+            std::cout << "{\"ok\":false,\"error\":\"" << JsonEscape(message) << "\"}\n";
+        } else {
+            std::cerr << "Error: " << message << "\n";
+        }
+        return 1;
+    };
+    if (op != "test") return fail("unknown adapter command: " + op + " (test)");
+
+    std::string name, file, dir;
+    for (size_t i = startIdx + 1; i < args.size(); ++i) {
+        if (args[i] == "--file" && i + 1 < args.size()) {
+            file = args[++i];
+        } else if (args[i] == "--dir" && i + 1 < args.size()) {
+            dir = args[++i];
+        } else if (args[i][0] != '-' && name.empty()) {
+            name = args[i];
+        }
+    }
+
+    if (file.empty()) {
+        if (name.empty()) return fail("adapter name is required (adapter test <name>)");
+        file = HanchoAdapterPathFor(name);
+    }
+    HanchoAdapter adapter;
+    std::string err;
+    if (!LoadHanchoAdapterFile(file, adapter, err)) return fail(err);
+    const std::string testName = name.empty() ? adapter.name : name;
+    if (dir.empty()) dir = "tests/adapters/" + testName;
+
+    std::filesystem::path testDir(Utf8ToWide(dir));
+    std::error_code ec;
+    if (!std::filesystem::is_directory(testDir, ec)) {
+        return fail("test directory not found: " + dir);
+    }
+
+    const std::string inputSuffix = ".input.jsonl";
+    std::vector<std::filesystem::path> inputs;
+    for (const auto& entry : std::filesystem::directory_iterator(testDir, ec)) {
+        if (ec) break;
+        if (!entry.is_regular_file()) continue;
+        std::string fileName = WideToUtf8(entry.path().filename().wstring());
+        if (fileName.size() > inputSuffix.size() &&
+            fileName.compare(fileName.size() - inputSuffix.size(), inputSuffix.size(), inputSuffix) == 0) {
+            inputs.push_back(entry.path());
+        }
+    }
+    std::sort(inputs.begin(), inputs.end());
+    if (inputs.empty()) return fail("no " + inputSuffix + " files in " + dir);
+
+    int failedFiles = 0;
+    int totalLines = 0;
+    for (const auto& inputPath : inputs) {
+        std::string inputUtf8 = WideToUtf8(inputPath.wstring());
+        std::string expectedUtf8 =
+            inputUtf8.substr(0, inputUtf8.size() - inputSuffix.size()) + ".expected.jsonl";
+        std::ifstream expectedIn(Utf8ToWide(expectedUtf8), std::ios::binary);
+        if (!expectedIn) {
+            if (jsonOutput) {
+                std::cout << "{\"ok\":false,\"file\":\"" << JsonEscape(inputUtf8) << "\",\"error\":\"missing expected file\"}\n";
+            } else {
+                std::cerr << "[FAIL] " << inputUtf8 << ": missing " << expectedUtf8 << "\n";
+            }
+            ++failedFiles;
+            continue;
+        }
+        std::vector<nlohmann::json> expected;
+        std::string expectedLine;
+        while (std::getline(expectedIn, expectedLine)) {
+            if (!expectedLine.empty() && expectedLine.back() == '\r') expectedLine.pop_back();
+            if (expectedLine.empty()) continue;
+            auto parsed = nlohmann::json::parse(expectedLine, nullptr, false);
+            if (!parsed.is_discarded()) expected.push_back(parsed);
+        }
+
+        std::ifstream inputIn(inputPath, std::ios::binary);
+        size_t index = 0;
+        int lineNo = 0;
+        int fileFailures = 0;
+        std::string line;
+        while (std::getline(inputIn, line)) {
+            if (!line.empty() && line.back() == '\r') line.pop_back();
+            if (line.empty()) continue;
+            ++lineNo;
+            nlohmann::json data;
+            std::string kind = NormalizeHanchoAdapterLine(adapter, line, data);
+            ++totalLines;
+            if (index >= expected.size()) {
+                ++fileFailures;
+                if (!jsonOutput) {
+                    std::cout << "[FAIL] " << inputUtf8 << ":" << lineNo << " unexpected event " << kind << "\n";
+                }
+                ++index;
+                continue;
+            }
+            const nlohmann::json& want = expected[index++];
+            std::string wantKind = want.value("kind", std::string());
+            nlohmann::json wantData = want.contains("data") ? want["data"] : nlohmann::json::object();
+            if (kind != wantKind || data != wantData) {
+                ++fileFailures;
+                if (!jsonOutput) {
+                    std::cout << "[FAIL] " << inputUtf8 << ":" << lineNo << " expected " << wantKind
+                              << " " << wantData.dump() << ", got " << kind << " " << data.dump() << "\n";
+                }
+            }
+        }
+        if (index < expected.size()) {
+            fileFailures += static_cast<int>(expected.size() - index);
+            if (!jsonOutput) {
+                std::cout << "[FAIL] " << inputUtf8 << " expected " << (expected.size() - index)
+                          << " more event(s)\n";
+            }
+        }
+        if (fileFailures == 0) {
+            if (!jsonOutput) std::cout << "[PASS] " << inputUtf8 << "\n";
+        } else {
+            ++failedFiles;
+        }
+    }
+
+    if (jsonOutput) {
+        std::cout << "{\"ok\":" << (failedFiles == 0 ? "true" : "false")
+                  << ",\"adapter\":\"" << JsonEscape(adapter.name) << "\""
+                  << ",\"files\":" << inputs.size() << ",\"failed_files\":" << failedFiles
+                  << ",\"lines\":" << totalLines << "}\n";
+    } else {
+        std::cout << (failedFiles == 0 ? "ALL PASS" : std::to_string(failedFiles) + " file(s) failed")
+                  << "\n";
+    }
+    return failedFiles == 0 ? 0 : 1;
 }
 
 std::string ResolveGuiExePathUtf8() {
@@ -355,11 +576,20 @@ COMMANDS:
   clear
       Remove finished processes from the dashboard list.
 
+  event emit --kind <kind> [--text <text>] [--tool <name>] [--activity <a>] [--target <t>]
+             [--status <s>] [--data <json>] [--pipe <name>]
+      Write one hancho.event/1 line to HANCHO_EVENT_PIPE (set for pipe-mode workers).
+
+  adapter test <name> [--file <adapter.json>] [--dir <test-dir>]
+      Run the Tier 1 declarative adapter against tests/adapters/<name>/*.input.jsonl and
+      *.expected.jsonl (each expected line is {kind, data}).
+
   worker status <id>
       Show current worker status, active tool, thoughts, message, and supervisor context.
 
-  worker stream <id> [--tail <n>] [--type <type>] [--since <seq>] [--summary]
+  worker stream <id> [--tail <n>] [--type <type>] [--since <seq>] [--summary] [--schema <legacy|v1>]
       View captured JSON streaming events for claude, agy, or opencode workers.
+      --schema v1 returns the stable hancho.event/1 shape from <log>.events.jsonl.
 
   worker info <id> [--notes "<notes>"] [--goal "<goal>"]
       Update supervisor notes or goal for an ongoing worker.
@@ -727,12 +957,36 @@ void PrintCliUsageJson() {
       "options": []
     },
     {
+      "name": "adapter test",
+      "description": "Run a Tier 1 declarative adapter (<data-dir>/adapters/<name>.json) against recorded input lines and compare the normalized {kind, data} pairs.",
+      "usage": "hancho-cli adapter test <name> [--file <adapter.json>] [--dir <test-dir>] [--json]",
+      "options": [
+        {"name": "--file", "value": "<adapter.json>", "description": "Adapter file to test. Default: <data-dir>/adapters/<name>.json."},
+        {"name": "--dir", "value": "<test-dir>", "description": "Directory with *.input.jsonl and *.expected.jsonl. Default: tests/adapters/<name>."}
+      ]
+    },
+    {
+      "name": "event emit",
+      "description": "Emit one hancho.event/1 line to the HANCHO_EVENT_PIPE that Hancho gives to a worker process. Lets wrapper scripts and non-JSON CLIs report what they are doing.",
+      "usage": "hancho-cli event emit --kind <kind> [--text <text>] [--tool <name>] [--activity <a>] [--target <t>] [--status <s>] [--data <json>] [--pipe <name>] [--json]",
+      "options": [
+        {"name": "--kind", "value": "<kind>", "description": "hancho.event/1 kind (tool.call, message, run.ended, raw, ...)."},
+        {"name": "--text", "value": "<text>", "description": "data.text for message/thought/raw."},
+        {"name": "--tool", "value": "<name>", "description": "data.tool for tool.call."},
+        {"name": "--activity", "value": "<a>", "description": "data.activity for tool.call."},
+        {"name": "--target", "value": "<t>", "description": "data.target for tool.call."},
+        {"name": "--status", "value": "<s>", "description": "data.status for run.ended/rate_limit."},
+        {"name": "--data", "value": "<json>", "description": "Extra data fields as a JSON object."},
+        {"name": "--pipe", "value": "<name>", "description": "Override HANCHO_EVENT_PIPE."}
+      ]
+    },
+    {
       "name": "worker",
       "description": "Inspect and supervise LLM workers (Claude, agy, opencode, codex, aider, ollama) running under Hancho. JSON stream events are parsed into <log>.stream.jsonl and visible in the GUI (LLM JSON Stream dialog). Use hancho-cli/Hancho to supervise and watch streams.",
       "usage": "hancho-cli worker <status|stream|info|install-template> [<id>] [options]",
       "subcommands": [
         {"name": "status", "usage": "hancho-cli worker status <id>", "description": "Display current worker status, model, active tool, thoughts, message, supervisor context, and Claude sub-agents (subagents array)."},
-        {"name": "stream", "usage": "hancho-cli worker stream <id> [--tail <n>] [--type <type>] [--since <seq>] [--summary]", "description": "View captured JSON streaming events from <log>.stream.jsonl (parsed tool_call/tool_result/thinking/message, subagent_start/subagent_end with parent_tool_use_id and agent_id)."},
+        {"name": "stream", "usage": "hancho-cli worker stream <id> [--tail <n>] [--type <type>] [--since <seq>] [--summary] [--schema <legacy|v1>]", "description": "View captured JSON streaming events from <log>.stream.jsonl (parsed tool_call/tool_result/thinking/message, subagent_start/subagent_end with parent_tool_use_id and agent_id). --schema v1 returns the stable hancho.event/1 shape from <log>.events.jsonl."},
         {"name": "info", "usage": "hancho-cli worker info <id> [--notes <notes>] [--goal <goal>]", "description": "Update supervisor instructions, notes, or goals."},
         {"name": "install-template", "usage": "hancho-cli worker install-template [--path <dir>] [--dry-run] [--json]", "description": "Write .claude/agents/hancho-runner.md (a Claude Code subagent that runs long commands through Hancho) under <dir>. Default: the current directory. An existing file is not overwritten."}
       ],
@@ -741,6 +995,7 @@ void PrintCliUsageJson() {
         {"name": "--type", "value": "<type>", "description": "For stream: filter by event type (tool_call/tool_result/thinking/message/...)."},
         {"name": "--since", "value": "<seq>", "description": "For stream: only events with seq > N."},
         {"name": "--summary", "description": "For stream: show summary view."},
+        {"name": "--schema", "value": "<legacy|v1>", "description": "For stream: event shape. 'v1' returns hancho.event/1 from <log>.events.jsonl."},
         {"name": "--path", "value": "<dir>", "description": "For install-template: project directory that receives .claude/agents/hancho-runner.md. Default: current directory."},
         {"name": "--dry-run", "description": "For install-template: print the target without writing it."},
         {"name": "--notes", "value": "<text>", "description": "For info: supervisor notes."},
@@ -813,7 +1068,7 @@ void PrintCliUsageJson() {
       "hancho-cli_start_example": "hancho-cli start --name opencode --cmd \"opencode run ...\" --json-stream --agent-type opencode --wait --wait-ms 0 --json",
       "notes": [
         "Hancho auto-detects common worker CLIs (claude, agy/antigravity, opencode, codex, aider, ollama) and enables JSON stream parsing if detected.",
-        "Parsed events are written to <logfile>.stream.jsonl. Use GUI context menu 'LLM JSON Stream Events...' or 'hancho-cli worker stream <id>'.",
+        "Parsed events are written to <logfile>.stream.jsonl, and their normalized hancho.event/1 form to <logfile>.events.jsonl. Use GUI context menu 'LLM JSON Stream Events...' or 'hancho-cli worker stream <id>' (add --schema v1 for the normalized shape).",
         "Model is captured from stream fields (model/modelId/llm.model/metadata.model) when present; hover the agent icon in the stream dialog to see it.",
         "Format reference: doc/LLM-jsonstream-format.md"
       ]
@@ -1361,6 +1616,40 @@ int PrintResponse(const std::string& action, const std::string& respJson, bool j
     }
 
     if (action == "get_agent_stream") {
+        if (JsonGetString(respJson, "schema", "") == "hancho.event/1") {
+            auto events = ExtractJsonObjectArray(respJson, "events");
+            std::cout << "Events (" << events.size() << ", hancho.event/1):\n";
+            for (const auto& ev : events) {
+                std::string kind = JsonGetString(ev, "kind", "");
+                std::cout << "  #" << JsonGetInt(ev, "seq", 0) << " [" << kind << "]";
+                std::string dataObj = ExtractJsonObject(ev, "data");
+                std::string detail;
+                if (kind == "tool.call") {
+                    detail = JsonGetString(dataObj, "tool", "");
+                    std::string target = JsonGetString(dataObj, "target", "");
+                    if (!target.empty()) detail += " : " + target;
+                } else if (kind == "tool.result") {
+                    detail = JsonGetBool(dataObj, "ok", true) ? "ok" : "error";
+                    std::string err = JsonGetString(dataObj, "error", "");
+                    if (err.empty()) err = JsonGetString(dataObj, "summary", "");
+                    if (!err.empty()) detail += " : " + err;
+                } else if (kind == "usage") {
+                    detail = "tokens " + std::to_string(JsonGetInt(dataObj, "totalTokens", 0));
+                } else if (kind == "run.started" || kind == "run.ended") {
+                    detail = JsonGetString(dataObj, "status", "");
+                } else {
+                    detail = JsonGetString(dataObj, "text", "");
+                    if (detail.empty()) detail = JsonGetString(dataObj, "message", "");
+                    if (detail.empty()) detail = JsonGetString(dataObj, "status", "");
+                }
+                if (!detail.empty()) {
+                    if (detail.size() > 100) detail = detail.substr(0, 97) + "...";
+                    std::cout << " " << detail;
+                }
+                std::cout << "\n";
+            }
+            return 0;
+        }
         std::string summary = JsonGetString(respJson, "summary", "");
         if (!summary.empty()) {
             std::cout << summary << "\n";
@@ -2159,6 +2448,12 @@ if (subcmd == "start" || subcmd == "run") {
         }
         reqJson << jReq.dump();
     }
+    else if (subcmd == "event") {
+        return RunEventCommand(args, 2, jsonOutput);
+    }
+    else if (subcmd == "adapter") {
+        return RunAdapterCommand(args, 2, jsonOutput);
+    }
     else if (subcmd == "worker" || subcmd == "agent") {  // agent: name used up to v2.3.1
         std::string op = (args.size() >= 3 && args[2][0] != '-') ? args[2] : "status";
         size_t startIdx = (args.size() >= 3 && args[2][0] != '-') ? 3 : 2;
@@ -2169,6 +2464,7 @@ if (subcmd == "start" || subcmd == "run") {
         std::string typeFilter;
         uint64_t sinceSeq = 0;
         std::string format = "json";
+        std::string schema;
         std::string notes;
         std::string goal;
 
@@ -2186,6 +2482,8 @@ if (subcmd == "start" || subcmd == "run") {
                 format = "summary";
             } else if (a == "--format" && i + 1 < args.size()) {
                 format = args[++i];
+            } else if (a == "--schema" && i + 1 < args.size()) {
+                schema = args[++i];
             } else if (a == "--notes" && i + 1 < args.size()) {
                 notes = args[++i];
             } else if (a == "--goal" && i + 1 < args.size()) {
@@ -2213,7 +2511,8 @@ if (subcmd == "start" || subcmd == "run") {
                     << ",\"tail\":" << tail
                     << ",\"type\":\"" << JsonEscape(typeFilter) << "\""
                     << ",\"since_seq\":" << sinceSeq
-                    << ",\"format\":\"" << JsonEscape(format) << "\"}";
+                    << ",\"format\":\"" << JsonEscape(format) << "\""
+                    << ",\"schema\":\"" << JsonEscape(schema) << "\"}";
             subcmd = "get_agent_stream";
         } else if (op == "info" || op == "update") {
             reqJson << "{\"action\":\"update_agent_info\",\"id\":" << id

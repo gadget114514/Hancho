@@ -144,6 +144,14 @@ JSONL, one event per line. The schema name is `hancho.event/1`.
 - A line that matches no rule becomes `raw`.
 - Anything the declarative form cannot express goes to Tier 3; the declarative language is kept from growing too far.
 
+For Tier 3, put the converter command in the adapter JSON's `exec`.
+
+```json
+{ "adapter": "mycli", "exec": "python adapters/mycli.py" }
+```
+
+Hancho runs `exec` as a process, writes the CLI's raw lines to its stdin, and reads `hancho.event/1` lines from its stdout. When both `rules` and `exec` are present, `exec` is used.
+
 **A path for CLIs to emit events themselves**: wrapper scripts and home-grown tools can write `hancho.event` lines straight to `HANCHO_EVENT_PIPE` (a pipe name Hancho passes at launch). By hand, use `hancho-cli event emit --kind message --text "…"`. This lets even shell-script jobs report what they are doing now.
 
 ### 1.5 Extending engine definitions

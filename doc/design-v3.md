@@ -120,6 +120,14 @@ Hancho は **CLI エージェントのためのプロセス外の制御プレー
 | Tier 2 組み込み | C++（`llm_stream_<name>.cpp`） | 1 行を複数イベントに分ける、状態を持つなど複雑な形式。既存 4 種 |
 | Tier 3 外部プロセス | 任意の言語 | 独自形式。stdin に生の行、stdout に `hancho.event` 行 |
 
+Tier 3 は、アダプター JSON の `exec` に変換コマンドを書きます。
+
+```json
+{ "adapter": "mycli", "exec": "python adapters/mycli.py" }
+```
+
+Hancho は `exec` をプロセスとして起動し、CLI の生の行を stdin に流し、stdout の `hancho.event/1` 行を読みます。`rules` と `exec` の両方があるときは `exec` を使います。
+
 **Tier 1 の例**
 
 ```json

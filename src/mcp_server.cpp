@@ -353,13 +353,14 @@ int RunMcpServer() {
                 << "},"
                 << "{"
                 << "\"name\":\"get_worker_stream\","
-                << "\"description\":\"Read structured JSON streaming events (tools called, arguments, reasoning/thoughts, assistant responses, status) emitted by Claude, agy, or OpenCode worker agents. Events are automatically captured and saved to logs/proc_<id>_<name>_stream.jsonl.\","
+                << "\"description\":\"Read structured JSON streaming events (tools called, arguments, reasoning/thoughts, assistant responses, status) emitted by Claude, agy, or OpenCode worker agents. Events are automatically captured and saved to logs/proc_<id>_<name>_stream.jsonl. Pass schema='v1' for the stable hancho.event/1 shape.\","
                 << "\"inputSchema\":{\"type\":\"object\",\"properties\":{"
                 << "\"id\":{\"type\":\"integer\",\"description\":\"Managed process ID of the agent\"},"
                 << "\"tail\":{\"type\":\"integer\",\"description\":\"Number of recent events to return (default 50, 0 = all)\"},"
-                << "\"type\":{\"type\":\"string\",\"description\":\"Filter by event type: 'tool_call', 'tool_result', 'thinking', 'message', 'status', 'step', 'error', 'usage'\"},"
+                << "\"type\":{\"type\":\"string\",\"description\":\"Filter by event type in the legacy shape, or by kind when schema='v1' (e.g. 'tool.call', 'message')\"},"
                 << "\"since_seq\":{\"type\":\"integer\",\"description\":\"Return only events with sequence number greater than since_seq\"},"
-                << "\"format\":{\"type\":\"string\",\"enum\":[\"json\",\"summary\"],\"description\":\"Return format: 'json' (structured events array, default) or 'summary' (compact text summary)\"}"
+                << "\"format\":{\"type\":\"string\",\"enum\":[\"json\",\"summary\"],\"description\":\"Return format: 'json' (structured events array, default) or 'summary' (compact text summary)\"},"
+                << "\"schema\":{\"type\":\"string\",\"enum\":[\"legacy\",\"v1\"],\"description\":\"Event shape: 'legacy' (default, internal type strings) or 'v1' (versioned hancho.event/1 from .events.jsonl)\"}"
                 << "},\"required\":[\"id\"]}"
                 << "},"
                 << "{"
@@ -710,11 +711,13 @@ int RunMcpServer() {
                 if (typeFilter.empty()) typeFilter = JsonGetString(argsJson, "filter", "");
                 int64_t sinceSeq = JsonGetInt(argsJson, "since_seq", 0);
                 std::string format = JsonGetString(argsJson, "format", "json");
+                std::string schema = JsonGetString(argsJson, "schema", "");
                 ipcReq << "{\"action\":\"get_agent_stream\",\"id\":" << id
                        << ",\"tail\":" << tail
                        << ",\"type\":\"" << JsonEscape(typeFilter) << "\""
                        << ",\"since_seq\":" << sinceSeq
-                       << ",\"format\":\"" << JsonEscape(format) << "\"}";
+                       << ",\"format\":\"" << JsonEscape(format) << "\""
+                       << ",\"schema\":\"" << JsonEscape(schema) << "\"}";
             }
             else if (toolName == "get_worker_state" || toolName == "get_agent_state") {
                 int64_t id = JsonGetInt(argsJson, "id", 0);

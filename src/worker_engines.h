@@ -20,12 +20,22 @@ public:
     virtual bool Knows(const std::string& engine, const std::string& model, std::string& err) const = 0;
 };
 
+struct WorkerEngineCapabilities {
+    bool jsonStream = false;
+    bool resume = false;
+    bool reportsUsage = false;
+    bool reportsSubagents = false;
+    std::vector<std::string> permissionModes;
+};
+
 struct WorkerEngineDef {
     std::string command;
     std::string defaultModel;
     std::string stream;
     std::string permissionArgs;
     std::vector<std::string> models; // optional allowlist; empty accepts any valid model name
+    std::string adapter;             // Tier 1/3 adapter name (doc/design-v3.md 1.5)
+    WorkerEngineCapabilities capabilities;
 };
 
 class WorkerEngineRegistry : public IBtEngineCatalog {
@@ -54,7 +64,8 @@ public:
                       int timeoutSec,
                       std::string& outCommand,
                       std::string& outStreamType,
-                      std::string& err) const;
+                      std::string& err,
+                      std::string* outAdapter = nullptr) const;
 
 private:
     std::string defaultEngine_;

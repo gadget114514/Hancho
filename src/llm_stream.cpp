@@ -1,6 +1,8 @@
 #define _CRT_SECURE_NO_WARNINGS
 #include "llm_stream.h"
 #include "llm_stream_internal.h"
+#include "event_adapter.h"
+#include "event_schema.h"
 #include "common.h"
 #include "nlohmann/json.hpp"
 #include <algorithm>
@@ -16,6 +18,7 @@
 #include <ctime>
 #include <iterator>
 #include <sstream>
+#include <thread>
 
 namespace pc {
 
@@ -971,14 +974,145 @@ std::string LlmEventsToSummary(const std::vector<LlmStreamEvent>& events, const 
     return oss.str();
 }
 
+LlmStreamTracker::LlmStreamTracker() = default;
+
+struct LlmStreamTracker::AdapterProcess {
+    HANDLE hStdin = nullptr;
+    HANDLE hStdout = nullptr;
+    HANDLE hProcess = nullptr;
+    std::thread reader;
+    std::atomic<bool> stop{false};
+};
+
+bool LlmStreamTracker::StartAdapterProcess() {
+    if (!adapter_ || adapter_->exec.empty()) return false;
+
+    auto ap = std::make_unique<AdapterProcess>();
+    SECURITY_ATTRIBUTES sa{};
+    sa.nLength = sizeof(sa);
+    sa.bInheritHandle = TRUE;
+    HANDLE stdinRead = nullptr;
+    HANDLE stdoutWrite = nullptr;
+    if (!CreatePipe(&stdinRead, &ap->hStdin, &sa, 0) ||
+        !CreatePipe(&ap->hStdout, &stdoutWrite, &sa, 0)) {
+        if (stdinRead) CloseHandle(stdinRead);
+        if (stdoutWrite) CloseHandle(stdoutWrite);
+        if (ap->hStdin) CloseHandle(ap->hStdin);
+        if (ap->hStdout) CloseHandle(ap->hStdout);
+        return false;
+    }
+    SetHandleInformation(ap->hStdin, HANDLE_FLAG_INHERIT, 0);
+    SetHandleInformation(ap->hStdout, HANDLE_FLAG_INHERIT, 0);
+
+    STARTUPINFOW si{};
+    si.cb = sizeof(si);
+    si.dwFlags = STARTF_USESTDHANDLES | STARTF_USESHOWWINDOW;
+    si.wShowWindow = SW_HIDE;
+    si.hStdInput = stdinRead;
+    si.hStdOutput = stdoutWrite;
+    si.hStdError = stdoutWrite;
+
+    PROCESS_INFORMATION pi{};
+    std::wstring cmd = Utf8ToWide(adapter_->exec);
+    std::vector<wchar_t> cmdLine(cmd.begin(), cmd.end());
+    cmdLine.push_back(L'\0');
+    BOOL ok = CreateProcessW(nullptr, cmdLine.data(), nullptr, nullptr, TRUE,
+                             CREATE_NO_WINDOW | CREATE_UNICODE_ENVIRONMENT, nullptr, nullptr, &si, &pi);
+    CloseHandle(stdinRead);
+    CloseHandle(stdoutWrite);
+    if (!ok) {
+        CloseHandle(ap->hStdin);
+        CloseHandle(ap->hStdout);
+        return false;
+    }
+    CloseHandle(pi.hThread);
+    ap->hProcess = pi.hProcess;
+
+    AdapterProcess* raw = ap.get();
+    LlmStreamTracker* self = this;
+    ap->reader = std::thread([self, raw] {
+        std::string buffer;
+        char chunk[4096];
+        while (!raw->stop.load()) {
+            DWORD bytesRead = 0;
+            if (!ReadFile(raw->hStdout, chunk, sizeof(chunk), &bytesRead, nullptr) || bytesRead == 0) break;
+            buffer.append(chunk, bytesRead);
+            size_t pos;
+            while ((pos = buffer.find('\n')) != std::string::npos) {
+                std::string line = buffer.substr(0, pos);
+                buffer.erase(0, pos + 1);
+                if (!line.empty() && line.back() == '\r') line.pop_back();
+                if (!line.empty()) self->IngestExternalEventLine(line);
+            }
+            constexpr size_t kMaxAdapterBuffer = 4 * 1024 * 1024;
+            if (buffer.size() > kMaxAdapterBuffer) buffer.clear();
+        }
+    });
+    adapterProcess_ = std::move(ap);
+    return true;
+}
+
+void LlmStreamTracker::StopAdapterProcess() {
+    if (!adapterProcess_) return;
+    AdapterProcess* ap = adapterProcess_.get();
+    ap->stop = true;
+    if (ap->hStdin) {
+        CloseHandle(ap->hStdin);
+        ap->hStdin = nullptr;
+    }
+    if (ap->hProcess) {
+        WaitForSingleObject(ap->hProcess, 500);
+        DWORD code = 0;
+        if (GetExitCodeProcess(ap->hProcess, &code) && code == STILL_ACTIVE) {
+            TerminateProcess(ap->hProcess, 0);
+            WaitForSingleObject(ap->hProcess, 1000);
+        }
+    }
+    if (ap->reader.joinable()) {
+        CancelSynchronousIo(ap->reader.native_handle());
+        ap->reader.join();
+    }
+    if (ap->hStdout) CloseHandle(ap->hStdout);
+    if (ap->hProcess) CloseHandle(ap->hProcess);
+    adapterProcess_.reset();
+}
+
+void LlmStreamTracker::WriteAdapterLine(const std::string& line) {
+    if (!adapterProcess_ || !adapterProcess_->hStdin) return;
+    std::string out = line;
+    if (!out.empty() && out.back() == '\r') out.pop_back();
+    out += "\n";
+    DWORD written = 0;
+    WriteFile(adapterProcess_->hStdin, out.data(), static_cast<DWORD>(out.size()), &written, nullptr);
+}
+
+LlmStreamTracker::~LlmStreamTracker() {
+    StopAdapterProcess();
+}
+
 void LlmStreamTracker::Init(int processId, const std::string& agentType, const std::string& streamFilePath,
                             const std::string& supervisorNotes, const std::string& supervisorGoal,
-                            const std::string& defaultModel) {
+                            const std::string& defaultModel, const std::string& jobId, int attempt) {
     std::lock_guard<std::mutex> lock(mutex_);
     processId_ = processId;
     agentType_ = agentType;
+    jobId_ = jobId;
+    attempt_ = attempt;
+    adapter_.reset();
+    if (!agentType.empty()) {
+        HanchoAdapter adapter;
+        std::string err;
+        if (LoadHanchoAdapterFile(HanchoAdapterPathFor(agentType), adapter, err)) {
+            adapter_ = std::make_shared<HanchoAdapter>(std::move(adapter));
+        }
+    }
+    if (adapter_ && !adapter_->exec.empty()) {
+        StartAdapterProcess();
+    }
     streamFilePath_ = streamFilePath;
     streamFilePathWide_ = Utf8ToWide(streamFilePath);
+    eventsFilePathWide_ = Utf8ToWide(HanchoEventsFilePathForStream(streamFilePath));
+    streamLineNo_ = 0;
 
     state_.agentType = agentType;
     state_.model = defaultModel;
@@ -998,8 +1132,11 @@ void LlmStreamTracker::UpdateSupervisorInfo(const std::string& notes, const std:
 void LlmStreamTracker::IngestChunk(const char* data, size_t len) {
     if (!data || len == 0) return;
     std::vector<LlmUsagePoint> usage;
+    std::vector<std::string> adapterLines;
+    bool tier3 = false;
     {
         std::lock_guard<std::mutex> lock(mutex_);
+        tier3 = adapter_ && !adapter_->exec.empty() && adapterProcess_ != nullptr;
         lineBuffer_.append(data, len);
 
         size_t start = 0;
@@ -1008,6 +1145,8 @@ void LlmStreamTracker::IngestChunk(const char* data, size_t len) {
             if (discardingLine_) {
                 // Tail of an oversized line that was already dropped.
                 discardingLine_ = false;
+            } else if (tier3) {
+                adapterLines.push_back(lineBuffer_.substr(start, pos - start));
             } else {
                 ProcessLine(lineBuffer_.substr(start, pos - start));
             }
@@ -1022,6 +1161,10 @@ void LlmStreamTracker::IngestChunk(const char* data, size_t len) {
             discardingLine_ = true;
         }
         usage.swap(pendingUsage_);
+    }
+
+    if (tier3) {
+        for (const auto& line : adapterLines) WriteAdapterLine(line);
     }
 
     // Recorded outside mutex_: it takes the global history lock and may do file I/O,
@@ -1050,6 +1193,17 @@ void LlmStreamTracker::ProcessLine(const std::string& line) {
         if (!m.empty()) state_.model = m;
     }
     std::vector<LlmStreamEvent> parsed;
+    if (adapter_) {
+        if (line.empty()) return;
+        if (!streamFilePathWide_.empty()) {
+            std::string writeLine = line;
+            if (writeLine.back() != '\n') writeLine += "\r\n";
+            AppendToLogFileWide(streamFilePathWide_, writeLine);
+        }
+        ++streamLineNo_;
+        IngestAdapterLine(line, streamLineNo_);
+        return;
+    }
     if (!ParseLlmStreamLines(line, agentType_, parsed)) {
         return;
     }
@@ -1062,6 +1216,7 @@ void LlmStreamTracker::ProcessLine(const std::string& line) {
         std::string writeLine = line;
         if (writeLine.empty() || writeLine.back() != '\n') writeLine += "\r\n";
         AppendToLogFileWide(streamFilePathWide_, writeLine);
+        ++streamLineNo_;
     }
 
     for (auto& ev : parsed) ApplyEvent(ev, line);
@@ -1162,6 +1317,119 @@ void LlmStreamTracker::RecordToolUseOwnerLocked(const std::string& toolUseId, co
 std::string LlmStreamTracker::ParentAgentIdLocked(const std::string& toolUseId) const {
     auto it = toolUseOwners_.find(toolUseId);
     return it == toolUseOwners_.end() ? std::string() : it->second;
+}
+
+void LlmStreamTracker::AppendNormalizedEvent(const LlmStreamEvent& ev) {
+    if (eventsFilePathWide_.empty()) return;
+    std::string parentAgentId;
+    if (!ev.agentId.empty()) {
+        const std::string& ownerToolUse = ev.parentToolUseId.empty() ? ev.toolUseId : ev.parentToolUseId;
+        parentAgentId = ParentAgentIdLocked(ownerToolUse);
+    }
+    HanchoEventSource source;
+    source.processId = processId_;
+    source.jobId = jobId_;
+    source.attempt = attempt_;
+    nlohmann::json event = BuildHanchoEventV1(ev, source, parentAgentId, streamFilePath_, streamLineNo_);
+    std::string text = event.dump(-1, ' ', false, nlohmann::json::error_handler_t::replace);
+    text += "\r\n";
+    AppendToLogFileWide(eventsFilePathWide_, text);
+}
+
+void LlmStreamTracker::AppendAdapterEvent(const LlmStreamEvent& ev, const std::string& kind,
+                                          nlohmann::json data, uint64_t rawLine) {
+    if (eventsFilePathWide_.empty() || kind.empty()) return;
+    HanchoEventSource source;
+    source.processId = processId_;
+    source.jobId = jobId_;
+    source.attempt = attempt_;
+    nlohmann::json event = BuildHanchoEventObject(source, ev.agentType, ev.model, ev.sessionId,
+                                                  ev.agentId, "", ev.seq, ev.recvEpochMs, kind,
+                                                  std::move(data), streamFilePath_, rawLine);
+    std::string text = event.dump(-1, ' ', false, nlohmann::json::error_handler_t::replace);
+    text += "\r\n";
+    AppendToLogFileWide(eventsFilePathWide_, text);
+}
+
+void LlmStreamTracker::IngestAdapterLine(const std::string& line, uint64_t rawLine) {
+    nlohmann::json data;
+    std::string kind = NormalizeHanchoAdapterLine(*adapter_, line, data);
+    nlohmann::json shaped{{"kind", kind}, {"data", data}};
+    LlmStreamEvent ev = LlmStreamEventFromHanchoV1(shaped);
+    ev.agentType = agentType_;
+    if (ev.model.empty()) ev.model = state_.model;
+    if (ev.sessionId.empty()) ev.sessionId = state_.sessionId;
+
+    if (kind == "raw") {
+        ev.seq = nextSeq_++;
+        ev.timestamp = GetCurrentTimestampStr();
+        ev.recvEpochMs = std::chrono::duration_cast<std::chrono::milliseconds>(
+            std::chrono::system_clock::now().time_since_epoch()).count();
+        state_.updatedAt = ev.timestamp;
+        AppendAdapterEvent(ev, kind, std::move(data), rawLine);
+        return;
+    }
+
+    suppressNormalizedWrite_ = true;
+    ApplyEvent(ev, line);
+    suppressNormalizedWrite_ = false;
+    AppendAdapterEvent(ev, kind, std::move(data), rawLine);
+}
+
+void LlmStreamTracker::IngestExternalEventLine(const std::string& line) {
+    std::lock_guard<std::mutex> lock(mutex_);
+    nlohmann::json parsed = nlohmann::json::parse(line, nullptr, false);
+    if (!parsed.is_object()) {
+        nlohmann::json data{{"text", line}};
+        LlmStreamEvent ev;
+        ev.type = "raw";
+        ev.agentType = agentType_;
+        ev.seq = nextSeq_++;
+        ev.timestamp = GetCurrentTimestampStr();
+        ev.recvEpochMs = std::chrono::duration_cast<std::chrono::milliseconds>(
+            std::chrono::system_clock::now().time_since_epoch()).count();
+        state_.updatedAt = ev.timestamp;
+        AppendAdapterEvent(ev, "raw", std::move(data), streamLineNo_);
+        return;
+    }
+
+    std::string kind = parsed.value("kind", std::string());
+    if (!IsHanchoEventKind(kind)) {
+        nlohmann::json data{{"text", line}};
+        LlmStreamEvent ev;
+        ev.type = "raw";
+        ev.agentType = agentType_;
+        ev.seq = nextSeq_++;
+        ev.timestamp = GetCurrentTimestampStr();
+        ev.recvEpochMs = std::chrono::duration_cast<std::chrono::milliseconds>(
+            std::chrono::system_clock::now().time_since_epoch()).count();
+        state_.updatedAt = ev.timestamp;
+        AppendAdapterEvent(ev, "raw", std::move(data), streamLineNo_);
+        return;
+    }
+
+    nlohmann::json data = parsed.contains("data") && parsed["data"].is_object()
+                              ? parsed["data"]
+                              : nlohmann::json::object();
+    LlmStreamEvent ev = LlmStreamEventFromHanchoV1(parsed);
+    ev.agentType = agentType_;
+    if (ev.model.empty()) ev.model = state_.model;
+    if (ev.sessionId.empty()) ev.sessionId = state_.sessionId;
+
+    if (kind == "raw") {
+        ev.seq = nextSeq_++;
+        ev.timestamp = GetCurrentTimestampStr();
+        ev.recvEpochMs = std::chrono::duration_cast<std::chrono::milliseconds>(
+            std::chrono::system_clock::now().time_since_epoch()).count();
+        state_.updatedAt = ev.timestamp;
+        AppendAdapterEvent(ev, kind, std::move(data), streamLineNo_);
+        return;
+    }
+
+    suppressNormalizedWrite_ = true;
+    ApplyEvent(ev, line);
+    suppressNormalizedWrite_ = false;
+    AppendAdapterEvent(ev, kind, std::move(data), streamLineNo_);
 }
 
 void LlmStreamTracker::ApplyEvent(LlmStreamEvent& ev, const std::string& line) {
@@ -1428,6 +1696,7 @@ void LlmStreamTracker::ApplyEvent(LlmStreamEvent& ev, const std::string& line) {
     }
 
     if (ev.transient) return;  // a usage chunk: counted above, not stored
+    if (!suppressNormalizedWrite_) AppendNormalizedEvent(ev);
     try {
         events_.push_back(ev);
     } catch (const std::bad_alloc&) {

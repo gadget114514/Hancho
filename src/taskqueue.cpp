@@ -2753,6 +2753,14 @@ bool TaskQueueManager::BuildLaunchRequest(TaskQueue& tq, TaskQueueJob& job, int 
         req.jsonStream = true;
     }
     req.env = job.env;
+    auto adapterIt = req.env.find("HANCHO_ADAPTER");
+    if (adapterIt != req.env.end()) {
+        if (!adapterIt->second.empty()) {
+            req.agentType = adapterIt->second;
+            req.jsonStream = true;
+        }
+        req.env.erase(adapterIt);
+    }
     req.killExclude = job.killExclude;
     if (job.idle.outputSec > 0 && job.idle.cpuSec > 0) {
         req.idleTimeoutSec = job.idle.outputSec;

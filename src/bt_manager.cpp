@@ -263,15 +263,17 @@ std::string BtManager::StartWorker(const BtWorkerSpec& spec) {
 
     std::string cmd;
     std::string streamType;
+    std::string adapterName;
     std::string err;
     int effTimeout = spec.timeoutSec > 0 ? spec.timeoutSec : 1800;
-    if (!engines_.BuildCommand(spec.engine, spec.model, launchPrompt, effTimeout, cmd, streamType, err)) {
+    if (!engines_.BuildCommand(spec.engine, spec.model, launchPrompt, effTimeout, cmd, streamType, err, &adapterName)) {
         WriteAuditLog("BT_WORKER_ERR", "BuildCommand for '" + jobId + "' failed: " + err);
         return "";
     }
 
     std::map<std::string, std::string> env = spec.env;
     env["PC_BT_RESULT_FILE"] = resultPathUtf8;
+    if (!adapterName.empty()) env["HANCHO_ADAPTER"] = adapterName;
 
     nlohmann::json jobJson = BuildAddBtJobJson(
         jobId,

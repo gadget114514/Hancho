@@ -270,6 +270,8 @@ bool WorkerEngineRegistry::LoadFromJson(const std::string& jsonText, std::string
                 if (!obj.contains("defaultModel")) def.defaultModel.clear();
                 if (!obj.contains("permissionArgs")) def.permissionArgs.clear();
                 if (!obj.contains("models")) def.models.clear();
+                if (!obj.contains("adapter")) def.adapter.clear();
+                if (!obj.contains("capabilities")) def.capabilities = WorkerEngineCapabilities{};
             } else if (!isExisting) {
                 err = "engine '" + name + "' is missing required 'command'";
                 return false;
@@ -308,6 +310,45 @@ bool WorkerEngineRegistry::LoadFromJson(const std::string& jsonText, std::string
                         return false;
                     }
                     def.models.push_back(m.get<std::string>());
+                }
+            }
+            if (obj.contains("adapter")) {
+                if (!obj["adapter"].is_string()) {
+                    err = "engine '" + name + "': 'adapter' must be a string";
+                    return false;
+                }
+                def.adapter = obj["adapter"].get<std::string>();
+            }
+            if (obj.contains("capabilities")) {
+                const json& caps = obj["capabilities"];
+                if (!caps.is_object()) {
+                    err = "engine '" + name + "': 'capabilities' must be an object";
+                    return false;
+                }
+                for (const char* key : {"jsonStream", "resume", "reportsUsage", "reportsSubagents"}) {
+                    if (!caps.contains(key)) continue;
+                    if (!caps[key].is_boolean()) {
+                        err = "engine '" + name + "': 'capabilities." + std::string(key) + "' must be a boolean";
+                        return false;
+                    }
+                }
+                if (caps.contains("jsonStream")) def.capabilities.jsonStream = caps["jsonStream"].get<bool>();
+                if (caps.contains("resume")) def.capabilities.resume = caps["resume"].get<bool>();
+                if (caps.contains("reportsUsage")) def.capabilities.reportsUsage = caps["reportsUsage"].get<bool>();
+                if (caps.contains("reportsSubagents")) def.capabilities.reportsSubagents = caps["reportsSubagents"].get<bool>();
+                if (caps.contains("permissionModes")) {
+                    if (!caps["permissionModes"].is_array()) {
+                        err = "engine '" + name + "': 'capabilities.permissionModes' must be an array of strings";
+                        return false;
+                    }
+                    def.capabilities.permissionModes.clear();
+                    for (const auto& mode : caps["permissionModes"]) {
+                        if (!mode.is_string()) {
+                            err = "engine '" + name + "': 'capabilities.permissionModes' entries must be strings";
+                            return false;
+                        }
+                        def.capabilities.permissionModes.push_back(mode.get<std::string>());
+                    }
                 }
             }
 
@@ -379,13 +420,16 @@ bool WorkerEngineRegistry::BuildCommand(const std::string& engine,
                                         int timeoutSec,
                                         std::string& outCommand,
                                         std::string& outStreamType,
-                                        std::string& err) const {
+                                        std::string& err,
+                                        std::string* outAdapter) const {
     outCommand.clear();
     outStreamType.clear();
+    if (outAdapter) outAdapter->clear();
     if (!Knows(engine, model, err)) return false;
 
     std::string engName = engine.empty() ? defaultEngine_ : engine;
     const WorkerEngineDef& def = engines_.at(engName);
+    if (outAdapter) *outAdapter = def.adapter;
 
     std::string resolvedModel = !model.empty() ? model : def.defaultModel;
     std::string cmd = def.command;

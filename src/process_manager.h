@@ -186,6 +186,11 @@ private:
         HANDLE hJob = nullptr;
         HANDLE hStdinWrite = nullptr;
         HANDLE hStdoutRead = nullptr;
+        HANDLE hEventPipe = nullptr;   // HANCHO_EVENT_PIPE server, one per process
+        std::wstring eventPipeName;
+        std::atomic<bool> eventPipeStop{false};
+        bool eventPipeConnected = false;
+        std::atomic<LlmStreamTracker*> eventTracker{nullptr};
 
         // Pseudo-PTY Terminal (src/Terminal + include)
         TerminalView* terminalView = nullptr;
@@ -230,6 +235,7 @@ private:
         uint64_t outputVersion = 0;
 
         std::thread readerThread;
+        std::thread eventPipeThread;
 
         // LLM JSON output streaming tracker
         std::unique_ptr<LlmStreamTracker> streamTracker;
@@ -242,6 +248,7 @@ private:
     };
 
     void ReaderThreadFunc(std::shared_ptr<ManagedProcess> proc);
+    static void EventPipeThreadFunc(std::shared_ptr<ManagedProcess> proc);
     void MonitorThreadFunc();
     void UpdateJobMetrics(ManagedProcess& proc);
     void TerminateJobInternal(ManagedProcess& proc, ProcState finalState, const std::string& reasonMsg);

@@ -1,14 +1,18 @@
 #pragma once
 
 #include "common.h"
+#include "nlohmann/json.hpp"
 #include <string>
 #include <vector>
 #include <deque>
+#include <memory>
 #include <mutex>
 #include <unordered_map>
 #include <cstdint>
 
 namespace pc {
+
+struct HanchoAdapter;
 
 // Structured representation of a single streamed JSON event from Claude, agy, or OpenCode.
 struct LlmStreamEvent {
@@ -181,14 +185,19 @@ uint64_t GetLlmUsageRecordCalls();
 // persists them to logs/proc_<id>_<name>_stream.jsonl, and maintains the current state.
 class LlmStreamTracker {
 public:
-    LlmStreamTracker() = default;
+    LlmStreamTracker();
+    ~LlmStreamTracker();
 
     void Init(int processId, const std::string& agentType, const std::string& streamFilePath,
               const std::string& supervisorNotes = "", const std::string& supervisorGoal = "",
-              const std::string& defaultModel = "");
+              const std::string& defaultModel = "", const std::string& jobId = "", int attempt = 0);
 
     // Ingests raw chunks from process stdout (pipe or ConPTY)
     void IngestChunk(const char* data, size_t len);
+
+    // Ingests one already-normalized hancho.event/1 line (HANCHO_EVENT_PIPE). Missing outer fields
+    // are filled in and the event is appended to <log>.events.jsonl.
+    void IngestExternalEventLine(const std::string& line);
 
     // Update supervisor context
     void UpdateSupervisorInfo(const std::string& notes, const std::string& goal);
@@ -215,6 +224,14 @@ private:
     };
 
     void ProcessLine(const std::string& line);
+    void AppendNormalizedEvent(const LlmStreamEvent& ev);
+    void AppendAdapterEvent(const LlmStreamEvent& ev, const std::string& kind, nlohmann::json data,
+                            uint64_t rawLine);
+    void IngestAdapterLine(const std::string& line, uint64_t rawLine);
+    void WriteAdapterLine(const std::string& line);
+    struct AdapterProcess;
+    bool StartAdapterProcess();
+    void StopAdapterProcess();
     void ApplyEvent(LlmStreamEvent& ev, const std::string& line);
     void ApplyPartialEvent(LlmStreamEvent& ev);
     void ApplyActivity(const LlmStreamEvent& ev);
@@ -231,11 +248,18 @@ private:
     mutable std::mutex mutex_;
     int processId_ = 0;
     std::string agentType_;
+    std::string jobId_;
+    int attempt_ = 0;
     std::string conversationId_;
     uint64_t lastAgyModelProbeMs_ = 0;
     std::vector<LlmUsagePoint> pendingUsage_;  // recorded by IngestChunk after releasing mutex_
     std::string streamFilePath_;
     std::wstring streamFilePathWide_;
+    std::wstring eventsFilePathWide_;
+    uint64_t streamLineNo_ = 0;
+    std::shared_ptr<HanchoAdapter> adapter_;
+    std::unique_ptr<AdapterProcess> adapterProcess_;
+    bool suppressNormalizedWrite_ = false;
     std::string lineBuffer_;
     bool discardingLine_ = false;
     std::deque<LlmStreamEvent> events_;

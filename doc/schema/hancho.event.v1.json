@@ -1,0 +1,362 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://hancho.dev/schema/hancho.event.v1.json",
+  "title": "hancho.event/1",
+  "description": "One normalized Hancho event, one JSON object per line in logs/proc_<id>_<name>_events.jsonl. Compatibility rules: adding a field is a minor change within the same version and consumers ignore fields they do not know; changing the meaning of a field or removing it requires hancho.event/2, which is emitted alongside v1 for at least one release; a consumer that receives an unknown kind treats it as raw.",
+  "type": "object",
+  "required": ["schema", "seq", "ts", "source", "agent", "kind", "data", "raw"],
+  "properties": {
+    "schema": {
+      "const": "hancho.event/1"
+    },
+    "seq": {
+      "type": "integer",
+      "minimum": 0,
+      "description": "Monotonic sequence number within one stream."
+    },
+    "ts": {
+      "type": "string",
+      "format": "date-time",
+      "description": "When Hancho received the event, ISO 8601 UTC."
+    },
+    "source": {
+      "type": "object",
+      "required": ["processId"],
+      "properties": {
+        "processId": {
+          "type": "integer"
+        },
+        "jobId": {
+          "type": "string"
+        },
+        "attempt": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "btId": {
+          "type": "string"
+        },
+        "node": {
+          "type": "string"
+        }
+      },
+      "additionalProperties": true
+    },
+    "agent": {
+      "type": "object",
+      "required": ["type"],
+      "properties": {
+        "type": {
+          "type": "string",
+          "description": "Agent adapter type, e.g. claude, agy, opencode, codex, generic."
+        },
+        "model": {
+          "type": "string"
+        },
+        "sessionId": {
+          "type": "string"
+        },
+        "agentId": {
+          "type": "string",
+          "description": "Sub-agent id; empty for the root agent."
+        },
+        "parentAgentId": {
+          "type": "string",
+          "description": "Agent that started this sub-agent; empty for the root agent."
+        }
+      },
+      "additionalProperties": true
+    },
+    "kind": {
+      "enum": [
+        "run.started",
+        "turn.started",
+        "tool.call",
+        "tool.result",
+        "thought",
+        "message",
+        "plan",
+        "usage",
+        "rate_limit",
+        "subagent.started",
+        "subagent.ended",
+        "run.ended",
+        "error",
+        "raw"
+      ]
+    },
+    "data": {
+      "type": "object",
+      "description": "Fields depend on kind; see the allOf rules below."
+    },
+    "raw": {
+      "type": "object",
+      "required": ["file"],
+      "description": "Where the event came from in the raw stream.",
+      "properties": {
+        "file": {
+          "type": "string",
+          "description": "The .stream.jsonl file name."
+        },
+        "line": {
+          "type": "integer",
+          "minimum": 1,
+          "description": "Physical line in that file, when known."
+        }
+      },
+      "additionalProperties": true
+    }
+  },
+  "allOf": [
+    {
+      "if": { "properties": { "kind": { "const": "run.started" } }, "required": ["kind"] },
+      "then": {
+        "properties": {
+          "data": {
+            "type": "object",
+            "properties": {
+              "cwd": { "type": "string" },
+              "toolsOffered": { "type": "integer", "minimum": 0 },
+              "permissionMode": { "type": "string" }
+            }
+          }
+        }
+      }
+    },
+    {
+      "if": { "properties": { "kind": { "const": "turn.started" } }, "required": ["kind"] },
+      "then": {
+        "properties": {
+          "data": {
+            "type": "object",
+            "properties": {
+              "messageId": { "type": "string" }
+            }
+          }
+        }
+      }
+    },
+    {
+      "if": { "properties": { "kind": { "const": "tool.call" } }, "required": ["kind"] },
+      "then": {
+        "properties": {
+          "data": {
+            "type": "object",
+            "required": ["tool", "activity"],
+            "properties": {
+              "tool": { "type": "string" },
+              "activity": {
+                "enum": ["read", "edit", "search", "command", "web", "subagent", "plan", "tool"]
+              },
+              "toolUseId": { "type": "string" },
+              "target": { "type": "string" },
+              "input": {},
+              "note": { "type": "string" }
+            }
+          }
+        }
+      }
+    },
+    {
+      "if": { "properties": { "kind": { "const": "tool.result" } }, "required": ["kind"] },
+      "then": {
+        "properties": {
+          "data": {
+            "type": "object",
+            "required": ["ok"],
+            "properties": {
+              "ok": { "type": "boolean" },
+              "toolUseId": { "type": "string" },
+              "error": { "type": "string" },
+              "summary": { "type": "string" }
+            }
+          }
+        }
+      }
+    },
+    {
+      "if": { "properties": { "kind": { "const": "thought" } }, "required": ["kind"] },
+      "then": {
+        "properties": {
+          "data": {
+            "type": "object",
+            "required": ["text"],
+            "properties": {
+              "text": { "type": "string" },
+              "truncated": { "type": "boolean" }
+            }
+          }
+        }
+      }
+    },
+    {
+      "if": { "properties": { "kind": { "const": "message" } }, "required": ["kind"] },
+      "then": {
+        "properties": {
+          "data": {
+            "type": "object",
+            "required": ["text"],
+            "properties": {
+              "text": { "type": "string" },
+              "truncated": { "type": "boolean" }
+            }
+          }
+        }
+      }
+    },
+    {
+      "if": { "properties": { "kind": { "const": "plan" } }, "required": ["kind"] },
+      "then": {
+        "properties": {
+          "data": {
+            "type": "object",
+            "required": ["items"],
+            "properties": {
+              "items": {
+                "type": "array",
+                "items": {
+                  "type": "object",
+                  "required": ["content", "status"],
+                  "properties": {
+                    "content": { "type": "string" },
+                    "status": { "type": "string" }
+                  },
+                  "additionalProperties": true
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    {
+      "if": { "properties": { "kind": { "const": "usage" } }, "required": ["kind"] },
+      "then": {
+        "properties": {
+          "data": {
+            "type": "object",
+            "anyOf": [
+              { "required": ["inputTokens"] },
+              { "required": ["outputTokens"] },
+              { "required": ["thinkingTokens"] },
+              { "required": ["cacheReadTokens"] },
+              { "required": ["cacheWriteTokens"] },
+              { "required": ["totalTokens"] }
+            ],
+            "properties": {
+              "inputTokens": { "type": "integer", "minimum": 0 },
+              "outputTokens": { "type": "integer", "minimum": 0 },
+              "thinkingTokens": { "type": "integer", "minimum": 0 },
+              "cacheReadTokens": { "type": "integer", "minimum": 0 },
+              "cacheWriteTokens": { "type": "integer", "minimum": 0 },
+              "totalTokens": { "type": "integer", "minimum": 0 },
+              "costUsd": { "type": "number", "minimum": 0 },
+              "cumulative": { "type": "boolean" }
+            }
+          }
+        }
+      }
+    },
+    {
+      "if": { "properties": { "kind": { "const": "rate_limit" } }, "required": ["kind"] },
+      "then": {
+        "properties": {
+          "data": {
+            "type": "object",
+            "required": ["status"],
+            "properties": {
+              "status": { "type": "string" },
+              "window": { "type": "string" },
+              "utilization": { "type": "number", "minimum": 0 },
+              "resetsAt": { "type": ["integer", "string"] }
+            }
+          }
+        }
+      }
+    },
+    {
+      "if": { "properties": { "kind": { "const": "subagent.started" } }, "required": ["kind"] },
+      "then": {
+        "properties": {
+          "data": {
+            "type": "object",
+            "required": ["agentId"],
+            "properties": {
+              "agentId": { "type": "string" },
+              "type": { "type": "string" },
+              "description": { "type": "string" },
+              "toolUseId": { "type": "string" }
+            }
+          }
+        }
+      }
+    },
+    {
+      "if": { "properties": { "kind": { "const": "subagent.ended" } }, "required": ["kind"] },
+      "then": {
+        "properties": {
+          "data": {
+            "type": "object",
+            "required": ["agentId", "status"],
+            "properties": {
+              "agentId": { "type": "string" },
+              "status": { "type": "string" },
+              "tokens": { "type": "integer", "minimum": 0 },
+              "toolUses": { "type": "integer", "minimum": 0 },
+              "durationMs": { "type": "integer", "minimum": 0 }
+            }
+          }
+        }
+      }
+    },
+    {
+      "if": { "properties": { "kind": { "const": "run.ended" } }, "required": ["kind"] },
+      "then": {
+        "properties": {
+          "data": {
+            "type": "object",
+            "required": ["status"],
+            "properties": {
+              "status": { "enum": ["completed", "error", "cancelled"] },
+              "stopReason": { "type": "string" },
+              "numTurns": { "type": "integer", "minimum": 0 },
+              "durationMs": { "type": "integer", "minimum": 0 },
+              "permissionDenials": { "type": "integer", "minimum": 0 }
+            }
+          }
+        }
+      }
+    },
+    {
+      "if": { "properties": { "kind": { "const": "error" } }, "required": ["kind"] },
+      "then": {
+        "properties": {
+          "data": {
+            "type": "object",
+            "required": ["message"],
+            "properties": {
+              "message": { "type": "string" },
+              "code": { "type": "string" },
+              "retryable": { "type": "boolean" }
+            }
+          }
+        }
+      }
+    },
+    {
+      "if": { "properties": { "kind": { "const": "raw" } }, "required": ["kind"] },
+      "then": {
+        "properties": {
+          "data": {
+            "type": "object",
+            "required": ["text"],
+            "properties": {
+              "text": { "type": "string" }
+            }
+          }
+        }
+      }
+    }
+  ],
+  "additionalProperties": true
+}

@@ -1,0 +1,6 @@
+{"kind":"tool.call","data":{"tool":"read_file","target":"src/a.cpp","toolUseId":"t1","activity":"read"}}
+{"kind":"tool.result","data":{"toolUseId":"t1","ok":true}}
+{"kind":"tool.result","data":{"toolUseId":"t2","ok":false,"error":"boom"}}
+{"kind":"usage","data":{"inputTokens":100,"outputTokens":20}}
+{"kind":"run.ended","data":{"status":"completed"}}
+{"kind":"raw","data":{"text":"{\"type\":\"mystery\",\"x\":1}"}}

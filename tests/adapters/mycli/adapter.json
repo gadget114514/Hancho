@@ -1,0 +1,31 @@
+{
+  "adapter": "mycli",
+  "match": { "field": "/type" },
+  "rules": [
+    {
+      "when": { "/type": "tool_start" },
+      "kind": "tool.call",
+      "map": { "tool": "/name", "target": "/args/path", "toolUseId": "/id" },
+      "activity": {
+        "from": "/name",
+        "table": { "read_file": "read", "write_file": "edit", "shell": "command" },
+        "default": "tool"
+      }
+    },
+    {
+      "when": { "/type": "tool_end" },
+      "kind": "tool.result",
+      "map": { "toolUseId": "/id", "ok": "!/error", "error": "/error" }
+    },
+    {
+      "when": { "/type": "usage" },
+      "kind": "usage",
+      "map": { "inputTokens": "/in", "outputTokens": "/out" }
+    },
+    {
+      "when": { "/type": "done" },
+      "kind": "run.ended",
+      "map": { "status": "/status" }
+    }
+  ]
+}
