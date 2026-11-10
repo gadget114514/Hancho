@@ -145,15 +145,15 @@ void BehaviorTree::Tick(int64_t nowMs) {
     }
 }
 
-void BehaviorTree::Start(int64_t nowMs) {
+void BehaviorTree::Start(int64_t nowMs, bool paused) {
     if (!impl_ || !impl_->root) return;
     startMs_ = nowMs > 0 ? nowMs : 1000;
     if (createdAt_.empty()) createdAt_ = FormatEpochMsIso(startMs_);
     updatedAt_ = FormatEpochMsIso(startMs_);
-    state_ = "running";
+    state_ = paused ? "paused" : "running";
     detail_.clear();
     EmitEvent(nowMs, "btStarted", id_, state_, "", nodeRuns_);
-    Tick(nowMs);
+    if (!paused) Tick(nowMs);
 }
 
 void BehaviorTree::OnJobFinished(const std::string& jobId,

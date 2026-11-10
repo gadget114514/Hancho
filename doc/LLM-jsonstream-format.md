@@ -84,8 +84,57 @@ The parser is permissive and looks for common fields across agents:
 ## Outputs
 
 - **Per-process stream file**: `<logfile>.stream.jsonl` (written by `LlmStreamTracker` as raw JSON lines are ingested).
+- **Normalized event file**: `<logfile>.events.jsonl` (one `hancho.event/1` object per line).
 - **GUI**: Stream dialog shows events list and preview; agent icon shows tooltip with model when known.
 - **IPC/MCP**: `GetAgentStream`/IPC and MCP endpoints can expose events/state (see `ipc_server.cpp`, `mcp_server.cpp`).
+
+## Legacy `type` strings and migration to `hancho.event/1`
+
+**Decision: `hancho.event/1` is the default schema for both entry points.**
+
+- `hancho-cli worker stream <id>` returns `hancho.event/1` from `<log>.events.jsonl` unless `--schema legacy` is passed.
+- MCP `get_worker_stream` returns `hancho.event/1` unless `schema: "legacy"` is passed.
+
+The legacy shape is the one built from the internal `LlmStreamEvent.type` strings. It is **deprecated as of v0.9.3** and stays available for at least one more release:
+
+| Version | `--schema legacy` / `schema: "legacy"` |
+|---|---|
+| v0.9.3 – v0.10.x | available; returns the old `type` strings |
+| v0.11.0 and later | removed; only `hancho.event/1` is returned |
+
+The raw `.stream.jsonl` file is still written after the legacy view is removed, so no captured data is lost.
+
+### Migration steps
+
+1. Drop `--schema legacy` from CLI calls and `schema: "legacy"` from MCP calls. The v1 shape is the default.
+2. Read `kind` instead of `type`, and read the event payload from `data` instead of the old top-level fields.
+3. Change `--type` / MCP `type` filters from legacy type names to v1 kind names. With v1 the filter matches `kind` (for example `tool.call`, not `tool_call`).
+4. Treat an unknown `kind` as `raw`; new kinds may be added within the same schema version.
+5. Keep using `.stream.jsonl` when the original CLI lines are needed; v1 events point back to them through `raw.file` and `raw.line`.
+6. `hancho-cli worker stream --summary` still uses the legacy shape through v0.10.x; pass `--schema legacy` with it, or read the v1 events directly.
+
+Logs written before v0.9.2 have no `.events.jsonl`; use `--schema legacy` to read them from `.stream.jsonl` until v0.11.0.
+
+### `type` to `kind` mapping
+
+| Legacy `type` | v1 `kind` | Main `data` fields |
+|---|---|---|
+| `tool_call` | `tool.call` (or `plan` for `TodoWrite` / plan activity) | `tool`, `toolUseId`, `activity`, `target`, `input` |
+| `tool_result` | `tool.result` | `ok`, `toolUseId`, `error`, `summary` |
+| `thinking` | `thought` | `text`, `truncated` |
+| `message` | `message` | `text`, `truncated` |
+| `usage` | `usage` | `inputTokens`, `outputTokens`, `thinkingTokens`, `cacheReadTokens`, `cacheWriteTokens`, `totalTokens`, `costUsd` |
+| `rate_limit` | `rate_limit` | `status`, `window`, `utilization`, `resetsAt` |
+| `subagent_start` | `subagent.started` | `agentId`, `type`, `description`, `toolUseId` |
+| `subagent_end` | `subagent.ended` | `agentId`, `status`, `tokens`, `toolUses`, `durationMs` |
+| `result` | `run.ended` | `status`, `stopReason`, `numTurns`, `durationMs`, `permissionDenials` |
+| `status` with `content: "init"` | `run.started` | `cwd`, `toolsOffered`, `permissionMode` |
+| `status` (other) / `step` start | `turn.started` | `messageId` |
+| `step` with tokens or cost | `usage` | token counts, `costUsd` |
+| `error` | `error` | `message`, `code`, `retryable` |
+| anything else (for example `user_input`) | `raw` | `text` |
+
+Outer fields also move: `seq` stays `seq`; `timestamp` becomes `ts`; `agentType`, `model`, `sessionId`, `agentId` and `parentAgentId` move under `agent`; process/job/attempt/BT details move under `source`; the source line moves under `raw`.
 
 ## Notes
 

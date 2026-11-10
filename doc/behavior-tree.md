@@ -101,7 +101,7 @@ Every node is a JSON object with a required `"type"` string and an optional `"id
 
 | `type` | Required Fields | Optional Fields & Behavior |
 |---|---|---|
-| `job` | `"command"`, `"summary"`, `"timeoutSec"` (`> 0`) | Optional: `"cwd"`, `"env"` (object), `"idle"` (`{outputSec, cpuSec}`), `"success"` (`{exitCode, filesNewer, outputRegex}`), `"resources"` (`{write:[...], read:[...]}`), `"instructionsText"`, `"instructionsFile"`, `"maxAttempts"` (default `1`), `"capture"`. Launches a task-queue job with ID `<btId>-<seq>`. Note: `ChainGuard` is enforced when the job launches (shell chains `&&`, `||`, `;` are rejected with `launchFailed`). |
+| `job` | `"command"`, `"summary"`, `"timeoutSec"` (`> 0`) | Optional: `"estimateSec"` (expected duration for the ETA display; the timeout is still enforced), `"cwd"`, `"env"` (object), `"idle"` (`{outputSec, cpuSec}`), `"success"` (`{exitCode, filesNewer, outputRegex}`), `"resources"` (`{write:[...], read:[...]}`), `"instructionsText"`, `"instructionsFile"`, `"maxAttempts"` (default `1`), `"capture"`. Launches a task-queue job with ID `<btId>-<seq>`. Note: `ChainGuard` is enforced when the job launches (shell chains `&&`, `||`, `;` are rejected with `launchFailed`). |
 | `worker` | `"summary"`, `"timeoutSec"` (`> 0`), and either `"prompt"` or `"promptFile"` | Optional: `"engine"`, `"model"`, `"outputSchema"` (JSON Schema object or string), `"cwd"`, `"env"`, `"idle"`, `"success"`, `"resources"`, `"maxAttempts"`, `"capture"`. Runs an LLM CLI worker via the engine registry. |
 | `wait` | `"sec"` (`>= 0`) | Pauses this branch for `"sec"` seconds, then succeeds. |
 | `set` | `"var"` (or `"name"`), `"value"` | Expands `${...}` in `"value"`, sets `vars[var]`, emits a `varSet` event, and succeeds immediately. |

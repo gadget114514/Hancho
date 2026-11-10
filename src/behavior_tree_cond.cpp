@@ -1,7 +1,9 @@
 #include "behavior_tree_internal.h"
 #include "common.h"
 
+#ifdef _WIN32
 #include <windows.h>
+#endif
 #include <cmath>
 #include <cstdlib>
 #include <regex>
@@ -12,16 +14,7 @@ namespace pc {
 namespace {
 
 bool ReadFileMtime(const std::wstring& pathW, uint64_t& outFiletime) {
-    HANDLE h = CreateFileW(pathW.c_str(), GENERIC_READ,
-                           FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
-                           nullptr, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, nullptr);
-    if (h == INVALID_HANDLE_VALUE) return false;
-    FILETIME ft = {};
-    BOOL ok = GetFileTime(h, nullptr, nullptr, &ft);
-    CloseHandle(h);
-    if (!ok) return false;
-    outFiletime = (static_cast<uint64_t>(ft.dwHighDateTime) << 32) | ft.dwLowDateTime;
-    return true;
+    return GetFileMtimeWide(pathW, outFiletime);
 }
 
 bool TryParseDouble(const json& v, double& out) {
@@ -57,6 +50,74 @@ bool ValuesEqual(const json& a, const json& b) {
         return std::fabs(da - db) < 1e-9;
     }
     return JsonNormalizedString(a) == JsonNormalizedString(b);
+}
+
+bool LooksLikeJsonlPath(const std::string& path) {
+    static const std::string ext = ".jsonl";
+    return path.size() >= ext.size() &&
+           path.compare(path.size() - ext.size(), ext.size(), ext) == 0;
+}
+
+// Selects a value from the last valid object of a JSONL file (for example a hancho.event/1
+// .events.jsonl). Bare "kind", "activity" and "failure" (and "failure.<field>") resolve against
+// that last event so conditions can name the v1 fields directly; "last.<path>" is explicit.
+bool NavigateLastJsonlValue(const std::string& text, const std::string& rawPath, json& outVal) {
+    json last;
+    json lastFailure;
+    bool found = false;
+    bool foundFailure = false;
+    std::istringstream iss(text);
+    std::string line;
+    while (std::getline(iss, line)) {
+        if (!line.empty() && line.back() == '\r') line.pop_back();
+        if (line.empty()) continue;
+        json parsed = json::parse(line, nullptr, false);
+        if (!parsed.is_discarded() && parsed.is_object()) {
+            if (parsed.contains("failure") && parsed["failure"].is_object()) {
+                lastFailure = parsed["failure"];
+                foundFailure = true;
+            } else if (parsed.contains("data") && parsed["data"].is_object() &&
+                       parsed["data"].contains("failure") &&
+                       parsed["data"]["failure"].is_object()) {
+                lastFailure = parsed["data"]["failure"];
+                foundFailure = true;
+            }
+            last = std::move(parsed);
+            found = true;
+        }
+    }
+    if (!found) return false;
+
+    std::string path = rawPath;
+    if (path.rfind("$.", 0) == 0) path = path.substr(2);
+    else if (path.rfind("$", 0) == 0) path = path.substr(1);
+    if (path.empty() || path == "last") {
+        outVal = last;
+        return true;
+    }
+    const bool explicitLast = path.rfind("last.", 0) == 0;
+    if (explicitLast) path = path.substr(5);
+
+    if (path == "activity") return NavigateJsonPath(last, "data.activity", outVal);
+    if (path == "failure" || path.rfind("failure.", 0) == 0) {
+        json failure;
+        // Prefer the newest failure in the file over the newest line: a failed job often
+        // writes jobQueued/retry events after its jobFailed record. An explicit "last."
+        // path keeps the strict last-line meaning.
+        if (foundFailure && !explicitLast) {
+            failure = lastFailure;
+        } else if (!NavigateJsonPath(last, "failure", failure) &&
+                   !NavigateJsonPath(last, "data.failure", failure)) {
+            return false;
+        }
+        const std::string rest = path == "failure" ? std::string() : path.substr(8);
+        if (rest.empty()) {
+            outVal = failure;
+            return true;
+        }
+        return NavigateJsonPath(failure, rest, outVal);
+    }
+    return NavigateJsonPath(last, path, outVal);
 }
 
 bool RegexMatchesLines(const std::string& text, const std::string& pattern) {
@@ -165,19 +226,7 @@ bool BehaviorTree::Impl::EvaluateCondition(BehaviorTree& bt, BtNode& node, int64
             return finishCond(false, "undefinedVar: " + undefVar);
         }
         std::wstring fullW = ResolveBtPathWide(bt.cwd_, relPath);
-        WIN32_FIND_DATAW fd = {};
-        HANDLE h = FindFirstFileW(fullW.c_str(), &fd);
-        bool found = false;
-        if (h != INVALID_HANDLE_VALUE) {
-            do {
-                std::wstring name = fd.cFileName;
-                if (name != L"." && name != L"..") {
-                    found = true;
-                    break;
-                }
-            } while (FindNextFileW(h, &fd));
-            FindClose(h);
-        }
+        bool found = PathExistsWide(fullW);
         return finishCond(found);
     }
 
@@ -248,12 +297,17 @@ bool BehaviorTree::Impl::EvaluateCondition(BehaviorTree& bt, BtNode& node, int64
         if (content.empty()) {
             return finishCond(false, "cannot read file: " + relFile);
         }
-        json doc = json::parse(content, nullptr, false);
-        if (doc.is_discarded()) {
-            return finishCond(false, "invalid JSON in " + relFile);
-        }
         json subVal;
-        bool exists = NavigateJsonPath(doc, jPath, subVal);
+        bool exists = false;
+        if (LooksLikeJsonlPath(relFile)) {
+            exists = NavigateLastJsonlValue(content, jPath, subVal);
+        } else {
+            json doc = json::parse(content, nullptr, false);
+            if (doc.is_discarded()) {
+                return finishCond(false, "invalid JSON in " + relFile);
+            }
+            exists = NavigateJsonPath(doc, jPath, subVal);
+        }
         bool ok = CompareJsonValue(bt, node, exists, subVal, undefVar);
         if (!undefVar.empty()) return finishCond(false, "undefinedVar: " + undefVar);
         return finishCond(ok);

@@ -226,6 +226,85 @@ void RunPart2IntegrationTests(const std::wstring& tempDirW, const std::string& t
               recMissing.value("detail", "") == "jobMissing",
               "startup recovery marked missing job bt-recover-missing-1 as failed with jobMissing");
     }
+
+    // 12. BT conditions read normalized hancho.event/1 fields from a .events.jsonl file.
+    {
+        TestHarness h;
+        std::string eventsContent =
+            R"({"schema":"hancho.event/1","seq":1,"kind":"message","data":{"text":"start"}})" "\r\n"
+            R"({"schema":"hancho.event/1","seq":2,"kind":"tool.call","data":{"tool":"Edit","activity":"edit","target":"src/a.cpp"},"failure":{"class":"success_check_failed"}})" "\r\n";
+        WriteFileAtomicWide(tempDirW + L"\\v1_conditions.events.jsonl", eventsContent);
+
+        json btDef = {
+            {"id", "bt-v1-conditions"},
+            {"cwd", tempDirUtf8},
+            {"root", {
+                {"type", "sequence"},
+                {"children", json::array({
+                    {{"type", "jsonValue"}, {"id", "cond_kind"}, {"file", "v1_conditions.events.jsonl"},
+                     {"path", "kind"}, {"eq", "tool.call"}},
+                    {{"type", "jsonValue"}, {"id", "cond_activity"}, {"file", "v1_conditions.events.jsonl"},
+                     {"path", "activity"}, {"eq", "edit"}},
+                    {{"type", "jsonValue"}, {"id", "cond_failure"}, {"file", "v1_conditions.events.jsonl"},
+                     {"path", "failure.class"}, {"eq", "success_check_failed"}},
+                    {{"type", "jsonValue"}, {"id", "cond_last"}, {"file", "v1_conditions.events.jsonl"},
+                     {"path", "last.data.target"}, {"eq", "src/a.cpp"}}
+                })}
+            }}
+        };
+        h.btm->Start(btDef.dump());
+        json waitResp = json::parse(h.btm->Wait("bt-v1-conditions", 0, 15000), nullptr, false);
+        Check(waitResp.value("state", "") == "succeeded",
+              "BT conditions read v1 kind/activity/failure from .events.jsonl (got " +
+                  waitResp.value("state", "") + ")");
+
+        json btMiss = {
+            {"id", "bt-v1-conditions-miss"},
+            {"cwd", tempDirUtf8},
+            {"root", {
+                {"type", "jsonValue"},
+                {"id", "cond_kind_miss"},
+                {"file", "v1_conditions.events.jsonl"},
+                {"path", "kind"},
+                {"eq", "message"}
+            }}
+        };
+        h.btm->Start(btMiss.dump());
+        json missResp = json::parse(h.btm->Wait("bt-v1-conditions-miss", 0, 15000), nullptr, false);
+        Check(missResp.value("state", "") == "failed",
+              "BT condition compares the last v1 event, not an earlier one");
+    }
+
+    // 13. A failure record stays readable after later queue events are appended.
+    {
+        TestHarness h;
+        std::string eventsContent =
+            R"({"schema":"hancho.event/1","seq":1,"kind":"run.started"})" "\r\n"
+            R"({"version":7,"seq":7,"type":"jobFailed","job_id":"j1","failure":{"class":"rate_limited","suggestedAction":"retry_after","summary":"five_hour limit"}})" "\r\n"
+            R"({"version":8,"seq":8,"type":"jobQueued","job_id":"j2"})" "\r\n";
+        WriteFileAtomicWide(tempDirW + L"\\failure_tail.events.jsonl", eventsContent);
+
+        json btDef = {
+            {"id", "bt-failure-tail"},
+            {"cwd", tempDirUtf8},
+            {"root", {
+                {"type", "sequence"},
+                {"children", json::array({
+                    {{"type", "jsonValue"}, {"id", "cond_failure_class"}, {"file", "failure_tail.events.jsonl"},
+                     {"path", "failure.class"}, {"eq", "rate_limited"}},
+                    {{"type", "jsonValue"}, {"id", "cond_failure_action"}, {"file", "failure_tail.events.jsonl"},
+                     {"path", "failure.suggestedAction"}, {"eq", "retry_after"}},
+                    {{"type", "jsonValue"}, {"id", "cond_tail_kind"}, {"file", "failure_tail.events.jsonl"},
+                     {"path", "last.type"}, {"eq", "jobQueued"}}
+                })}
+            }}
+        };
+        h.btm->Start(btDef.dump());
+        json waitResp = json::parse(h.btm->Wait("bt-failure-tail", 0, 15000), nullptr, false);
+        Check(waitResp.value("state", "") == "succeeded",
+              "BT failure.class/suggestedAction use the newest failure even when later events follow (got " +
+                  waitResp.value("state", "") + ")");
+    }
 }
 
 } // namespace bt_int_test

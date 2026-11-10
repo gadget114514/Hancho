@@ -22,7 +22,11 @@ hancho-cli.exe mcp install                              # .mcp.json (Claude Code
 hancho-cli.exe mcp install --client opencode            # opencode.json
 hancho-cli.exe mcp install --data-dir .hancho # プロジェクト内データも一緒に
 hancho-cli.exe mcp install --dry-run --json             # 書き込まずに確認
+hancho-cli.exe mcp uninstall                             # 項目を外す（データは残す）
+hancho-cli.exe mcp uninstall --delete-data-dir           # データディレクトリも消す
 ```
+
+`mcp uninstall` は `mcp install` の逆で、Hancho の項目だけを外し、ほかのサーバー設定は残します。データは既定で残り、すべて JSON / JSONL のまま Hancho なしで読めます。やめる判断の基準は [design-v3.md 5.3〜5.5](design-v3.md) を参照してください。
 
 ## 提供される MCP ツール
 
@@ -52,3 +56,14 @@ hancho-cli.exe mcp install --dry-run --json             # 書き込まずに確�
 | `taskqueue_purge` | 終了済みジョブを削除（`taskqueue`, `states[]`）。 |
 | `taskqueue_link` / `taskqueue_unlink` | 依存を 1 本追加 / 削除（`job`, `dependsOn`, `on` = `success`\|`done`）。 |
 | `taskqueue_graph` | 依存グラフ（`ready` / `waiting_for` / `dependents`）。 |
+
+**メモリ操作**
+
+| ツール | 説明 |
+| :--- | :--- |
+| `memory_search` | L1 実行記録・L2 ノート・L3 知識の BM25 風検索（`query`, `kinds?`, `scope?`, `file?`, `jobName?`, `taskqueue?`, `engine?`, `model?`, `outcome?`, `failureClass?`, `since?`, `limit?`）。 |
+| `memory_get` | 1 件の全文と出典（`id`, `kind?`）。 |
+| `memory_brief` | ジョブに関係する記録を固定形式で要約（`jobName?`, `taskqueue?`, `file?`, `files?`, `scopes?`, `budgetChars?`, `includeAgentNotes?`, `maxPreviousRuns?`）。前回の実行 / よくある失敗 / 関連ノート / プロジェクト知識を、各行に id 付きで返す。 |
+| `memory_stats` | L1 の集計（成功率、所要時間の中央値・p90、失敗分類、トークン数と費用。ジョブ・エンジン・モデル別）。 |
+
+L3 のプロジェクト知識への昇格は人だけが行えます（`hancho-cli memory approve <id>` または GUI）。MCP ツールとしては公開しないため、エージェントは承認できません。

@@ -19,6 +19,14 @@
 #include <iterator>
 #include <sstream>
 #include <thread>
+#include <chrono>
+#ifndef _WIN32
+#include <cerrno>
+#include <csignal>
+#include <sys/types.h>
+#include <sys/wait.h>
+#include <unistd.h>
+#endif
 
 namespace pc {
 
@@ -68,7 +76,7 @@ static std::atomic<uint64_t> g_recordCalls{0};
 static std::string g_lastSkipReason;
 
 static std::wstring UsageHistoryPathWide() {
-    return GetLogsDirectoryWide() + L"\\usage_history.jsonl";
+    return PathJoinWide(GetLogsDirectoryWide(), L"usage_history.jsonl");
 }
 
 static void LoadUsageHistoryLocked() {
@@ -977,9 +985,15 @@ std::string LlmEventsToSummary(const std::vector<LlmStreamEvent>& events, const 
 LlmStreamTracker::LlmStreamTracker() = default;
 
 struct LlmStreamTracker::AdapterProcess {
+#ifdef _WIN32
     HANDLE hStdin = nullptr;
     HANDLE hStdout = nullptr;
     HANDLE hProcess = nullptr;
+#else
+    int stdinFd = -1;
+    int stdoutFd = -1;
+    long pid = -1;
+#endif
     std::thread reader;
     std::atomic<bool> stop{false};
 };
@@ -988,6 +1002,7 @@ bool LlmStreamTracker::StartAdapterProcess() {
     if (!adapter_ || adapter_->exec.empty()) return false;
 
     auto ap = std::make_unique<AdapterProcess>();
+#ifdef _WIN32
     SECURITY_ATTRIBUTES sa{};
     sa.nLength = sizeof(sa);
     sa.bInheritHandle = TRUE;
@@ -1027,6 +1042,35 @@ bool LlmStreamTracker::StartAdapterProcess() {
     }
     CloseHandle(pi.hThread);
     ap->hProcess = pi.hProcess;
+#else
+    int inPipe[2] = {-1, -1};
+    int outPipe[2] = {-1, -1};
+    if (::pipe(inPipe) != 0 || ::pipe(outPipe) != 0) {
+        if (inPipe[0] >= 0) { ::close(inPipe[0]); ::close(inPipe[1]); }
+        if (outPipe[0] >= 0) { ::close(outPipe[0]); ::close(outPipe[1]); }
+        return false;
+    }
+    pid_t pid = ::fork();
+    if (pid < 0) {
+        ::close(inPipe[0]); ::close(inPipe[1]);
+        ::close(outPipe[0]); ::close(outPipe[1]);
+        return false;
+    }
+    if (pid == 0) {
+        ::dup2(inPipe[0], STDIN_FILENO);
+        ::dup2(outPipe[1], STDOUT_FILENO);
+        ::dup2(outPipe[1], STDERR_FILENO);
+        ::close(inPipe[0]); ::close(inPipe[1]);
+        ::close(outPipe[0]); ::close(outPipe[1]);
+        ::execl("/bin/sh", "sh", "-c", adapter_->exec.c_str(), static_cast<char*>(nullptr));
+        _exit(127);
+    }
+    ::close(inPipe[0]);
+    ::close(outPipe[1]);
+    ap->stdinFd = inPipe[1];
+    ap->stdoutFd = outPipe[0];
+    ap->pid = static_cast<long>(pid);
+#endif
 
     AdapterProcess* raw = ap.get();
     LlmStreamTracker* self = this;
@@ -1034,9 +1078,16 @@ bool LlmStreamTracker::StartAdapterProcess() {
         std::string buffer;
         char chunk[4096];
         while (!raw->stop.load()) {
+#ifdef _WIN32
             DWORD bytesRead = 0;
             if (!ReadFile(raw->hStdout, chunk, sizeof(chunk), &bytesRead, nullptr) || bytesRead == 0) break;
-            buffer.append(chunk, bytesRead);
+            const size_t bytesReadSize = bytesRead;
+#else
+            ssize_t n = ::read(raw->stdoutFd, chunk, sizeof(chunk));
+            if (n <= 0) break;
+            const size_t bytesReadSize = static_cast<size_t>(n);
+#endif
+            buffer.append(chunk, bytesReadSize);
             size_t pos;
             while ((pos = buffer.find('\n')) != std::string::npos) {
                 std::string line = buffer.substr(0, pos);
@@ -1056,6 +1107,7 @@ void LlmStreamTracker::StopAdapterProcess() {
     if (!adapterProcess_) return;
     AdapterProcess* ap = adapterProcess_.get();
     ap->stop = true;
+#ifdef _WIN32
     if (ap->hStdin) {
         CloseHandle(ap->hStdin);
         ap->hStdin = nullptr;
@@ -1074,16 +1126,55 @@ void LlmStreamTracker::StopAdapterProcess() {
     }
     if (ap->hStdout) CloseHandle(ap->hStdout);
     if (ap->hProcess) CloseHandle(ap->hProcess);
+#else
+    if (ap->stdinFd >= 0) {
+        ::close(ap->stdinFd);
+        ap->stdinFd = -1;
+    }
+    if (ap->pid > 0) {
+        int status = 0;
+        if (::waitpid(static_cast<pid_t>(ap->pid), &status, WNOHANG) == 0) {
+            ::kill(static_cast<pid_t>(ap->pid), SIGTERM);
+            for (int i = 0; i < 20; ++i) {
+                if (::waitpid(static_cast<pid_t>(ap->pid), &status, WNOHANG) != 0) break;
+                std::this_thread::sleep_for(std::chrono::milliseconds(50));
+            }
+            ::kill(static_cast<pid_t>(ap->pid), SIGKILL);
+            ::waitpid(static_cast<pid_t>(ap->pid), &status, 0);
+        }
+    }
+    if (ap->stdoutFd >= 0) {
+        ::close(ap->stdoutFd);
+        ap->stdoutFd = -1;
+    }
+    if (ap->reader.joinable()) ap->reader.join();
+#endif
     adapterProcess_.reset();
 }
 
 void LlmStreamTracker::WriteAdapterLine(const std::string& line) {
-    if (!adapterProcess_ || !adapterProcess_->hStdin) return;
+    if (!adapterProcess_) return;
     std::string out = line;
     if (!out.empty() && out.back() == '\r') out.pop_back();
     out += "\n";
+#ifdef _WIN32
+    if (!adapterProcess_->hStdin) return;
     DWORD written = 0;
     WriteFile(adapterProcess_->hStdin, out.data(), static_cast<DWORD>(out.size()), &written, nullptr);
+#else
+    if (adapterProcess_->stdinFd < 0) return;
+    const char* p = out.data();
+    size_t left = out.size();
+    while (left > 0) {
+        ssize_t n = ::write(adapterProcess_->stdinFd, p, left);
+        if (n < 0) {
+            if (errno == EINTR) continue;
+            return;
+        }
+        p += n;
+        left -= static_cast<size_t>(n);
+    }
+#endif
 }
 
 LlmStreamTracker::~LlmStreamTracker() {

@@ -1,7 +1,9 @@
 #include "behavior_tree_internal.h"
 #include "common.h"
 
+#ifdef _WIN32
 #include <windows.h>
+#endif
 #include <algorithm>
 #include <cstdio>
 #include <ctime>
@@ -11,12 +13,24 @@ namespace pc {
 std::wstring ResolveBtPathWide(const std::string& cwdUtf8, const std::string& relOrAbsUtf8) {
     if (relOrAbsUtf8.empty()) return ResolveAbsolutePathWide(Utf8ToWide(cwdUtf8));
     std::wstring p = Utf8ToWide(relOrAbsUtf8);
+#ifdef _WIN32
     if (p.size() >= 2 && (p[1] == L':' || (p[0] == L'\\' && p[1] == L'\\') || (p[0] == L'/' && p[1] == L'/'))) {
         return ResolveAbsolutePathWide(p);
     }
+#else
+    if (!p.empty() && p[0] == L'/') {
+        return ResolveAbsolutePathWide(p);
+    }
+#endif
     if (!cwdUtf8.empty()) {
         std::wstring base = Utf8ToWide(cwdUtf8);
-        if (!base.empty() && base.back() != L'\\' && base.back() != L'/') base.push_back(L'\\');
+        if (!base.empty() && base.back() != L'\\' && base.back() != L'/') {
+#ifdef _WIN32
+            base.push_back(L'\\');
+#else
+            base.push_back(L'/');
+#endif
+        }
         return ResolveAbsolutePathWide(base + p);
     }
     return ResolveAbsolutePathWide(p);
@@ -27,7 +41,11 @@ std::string FormatEpochMsIso(int64_t nowMs) {
     // If nowMs looks like a small synthetic test clock (< 10^11 ms, ~1973), format deterministically in UTC.
     time_t sec = static_cast<time_t>(nowMs / 1000);
     std::tm tmv = {};
+#ifdef _WIN32
     gmtime_s(&tmv, &sec);
+#else
+    gmtime_r(&sec, &tmv);
+#endif
     char buf[64] = {};
     std::snprintf(buf, sizeof(buf), "%04d-%02d-%02dT%02d:%02d:%02d",
                   tmv.tm_year + 1900, tmv.tm_mon + 1, tmv.tm_mday,

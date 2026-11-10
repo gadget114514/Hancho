@@ -2,8 +2,11 @@
 #include "common.h"
 #include "nlohmann/json.hpp"
 
+#ifdef _WIN32
 #include <windows.h>
+#endif
 #include <algorithm>
+#include <filesystem>
 #include <fstream>
 #include <sstream>
 
@@ -172,7 +175,7 @@ void BuildNode(const json& n, const std::string& btId, const std::string& role,
 } // namespace
 
 std::wstring GetBehaviorTreesDirWide() {
-    return GetLogsDirectoryWide() + L"\\behaviortrees";
+    return PathJoinWide(GetLogsDirectoryWide(), L"behaviortrees");
 }
 
 bool ParseBtDebugTree(const std::string& jsonText, BtDebugNode& out, std::string& err) {
@@ -233,32 +236,25 @@ std::vector<BtDebugNode> LoadBtDebugTrees(const std::wstring& dir, std::vector<s
     };
     std::vector<Loaded> loaded;
 
-    WIN32_FIND_DATAW fd = {};
-    HANDLE h = FindFirstFileW((dir + L"\\*.json").c_str(), &fd);
-    if (h != INVALID_HANDLE_VALUE) {
-        do {
-            if (fd.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) continue;
-            std::wstring path = dir + L"\\" + fd.cFileName;
-            std::string name = WideToUtf8(fd.cFileName);
-            std::ifstream f(path, std::ios::binary);
-            if (!f) {
-                errors.push_back(name + ": cannot open");
-                continue;
-            }
-            std::stringstream buf;
-            buf << f.rdbuf();
-            std::string text = buf.str();
-            Loaded item;
-            std::string err;
-            if (!ParseBtDebugTree(text, item.node, err)) {
-                errors.push_back(name + ": " + err);
-                continue;
-            }
-            json bt = json::parse(text, nullptr, false);
-            item.updatedAt = Str(bt, "updatedAt");
-            loaded.push_back(std::move(item));
-        } while (FindNextFileW(h, &fd));
-        FindClose(h);
+    for (const std::wstring& path : ListDirectoryWide(dir, L"*.json")) {
+        std::string name = WideToUtf8(path.substr(path.find_last_of(L"/\\") + 1));
+        std::ifstream f(std::filesystem::path(WideToUtf8(ToNativePathWide(path))), std::ios::binary);
+        if (!f) {
+            errors.push_back(name + ": cannot open");
+            continue;
+        }
+        std::stringstream buf;
+        buf << f.rdbuf();
+        std::string text = buf.str();
+        Loaded item;
+        std::string err;
+        if (!ParseBtDebugTree(text, item.node, err)) {
+            errors.push_back(name + ": " + err);
+            continue;
+        }
+        json bt = json::parse(text, nullptr, false);
+        item.updatedAt = Str(bt, "updatedAt");
+        loaded.push_back(std::move(item));
     }
 
     std::sort(loaded.begin(), loaded.end(), [](const Loaded& a, const Loaded& b) {

@@ -26,6 +26,7 @@
             "command": "D:\\wsgit\\Hancho\\tools\\ww\\ww-run.cmd 010 -Shared -Engine opencode -Root D:\\wsgit\\Hancho -JsonStdout",
             "cwd": "D:\\wsgit\\Hancho",
             "timeoutSec": 12600,
+            "estimateSec": 10800,
             "resources": {
               "write": [
                 "src/gui_dashboard.cpp",
@@ -47,6 +48,7 @@
             "command": "D:\\wsgit\\Hancho\\tools\\ww\\ww-run.cmd 011 -Shared -Engine opencode -Root D:\\wsgit\\Hancho -JsonStdout",
             "cwd": "D:\\wsgit\\Hancho",
             "timeoutSec": 9000,
+            "estimateSec": 7200,
             "resources": {
               "write": [
                 "src/cli.cpp",
@@ -70,6 +72,7 @@
             "command": "D:\\wsgit\\Hancho\\tools\\ww\\ww-run.cmd 020 -Shared -Engine opencode -Root D:\\wsgit\\Hancho -JsonStdout",
             "cwd": "D:\\wsgit\\Hancho",
             "timeoutSec": 16200,
+            "estimateSec": 14400,
             "resources": {
               "write": [
                 "src/main.cpp",
@@ -94,6 +97,7 @@
             "command": "D:\\wsgit\\Hancho\\tools\\ww\\ww-run.cmd 021 -Shared -Engine opencode -Root D:\\wsgit\\Hancho -JsonStdout",
             "cwd": "D:\\wsgit\\Hancho",
             "timeoutSec": 10800,
+            "estimateSec": 9000,
             "resources": {
               "write": [
                 "src/cli.cpp",
@@ -114,6 +118,7 @@
             "command": "D:\\wsgit\\Hancho\\tools\\ww\\ww-run.cmd 022 -Shared -Engine opencode -Root D:\\wsgit\\Hancho -JsonStdout",
             "cwd": "D:\\wsgit\\Hancho",
             "timeoutSec": 23400,
+            "estimateSec": 21600,
             "resources": {
               "write": [
                 "src",
@@ -134,6 +139,7 @@
             "command": "D:\\wsgit\\Hancho\\tools\\ww\\ww-run.cmd 023 -Shared -Engine opencode -Root D:\\wsgit\\Hancho -JsonStdout",
             "cwd": "D:\\wsgit\\Hancho",
             "timeoutSec": 30600,
+            "estimateSec": 28800,
             "resources": {
               "write": [
                 "src",
@@ -155,6 +161,7 @@
             "command": "D:\\wsgit\\Hancho\\tools\\ww\\ww-run.cmd 024 -Shared -Engine opencode -Root D:\\wsgit\\Hancho -JsonStdout",
             "cwd": "D:\\wsgit\\Hancho",
             "timeoutSec": 19800,
+            "estimateSec": 18000,
             "resources": {
               "write": [
                 "src",
@@ -176,6 +183,7 @@
             "command": "D:\\wsgit\\Hancho\\tools\\ww\\ww-run.cmd 030 -Shared -Engine opencode -Root D:\\wsgit\\Hancho -JsonStdout",
             "cwd": "D:\\wsgit\\Hancho",
             "timeoutSec": 13800,
+            "estimateSec": 12000,
             "resources": {
               "write": [
                 "src",
@@ -196,6 +204,7 @@
             "command": "D:\\wsgit\\Hancho\\tools\\ww\\ww-run.cmd 031 -Shared -Engine opencode -Root D:\\wsgit\\Hancho -JsonStdout",
             "cwd": "D:\\wsgit\\Hancho",
             "timeoutSec": 13800,
+            "estimateSec": 12000,
             "resources": {
               "write": [
                 "src",
@@ -215,6 +224,7 @@
             "command": "D:\\wsgit\\Hancho\\tools\\ww\\ww-run.cmd 032 -Shared -Engine opencode -Root D:\\wsgit\\Hancho -JsonStdout",
             "cwd": "D:\\wsgit\\Hancho",
             "timeoutSec": 9000,
+            "estimateSec": 7200,
             "resources": {
               "write": [
                 "src",
@@ -235,6 +245,7 @@
             "command": "D:\\wsgit\\Hancho\\tools\\ww\\ww-run.cmd 033 -Shared -Engine opencode -Root D:\\wsgit\\Hancho -JsonStdout",
             "cwd": "D:\\wsgit\\Hancho",
             "timeoutSec": 16200,
+            "estimateSec": 14400,
             "resources": {
               "write": [
                 "src",
@@ -254,6 +265,7 @@
             "command": "D:\\wsgit\\Hancho\\tools\\ww\\ww-run.cmd 034 -Shared -Engine opencode -Root D:\\wsgit\\Hancho -JsonStdout",
             "cwd": "D:\\wsgit\\Hancho",
             "timeoutSec": 12600,
+            "estimateSec": 10800,
             "resources": {
               "write": [
                 "src",
@@ -274,6 +286,7 @@
             "command": "D:\\wsgit\\Hancho\\tools\\ww\\ww-run.cmd 035 -Shared -Engine opencode -Root D:\\wsgit\\Hancho -JsonStdout",
             "cwd": "D:\\wsgit\\Hancho",
             "timeoutSec": 12600,
+            "estimateSec": 10800,
             "resources": {
               "write": [
                 "src/gui_dashboard.cpp",
@@ -295,6 +308,7 @@
             "command": "D:\\wsgit\\Hancho\\tools\\ww\\ww-run.cmd 040 -Shared -Engine opencode -Root D:\\wsgit\\Hancho -JsonStdout",
             "cwd": "D:\\wsgit\\Hancho",
             "timeoutSec": 16200,
+            "estimateSec": 14400,
             "resources": {
               "write": [
                 "src/taskqueue.cpp",
@@ -318,6 +332,7 @@
             "command": "D:\\wsgit\\Hancho\\tools\\ww\\ww-run.cmd 041 -Shared -Engine opencode -Root D:\\wsgit\\Hancho -JsonStdout",
             "cwd": "D:\\wsgit\\Hancho",
             "timeoutSec": 7800,
+            "estimateSec": 6000,
             "resources": {
               "write": [
                 "src/taskqueue.cpp",
@@ -337,6 +352,7 @@
             "command": "D:\\wsgit\\Hancho\\tools\\ww\\ww-run.cmd 042 -Shared -Engine opencode -Root D:\\wsgit\\Hancho -JsonStdout",
             "cwd": "D:\\wsgit\\Hancho",
             "timeoutSec": 11400,
+            "estimateSec": 9600,
             "resources": {
               "write": [
                 "src/cli.cpp",
@@ -358,6 +374,7 @@
             "command": "D:\\wsgit\\Hancho\\tools\\ww\\ww-run.cmd 043 -Shared -Engine opencode -Root D:\\wsgit\\Hancho -JsonStdout",
             "cwd": "D:\\wsgit\\Hancho",
             "timeoutSec": 11400,
+            "estimateSec": 9600,
             "resources": {
               "write": [
                 "src",
@@ -377,6 +394,7 @@
             "command": "D:\\wsgit\\Hancho\\tools\\ww\\ww-run.cmd 050 -Shared -Engine opencode -Root D:\\wsgit\\Hancho -JsonStdout",
             "cwd": "D:\\wsgit\\Hancho",
             "timeoutSec": 11400,
+            "estimateSec": 9600,
             "resources": {
               "write": [
                 "src/cli.cpp",
@@ -400,6 +418,7 @@
             "command": "D:\\wsgit\\Hancho\\tools\\ww\\ww-run.cmd 051 -Shared -Engine opencode -Root D:\\wsgit\\Hancho -JsonStdout",
             "cwd": "D:\\wsgit\\Hancho",
             "timeoutSec": 7800,
+            "estimateSec": 6000,
             "resources": {
               "write": [
                 "src/cli.cpp",
@@ -424,6 +443,7 @@
         "command": "cmake --build build --config Release",
         "cwd": "D:/wsgit/Hancho",
         "timeoutSec": 3600,
+        "estimateSec": 1800,
         "resources": {
           "write": [
             "build"

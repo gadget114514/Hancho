@@ -6,6 +6,17 @@ CLI コマンドは Named Pipe (`\\.\pipe\Hancho_IPC_v1`) を通じて起動中�
 
 > **呼称:** `Hancho.exe` は GUI ダッシュボード / MCP サーバー、`hancho-cli.exe` はそのコンソールクライアントです。
 
+## Linux / macOS: `hancho-cli top`
+
+POSIX ではコアはヘッドレスで動き、CLI は Unix ドメインソケットで接続します。端末向けの簡易表示は `top` です:
+
+```sh
+hancho-cli --data-dir ./ww-data top              # 1 秒ごとに更新
+hancho-cli top --once --json                     # 1 回だけ JSON で取得
+```
+
+ビルド手順は [build-posix-ja.md](build-posix-ja.md) を参照してください。
+
 ## バージョン確認（`--version` / `-V` / `version`）
 
 ```powershell
@@ -81,6 +92,19 @@ hancho-cli.exe taskqueue wait main --since 0 --timeout-ms 30000
 hancho-cli.exe taskqueue retry A
 ```
 
+**メモリ（過去の実行・ノート・プロジェクト知識）:**
+
+```powershell
+hancho-cli.exe memory search "LNK2019" --job-name build
+hancho-cli.exe memory brief --job-name build --budget-chars 1500
+hancho-cli.exe memory get rr_j_7f3a_2
+hancho-cli.exe memory approve nt_01JC9Z --by alice
+```
+
+`memory brief` は決まった形（前回の実行 / よくある失敗 / 関連ノート / プロジェクト知識）で、各行に id を付けて出力します。`--budget-chars`（既定 1500）に収めるため下の節から削り、L3 のプロジェクト知識は最後まで残します。`--no-agent-notes` でエージェントが書いた L2 ノートを除けます。ジョブへの自動注入は [taskqueue-ja.md](taskqueue-ja.md) の `memory` フィールドを参照してください。
+
+`memory approve <note-id>` は承認した L2 ノートを L3 のプロジェクト知識として `memory/knowledge.jsonl` に昇格します。`approvedBy` と `approvedAt` を付け、元のノートは退役させます。人が行う経路（GUI のメモリ一覧にも同じ操作があります）で、MCP ツールとしては公開しないためエージェントは昇格できません。ファイルは 1 行 1 事実の JSONL で、git にコミットしてチームで共有する前提です。
+
 **プロジェクト内のデータディレクトリ（git 管理）:**
 
 ```powershell
@@ -95,6 +119,8 @@ hancho-cli.exe mcp install --data-dir .hancho
 hancho-cli.exe mcp install                     # .mcp.json (Claude Code)
 hancho-cli.exe mcp install --client opencode   # opencode.json
 hancho-cli.exe mcp install --dry-run --json    # 書き込まずに確認
+hancho-cli.exe mcp uninstall                   # 項目を外す（データは残す）
+hancho-cli.exe mcp uninstall --delete-data-dir # 項目とデータディレクトリを消す
 ```
 
 **hancho-runner サブエージェント（Claude Code）を配置する:**
@@ -105,3 +131,32 @@ hancho-cli.exe agent install-template --path C:\proj --dry-run
 ```
 
 `hancho-runner` は長いビルドやテストを Hancho の MCP ツールで実行し、要約だけを返す。既存のファイルは上書きしない。
+
+**やめ方:** `hancho-cli.exe agent uninstall-template` で `hancho-runner.md` を、`hancho-cli.exe mcp uninstall` で MCP の項目を外します。データディレクトリは `--delete-data-dir` を付けない限り残ります。Hancho のデータはすべて JSON / JSONL で、Hancho がなくても読めます。機能対応表は [design-v3.md 5.3〜5.5](design-v3.md)、リリースごとの見直しは [release-checklist-ja.md](release-checklist-ja.md) を参照してください。
+
+**データの書き出し（Hancho なしで読める形）:**
+
+```powershell
+# キューを依存順の PowerShell スクリプトにする
+hancho-cli.exe export queues main --format powershell --out main.ps1
+
+# CI ワークフローの雛形 / 開いた形式にする
+hancho-cli.exe export queues main --format github-actions --out .github/workflows/main.yml
+hancho-cli.exe export queues main --format jsonl
+
+# ビヘイビアツリーを手順書（Markdown）にする
+hancho-cli.exe export bt my-tree --out runbook.md
+
+# L3 のプロジェクト知識を CLAUDE.md に貼れる Markdown にする
+hancho-cli.exe export knowledge --out project-knowledge.md
+
+# すべてを ./export に書き出す（queues/、behavior-trees/、knowledge.md）
+hancho-cli.exe export
+hancho-cli.exe export all --out C:\backup\hancho-export
+
+# データディレクトリにある書き出し対象を一覧する
+hancho-cli.exe export list
+```
+
+`export` の出力は Hancho の実行環境を必要としません。キューは依存順のスクリプト（`powershell` / `bash`）、`github-actions` のワークフロー雛形、`jsonl` / `json` になり、ビヘイビアツリーは Markdown の手順書（`markdown`、または元の開いた `json`）、L3 の知識は Markdown（`markdown`）または `jsonl` になります。`--out` を省くと、単一のキュー / ツリー / 知識は標準出力へ、複数は `export/queues`、`export/behavior-trees`、`export/knowledge.md` へ書き出します。`on: "done"` の依存は依存先が失敗しても実行し、通常の（`success`）依存はスキップします。依存の循環は警告として報告し、残りのジョブはファイル順のまま書き出します。
+

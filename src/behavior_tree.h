@@ -49,6 +49,7 @@ struct BtJobSpec {
     std::string summary;
     std::string cwd;
     int timeoutSec = 0;
+    int estimateSec = 0;  // optional expected duration for ETA display (0 = use timeoutSec)
     std::map<std::string, std::string> env;
     BtJobSuccess success;
     BtJobIdle idle;
@@ -70,6 +71,7 @@ struct BtWorkerSpec {
     std::string summary;
     std::string cwd;
     int timeoutSec = 0;
+    int estimateSec = 0;  // optional expected duration for ETA display (0 = use timeoutSec)
     std::map<std::string, std::string> env;
     BtJobSuccess success;
     BtJobIdle idle;
@@ -160,7 +162,7 @@ public:
     void SetEngineCatalog(const IBtEngineCatalog* catalog) { catalog_ = catalog; }
 
     // Execution entry points (event-driven tick, section 5.2).
-    void Start(int64_t nowMs);
+    void Start(int64_t nowMs, bool paused = false);
 
     void OnJobFinished(const std::string& jobId,
                        bool succeeded,

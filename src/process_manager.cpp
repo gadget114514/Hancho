@@ -1,6 +1,5 @@
 #include "process_manager.h"
 #include "nlohmann/json.hpp"
-#include <psapi.h>
 #include <sstream>
 #include <algorithm>
 
@@ -157,13 +156,15 @@ ProcessManager::ManagedProcess::~ManagedProcess() {
         CloseHandle(hThread);
         hThread = nullptr;
     }
+    if (tree) {
+        // Closing a job with KILL_ON_JOB_CLOSE terminates the tree; keep that
+        // behaviour by killing explicitly before releasing the boundary object.
+        tree->Kill(1);
+        tree.reset();
+    }
     if (hProcess) {
         CloseHandle(hProcess);
         hProcess = nullptr;
-    }
-    if (hJob) {
-        CloseHandle(hJob);
-        hJob = nullptr;
     }
 }
 
@@ -228,18 +229,13 @@ int ProcessManager::StartProcess(const StartProcessRequest& req, std::string& ou
     }
     std::vector<wchar_t> childEnv = BuildChildEnvironment(cwdWide, childEnvVars);
 
-    // Create Win32 Job Object with KILL_ON_JOB_CLOSE
-    HANDLE hJob = CreateJobObjectW(nullptr, nullptr);
-    if (!hJob) {
-        outError = "CreateJobObjectW failed (error " + std::to_string(GetLastError()) + ")";
+    auto proc = std::make_shared<ManagedProcess>();
+    proc->tree = platform::CreateProcessTree();
+    if (!proc->tree) {
+        if (hEventPipe) CloseHandle(hEventPipe);
+        outError = "Failed to create the process tree boundary.";
         return -1;
     }
-
-    JOBOBJECT_EXTENDED_LIMIT_INFORMATION jeli = {};
-    jeli.BasicLimitInformation.LimitFlags = JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE | JOB_OBJECT_LIMIT_DIE_ON_UNHANDLED_EXCEPTION;
-    SetInformationJobObject(hJob, JobObjectExtendedLimitInformation, &jeli, sizeof(jeli));
-
-    auto proc = std::make_shared<ManagedProcess>();
     proc->hEventPipe = hEventPipe;
     proc->eventPipeName = eventPipeName;
     if (proc->hEventPipe) {
@@ -255,7 +251,6 @@ int ProcessManager::StartProcess(const StartProcessRequest& req, std::string& ou
     proc->jobId = req.jobId;
     proc->attemptN = req.attemptN;
     proc->estimatedEndTimeStr = req.estimatedEndTimeStr;
-    proc->hJob = hJob;
     proc->destroyTerminalCb = destroyTerminalCb_;
 
     uint64_t now = GetNowTickMs();
@@ -337,8 +332,9 @@ int ProcessManager::StartProcess(const StartProcessRequest& req, std::string& ou
             proc->rootPid = proc->headlessPty->ProcessId();
         }
 
-        if (proc->hProcess) {
-            AssignProcessToJobObject(proc->hJob, proc->hProcess);
+        if (proc->hProcess && proc->tree) {
+            std::string attachError;
+            proc->tree->Attach(proc->rootPid, attachError);
         }
         proc->treeProcessCount = 1;
     } else {
@@ -422,7 +418,10 @@ int ProcessManager::StartProcess(const StartProcessRequest& req, std::string& ou
             proc->hStdinWrite = nullptr;
         }
 
-        AssignProcessToJobObject(proc->hJob, pi.hProcess);
+        if (proc->tree) {
+            std::string attachError;
+            proc->tree->Attach(pi.dwProcessId, attachError);
+        }
         ResumeThread(pi.hThread);
 
         proc->hProcess = pi.hProcess;
@@ -676,37 +675,18 @@ void ProcessManager::ReaderThreadFunc(std::shared_ptr<ManagedProcess> proc) {
 }
 
 void ProcessManager::UpdateJobMetrics(ManagedProcess& proc) {
-    if (!proc.hJob) return;
+    if (!proc.tree) return;
 
-    JOBOBJECT_BASIC_ACCOUNTING_INFORMATION acct = {};
-    if (QueryInformationJobObject(proc.hJob, JobObjectBasicAccountingInformation, &acct, sizeof(acct), nullptr)) {
-        uint64_t total100ns = static_cast<uint64_t>(acct.TotalUserTime.QuadPart) +
-                              static_cast<uint64_t>(acct.TotalKernelTime.QuadPart);
-        uint64_t prev = proc.cpuTime100ns.exchange(total100ns);
-        if (total100ns > prev) {
-            proc.lastCpuActivityTickMs = GetNowTickMs();
-        }
-    }
+    platform::ProcessMetrics metrics;
+    if (!proc.tree->Query(metrics)) return;
 
-    alignas(JOBOBJECT_BASIC_PROCESS_ID_LIST) uint8_t buf[sizeof(JOBOBJECT_BASIC_PROCESS_ID_LIST) + sizeof(ULONG_PTR) * 256];
-    auto* pidList = reinterpret_cast<PJOBOBJECT_BASIC_PROCESS_ID_LIST>(buf);
-    if (QueryInformationJobObject(proc.hJob, JobObjectBasicProcessIdList, pidList, sizeof(buf), nullptr)) {
-        proc.treeProcessCount = static_cast<uint32_t>(pidList->NumberOfProcessIdsInList);
-        uint64_t totalMem = 0;
-        for (DWORD i = 0; i < pidList->NumberOfProcessIdsInList; ++i) {
-            DWORD pid = static_cast<DWORD>(pidList->ProcessIdList[i]);
-            HANDLE hP = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION | PROCESS_VM_READ, FALSE, pid);
-            if (hP) {
-                PROCESS_MEMORY_COUNTERS pmc = {};
-                pmc.cb = sizeof(pmc);
-                if (GetProcessMemoryInfo(hP, &pmc, sizeof(pmc))) {
-                    totalMem += pmc.WorkingSetSize;
-                }
-                CloseHandle(hP);
-            }
-        }
-        proc.treeMemoryBytes = totalMem;
+    uint64_t total100ns = metrics.cpuTimeMs * 10000ull;
+    uint64_t prev = proc.cpuTime100ns.exchange(total100ns);
+    if (total100ns > prev) {
+        proc.lastCpuActivityTickMs = GetNowTickMs();
     }
+    proc.treeProcessCount = metrics.processCount;
+    proc.treeMemoryBytes = metrics.memoryBytes;
 }
 
 void ProcessManager::WriteDoneFile(ManagedProcess& proc, ProcState finalState, DWORD exitCode,
@@ -740,9 +720,8 @@ void ProcessManager::WriteDoneFile(ManagedProcess& proc, ProcState finalState, D
 }
 
 void ProcessManager::TerminateJobInternal(ManagedProcess& proc, ProcState finalState, const std::string& reasonMsg) {
-    if (proc.hJob) {
-        TerminateJobObject(proc.hJob, 1);
-    } else if (proc.hProcess) {
+    const bool treeKilled = proc.tree && proc.tree->Kill(1);
+    if (!treeKilled && proc.hProcess) {
         TerminateProcess(proc.hProcess, 1);
     }
 
@@ -832,8 +811,8 @@ void ProcessManager::MonitorThreadFunc() {
                     GetExitCodeProcess(proc->hProcess, &code);
                     // The root exited, but it may have left descendants (python, cmd, ...) running.
                     // Kill whatever is still in the job so nothing is orphaned.
-                    if (proc->hJob) {
-                        TerminateJobObject(proc->hJob, 0);
+                    if (proc->tree) {
+                        proc->tree->Kill(0);
                     }
                     proc->exitCode = code;
                     proc->endTickMs = now;

@@ -8,6 +8,7 @@
 #include <cwctype>
 #include <ctime>
 #include <cstring>
+#include <filesystem>
 
 namespace pc {
 
@@ -497,6 +498,98 @@ std::string GetLogsDirectoryUtf8() {
     return WideToUtf8(GetLogsDirectoryWide());
 }
 
+void EnsureDirectoryWide(const std::wstring& dir) {
+    if (dir.empty()) return;
+    std::error_code ec;
+    std::filesystem::create_directories(std::filesystem::path(dir), ec);
+}
+
+bool PathExistsWide(const std::wstring& path) {
+    return GetFileAttributesW(path.c_str()) != INVALID_FILE_ATTRIBUTES;
+}
+
+bool IsDirectoryWide(const std::wstring& path) {
+    DWORD attr = GetFileAttributesW(path.c_str());
+    return attr != INVALID_FILE_ATTRIBUTES && (attr & FILE_ATTRIBUTE_DIRECTORY);
+}
+
+bool RemoveFileWide(const std::wstring& path) {
+    if (path.empty()) return false;
+    return DeleteFileW(path.c_str()) != 0;
+}
+
+std::vector<std::wstring> ListDirectoryWide(const std::wstring& dir,
+                                            const std::wstring& pattern) {
+    std::vector<std::wstring> out;
+    WIN32_FIND_DATAW fd = {};
+    std::wstring search = dir + L"\\" + pattern;
+    HANDLE h = FindFirstFileW(search.c_str(), &fd);
+    if (h == INVALID_HANDLE_VALUE) return out;
+    do {
+        std::wstring name = fd.cFileName;
+        if (name == L"." || name == L"..") continue;
+        out.push_back(dir + L"\\" + name);
+    } while (FindNextFileW(h, &fd));
+    FindClose(h);
+    std::sort(out.begin(), out.end());
+    return out;
+}
+
+bool GetFileMtimeWide(const std::wstring& path, uint64_t& outFiletime) {
+    HANDLE h = CreateFileW(path.c_str(), GENERIC_READ,
+                           FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+                           nullptr, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, nullptr);
+    if (h == INVALID_HANDLE_VALUE) return false;
+    FILETIME ft = {};
+    BOOL ok = GetFileTime(h, nullptr, nullptr, &ft);
+    CloseHandle(h);
+    if (!ok) return false;
+    outFiletime = (static_cast<uint64_t>(ft.dwHighDateTime) << 32) | ft.dwLowDateTime;
+    return true;
+}
+
+uint64_t GetSystemTimeAsFiletime100ns() {
+    FILETIME ft = {};
+    GetSystemTimeAsFileTime(&ft);
+    return (static_cast<uint64_t>(ft.dwHighDateTime) << 32) | ft.dwLowDateTime;
+}
+
+std::string GetTempDirectoryUtf8() {
+    wchar_t buf[MAX_PATH] = {};
+    DWORD len = GetTempPathW(MAX_PATH, buf);
+    if (len == 0 || len >= MAX_PATH) return ".";
+    std::wstring path(buf, len);
+    while (!path.empty() && (path.back() == L'\\' || path.back() == L'/')) path.pop_back();
+    return WideToUtf8(path);
+}
+
+std::string GetExecutablePathUtf8() {
+    wchar_t buf[MAX_PATH] = {};
+    DWORD len = GetModuleFileNameW(nullptr, buf, MAX_PATH);
+    if (len == 0) return "";
+    return WideToUtf8(std::wstring(buf, len));
+}
+
+uint32_t GetCurrentProcessIdPortable() {
+    return static_cast<uint32_t>(GetCurrentProcessId());
+}
+
+std::string GetIpcEndpointUtf8() {
+    return WideToUtf8(GetPipeNameWide());
+}
+
+bool WideEqualsIgnoreCase(const std::wstring& a, const std::wstring& b) {
+    return _wcsicmp(a.c_str(), b.c_str()) == 0;
+}
+
+std::wstring ToNativePathWide(const std::wstring& path) {
+    return path;
+}
+
+std::wstring PathJoinWide(const std::wstring& left, const std::wstring& right) {
+    return left + L"\\" + right;
+}
+
 std::string SanitizeFileNameComponent(const std::string& s) {
     std::string out;
     out.reserve(s.size());
@@ -787,6 +880,27 @@ std::string CallerSelfOriginFilter() {
     std::string s = CallerSessionId();
     if (!s.empty()) return s;
     return "pid:" + std::to_string(CallerPid());
+}
+
+bool WriteHanchoEventLine(const std::string& endpoint, const std::string& line,
+                          std::string& outError) {
+    std::wstring fullPipe = Utf8ToWide(endpoint);
+    if (fullPipe.rfind(L"\\\\.\\pipe\\", 0) != 0) fullPipe = L"\\\\.\\pipe\\" + fullPipe;
+    HANDLE h = CreateFileW(fullPipe.c_str(), GENERIC_WRITE, 0, nullptr, OPEN_EXISTING, 0, nullptr);
+    if (h == INVALID_HANDLE_VALUE) {
+        outError = "cannot open event pipe " + endpoint + " (Win32 error " +
+                   std::to_string(GetLastError()) + ")";
+        return false;
+    }
+    DWORD written = 0;
+    BOOL ok = WriteFile(h, line.data(), static_cast<DWORD>(line.size()), &written, nullptr);
+    DWORD lastError = ok ? ERROR_SUCCESS : GetLastError();
+    CloseHandle(h);
+    if (!ok) {
+        outError = "cannot write to event pipe (Win32 error " + std::to_string(lastError) + ")";
+        return false;
+    }
+    return true;
 }
 
 } // namespace pc

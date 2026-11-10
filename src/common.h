@@ -6,7 +6,33 @@
 #define PC_VERSION "unknown"
 #endif
 
+#ifdef _WIN32
 #include <windows.h>
+#else
+// Minimal type aliases for the remaining shared declarations. The POSIX
+// implementations do not call Win32; these only keep the public structs in
+// process_manager.h / ipc_server.h source-compatible.
+#include <cstddef>
+#include <cstdint>
+using DWORD = uint32_t;
+using BOOL = int;
+using HANDLE = void*;
+using HWND = void*;
+using WPARAM = uintptr_t;
+using UINT = unsigned int;
+#ifndef WM_APP
+#define WM_APP 0x8000
+#endif
+template <typename A, typename B>
+inline void PostMessageW(HWND, unsigned int, A, B) {}
+#ifndef STILL_ACTIVE
+#define STILL_ACTIVE 259
+#endif
+#ifndef MAX_PATH
+#define MAX_PATH 260
+#endif
+#endif
+
 #include <string>
 #include <vector>
 #include <map>
@@ -14,8 +40,13 @@
 
 namespace pc {
 
+#ifdef _WIN32
 constexpr const wchar_t* kPipeName = L"\\\\.\\pipe\\Hancho_IPC_v1";
 constexpr const wchar_t* kMutexName = L"Local\\Hancho_GUI_Mutex_v1";
+#else
+constexpr const wchar_t* kPipeName = L"/tmp/Hancho_IPC_v1.sock";
+constexpr const wchar_t* kMutexName = L"Hancho_GUI_Mutex_v1";
+#endif
 
 enum class ExecMode {
     Pipe = 0,     // Anonymous pipes (non-interactive / standard CLI)
@@ -39,6 +70,37 @@ std::string WideToUtf8(const std::wstring& wide);
 std::wstring GetCurrentDirectoryWide();
 std::wstring ResolveAbsolutePathWide(const std::wstring& path);
 std::string ResolveAbsolutePathUtf8(const std::string& path);
+
+// Portable filesystem helpers. Windows keeps its Win32 semantics; POSIX maps
+// backslashes to the native separator before touching the filesystem.
+#ifdef _WIN32
+inline void SleepMs(uint32_t ms) { ::Sleep(ms); }
+#else
+void SleepMs(uint32_t ms);
+#endif
+void EnsureDirectoryWide(const std::wstring& dir);
+bool PathExistsWide(const std::wstring& path);
+bool IsDirectoryWide(const std::wstring& path);
+bool RemoveFileWide(const std::wstring& path);
+std::vector<std::wstring> ListDirectoryWide(const std::wstring& dir,
+                                            const std::wstring& pattern = L"*");
+// File mtime in 100 ns units since 1601-01-01, the same clock the behaviour
+// tree uses for filesNewer comparisons.
+bool GetFileMtimeWide(const std::wstring& path, uint64_t& outFiletime);
+uint64_t GetSystemTimeAsFiletime100ns();
+std::string GetTempDirectoryUtf8();
+std::string GetExecutablePathUtf8();
+uint32_t GetCurrentProcessIdPortable();
+// Unix domain socket on POSIX, Named Pipe name on Windows.
+std::string GetIpcEndpointUtf8();
+bool WideEqualsIgnoreCase(const std::wstring& a, const std::wstring& b);
+std::wstring ToNativePathWide(const std::wstring& path);
+std::wstring PathJoinWide(const std::wstring& left, const std::wstring& right);
+
+// Write one hancho.event/1 line to HANCHO_EVENT_PIPE. The endpoint is a
+// Named Pipe on Windows and a Unix domain socket on POSIX.
+bool WriteHanchoEventLine(const std::string& endpoint, const std::string& line,
+                          std::string& outError);
 
 std::string ExecModeToString(ExecMode mode);
 ExecMode StringToExecMode(const std::string& s);

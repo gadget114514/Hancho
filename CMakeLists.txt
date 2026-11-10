@@ -1,5 +1,5 @@
 cmake_minimum_required(VERSION 3.20)
-project(Hancho VERSION 0.9.3 LANGUAGES CXX)
+project(Hancho VERSION 0.9.4 LANGUAGES CXX)
 
 set(CMAKE_CXX_STANDARD 20)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
@@ -9,15 +9,31 @@ set(CMAKE_MSVC_RUNTIME_LIBRARY "MultiThreaded$<$<CONFIG:Debug>:Debug>")
 
 add_definitions(-DUNICODE -D_UNICODE -DWIN32_LEAN_AND_MEAN -DNOMINMAX -DECODE_ENABLE_SIXEL)
 
+# Version macros for C++ (PC_VERSION) and the VERSIONINFO resource (src/version_info.rc2).
+set(PC_VERSION_DEFINITIONS
+    PC_VERSION="${PROJECT_VERSION}"
+    PC_VERSION_MAJOR=${PROJECT_VERSION_MAJOR}
+    PC_VERSION_MINOR=${PROJECT_VERSION_MINOR}
+    PC_VERSION_PATCH=${PROJECT_VERSION_PATCH}
+)
+
+
+if(WIN32)
+
 add_executable(Hancho
     src/main.cpp
     src/common.cpp
+    src/platform/platform_windows.cpp
     src/process_manager.cpp
     src/taskqueue.cpp
     src/chain_guard.cpp
     src/ipc_server.cpp
+    src/ipc_server_remote.cpp
     src/ipc_client.cpp
+    src/remote_client.cpp
+    src/remote_hosts.cpp
     src/cli.cpp
+    src/memory_cli.cpp
     src/mcp_server.cpp
     src/llm_stream.cpp
     src/llm_stream_claude.cpp
@@ -26,6 +42,8 @@ add_executable(Hancho
     src/llm_stream_codex.cpp
     src/event_schema.cpp
     src/event_adapter.cpp
+    src/memory_search.cpp
+    src/memory_record.cpp
     src/activity_tree.cpp
     src/bt_debug_view.cpp
     src/behavior_tree.cpp
@@ -48,14 +66,6 @@ add_executable(Hancho
     src/Terminal/src/TerminalEmulator.cpp
     src/Terminal/src/TerminalView.cpp
     src/Terminal/src/TerminalGridView.cpp
-)
-
-# Version macros for C++ (PC_VERSION) and the VERSIONINFO resource (src/version_info.rc2).
-set(PC_VERSION_DEFINITIONS
-    PC_VERSION="${PROJECT_VERSION}"
-    PC_VERSION_MAJOR=${PROJECT_VERSION_MAJOR}
-    PC_VERSION_MINOR=${PROJECT_VERSION_MINOR}
-    PC_VERSION_PATCH=${PROJECT_VERSION_PATCH}
 )
 
 target_compile_definitions(Hancho PRIVATE ${PC_VERSION_DEFINITIONS})
@@ -91,6 +101,7 @@ target_link_libraries(Hancho PRIVATE
     dwmapi
     windowscodecs
     crypt32
+    ws2_32
     "${CMAKE_CURRENT_SOURCE_DIR}/lib/libsixel.lib"
 )
 
@@ -109,7 +120,12 @@ add_executable(hancho-cli
     src/cli_main.cpp
     src/cli.cpp
     src/ipc_client.cpp
+    src/remote_client.cpp
+    src/remote_hosts.cpp
     src/event_adapter.cpp
+    src/memory_cli.cpp
+    src/memory_search.cpp
+    src/memory_record.cpp
     src/common.cpp
     src/hancho-cli.rc
     src/agent_template.rc
@@ -137,6 +153,7 @@ target_link_libraries(hancho-cli PRIVATE
     shell32
     advapi32
     crypt32
+    ws2_32
 )
 
 # Headless smoke test for the task queue engine (deps, retries, chain guard, persistence).
@@ -145,6 +162,7 @@ add_executable(taskqueue_smoke
     src/taskqueue.cpp
     src/chain_guard.cpp
     src/process_manager.cpp
+    src/platform/platform_windows.cpp
     src/llm_stream.cpp
     src/llm_stream_claude.cpp
     src/llm_stream_opencode.cpp
@@ -153,6 +171,8 @@ add_executable(taskqueue_smoke
     src/event_schema.cpp
     src/event_adapter.cpp
     src/common.cpp
+    src/memory_search.cpp
+    src/memory_record.cpp
     src/Terminal/src/ConPtySession.cpp
     src/Terminal/src/ImageManager.cpp
     src/Terminal/src/TerminalBuffer.cpp
@@ -326,6 +346,7 @@ target_link_libraries(event_adapter_smoke PRIVATE
 add_executable(event_pipe_smoke
     tests/event_pipe_smoke.cpp
     src/process_manager.cpp
+    src/platform/platform_windows.cpp
     src/llm_stream.cpp
     src/llm_stream_claude.cpp
     src/llm_stream_opencode.cpp
@@ -432,6 +453,7 @@ target_link_libraries(bt_debug_view_smoke PRIVATE
 add_executable(worker_engines_smoke
     tests/worker_engines_smoke.cpp
     src/worker_engines.cpp
+    src/platform/platform_windows.cpp
     src/common.cpp
 )
 
@@ -448,6 +470,7 @@ target_link_libraries(worker_engines_smoke PRIVATE
     user32
     shell32
     advapi32
+    psapi
     crypt32
 )
 
@@ -464,6 +487,7 @@ add_executable(behavior_tree_smoke
     src/behavior_tree_state.cpp
     src/behavior_tree_runtime.cpp
     src/worker_engines.cpp
+    src/platform/platform_windows.cpp
     src/bt_debug_view.cpp
     src/common.cpp
 )
@@ -483,6 +507,7 @@ target_link_libraries(behavior_tree_smoke PRIVATE
     user32
     shell32
     advapi32
+    psapi
     crypt32
 )
 
@@ -501,7 +526,10 @@ add_executable(bt_integration_smoke
     src/behavior_tree_state.cpp
     src/behavior_tree_runtime.cpp
     src/worker_engines.cpp
+    src/platform/platform_windows.cpp
     src/taskqueue.cpp
+    src/memory_record.cpp
+    src/memory_search.cpp
     src/chain_guard.cpp
     src/process_manager.cpp
     src/llm_stream.cpp
@@ -546,6 +574,7 @@ target_link_libraries(bt_integration_smoke PRIVATE
     dwmapi
     windowscodecs
     crypt32
+    ws2_32
     "${CMAKE_CURRENT_SOURCE_DIR}/lib/libsixel.lib"
 )
 
@@ -553,6 +582,9 @@ target_link_libraries(bt_integration_smoke PRIVATE
 add_executable(bt_ipc_smoke
     tests/bt_ipc_smoke.cpp
     src/ipc_server.cpp
+    src/ipc_server_remote.cpp
+    src/remote_client.cpp
+    src/remote_hosts.cpp
     src/bt_manager.cpp
     src/bt_manager_api.cpp
     src/behavior_tree.cpp
@@ -564,7 +596,10 @@ add_executable(bt_ipc_smoke
     src/behavior_tree_state.cpp
     src/behavior_tree_runtime.cpp
     src/worker_engines.cpp
+    src/platform/platform_windows.cpp
     src/taskqueue.cpp
+    src/memory_record.cpp
+    src/memory_search.cpp
     src/chain_guard.cpp
     src/process_manager.cpp
     src/llm_stream.cpp
@@ -609,9 +644,193 @@ target_link_libraries(bt_ipc_smoke PRIVATE
     dwmapi
     windowscodecs
     crypt32
+    ws2_32
     "${CMAKE_CURRENT_SOURCE_DIR}/lib/libsixel.lib"
 )
 
 
 
 
+# Headless smoke test for memory search/index/rebuild (src/memory_search.cpp).
+add_executable(memory_search_smoke
+    tests/memory_search_smoke.cpp
+    src/memory_search.cpp
+    src/memory_record.cpp
+    src/common.cpp
+)
+
+target_include_directories(memory_search_smoke PRIVATE
+    src
+    include
+)
+
+if(MSVC)
+    target_compile_options(memory_search_smoke PRIVATE /W4 /utf-8 /EHsc)
+endif()
+
+target_link_libraries(memory_search_smoke PRIVATE
+    user32
+    shell32
+    advapi32
+    crypt32
+)
+
+# Headless smoke test for L1 run records (src/memory_record.cpp).
+add_executable(memory_record_smoke
+    tests/memory_record_smoke.cpp
+    src/memory_record.cpp
+    src/common.cpp
+)
+
+target_include_directories(memory_record_smoke PRIVATE
+    src
+    include
+)
+
+if(MSVC)
+    target_compile_options(memory_record_smoke PRIVATE /W4 /utf-8 /EHsc)
+endif()
+
+target_link_libraries(memory_record_smoke PRIVATE
+    user32
+    shell32
+    advapi32
+    crypt32
+)
+
+# Smoke test for the `--headless` core: starts the real Hancho.exe without a
+# dashboard, drives it over the Named Pipe, reconnects between requests, and
+# stops it through IPC.
+add_executable(headless_smoke
+    tests/headless_smoke.cpp
+    src/ipc_client.cpp
+    src/common.cpp
+)
+
+add_dependencies(headless_smoke Hancho)
+
+target_include_directories(headless_smoke PRIVATE
+    src
+    include
+)
+
+if(MSVC)
+    target_compile_options(headless_smoke PRIVATE /W4 /utf-8 /EHsc)
+endif()
+
+target_link_libraries(headless_smoke PRIVATE
+    user32
+    shell32
+    advapi32
+    crypt32
+)
+
+# Unit smoke test for the platform boundary: shell quoting, instance lock and
+# IPC transport through platform/platform.h only.
+add_executable(platform_abstraction_smoke
+    tests/platform_abstraction_smoke.cpp
+    src/platform/platform_windows.cpp
+)
+
+target_include_directories(platform_abstraction_smoke PRIVATE
+    src
+    include
+)
+
+if(MSVC)
+    target_compile_options(platform_abstraction_smoke PRIVATE /W4 /utf-8 /EHsc)
+endif()
+
+target_link_libraries(platform_abstraction_smoke PRIVATE
+    user32
+    advapi32
+    psapi
+)
+
+
+else()
+    # POSIX headless core and CLI (doc/design-v3.md 2.4). There is no GUI here:
+    # the only screen is `hancho-cli top`.
+    find_package(Threads REQUIRED)
+
+    set(HANCHO_CORE_SOURCES
+        src/common_posix.cpp
+        src/platform/platform_posix.cpp
+        src/process_manager_posix.cpp
+        src/taskqueue.cpp
+        src/chain_guard_posix.cpp
+        src/ipc_server.cpp
+        src/ipc_server_posix.cpp
+        src/ipc_server_remote.cpp
+        src/ipc_client_posix.cpp
+        src/remote_client.cpp
+        src/remote_hosts.cpp
+        src/mcp_server.cpp
+        src/llm_stream.cpp
+        src/llm_stream_claude.cpp
+        src/llm_stream_opencode.cpp
+        src/llm_stream_agy.cpp
+        src/llm_stream_codex.cpp
+        src/event_schema.cpp
+        src/event_adapter.cpp
+        src/memory_search.cpp
+        src/memory_record.cpp
+        src/activity_tree.cpp
+        src/bt_debug_view.cpp
+        src/behavior_tree.cpp
+        src/behavior_tree_parse.cpp
+        src/behavior_tree_vars.cpp
+        src/behavior_tree_cond.cpp
+        src/behavior_tree_exec.cpp
+        src/behavior_tree_escalate.cpp
+        src/behavior_tree_state.cpp
+        src/behavior_tree_runtime.cpp
+        src/worker_engines.cpp
+        src/bt_manager.cpp
+        src/bt_manager_api.cpp
+    )
+
+    add_executable(Hancho src/main_posix.cpp ${HANCHO_CORE_SOURCES})
+    target_compile_definitions(Hancho PRIVATE ${PC_VERSION_DEFINITIONS})
+    target_include_directories(Hancho PRIVATE src include)
+    target_compile_options(Hancho PRIVATE -Wall -Wextra -Wno-unused-parameter)
+    target_link_libraries(Hancho PRIVATE Threads::Threads util)
+
+    add_executable(hancho-cli
+        src/cli_main_posix.cpp
+        src/cli.cpp
+        src/ipc_client_posix.cpp
+        src/remote_client.cpp
+        src/remote_hosts.cpp
+        src/event_adapter.cpp
+        src/memory_cli.cpp
+        src/memory_search.cpp
+        src/memory_record.cpp
+        src/common_posix.cpp
+        src/platform/platform_posix.cpp
+    )
+    target_compile_definitions(hancho-cli PRIVATE ${PC_VERSION_DEFINITIONS})
+    target_include_directories(hancho-cli PRIVATE src include)
+    target_compile_options(hancho-cli PRIVATE -Wall -Wextra -Wno-unused-parameter)
+    target_link_libraries(hancho-cli PRIVATE Threads::Threads util)
+
+    # POSIX portability smoke test: shell quoting, file helpers, instance lock,
+    # IPC transport and a real task queue run with /bin/sh.
+    add_executable(posix_core_smoke
+        tests/posix_core_smoke.cpp
+        ${HANCHO_CORE_SOURCES}
+    )
+    target_compile_definitions(posix_core_smoke PRIVATE ${PC_VERSION_DEFINITIONS})
+    target_include_directories(posix_core_smoke PRIVATE src include)
+    target_compile_options(posix_core_smoke PRIVATE -Wall -Wextra -Wno-unused-parameter)
+    target_link_libraries(posix_core_smoke PRIVATE Threads::Threads util)
+
+    # Boundary-only smoke test shared with the Windows build.
+    add_executable(platform_abstraction_smoke
+        tests/platform_abstraction_smoke.cpp
+        src/platform/platform_posix.cpp
+    )
+    target_include_directories(platform_abstraction_smoke PRIVATE src include)
+    target_compile_options(platform_abstraction_smoke PRIVATE -Wall -Wextra -Wno-unused-parameter)
+    target_link_libraries(platform_abstraction_smoke PRIVATE Threads::Threads util)
+endif()

@@ -463,6 +463,43 @@ int main() {
               "undefined variable fails node with undefinedVar: " + bt.NodeDetail("j_undef"));
     }
 
+    // Start paused: register the tree without creating any jobs; resume starts it.
+    {
+        std::string pausedBt = R"({
+            "id": "paused-test",
+            "root": { "type": "job", "id": "p1", "summary": "P", "command": "c", "timeoutSec": 60 }
+        })";
+        FakeJobRunner runnerP;
+        BehaviorTree btP;
+        std::string err;
+        Check(btP.LoadDefinition(pausedBt, &catalog, err), "load paused-start BT");
+        btP.SetJobRunner(&runnerP);
+        btP.Start(1000, true);
+        Check(btP.State() == "paused" && runnerP.startedJobs.empty(),
+              "Start(paused=true) creates no jobs");
+        Check(btP.SetPaused(false, 1100, err) && btP.State() == "running" &&
+                  runnerP.startedJobs.size() == 1,
+              "resuming a paused start creates the first job");
+    }
+
+    // estimateSec (optional ETA hint) is carried from the job node into the job spec.
+    {
+        std::string estBt = R"({
+            "id": "est-test",
+            "root": { "type": "job", "id": "e1", "summary": "E", "command": "c",
+                      "timeoutSec": 600, "estimateSec": 300 }
+        })";
+        FakeJobRunner runnerE;
+        BehaviorTree btE;
+        std::string err;
+        Check(btE.LoadDefinition(estBt, &catalog, err), "load estimateSec BT");
+        btE.SetJobRunner(&runnerE);
+        btE.Start(1000);
+        Check(runnerE.startedJobs.size() == 1 && runnerE.startedJobs[0].estimateSec == 300 &&
+                  runnerE.startedJobs[0].timeoutSec == 600,
+              "estimateSec reaches the job spec");
+    }
+
     RunPart2Tests(tempDirUtf8, tempDirW);
 
     RemoveTempDirRecursive(tempDirW);

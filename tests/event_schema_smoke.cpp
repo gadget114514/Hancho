@@ -3,6 +3,7 @@
 // and checked for their kind and required data fields; a tracker run checks the derived file path,
 // the appended lines and their raw.line numbers.
 
+#include "../src/event_adapter.h"
 #include "../src/event_schema.h"
 #include "../src/llm_stream.h"
 #include <windows.h>
@@ -42,6 +43,124 @@ static nlohmann::json DataOf(const LlmStreamEvent& ev, const std::string& parent
     HanchoEventSource source;
     source.processId = 12;
     return BuildHanchoEventV1(ev, source, parentAgentId, "proc_12_build_stream.jsonl", 7)["data"];
+}
+
+static LlmStreamEvent RoundTripV1(const LlmStreamEvent& ev) {
+    HanchoEventSource source;
+    source.processId = 12;
+    nlohmann::json v1 = BuildHanchoEventV1(ev, source, "", "proc_12_build_stream.jsonl", 7);
+    return LlmStreamEventFromHanchoV1(v1);
+}
+
+static void CheckLegacyV1Compatibility() {
+    LlmStreamEvent call = MakeEvent("tool_call", "claude");
+    call.toolName = "Edit";
+    call.toolUseId = "toolu-c1";
+    call.toolInput = R"({"file_path":"src/a.cpp"})";
+    LlmStreamEvent callBack = RoundTripV1(call);
+    Check(callBack.type == "tool_call" && callBack.toolName == call.toolName &&
+              callBack.toolUseId == call.toolUseId && callBack.toolInput == call.toolInput,
+          "compat: tool_call keeps tool name, id and input through v1");
+
+    LlmStreamEvent result = MakeEvent("tool_result", "claude");
+    result.toolUseId = "toolu-c1";
+    result.toolError = true;
+    result.content = "permission denied";
+    LlmStreamEvent resultBack = RoundTripV1(result);
+    Check(resultBack.type == "tool_result" && resultBack.toolError &&
+              resultBack.content == result.content && resultBack.toolUseId == result.toolUseId,
+          "compat: tool_result keeps ok/error, text and tool id through v1");
+
+    LlmStreamEvent thought = MakeEvent("thinking", "claude");
+    thought.content = "considering";
+    Check(RoundTripV1(thought).content == thought.content,
+          "compat: thinking keeps its text through v1 (thought)");
+
+    LlmStreamEvent reply = MakeEvent("message", "claude");
+    reply.content = "done";
+    LlmStreamEvent replyBack = RoundTripV1(reply);
+    Check(replyBack.type == "message" && replyBack.content == reply.content,
+          "compat: message keeps its text through v1");
+
+    LlmStreamEvent usage = MakeEvent("usage", "claude");
+    usage.inputTokens = 11;
+    usage.outputTokens = 5;
+    usage.cacheReadTokens = 2;
+    usage.totalTokens = 18;
+    usage.costUsd = 0.25;
+    LlmStreamEvent usageBack = RoundTripV1(usage);
+    Check(usageBack.type == "usage" && usageBack.inputTokens == usage.inputTokens &&
+              usageBack.outputTokens == usage.outputTokens &&
+              usageBack.cacheReadTokens == usage.cacheReadTokens &&
+              usageBack.totalTokens == usage.totalTokens && usageBack.costUsd == usage.costUsd,
+          "compat: usage keeps token counts and cost through v1");
+
+    LlmStreamEvent runEnd = MakeEvent("result", "claude");
+    runEnd.status = "completed";
+    runEnd.stopReason = "end_turn";
+    runEnd.numTurns = 3;
+    runEnd.apiDurationMs = 1234;
+    runEnd.permissionDenials = 2;
+    LlmStreamEvent runEndBack = RoundTripV1(runEnd);
+    Check(runEndBack.type == "result" && runEndBack.status == runEnd.status &&
+              runEndBack.stopReason == runEnd.stopReason &&
+              runEndBack.numTurns == runEnd.numTurns &&
+              runEndBack.apiDurationMs == runEnd.apiDurationMs &&
+              runEndBack.permissionDenials == runEnd.permissionDenials,
+          "compat: result keeps status, turns, duration and denials through v1");
+
+    LlmStreamEvent error = MakeEvent("error", "codex");
+    error.content = "usage limit reached";
+    LlmStreamEvent errorBack = RoundTripV1(error);
+    Check(errorBack.type == "error" && errorBack.content == error.content,
+          "compat: error keeps its message through v1");
+
+    LlmStreamEvent subStart = MakeEvent("subagent_start", "claude");
+    subStart.agentId = "task-1";
+    subStart.toolUseId = "toolu-a1";
+    subStart.subagentType = "general-purpose";
+    subStart.taskDescription = "say ok";
+    LlmStreamEvent subStartBack = RoundTripV1(subStart);
+    Check(subStartBack.type == "subagent_start" && subStartBack.agentId == subStart.agentId &&
+              subStartBack.toolUseId == subStart.toolUseId &&
+              subStartBack.subagentType == subStart.subagentType &&
+              subStartBack.taskDescription == subStart.taskDescription,
+          "compat: subagent_start keeps agent, tool and description through v1");
+
+    LlmStreamEvent subEnd = MakeEvent("subagent_end", "claude");
+    subEnd.agentId = "task-1";
+    subEnd.taskStatus = "completed";
+    subEnd.taskTokens = 310;
+    subEnd.taskToolUses = 2;
+    subEnd.taskDurationMs = 900;
+    LlmStreamEvent subEndBack = RoundTripV1(subEnd);
+    Check(subEndBack.type == "subagent_end" && subEndBack.agentId == subEnd.agentId &&
+              subEndBack.taskStatus == subEnd.taskStatus &&
+              subEndBack.taskTokens == subEnd.taskTokens &&
+              subEndBack.taskToolUses == subEnd.taskToolUses &&
+              subEndBack.taskDurationMs == subEnd.taskDurationMs,
+          "compat: subagent_end keeps status, tokens, tool uses and duration through v1");
+
+    LlmStreamEvent init = MakeEvent("status", "claude");
+    init.content = "init";
+    init.cwd = "D:/work";
+    init.toolsOffered = 14;
+    LlmStreamEvent initBack = RoundTripV1(init);
+    Check(initBack.type == "status" && initBack.content == "init" &&
+              initBack.cwd == init.cwd && initBack.toolsOffered == init.toolsOffered,
+          "compat: run.started keeps cwd and toolsOffered through v1");
+
+    LlmStreamEvent limit = MakeEvent("rate_limit", "claude");
+    limit.rateLimitType = "five_hour";
+    limit.rateLimitStatus = "rejected";
+    limit.rateLimitUtilization = 0.91;
+    limit.rateLimitResetsAtSec = 1794303600;
+    LlmStreamEvent limitBack = RoundTripV1(limit);
+    Check(limitBack.type == "rate_limit" && limitBack.rateLimitType == limit.rateLimitType &&
+              limitBack.rateLimitStatus == limit.rateLimitStatus &&
+              limitBack.rateLimitUtilization == limit.rateLimitUtilization &&
+              limitBack.rateLimitResetsAtSec == limit.rateLimitResetsAtSec,
+          "compat: rate_limit keeps status, window, utilization and reset time through v1");
 }
 
 static bool HasAnyToken(const nlohmann::json& data) {
@@ -92,6 +211,7 @@ int main() {
           "derived path: a path without _stream.jsonl yields no event file");
 
     CheckTopLevel("claude", "claude", "message");
+    CheckLegacyV1Compatibility();
 
     // Claude: tool call, tool result, thinking, message, plan, init, rate limit, sub-agents, result.
     LlmStreamEvent call = MakeEvent("tool_call", "claude");
@@ -323,6 +443,9 @@ int main() {
                   written[2]["agent"]["agentId"] == "task-1" &&
                   written[2]["agent"]["parentAgentId"] == "",
               "tracker: sub-agent tool.call carries its agent and parent agent ids");
+        Check(written[0]["data"]["activity"] == "subagent" && written[2]["data"]["activity"] == "command" &&
+                  written[2]["data"]["target"] == "echo hi",
+              "reader consumers get v1 kind, activity and target without legacy type strings");
     }
     Check(std::filesystem::exists(streamPath), "tracker still writes the .stream.jsonl file");
 

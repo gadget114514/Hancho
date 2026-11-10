@@ -3,7 +3,9 @@
 #include "common.h"
 #include "nlohmann/json.hpp"
 
+#ifdef _WIN32
 #include <windows.h>
+#endif
 #include <algorithm>
 #include <chrono>
 
@@ -40,6 +42,7 @@ nlohmann::json BuildAddBtJobJson(const std::string& jobId,
                                  const std::string& cwd,
                                  const std::string& instructionsText,
                                  int timeoutSec,
+                                 int estimateSec,
                                  int maxAttempts,
                                  const std::map<std::string, std::string>& env,
                                  const BtJobResources& resources,
@@ -52,6 +55,7 @@ nlohmann::json BuildAddBtJobJson(const std::string& jobId,
     if (!cwd.empty()) j["cwd"] = cwd;
     if (!instructionsText.empty()) j["instructions_text"] = instructionsText;
     j["timeout_sec"] = timeoutSec > 0 ? timeoutSec : 1800;
+    if (estimateSec > 0) j["estimate_sec"] = estimateSec;
     j["max_attempts"] = maxAttempts >= 1 ? maxAttempts : 1;
     if (!env.empty()) j["env"] = env;
     if (!resources.write.empty() || !resources.read.empty()) {
@@ -82,37 +86,37 @@ int64_t BtManager::NowEpochMs() {
 }
 
 std::wstring BtManager::GetBtDirectoryWide() {
-    std::wstring dir = GetLogsDirectoryWide() + L"\\behaviortrees";
-    CreateDirectoryW(dir.c_str(), nullptr);
+    std::wstring dir = PathJoinWide(GetLogsDirectoryWide(), L"behaviortrees");
+    EnsureDirectoryWide(dir);
     return dir;
 }
 
 std::wstring BtManager::GetBtStateFileWide(const std::string& btId) {
-    return GetBtDirectoryWide() + L"\\" + Utf8ToWide(SanitizeFileNameComponent(btId)) + L".json";
+    return PathJoinWide(GetBtDirectoryWide(), Utf8ToWide(SanitizeFileNameComponent(btId))) + L".json";
 }
 
 std::wstring BtManager::GetBtEventsFileWide(const std::string& btId) {
-    return GetLogsDirectoryWide() + L"\\bt-" + Utf8ToWide(SanitizeFileNameComponent(btId)) + L".events.jsonl";
+    return PathJoinWide(GetLogsDirectoryWide(), L"bt-" + Utf8ToWide(SanitizeFileNameComponent(btId)) + L".events.jsonl");
 }
 
 std::wstring BtManager::GetBtResultFileWide(const std::string& btId, const std::string& jobId) {
-    std::wstring btDir = GetBtDirectoryWide() + L"\\" + Utf8ToWide(SanitizeFileNameComponent(btId));
-    CreateDirectoryW(btDir.c_str(), nullptr);
-    std::wstring resDir = btDir + L"\\results";
-    CreateDirectoryW(resDir.c_str(), nullptr);
-    return resDir + L"\\" + Utf8ToWide(SanitizeFileNameComponent(jobId)) + L".json";
+    std::wstring btDir = PathJoinWide(GetBtDirectoryWide(), Utf8ToWide(SanitizeFileNameComponent(btId)));
+    EnsureDirectoryWide(btDir);
+    std::wstring resDir = PathJoinWide(btDir, L"results");
+    EnsureDirectoryWide(resDir);
+    return PathJoinWide(resDir, Utf8ToWide(SanitizeFileNameComponent(jobId))) + L".json";
 }
 
 std::wstring BtManager::GetBtEscalationFileWide(const std::string& btId,
                                                 const std::string& nodeKey,
                                                 int run,
                                                 const std::wstring& ext) {
-    std::wstring btDir = GetBtDirectoryWide() + L"\\" + Utf8ToWide(SanitizeFileNameComponent(btId));
-    CreateDirectoryW(btDir.c_str(), nullptr);
-    std::wstring escDir = btDir + L"\\escalations";
-    CreateDirectoryW(escDir.c_str(), nullptr);
+    std::wstring btDir = PathJoinWide(GetBtDirectoryWide(), Utf8ToWide(SanitizeFileNameComponent(btId)));
+    EnsureDirectoryWide(btDir);
+    std::wstring escDir = PathJoinWide(btDir, L"escalations");
+    EnsureDirectoryWide(escDir);
     std::string shortNode = ShortNodeName(btId, nodeKey);
-    return escDir + L"\\" + Utf8ToWide(SanitizeFileNameComponent(shortNode)) +
+    return PathJoinWide(escDir, Utf8ToWide(SanitizeFileNameComponent(shortNode))) +
            L"." + std::to_wstring(run > 0 ? run : 1) + ext;
 }
 
@@ -161,8 +165,8 @@ bool BtManager::ReloadEngines(std::string& outError) {
     outError.clear();
     std::lock_guard<std::mutex> lock(mutex_);
     engines_.ResetToBuiltins();
-    std::wstring enginesPath = GetLogsDirectoryWide() + L"\\engines.json";
-    if (GetFileAttributesW(enginesPath.c_str()) == INVALID_FILE_ATTRIBUTES) {
+    std::wstring enginesPath = PathJoinWide(GetLogsDirectoryWide(), L"engines.json");
+    if (!PathExistsWide(enginesPath)) {
         return true;
     }
     std::string text = ReadFileUtf8Wide(enginesPath);
@@ -215,6 +219,7 @@ std::string BtManager::StartJob(const BtJobSpec& spec) {
         spec.cwd,
         spec.instructionsText,
         spec.timeoutSec,
+        spec.estimateSec,
         spec.maxAttempts,
         spec.env,
         spec.resources,
@@ -241,7 +246,7 @@ std::string BtManager::StartWorker(const BtWorkerSpec& spec) {
     const std::string jobId = UniqueJobId(spec.proposedJobId);
 
     std::wstring resultFileW = GetBtResultFileWide(spec.btId, jobId);
-    DeleteFileW(resultFileW.c_str());
+    RemoveFileWide(resultFileW);
     const std::string resultPathUtf8 = WideToUtf8(resultFileW);
 
     // The node's outputSchema is checked when the worker exits, so the worker has to
@@ -284,6 +289,7 @@ std::string BtManager::StartWorker(const BtWorkerSpec& spec) {
         spec.cwd,
         instructions,
         effTimeout,
+        spec.estimateSec,
         1,
         env,
         spec.resources,
@@ -390,7 +396,7 @@ void BtManager::DeliverJobOutcomeLocked(TreeEntry& entry,
 
     std::string resultFile;
     std::wstring resFileW = GetBtResultFileWide(entry.tree->Id(), job.id);
-    if (GetFileAttributesW(resFileW.c_str()) != INVALID_FILE_ATTRIBUTES) {
+    if (PathExistsWide(resFileW)) {
         resultFile = WideToUtf8(resFileW);
     }
 
@@ -463,15 +469,8 @@ bool BtManager::OnTaskQueueBtRetry(const TaskQueueBtRef& ref, bool resetCounters
 
 void BtManager::LoadPersistedTrees() {
     std::lock_guard<std::mutex> lock(mutex_);
-    std::wstring pattern = GetBtDirectoryWide() + L"\\*.json";
-    WIN32_FIND_DATAW fd = {};
-    HANDLE hFind = FindFirstFileW(pattern.c_str(), &fd);
-    if (hFind == INVALID_HANDLE_VALUE) return;
-
     int64_t nowMs = NowEpochMs();
-    do {
-        if ((fd.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) != 0) continue;
-        std::wstring filePath = GetBtDirectoryWide() + L"\\" + fd.cFileName;
+    for (const std::wstring& filePath : ListDirectoryWide(GetBtDirectoryWide(), L"*.json")) {
         std::string text = ReadFileUtf8Wide(filePath);
         if (text.empty()) continue;
 
@@ -509,9 +508,7 @@ void BtManager::LoadPersistedTrees() {
             activeLaunchingQueueName_.clear();
             PersistEntryLocked(*entryPtr);
         }
-    } while (FindNextFileW(hFind, &fd));
-
-    FindClose(hFind);
+    }
 }
 
 void BtManager::TimerLoop() {

@@ -6,10 +6,13 @@
 #include "mcp_server.h"
 #include "gui_dashboard.h"
 #include "cli.h"
+#include "ipc_client.h"
+#include "platform/platform.h"
 #include <shellapi.h>
 #include <cstdlib>
 #include <exception>
 #include <iostream>
+#include <thread>
 #include <vector>
 
 using namespace pc;
@@ -20,10 +23,18 @@ static void PrintUsage() {
 
 USAGE:
   Hancho.exe [gui] [--data-dir <path>]
-      Launch the live Win32 Dashboard GUI and Named Pipe server.
+      Launch the core and the live Win32 Dashboard GUI.
+      If a core is already running (for example from --headless), the dashboard
+      attaches to it and this process exits.
+
+  Hancho.exe --headless [--data-dir <path>]
+      Run the core (process manager, task queue, behavior trees) and the Named
+      Pipe server without a window or tray icon. Jobs keep running after the
+      dashboard is closed; `Hancho.exe gui` attaches again later.
 
   Hancho.exe quit
-      Quit the running GUI, including one hidden in the system tray (its tray icon is removed).
+      Quit the running core, including a headless one or one hidden in the
+      system tray (its tray icon is removed).
 
   Hancho.exe mcp [--data-dir <path>]
       Run as a Model Context Protocol (MCP) stdio server for Claude.
@@ -191,17 +202,227 @@ MCP SERVER SETUP:
 )";
 }
 
-// Asks the running GUI to exit (same path as the tray menu's "Exit") and waits for it to go.
+// ---------------------------------------------------------------------------
+// Core host
+//
+// The core (ProcessManager / TaskQueueManager / BtManager / IpcServer) owns the
+// jobs. A --headless host runs it with a hidden message window and no dashboard;
+// the dashboard can be attached later by any process. In the normal `gui` mode
+// the dashboard runs on the main thread and the core is still independent of
+// the window: closing the window hides the dashboard (tray) without stopping
+// jobs, and `Hancho.exe gui` restores it.
+// ---------------------------------------------------------------------------
+
+static const wchar_t* kCoreHostClass = L"HanchoCoreHostWnd";
+static const wchar_t* kDashboardClass = L"HanchoDashboardWnd";
+static const UINT WM_PC_HOST_SHOW_GUI = WM_APP + 201;
+static const UINT WM_PC_HOST_GUI_CLOSED = WM_APP + 202;
+static const UINT WM_PC_HOST_QUIT = WM_APP + 203;
+
+static HWND g_coreHostHwnd = nullptr;
+
+// Window classes are process-global, so two Hancho data directories can each own
+// a dashboard. Only ever treat a window from this process as ours.
+static HWND FindOwnWindow(const wchar_t* cls) {
+    HWND h = FindWindowW(cls, nullptr);
+    while (h) {
+        DWORD pid = 0;
+        GetWindowThreadProcessId(h, &pid);
+        if (pid == GetCurrentProcessId()) return h;
+        h = FindWindowExW(nullptr, h, cls, nullptr);
+    }
+    return nullptr;
+}
+
+struct CoreHostContext {
+    ProcessManager* pm = nullptr;
+    TaskQueueManager* tqm = nullptr;
+    BtManager* btm = nullptr;
+    IpcServer* ipc = nullptr;
+    HWND hwnd = nullptr;
+    std::thread guiThread;
+    bool guiRunning = false;
+    bool guiShowPending = false;
+    bool quit = false;
+};
+
+static void CoreHostShowGui(CoreHostContext* ctx) {
+    if (!ctx) return;
+    HWND dash = FindOwnWindow(kDashboardClass);
+    if (dash) {
+        if (IsIconic(dash)) ShowWindow(dash, SW_RESTORE);
+        else ShowWindow(dash, SW_SHOW);
+        SetForegroundWindow(dash);
+        return;
+    }
+    if (ctx->guiRunning) {
+        ctx->guiShowPending = true;
+        return;
+    }
+    if (ctx->guiThread.joinable()) ctx->guiThread.join();
+    ctx->guiRunning = true;
+    CoreHostContext* c = ctx;
+    ctx->guiThread = std::thread([c] {
+        int rc = 0;
+        try {
+            rc = RunGuiDashboard(*c->pm, *c->ipc, *c->tqm);
+        } catch (const std::exception& e) {
+            WriteAuditLog("CRASH_GUARD", std::string("GUI thread exception: ") + e.what());
+        } catch (...) {
+            WriteAuditLog("CRASH_GUARD", "GUI thread exception: unknown");
+        }
+        PostMessageW(c->hwnd, WM_PC_HOST_GUI_CLOSED, static_cast<WPARAM>(rc), 0);
+    });
+}
+
+static LRESULT CALLBACK CoreHostWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
+    CoreHostContext* ctx =
+        reinterpret_cast<CoreHostContext*>(GetWindowLongPtrW(hwnd, GWLP_USERDATA));
+
+    static const UINT quitMessage = RegisterWindowMessageW(L"HanchoQuit");
+    if (msg == quitMessage) {
+        PostMessageW(hwnd, WM_PC_HOST_QUIT, 0, 0);
+        return 0;
+    }
+
+    switch (msg) {
+        case WM_NCCREATE: {
+            auto* cs = reinterpret_cast<CREATESTRUCTW*>(lParam);
+            ctx = reinterpret_cast<CoreHostContext*>(cs ? cs->lpCreateParams : nullptr);
+            SetWindowLongPtrW(hwnd, GWLP_USERDATA, reinterpret_cast<LONG_PTR>(ctx));
+            if (ctx) ctx->hwnd = hwnd;
+            return DefWindowProcW(hwnd, msg, wParam, lParam);
+        }
+        case WM_PC_HOST_SHOW_GUI:
+            CoreHostShowGui(ctx);
+            return 0;
+        case WM_PC_HOST_GUI_CLOSED:
+            if (ctx) {
+                if (ctx->guiThread.joinable()) ctx->guiThread.join();
+                ctx->guiRunning = false;
+                if (ctx->guiShowPending) {
+                    ctx->guiShowPending = false;
+                    CoreHostShowGui(ctx);
+                }
+            }
+            return 0;
+        case WM_PC_HOST_QUIT:
+            if (ctx) ctx->quit = true;
+            PostQuitMessage(0);
+            return 0;
+        case WM_DESTROY:
+            PostQuitMessage(0);
+            return 0;
+    }
+    return DefWindowProcW(hwnd, msg, wParam, lParam);
+}
+
+static BOOL WINAPI CoreHostCtrlHandler(DWORD type) {
+    switch (type) {
+        case CTRL_C_EVENT:
+        case CTRL_BREAK_EVENT:
+        case CTRL_CLOSE_EVENT:
+        case CTRL_LOGOFF_EVENT:
+        case CTRL_SHUTDOWN_EVENT:
+            if (g_coreHostHwnd) {
+                PostMessageW(g_coreHostHwnd, WM_PC_HOST_QUIT, 0, 0);
+                Sleep(500);
+            }
+            return TRUE;
+    }
+    return FALSE;
+}
+
+static int RunCoreHost(platform::IInstanceLock* instanceLock, bool showGuiAtStart) {
+    std::set_terminate([] {
+        WriteAuditLog("CRASH", "std::terminate called: unhandled exception");
+        std::abort();
+    });
+
+    ProcessManager pm;
+    TaskQueueManager tqm;
+    tqm.SetProcessManager(&pm);
+    pm.SetProcessFinishedCallback([&tqm](int pid, int ec, const std::string& kind) {
+        tqm.OnProcessFinished(pid, ec, kind);
+    });
+    BtManager btm(pm, tqm);
+
+    WNDCLASSEXW wc = {};
+    wc.cbSize = sizeof(wc);
+    wc.lpfnWndProc = CoreHostWndProc;
+    wc.hInstance = GetModuleHandleW(nullptr);
+    wc.lpszClassName = kCoreHostClass;
+    RegisterClassExW(&wc);
+
+    CoreHostContext ctx;
+    ctx.pm = &pm;
+    ctx.tqm = &tqm;
+    ctx.btm = &btm;
+
+    IpcServer ipc(pm, tqm, &btm);
+    ctx.ipc = &ipc;
+    ipc.SetHeadless(true);
+
+    HWND hwnd = CreateWindowExW(0, kCoreHostClass, L"Hancho Core", WS_POPUP,
+                                0, 0, 0, 0, nullptr, nullptr, wc.hInstance, &ctx);
+    if (!hwnd) {
+        if (instanceLock) instanceLock->Release();
+        return 1;
+    }
+    g_coreHostHwnd = hwnd;
+    SetConsoleCtrlHandler(CoreHostCtrlHandler, TRUE);
+
+    ipc.SetGuiShowCallback([hwnd] {
+        PostMessageW(hwnd, WM_PC_HOST_SHOW_GUI, 0, 0);
+    });
+    ipc.SetShutdownCallback([hwnd] {
+        PostMessageW(hwnd, WM_PC_HOST_QUIT, 0, 0);
+    });
+
+    ipc.Start();
+    if (showGuiAtStart) CoreHostShowGui(&ctx);
+
+    MSG msg;
+    while (!ctx.quit && GetMessageW(&msg, nullptr, 0, 0) > 0) {
+        TranslateMessage(&msg);
+        DispatchMessageW(&msg);
+    }
+
+    // Ask an attached dashboard to close and wait for its thread.
+    if (ctx.guiRunning) {
+        if (HWND dash = FindOwnWindow(kDashboardClass)) {
+            PostMessageW(dash, RegisterWindowMessageW(L"HanchoQuit"), 0, 0);
+        }
+    }
+    if (ctx.guiThread.joinable()) ctx.guiThread.join();
+
+    ipc.SetGuiShowCallback(nullptr);
+    ipc.SetShutdownCallback(nullptr);
+    ipc.Stop();
+    pm.SetProcessFinishedCallback(nullptr);
+    btm.Shutdown();
+    tqm.ShutdownTaskQueueManager();
+
+    g_coreHostHwnd = nullptr;
+    if (instanceLock) instanceLock->Release();
+    return 0;
+}
+
+// Asks the running core (headless host or dashboard) to exit and waits for it to go.
 static int RunQuitCommand() {
-    const wchar_t* kWindowClass = L"HanchoDashboardWnd";
-    if (!FindWindowW(kWindowClass, nullptr)) {
+    HWND target = FindWindowW(kCoreHostClass, nullptr);
+    if (!target) target = FindWindowW(kDashboardClass, nullptr);
+    if (!target) {
         std::cout << "Hancho is not running" << std::endl;
         return 1;
     }
     UINT quitMessage = RegisterWindowMessageW(L"HanchoQuit");
-    PostMessageW(FindWindowW(kWindowClass, nullptr), quitMessage, 0, 0);
-    for (int i = 0; i < 100 && FindWindowW(kWindowClass, nullptr); ++i) Sleep(100);
-    if (FindWindowW(kWindowClass, nullptr)) {
+    PostMessageW(target, quitMessage, 0, 0);
+    for (int i = 0; i < 100 && (FindWindowW(kCoreHostClass, nullptr) ||
+                                FindWindowW(kDashboardClass, nullptr)); ++i) {
+        Sleep(100);
+    }
+    if (FindWindowW(kCoreHostClass, nullptr) || FindWindowW(kDashboardClass, nullptr)) {
         std::cout << "Hancho did not exit within 10 seconds" << std::endl;
         return 1;
     }
@@ -271,17 +492,47 @@ int main() {
         return RunQuitCommand();
     }
 
-    if (subcmd == "gui" || subcmd == "--gui") {
-        HANDLE hMutex = CreateMutexW(nullptr, TRUE, GetGuiMutexNameWide().c_str());
-        if (GetLastError() == ERROR_ALREADY_EXISTS) {
-            HWND existing = FindWindowW(L"HanchoDashboardWnd", nullptr);
-            if (existing) {
-                ShowWindow(existing, SW_SHOW);
-                if (IsIconic(existing)) ShowWindow(existing, SW_RESTORE);
-                SetForegroundWindow(existing);
+    const bool headlessRequested = (subcmd == "headless" || subcmd == "--headless");
+    if (subcmd == "gui" || subcmd == "--gui" || headlessRequested) {
+        // A core may already be running (headless or with a dashboard). For a GUI
+        // launch, ask it to expose the dashboard and let this process exit: the
+        // core stays alive, and jobs keep running.
+        if (!headlessRequested) {
+            std::string resp, err;
+            if (SendIpcRequest("{\"action\":\"gui_show\"}", resp, err, false)) {
+                for (int i = 0; i < 50; ++i) {
+                    if (FindWindowW(kDashboardClass, nullptr)) break;
+                    Sleep(100);
+                }
+                return 0;
             }
-            if (hMutex) CloseHandle(hMutex);
+        }
+
+        auto instanceLock = platform::CreateInstanceLock(WideToUtf8(GetGuiMutexNameWide()));
+        std::string lockError;
+        if (!instanceLock || !instanceLock->Acquire(lockError)) {
+            if (!headlessRequested) {
+                // The core may still be starting: wait for its pipe, then attach.
+                std::string resp, err;
+                for (int i = 0; i < 50; ++i) {
+                    if (SendIpcRequest("{\"action\":\"gui_show\"}", resp, err, false)) {
+                        for (int j = 0; j < 50; ++j) {
+                            if (FindWindowW(kDashboardClass, nullptr)) break;
+                            Sleep(100);
+                        }
+                        return 0;
+                    }
+                    Sleep(100);
+                }
+            }
+            std::cout << "Hancho core is already running" << std::endl;
             return 0;
+        }
+
+        if (headlessRequested) {
+            std::cout << "Hancho headless core started (pipe: "
+                      << WideToUtf8(GetPipeNameWide()) << ")" << std::endl;
+            return RunCoreHost(instanceLock.get(), false);
         }
 
         // Hide the console window of the GUI daemon instead of calling FreeConsole().
@@ -311,13 +562,23 @@ int main() {
         });
         BtManager btm(pm, tqm);
         IpcServer ipc(pm, tqm, &btm);
+        ipc.SetHeadless(false);
+        // `Hancho.exe gui` from another process: restore the existing window.
+        ipc.SetGuiShowCallback([] {
+            HWND dash = FindWindowW(kDashboardClass, nullptr);
+            if (dash) PostMessageW(dash, RegisterWindowMessageW(L"HanchoShowGui"), 0, 0);
+        });
+        ipc.SetShutdownCallback([] {
+            HWND dash = FindWindowW(kDashboardClass, nullptr);
+            if (dash) PostMessageW(dash, RegisterWindowMessageW(L"HanchoQuit"), 0, 0);
+        });
         ipc.Start();
         int rc = RunGuiDashboard(pm, ipc, tqm);
         ipc.Stop();
         pm.SetProcessFinishedCallback(nullptr);
         btm.Shutdown();
         tqm.ShutdownTaskQueueManager();
-        if (hMutex) CloseHandle(hMutex);
+        if (instanceLock) instanceLock->Release();
         return rc;
     }
 

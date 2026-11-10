@@ -30,6 +30,7 @@ hancho-cli.exe taskqueue wait main --since 0 --timeout-ms 30000
 | `id`, `command` | ジョブ id（全キューで一意）と、ちょうど 1 つのコマンド。 |
 | `summary` (必須) | 1 行・200 文字以内。`{summary}` に置換され、`PC_JOB_SUMMARY` にも入る。 |
 | `timeoutSec` (必須) | ジョブ単位の制限。合算しない。キューの `maxTimeoutSec`（既定 7200）以下。 |
+| `estimateSec` (任意) | ダッシュボードの残り時間・ETA 表示に使う見積もり秒数。強制される `timeoutSec` は変えない。 |
 | `dependsOn` | `["A"]`（= `on: success`）または `[{ "id": "A", "on": "done" }]`。別キューの id も可。 |
 | `idle` | `{ "outputSec": 720, "cpuSec": 720 }`。両方指定必須（出力と CPU の両方が止まったときだけ kill）。 |
 | `maxAttempts`, `retryDelaySec` | 自動再実行（既定 2）と試行間の待ち。 |
@@ -38,6 +39,7 @@ hancho-cli.exe taskqueue wait main --since 0 --timeout-ms 30000
 | `cwd`, `env`, `killExclude`, `priority` | 作業ディレクトリ、追加環境変数、ツリー kill 除外イメージ名、優先度。 |
 | `resources` | `{ "write": [...], "read": [...] }`。パス/glob（`cwd` 基準。ファイル名だけの `Foo.cs` は `**/Foo.cs`）または `@name` ロック。集合が重なる（write/write、write/read）ジョブはキューをまたいでも同時に実行しない。read 同士は並列可。デフォルトはオン（設定画面のチェックボックス）。[resource-locks-ja.md](resource-locks-ja.md) を参照。 |
 | `instructionsFile` / `instructionsText` | 任意の指示書。ジョブに複製され、版ごとに実体化される。 |
+| `memory` | `{ "inject": true, "budgetChars": 1500, "scopes": ["job","file","project"] }` — 起動時に `memory_brief` を指示書へ注入する。既定はオフ。`{memory}` の位置に展開し、プレースホルダがなければ末尾に足す。ファイルスコープは `resources` と前回の `filesEdited` から決める。注入した id は試行の `memory_refs` に残る。`includeAgentNotes: false` でエージェントが書いた L2 ノートを除ける。 |
 
 **発行元: どのセッションが追加したジョブか**
 
@@ -62,6 +64,27 @@ hancho-cli.exe taskqueue wait main --since 0 --timeout-ms 30000
 | `blocked` | success 依存が失敗/キャンセル。依存を直して `taskqueue_retry` すると blocked の後続も自動で戻る。 |
 | `running` | 試行（1 つの managed process）が実行中。 |
 | `succeeded` / `failed` / `cancelled` | 終了状態。failed は `maxAttempts` まで自動再実行。 |
+
+**失敗の診断と `failure-rules.json`**
+
+失敗した試行には診断 (`failure`) が付きます（試行と `jobAttemptFailed` / `jobFailed` イベント）。内容は `class`, `confidence`, `summary`, `detail`, `evidence`, `lastActivity`, `suggestedAction`, `retryAt` です。`hancho-cli taskqueue why <id>`、GUI、MCP の `taskqueue_get` / `taskqueue_wait`、memory の集計が同じレコードを使います。
+
+規則は順序付きで決定的です（最初に当たったものを採用）。組み込み規則に加えて `<data-dir>/failure-rules.json` で分類を追加でき、同じ `class` の組み込み規則より先に評価されます（外部規則はファイル順で、組み込みより前）。
+
+```json
+{
+  "rules": [
+    { "class": "auth_error", "when": { "logRegex": "(?i)(invalid api key|401 unauthorized)" },
+      "confidence": "high", "action": "human" },
+    { "class": "lint_error", "when": { "jobName": "lint", "exitCode": [2], "logRegex": "(?i)problems? found" },
+      "summary": "Lint の指摘あり", "action": "fix_spec" }
+  ]
+}
+```
+
+`when` の条件はすべて満たす必要があります。指定できるのは `jobName`, `taskqueue`, `endKind`, `exitCode`（数値または配列）, `logRegex`, `eventKind`, `eventRegex`, `launchFailed`, `cancelled`, `interrupted` です。`logRegex` と `eventRegex` は先頭の `(?i)` で大文字小文字を無視できます。正規表現が不正な規則は単に一致しません。`summary`, `detail`, `confidence` (`high` / `medium` / `low`), `action` は任意です。`logRegex` / `eventRegex` がある規則は一致したログ行またはイベント `seq` を証拠にし、それ以外は最後のログ行またはタスクキューイベントを指します。
+
+規則で決まらない（`class` が `unknown` か `confidence` が `low`）ときだけ、既存の BT `escalate` で LLM に見立てを頼めます。渡すのは証拠だけ（試行情報、正規化イベントの末尾、ログの末尾）で、コマンド・環境変数・指示書は渡しません。答えは `failure.llmGuess` に `confidence: "low"` と `advisory: true` を付けた参考欄として保存します。`class`, `confidence`, `suggestedAction`, `retryAt` は変わらず、自動再試行の判断にも使いません。LLM が使えない、または不正な JSON を返した場合も、決定的な診断はそのまま残ります。外部規則で追加した分類も、組み込みと同じく `memory stats` やダッシュボードの失敗分類の集計に反映されます。`retry.on` / `retry.never` にも指定できます。
 
 **ChainGuard:** `start_process` / `taskqueue_add` / `taskqueue_update` は `&&`, `||`, 単独 `&`, PowerShell `;`, 改行連鎖, 待ちループ（`while` + `Test-Path`, `goto` ループ）を拒否します。コマンドをジョブに分割するのが正しい対処です。CLI の `--allow-chain` は単一プロセス用の例外で、MCP には公開しません。
 

@@ -1,7 +1,9 @@
 #include "behavior_tree_internal.h"
 #include "common.h"
 
+#ifdef _WIN32
 #include <windows.h>
+#endif
 #include <algorithm>
 
 namespace pc {
@@ -9,12 +11,10 @@ namespace pc {
 namespace {
 
 uint64_t CaptureStartFiletimeWithGuard() {
-    Sleep(2);
-    FILETIME ft = {};
-    GetSystemTimeAsFileTime(&ft);
-    uint64_t val = (static_cast<uint64_t>(ft.dwHighDateTime) << 32) | ft.dwLowDateTime;
-    Sleep(2);
-    return val;
+    SleepMs(2);
+    uint64_t value = GetSystemTimeAsFiletime100ns();
+    SleepMs(2);
+    return value;
 }
 
 bool IsConditionType(const std::string& t) {
@@ -171,7 +171,7 @@ void BehaviorTree::Impl::TickNode(BehaviorTree& bt, BtNode& node, int64_t nowMs)
 
             BtJobSpec spec{bt.id_, node.id, node.nodeKey, node.runs, proposedId, node.queueName,
                            expCmd, expSummary,
-                           expCwd, node.timeoutSec, std::move(expEnv), node.success, node.idle,
+                           expCwd, node.timeoutSec, node.estimateSec, std::move(expEnv), node.success, node.idle,
                            std::move(expRes), expInstr, node.maxAttempts};
             node.isWorkerJob = false;
             if (bt.runner_) jobId = bt.runner_->StartJob(spec);
@@ -195,7 +195,7 @@ void BehaviorTree::Impl::TickNode(BehaviorTree& bt, BtNode& node, int64_t nowMs)
 
             BtWorkerSpec wspec{bt.id_, node.id, node.nodeKey, node.runs, proposedId, node.queueName,
                                effEng, effMod,
-                               expPrompt, expSummary, expCwd, node.timeoutSec, std::move(expEnv),
+                               expPrompt, expSummary, expCwd, node.timeoutSec, node.estimateSec, std::move(expEnv),
                                node.success, node.idle, std::move(expRes), node.outputSchema};
             node.isWorkerJob = true;
             if (bt.runner_) jobId = bt.runner_->StartWorker(wspec);

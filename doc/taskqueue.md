@@ -30,6 +30,7 @@ hancho-cli.exe taskqueue wait main --since 0 --timeout-ms 30000
 | `id`, `command` | Job id (unique across all queues) and exactly one command. |
 | `summary` (required) | One line, <=200 chars. Substituted for `{summary}` and exported as `PC_JOB_SUMMARY`. |
 | `timeoutSec` (required) | Per-job limit. Never summed. Must be <= the queue `maxTimeoutSec` (default 7200). |
+| `estimateSec` (optional) | Expected duration used by the dashboard's remaining/ETA display. It does not change the enforced `timeoutSec`. |
 | `dependsOn` | `["A"]` (same as `on: success`) or `[{ "id": "A", "on": "done" }]`. Cross-queue ids are allowed. |
 | `idle` | `{ "outputSec": 720, "cpuSec": 720 }`; both must be set (output **and** CPU idle). |
 | `maxAttempts`, `retryDelaySec` | Automatic retries (default 2) and delay between attempts. |
@@ -38,6 +39,7 @@ hancho-cli.exe taskqueue wait main --since 0 --timeout-ms 30000
 | `cwd`, `env`, `killExclude`, `priority` | Working directory, extra environment, image names excluded from tree kill, scheduling priority. |
 | `resources` | `{ "write": [...], "read": [...] }`: paths/globs (relative to `cwd`; a bare file name `Foo.cs` means `**/Foo.cs`) or `@name` locks. Jobs whose sets overlap (write/write, write/read) never run together, across all queues; read/read may. On by default (Settings checkbox). See [resource-locks.md](resource-locks.md). |
 | `instructionsFile` / `instructionsText` | Optional instructions captured into the job and materialized per revision. |
+| `memory` | `{ "inject": true, "budgetChars": 1500, "scopes": ["job","file","project"] }` — inject `memory_brief` into the instructions at launch. Off by default. The brief is expanded at `{memory}`, or appended when the placeholder is absent. The file scope comes from `resources` and the previous run's `filesEdited`. The injected ids are recorded as `memory_refs` on the attempt. `includeAgentNotes: false` leaves out L2 notes written by agents. |
 
 **Origin: which session added a job**
 
@@ -62,6 +64,27 @@ Jobs that a behavior tree adds carry the origin of the `bt_start` call. The dash
 | `blocked` | A success-dependency failed/cancelled. Fix it and `taskqueue_retry` the dependency; blocked dependents are requeued automatically. |
 | `running` | An attempt (one managed process) is executing. |
 | `succeeded` / `failed` / `cancelled` | Terminal states. Failed jobs auto-retry up to `maxAttempts`. |
+
+**Failure diagnosis and `failure-rules.json`**
+
+Each failed attempt gets a diagnosis (`failure` on the attempt and on `jobAttemptFailed` / `jobFailed` events): `class`, `confidence`, `summary`, `detail`, `evidence`, `lastActivity`, `suggestedAction` and `retryAt`. `hancho-cli taskqueue why <id>` prints it; the GUI, MCP `taskqueue_get` / `taskqueue_wait` and memory stats use the same record.
+
+Rules are ordered and deterministic: the first match wins. In addition to the built-in rules, `<data-dir>/failure-rules.json` can add classes or take precedence over a built-in rule with the same class. External rules run before the built-ins, in file order.
+
+```json
+{
+  "rules": [
+    { "class": "auth_error", "when": { "logRegex": "(?i)(invalid api key|401 unauthorized)" },
+      "confidence": "high", "action": "human" },
+    { "class": "lint_error", "when": { "jobName": "lint", "exitCode": [2], "logRegex": "(?i)problems? found" },
+      "summary": "Lint reported findings", "action": "fix_spec" }
+  ]
+}
+```
+
+Every condition in `when` must hold. Supported conditions: `jobName`, `taskqueue`, `endKind`, `exitCode` (number or array), `logRegex`, `eventKind`, `eventRegex`, `launchFailed`, `cancelled`, `interrupted`. `logRegex` and `eventRegex` accept a leading `(?i)` for case-insensitive matching; an invalid regex simply does not match. `summary`, `detail`, `confidence` (`high` / `medium` / `low`) and `action` are optional. A rule with `logRegex` or `eventRegex` points its evidence at the matched log line or event `seq`; other rules fall back to the last log line or task-queue event.
+
+When the rules leave the failure undecided (`class: "unknown"` or `confidence: "low"`), an existing BT `escalate` node may ask an LLM for a second opinion. Pass it only the evidence packet (attempt facts, the tail of the normalized events and the tail of the log), never the command, environment or instructions. Store the answer in the composite reference column: it is written as `failure.llmGuess` with `confidence: "low"` and `advisory: true`. It never changes `class`, `confidence`, `suggestedAction` or `retryAt`, and automatic retry ignores it. If the LLM is unavailable or returns invalid JSON, the deterministic diagnosis is unchanged. External classes flow into `memory stats` and the dashboard failure-class counts exactly like built-in classes. They can also be named in `retry.on` / `retry.never`.
 
 **ChainGuard:** `start_process`, `taskqueue_add` and `taskqueue_update` reject `&&`, `||`, a single `&`, PowerShell `;`, newline chains, and polling loops (`while` + `Test-Path`, `goto` loops). Splitting commands into jobs is the intended fix. CLI `--allow-chain` bypasses the guard for a single process; MCP never exposes it.
 

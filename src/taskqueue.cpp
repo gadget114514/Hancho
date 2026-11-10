@@ -1,6 +1,10 @@
 #include "taskqueue.h"
 #include "common.h"
 #include "chain_guard.h"
+#include "event_schema.h"
+#include "memory_search.h"
+#include "memory_record.h"
+#include "platform/platform.h"
 #include <sstream>
 #include <algorithm>
 #include <functional>
@@ -14,6 +18,15 @@
 #include <stdexcept>
 
 namespace pc {
+
+// Defined with the process/log helpers further down; the restart path in the constructor
+// classifies the interrupted attempt before those definitions.
+static std::wstring GetTaskQueueLogDirWide();
+static std::wstring GetAttemptLogPathWide(const std::string& jobId, int n);
+static void AppendRunRecordForAttempt(const TaskQueue& tq, const TaskQueueJob& job,
+                                      const TaskQueueAttempt& attempt,
+                                      const TaskQueueFailureInput& fin,
+                                      const std::string& logText);
 
 std::string TaskQueueStateToString(TaskQueueState state) {
     switch (state) {
@@ -59,31 +72,30 @@ static std::wstring QueueNameComponentWide(const std::string& name) {
 }
 
 std::wstring TaskQueueManager::GetTaskQueuesDirWide() {
-    std::wstring dir = GetLogsDirectoryWide();
-    dir += L"\\taskqueues";
-    CreateDirectoryW(dir.c_str(), nullptr);
+    std::wstring dir = PathJoinWide(GetLogsDirectoryWide(), L"taskqueues");
+    EnsureDirectoryWide(dir);
     return dir;
 }
 
 std::wstring TaskQueueManager::GetTaskQueueFileWide(const std::string& name) {
-    return GetTaskQueuesDirWide() + L"\\" + QueueNameComponentWide(name) + L".json";
+    return PathJoinWide(GetTaskQueuesDirWide(), QueueNameComponentWide(name)) + L".json";
 }
 
 std::wstring TaskQueueManager::GetInstructionsDirWide(const std::string& name) {
-    std::wstring base = GetTaskQueuesDirWide() + L"\\" + QueueNameComponentWide(name);
-    CreateDirectoryW(base.c_str(), nullptr);
-    std::wstring dir = base + L"\\instructions";
-    CreateDirectoryW(dir.c_str(), nullptr);
+    std::wstring base = PathJoinWide(GetTaskQueuesDirWide(), QueueNameComponentWide(name));
+    EnsureDirectoryWide(base);
+    std::wstring dir = PathJoinWide(base, L"instructions");
+    EnsureDirectoryWide(dir);
     return dir;
 }
 
 std::wstring TaskQueueManager::GetInstructionsFileWide(const std::string& name, const std::string& jobId, int rev) {
     std::wstring fileName = Utf8ToWide(SanitizeFileNameComponent(jobId)) + L".r" + std::to_wstring(rev) + L".md";
-    return GetInstructionsDirWide(name) + L"\\" + fileName;
+    return PathJoinWide(GetInstructionsDirWide(name), fileName);
 }
 
 std::wstring TaskQueueManager::GetTaskEventsFileWide(const std::string& name) {
-    return GetLogsDirectoryWide() + L"\\taskqueue-" + QueueNameComponentWide(name) + L".events.jsonl";
+    return PathJoinWide(GetLogsDirectoryWide(), L"taskqueue-" + QueueNameComponentWide(name) + L".events.jsonl");
 }
 
 // ---------------------------------------------------------------------------
@@ -283,6 +295,7 @@ static std::string BuildErrorJson(const std::string& msg) {
 static std::string NormalizeJobJsonKeys(const std::string& in) {
     static const char* kPairs[][2] = {
         {"timeoutSec", "timeout_sec"},
+        {"estimateSec", "estimate_sec"},
         {"maxAttempts", "max_attempts"},
         {"retryDelaySec", "retry_delay_sec"},
         {"exitCodes", "exit_codes"},
@@ -295,7 +308,10 @@ static std::string NormalizeJobJsonKeys(const std::string& in) {
         {"cpuSec", "cpu_sec"},
         {"exitCode", "exit_code"},
         {"filesNewer", "files_newer"},
-        {"outputRegex", "output_regex"}
+        {"outputRegex", "output_regex"},
+        {"budgetChars", "budget_chars"},
+        {"includeAgentNotes", "include_agent_notes"},
+        {"waitForRateLimit", "wait_for_rate_limit"}
     };
     std::string out = in;
     for (const auto& pair : kPairs) {
@@ -318,17 +334,1170 @@ namespace pc {
 // JSON serialization (taskqueue.json format, snake_case keys)
 // ---------------------------------------------------------------------------
 
+static std::string StrArrayToJson(const std::vector<std::string>& v);
+
+// ---------------------------------------------------------------------------
+// Failure classifier (doc/design-v3.md 4.2-4.4)
+//
+// The rules below are evaluated from the top and the first match wins. Each rule
+// records the original event seq or log line it acted on, so a diagnostic can be
+// traced back to the data that produced it.
+// ---------------------------------------------------------------------------
+
+static std::string LowerAscii(std::string s) {
+    for (char& c : s) c = static_cast<char>(std::tolower(static_cast<unsigned char>(c)));
+    return s;
+}
+
+static bool MatchesNoCase(const std::string& text, const char* pattern) {
+    if (text.empty()) return false;
+    try {
+        std::regex re(pattern, std::regex::icase);
+        return std::regex_search(text, re);
+    } catch (const std::regex_error&) {
+        return false;
+    }
+}
+
+// External rules may opt into case-insensitive matching with a leading (?i), the form
+// used in doc/design-v3.md. std::regex's ECMAScript grammar does not parse it.
+static bool PrepareRegex(std::string pattern, bool defaultIcase, std::regex& out) {
+    bool icase = defaultIcase;
+    if (pattern.rfind("(?i)", 0) == 0) {
+        icase = true;
+        pattern.erase(0, 4);
+    } else if (pattern.rfind("(?-i)", 0) == 0) {
+        icase = false;
+        pattern.erase(0, 5);
+    }
+    std::regex::flag_type flags = std::regex::ECMAScript;
+    if (icase) flags |= std::regex::icase;
+    try {
+        out = std::regex(pattern, flags);
+        return true;
+    } catch (const std::regex_error&) {
+        return false;
+    }
+}
+
+static std::vector<std::string> RuleStringList(const nlohmann::json& v) {
+    std::vector<std::string> out;
+    if (v.is_string()) {
+        out.push_back(v.get<std::string>());
+    } else if (v.is_array()) {
+        for (const auto& item : v) {
+            if (item.is_string()) out.push_back(item.get<std::string>());
+        }
+    }
+    return out;
+}
+
+static std::vector<int> RuleIntList(const nlohmann::json& v) {
+    std::vector<int> out;
+    auto add = [&out](const nlohmann::json& item) {
+        if (item.is_number_integer()) out.push_back(static_cast<int>(item.get<int64_t>()));
+        else if (item.is_number_unsigned()) out.push_back(static_cast<int>(item.get<uint64_t>()));
+    };
+    if (v.is_array()) {
+        for (const auto& item : v) add(item);
+    } else {
+        add(v);
+    }
+    return out;
+}
+
+std::string TaskQueueFailureRulesPath() {
+    return WideToUtf8(GetEffectiveDataDirectoryWide()) + "/failure-rules.json";
+}
+
+std::vector<TaskQueueFailureRule> LoadTaskQueueFailureRules(const std::string& path) {
+    std::vector<TaskQueueFailureRule> rules;
+    if (path.empty()) return rules;
+    std::string text = ReadFileUtf8Wide(Utf8ToWide(path));
+    if (text.size() >= 3 && static_cast<unsigned char>(text[0]) == 0xEF &&
+        static_cast<unsigned char>(text[1]) == 0xBB && static_cast<unsigned char>(text[2]) == 0xBF) {
+        text.erase(0, 3);
+    }
+    nlohmann::json root = nlohmann::json::parse(text, nullptr, false);
+    if (root.is_discarded()) return rules;
+    const nlohmann::json* list = nullptr;
+    if (root.is_array()) {
+        list = &root;
+    } else if (root.is_object()) {
+        auto it = root.find("rules");
+        if (it != root.end() && it->is_array()) list = &*it;
+    }
+    if (!list) return rules;
+
+    for (const auto& entry : *list) {
+        if (!entry.is_object()) continue;
+        auto str = [&entry](const char* key) {
+            auto it = entry.find(key);
+            return it != entry.end() && it->is_string() ? it->get<std::string>() : std::string();
+        };
+        TaskQueueFailureRule r;
+        r.failureClass = str("class");
+        if (r.failureClass.empty()) r.failureClass = str("failureClass");
+        if (r.failureClass.empty()) continue;
+
+        auto when = entry.find("when");
+        if (when == entry.end() || !when->is_object()) continue;
+        auto takeStrings = [&when](const char* key, std::vector<std::string>& out) {
+            auto it = when->find(key);
+            if (it != when->end()) out = RuleStringList(*it);
+        };
+        auto takeInts = [&when](const char* key, std::vector<int>& out) {
+            auto it = when->find(key);
+            if (it != when->end()) out = RuleIntList(*it);
+        };
+        takeStrings("jobName", r.jobNames);
+        takeStrings("taskqueue", r.taskqueues);
+        takeStrings("endKind", r.endKinds);
+        takeInts("exitCode", r.exitCodes);
+        if (when->contains("logRegex") && (*when)["logRegex"].is_string()) {
+            r.logRegex = (*when)["logRegex"].get<std::string>();
+        }
+        if (when->contains("eventRegex") && (*when)["eventRegex"].is_string()) {
+            r.eventRegex = (*when)["eventRegex"].get<std::string>();
+        }
+        if (when->contains("eventKind") && (*when)["eventKind"].is_string()) {
+            r.eventKind = (*when)["eventKind"].get<std::string>();
+        }
+        auto takeBool = [&when](const char* key, bool& isSet, bool& value) {
+            auto it = when->find(key);
+            if (it != when->end() && it->is_boolean()) {
+                isSet = true;
+                value = it->get<bool>();
+            }
+        };
+        takeBool("launchFailed", r.launchFailedSet, r.launchFailed);
+        takeBool("cancelled", r.cancelledSet, r.cancelled);
+        takeBool("interrupted", r.interruptedSet, r.interrupted);
+        if (!r.HasConditions()) continue;
+
+        std::string confidence = LowerAscii(str("confidence"));
+        if (confidence == "high" || confidence == "medium" || confidence == "low") {
+            r.confidence = confidence;
+        }
+        r.summary = str("summary");
+        r.suggestedAction = str("action");
+        if (r.suggestedAction.empty()) r.suggestedAction = str("suggestedAction");
+        auto detail = entry.find("detail");
+        if (detail != entry.end() && detail->is_object()) r.detail = *detail;
+        rules.push_back(std::move(r));
+    }
+    return rules;
+}
+
+static std::string JsonScalarToString(const nlohmann::json& v) {
+    if (v.is_string()) return v.get<std::string>();
+    if (v.is_boolean()) return v.get<bool>() ? "true" : "false";
+    if (v.is_number_unsigned()) return std::to_string(v.get<uint64_t>());
+    if (v.is_number_integer()) return std::to_string(v.get<int64_t>());
+    if (v.is_number_float()) return std::to_string(v.get<double>());
+    return "";
+}
+
+static uint64_t JsonUInt64(const nlohmann::json& o, const std::string& key, uint64_t defVal = 0) {
+    auto it = o.find(key);
+    if (it == o.end()) return defVal;
+    if (it->is_number_unsigned()) return it->get<uint64_t>();
+    if (it->is_number_integer()) {
+        int64_t v = it->get<int64_t>();
+        return v < 0 ? defVal : static_cast<uint64_t>(v);
+    }
+    return defVal;
+}
+
+static int64_t JsonInt64(const nlohmann::json& o, const std::string& key, int64_t defVal = 0) {
+    auto it = o.find(key);
+    if (it == o.end()) return defVal;
+    if (it->is_number_unsigned()) return static_cast<int64_t>(it->get<uint64_t>());
+    if (it->is_number_integer()) return it->get<int64_t>();
+    return defVal;
+}
+
+static const nlohmann::json* LastEventOfKind(const std::vector<nlohmann::json>& events,
+                                             const std::string& kind) {
+    const nlohmann::json* found = nullptr;
+    for (const auto& ev : events) {
+        if (ev.is_object() && ev.value("kind", std::string()) == kind) found = &ev;
+    }
+    return found;
+}
+
+template <typename Pred>
+static const nlohmann::json* FindLastEvent(const std::vector<nlohmann::json>& events, Pred pred) {
+    const nlohmann::json* found = nullptr;
+    for (const auto& ev : events) {
+        if (ev.is_object() && pred(ev)) found = &ev;
+    }
+    return found;
+}
+
+static std::string EventDataString(const nlohmann::json& ev, const std::string& key) {
+    auto data = ev.find("data");
+    if (data == ev.end() || !data->is_object()) return "";
+    auto v = data->find(key);
+    if (v == data->end()) return "";
+    return JsonScalarToString(*v);
+}
+
+static int64_t EventDataInt(const nlohmann::json& ev, const std::string& key, int64_t defVal = 0) {
+    auto data = ev.find("data");
+    if (data == ev.end() || !data->is_object()) return defVal;
+    auto v = data->find(key);
+    if (v == data->end()) return defVal;
+    if (v->is_number_unsigned()) return static_cast<int64_t>(v->get<uint64_t>());
+    if (v->is_number_integer()) return v->get<int64_t>();
+    if (v->is_string()) {
+        try { return std::stoll(v->get<std::string>()); } catch (...) { return defVal; }
+    }
+    return defVal;
+}
+
+static bool EventDataBool(const nlohmann::json& ev, const std::string& key, bool defVal) {
+    auto data = ev.find("data");
+    if (data == ev.end() || !data->is_object()) return defVal;
+    auto v = data->find(key);
+    if (v == data->end()) return defVal;
+    if (v->is_boolean()) return v->get<bool>();
+    if (v->is_string()) return LowerAscii(v->get<std::string>()) == "true";
+    return defVal;
+}
+
+static uint64_t EventSeqOf(const nlohmann::json& ev) {
+    auto it = ev.find("seq");
+    if (it == ev.end()) return 0;
+    if (it->is_number_unsigned()) return it->get<uint64_t>();
+    if (it->is_number_integer()) return static_cast<uint64_t>(it->get<int64_t>());
+    return 0;
+}
+
+// "2026-11-10T09:12:33.120Z" (or without the fraction/zone) to UTC epoch seconds.
+static int64_t ParseIsoUtcSec(const std::string& s) {
+    int y = 0, mo = 0, d = 0, h = 0, mi = 0, se = 0;
+    char sep = 0;
+    if (std::sscanf(s.c_str(), "%d-%d-%d%c%d:%d:%d", &y, &mo, &d, &sep, &h, &mi, &se) < 7) return 0;
+    if (sep != 'T' && sep != ' ') return 0;
+    std::tm tmv = {};
+    tmv.tm_year = y - 1900;
+    tmv.tm_mon = mo - 1;
+    tmv.tm_mday = d;
+    tmv.tm_hour = h;
+    tmv.tm_min = mi;
+    tmv.tm_sec = se;
+    return static_cast<int64_t>(_mkgmtime64(&tmv));
+}
+
+static std::string EpochToIso8601Local(int64_t epochSec) {
+    time_t t = static_cast<time_t>(epochSec);
+    std::tm local = {};
+    if (localtime_s(&local, &t) != 0) return "";
+    char base[32] = {};
+    if (std::strftime(base, sizeof(base), "%Y-%m-%dT%H:%M:%S", &local) == 0) return "";
+    std::tm asLocal = local;
+    std::tm asUtc = local;
+    std::time_t localEpoch = std::mktime(&asLocal);
+    std::time_t utcEpoch = _mkgmtime64(&asUtc);
+    long long offsetSec = static_cast<long long>(utcEpoch) - static_cast<long long>(localEpoch);
+    if (offsetSec == 0) return std::string(base) + "Z";
+    char sign = offsetSec < 0 ? '-' : '+';
+    long long absSec = offsetSec < 0 ? -offsetSec : offsetSec;
+    char off[8] = {};
+    std::snprintf(off, sizeof(off), "%c%02lld:%02lld", sign, absSec / 3600, (absSec % 3600) / 60);
+    return std::string(base) + off;
+}
+
+static int CountTextLines(const std::string& text) {
+    if (text.empty()) return 0;
+    int n = 0;
+    for (char c : text) {
+        if (c == '\n') n++;
+    }
+    if (text.back() != '\n') n++;
+    return n;
+}
+
+static void FillFailureInputBase(TaskQueueFailureInput& in, const TaskQueueJob& job,
+                                 const TaskQueueAttempt& attempt) {
+    in.jobId = job.id;
+    in.jobName = job.name;
+    in.taskqueue = job.taskqueue;
+    in.attempt = attempt.n;
+    in.maxAttempts = job.maxAttempts;
+    in.expectedExitCode = job.success.exitCode;
+    in.timeoutSec = job.timeoutSec;
+    in.idleOutputSec = job.idle.outputSec;
+    in.idleCpuSec = job.idle.cpuSec;
+    in.filesNewerConfigured = !job.success.filesNewer.empty();
+    in.outputRegexConfigured = !job.success.outputRegex.empty();
+    in.nowEpochSec = static_cast<int64_t>(std::time(nullptr));
+    in.externalRules = LoadTaskQueueFailureRules(TaskQueueFailureRulesPath());
+}
+
+// Keeps the log tail for matching, but remembers where it started in the file so
+// evidence can name a real line number.
+static void FillFailureLog(TaskQueueFailureInput& in, const std::string& fullLog) {
+    if (fullLog.empty()) return;
+    const int kTailLines = 200;
+    int total = CountTextLines(fullLog);
+    in.logText = GetTailLines(fullLog, kTailLines);
+    in.logLastLine = total;
+    int tailLines = CountTextLines(in.logText);
+    in.logFirstLine = total - tailLines + 1;
+    if (in.logFirstLine < 1) in.logFirstLine = 1;
+}
+
+static void AddEventEvidence(TaskQueueFailureDiagnostic& d, const std::string& file, uint64_t seq) {
+    if (file.empty() || seq == 0) return;
+    for (const auto& e : d.evidence) {
+        if (e.events == file && e.seq == seq) return;
+    }
+    TaskQueueFailureEvidence e;
+    e.events = file;
+    e.seq = seq;
+    d.evidence.push_back(e);
+}
+
+static void AddLogEvidence(TaskQueueFailureDiagnostic& d, const std::string& file, int line) {
+    if (file.empty() || line <= 0) return;
+    for (const auto& e : d.evidence) {
+        if (e.log == file && e.line == line) return;
+    }
+    TaskQueueFailureEvidence e;
+    e.log = file;
+    e.line = line;
+    d.evidence.push_back(e);
+}
+
+// At least one pointer back to the source, even when the rule had no direct match.
+static void EnsureEvidence(TaskQueueFailureDiagnostic& d, const TaskQueueFailureInput& in) {
+    if (!d.evidence.empty()) return;
+    if (in.logLastLine > 0 && !in.logFile.empty()) {
+        AddLogEvidence(d, in.logFile, in.logLastLine);
+        return;
+    }
+    AddEventEvidence(d, in.fallbackEventsFile, in.fallbackEventSeq);
+}
+
+// Last line in the log tail matching a pattern, as a file line number (0 when none).
+static int FindLogLineNoCase(const TaskQueueFailureInput& in, const char* pattern) {
+    if (in.logText.empty()) return 0;
+    try {
+        std::regex re(pattern, std::regex::icase);
+        int lineNo = in.logFirstLine;
+        int found = 0;
+        size_t pos = 0;
+        while (pos <= in.logText.size()) {
+            size_t nl = in.logText.find('\n', pos);
+            std::string line = nl == std::string::npos ? in.logText.substr(pos)
+                                                       : in.logText.substr(pos, nl - pos);
+            if (!line.empty() && line.back() == '\r') line.pop_back();
+            if (!line.empty() && std::regex_search(line, re)) found = lineNo;
+            if (nl == std::string::npos) break;
+            pos = nl + 1;
+            ++lineNo;
+        }
+        return found;
+    } catch (const std::regex_error&) {
+        return 0;
+    }
+}
+
+// Last line in the log tail matching an external pattern, as a file line number (0 when none).
+static int FindLogLineRegex(const TaskQueueFailureInput& in, const std::string& pattern) {
+    if (in.logText.empty() || pattern.empty()) return 0;
+    std::regex re;
+    if (!PrepareRegex(pattern, false, re)) return 0;
+    int lineNo = in.logFirstLine;
+    int found = 0;
+    size_t pos = 0;
+    while (pos <= in.logText.size()) {
+        size_t nl = in.logText.find('\n', pos);
+        std::string line = nl == std::string::npos ? in.logText.substr(pos)
+                                                   : in.logText.substr(pos, nl - pos);
+        if (!line.empty() && line.back() == '\r') line.pop_back();
+        if (!line.empty() && std::regex_search(line, re)) found = lineNo;
+        if (nl == std::string::npos) break;
+        pos = nl + 1;
+        ++lineNo;
+    }
+    return found;
+}
+
+static std::string EventMatchText(const nlohmann::json& ev) {
+    std::string message = EventDataString(ev, "message");
+    if (!message.empty()) return message;
+    auto data = ev.find("data");
+    if (data != ev.end() && !data->is_null()) return data->dump();
+    return "";
+}
+
+static const nlohmann::json* FindExternalRuleEvent(const TaskQueueFailureRule& rule,
+                                                   const TaskQueueFailureInput& in) {
+    if (rule.eventKind.empty() && rule.eventRegex.empty()) return nullptr;
+    std::regex re;
+    bool useRegex = !rule.eventRegex.empty();
+    if (useRegex && !PrepareRegex(rule.eventRegex, false, re)) return nullptr;
+    const nlohmann::json* found = nullptr;
+    for (const auto& ev : in.events) {
+        if (!ev.is_object()) continue;
+        if (!rule.eventKind.empty() && ev.value("kind", std::string()) != rule.eventKind) continue;
+        if (useRegex && !std::regex_search(EventMatchText(ev), re)) continue;
+        found = &ev;
+    }
+    return found;
+}
+
+static bool MatchExternalRule(const TaskQueueFailureRule& rule, const TaskQueueFailureInput& in,
+                              int& logLine, const nlohmann::json*& event) {
+    logLine = 0;
+    event = nullptr;
+    if (!rule.HasConditions()) return false;
+    if (!rule.exitCodes.empty()) {
+        if (std::find(rule.exitCodes.begin(), rule.exitCodes.end(), in.exitCode) == rule.exitCodes.end()) {
+            return false;
+        }
+    }
+    auto matchesOneOf = [](const std::vector<std::string>& values, const std::string& actual) {
+        if (values.empty()) return true;
+        for (const auto& v : values) {
+            if (LowerAscii(v) == LowerAscii(actual)) return true;
+        }
+        return false;
+    };
+    if (!matchesOneOf(rule.jobNames, in.jobName)) return false;
+    if (!matchesOneOf(rule.taskqueues, in.taskqueue)) return false;
+    if (!matchesOneOf(rule.endKinds, in.endKind)) return false;
+    if (rule.launchFailedSet && in.launchFailed != rule.launchFailed) return false;
+    if (rule.cancelledSet && in.cancelled != rule.cancelled) return false;
+    if (rule.interruptedSet && in.interrupted != rule.interrupted) return false;
+    if (!rule.logRegex.empty()) {
+        logLine = FindLogLineRegex(in, rule.logRegex);
+        if (logLine <= 0) return false;
+    }
+    if (!rule.eventKind.empty() || !rule.eventRegex.empty()) {
+        event = FindExternalRuleEvent(rule, in);
+        if (!event) return false;
+    }
+    return true;
+}
+
+static void FillFromExternalRule(TaskQueueFailureDiagnostic& d, const TaskQueueFailureRule& rule,
+                                 int logLine, const nlohmann::json* event,
+                                 const TaskQueueFailureInput& in) {
+    d.failureClass = rule.failureClass;
+    d.confidence = rule.confidence.empty() ? "high" : rule.confidence;
+    d.summary = rule.summary.empty()
+        ? "An external failure rule classified this as " + rule.failureClass + "."
+        : rule.summary;
+    d.detail = rule.detail.is_object() ? rule.detail : nlohmann::json::object();
+    d.detail["rule"] = "external." + rule.failureClass;
+    d.detail["external"] = true;
+    d.suggestedAction = rule.suggestedAction.empty() ? "retry" : rule.suggestedAction;
+    if (event) AddEventEvidence(d, in.eventsFile, EventSeqOf(*event));
+    if (logLine > 0) AddLogEvidence(d, in.logFile, logLine);
+    EnsureEvidence(d, in);
+    if (!in.llmGuessJson.empty() && TaskQueueFailureNeedsLlmGuess(d)) {
+        ApplyTaskQueueFailureLlmGuess(d, in.llmGuessJson);
+    }
+}
+
+static bool IsCrashExitCode(int exitCode) {
+    uint32_t u = static_cast<uint32_t>(exitCode);
+    if (u == 0xFFFFFFFFu) return false; // a plain `exit(-1)`, not an NTSTATUS exception
+    if (u >= 0xC0000000u) return true; // NTSTATUS exception (access violation, stack overflow, ...)
+    if (u == 0x40000015u) return true; // fatal application exit
+    return false;
+}
+
+static std::string SuccessConditionOf(const std::string& detail) {
+    if (detail.rfind("missing file:", 0) == 0 ||
+        detail.rfind("file not newer", 0) == 0 ||
+        detail.rfind("cannot read mtime", 0) == 0) {
+        return "filesNewer";
+    }
+    if (detail.find("output_regex") != std::string::npos) return "outputRegex";
+    if (detail.rfind("exit code ", 0) == 0) return "exitCode";
+    return "";
+}
+
+static int CountUnfinishedPlanItems(const nlohmann::json& ev) {
+    auto data = ev.find("data");
+    if (data == ev.end() || !data->is_object()) return 0;
+    auto items = data->find("items");
+    if (items == data->end() || !items->is_array()) return 0;
+    int remaining = 0;
+    for (const auto& item : *items) {
+        if (!item.is_object()) continue;
+        auto st = item.find("status");
+        std::string status = st == item.end() ? std::string() : LowerAscii(JsonScalarToString(*st));
+        if (status.empty()) continue;
+        if (status != "completed" && status != "done" && status != "cancelled") remaining++;
+    }
+    return remaining;
+}
+
+struct ToolErrorLoop {
+    bool found = false;
+    std::string tool;
+    int errors = 0;
+    uint64_t lastSeq = 0;
+};
+
+static ToolErrorLoop FindToolErrorLoop(const std::vector<nlohmann::json>& events) {
+    std::map<std::string, std::string> toolByUseId;
+    for (const auto& ev : events) {
+        if (!ev.is_object() || ev.value("kind", std::string()) != "tool.call") continue;
+        std::string useId = EventDataString(ev, "toolUseId");
+        std::string tool = EventDataString(ev, "tool");
+        if (!useId.empty() && !tool.empty()) toolByUseId[useId] = tool;
+    }
+    std::map<std::string, int> counts;
+    std::map<std::string, uint64_t> lastSeq;
+    for (const auto& ev : events) {
+        if (!ev.is_object() || ev.value("kind", std::string()) != "tool.result") continue;
+        if (EventDataBool(ev, "ok", true)) continue;
+        std::string useId = EventDataString(ev, "toolUseId");
+        std::string tool = toolByUseId.count(useId) ? toolByUseId[useId] : std::string("tool");
+        counts[tool]++;
+        lastSeq[tool] = EventSeqOf(ev);
+    }
+    ToolErrorLoop out;
+    for (const auto& [tool, n] : counts) {
+        if (n > out.errors) {
+            out.errors = n;
+            out.tool = tool;
+            out.lastSeq = lastSeq[tool];
+        }
+    }
+    out.found = out.errors >= 3;
+    return out;
+}
+
+static void FillLastActivity(TaskQueueFailureDiagnostic& d, const TaskQueueFailureInput& in,
+                             int64_t nowEpochSec) {
+    for (auto it = in.events.rbegin(); it != in.events.rend(); ++it) {
+        if (!it->is_object() || it->value("kind", std::string()) != "tool.call") continue;
+        std::string activity = EventDataString(*it, "activity");
+        if (activity.empty()) continue;
+        d.lastActivity.activity = activity;
+        d.lastActivity.target = EventDataString(*it, "target");
+        int64_t ts = ParseIsoUtcSec(it->value("ts", std::string()));
+        if (nowEpochSec > 0 && ts > 0 && nowEpochSec >= ts) d.lastActivity.sinceSec = nowEpochSec - ts;
+        return;
+    }
+    if (in.lastActivity.empty() && in.lastActivityTarget.empty()) return;
+    d.lastActivity.activity = in.lastActivity;
+    d.lastActivity.target = in.lastActivityTarget;
+    d.lastActivity.sinceSec = in.lastActivitySinceSec;
+}
+
+TaskQueueFailureDiagnostic ClassifyTaskQueueFailure(const TaskQueueFailureInput& in) {
+    // Patterns are the built-in "fixed wording" the design refers to. They are tried in
+    // this order only where a rule is reached; the rules themselves run top to bottom.
+    static const char* kRatePattern =
+        "(rate.?limit|too many requests|usage limit|quota exceeded|insufficient quota|resource exhausted|\\b429\\b)";
+    static const char* kAuthPattern =
+        "(invalid api key|invalid_api_key|invalid x-api-key|api key not valid|missing api key|"
+        "401 unauthorized|authentication failed|not authenticated|unauthorized request)";
+    static const char* kPermissionPattern =
+        "(permission denied|permission_denied|access is denied|not permitted|eacces|operation not permitted)";
+    static const char* kTurnPattern =
+        "(max_turns|maximum number of turns|turn limit|context length|context window|maximum context|"
+        "prompt is too long|too many tokens|token limit)";
+
+    TaskQueueFailureDiagnostic d;
+    d.detail = nlohmann::json::object();
+    const int64_t now = in.nowEpochSec > 0 ? in.nowEpochSec : static_cast<int64_t>(std::time(nullptr));
+    FillLastActivity(d, in, now);
+
+    // 0. External rules from <data-dir>/failure-rules.json run first, so they can add a
+    // class or take precedence over a built-in rule with the same class. The order in the
+    // file is preserved and the first match wins, just like the built-in chain.
+    for (const auto& rule : in.externalRules) {
+        int logLine = 0;
+        const nlohmann::json* event = nullptr;
+        if (!MatchExternalRule(rule, in, logLine, event)) continue;
+        FillFromExternalRule(d, rule, logLine, event, in);
+        return d;
+    }
+
+    // Pre-read the normalized events once so the rules stay cheap and deterministic.
+    const nlohmann::json* rateEvent = nullptr;
+    for (const auto& ev : in.events) {
+        if (!ev.is_object() || ev.value("kind", std::string()) != "rate_limit") continue;
+        if (LowerAscii(EventDataString(ev, "status")) == "rejected") rateEvent = &ev;
+    }
+    const nlohmann::json* rateError = FindLastEvent(in.events, [&](const nlohmann::json& ev) {
+        return ev.value("kind", std::string()) == "error" &&
+               MatchesNoCase(EventDataString(ev, "message"), kRatePattern);
+    });
+    const nlohmann::json* authEvent = FindLastEvent(in.events, [&](const nlohmann::json& ev) {
+        return ev.value("kind", std::string()) == "error" &&
+               MatchesNoCase(EventDataString(ev, "message"), kAuthPattern);
+    });
+    const nlohmann::json* permissionEvent = FindLastEvent(in.events, [&](const nlohmann::json& ev) {
+        return ev.value("kind", std::string()) == "error" &&
+               MatchesNoCase(EventDataString(ev, "message"), kPermissionPattern);
+    });
+    const nlohmann::json* runEnded = LastEventOfKind(in.events, "run.ended");
+    const nlohmann::json* turnEvent = FindLastEvent(in.events, [&](const nlohmann::json& ev) {
+        return ev.value("kind", std::string()) == "error" &&
+               MatchesNoCase(EventDataString(ev, "message"), kTurnPattern);
+    });
+    const nlohmann::json* planEvent = LastEventOfKind(in.events, "plan");
+    const ToolErrorLoop toolLoop = FindToolErrorLoop(in.events);
+
+    const bool completed = in.endKind == "completed";
+
+    // 1. launch_error: the process never started.
+    if (in.launchFailed) {
+        d.failureClass = "launch_error";
+        d.confidence = "high";
+        d.summary = "The process could not be started.";
+        d.detail["rule"] = "builtin.launch_error";
+        if (!in.checkDetail.empty()) d.detail["error"] = in.checkDetail;
+        d.suggestedAction = "fix_spec";
+        EnsureEvidence(d, in);
+        return d;
+    }
+
+    // 2. killed: a caller stopped the job, or Hancho restarted under a running attempt.
+    if (in.interrupted || in.cancelled || in.endKind == "killed") {
+        d.failureClass = "killed";
+        d.confidence = "high";
+        d.detail["rule"] = "builtin.killed";
+        if (in.interrupted) {
+            d.summary = "Hancho restarted while the attempt was running.";
+            d.detail["reason"] = "interrupted";
+            d.suggestedAction = "retry"; // interrupted attempts are re-run by design
+        } else {
+            d.summary = "The job was cancelled; the attempt was stopped.";
+            d.detail["reason"] = "cancelled";
+            d.suggestedAction = "human";
+        }
+        AddLogEvidence(d, in.logFile, in.logLastLine);
+        EnsureEvidence(d, in);
+        return d;
+    }
+
+    // 3. timeout: the attempt exceeded timeoutSec and was terminated.
+    if (in.endKind == "timed_out") {
+        d.failureClass = "timeout";
+        d.confidence = "high";
+        d.summary = "The attempt did not finish within " + std::to_string(in.timeoutSec) + " s.";
+        d.detail["rule"] = "builtin.timeout";
+        d.detail["timeoutSec"] = in.timeoutSec;
+        if (in.elapsedSec > 0) d.detail["elapsedSec"] = in.elapsedSec;
+        d.suggestedAction = "raise_timeout";
+        AddLogEvidence(d, in.logFile, in.logLastLine);
+        EnsureEvidence(d, in);
+        return d;
+    }
+
+    // 4. idle_stall: output and CPU activity stopped.
+    if (in.endKind == "idle_timed_out") {
+        d.failureClass = "idle_stall";
+        d.confidence = "high";
+        d.summary = "Output and CPU activity stopped for " + std::to_string(in.idleOutputSec) + " s.";
+        d.detail["rule"] = "builtin.idle_stall";
+        d.detail["idleOutputSec"] = in.idleOutputSec;
+        d.detail["idleCpuSec"] = in.idleCpuSec;
+        d.suggestedAction = "retry";
+        AddLogEvidence(d, in.logFile, in.logLastLine);
+        EnsureEvidence(d, in);
+        return d;
+    }
+
+    // 5. rate_limited: a rejected rate_limit event, or an equivalent error/log line.
+    if (rateEvent || rateError) {
+        const nlohmann::json& ev = rateEvent ? *rateEvent : *rateError;
+        d.failureClass = "rate_limited";
+        d.confidence = rateEvent ? "high" : "medium";
+        d.detail["rule"] = "builtin.rate_limited";
+        std::string window = EventDataString(ev, "window");
+        if (!window.empty()) d.detail["window"] = window;
+        std::string status = EventDataString(ev, "status");
+        if (!status.empty()) d.detail["status"] = status;
+        int64_t resets = EventDataInt(ev, "resetsAt", 0);
+        if (resets > 0) {
+            std::string iso = EpochToIso8601Local(resets);
+            if (!iso.empty()) d.detail["resetsAt"] = iso;
+            d.detail["resetsAtEpochSec"] = resets;
+            std::string retryIso = EpochToIso8601Local(resets + 30);
+            if (!retryIso.empty()) d.retryAt = retryIso;
+        }
+        auto util = ev.find("data");
+        if (util != ev.end() && util->is_object()) {
+            auto u = util->find("utilization");
+            if (u != util->end() && u->is_number()) d.detail["utilization"] = *u;
+        }
+        d.summary = window.empty() ? "The agent was rate limited; wait before retrying."
+                                   : "Rejected by the " + window + " rate limit; wait before retrying.";
+        d.suggestedAction = "retry_after";
+        AddEventEvidence(d, in.eventsFile, EventSeqOf(ev));
+        EnsureEvidence(d, in);
+        return d;
+    }
+    {
+        int line = FindLogLineNoCase(in, kRatePattern);
+        if (line > 0) {
+            d.failureClass = "rate_limited";
+            d.confidence = "medium";
+            d.summary = "The log reports a rate limit; wait before retrying.";
+            d.detail["rule"] = "builtin.rate_limited";
+            d.detail["source"] = "log";
+            d.suggestedAction = "retry_after";
+            AddLogEvidence(d, in.logFile, line);
+            return d;
+        }
+    }
+
+    // 6. auth_error: an authentication error event, or the same wording in the log.
+    if (authEvent) {
+        d.failureClass = "auth_error";
+        d.confidence = "high";
+        std::string msg = EventDataString(*authEvent, "message");
+        d.summary = msg.empty() ? "Authentication failed." : "Authentication failed: " + msg;
+        d.detail["rule"] = "builtin.auth_error";
+        if (!msg.empty()) d.detail["message"] = msg;
+        d.suggestedAction = "human";
+        AddEventEvidence(d, in.eventsFile, EventSeqOf(*authEvent));
+        EnsureEvidence(d, in);
+        return d;
+    }
+    {
+        int line = FindLogLineNoCase(in, kAuthPattern);
+        if (line > 0) {
+            d.failureClass = "auth_error";
+            d.confidence = "high";
+            d.summary = "The log reports an authentication failure.";
+            d.detail["rule"] = "builtin.auth_error";
+            d.detail["source"] = "log";
+            d.suggestedAction = "human";
+            AddLogEvidence(d, in.logFile, line);
+            return d;
+        }
+    }
+
+    // 7. permission_denied: explicit denials, or a non-zero permission_denials count.
+    {
+        int64_t denials = runEnded ? EventDataInt(*runEnded, "permissionDenials", 0) : 0;
+        if (permissionEvent || denials > 0) {
+            d.failureClass = "permission_denied";
+            d.confidence = permissionEvent ? "high" : "medium";
+            d.detail["rule"] = "builtin.permission_denied";
+            if (permissionEvent) {
+                std::string msg = EventDataString(*permissionEvent, "message");
+                if (!msg.empty()) d.detail["message"] = msg;
+                d.summary = msg.empty() ? "A tool call was denied by permissions."
+                                        : "Permission denied: " + msg;
+            } else {
+                d.detail["permissionDenials"] = denials;
+                d.summary = "The agent was denied permission " + std::to_string(denials) + " time(s).";
+            }
+            d.suggestedAction = "fix_spec";
+            if (permissionEvent) AddEventEvidence(d, in.eventsFile, EventSeqOf(*permissionEvent));
+            EnsureEvidence(d, in);
+            return d;
+        }
+        int line = FindLogLineNoCase(in, kPermissionPattern);
+        if (line > 0) {
+            d.failureClass = "permission_denied";
+            d.confidence = "high";
+            d.summary = "The log reports a permission denial.";
+            d.detail["rule"] = "builtin.permission_denied";
+            d.detail["source"] = "log";
+            d.suggestedAction = "fix_spec";
+            AddLogEvidence(d, in.logFile, line);
+            return d;
+        }
+    }
+
+    // 8. turn_or_context_limit: the agent stopped at a turn or context limit.
+    {
+        std::string stopReason = runEnded ? EventDataString(*runEnded, "stopReason") : "";
+        if (MatchesNoCase(stopReason, kTurnPattern) || turnEvent) {
+            const nlohmann::json* ev = turnEvent ? turnEvent : runEnded;
+            d.failureClass = "turn_or_context_limit";
+            d.confidence = "high";
+            d.detail["rule"] = "builtin.turn_or_context_limit";
+            if (!stopReason.empty()) d.detail["stopReason"] = stopReason;
+            if (turnEvent) {
+                std::string msg = EventDataString(*turnEvent, "message");
+                if (!msg.empty()) d.detail["message"] = msg;
+            }
+            d.summary = stopReason.empty() ? "The agent stopped at a turn or context limit."
+                                           : "The agent stopped at the " + stopReason + " limit.";
+            d.suggestedAction = "escalate";
+            if (ev) AddEventEvidence(d, in.eventsFile, EventSeqOf(*ev));
+            EnsureEvidence(d, in);
+            return d;
+        }
+    }
+
+    // 9. crash: an NTSTATUS exception exit code.
+    if (IsCrashExitCode(in.exitCode)) {
+        d.failureClass = "crash";
+        d.confidence = "high";
+        char hex[16] = {};
+        std::snprintf(hex, sizeof(hex), "0x%08X", static_cast<unsigned>(in.exitCode));
+        d.summary = std::string("The process crashed with exit code ") + hex + ".";
+        d.detail["rule"] = "builtin.crash";
+        d.detail["exitCode"] = in.exitCode;
+        d.detail["exitCodeHex"] = hex;
+        d.suggestedAction = in.attempt >= in.maxAttempts ? "human" : "retry";
+        AddLogEvidence(d, in.logFile, in.logLastLine);
+        EnsureEvidence(d, in);
+        return d;
+    }
+
+    // 10. tool_error_loop: the same tool failed repeatedly in this attempt.
+    if (toolLoop.found) {
+        d.failureClass = "tool_error_loop";
+        d.confidence = "medium";
+        d.summary = "The " + toolLoop.tool + " tool failed " + std::to_string(toolLoop.errors) + " times.";
+        d.detail["rule"] = "builtin.tool_error_loop";
+        d.detail["tool"] = toolLoop.tool;
+        d.detail["errors"] = toolLoop.errors;
+        d.suggestedAction = "escalate";
+        AddEventEvidence(d, in.eventsFile, toolLoop.lastSeq);
+        EnsureEvidence(d, in);
+        return d;
+    }
+
+    // 11. dependency_blocked: a dependency failed, so this job never ran.
+    if (in.blockKind == "dependency") {
+        d.failureClass = "dependency_blocked";
+        d.confidence = "high";
+        d.summary = in.blockedBy.empty() ? "Blocked by a failed dependency."
+                                         : "Blocked by the failed dependency " + in.blockedBy + ".";
+        d.detail["rule"] = "builtin.dependency_blocked";
+        if (!in.blockedBy.empty()) d.detail["blockedBy"] = in.blockedBy;
+        d.suggestedAction = "human";
+        EnsureEvidence(d, in);
+        return d;
+    }
+
+    // 12. resource_conflict: the job is waiting for a resource lock.
+    if (in.blockKind == "resource") {
+        d.failureClass = "resource_conflict";
+        d.confidence = "high";
+        d.summary = in.blockedResource.empty() ? "Waiting for a resource lock."
+                                               : "Waiting for " + in.blockedResource + " held by " +
+                                                     (in.blockedBy.empty() ? "another job" : in.blockedBy) + ".";
+        d.detail["rule"] = "builtin.resource_conflict";
+        if (!in.blockedBy.empty()) d.detail["blockedBy"] = in.blockedBy;
+        if (!in.blockedResource.empty()) d.detail["resource"] = in.blockedResource;
+        d.suggestedAction = "human";
+        EnsureEvidence(d, in);
+        return d;
+    }
+
+    // 13. incomplete: the agent ended normally but left TODOs and did not satisfy the checks.
+    if (completed && !in.success && planEvent) {
+        int remaining = CountUnfinishedPlanItems(*planEvent);
+        if (remaining > 0) {
+            d.failureClass = "incomplete";
+            d.confidence = "medium";
+            d.summary = "The agent stopped with " + std::to_string(remaining) + " unfinished TODO item(s).";
+            d.detail["rule"] = "builtin.incomplete";
+            d.detail["remaining"] = remaining;
+            d.suggestedAction = "retry";
+            AddEventEvidence(d, in.eventsFile, EventSeqOf(*planEvent));
+            EnsureEvidence(d, in);
+            return d;
+        }
+    }
+
+    // 14. success_check_failed: exit was fine but filesNewer/outputRegex/exitCode failed.
+    if (completed && !in.success) {
+        std::string condition = SuccessConditionOf(in.checkDetail);
+        d.failureClass = "success_check_failed";
+        d.confidence = "high";
+        d.summary = in.checkDetail.empty() ? "A success condition was not met."
+                                           : "Success condition not met: " + in.checkDetail;
+        d.detail["rule"] = "builtin.success_check_failed";
+        if (!condition.empty()) d.detail["condition"] = condition;
+        if (!in.checkDetail.empty()) d.detail["detail"] = in.checkDetail;
+        d.suggestedAction = "retry";
+        AddLogEvidence(d, in.logFile, in.logLastLine);
+        EnsureEvidence(d, in);
+        return d;
+    }
+
+    // 15. exit_nonzero: the process exited with a non-zero code.
+    if (in.endKind == "failed" || in.exitCode != in.expectedExitCode) {
+        d.failureClass = "exit_nonzero";
+        d.confidence = "high";
+        d.summary = "Exited with code " + std::to_string(in.exitCode) +
+                    " (expected " + std::to_string(in.expectedExitCode) + ").";
+        d.detail["rule"] = "builtin.exit_nonzero";
+        d.detail["exitCode"] = in.exitCode;
+        d.detail["expectedExitCode"] = in.expectedExitCode;
+        d.suggestedAction = "retry";
+        AddLogEvidence(d, in.logFile, in.logLastLine);
+        EnsureEvidence(d, in);
+        return d;
+    }
+
+    // 16. unknown: nothing matched. Retry, and suggest escalating.
+    d.failureClass = "unknown";
+    d.confidence = "low";
+    d.summary = "The failure did not match any known classification.";
+    d.detail["rule"] = "builtin.unknown";
+    d.detail["escalateSuggested"] = true;
+    d.suggestedAction = "retry";
+    EnsureEvidence(d, in);
+    if (!in.llmGuessJson.empty()) ApplyTaskQueueFailureLlmGuess(d, in.llmGuessJson);
+    return d;
+}
+
+std::string TaskQueueFailureDiagnosticToJson(const TaskQueueFailureDiagnostic& d) {
+    if (d.Empty()) return "";
+    nlohmann::json o;
+    o["class"] = d.failureClass;
+    o["confidence"] = d.confidence.empty() ? "low" : d.confidence;
+    o["summary"] = d.summary;
+    o["detail"] = d.detail.is_object() ? d.detail : nlohmann::json::object();
+    nlohmann::json evidence = nlohmann::json::array();
+    for (const auto& e : d.evidence) {
+        nlohmann::json item = nlohmann::json::object();
+        if (e.IsEvent()) {
+            item["events"] = e.events;
+            item["seq"] = e.seq;
+        } else if (e.IsLog()) {
+            item["log"] = e.log;
+            item["line"] = e.line;
+        } else {
+            continue;
+        }
+        evidence.push_back(std::move(item));
+    }
+    o["evidence"] = std::move(evidence);
+    if (d.lastActivity.Present()) {
+        nlohmann::json activity;
+        if (!d.lastActivity.activity.empty()) activity["activity"] = d.lastActivity.activity;
+        if (!d.lastActivity.target.empty()) activity["target"] = d.lastActivity.target;
+        if (d.lastActivity.sinceSec >= 0) activity["sinceSec"] = d.lastActivity.sinceSec;
+        o["lastActivity"] = std::move(activity);
+    } else {
+        o["lastActivity"] = nullptr;
+    }
+    o["suggestedAction"] = d.suggestedAction.empty() ? "retry" : d.suggestedAction;
+    o["retryAt"] = d.retryAt.empty() ? nlohmann::json(nullptr) : nlohmann::json(d.retryAt);
+    if (d.llmGuess.Present()) {
+        nlohmann::json guess = nlohmann::json::object();
+        guess["class"] = d.llmGuess.failureClass;
+        guess["confidence"] = "low";
+        guess["advisory"] = true;
+        if (!d.llmGuess.summary.empty()) guess["summary"] = d.llmGuess.summary;
+        if (!d.llmGuess.suggestedAction.empty()) guess["suggestedAction"] = d.llmGuess.suggestedAction;
+        if (!d.llmGuess.rationale.empty()) guess["rationale"] = d.llmGuess.rationale;
+        if (!d.llmGuess.source.empty()) guess["source"] = d.llmGuess.source;
+        o["llmGuess"] = std::move(guess);
+    }
+    // Log text and process error messages may contain invalid UTF-8; keep the record valid.
+    return o.dump(-1, ' ', false, nlohmann::json::error_handler_t::replace);
+}
+
+bool TaskQueueFailureNeedsLlmGuess(const TaskQueueFailureDiagnostic& diagnostic) {
+    if (diagnostic.Empty()) return false;
+    return LowerAscii(diagnostic.failureClass) == "unknown" ||
+           LowerAscii(diagnostic.confidence) == "low";
+}
+
+std::string BuildTaskQueueFailureEscalationPacket(const TaskQueueFailureInput& input,
+                                                  const TaskQueueFailureDiagnostic& diagnostic) {
+    if (!TaskQueueFailureNeedsLlmGuess(diagnostic)) return "";
+
+    nlohmann::json packet = nlohmann::json::object();
+    packet["schema"] = "hancho.failure-guess/1";
+    packet["question"] =
+        "Which failure class fits this attempt? Answer from the evidence only; the "
+        "deterministic classifier could not decide.";
+    packet["guidance"] =
+        "Reply with JSON {\"class\", \"summary\", \"action\", \"rationale\"}. The guess "
+        "is advisory (confidence low) and will not trigger an automatic retry.";
+
+    nlohmann::json attempt = nlohmann::json::object();
+    attempt["jobId"] = input.jobId;
+    attempt["jobName"] = input.jobName;
+    attempt["taskqueue"] = input.taskqueue;
+    attempt["attempt"] = input.attempt;
+    attempt["maxAttempts"] = input.maxAttempts;
+    attempt["endKind"] = input.endKind;
+    attempt["exitCode"] = input.exitCode;
+    attempt["expectedExitCode"] = input.expectedExitCode;
+    attempt["timeoutSec"] = input.timeoutSec;
+    attempt["elapsedSec"] = input.elapsedSec;
+    attempt["success"] = input.success;
+    if (!input.checkDetail.empty()) attempt["checkDetail"] = input.checkDetail;
+    packet["attempt"] = std::move(attempt);
+
+    nlohmann::json classifier = nlohmann::json::object();
+    classifier["class"] = diagnostic.failureClass;
+    classifier["confidence"] = diagnostic.confidence.empty() ? "low" : diagnostic.confidence;
+    classifier["summary"] = diagnostic.summary;
+    classifier["detail"] = diagnostic.detail.is_object() ? diagnostic.detail : nlohmann::json::object();
+    classifier["suggestedAction"] = diagnostic.suggestedAction;
+    packet["classifier"] = std::move(classifier);
+
+    nlohmann::json evidence = nlohmann::json::array();
+    for (const auto& e : diagnostic.evidence) {
+        if (e.IsEvent()) {
+            evidence.push_back({{"events", e.events}, {"seq", e.seq}});
+        } else if (e.IsLog()) {
+            evidence.push_back({{"log", e.log}, {"line", e.line}});
+        }
+    }
+    packet["evidence"] = std::move(evidence);
+
+    // Only the tail of the normalized events and of the attempt log is handed over.
+    nlohmann::json events = nlohmann::json::array();
+    const size_t kMaxEvents = 24;
+    size_t start = input.events.size() > kMaxEvents ? input.events.size() - kMaxEvents : 0;
+    for (size_t i = start; i < input.events.size(); ++i) {
+        if (input.events[i].is_object()) events.push_back(input.events[i]);
+    }
+    packet["events"] = std::move(events);
+
+    nlohmann::json log = nlohmann::json::object();
+    log["file"] = input.logFile;
+    log["firstLine"] = input.logFirstLine;
+    log["lastLine"] = input.logLastLine;
+    log["text"] = input.logText;
+    packet["log"] = std::move(log);
+
+    return packet.dump(-1, ' ', false, nlohmann::json::error_handler_t::replace);
+}
+
+bool ApplyTaskQueueFailureLlmGuess(TaskQueueFailureDiagnostic& diagnostic,
+                                   const std::string& answerJson, std::string* outError) {
+    if (!TaskQueueFailureNeedsLlmGuess(diagnostic)) {
+        if (outError) *outError = "the deterministic classifier already decided";
+        return false;
+    }
+    nlohmann::json answer = nlohmann::json::parse(TrimJsonStr(answerJson), nullptr, false);
+    if (answer.is_string()) {
+        answer = nlohmann::json::parse(TrimJsonStr(answer.get<std::string>()), nullptr, false);
+    }
+    if (answer.is_object()) {
+        auto nested = answer.find("answer");
+        if (nested != answer.end()) {
+            if (nested->is_object()) {
+                answer = *nested;
+            } else if (nested->is_string()) {
+                nlohmann::json parsed = nlohmann::json::parse(TrimJsonStr(nested->get<std::string>()),
+                                                             nullptr, false);
+                if (parsed.is_object()) answer = std::move(parsed);
+            }
+        }
+    }
+    if (!answer.is_object()) {
+        if (outError) *outError = "the answer is not a JSON object";
+        return false;
+    }
+
+    auto readString = [&answer](const char* key) {
+        auto it = answer.find(key);
+        return it != answer.end() && it->is_string() ? it->get<std::string>() : std::string();
+    };
+    std::string failureClass = readString("class");
+    if (failureClass.empty()) failureClass = readString("failureClass");
+    if (failureClass.empty()) {
+        if (outError) *outError = "the answer has no class";
+        return false;
+    }
+    std::string summary = readString("summary");
+    if (summary.empty()) summary = readString("reason");
+    std::string action = readString("action");
+    if (action.empty()) action = readString("suggestedAction");
+    std::string rationale = readString("rationale");
+    if (rationale.empty()) rationale = readString("reason");
+
+    TaskQueueFailureLlmGuess guess;
+    guess.failureClass = failureClass;
+    guess.confidence = "low";
+    guess.summary = summary;
+    guess.suggestedAction = action;
+    guess.rationale = rationale;
+    guess.source = "escalate";
+    diagnostic.llmGuess = std::move(guess);
+    if (outError) outError->clear();
+    return true;
+}
+
+static TaskQueueFailureDiagnostic ParseFailureDiagnostic(const std::string& obj) {
+    TaskQueueFailureDiagnostic d;
+    if (TrimJsonStr(obj).empty()) return d;
+    nlohmann::json o = nlohmann::json::parse(obj, nullptr, false);
+    if (o.is_discarded() || !o.is_object()) return d;
+    auto readString = [&o](const char* key) {
+        auto it = o.find(key);
+        return it != o.end() && it->is_string() ? it->get<std::string>() : std::string();
+    };
+    d.failureClass = readString("class");
+    d.confidence = readString("confidence");
+    d.summary = readString("summary");
+    auto detail = o.find("detail");
+    if (detail != o.end() && detail->is_object()) d.detail = *detail;
+    auto evidence = o.find("evidence");
+    if (evidence != o.end() && evidence->is_array()) {
+        for (const auto& item : *evidence) {
+            if (!item.is_object()) continue;
+            TaskQueueFailureEvidence e;
+            e.events = item.value("events", std::string());
+            e.seq = JsonUInt64(item, "seq");
+            e.log = item.value("log", std::string());
+            e.line = static_cast<int>(JsonInt64(item, "line"));
+            d.evidence.push_back(e);
+        }
+    }
+    auto activity = o.find("lastActivity");
+    if (activity != o.end() && activity->is_object()) {
+        d.lastActivity.activity = activity->value("activity", std::string());
+        d.lastActivity.target = activity->value("target", std::string());
+        d.lastActivity.sinceSec = JsonInt64(*activity, "sinceSec", -1);
+    }
+    d.suggestedAction = readString("suggestedAction");
+    d.retryAt = readString("retryAt");
+    auto guess = o.find("llmGuess");
+    if (guess != o.end() && guess->is_object()) {
+        auto readGuess = [&guess](const char* key) {
+            auto it = guess->find(key);
+            return it != guess->end() && it->is_string() ? it->get<std::string>() : std::string();
+        };
+        d.llmGuess.failureClass = readGuess("class");
+        d.llmGuess.confidence = "low";
+        d.llmGuess.summary = readGuess("summary");
+        d.llmGuess.suggestedAction = readGuess("suggestedAction");
+        d.llmGuess.rationale = readGuess("rationale");
+        d.llmGuess.source = readGuess("source");
+    }
+    return d;
+}
+
 static std::string AttemptToJson(const TaskQueueAttempt& a) {
     std::ostringstream oss;
     oss << "{\"n\":" << a.n
-        << ",\"process_id\":" << a.processId
-        << ",\"start\":\"" << JsonEscape(a.start) << "\""
+        << ",\"process_id\":" << a.processId;
+    if (!a.remoteHost.empty()) {
+        oss << ",\"remote_host\":\"" << JsonEscape(a.remoteHost) << "\""
+            << ",\"remote_process_id\":" << a.remoteProcessId;
+    }
+    oss << ",\"start\":\"" << JsonEscape(a.start) << "\""
         << ",\"end\":\"" << JsonEscape(a.end) << "\""
         << ",\"reason\":\"" << JsonEscape(a.reason) << "\""
         << ",\"exit_code\":" << a.exitCode
         << ",\"instructions_rev\":" << a.instructionsRev
         << ",\"last_lines_file\":\"" << JsonEscape(a.lastLinesFile) << "\""
-        << ",\"check_detail\":\"" << JsonEscape(a.checkDetail) << "\"}";
+        << ",\"check_detail\":\"" << JsonEscape(a.checkDetail) << "\"";
+    if (!a.memoryRefs.empty()) oss << ",\"memory_refs\":" << StrArrayToJson(a.memoryRefs);
+    if (!a.failure.Empty()) oss << ",\"failure\":" << TaskQueueFailureDiagnosticToJson(a.failure);
+    oss << "}";
     return oss.str();
 }
 
@@ -403,6 +1572,15 @@ static std::string ResourcesToJson(const TaskQueueResources& r) {
     return "{\"write\":" + StrArrayToJson(r.write) + ",\"read\":" + StrArrayToJson(r.read) + "}";
 }
 
+static std::string MemoryToJson(const TaskQueueMemory& m) {
+    std::ostringstream oss;
+    oss << "{\"inject\":" << (m.inject ? "true" : "false")
+        << ",\"budget_chars\":" << m.budgetChars
+        << ",\"scopes\":" << StrArrayToJson(m.scopes)
+        << ",\"include_agent_notes\":" << (m.includeAgentNotes ? "true" : "false") << "}";
+    return oss.str();
+}
+
 static std::string DeferToJson(const TaskQueueDefer& d) {
     std::ostringstream oss;
     oss << "{\"exit_codes\":[";
@@ -412,6 +1590,11 @@ static std::string DeferToJson(const TaskQueueDefer& d) {
     }
     oss << "],\"delay_sec\":" << d.delaySec << ",\"limit\":" << d.limit << "}";
     return oss.str();
+}
+
+static std::string RetryToJson(const TaskQueueRetry& r) {
+    return "{\"on\":" + StrArrayToJson(r.on) + ",\"never\":" + StrArrayToJson(r.never) +
+           ",\"wait_for_rate_limit\":" + (r.waitForRateLimit ? "true" : "false") + "}";
 }
 
 // "defer" as given by a caller (add/update) or as persisted; missing fields keep the defaults.
@@ -452,11 +1635,64 @@ static bool ParseDeferChecked(const std::string& json, int successExitCode, Task
     return true;
 }
 
+static bool RetryClassKnown(const std::string& c) {
+    static const char* kClasses[] = {
+        "launch_error", "timeout", "idle_stall", "exit_nonzero", "crash",
+        "success_check_failed", "rate_limited", "auth_error", "permission_denied",
+        "turn_or_context_limit", "tool_error_loop", "incomplete", "killed",
+        "dependency_blocked", "resource_conflict", "unknown",
+    };
+    for (const char* known : kClasses) {
+        if (LowerAscii(c) == LowerAscii(known)) return true;
+    }
+    // Classes added by <data-dir>/failure-rules.json are valid retry targets too.
+    for (const auto& rule : LoadTaskQueueFailureRules(TaskQueueFailureRulesPath())) {
+        if (LowerAscii(rule.failureClass) == LowerAscii(c)) return true;
+    }
+    return false;
+}
+
+// "retry" as given by a caller (add/update) or as persisted. Returns false on a malformed
+// value. A missing "retry" keeps configured false, i.e. the legacy retry-everything policy.
+static bool ParseRetryChecked(const std::string& json, TaskQueueRetry& out, std::string& err) {
+    out = TaskQueueRetry();
+    if (!HasJsonKey(json, "retry")) return true;
+    std::string obj = JsonFieldObj(json, "retry", "");
+    if (obj.empty()) {
+        err = "retry must be an object like {\"on\":[...],\"never\":[...],\"waitForRateLimit\":true}";
+        return false;
+    }
+    out.configured = true;
+    out.on = JsonFieldStrArray(obj, "on");
+    out.never = JsonFieldStrArray(obj, "never");
+    out.waitForRateLimit = JsonFieldBool(obj, "wait_for_rate_limit", true);
+    for (const auto* list : { &out.on, &out.never }) {
+        for (const auto& c : *list) {
+            if (!RetryClassKnown(c)) {
+                err = "retry.on/never contains an unknown failure class: " + c;
+                return false;
+            }
+        }
+    }
+    return true;
+}
+
 static TaskQueueResources ParseResources(const std::string& obj) {
     TaskQueueResources r;
     r.write = JsonFieldStrArray(obj, "write");
     r.read = JsonFieldStrArray(obj, "read");
     return r;
+}
+
+static TaskQueueMemory ParseMemory(const std::string& obj) {
+    TaskQueueMemory m;
+    if (TrimJsonStr(obj).empty()) return m;
+    m.inject = JsonFieldBool(obj, "inject", false);
+    m.budgetChars = static_cast<int>(JsonFieldInt(obj, "budget_chars", 1500));
+    if (m.budgetChars <= 0) m.budgetChars = 1500;
+    m.scopes = JsonFieldStrArray(obj, "scopes");
+    m.includeAgentNotes = JsonFieldBool(obj, "include_agent_notes", true);
+    return m;
 }
 
 // "resources" as given by a caller (add/update): an object with optional string arrays
@@ -485,6 +1721,8 @@ static TaskQueueAttempt ParseAttempt(const std::string& j) {
     TaskQueueAttempt a;
     a.n = static_cast<int>(JsonFieldInt(j, "n", 1));
     a.processId = static_cast<int>(JsonFieldInt(j, "process_id", 0));
+    a.remoteHost = JsonFieldStr(j, "remote_host", "");
+    a.remoteProcessId = static_cast<int>(JsonFieldInt(j, "remote_process_id", 0));
     a.start = JsonFieldStr(j, "start", "");
     a.end = JsonFieldStr(j, "end", "");
     a.reason = JsonFieldStr(j, "reason", "");
@@ -492,6 +1730,9 @@ static TaskQueueAttempt ParseAttempt(const std::string& j) {
     a.instructionsRev = static_cast<int>(JsonFieldInt(j, "instructions_rev", 1));
     a.lastLinesFile = JsonFieldStr(j, "last_lines_file", "");
     a.checkDetail = JsonFieldStr(j, "check_detail", "");
+    a.memoryRefs = JsonFieldStrArray(j, "memory_refs");
+    std::string failureObj = JsonFieldObj(j, "failure", "");
+    if (!failureObj.empty()) a.failure = ParseFailureDiagnostic(failureObj);
     return a;
 }
 
@@ -567,6 +1808,7 @@ static TaskQueueJob ParseJob(const std::string& j) {
     job.instructions = ParseInstructions(JsonFieldObj(j, "instructions"));
     job.command = JsonFieldStr(j, "command", "");
     job.cwd = JsonFieldStr(j, "cwd", "");
+    job.host = JsonFieldStr(j, "host", "");
     job.env = ParseJsonStringMap(JsonFieldObj(j, "env"));
     for (const auto& depJson : JsonFieldObjArray(j, "depends_on")) {
         TaskQueueDependency dep;
@@ -575,11 +1817,14 @@ static TaskQueueJob ParseJob(const std::string& j) {
         if (!dep.id.empty()) job.dependsOn.push_back(dep);
     }
     job.timeoutSec = static_cast<int>(JsonFieldInt(j, "timeout_sec", 0));
+    job.estimateSec = static_cast<int>(JsonFieldInt(j, "estimate_sec", 0));
     std::string idleObj = JsonFieldObj(j, "idle");
     job.idle.outputSec = static_cast<int>(JsonFieldInt(idleObj, "output_sec", 0));
     job.idle.cpuSec = static_cast<int>(JsonFieldInt(idleObj, "cpu_sec", 0));
     job.maxAttempts = static_cast<int>(JsonFieldInt(j, "max_attempts", 2));
     job.retryDelaySec = static_cast<int>(JsonFieldInt(j, "retry_delay_sec", 0));
+    std::string retryErr;
+    if (!ParseRetryChecked(j, job.retry, retryErr)) job.retry = TaskQueueRetry();
     std::string successObj = JsonFieldObj(j, "success");
     job.success.exitCode = static_cast<int>(JsonFieldInt(successObj, "exit_code", 0));
     job.success.filesNewer = JsonFieldStrArray(successObj, "files_newer");
@@ -588,6 +1833,7 @@ static TaskQueueJob ParseJob(const std::string& j) {
     if (!ParseDeferChecked(j, job.success.exitCode, job.defer, deferErr)) job.defer = TaskQueueDefer();
     job.killExclude = JsonFieldStrArray(j, "kill_exclude");
     job.resources = ParseResources(JsonFieldObj(j, "resources"));
+    job.memory = ParseMemory(JsonFieldObj(j, "memory", ""));
     job.priority = static_cast<int>(JsonFieldInt(j, "priority", 0));
     job.state = JsonFieldStr(j, "state", "pending");
     for (const auto& attJson : JsonFieldObjArray(j, "attempts")) {
@@ -653,7 +1899,20 @@ TaskQueueManager::TaskQueueManager() {
             for (auto& job : tq.jobs) {
                 if (job.state != "running") continue;
                 if (!job.attempts.empty()) {
-                    ApplyAttemptOutcome(tq, job, false, "interrupted", -1, "Hancho restarted");
+                    TaskQueueFailureInput fin;
+                    FillFailureInputBase(fin, job, job.attempts.back());
+                    fin.interrupted = true;
+                    fin.endKind = "killed";
+                    fin.exitCode = -1;
+                    fin.checkDetail = "Hancho restarted";
+                    std::wstring logPath = GetAttemptLogPathWide(job.id, job.attempts.back().n);
+                    fin.logFile = WideToUtf8(logPath);
+                    FillFailureLog(fin, ReadFileUtf8Wide(logPath));
+                    fin.fallbackEventsFile = WideToUtf8(GetTaskEventsFileWide(tq.name));
+                    fin.fallbackEventSeq = static_cast<uint64_t>(tq.version + 1);
+                    ApplyAttemptOutcome(tq, job, false, "interrupted", -1, "Hancho restarted", &fin);
+                    AppendRunRecordForAttempt(tq, job, job.attempts.back(), fin,
+                                              ReadFileUtf8Wide(logPath));
                 } else {
                     job.state = "pending";
                     job.updatedAt = GetCurrentTimestampStr();
@@ -708,6 +1967,14 @@ void TaskQueueManager::SetJobFinishedCallback(JobFinishedCallback cb) {
 void TaskQueueManager::SetBtRetryCallback(BtRetryCallback cb) {
     std::lock_guard<std::mutex> lock(mutex_);
     btRetryCb_ = std::move(cb);
+}
+
+void TaskQueueManager::SetRemoteCallbacks(RemoteStartCallback start, RemotePollCallback poll,
+                                          RemoteKillCallback kill) {
+    std::lock_guard<std::mutex> lock(mutex_);
+    remoteStartCb_ = std::move(start);
+    remotePollCb_ = std::move(poll);
+    remoteKillCb_ = std::move(kill);
 }
 
 void TaskQueueManager::FlushFinishedCallbacks() {
@@ -777,7 +2044,8 @@ TaskQueueCounts TaskQueueManager::GetJobCounts() const {
             counts.total++;
             if (job.state == "running") {
                 counts.running++;
-                if (job.timeoutSec > 0 && !job.attempts.empty()) {
+                const int64_t budget = job.estimateSec > 0 ? job.estimateSec : job.timeoutSec;
+                if (budget > 0 && !job.attempts.empty()) {
                     const auto& lastAtt = job.attempts.back();
                     if (!lastAtt.start.empty()) {
                         int y = 0, mo = 0, d = 0, h = 0, mi = 0, sec = 0;
@@ -794,7 +2062,7 @@ TaskQueueCounts TaskQueueManager::GetJobCounts() const {
                             if (startEpoch != static_cast<time_t>(-1)) {
                                 time_t nowEpoch = time(nullptr);
                                 int64_t elapsed = static_cast<int64_t>(nowEpoch - startEpoch);
-                                int64_t rem = static_cast<int64_t>(job.timeoutSec) - elapsed;
+                                int64_t rem = budget - elapsed;
                                 if (rem < 0) rem = 0;
                                 if (counts.minRemainingSec < 0 || rem < counts.minRemainingSec) {
                                     counts.minRemainingSec = rem;
@@ -804,8 +2072,8 @@ TaskQueueCounts TaskQueueManager::GetJobCounts() const {
                             }
                         }
                     }
-                } else if (job.timeoutSec > 0) {
-                    int64_t rem = static_cast<int64_t>(job.timeoutSec);
+                } else if (budget > 0) {
+                    int64_t rem = budget;
                     if (counts.minRemainingSec < 0 || rem < counts.minRemainingSec) {
                         counts.minRemainingSec = rem;
                     }
@@ -832,8 +2100,9 @@ TaskQueueCounts TaskQueueManager::GetJobCounts() const {
                     counts.pending++;
                 }
                 // Only jobs that can still run count toward the remaining time.
-                if (job.timeoutSec > 0 && !isNeverRunnable(job, 0)) {
-                    counts.sumRemainingSec += static_cast<int64_t>(job.timeoutSec);
+                const int64_t budget = job.estimateSec > 0 ? job.estimateSec : job.timeoutSec;
+                if (budget > 0 && !isNeverRunnable(job, 0)) {
+                    counts.sumRemainingSec += budget;
                     anyRemain = true;
                 }
             } else if (job.state == "blocked") {
@@ -874,15 +2143,21 @@ void TaskQueueManager::EmitTaskQueueEvent(const std::string& taskqueue, const st
     SaveQueue(tq);
 }
 
-void TaskQueueManager::EmitEventLocked(TaskQueue& tq, const std::string& type, const std::string& jobId, int64_t attempt) {
+void TaskQueueManager::EmitEventLocked(TaskQueue& tq, const std::string& type, const std::string& jobId,
+                                       int64_t attempt, const TaskQueueFailureDiagnostic* failure) {
     tq.version++;
     std::ostringstream oss;
     oss << "{\"version\":" << tq.version
+        << ",\"seq\":" << tq.version
         << ",\"type\":\"" << JsonEscape(type) << "\""
         << ",\"taskqueue\":\"" << JsonEscape(tq.name) << "\""
         << ",\"job_id\":\"" << JsonEscape(jobId) << "\""
         << ",\"attempt\":" << attempt
-        << ",\"timestamp\":\"" << GetCurrentTimestampStr() << "\"}";
+        << ",\"timestamp\":\"" << GetCurrentTimestampStr() << "\"";
+    if (failure && !failure->Empty()) {
+        oss << ",\"failure\":" << TaskQueueFailureDiagnosticToJson(*failure);
+    }
+    oss << "}";
     std::string line = oss.str() + "\r\n";
     AppendToLogFileWide(GetTaskEventsFileWide(tq.name), line);
     if (!tq.notifyFile.empty() &&
@@ -893,17 +2168,12 @@ void TaskQueueManager::EmitEventLocked(TaskQueue& tq, const std::string& type, c
 
 void TaskQueueManager::LoadQueues() {
     std::wstring dir = GetTaskQueuesDirWide();
-    WIN32_FIND_DATAW fd = {};
-    HANDLE hFind = FindFirstFileW((dir + L"\\*.json").c_str(), &fd);
-    if (hFind == INVALID_HANDLE_VALUE) return;
-    do {
-        if (fd.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) continue;
-        std::wstring path = dir + L"\\" + fd.cFileName;
+    for (const std::wstring& path : ListDirectoryWide(dir, L"*.json")) {
         std::string content = ReadFileUtf8Wide(path);
         if (content.empty()) continue;
         TaskQueue tq = ParseQueue(content);
         if (tq.name.empty()) {
-            std::wstring fn = fd.cFileName;
+            std::wstring fn = path.substr(path.find_last_of(L"/\\") + 1);
             if (fn.size() > 5) tq.name = WideToUtf8(fn.substr(0, fn.size() - 5));
         }
         if (tq.name.empty()) continue;
@@ -911,8 +2181,7 @@ void TaskQueueManager::LoadQueues() {
             if (job.num <= 0) job.num = nextJobNum_++;
         }
         queues_[tq.name] = tq;
-    } while (FindNextFileW(hFind, &fd));
-    FindClose(hFind);
+    }
 }
 
 void TaskQueueManager::SaveQueue(const TaskQueue& tq) {
@@ -949,16 +2218,20 @@ std::string TaskQueueManager::JobToJson(const TaskQueueJob& job, bool includeIns
     }
     oss << ",\"command\":\"" << JsonEscape(job.command) << "\""
         << ",\"cwd\":\"" << JsonEscape(job.cwd) << "\""
+        << ",\"host\":\"" << JsonEscape(job.host) << "\""
         << ",\"env\":" << EnvToJson(job.env)
         << ",\"depends_on\":" << DepsToJson(job.dependsOn)
         << ",\"timeout_sec\":" << job.timeoutSec
+        << ",\"estimate_sec\":" << job.estimateSec
         << ",\"idle\":{\"output_sec\":" << job.idle.outputSec << ",\"cpu_sec\":" << job.idle.cpuSec << "}"
         << ",\"max_attempts\":" << job.maxAttempts
-        << ",\"retry_delay_sec\":" << job.retryDelaySec
-        << ",\"defer\":" << DeferToJson(job.defer)
+        << ",\"retry_delay_sec\":" << job.retryDelaySec;
+    if (job.retry.configured) oss << ",\"retry\":" << RetryToJson(job.retry);
+    oss << ",\"defer\":" << DeferToJson(job.defer)
         << ",\"success\":" << SuccessToJson(job.success)
         << ",\"kill_exclude\":" << StrArrayToJson(job.killExclude)
         << ",\"resources\":" << ResourcesToJson(job.resources)
+        << ",\"memory\":" << MemoryToJson(job.memory)
         << ",\"priority\":" << job.priority
         << ",\"state\":\"" << JsonEscape(job.state) << "\""
         << ",\"attempts\":" << AttemptsToJson(job.attempts)
@@ -1213,6 +2486,16 @@ bool ResourcesOverlap(const std::string& a, const std::string& b) {
 bool FindResourceConflict(const TaskQueueResources& a, const std::string& cwdA,
                           const TaskQueueResources& b, const std::string& cwdB,
                           std::string& outResource) {
+    return FindResourceConflict(a, cwdA, "", b, cwdB, "", outResource);
+}
+
+bool FindResourceConflict(const TaskQueueResources& a, const std::string& cwdA,
+                          const std::string& hostA,
+                          const TaskQueueResources& b, const std::string& cwdB,
+                          const std::string& hostB,
+                          std::string& outResource) {
+    // The same path means different things on different machines.
+    if (hostA != hostB) return false;
     if (a.empty() || b.empty()) return false;
     auto norm = [](const std::vector<std::string>& v, const std::string& cwd) {
         std::vector<std::string> out;
@@ -1263,7 +2546,8 @@ bool TaskQueueManager::FindQueuedResourceConflictLocked(const TaskQueueJob& job,
         if (tq.paused) continue;
         for (const auto& other : tq.jobs) {
             if (other.id == job.id || !RunsBefore(other, job) || !IsReadyLocked(other, nowMs)) continue;
-            if (FindResourceConflict(job.resources, job.cwd, other.resources, other.cwd, outResource)) {
+            if (FindResourceConflict(job.resources, job.cwd, job.host,
+                                     other.resources, other.cwd, other.host, outResource)) {
                 outHolder = other.id;
                 return true;
             }
@@ -1279,7 +2563,8 @@ bool TaskQueueManager::FindRunningResourceConflictLocked(const TaskQueueJob& job
         (void)name;
         for (const auto& other : tq.jobs) {
             if (other.state != "running" || other.id == job.id) continue;
-            if (FindResourceConflict(job.resources, job.cwd, other.resources, other.cwd, outResource)) {
+            if (FindResourceConflict(job.resources, job.cwd, job.host,
+                                     other.resources, other.cwd, other.host, outResource)) {
                 outHolder = other.id;
                 return true;
             }
@@ -1481,6 +2766,15 @@ static bool ParseNewJob(const std::string& rawJson, const std::string& taskqueue
         return false;
     }
     job.cwd = JsonFieldStr(j, "cwd", "");
+    job.host = JsonFieldStr(j, "host", "");
+    if (!job.host.empty()) {
+        for (char c : job.host) {
+            if (!std::isalnum(static_cast<unsigned char>(c)) && c != '.' && c != '_' && c != '-') {
+                err = "job '" + job.id + "': host may only contain letters, digits, '.', '_' and '-'";
+                return false;
+            }
+        }
+    }
     job.timeoutSec = static_cast<int>(JsonFieldInt(j, "timeout_sec", 0));
     if (job.timeoutSec <= 0) {
         err = "job '" + job.id + "': timeout_sec is required and must be greater than 0";
@@ -1489,6 +2783,11 @@ static bool ParseNewJob(const std::string& rawJson, const std::string& taskqueue
     if (maxTimeoutSec > 0 && job.timeoutSec > maxTimeoutSec) {
         err = "job '" + job.id + "': timeout_sec (" + std::to_string(job.timeoutSec) +
               ") exceeds max_timeout_sec (" + std::to_string(maxTimeoutSec) + ")";
+        return false;
+    }
+    job.estimateSec = static_cast<int>(JsonFieldInt(j, "estimate_sec", 0));
+    if (job.estimateSec < 0) {
+        err = "job '" + job.id + "': estimate_sec must be 0 or greater";
         return false;
     }
     std::string idleObj = JsonFieldObj(j, "idle");
@@ -1502,6 +2801,11 @@ static bool ParseNewJob(const std::string& rawJson, const std::string& taskqueue
     if (job.maxAttempts < 1) job.maxAttempts = 1;
     job.retryDelaySec = static_cast<int>(JsonFieldInt(j, "retry_delay_sec", 0));
     if (job.retryDelaySec < 0) job.retryDelaySec = 0;
+    std::string retryErr;
+    if (!ParseRetryChecked(j, job.retry, retryErr)) {
+        err = "job '" + job.id + "': " + retryErr;
+        return false;
+    }
     std::string successObj = JsonFieldObj(j, "success");
     job.success.exitCode = static_cast<int>(JsonFieldInt(successObj, "exit_code", 0));
     job.success.filesNewer = JsonFieldStrArray(successObj, "files_newer");
@@ -1511,6 +2815,19 @@ static bool ParseNewJob(const std::string& rawJson, const std::string& taskqueue
     if (!ParseResourcesChecked(j, job.resources, resErr)) {
         err = "job '" + job.id + "': " + resErr;
         return false;
+    }
+    job.memory = ParseMemory(JsonFieldObj(j, "memory", ""));
+    if (job.memory.inject) {
+        for (const auto& s : job.memory.scopes) {
+            std::string kind = s;
+            auto colon = kind.find(':');
+            if (colon != std::string::npos) kind = kind.substr(0, colon);
+            if (kind != "job" && kind != "file" && kind != "taskqueue" && kind != "project" &&
+                kind != "engine") {
+                err = "job '" + job.id + "': memory.scopes entries must be job, file, taskqueue, project or engine";
+                return false;
+            }
+        }
     }
     std::string deferErr;
     if (!ParseDeferChecked(j, job.success.exitCode, job.defer, deferErr)) {
@@ -1556,9 +2873,9 @@ static bool ParseNewJob(const std::string& rawJson, const std::string& taskqueue
             pathW = ResolveAbsolutePathWide(Utf8ToWide(instrFile));
         } else {
             std::wstring base = job.cwd.empty() ? GetCurrentDirectoryWide() : ResolveAbsolutePathWide(Utf8ToWide(job.cwd));
-            pathW = ResolveAbsolutePathWide(base + L"\\" + Utf8ToWide(instrFile));
+            pathW = ResolveAbsolutePathWide(PathJoinWide(base, Utf8ToWide(instrFile)));
         }
-        if (GetFileAttributesW(pathW.c_str()) == INVALID_FILE_ATTRIBUTES) {
+        if (!PathExistsWide(pathW)) {
             err = "job '" + job.id + "': instructions_file not found: " + instrFile;
             return false;
         }
@@ -1594,7 +2911,7 @@ static std::wstring ResolveJobPathWide(const TaskQueueJob& job, const std::strin
     bool absolute = path.size() > 1 && (path[1] == ':' || path[0] == '\\' || path[0] == '/');
     if (absolute) return ResolveAbsolutePathWide(Utf8ToWide(path));
     std::wstring base = job.cwd.empty() ? GetCurrentDirectoryWide() : ResolveAbsolutePathWide(Utf8ToWide(job.cwd));
-    return ResolveAbsolutePathWide(base + L"\\" + Utf8ToWide(path));
+    return ResolveAbsolutePathWide(PathJoinWide(base, Utf8ToWide(path)));
 }
 
 std::string TaskQueueManager::TaskQueueAdd(const std::string& taskqueue, const std::string& jobsJson,
@@ -1809,7 +3126,7 @@ std::string TaskQueueManager::TaskQueueGet(const std::string& id, bool includeIn
     bool sourceChanged = false;
     if (!job.instructions.source.empty()) {
         std::wstring pathW = ResolveJobPathWide(job, job.instructions.source);
-        if (GetFileAttributesW(pathW.c_str()) == INVALID_FILE_ATTRIBUTES) {
+        if (!PathExistsWide(pathW)) {
             sourceMissing = true;
         } else {
             std::string text = ReadFileUtf8Wide(pathW);
@@ -1827,7 +3144,7 @@ std::string TaskQueueManager::TaskQueueGet(const std::string& id, bool includeIn
 void TaskQueueManager::RequeueJobLocked(TaskQueue& tq, TaskQueueJob& job, bool resetAttempts, bool refreshInstructions) {
     if (refreshInstructions && !job.instructions.source.empty()) {
         std::wstring pathW = ResolveJobPathWide(job, job.instructions.source);
-        if (GetFileAttributesW(pathW.c_str()) != INVALID_FILE_ATTRIBUTES) {
+        if (PathExistsWide(pathW)) {
             std::string text = ReadFileUtf8Wide(pathW);
             std::string sha = Sha256Hex(text);
             if (sha != job.instructions.sha256) {
@@ -1985,8 +3302,8 @@ std::string TaskQueueManager::TaskQueueUpdate(const std::string& id, const std::
     bool onlyNotes = HasJsonKey(patchJson, "notes");
     // Only "notes" may be updated after a job has finished or is running.
     if (onlyNotes) {
-        for (const char* k : {"summary","command","cwd","timeout_sec","idle","max_attempts",
-                              "retry_delay_sec","defer","priority","kill_exclude","resources","env","success",
+        for (const char* k : {"summary","command","cwd","host","timeout_sec","idle","max_attempts",
+                              "retry_delay_sec","retry","defer","priority","kill_exclude","resources","memory","env","success",
                               "instructions_text","instructions_file","depends_on"}) {
             if (HasJsonKey(patchJson, k)) { onlyNotes = false; break; }
         }
@@ -2018,6 +3335,16 @@ std::string TaskQueueManager::TaskQueueUpdate(const std::string& id, const std::
         job->command = c;
     }
     if (HasJsonKey(patchJson, "cwd")) job->cwd = JsonFieldStr(patchJson, "cwd", "");
+    if (HasJsonKey(patchJson, "host")) {
+        std::string h = JsonFieldStr(patchJson, "host", "");
+        for (char c : h) {
+            if (!std::isalnum(static_cast<unsigned char>(c)) && c != '.' && c != '_' && c != '-') {
+                outError = "host may only contain letters, digits, '.', '_' and '-'";
+                return BuildError(outError);
+            }
+        }
+        job->host = h;
+    }
     if (HasJsonKey(patchJson, "timeout_sec")) {
         int t = static_cast<int>(JsonFieldInt(patchJson, "timeout_sec", 0));
         if (t <= 0) {
@@ -2043,6 +3370,15 @@ std::string TaskQueueManager::TaskQueueUpdate(const std::string& id, const std::
         int r = static_cast<int>(JsonFieldInt(patchJson, "retry_delay_sec", job->retryDelaySec));
         job->retryDelaySec = (r > 0) ? r : 0;
     }
+    if (HasJsonKey(patchJson, "retry")) {
+        struct TaskQueueRetry r;
+        std::string retryErr;
+        if (!ParseRetryChecked(patchJson, r, retryErr)) {
+            outError = retryErr;
+            return BuildError(outError);
+        }
+        job->retry = r;
+    }
     if (HasJsonKey(patchJson, "priority")) job->priority = static_cast<int>(JsonFieldInt(patchJson, "priority", job->priority));
     if (HasJsonKey(patchJson, "kill_exclude")) job->killExclude = JsonFieldStrArray(patchJson, "kill_exclude");
     if (HasJsonKey(patchJson, "resources")) {
@@ -2053,6 +3389,9 @@ std::string TaskQueueManager::TaskQueueUpdate(const std::string& id, const std::
             return BuildError(outError);
         }
         job->resources = res;
+    }
+    if (HasJsonKey(patchJson, "memory")) {
+        job->memory = ParseMemory(JsonFieldObj(patchJson, "memory", ""));
     }
     if (HasJsonKey(patchJson, "env")) job->env = ParseJsonStringMap(JsonFieldObj(patchJson, "env"));
     if (HasJsonKey(patchJson, "success")) {
@@ -2082,7 +3421,7 @@ std::string TaskQueueManager::TaskQueueUpdate(const std::string& id, const std::
     } else if (HasJsonKey(patchJson, "instructions_file")) {
         std::string f = JsonFieldStr(patchJson, "instructions_file", "");
         std::wstring pathW = ResolveJobPathWide(*job, f);
-        if (GetFileAttributesW(pathW.c_str()) == INVALID_FILE_ATTRIBUTES) {
+        if (!PathExistsWide(pathW)) {
             outError = "instructions_file not found: " + f;
             return BuildError(outError);
         }
@@ -2118,6 +3457,9 @@ std::string TaskQueueManager::TaskQueueCancel(const std::string& id, std::string
     std::string resp;
     ProcessManager* pm = nullptr;
     int pid = 0;
+    std::string remoteHost;
+    int remotePid = 0;
+    RemoteKillCallback remoteKill;
     {
         std::lock_guard<std::mutex> lock(mutex_);
         TaskQueue* tq = nullptr;
@@ -2135,6 +3477,8 @@ std::string TaskQueueManager::TaskQueueCancel(const std::string& id, std::string
         }
         if (job->state == "running" && !job->attempts.empty()) {
             pid = job->attempts.back().processId;
+            remoteHost = job->attempts.back().remoteHost;
+            remotePid = job->attempts.back().remoteProcessId;
         }
         job->state = "cancelled";
         job->blockedBy.clear();
@@ -2148,8 +3492,14 @@ std::string TaskQueueManager::TaskQueueCancel(const std::string& id, std::string
         }
         resp = "{\"ok\":true,\"job\":" + JobToJson(*job, true) + "}";
         pm = pm_;
+        remoteKill = remoteKillCb_;
     }
-    if (pm && pid > 0) {
+    if (!remoteHost.empty() && remotePid > 0) {
+        if (remoteKill) {
+            std::string err;
+            remoteKill(remoteHost, remotePid, err);
+        }
+    } else if (pm && pid > 0) {
         std::string err;
         pm->KillProcess(pid, err);
     }
@@ -2568,23 +3918,20 @@ bool TaskQueueManager::EvaluateSuccess(const TaskQueueJob& job, TaskQueueAttempt
         detail = "exit code " + std::to_string(exitCode) + " (expected " + std::to_string(job.success.exitCode) + ")";
         return false;
     }
+    // filesNewer names paths on the machine that ran the job. For a remote job those
+    // paths are not local, so the check stays with the remote command / output.
     for (const auto& rel : job.success.filesNewer) {
+        if (!job.host.empty()) break;
         std::wstring pathW = ResolveJobPathWide(job, rel);
-        HANDLE h = CreateFileW(pathW.c_str(), GENERIC_READ,
-                               FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
-                               nullptr, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, nullptr);
-        if (h == INVALID_HANDLE_VALUE) {
+        if (!PathExistsWide(pathW)) {
             detail = "missing file: " + rel;
             return false;
         }
-        FILETIME ft = {};
-        bool ok = GetFileTime(h, nullptr, nullptr, &ft) != FALSE;
-        CloseHandle(h);
-        if (!ok) {
+        uint64_t fileTime = 0;
+        if (!GetFileMtimeWide(pathW, fileTime)) {
             detail = "cannot read mtime: " + rel;
             return false;
         }
-        uint64_t fileTime = (static_cast<uint64_t>(ft.dwHighDateTime) << 32) | ft.dwLowDateTime;
         if (attempt.startFiletime > 0 && fileTime <= attempt.startFiletime) {
             detail = "file not newer than attempt start: " + rel;
             return false;
@@ -2609,8 +3956,39 @@ bool TaskQueueManager::EvaluateSuccess(const TaskQueueJob& job, TaskQueueAttempt
     return true;
 }
 
+TaskQueueRetryDecision DecideTaskQueueRetry(const TaskQueueJob& job, const std::string& failureClass,
+                                            int countedAttempts, bool allowRateLimitWait) {
+    auto listed = [&failureClass](const std::vector<std::string>& classes) {
+        for (const auto& c : classes) {
+            if (LowerAscii(c) == LowerAscii(failureClass)) return true;
+        }
+        return false;
+    };
+
+    TaskQueueRetryDecision out;
+    if (!job.retry.configured) {
+        out.action = countedAttempts < job.maxAttempts ? TaskQueueRetryAction::Retry
+                                                       : TaskQueueRetryAction::GiveUp;
+        return out;
+    }
+    if (listed(job.retry.never)) {
+        out.action = TaskQueueRetryAction::GiveUp;
+        return out;
+    }
+    if (allowRateLimitWait && LowerAscii(failureClass) == "rate_limited" && job.retry.waitForRateLimit) {
+        out.action = TaskQueueRetryAction::WaitForRateLimit;
+        out.consumesAttempt = false;
+        return out;
+    }
+    bool allowed = job.retry.on.empty() || listed(job.retry.on);
+    out.action = allowed && countedAttempts < job.maxAttempts ? TaskQueueRetryAction::Retry
+                                                             : TaskQueueRetryAction::GiveUp;
+    return out;
+}
+
 void TaskQueueManager::ApplyAttemptOutcome(TaskQueue& tq, TaskQueueJob& job, bool success,
-                                           const std::string& reason, int exitCode, const std::string& checkDetail) {
+                                           const std::string& reason, int exitCode, const std::string& checkDetail,
+                                           const TaskQueueFailureInput* failureInput) {
     if (job.attempts.empty()) return;
     TaskQueueAttempt& a = job.attempts.back();
     a.end = GetCurrentTimestampStr();
@@ -2663,7 +4041,11 @@ void TaskQueueManager::ApplyAttemptOutcome(TaskQueue& tq, TaskQueueJob& job, boo
         }
     }
 
-    EmitEventLocked(tq, "jobAttemptFailed", job.id, a.n);
+    // Classify only real failures: a deferral did not run the job's work and is not one.
+    if (!success && failureInput) {
+        a.failure = ClassifyTaskQueueFailure(*failureInput);
+    }
+
     // An attempt cut short by a Hancho restart is not the job's fault,
     // so it does not use up max_attempts (spec: interrupted jobs are re-run).
     // A deferred attempt did not run the job's work either.
@@ -2671,13 +4053,46 @@ void TaskQueueManager::ApplyAttemptOutcome(TaskQueue& tq, TaskQueueJob& job, boo
     for (const auto& att : job.attempts) {
         if (att.reason != "interrupted" && att.reason != "deferred") countedAttempts++;
     }
-    if (countedAttempts < job.maxAttempts) {
+
+    // rate_limited waits like a deferral: pending until the reset without using up
+    // max_attempts, until defer.limit deferrals have happened.
+    TaskQueueRetryDecision decision =
+        DecideTaskQueueRetry(job, a.failure.failureClass, countedAttempts);
+    if (decision.action == TaskQueueRetryAction::WaitForRateLimit) {
+        int deferrals = 0;
+        for (const auto& att : job.attempts) {
+            if (att.reason == "deferred") deferrals++;
+        }
+        if (job.defer.limit == 0 || deferrals < job.defer.limit) {
+            a.reason = "deferred";
+            job.state = "pending";
+            int64_t nowMs = static_cast<int64_t>(GetNowTickMs());
+            int64_t resets = a.failure.detail.value("resetsAtEpochSec", static_cast<int64_t>(0));
+            job.retryAtMs = resets > 0 ? (resets + 30) * 1000
+                                       : nowMs + static_cast<int64_t>(job.defer.delaySec) * 1000;
+            EmitEventLocked(tq, "jobDeferred", job.id, a.n, &a.failure);
+            SaveAllLocked();
+            CheckQueueNotices(tq);
+            cv_.notify_all();
+            return;
+        }
+        // The deferral limit is used up: treat it as an ordinary failure from here.
+        decision = DecideTaskQueueRetry(job, a.failure.failureClass, countedAttempts, false);
+    }
+    if (reason == "interrupted") {
+        decision = TaskQueueRetryDecision();
+        decision.action = countedAttempts < job.maxAttempts ? TaskQueueRetryAction::Retry
+                                                           : TaskQueueRetryAction::GiveUp;
+    }
+
+    EmitEventLocked(tq, "jobAttemptFailed", job.id, a.n, &a.failure);
+    if (decision.action == TaskQueueRetryAction::Retry) {
         job.state = "pending";
         job.retryAtMs = static_cast<int64_t>(GetNowTickMs()) + static_cast<int64_t>(job.retryDelaySec) * 1000;
     } else {
         job.state = "failed";
         job.retryAtMs = 0;
-        EmitEventLocked(tq, "jobFailed", job.id, a.n);
+        EmitEventLocked(tq, "jobFailed", job.id, a.n, &a.failure);
         ReevaluateAll();
         if (schedulerRunning_.load()) {
             pendingFinished_.push_back({job, "failed"});
@@ -2693,39 +4108,32 @@ void TaskQueueManager::ApplyAttemptOutcome(TaskQueue& tq, TaskQueueJob& job, boo
 namespace pc {
 
 static std::wstring GetTaskQueueLogDirWide() {
-    std::wstring dir = GetLogsDirectoryWide() + L"\\taskqueue";
-    CreateDirectoryW(dir.c_str(), nullptr);
+    std::wstring dir = PathJoinWide(GetLogsDirectoryWide(), L"taskqueue");
+    EnsureDirectoryWide(dir);
     return dir;
 }
 
 static std::wstring GetAttemptLogPathWide(const std::string& jobId, int n) {
-    return GetTaskQueueLogDirWide() + L"\\" + Utf8ToWide(SanitizeFileNameComponent(jobId)) +
+    return PathJoinWide(GetTaskQueueLogDirWide(), Utf8ToWide(SanitizeFileNameComponent(jobId))) +
            L"." + std::to_wstring(n) + L".log";
+}
+
+static std::wstring GetAttemptEventsPathWide(const std::string& jobId, int n) {
+    return PathJoinWide(GetTaskQueueLogDirWide(), Utf8ToWide(SanitizeFileNameComponent(jobId))) +
+           L"." + std::to_wstring(n) + L".events.jsonl";
+}
+
+static std::wstring GetAttemptDonePathWide(const std::string& jobId, int n) {
+    return PathJoinWide(GetTaskQueueLogDirWide(), Utf8ToWide(SanitizeFileNameComponent(jobId))) +
+           L"." + std::to_wstring(n) + L".done";
 }
 
 std::wstring TaskQueueManager::GetAttemptLogFileWide(const std::string& jobId, int n) {
     return GetAttemptLogPathWide(jobId, n);
 }
 
-static std::string QuoteCommandArg(const std::string& s) {
-    std::string out = "\"";
-    size_t backslashes = 0;
-    for (char c : s) {
-        if (c == '\\') {
-            backslashes++;
-            out.push_back(c);
-        } else if (c == '"') {
-            out.append(backslashes + 1, '\\');
-            out.push_back('"');
-            backslashes = 0;
-        } else {
-            backslashes = 0;
-            out.push_back(c);
-        }
-    }
-    out.append(backslashes, '\\');
-    out.push_back('"');
-    return out;
+static std::string QuoteCommandArgLocal(const std::string& s) {
+    return platform::QuoteCommandArg(s);
 }
 
 bool TaskQueueManager::BuildLaunchRequest(TaskQueue& tq, TaskQueueJob& job, int attemptN, LaunchItem& out) {
@@ -2735,20 +4143,57 @@ bool TaskQueueManager::BuildLaunchRequest(TaskQueue& tq, TaskQueueJob& job, int 
 
     std::string instrPathUtf8;
     int rev = job.instructions.rev > 0 ? job.instructions.rev : 1;
-    if (!job.instructions.text.empty()) {
+    std::string instructionText = job.instructions.text;
+    if (job.memory.inject) {
+        memory::BriefOptions bo;
+        bo.jobName = job.name.empty() ? job.id : job.name;
+        bo.taskqueue = tq.name;
+        bo.budgetChars = job.memory.budgetChars;
+        bo.scopes = job.memory.scopes;
+        bo.includeAgentNotes = job.memory.includeAgentNotes;
+        for (const auto* list : { &job.resources.write, &job.resources.read }) {
+            for (const auto& path : *list) {
+                if (path.empty() || path[0] == '@') continue;
+                if (path.find('*') != std::string::npos || path.find('?') != std::string::npos) continue;
+                bo.files.push_back(path);
+            }
+        }
+        memory::BriefResult brief = memory::BuildBrief(bo);
+        if (brief.ok) {
+            out.memoryRefs = brief.ids;
+            const std::string injected = brief.ids.empty() ? std::string() : brief.text;
+            bool expanded = false;
+            size_t pos = 0;
+            while ((pos = instructionText.find("{memory}", pos)) != std::string::npos) {
+                instructionText.replace(pos, 8, injected);
+                pos += injected.size();
+                expanded = true;
+            }
+            if (!expanded && !injected.empty()) {
+                if (!instructionText.empty()) instructionText += "\n\n";
+                instructionText += injected;
+            }
+        }
+    }
+    if (!instructionText.empty()) {
         std::wstring instrW = GetInstructionsFileWide(tq.name, job.id, rev);
-        WriteFileAtomicWide(instrW, job.instructions.text);
+        WriteFileAtomicWide(instrW, instructionText);
         instrPathUtf8 = WideToUtf8(instrW);
     }
 
     std::string cmd = job.command;
-    size_t pos = 0;
-    while ((pos = cmd.find("{instructions}", pos)) != std::string::npos) {
-        cmd.replace(pos, 14, instrPathUtf8);
-        pos += instrPathUtf8.size();
+    if (job.host.empty()) {
+        size_t pos = 0;
+        while ((pos = cmd.find("{instructions}", pos)) != std::string::npos) {
+            cmd.replace(pos, 14, instrPathUtf8);
+            pos += instrPathUtf8.size();
+        }
     }
-    pos = 0;
-    std::string quotedSummary = QuoteCommandArg(job.summary);
+    // A remote job sends the instruction text instead of a local path; the
+    // remote host writes it under its own data directory and expands the
+    // placeholder there.
+    size_t pos = 0;
+    std::string quotedSummary = QuoteCommandArgLocal(job.summary);
     while ((pos = cmd.find("{summary}", pos)) != std::string::npos) {
         cmd.replace(pos, 9, quotedSummary);
         pos += quotedSummary.size();
@@ -2765,6 +4210,10 @@ bool TaskQueueManager::BuildLaunchRequest(TaskQueue& tq, TaskQueueJob& job, int 
     req.jobKey = job.id;
     req.jobId = job.num;
     req.attemptN = attemptN;
+    if (!job.host.empty() && !instructionText.empty()) {
+        req.instructionsText = instructionText;
+        req.instructionsRev = rev;
+    }
     req.supervisorGoal = job.summary;
     req.supervisorNotes = "Task ID: " + job.id + (job.summary.empty() ? "" : " - " + job.summary);
     req.agentType = DetectAgentType(req.commandLine, req.name);
@@ -2789,7 +4238,7 @@ bool TaskQueueManager::BuildLaunchRequest(TaskQueue& tq, TaskQueueJob& job, int 
     req.env["PC_JOB_ID"] = job.id;
     req.env["PC_ATTEMPT"] = std::to_string(attemptN);
     req.env["PC_JOB_SUMMARY"] = job.summary;
-    if (!instrPathUtf8.empty()) {
+    if (job.host.empty() && !instrPathUtf8.empty()) {
         req.env["PC_JOB_INSTRUCTIONS"] = instrPathUtf8;
         req.env["PC_JOB_INSTRUCTIONS_REV"] = std::to_string(rev);
     }
@@ -2797,7 +4246,7 @@ bool TaskQueueManager::BuildLaunchRequest(TaskQueue& tq, TaskQueueJob& job, int 
         const TaskQueueAttempt& prev = job.attempts[job.attempts.size() - 2];
         req.env["PC_PREV_REASON"] = prev.reason;
         req.env["PC_PREV_EXIT"] = std::to_string(prev.exitCode);
-        if (!prev.lastLinesFile.empty()) req.env["PC_PREV_TAIL"] = prev.lastLinesFile;
+        if (job.host.empty() && !prev.lastLinesFile.empty()) req.env["PC_PREV_TAIL"] = prev.lastLinesFile;
     }
 
     out.req = std::move(req);
@@ -2809,6 +4258,7 @@ bool TaskQueueManager::BuildLaunchRequest(TaskQueue& tq, TaskQueueJob& job, int 
 namespace pc {
 
 void TaskQueueManager::ProcessSchedulerTick() {
+    PollRemoteJobs();
     {
         std::lock_guard<std::mutex> lock(mutex_);
         if (!pm_) return;
@@ -2846,7 +4296,9 @@ void TaskQueueManager::ProcessSchedulerTick() {
             bool wait = running[tq.name] >= tq.concurrency ||
                         FindRunningResourceConflictLocked(job, holder, resource);
             for (size_t w = 0; !wait && locks && w < waiters.size(); ++w) {
-                wait = FindResourceConflict(job.resources, job.cwd, waiters[w]->resources, waiters[w]->cwd, resource);
+                wait = FindResourceConflict(job.resources, job.cwd, job.host,
+                                            waiters[w]->resources, waiters[w]->cwd,
+                                            waiters[w]->host, resource);
             }
             if (wait) {
                 if (!job.resources.empty()) waiters.push_back(&job);
@@ -2859,25 +4311,169 @@ void TaskQueueManager::ProcessSchedulerTick() {
             a.n = n;
             a.start = GetCurrentTimestampStr();
             a.instructionsRev = job.instructions.rev;
+            a.memoryRefs = item.memoryRefs;
             a.startFiletime = NowFiletime();
             job.attempts.push_back(a);
             job.state = "running";
             job.updatedAt = a.start;
             EmitEventLocked(tq, "jobStarted", job.id, n);
+            job.attempts.back().startEventSeq = static_cast<uint64_t>(tq.version);
 
             std::string err;
-            int pid = pm_->StartProcess(item.req, err);
-            if (pid > 0) {
-                job.attempts.back().processId = pid;
-                running[tq.name]++;
+            int pid = 0;
+            if (!job.host.empty()) {
+                if (!remoteStartCb_) {
+                    err = "job '" + job.id + "' targets host '" + job.host +
+                          "' but remote dispatch is not available";
+                } else {
+                    // Local paths in the request belong to this machine; the remote
+                    // host picks its own log and done files.
+                    StartProcessRequest remoteReq = item.req;
+                    remoteReq.logFile.clear();
+                    remoteReq.doneFile.clear();
+                    pid = remoteStartCb_(job.host, remoteReq, err);
+                    if (pid > 0) {
+                        job.attempts.back().remoteHost = job.host;
+                        job.attempts.back().remoteProcessId = pid;
+                        running[tq.name]++;
+                    }
+                }
             } else {
-                ApplyAttemptOutcome(tq, job, false, "launchFailed", -1, err);
+                pid = pm_->StartProcess(item.req, err);
+                if (pid > 0) {
+                    job.attempts.back().processId = pid;
+                    running[tq.name]++;
+                }
+            }
+            if (pid <= 0) {
+                TaskQueueFailureInput fin;
+                FillFailureInputBase(fin, job, job.attempts.back());
+                fin.launchFailed = true;
+                fin.endKind = "failed";
+                fin.exitCode = -1;
+                fin.checkDetail = err;
+                fin.logFile = WideToUtf8(GetAttemptLogPathWide(job.id, n));
+                fin.fallbackEventsFile = WideToUtf8(GetTaskEventsFileWide(tq.name));
+                fin.fallbackEventSeq = job.attempts.back().startEventSeq;
+                ApplyAttemptOutcome(tq, job, false, "launchFailed", -1, err, &fin);
             }
             changed = true;
         }
         if (changed) SaveAllLocked();
     }
     FlushFinishedCallbacks();
+}
+
+void TaskQueueManager::PollRemoteJobs() {
+    struct Target {
+        std::string host;
+        int remoteId = 0;
+        std::string jobId;
+        int attemptN = 0;
+    };
+    std::vector<Target> targets;
+    RemotePollCallback poll;
+    {
+        std::lock_guard<std::mutex> lock(mutex_);
+        if (!remotePollCb_) return;
+        poll = remotePollCb_;
+        const int64_t now = static_cast<int64_t>(GetNowTickMs());
+        for (auto& [name, tq] : queues_) {
+            (void)name;
+            for (auto& job : tq.jobs) {
+                if (job.state != "running" || job.attempts.empty()) continue;
+                TaskQueueAttempt& a = job.attempts.back();
+                if (a.remoteHost.empty() || a.remoteProcessId <= 0) continue;
+                // Keep the remote host from being polled several times per second.
+                if (a.lastRemotePollMs != 0 && now - static_cast<int64_t>(a.lastRemotePollMs) < 750) {
+                    continue;
+                }
+                a.lastRemotePollMs = static_cast<uint64_t>(now);
+                targets.push_back({a.remoteHost, a.remoteProcessId, job.id, a.n});
+            }
+        }
+    }
+
+    for (const auto& target : targets) {
+        RemotePollResult result;
+        std::string err;
+        if (!poll(target.host, target.remoteId, result, err)) {
+            if (!err.empty()) {
+                WriteAuditLog("REMOTE_POLL", target.host + " job " + target.jobId + ": " + err);
+            }
+            continue;
+        }
+        if (!result.finished) continue;
+
+        std::lock_guard<std::mutex> lock(mutex_);
+        TaskQueue* tq = nullptr;
+        TaskQueueJob* job = FindJob(target.jobId, &tq);
+        if (!job || !tq || job->state != "running" || job->attempts.empty()) continue;
+        TaskQueueAttempt& a = job->attempts.back();
+        if (a.n != target.attemptN || a.remoteProcessId != target.remoteId) continue;
+        FinishRemoteAttemptLocked(*tq, *job, result);
+        SaveAllLocked();
+    }
+    FlushFinishedCallbacks();
+}
+
+bool TaskQueueManager::FinishRemoteAttemptLocked(TaskQueue& tq, TaskQueueJob& job,
+                                                 const RemotePollResult& result) {
+    if (job.attempts.empty()) return false;
+    TaskQueueAttempt& a = job.attempts.back();
+
+    const std::wstring logPath = GetAttemptLogPathWide(job.id, a.n);
+    if (!result.output.empty()) {
+        WriteFileAtomicWide(logPath, result.output);
+    }
+    const std::string logText = ReadFileUtf8Wide(logPath);
+
+    const std::wstring eventsPath = GetAttemptEventsPathWide(job.id, a.n);
+    if (!result.eventsJsonl.empty()) {
+        WriteFileAtomicWide(eventsPath, result.eventsJsonl);
+    }
+    if (!result.doneContent.empty()) {
+        WriteFileAtomicWide(GetAttemptDonePathWide(job.id, a.n), result.doneContent);
+    }
+
+    if (!logText.empty()) {
+        std::wstring tailPath = PathJoinWide(
+            GetTaskQueueLogDirWide(),
+            Utf8ToWide(SanitizeFileNameComponent(job.id)) + L"." + std::to_wstring(a.n) + L".tail.txt");
+        WriteFileAtomicWide(tailPath, GetTailLines(logText, 50));
+        a.lastLinesFile = WideToUtf8(tailPath);
+    }
+
+    a.end = GetCurrentTimestampStr();
+    a.exitCode = result.exitCode;
+    job.updatedAt = a.end;
+
+    TaskQueueFailureInput fin;
+    FillFailureInputBase(fin, job, a);
+    fin.endKind = result.endKind.empty() ? "completed" : result.endKind;
+    fin.exitCode = result.exitCode;
+    fin.logFile = WideToUtf8(logPath);
+    FillFailureLog(fin, logText);
+    if (!result.eventsJsonl.empty()) {
+        fin.eventsFile = WideToUtf8(eventsPath);
+        fin.events = ReadHanchoEventsFile(fin.eventsFile, 500, "", 0);
+    }
+    fin.fallbackEventsFile = WideToUtf8(GetTaskEventsFileWide(tq.name));
+    fin.fallbackEventSeq = static_cast<uint64_t>(tq.version + 1);
+
+    std::string detail;
+    const bool ok = EvaluateSuccess(job, a, fin.endKind, result.exitCode, WideToUtf8(logPath), detail);
+    fin.success = ok;
+    fin.checkDetail = detail;
+
+    std::string reason;
+    if (ok) reason = "ok";
+    else if (fin.endKind == "completed") reason = "checkFailed";
+    else reason = fin.endKind;
+
+    ApplyAttemptOutcome(tq, job, ok, reason, result.exitCode, detail, ok ? nullptr : &fin);
+    AppendRunRecordForAttempt(tq, job, a, fin, logText);
+    return true;
 }
 
 void TaskQueueManager::SchedulerLoop() {
@@ -2889,6 +4485,44 @@ void TaskQueueManager::SchedulerLoop() {
         if (!schedulerRunning_.load()) break;
         ProcessSchedulerTick();
     }
+}
+
+// One L1 RunRecord per finished attempt (doc/design-v3.md 3.3). The record is built from
+// the same taskqueue facts and .events.jsonl that `memory rebuild` uses, so a live record
+// and a rebuilt one are identical.
+static void AppendRunRecordForAttempt(const TaskQueue& tq, const TaskQueueJob& job,
+                                      const TaskQueueAttempt& attempt,
+                                      const TaskQueueFailureInput& fin,
+                                      const std::string& logText) {
+    memory::RunRecordInput in;
+    in.jobId = job.id;
+    in.taskqueue = tq.name;
+    in.jobName = job.name;
+    in.summary = job.summary;
+    in.instructions = job.instructions.text;
+    in.command = job.command;
+    in.cwd = job.cwd;
+    in.btId = job.bt.id;
+    in.btNode = job.bt.node;
+    in.btRun = job.bt.run;
+    in.attempt = attempt.n;
+    in.originClient = job.origin.client;
+    in.originSession = job.origin.session;
+    in.originCwd = job.origin.cwd;
+    in.start = attempt.start;
+    in.end = attempt.end;
+    in.exitCode = attempt.exitCode;
+    in.reason = attempt.reason;
+    in.jobState = job.state;
+    in.failureClass = attempt.failure.failureClass;
+    in.failureSummary = attempt.failure.summary;
+    in.checkDetail = attempt.checkDetail;
+    in.processId = attempt.processId;
+    in.eventsFile = fin.eventsFile;
+    in.logFile = fin.logFile;
+    in.lastLinesFile = attempt.lastLinesFile;
+    in.logText = logText;
+    memory::AppendRunRecordJson(in);
 }
 
 void TaskQueueManager::OnProcessFinished(int processId, int exitCode, const std::string& endKind) {
@@ -2905,10 +4539,39 @@ void TaskQueueManager::OnProcessFinished(int processId, int exitCode, const std:
                 std::wstring logPath = GetAttemptLogPathWide(job.id, a.n);
                 std::string logText = ReadFileUtf8Wide(logPath);
                 if (!logText.empty()) {
-                    std::wstring tailPath = GetTaskQueueLogDirWide() + L"\\" +
-                        Utf8ToWide(SanitizeFileNameComponent(job.id)) + L"." + std::to_wstring(a.n) + L".tail.txt";
+                    std::wstring tailPath = PathJoinWide(GetTaskQueueLogDirWide(),
+                        Utf8ToWide(SanitizeFileNameComponent(job.id)) + L"." + std::to_wstring(a.n) + L".tail.txt");
                     WriteFileAtomicWide(tailPath, GetTailLines(logText, 50));
                     a.lastLinesFile = WideToUtf8(tailPath);
+                }
+
+                // Inputs for the classifier: attempt facts, normalized events and the log tail.
+                TaskQueueFailureInput fin;
+                FillFailureInputBase(fin, job, a);
+                fin.endKind = endKind;
+                fin.exitCode = exitCode;
+                fin.cancelled = (job.state == "cancelled");
+                fin.logFile = WideToUtf8(logPath);
+                FillFailureLog(fin, logText);
+                fin.fallbackEventsFile = WideToUtf8(GetTaskEventsFileWide(tq.name));
+                fin.fallbackEventSeq = static_cast<uint64_t>(tq.version + 1);
+                ProcessSnapshot snap;
+                if (pm_ && pm_->GetSnapshot(processId, snap)) {
+                    fin.elapsedSec = static_cast<int64_t>(snap.elapsedMs / 1000);
+                    if (!snap.activity.empty() || !snap.activityTarget.empty()) {
+                        fin.lastActivity = snap.activity;
+                        fin.lastActivityTarget = snap.activityTarget;
+                        if (snap.activitySinceEpochMs > 0) {
+                            int64_t nowMs = std::chrono::duration_cast<std::chrono::milliseconds>(
+                                std::chrono::system_clock::now().time_since_epoch()).count();
+                            fin.lastActivitySinceSec = nowMs > snap.activitySinceEpochMs
+                                ? (nowMs - snap.activitySinceEpochMs) / 1000 : 0;
+                        }
+                    }
+                    fin.eventsFile = HanchoEventsFilePathForStream(snap.streamFilePath);
+                    if (!fin.eventsFile.empty()) {
+                        fin.events = ReadHanchoEventsFile(fin.eventsFile, 500, "", 0);
+                    }
                 }
 
                 if (job.state == "cancelled") {
@@ -2917,12 +4580,20 @@ void TaskQueueManager::OnProcessFinished(int processId, int exitCode, const std:
                     a.exitCode = exitCode;
                     a.checkDetail = "cancelled";
                     job.updatedAt = a.end;
+                    fin.checkDetail = "cancelled";
+                    a.failure = ClassifyTaskQueueFailure(fin);
                     tq.version++;
-                    std::string ev = "{\"version\":" + std::to_string(tq.version) +
-                                     ",\"type\":\"jobCancelled\",\"taskqueue\":\"" + JsonEscape(tq.name) +
-                                     "\",\"job_id\":\"" + JsonEscape(job.id) +
-                                     "\",\"attempt\":" + std::to_string(a.n) +
-                                     ",\"timestamp\":\"" + GetCurrentTimestampStr() + "\"}\r\n";
+                    std::ostringstream evs;
+                    evs << "{\"version\":" << tq.version
+                        << ",\"seq\":" << tq.version
+                        << ",\"type\":\"jobCancelled\",\"taskqueue\":\"" << JsonEscape(tq.name)
+                        << "\",\"job_id\":\"" << JsonEscape(job.id)
+                        << "\",\"attempt\":" << a.n
+                        << ",\"timestamp\":\"" << GetCurrentTimestampStr() << "\"";
+                    std::string failureJson = TaskQueueFailureDiagnosticToJson(a.failure);
+                    if (!failureJson.empty()) evs << ",\"failure\":" << failureJson;
+                    evs << "}\r\n";
+                    std::string ev = evs.str();
                     AppendToLogFileWide(GetTaskEventsFileWide(tq.name), ev);
                     if (!tq.notifyFile.empty()) {
                         std::string notify = ev;
@@ -2931,17 +4602,21 @@ void TaskQueueManager::OnProcessFinished(int processId, int exitCode, const std:
                     }
                     SaveQueue(tq);
                     CheckQueueNotices(tq);
+                    AppendRunRecordForAttempt(tq, job, a, fin, logText);
                     cv_.notify_all();
                     return;
                 }
 
                 std::string detail;
                 bool ok = EvaluateSuccess(job, a, endKind, exitCode, WideToUtf8(logPath), detail);
+                fin.success = ok;
+                fin.checkDetail = detail;
                 std::string reason;
                 if (ok) reason = "ok";
                 else if (endKind == "completed") reason = "checkFailed";
                 else reason = endKind;
-                ApplyAttemptOutcome(tq, job, ok, reason, exitCode, detail);
+                ApplyAttemptOutcome(tq, job, ok, reason, exitCode, detail, ok ? nullptr : &fin);
+                AppendRunRecordForAttempt(tq, job, a, fin, logText);
                 break;
             }
         }

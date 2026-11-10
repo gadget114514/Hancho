@@ -22,8 +22,8 @@
 
 ## Express
 
-- [Hancho-v0.9.3-win64-setup.exe](https://github.com/gadget114514/Hancho/releases/download/v0.9.3/Hancho-v0.9.3-win64-setup.exe) をダウンロードしてインストール
-  （ポータブル版: [Hancho-v0.9.3-win64.zip](https://github.com/gadget114514/Hancho/releases/download/v0.9.3/Hancho-v0.9.3-win64.zip)、全バージョン: [Releases](https://github.com/gadget114514/Hancho/releases)）
+- [Hancho-v0.9.4-win64-setup.exe](https://github.com/gadget114514/Hancho/releases/download/v0.9.4/Hancho-v0.9.4-win64-setup.exe) をダウンロードしてインストール
+  （ポータブル版: [Hancho-v0.9.4-win64.zip](https://github.com/gadget114514/Hancho/releases/download/v0.9.4/Hancho-v0.9.4-win64.zip)、全バージョン: [Releases](https://github.com/gadget114514/Hancho/releases)）
 - LLM に「PATH から hancho を探して、help を読んで使い方を把握して」と伝える
 - LLM に「タスクを作成して、hancho 経由で (opencode|claude|agy|codex) に実行させて」と伝える
 - 以上
@@ -96,12 +96,24 @@ MCP ツール `run_worker` は、1つのタスクをワーカーの LLM CLI に�
 
 Hancho は生のストリームの隣に、版番号つきのイベント列を書き出します。ワーカープロセスの `logs/proc_<id>_<name>_stream.jsonl` は CLI の生の行を、`logs/proc_<id>_<name>.events.jsonl` は正規化した `hancho.event/1` イベント（`tool.call`、`tool.result`、`usage`、`run.ended` など）を持ちます。スキーマは [doc/schema/hancho.event.v1.json](doc/schema/hancho.event.v1.json) で配布します。
 
-- `hancho-cli worker stream <id> --schema v1` で `.events.jsonl` の正規化イベントを表示します。
-- MCP の `get_worker_stream` は `schema: "v1"` で同じ形式を返します。
+- `hancho-cli worker stream <id>` は既定で `.events.jsonl` の正規化イベントを表示します（旧形式は `--schema legacy`）。
+- MCP の `get_worker_stream` は既定で同じ形式を返します（旧形式は `schema: "legacy"`）。
 - C++ を書かずに CLI を追加できます。`<data-dir>/adapters/<name>.json` を置く（Tier 1: `match`、`rules`、JSON Pointer の `map`）か、`exec` に変換プロセスを指定します（Tier 3: stdin に生の行、stdout に `hancho.event` 行）。
 - `engines.json` に `adapter` と `capabilities`（`jsonStream`、`resume`、`reportsUsage`、`reportsSubagents`、`permissionModes`）を書けます。
 - ラッパースクリプトから直接イベントを出せます。pipe モードのワーカーには `HANCHO_EVENT_PIPE` が渡され、`hancho-cli event emit --kind message --text "..."` で書き込めます。
 - `hancho-cli adapter test <name>` は `tests/adapters/<name>/` の入力と期待する `{kind, data}` を照合します。
+
+**既定の形式と旧形式の廃止予定。** `hancho-cli worker stream` と MCP `get_worker_stream` は既定で `hancho.event/1` を返します。以前の内部 `type` 文字列は v0.9.3 で非推奨になりました。`--schema legacy`（CLI）または `schema: "legacy"`（MCP）を渡せば v0.10.x までは引き続き読めますが、**v0.11.0** で削除します。移行手順と `type` → `kind` の対応表は [doc/LLM-jsonstream-format.md](doc/LLM-jsonstream-format.md#legacy-type-strings-and-migration-to-hanchoevent1) にあります。
+
+## Hancho をやめるとき（卒業）
+
+Hancho は目的ではなく手段です。[Hancho v3 設計 §5.2](doc/design-v3.md) の理由を harness 側が満たしたら、作業を失わずにやめられます。
+
+1. `hancho-cli.exe mcp uninstall` で `.mcp.json` / `opencode.json` から Hancho の項目を外します。
+2. `hancho-cli.exe agent uninstall-template` で `.claude\agents\hancho-runner.md` を消します。
+3. データディレクトリは既定で残ります。消す場合はどちらかのコマンドに `--delete-data-dir` を付けます。
+
+Hancho のデータはすべて JSON / JSONL（タスクキュー、ビヘイビアツリー、ストリームイベント、意味的メモリ）で、Hancho がなくても読めます。やめる前に [design-v3.md §5.3–5.5](doc/design-v3.md) の機能対応表と置き換え条件を確認してください。この表はリリースごとに[リリースチェックリスト](doc/release-checklist-ja.md)で見直します。
 
 ## ドキュメント
 
@@ -119,6 +131,7 @@ Hancho は生のストリームの隣に、版番号つきのイベント列を�
 | [Pros/Cons](doc/pros-cons-comparison-ja.md) | サブエージェント等との使い分け |
 | [批判的比較](doc/critical-comparison-ja.md) | Hancho の限界と使うべきでないケースを辛口に整理 |
 | [Hancho v3 設計](doc/design-v3.md) | イベントスキーマとアダプター、ヘッドレス/リモート、意味的メモリ、失敗分析、卒業指針 |
+| [リリースチェックリスト](doc/release-checklist-ja.md) | リリースごとの卒業用機能対応表の見直しと片付けコマンドの確認 |
 | [tools/ww](tools/ww/README-ww.md) | 任意・独立のタスクカード実行テンプレート（Hancho の一部ではない） |
 
 ---
@@ -127,7 +140,15 @@ Hancho は生のストリームの隣に、版番号つきのイベント列を�
 
 ## リリースノート
 
+### v0.9.4
+- **意味的メモリ**: L1 実行記録、L2 ノート、L3 承認済み知識を `memory/` に保存。`hancho-cli memory search|get|brief|stats|note|approve|rebuild|prune` と MCP `memory_search` / `memory_get` / `memory_brief` / `memory_stats` / `memory_note` / `memory_retract`。`{memory}` で上限付きの brief を注入し、渡した id を試行に記録します。
+- **失敗分析**: 試行ごとに決定的な診断（分類、確信度、要約、証拠、直前の活動、推奨アクション）。`hancho-cli taskqueue why <id>`、MCP のタスク結果、BT の条件から参照でき、再試行方針を分類ごとに変えられます。
+- **ヘッドレス / POSIX / リモートの基礎**: `Hancho.exe --headless`、`hancho-cli run --exit-on-drain --report junit.xml`、POSIX ビルドとプラットフォーム境界、`hosts.json` とリモートジョブのミラー。初期段階です（`doc/build-posix.md`、`doc/remote-hosts.md`）。
+- **卒業**: キュー / BT / 知識の `hancho-cli export`、`mcp uninstall`、`agent uninstall-template`、リリースチェックリスト。
+- **ETA と paused 起動**: ジョブが `estimateSec` を受け取り、ダッシュボードがタイムアウトではなくカード見積を残り時間に表示。`bt start --paused true` はジョブを作らずにツリーを登録します。
+
 ### v0.9.3
+- **旧ストリーム形式の非推奨化**: `hancho-cli worker stream` と MCP `get_worker_stream` は既定で `hancho.event/1` を返します。旧 `type` 文字列は `--schema legacy` / `schema: "legacy"` で v0.10.x まで利用でき、v0.11.0 で削除します。[移行手順](doc/LLM-jsonstream-format.md#legacy-type-strings-and-migration-to-hanchoevent1)を参照してください。
 - **BT 全体のタスク一覧**: `hancho-cli bt tasks --id <id>`、`taskqueue list --bt <id>`、MCP `taskqueue_list` の `bt` で、ビヘイビアツリーの全ジョブを並列分岐のキューをまたいで一覧できます。並列分岐は専用キュー（と専用の並列度）を保ち、ダッシュボードは元々すべてのキューをまとめて表示します。
 
 ### v0.9.2
@@ -556,7 +577,9 @@ COMMANDS:
 
   worker stream <id> [--tail <n>] [--type <type>] [--since <seq>] [--summary] [--schema <legacy|v1>]
       View captured JSON streaming events for claude, agy, or opencode workers.
-      --schema v1 returns the stable hancho.event/1 shape from <log>.events.jsonl.
+      --schema v1 (default) returns the stable hancho.event/1 shape from <log>.events.jsonl.
+      --schema legacy returns the deprecated internal type strings and is removed in v0.11.0.
+      With v1, --type matches the kind (tool.call, message, ...).
 
   worker info <id> [--notes "<notes>"] [--goal "<goal>"]
       Update supervisor notes or goal for an ongoing worker.
@@ -566,12 +589,35 @@ COMMANDS:
       directory). It runs long commands through Hancho and returns a short summary.
       An existing file is not overwritten.
 
+  agent uninstall-template [--path <dir>] [--dry-run] [--delete-data-dir]
+      Remove the hancho-runner subagent written by install-template (the inverse command).
+      Empty .claude\agents and .claude directories are removed too. Add --delete-data-dir
+      to also delete the data directory (kept by default).
+
   mcp install [--client claude|opencode] [--path <file>] [--name <name>] [--data-dir <path>] [--dry-run]
       Register Hancho as an MCP server automatically. Writes or updates
       .mcp.json (Claude Code, default) or opencode.json (--client opencode).
       --data-dir embeds "--data-dir <path>" in the generated MCP server args so the
       project keeps its logs/state/task queues inside that directory.
       --json prints the machine-readable result; --dry-run previews without writing.
+
+  mcp uninstall [--client claude|opencode] [--path <file>] [--name <name>] [--data-dir <path>]
+                [--delete-data-dir] [--dry-run]
+      Remove the Hancho entry from the MCP config (the inverse of mcp install).
+      The data directory is kept by default; add --delete-data-dir to delete it too.
+      The data directory is the one embedded by mcp install, --data-dir, or the default.
+
+LEAVING HANCHO (graduation):
+  Stop using Hancho without losing your work:
+    1. hancho-cli.exe mcp uninstall                  # remove MCP registration (keep data)
+    2. hancho-cli.exe agent uninstall-template       # remove hancho-runner.md
+    3. Delete the data directory only if you want to:
+         hancho-cli.exe mcp uninstall --delete-data-dir
+  While you keep it, all Hancho data stays in open formats: queues, behavior trees,
+  events and memory are JSON / JSONL and readable without Hancho.
+  When a harness covers your use, compare it with doc\design-v3.md sections 5.3-5.5
+  (feature map and conditions) before leaving. doc\release-checklist.md records the
+  per-release review of that table.
 
 TASK QUEUE:
   taskqueue add --file <jobs.json> [--taskqueue <name>] [--concurrency <n>] [--notify-file <path>]

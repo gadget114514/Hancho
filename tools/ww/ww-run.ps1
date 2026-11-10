@@ -156,8 +156,10 @@ if ($Jobs) {
         if (-not $Worktree -and $e.Count -eq 0) {
             [Console]::Error.WriteLine("[ww-run] note: $($c.Name) has no '## Authorised edits'; it locks the whole checkout and runs alone")
         }
+        $estMin = Get-EstimateMinutes -CardPath $c.FullName
+        $estSec = if ($estMin) { [int]$estMin * 60 } else { 0 }
         $list.Add((New-HanchoCliJob -Task $id -CardName $c.Name -Root $root -RunCmd $runCmd -Engine $Engine -Model $Model -Agent $Agent `
-            -TimeoutSec $TimeoutSec -Worktree:$Worktree -Edits $e -Reads $r))
+            -TimeoutSec $TimeoutSec -EstimateSec $estSec -Worktree:$Worktree -Edits $e -Reads $r))
         $declared += [pscustomobject]@{ Task = $id; Locks = (Get-RunLocks ([pscustomobject]@{ Shared = $true; Edits = $e; Reads = $r })) }
     }
     if (-not $Worktree) {

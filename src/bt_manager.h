@@ -41,7 +41,7 @@ public:
 
     // JSON API (stage 2 & stage 3)
     std::string Validate(const std::string& json);
-    std::string Start(const std::string& json);
+    std::string Start(const std::string& json, bool paused = false);
     std::string Get(const std::string& id, bool compact = false);
     std::string List();
     std::string Wait(const std::string& id, uint64_t sinceVersion, int timeoutMs, bool compact = false);

@@ -1,6 +1,7 @@
 #include "mcp_server.h"
 #include "ipc_client.h"
 #include "common.h"
+#include "memory_search.h"
 #include "nlohmann/json.hpp"
 #include <fstream>
 #include <iostream>
@@ -15,11 +16,10 @@
 
 namespace pc {
 
-// Event shape that get_worker_stream returns when the caller does not pass `schema`. "legacy" is
-// the internal LlmStreamEvent shape; "v1" is hancho.event/1 from .events.jsonl. Both stay
-// available by passing `schema` explicitly. To make v1 the default, change this to "v1" and update
-// the `schema` description in the get_worker_stream tool definition to match.
-static constexpr const char* kWorkerStreamDefaultSchema = "legacy";
+// Event shape that get_worker_stream returns when the caller does not pass `schema`. "v1" is the
+// stable hancho.event/1 shape read from .events.jsonl; "legacy" is the internal LlmStreamEvent
+// shape, deprecated and kept for opt-in use until it is removed in v0.11.0.
+static constexpr const char* kWorkerStreamDefaultSchema = "v1";
 
 // The top-level JSON-RPC fields of one request line. Parsed with nlohmann::json so that keys
 // inside "params" (e.g. a tool argument named "id") are never mistaken for the request's own;
@@ -112,6 +112,61 @@ static std::string BuildMcpToolResult(const std::string& rpcIdRaw, const std::st
         << (isError ? ",\"isError\":true" : "")
         << "}}";
     return oss.str();
+}
+
+// The diagnosis an upper-level agent needs to choose the next step without reading logs
+// (doc/design-v3.md 4.6): the last failure plus the class of every earlier attempt.
+static nlohmann::json McpDiagnosisForJob(const nlohmann::json& job) {
+    if (!job.is_object()) return nlohmann::json();
+    auto attempts = job.find("attempts");
+    if (attempts == job.end() || !attempts->is_array()) return nlohmann::json();
+
+    const nlohmann::json* lastFailure = nullptr;
+    nlohmann::json history = nlohmann::json::array();
+    for (size_t i = 0; i < attempts->size(); ++i) {
+        const nlohmann::json& attempt = (*attempts)[i];
+        if (!attempt.is_object()) continue;
+        auto failure = attempt.find("failure");
+        if (failure == attempt.end() || !failure->is_object() || failure->empty()) continue;
+        nlohmann::json item = nlohmann::json::object();
+        item["attempt"] = attempt.value("n", static_cast<int>(i) + 1);
+        item["class"] = failure->value("class", std::string());
+        item["suggestedAction"] = failure->value("suggestedAction", std::string());
+        item["summary"] = failure->value("summary", std::string());
+        history.push_back(std::move(item));
+        lastFailure = &(*failure);
+    }
+    if (!lastFailure) return nlohmann::json();
+
+    nlohmann::json diagnosis = *lastFailure;
+    diagnosis["history"] = std::move(history);
+    return diagnosis;
+}
+
+static void AttachDiagnosisToJob(nlohmann::json& job) {
+    nlohmann::json diagnosis = McpDiagnosisForJob(job);
+    if (!diagnosis.is_null()) job["failure"] = std::move(diagnosis);
+}
+
+// taskqueue_get and taskqueue_wait carry the diagnosis of every job on the top level too,
+// so a caller does not have to walk attempts[].failure.
+static void AttachTaskQueueDiagnosis(const std::string& toolName, std::string& respJson) {
+    if (toolName != "taskqueue_get" && toolName != "taskqueue_wait" && toolName != "taskqueue_list") {
+        return;
+    }
+    nlohmann::json resp = nlohmann::json::parse(respJson, nullptr, false);
+    if (resp.is_discarded() || !resp.is_object() || !resp.value("ok", false)) return;
+
+    if (toolName == "taskqueue_get") {
+        auto job = resp.find("job");
+        if (job != resp.end() && job->is_object()) AttachDiagnosisToJob(*job);
+    } else {
+        auto jobs = resp.find("jobs");
+        if (jobs != resp.end() && jobs->is_array()) {
+            for (auto& job : *jobs) AttachDiagnosisToJob(job);
+        }
+    }
+    respJson = resp.dump(-1, ' ', false, nlohmann::json::error_handler_t::replace);
 }
 
 // stdout is shared by the read loop and the bt_wait threads; one line per message.
@@ -359,14 +414,14 @@ int RunMcpServer() {
                 << "},"
                 << "{"
                 << "\"name\":\"get_worker_stream\","
-                << "\"description\":\"Read structured JSON streaming events (tools called, arguments, reasoning/thoughts, assistant responses, status) emitted by Claude, agy, or OpenCode worker agents. Events are automatically captured and saved to logs/proc_<id>_<name>_stream.jsonl. Pass schema='v1' for the stable hancho.event/1 shape.\","
+                << "\"description\":\"Read structured JSON streaming events (tools called, arguments, reasoning/thoughts, assistant responses, status) emitted by Claude, agy, or OpenCode worker agents. Events are automatically captured and saved to logs/proc_<id>_<name>_stream.jsonl. Returns the stable hancho.event/1 shape by default; pass schema='legacy' for the deprecated internal type strings, which are removed in v0.11.0.\","
                 << "\"inputSchema\":{\"type\":\"object\",\"properties\":{"
                 << "\"id\":{\"type\":\"integer\",\"description\":\"Managed process ID of the agent\"},"
                 << "\"tail\":{\"type\":\"integer\",\"description\":\"Number of recent events to return (default 50, 0 = all)\"},"
-                << "\"type\":{\"type\":\"string\",\"description\":\"Filter by event type in the legacy shape, or by kind when schema='v1' (e.g. 'tool.call', 'message')\"},"
+                << "\"type\":{\"type\":\"string\",\"description\":\"Filter by event type in the legacy shape, or by kind when schema='v1' (the default; e.g. 'tool.call', 'message')\"},"
                 << "\"since_seq\":{\"type\":\"integer\",\"description\":\"Return only events with sequence number greater than since_seq\"},"
                 << "\"format\":{\"type\":\"string\",\"enum\":[\"json\",\"summary\"],\"description\":\"Return format: 'json' (structured events array, default) or 'summary' (compact text summary)\"},"
-                << "\"schema\":{\"type\":\"string\",\"enum\":[\"legacy\",\"v1\"],\"description\":\"Event shape: 'legacy' (default, internal type strings) or 'v1' (versioned hancho.event/1 from .events.jsonl)\"}"
+                << "\"schema\":{\"type\":\"string\",\"enum\":[\"legacy\",\"v1\"],\"description\":\"Event shape: 'v1' (default, versioned hancho.event/1 from .events.jsonl) or 'legacy' (deprecated internal type strings; removed in v0.11.0)\"}"
                 << "},\"required\":[\"id\"]}"
                 << "},"
                 << "{"
@@ -438,8 +493,8 @@ int RunMcpServer() {
                 << "},\"required\":[\"taskqueue\",\"jobs\"]}"
                 << "},"
                 << "{"
-                << "\"name\":\"taskqueue_list\","
-                << "\"description\":\"List task queue jobs with state, attempts, last reason and blockedBy.\","
+                 << "\"name\":\"taskqueue_list\","
+                 << "\"description\":\"List task queue jobs with state, attempts, last reason and blockedBy. Failed jobs carry the same top-level failure record (class, summary, suggestedAction, evidence) as taskqueue_get.\","
                 << "\"inputSchema\":{\"type\":\"object\",\"properties\":{"
                 << "\"taskqueue\":{\"type\":\"string\",\"description\":\"Optional task queue name (all queues when omitted)\"},"
                 << "\"state\":{\"type\":\"string\",\"description\":\"Optional state filter: pending, running, succeeded, failed, blocked, cancelled\"},"
@@ -449,8 +504,8 @@ int RunMcpServer() {
                 << "}}"
                 << "},"
                 << "{"
-                << "\"name\":\"taskqueue_get\","
-                << "\"description\":\"Get a job with attempt history, instructions text, and sourceChanged/sourceMissing flags.\","
+                 << "\"name\":\"taskqueue_get\","
+                 << "\"description\":\"Get a job with attempt history, instructions text, and sourceChanged/sourceMissing flags. A failed job also carries a top-level failure record (class, confidence, summary, lastActivity, evidence, suggestedAction, retryAt) plus failure.history for earlier attempts.\","
                 << "\"inputSchema\":{\"type\":\"object\",\"properties\":{"
                 << "\"id\":{\"type\":\"string\",\"description\":\"Job id\"},"
                 << "\"includeInstructions\":{\"type\":\"boolean\",\"description\":\"Include instructions text (default true)\"},"
@@ -514,8 +569,8 @@ int RunMcpServer() {
                 << "},\"required\":[\"taskqueue\"]}"
                 << "},"
                 << "{"
-                << "\"name\":\"taskqueue_wait\","
-                << "\"description\":\"Wait until a task queue version changes (long poll) and return its jobs.\","
+                 << "\"name\":\"taskqueue_wait\","
+                 << "\"description\":\"Wait until a task queue version changes (long poll) and return its jobs. Each failed job carries a top-level failure record (class, summary, lastActivity, evidence, suggestedAction, retryAt) so the next step can be chosen without reading logs.\","
                 << "\"inputSchema\":{\"type\":\"object\",\"properties\":{"
                 << "\"taskqueue\":{\"type\":\"string\"},"
                 << "\"sinceVersion\":{\"type\":\"integer\",\"description\":\"Version last seen by the caller\"},"
@@ -569,7 +624,8 @@ int RunMcpServer() {
                 << "\"inputSchema\":{\"type\":\"object\",\"properties\":{"
                 << "\"bt\":{\"type\":\"object\",\"description\":\"Behavior tree definition object (id, summary, intent, cwd, vars, limits, worker, root)\"},"
                 << "\"file\":{\"type\":\"string\",\"description\":\"Path to a behavior tree JSON file\"},"
-                << "\"originLabel\":{\"type\":\"string\",\"description\":\"Optional short name shown as the Origin of the jobs this tree adds\"}"
+                << "\"paused\":{\"type\":\"boolean\",\"description\":\"Register the tree paused without creating any jobs (default false)\"}"
+                << ",\"originLabel\":{\"type\":\"string\",\"description\":\"Optional short name shown as the Origin of the jobs this tree adds\"}"
                 << "}}"
                 << "},"
                 << "{"
@@ -640,6 +696,81 @@ int RunMcpServer() {
                 << "\"id\":{\"type\":\"string\",\"description\":\"Behavior tree id\"},"
                 << "\"paused\":{\"type\":\"boolean\",\"description\":\"true to pause, false to resume (default true)\"}"
                 << "},\"required\":[\"id\"]}"
+                << "},"
+                << "{"
+                << "\"name\":\"memory_search\","
+                << "\"description\":\"Search Hancho's persistent memory (L1 run records, L2 notes, L3 approved knowledge). Uses BM25-like keyword ranking with boosts for matching scope/file, recency, layer (L3 > L2 > L1) and failed runs when the query is about failures. Returns id, kind, a one-line summary, score and the source file/line for memory_get.\","
+                << "\"inputSchema\":{\"type\":\"object\",\"properties\":{"
+                << "\"query\":{\"type\":\"string\",\"description\":\"Keywords or a natural-language question\"},"
+                << "\"kinds\":{\"type\":\"array\",\"items\":{\"type\":\"string\",\"enum\":[\"run\",\"note\",\"knowledge\"]},\"description\":\"Restrict to memory layers (default: all)\"},"
+                << "\"scope\":{\"type\":\"string\",\"description\":\"Exact scope, e.g. project, taskqueue:main, job:build, file:src/a.cpp, engine:claude\"},"
+                << "\"file\":{\"type\":\"string\",\"description\":\"File path touched by a run or named by a note scope\"},"
+                << "\"jobName\":{\"type\":\"string\",\"description\":\"Job name\"},"
+                << "\"taskqueue\":{\"type\":\"string\",\"description\":\"Task queue name\"},"
+                << "\"engine\":{\"type\":\"string\",\"description\":\"Worker engine name\"},"
+                << "\"model\":{\"type\":\"string\",\"description\":\"Model name\"},"
+                << "\"outcome\":{\"type\":\"string\",\"description\":\"Run outcome, e.g. success or failed\"},"
+                << "\"failureClass\":{\"type\":\"string\",\"description\":\"Failure classification\"},"
+                << "\"since\":{\"type\":\"string\",\"description\":\"Only records newer than a duration (30m, 6h, 2d) or a timestamp\"},"
+                << "\"limit\":{\"type\":\"integer\",\"description\":\"Maximum results (default 20, max 200)\"}"
+                << "},\"required\":[\"query\"]}"
+                << "},"
+                << "{"
+                << "\"name\":\"memory_get\","
+                << "\"description\":\"Get one memory record by id, with its full JSON and the source file/line it was read from.\","
+                << "\"inputSchema\":{\"type\":\"object\",\"properties\":{"
+                << "\"id\":{\"type\":\"string\",\"description\":\"Memory id returned by memory_search\"},"
+                << "\"kind\":{\"type\":\"string\",\"enum\":[\"run\",\"note\",\"knowledge\"],\"description\":\"Optional kind when the id is ambiguous\"}"
+                << "},\"required\":[\"id\"]}"
+                << "},"
+                << "{"
+                << "\"name\":\"memory_stats\","
+                << "\"description\":\"Compute L1 memory statistics: success rate, duration median/p90, failure classes, token and cost totals, grouped by job, engine and model.\","
+                << "\"inputSchema\":{\"type\":\"object\",\"properties\":{"
+                << "\"since\":{\"type\":\"string\",\"description\":\"Only records newer than a duration or timestamp\"},"
+                << "\"jobName\":{\"type\":\"string\",\"description\":\"Job name filter\"},"
+                << "\"taskqueue\":{\"type\":\"string\",\"description\":\"Task queue filter\"},"
+                << "\"engine\":{\"type\":\"string\",\"description\":\"Engine filter\"},"
+                << "\"model\":{\"type\":\"string\",\"description\":\"Model filter\"},"
+                << "\"outcome\":{\"type\":\"string\",\"description\":\"Outcome filter\"},"
+                << "\"failureClass\":{\"type\":\"string\",\"description\":\"Failure class filter\"}"
+                << "}}"
+                << "},"
+                << "{"
+                << "\"name\":\"memory_brief\","
+                << "\"description\":\"Summarize the memory records relevant to a job in a fixed block: previous runs, common failures, related notes and project knowledge. No LLM is used. Each line carries an id for memory_get; sections are trimmed to fit budgetChars (default 1500) from the bottom up, keeping L3 project knowledge to the end.\","
+                << "\"inputSchema\":{\"type\":\"object\",\"properties\":{"
+                << "\"jobName\":{\"type\":\"string\",\"description\":\"Job name\"},"
+                << "\"taskqueue\":{\"type\":\"string\",\"description\":\"Task queue name\"},"
+                << "\"file\":{\"type\":\"string\",\"description\":\"One related file path\"},"
+                << "\"files\":{\"type\":\"array\",\"items\":{\"type\":\"string\"},\"description\":\"Related file paths; the previous run's filesEdited are added automatically\"},"
+                << "\"scopes\":{\"type\":\"array\",\"items\":{\"type\":\"string\",\"enum\":[\"job\",\"file\",\"taskqueue\",\"project\",\"engine\"]},\"description\":\"Which scopes to draw notes and knowledge from (default: job, file, project)\"},"
+                << "\"budgetChars\":{\"type\":\"integer\",\"description\":\"Maximum characters of the brief (default 1500)\"},"
+                << "\"includeAgentNotes\":{\"type\":\"boolean\",\"description\":\"Include L2 notes authored by agents (default true)\"},"
+                << "\"maxPreviousRuns\":{\"type\":\"integer\",\"description\":\"Maximum previous runs listed (default 3)\"}"
+                << "}}"
+                << "}"
+                << ","
+                << "{"
+                << "\"name\":\"memory_note\","
+                << "\"description\":\"Write an L2 note: a short fact for this project, job, task queue, file or engine. Known secrets (sk-, ghp_, AKIA, Bearer, password=) are redacted and job env is never recorded. Agent notes must cite existing source ids, are limited to 5 per attempt, and an identical scope+text is not stacked.\","
+                << "\"inputSchema\":{\"type\":\"object\",\"properties\":{"
+                << "\"text\":{\"type\":\"string\",\"description\":\"The fact to remember (max 1KB)\"},"
+                << "\"scope\":{\"type\":\"string\",\"description\":\"project, taskqueue:<name>, job:<name>, file:<path> or engine:<name> (default: project)\"},"
+                << "\"tags\":{\"type\":\"array\",\"items\":{\"type\":\"string\"},\"description\":\"Optional tags\"},"
+                << "\"sources\":{\"type\":\"array\",\"items\":{\"type\":\"string\"},\"description\":\"Existing memory ids this note comes from; required for agent notes (usually your attempt's run record id)\"},"
+                << "\"supersedes\":{\"type\":\"string\",\"description\":\"Id of the L2 note this one replaces; the old note becomes superseded\"},"
+                << "\"expiresAt\":{\"type\":\"string\",\"description\":\"Optional expiry timestamp; the note stops being active after it\"}"
+                << "},\"required\":[\"text\",\"sources\"]}"
+                << "}"
+                << ","
+                << "{"
+                << "\"name\":\"memory_retract\","
+                << "\"description\":\"Retract an L2 note. The note and the retraction both stay in memory/notes.jsonl, and replay marks the note as retracted.\","
+                << "\"inputSchema\":{\"type\":\"object\",\"properties\":{"
+                << "\"id\":{\"type\":\"string\",\"description\":\"L2 note id\"},"
+                << "\"reason\":{\"type\":\"string\",\"description\":\"Why the note is being retracted\"}"
+                << "},\"required\":[\"id\"]}"
                 << "}"
                 << "]}}";
             EmitLine(oss.str());
@@ -649,6 +780,17 @@ int RunMcpServer() {
             const std::string& argsJson = req.argumentsJson;
             WriteAuditLog("MCP_TOOL_CALL", "tool=" + toolName + " args=" + argsJson);
             std::ostringstream ipcReq;
+
+            if (toolName == "memory_search" || toolName == "memory_get" || toolName == "memory_stats" ||
+                toolName == "memory_brief" || toolName == "memory_note" ||
+                toolName == "memory_retract") {
+                std::string memResp = memory::HandleToolCall(toolName, argsJson);
+                bool ok = JsonGetBool(memResp, "ok", false);
+                WriteAuditLog("MCP_TOOL_RESP", "tool=" + toolName + " ok=" + (ok ? "true" : "false") +
+                                                   " bytes=" + std::to_string(memResp.size()));
+                EmitLine(BuildMcpToolResult(rpcId, memResp, !ok));
+                continue;
+            }
 
             if (toolName == "start_process") {
                 std::string cmd = JsonGetString(argsJson, "cmd", "");
@@ -910,6 +1052,7 @@ int RunMcpServer() {
                 EmitLine(BuildMcpToolResult(rpcId, "IPC error: " + err, true));
             } else {
                 bool ok = JsonGetBool(ipcResp, "ok", false);
+                if (ok) AttachTaskQueueDiagnosis(toolName, ipcResp);
                 WriteAuditLog("MCP_TOOL_RESP", "tool=" + toolName + " ok=" + (ok ? "true" : "false") + " bytes=" + std::to_string(ipcResp.size()));
                 EmitLine(BuildMcpToolResult(rpcId, ipcResp, !ok));
             }

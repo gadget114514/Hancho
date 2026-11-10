@@ -6,6 +6,18 @@ The console client `hancho-cli.exe` communicates with the running GUI Dashboard 
 
 > **Naming:** `Hancho.exe` is the GUI dashboard / MCP server; `hancho-cli.exe` is its console client.
 
+## Linux / macOS: `hancho-cli top`
+
+On POSIX the core runs headless and the CLI talks to a Unix domain socket. Use
+`top` for a small terminal view of the queue and running processes:
+
+```sh
+hancho-cli --data-dir ./ww-data top              # refresh every second
+hancho-cli top --once --json                     # one machine-readable snapshot
+```
+
+Build instructions are in [build-posix.md](build-posix.md).
+
 ## Version (`--version` / `-V` / `version`)
 
 ```powershell
@@ -127,12 +139,27 @@ hancho-cli.exe taskqueue retry --failed
 hancho-cli.exe taskqueue retry --failed main --since 6h
 ```
 
+**Memory (previous runs, notes and project knowledge):**
+
+```powershell
+hancho-cli.exe memory search "LNK2019" --job-name build
+hancho-cli.exe memory brief --job-name build --budget-chars 1500
+hancho-cli.exe memory get rr_j_7f3a_2
+hancho-cli.exe memory approve nt_01JC9Z --by alice
+```
+
+`memory brief` prints the fixed block (previous runs, common failures, related notes, project knowledge) with an id on every line. Sections are trimmed from the bottom up to fit `--budget-chars` (default 1500), keeping L3 project knowledge to the end. `--no-agent-notes` leaves out L2 notes written by agents. Jobs can receive the same brief automatically: see the `memory` job field in [taskqueue.md](taskqueue.md).
+
+`memory approve <note-id>` promotes an approved L2 note to L3 project knowledge in `memory/knowledge.jsonl`, adding `approvedBy` and `approvedAt` and retiring the note. It is the human-only path (the GUI memory list offers the same action); it is deliberately not exposed as an MCP tool, so agents cannot promote. The file is plain JSONL with one approved fact per line, meant to be committed to git and shared with the team.
+
 **Register as an MCP server automatically (recommended for LLM agents):**
 
 ```powershell
 hancho-cli.exe mcp install                     # .mcp.json (Claude Code)
 hancho-cli.exe mcp install --client opencode   # opencode.json
 hancho-cli.exe mcp install --dry-run --json    # preview without writing
+hancho-cli.exe mcp uninstall                   # remove the entry (keeps data)
+hancho-cli.exe mcp uninstall --delete-data-dir # remove the entry and the data directory
 ```
 
 **Install the `hancho-runner` subagent (Claude Code):**
@@ -143,6 +170,34 @@ hancho-cli.exe agent install-template --path C:\proj --dry-run
 ```
 
 `hancho-runner` runs long builds and tests through Hancho's MCP tools and returns only a short summary. The file is never overwritten.
+
+**Leaving Hancho:** `hancho-cli.exe agent uninstall-template` removes `hancho-runner.md`, and `hancho-cli.exe mcp uninstall` removes the MCP entry. The data directory is kept unless you pass `--delete-data-dir`. All Hancho data is plain JSON / JSONL and remains readable without Hancho. See [design-v3-en.md section 5.3-5.5](design-v3-en.md) for the feature map and [release-checklist.md](release-checklist.md) for the per-release review.
+
+**Exporting data (readable without Hancho):**
+
+```powershell
+# Whole task queue in dependency order, as a runnable PowerShell script
+hancho-cli.exe export queues main --format powershell --out main.ps1
+
+# Or as a CI workflow skeleton / open data
+hancho-cli.exe export queues main --format github-actions --out .github/workflows/main.yml
+hancho-cli.exe export queues main --format jsonl
+
+# Behavior tree as a Markdown runbook
+hancho-cli.exe export bt my-tree --out runbook.md
+
+# L3 approved project knowledge as Markdown to paste into CLAUDE.md
+hancho-cli.exe export knowledge --out project-knowledge.md
+
+# Everything into ./export (queues/, behavior-trees/, knowledge.md)
+hancho-cli.exe export
+hancho-cli.exe export all --out C:\backup\hancho-export
+
+# See what is available in the data directory
+hancho-cli.exe export list
+```
+
+`export` writes with no Hancho-specific runtime: queues become a dependency-ordered script (`powershell`, `bash`), a `github-actions` workflow skeleton, or `jsonl` / `json`; behavior trees become a Markdown runbook (`markdown` or the original open `json`); and L3 knowledge becomes Markdown (`markdown`) or `jsonl`. Without `--out`, a single queue/tree/knowledge export prints to stdout; multiple items are written under `export/queues`, `export/behavior-trees`, and `export/knowledge.md`. Dependencies declared with `on: "done"` still run after a dependency fails; normal (`success`) dependents are skipped. A dependency cycle is reported as a warning and the remaining jobs keep their file order.
 
 `hancho-cli.exe help` is a complete, self-contained usage guide. It covers **HANCHO-CLI CONCEPTS** (process IDs, modes, stdin, logs, `.done` files, cwd/env), **exit codes**, **environment variables**, **examples**, the **per-invocation `--data-dir`** and how to keep one project's data consistent, the **task queue**, **MCP auto-registration**, the **LLM orchestration model**, and the full **19-tool MCP list**.
 
@@ -155,8 +210,9 @@ hancho-cli.exe agent install-template --path C:\proj --dry-run
 | `cli_exit_codes`, `environment_variables` | Exit codes and `HANCHO_LOG_DIR` |
 | `data_dir_option`, `effective_data_dir` | Per-invocation `--data-dir`, its resolved absolute path for this call, and project consistency rules |
 | `common_examples` | Ready-to-run `hancho-cli.exe` commands |
-| `commands` | Every command and option, including `taskqueue add/list/get/retry/cancel/pause/resume/graph/wait/purge` and `mcp install` |
-| `setup.mcp` | MCP registration, a ready-to-use config, and `auto_install` (`argv` + `command`) |
+| `commands` | Every command and option, including `taskqueue add/list/get/retry/cancel/pause/resume/graph/wait/purge`, `mcp install/uninstall` and `agent uninstall-template` |
+| `setup.mcp` | MCP registration, a ready-to-use config, and `auto_install` / `uninstall` (`argv` + `command`) |
 | `agent` | `working_model` (supervisor → Hancho → worker LLM), `data_dir_consistency`, `decision`, `states`, `quick_start` |
+| `leaving` | Graduation steps, JSON / JSONL data formats, keep-or-delete-data behavior, and the release checklist |
 
 This makes it possible for an LLM to read `help --json`, register the MCP server, pick the right execution model, and start using the tool without extra instructions. The legacy `Hancho.exe <command>` form remains available for compatibility, but `hancho-cli.exe` is the recommended console interface. `Hancho.exe --help` documents the GUI/MCP server, the working model, and the same per-launch `--data-dir` option (see the [appendix](../README.md#appendix-hanchoexe---help)).

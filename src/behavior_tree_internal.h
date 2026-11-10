@@ -64,6 +64,7 @@ struct BtNode {
     std::string command;
     std::string cwd;
     int timeoutSec = 0;
+    int estimateSec = 0;  // optional expected duration for ETA display (0 = use timeoutSec)
     std::map<std::string, std::string> env;
     BtJobSuccess success;
     BtJobIdle idle;

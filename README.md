@@ -25,8 +25,8 @@ The dashboard has an **execution monitor pane** below the process and task lists
 
 ## Express
 
-- Download and install [Hancho-v0.9.3-win64-setup.exe](https://github.com/gadget114514/Hancho/releases/download/v0.9.3/Hancho-v0.9.3-win64-setup.exe)
-  (portable: [Hancho-v0.9.3-win64.zip](https://github.com/gadget114514/Hancho/releases/download/v0.9.3/Hancho-v0.9.3-win64.zip), all versions: [Releases](https://github.com/gadget114514/Hancho/releases))
+- Download and install [Hancho-v0.9.4-win64-setup.exe](https://github.com/gadget114514/Hancho/releases/download/v0.9.4/Hancho-v0.9.4-win64-setup.exe)
+  (portable: [Hancho-v0.9.4-win64.zip](https://github.com/gadget114514/Hancho/releases/download/v0.9.4/Hancho-v0.9.4-win64.zip), all versions: [Releases](https://github.com/gadget114514/Hancho/releases))
 - In your llm, "find hancho in PATH, then read help to use it" 
 - In your llm, "create task and use (opencode|claude|agy|codex) to execute the task via hancho" 
 - That's all
@@ -94,12 +94,24 @@ What stays the same: each step is still a normal task-queue job with its own tim
 
 Hancho writes a versioned event stream next to the raw one. For a worker process, `logs/proc_<id>_<name>_stream.jsonl` keeps the CLI's raw lines and `logs/proc_<id>_<name>.events.jsonl` holds normalized `hancho.event/1` events (`tool.call`, `tool.result`, `usage`, `run.ended`, ...). The schema is published as [doc/schema/hancho.event.v1.json](doc/schema/hancho.event.v1.json).
 
-- `hancho-cli worker stream <id> --schema v1` returns the normalized events from `.events.jsonl`.
-- MCP `get_worker_stream` takes `schema: "v1"` for the same shape.
+- `hancho-cli worker stream <id>` returns the normalized events from `.events.jsonl` by default (`--schema legacy` for the old shape).
+- MCP `get_worker_stream` returns the same shape by default (`schema: "legacy"` for the old shape).
 - Add a CLI without C++ by dropping `<data-dir>/adapters/<name>.json` (Tier 1: `match`, `rules`, JSON Pointer `map`), or point `exec` at a converter process (Tier 3: raw lines on stdin, `hancho.event` lines on stdout).
 - `engines.json` may set `adapter` and `capabilities` (`jsonStream`, `resume`, `reportsUsage`, `reportsSubagents`, `permissionModes`).
 - Wrapper scripts can write events directly: pipe-mode workers get `HANCHO_EVENT_PIPE`, and `hancho-cli event emit --kind message --text "..."` writes to it.
 - `hancho-cli adapter test <name>` checks recorded inputs against expected `{kind, data}` pairs under `tests/adapters/<name>/`.
+
+**Default shape and legacy removal.** Both `hancho-cli worker stream` and MCP `get_worker_stream` return `hancho.event/1` by default. The older internal `type` strings are deprecated as of v0.9.3: pass `--schema legacy` (CLI) or `schema: "legacy"` (MCP) to keep reading them through v0.10.x. They are removed in **v0.11.0**. Migration steps and the `type` → `kind` mapping are in [doc/LLM-jsonstream-format.md](doc/LLM-jsonstream-format.md#legacy-type-strings-and-migration-to-hanchoevent1).
+
+## Leaving Hancho (graduation)
+
+Hancho is a means to an end. When your harness covers the reasons in [Hancho v3 Design §5.2](doc/design-v3-en.md), you can leave without losing work.
+
+1. `hancho-cli.exe mcp uninstall` removes the Hancho entry from `.mcp.json` / `opencode.json`.
+2. `hancho-cli.exe agent uninstall-template` removes `.claude\agents\hancho-runner.md`.
+3. The data directory is kept by default. Add `--delete-data-dir` to either command to remove it too.
+
+All Hancho data is plain JSON / JSONL (task queues, behavior trees, stream events, semantic memory) and stays readable without Hancho. Before leaving, check the feature map and replacement conditions in [design-v3-en.md §5.3–5.5](doc/design-v3-en.md); every release reviews that table using the [release checklist](doc/release-checklist.md).
 
 ## Documentation
 
@@ -117,13 +129,22 @@ Hancho writes a versioned event stream next to the raw one. For a worker process
 | [Pros/Cons](doc/pros-cons-comparison.md) | When to use Hancho vs. sub-agents and alternatives |
 | [Critical Comparison](doc/critical-comparison.md) | A skeptical look at Hancho's limits and when not to use it |
 | [Hancho v3 Design](doc/design-v3-en.md) | Event schema and adapters, headless/remote, semantic memory, failure analysis, graduation guide |
+| [Release Checklist](doc/release-checklist.md) | Per-release review of the graduation feature map and cleanup commands |
 | [tools/ww](tools/ww/README-ww.md) | Optional, independent task-card runner template (not part of Hancho) |
 
 ---
 
 ## Release Notes
 
+### v0.9.4
+- **Semantic memory**: L1 run records, L2 notes and L3 approved knowledge under `memory/`. `hancho-cli memory search|get|brief|stats|note|approve|rebuild|prune` and MCP `memory_search`, `memory_get`, `memory_brief`, `memory_stats`, `memory_note`, `memory_retract`. `{memory}` injects a bounded brief and records the ids on the attempt.
+- **Failure analysis**: deterministic per-attempt diagnosis (class, confidence, summary, evidence, last activity, suggested action); `hancho-cli taskqueue why <id>`, MCP task results and behavior-tree conditions use it; retry policy can be class-dependent.
+- **Headless, POSIX and remote foundations**: `Hancho.exe --headless`, `hancho-cli run --exit-on-drain --report junit.xml`, POSIX build targets and platform boundaries, `hosts.json` and remote job mirroring. These are early; see `doc/build-posix.md` and `doc/remote-hosts.md`.
+- **Graduation**: `hancho-cli export` for queues / BTs / knowledge, `mcp uninstall`, `agent uninstall-template`, and a release checklist.
+- **ETA and paused start**: jobs accept `estimateSec` so the dashboard shows the card estimate instead of the timeout; `bt start --paused true` registers a tree without creating jobs.
+
 ### v0.9.3
+- **Legacy stream shape deprecated**: `hancho-cli worker stream` and MCP `get_worker_stream` return `hancho.event/1` by default. The old `type` strings stay available with `--schema legacy` / `schema: "legacy"` through v0.10.x and are removed in v0.11.0. See [migration steps](doc/LLM-jsonstream-format.md#legacy-type-strings-and-migration-to-hanchoevent1).
 - **BT-wide task list**: `hancho-cli bt tasks --id <id>`, `taskqueue list --bt <id>` and MCP `taskqueue_list` with `bt` list every job of a behavior tree across its parallel branch queues. Parallel branches keep their own queues (and their own concurrency); the dashboard already shows all queues together.
 
 ### v0.9.2
@@ -552,7 +573,9 @@ COMMANDS:
 
   worker stream <id> [--tail <n>] [--type <type>] [--since <seq>] [--summary] [--schema <legacy|v1>]
       View captured JSON streaming events for claude, agy, or opencode workers.
-      --schema v1 returns the stable hancho.event/1 shape from <log>.events.jsonl.
+      --schema v1 (default) returns the stable hancho.event/1 shape from <log>.events.jsonl.
+      --schema legacy returns the deprecated internal type strings and is removed in v0.11.0.
+      With v1, --type matches the kind (tool.call, message, ...).
 
   worker info <id> [--notes "<notes>"] [--goal "<goal>"]
       Update supervisor notes or goal for an ongoing worker.
@@ -562,12 +585,35 @@ COMMANDS:
       directory). It runs long commands through Hancho and returns a short summary.
       An existing file is not overwritten.
 
+  agent uninstall-template [--path <dir>] [--dry-run] [--delete-data-dir]
+      Remove the hancho-runner subagent written by install-template (the inverse command).
+      Empty .claude\agents and .claude directories are removed too. Add --delete-data-dir
+      to also delete the data directory (kept by default).
+
   mcp install [--client claude|opencode] [--path <file>] [--name <name>] [--data-dir <path>] [--dry-run]
       Register Hancho as an MCP server automatically. Writes or updates
       .mcp.json (Claude Code, default) or opencode.json (--client opencode).
       --data-dir embeds "--data-dir <path>" in the generated MCP server args so the
       project keeps its logs/state/task queues inside that directory.
       --json prints the machine-readable result; --dry-run previews without writing.
+
+  mcp uninstall [--client claude|opencode] [--path <file>] [--name <name>] [--data-dir <path>]
+                [--delete-data-dir] [--dry-run]
+      Remove the Hancho entry from the MCP config (the inverse of mcp install).
+      The data directory is kept by default; add --delete-data-dir to delete it too.
+      The data directory is the one embedded by mcp install, --data-dir, or the default.
+
+LEAVING HANCHO (graduation):
+  Stop using Hancho without losing your work:
+    1. hancho-cli.exe mcp uninstall                  # remove MCP registration (keep data)
+    2. hancho-cli.exe agent uninstall-template       # remove hancho-runner.md
+    3. Delete the data directory only if you want to:
+         hancho-cli.exe mcp uninstall --delete-data-dir
+  While you keep it, all Hancho data stays in open formats: queues, behavior trees,
+  events and memory are JSON / JSONL and readable without Hancho.
+  When a harness covers your use, compare it with doc\design-v3.md sections 5.3-5.5
+  (feature map and conditions) before leaving. doc\release-checklist.md records the
+  per-release review of that table.
 
 TASK QUEUE:
   taskqueue add --file <jobs.json> [--taskqueue <name>] [--concurrency <n>] [--notify-file <path>]

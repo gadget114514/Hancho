@@ -424,6 +424,36 @@ int main() {
                       reused.state == "succeeded",
                   "second run's job got the id ipc-reuse-1-r2");
         }
+
+        // 12. get_agent_stream returns hancho.event/1 for schema=v1 (the MCP default) and the legacy
+        // shape when asked explicitly, so both stay available during the migration.
+        {
+            std::wstring batW = tempDirW + L"\\v1_stream.bat";
+            WriteFileAtomicWide(batW,
+                "@echo off\r\n"
+                "echo {\"type\":\"assistant\",\"message\":{\"id\":\"m1\",\"model\":\"claude-test\","
+                "\"content\":[{\"type\":\"text\",\"text\":\"hello v1\"}]}}\r\n");
+            json start = h.Call({{"action", "start"},
+                                 {"cmd", QuoteCommandArg(WideToUtf8(batW))},
+                                 {"name", "v1_stream"},
+                                 {"agent_type", "claude"},
+                                 {"json_stream", true},
+                                 {"wait", true},
+                                 {"wait_ms", 15000}});
+            Check(start.value("ok", false), "start a json-stream process for the v1 IPC test");
+            int id = start.value("id", 0);
+            if (id > 0) {
+                json v1 = h.Call({{"action", "get_agent_stream"}, {"id", id}, {"schema", "v1"}, {"tail", 0}});
+                Check(v1.value("ok", false) && v1.value("schema", "") == "hancho.event/1" &&
+                          v1.contains("events") && v1["events"].is_array() && !v1["events"].empty() &&
+                          v1["events"][0].value("kind", "") == "message",
+                      "IPC get_agent_stream schema=v1 returns hancho.event/1 events");
+
+                json legacy = h.Call({{"action", "get_agent_stream"}, {"id", id}, {"schema", "legacy"}, {"tail", 0}});
+                Check(legacy.value("ok", false) && legacy.value("schema", "") != "hancho.event/1",
+                      "IPC get_agent_stream schema=legacy still returns the old shape");
+            }
+        }
     }
 
     RemoveDirRecursive(tempDirW);

@@ -3,6 +3,7 @@
 #include "chain_guard.h"
 #include "event_schema.h"
 #include "llm_stream.h"
+#include "remote_hosts.h"
 #include "nlohmann/json.hpp"
 #include <ctime>
 #include <fstream>
@@ -105,23 +106,30 @@ static std::string ExtractRawJsonValue(const std::string& json, const std::strin
 }
 
 IpcServer::IpcServer(ProcessManager& pm, TaskQueueManager& tqm, HWND notifyHwnd)
-    : pm_(pm), tqm_(tqm), btm_(nullptr), notifyHwnd_(notifyHwnd) {}
+    : pm_(pm), tqm_(tqm), btm_(nullptr), notifyHwnd_(notifyHwnd) {
+    InstallRemoteCallbacks();
+}
 
 IpcServer::IpcServer(ProcessManager& pm, TaskQueueManager& tqm, BtManager* btm, HWND notifyHwnd)
-    : pm_(pm), tqm_(tqm), btm_(btm), notifyHwnd_(notifyHwnd) {}
+    : pm_(pm), tqm_(tqm), btm_(btm), notifyHwnd_(notifyHwnd) {
+    InstallRemoteCallbacks();
+}
 
 IpcServer::~IpcServer() {
     Stop();
 }
 
+#ifdef _WIN32
 bool IpcServer::Start() {
     stop_ = false;
     acceptThread_ = std::thread(&IpcServer::AcceptLoop, this);
+    StartRemoteListener();
     return true;
 }
 
 void IpcServer::Stop() {
     if (stop_.exchange(true)) return;
+    StopRemoteListener();
     // Wake up blocking ConnectNamedPipe by opening a dummy connection
     HANDLE hDummy = CreateFileW(GetPipeNameWide().c_str(), GENERIC_READ | GENERIC_WRITE, 0, nullptr, OPEN_EXISTING, 0, nullptr);
     if (hDummy != INVALID_HANDLE_VALUE) {
@@ -145,7 +153,7 @@ void IpcServer::AcceptLoop() {
             nullptr
         );
         if (hPipe == INVALID_HANDLE_VALUE) {
-            Sleep(100);
+            SleepMs(100);
             continue;
         }
 
@@ -203,6 +211,8 @@ void IpcServer::HandleClient(HANDLE hPipe) {
     CloseHandle(hPipe);
 }
 
+#endif
+
 // The worker's final report for run_worker / wait_worker: only this reaches the supervisor's context,
 // the raw stream stays in stream_file. Size-capped so one run cannot flood that context.
 static std::string AgentResultToJson(ProcessManager& pm, int id, bool finished) {
@@ -238,15 +248,68 @@ static std::string AgentResultToJson(ProcessManager& pm, int id, bool finished) 
     return oss.str();
 }
 
+static std::string RedactIpcToken(const std::string& json) {
+    nlohmann::json doc = nlohmann::json::parse(json, nullptr, false);
+    if (doc.is_discarded() || !doc.is_object()) return json;
+    auto it = doc.find("token");
+    if (it == doc.end()) return json;
+    doc["token"] = "<redacted>";
+    return doc.dump();
+}
+
 std::string IpcServer::HandleRequestJson(const std::string& reqJson) {
     std::string action = JsonGetString(reqJson, "action", "");
     if (action != "ping") {
-        WriteAuditLog("IPC_REQ", reqJson);
+        WriteAuditLog("IPC_REQ", RedactIpcToken(reqJson));
     }
     std::ostringstream oss;
 
     if (action == "ping") {
-        return "{\"ok\":true,\"status\":\"running\"}";
+        return "{\"ok\":true,\"status\":\"running\",\"headless\":"
+               + std::string(headless_ ? "true" : "false") + "}";
+    }
+    else if (action == "gui_status") {
+        // A GUI client can ask whether a dashboard is available without starting one.
+        bool canShow = false;
+        {
+            std::lock_guard<std::mutex> lock(cbMutex_);
+            canShow = !!guiShowCb_;
+        }
+        return "{\"ok\":true,\"headless\":" + std::string(headless_ ? "true" : "false")
+               + ",\"canShowGui\":" + std::string(canShow ? "true" : "false") + "}";
+    }
+    else if (action == "gui_show") {
+        // Ask the core host to expose the dashboard. In a --headless host this
+        // starts the dashboard window in the host process; the calling GUI
+        // process exits afterwards.
+        std::function<void()> showCb;
+        {
+            std::lock_guard<std::mutex> lock(cbMutex_);
+            showCb = guiShowCb_;
+        }
+        if (!showCb) {
+            return "{\"ok\":false,\"error\":\"no dashboard host is available\"}";
+        }
+        showCb();
+        return "{\"ok\":true,\"shown\":true}";
+    }
+    else if (action == "quit") {
+        // Stop the core host. The response is sent before the host begins its
+        // shutdown sequence, so the client always gets an answer.
+        std::function<void()> stopCb;
+        {
+            std::lock_guard<std::mutex> lock(cbMutex_);
+            stopCb = shutdownCb_;
+        }
+        if (!stopCb) {
+            return "{\"ok\":false,\"error\":\"shutdown is not available\"}";
+        }
+        // Answer the client first, then let the host tear the pipe down.
+        std::thread([stopCb] {
+            SleepMs(200);
+            stopCb();
+        }).detach();
+        return "{\"ok\":true,\"stopping\":true}";
     }
     else if (action == "start") {
         StartProcessRequest req;
@@ -264,6 +327,25 @@ std::string IpcServer::HandleRequestJson(const std::string& reqJson) {
         req.jsonStream = JsonGetBool(reqJson, "json_stream", false);
         req.supervisorNotes = JsonGetString(reqJson, "supervisor_notes", "");
         req.supervisorGoal = JsonGetString(reqJson, "supervisor_goal", "");
+
+        // A remote job sends its instruction text instead of the sender's local path.
+        const std::string instructionsText = JsonGetString(reqJson, "instructions_text", "");
+        if (!instructionsText.empty()) {
+            std::string jobKey = req.jobKey.empty() ? req.name : req.jobKey;
+            if (jobKey.empty()) jobKey = "remote";
+            int rev = static_cast<int>(JsonGetInt(reqJson, "instructions_rev", 1));
+            if (rev <= 0) rev = 1;
+            std::wstring instrW = TaskQueueManager::GetInstructionsFileWide(jobKey, jobKey, rev);
+            WriteFileAtomicWide(instrW, instructionsText);
+            const std::string instrPathUtf8 = WideToUtf8(instrW);
+            size_t instrPos = 0;
+            while ((instrPos = req.commandLine.find("{instructions}", instrPos)) != std::string::npos) {
+                req.commandLine.replace(instrPos, 14, instrPathUtf8);
+                instrPos += instrPathUtf8.size();
+            }
+            req.env["PC_JOB_INSTRUCTIONS"] = instrPathUtf8;
+            req.env["PC_JOB_INSTRUCTIONS_REV"] = std::to_string(rev);
+        }
         bool waitFinish = JsonGetBool(reqJson, "wait", false);
         int waitMs = static_cast<int>(JsonGetInt(reqJson, "wait_ms", 0));
 
@@ -334,6 +416,20 @@ std::string IpcServer::HandleRequestJson(const std::string& reqJson) {
         oss << "]}";
         return oss.str();
     }
+    else if (action == "get_done") {
+        int id = static_cast<int>(JsonGetInt(reqJson, "id", 0));
+        ProcessSnapshot snap;
+        if (!pm_.GetSnapshot(id, snap)) {
+            return "{\"ok\":false,\"error\":\"Process ID not found.\"}";
+        }
+        std::string content;
+        if (!snap.doneFilePath.empty()) content = ReadFileUtf8Wide(Utf8ToWide(snap.doneFilePath));
+        oss << "{\"ok\":true,\"id\":" << id
+            << ",\"done_file\":\"" << JsonEscape(snap.doneFilePath) << "\""
+            << ",\"exists\":" << (content.empty() ? "false" : "true")
+            << ",\"content\":\"" << JsonEscape(content) << "\"}";
+        return oss.str();
+    }
     else if (action == "logs" || action == "output") {
         int id = static_cast<int>(JsonGetInt(reqJson, "id", 0));
         int tailLines = static_cast<int>(JsonGetInt(reqJson, "tail", 0));
@@ -367,7 +463,7 @@ std::string IpcServer::HandleRequestJson(const std::string& reqJson) {
             return oss.str();
         }
         if (waitMs > 0) {
-            Sleep(static_cast<DWORD>(waitMs));
+            SleepMs(static_cast<DWORD>(waitMs));
         }
         ProcessSnapshot snap;
         pm_.GetSnapshot(id, snap);
@@ -540,12 +636,144 @@ std::string IpcServer::HandleRequestJson(const std::string& reqJson) {
         return "{\"ok\":true,\"id\":" + std::to_string(id) + "}";
     }
 
+    else if (action == "hosts_list" || action == "hosts_reload") {
+        HostRegistry registry;
+        std::string err;
+        if (!registry.Load(err)) {
+            return "{\"ok\":false,\"error\":\"" + JsonEscape(err) + "\"}";
+        }
+        return registry.ToJson(JsonGetBool(reqJson, "token_presence", true));
+    }
+    else if (action == "hosts_add") {
+        RemoteHost host;
+        host.name = JsonGetString(reqJson, "name", "");
+        host.address = JsonGetString(reqJson, "address", "");
+        host.tokenEnv = JsonGetString(reqJson, "token_env", "");
+        host.tokenCredential = JsonGetString(reqJson, "token_credential", "");
+        host.enabled = JsonGetBool(reqJson, "enabled", true);
+        HostRegistry registry;
+        std::string err;
+        if (!registry.Load(err)) {
+            return "{\"ok\":false,\"error\":\"" + JsonEscape(err) + "\"}";
+        }
+        if (!registry.Add(host, err)) {
+            return "{\"ok\":false,\"error\":\"" + JsonEscape(err) + "\"}";
+        }
+        return "{\"ok\":true,\"host\":\"" + JsonEscape(host.name) + "\"}";
+    }
+    else if (action == "hosts_remove") {
+        HostRegistry registry;
+        std::string err;
+        if (!registry.Load(err)) {
+            return "{\"ok\":false,\"error\":\"" + JsonEscape(err) + "\"}";
+        }
+        if (!registry.Remove(JsonGetString(reqJson, "name", ""), err)) {
+            return "{\"ok\":false,\"error\":\"" + JsonEscape(err) + "\"}";
+        }
+        return "{\"ok\":true}";
+    }
+    else if (action == "hosts_ping") {
+        const std::string name = JsonGetString(reqJson, "name", "");
+        HostRegistry registry;
+        std::string err;
+        if (!registry.Load(err)) {
+            return "{\"ok\":false,\"error\":\"" + JsonEscape(err) + "\"}";
+        }
+        RemoteHost host;
+        if (!registry.Get(name, host)) {
+            return "{\"ok\":false,\"error\":\"" + JsonEscape("host not registered: " + name) + "\"}";
+        }
+        uint64_t started = GetNowTickMs();
+        std::string response;
+        if (!remote::CallHost(host, "{\"action\":\"ping\"}", response, err)) {
+            return "{\"ok\":false,\"host\":\"" + JsonEscape(name) +
+                   "\",\"error\":\"" + JsonEscape(err) + "\"}";
+        }
+        nlohmann::json reply = nlohmann::json::parse(response, nullptr, false);
+        nlohmann::json out;
+        out["ok"] = true;
+        out["host"] = name;
+        out["latency_ms"] = GetNowTickMs() - started;
+        out["response"] = reply.is_discarded() ? nlohmann::json(response) : reply;
+        return out.dump();
+    }
+    else if (action == "remote_taskqueues" || action == "remote_processes") {
+        HostRegistry registry;
+        std::string err;
+        if (!registry.Load(err)) {
+            return "{\"ok\":false,\"error\":\"" + JsonEscape(err) + "\"}";
+        }
+        nlohmann::json out;
+        out["ok"] = true;
+        out["hosts"] = nlohmann::json::array();
+        for (const auto& host : registry.List()) {
+            nlohmann::json item;
+            item["host"] = host.name;
+            item["address"] = host.address;
+            if (!host.enabled) {
+                item["error"] = "host is disabled";
+                out["hosts"].push_back(std::move(item));
+                continue;
+            }
+            nlohmann::json request;
+            std::string response;
+            if (action == "remote_taskqueues") {
+                request["action"] = "taskqueue_list";
+                request["taskqueue"] = JsonGetString(reqJson, "taskqueue", "");
+                request["state"] = JsonGetString(reqJson, "state", "");
+                request["since"] = JsonGetString(reqJson, "since", "");
+            } else {
+                request["action"] = "list";
+            }
+            if (!remote::CallHost(host, request.dump(), response, err)) {
+                item["error"] = err;
+            } else {
+                nlohmann::json reply = nlohmann::json::parse(response, nullptr, false);
+                if (reply.is_discarded()) item["error"] = "invalid JSON from remote host";
+                else item["response"] = reply;
+            }
+            out["hosts"].push_back(std::move(item));
+        }
+        return out.dump();
+    }
     else if (action.rfind("taskqueue_", 0) == 0) {
         std::string err;
         std::string resp;
         if (action == "taskqueue_add") {
+            const std::string jobsRaw = ExtractRawJsonValue(reqJson, "jobs");
+            // A job that names a host must reference a registered, enabled host.
+            nlohmann::json jobsDoc = nlohmann::json::parse(jobsRaw, nullptr, false);
+            if (jobsDoc.is_array()) {
+                std::vector<std::string> wantedHosts;
+                for (const auto& job : jobsDoc) {
+                    if (!job.is_object()) continue;
+                    auto it = job.find("host");
+                    if (it != job.end() && it->is_string() && !it->get<std::string>().empty()) {
+                        wantedHosts.push_back(it->get<std::string>());
+                    }
+                }
+                if (!wantedHosts.empty()) {
+                    HostRegistry registry;
+                    std::string hostErr;
+                    if (!registry.Load(hostErr)) {
+                        err = hostErr;
+                        return "{\"ok\":false,\"error\":\"" + JsonEscape(err) + "\"}";
+                    }
+                    for (const auto& name : wantedHosts) {
+                        RemoteHost host;
+                        if (!registry.Get(name, host)) {
+                            err = "host not registered: " + name + " (add it to hosts.json)";
+                            return "{\"ok\":false,\"error\":\"" + JsonEscape(err) + "\"}";
+                        }
+                        if (!host.enabled) {
+                            err = "host is disabled: " + name;
+                            return "{\"ok\":false,\"error\":\"" + JsonEscape(err) + "\"}";
+                        }
+                    }
+                }
+            }
             resp = tqm_.TaskQueueAdd(JsonGetString(reqJson, "taskqueue", ""),
-                                     ExtractRawJsonValue(reqJson, "jobs"),
+                                     jobsRaw,
                                      JsonGetInt(reqJson, "concurrency", 0),
                                      JsonGetString(reqJson, "notify_file", ""), err,
                                      ExtractRawJsonValue(reqJson, "origin"));
@@ -694,7 +922,7 @@ std::string IpcServer::HandleRequestJson(const std::string& reqJson) {
                     tqm_.SetBtOrigin(btDef["id"].get<std::string>(), req["origin"].dump());
                 }
             }
-            resp = btm_->Start(btJson);
+            resp = btm_->Start(btJson, JsonGetBool(reqJson, "paused", false));
         } else if (action == "bt_get") {
             std::string id = req.value("id", std::string());
             bool compact = req.value("compact", false);

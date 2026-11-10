@@ -284,6 +284,7 @@ function New-HanchoCliJob {
         [string]$Model = "",
         [string]$Agent = "",
         [int]$TimeoutSec = 7200,
+        [int]$EstimateSec = 0,
         [switch]$Worktree,
         $Edits = @(),
         $Reads = @()
@@ -300,6 +301,7 @@ function New-HanchoCliJob {
         cwd        = $Root
         command    = ($parts -join ' ')
     }
+    if ($EstimateSec -gt 0) { $job.estimateSec = $EstimateSec }
     if (-not $Worktree) {
         $w = @(@($Edits) | Where-Object { $_ } | ForEach-Object { ConvertTo-WwPattern $_ })
         $r = @(@($Reads) | Where-Object { $_ } | ForEach-Object { ConvertTo-WwPattern $_ })

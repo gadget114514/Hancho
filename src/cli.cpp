@@ -2,22 +2,45 @@
 #include "common.h"
 #include "event_adapter.h"
 #include "ipc_client.h"
+#include "memory_cli.h"
+#include "remote_client.h"
+#include "remote_hosts.h"
+#include "taskqueue.h"
 #include "nlohmann/json.hpp"
 #include <iostream>
 #include <sstream>
 #include <algorithm>
 #include <cctype>
+#include <cmath>
+#include <cstdio>
+#include <ctime>
+#include <time.h>
 #include <filesystem>
 #include <fstream>
+#include <map>
+#include <cstdlib>
+#include <iomanip>
 
 namespace pc {
 
 namespace {
 
+std::filesystem::path NativePath(const std::wstring& path) {
+#ifdef _WIN32
+    return std::filesystem::path(path);
+#else
+    return std::filesystem::path(WideToUtf8(ToNativePathWide(path)));
+#endif
+}
+
+
 // hancho-runner.md, embedded from tools/agents/hancho-runner.md (src/agent_template.rc).
+#ifdef _WIN32
 constexpr WORD kRunnerTemplateResourceId = 101;
+#endif
 
 bool LoadRunnerTemplate(std::string& outText) {
+#ifdef _WIN32
     HRSRC res = FindResourceW(nullptr, MAKEINTRESOURCEW(kRunnerTemplateResourceId), RT_RCDATA);
     if (!res) return false;
     HGLOBAL handle = LoadResource(nullptr, res);
@@ -25,6 +48,112 @@ bool LoadRunnerTemplate(std::string& outText) {
     const char* data = static_cast<const char*>(LockResource(handle));
     if (!data) return false;
     outText.assign(data, SizeofResource(nullptr, res));
+    return true;
+#else
+    namespace fs = std::filesystem;
+    std::error_code ec;
+    fs::path exe = fs::path(GetExecutablePathUtf8());
+    std::vector<fs::path> candidates = {
+        exe.parent_path() / "tools" / "agents" / "hancho-runner.md",
+        exe.parent_path().parent_path() / "tools" / "agents" / "hancho-runner.md",
+        fs::current_path(ec) / "tools" / "agents" / "hancho-runner.md"
+    };
+    for (const auto& path : candidates) {
+        std::ifstream in(path, std::ios::binary);
+        if (!in) continue;
+        std::ostringstream buf;
+        buf << in.rdbuf();
+        outText = buf.str();
+        return !outText.empty();
+    }
+    return false;
+#endif
+}
+
+struct DataDirDeleteOutcome {
+    bool ok = true;
+    bool deleted = false;
+    std::string error;
+    std::string path;
+};
+
+// True when `prefix` is `full` itself or one of its ancestors.
+bool PathIsPrefixOf(const std::filesystem::path& prefix, const std::filesystem::path& full) {
+    auto p = prefix.begin();
+    auto f = full.begin();
+    for (; p != prefix.end(); ++p, ++f) {
+        if (f == full.end()) return false;
+        if (!WideEqualsIgnoreCase(p->wstring(), f->wstring())) return false;
+    }
+    return true;
+}
+
+// Never remove a drive root, the current directory, or one of its ancestors. This keeps an
+// accidental "--delete-data-dir" from wiping a project or a whole drive.
+bool IsUnsafeDataDirToDelete(const std::filesystem::path& p) {
+    if (p.empty() || p.filename().empty()) return true;
+    std::error_code ec;
+    std::filesystem::path abs = std::filesystem::weakly_canonical(p, ec);
+    if (ec) abs = std::filesystem::absolute(p, ec);
+    if (ec || abs.empty()) return true;
+    if (abs == abs.root_path()) return true;
+
+    std::filesystem::path cwd = std::filesystem::current_path(ec);
+    if (ec) return false;
+    std::filesystem::path cwdAbs = std::filesystem::weakly_canonical(cwd, ec);
+    if (ec) cwdAbs = cwd;
+    // A data directory inside the project (e.g. D:\proj\.hancho) is fine; the project root
+    // itself, its parent, and a drive root are not.
+    return PathIsPrefixOf(abs, cwdAbs);
+}
+
+DataDirDeleteOutcome DeleteHanchoDataDirectory(const std::wstring& dirW) {
+    DataDirDeleteOutcome out;
+    std::filesystem::path p = NativePath(dirW);
+    out.path = WideToUtf8(p.wstring());
+    if (IsUnsafeDataDirToDelete(p)) {
+        out.ok = false;
+        out.error = "refusing to delete a drive root, the current directory, or its parent: " + out.path;
+        return out;
+    }
+
+    std::error_code ec;
+    if (!std::filesystem::exists(p, ec)) {
+        out.deleted = false;
+        return out;
+    }
+
+    // Select the matching dashboard mutex: the current effective dir, the default/env dir,
+    // or the dir passed explicitly (which needs an override to produce its tagged mutex).
+    if (!WideEqualsIgnoreCase(GetEffectiveDataDirectoryWide(), dirW)) {
+        SetDataDirectoryOverride(L"");
+        if (!WideEqualsIgnoreCase(GetEffectiveDataDirectoryWide(), dirW)) {
+            SetDataDirectoryOverride(dirW);
+        }
+    }
+    if (IsHanchoRunningForDataDirWide()) {
+        out.ok = false;
+        out.error = "Hancho is running for this data directory; close the dashboard for it and retry: " + out.path;
+        return out;
+    }
+
+    std::filesystem::remove_all(p, ec);
+    if (ec) {
+        out.ok = false;
+        out.error = "cannot delete " + out.path + ": " + ec.message();
+        return out;
+    }
+    out.deleted = true;
+    return out;
+}
+
+bool ResolveDataDirForUninstall(const std::string& explicitDir, const std::string& embeddedDir,
+                                std::wstring& outWide, std::string& outUtf8) {
+    std::string dir = explicitDir.empty() ? embeddedDir : explicitDir;
+    if (dir.empty()) dir = WideToUtf8(GetEffectiveDataDirectoryWide());
+    if (dir.empty()) return false;
+    outUtf8 = WideToUtf8(ResolveAbsolutePathWide(Utf8ToWide(dir)));
+    outWide = Utf8ToWide(outUtf8);
     return true;
 }
 
@@ -48,7 +177,7 @@ int RunAgentInstallTemplate(const std::vector<std::string>& args, size_t startId
         return 1;
     };
 
-    std::filesystem::path target = std::filesystem::path(Utf8ToWide(dir)) / L".claude" / L"agents" / L"hancho-runner.md";
+    std::filesystem::path target = NativePath(Utf8ToWide(dir)) / L".claude" / L"agents" / L"hancho-runner.md";
     const std::string targetUtf8 = WideToUtf8(target.wstring());
 
     std::string text;
@@ -73,6 +202,98 @@ int RunAgentInstallTemplate(const std::vector<std::string>& args, size_t startId
                   << ",\"bytes\":" << text.size() << "}\n";
     } else {
         std::cout << (dryRun ? "Would write " : "Wrote ") << targetUtf8 << " (" << text.size() << " bytes)\n";
+    }
+    return 0;
+}
+
+// hancho-cli agent uninstall-template [--path <dir>] [--dry-run] [--delete-data-dir] [--json]
+// Removes <dir>\.claude\agents\hancho-runner.md (the inverse of install-template).
+int RunAgentUninstallTemplate(const std::vector<std::string>& args, size_t startIdx, bool jsonOutput) {
+    std::string dir = ".";
+    bool dryRun = false;
+    bool deleteDataDir = false;
+    for (size_t i = startIdx; i < args.size(); ++i) {
+        if (args[i] == "--path" && i + 1 < args.size()) dir = args[++i];
+        else if (args[i] == "--dry-run") dryRun = true;
+        else if (args[i] == "--delete-data-dir") deleteDataDir = true;
+    }
+
+    auto fail = [&](const std::string& message) {
+        if (jsonOutput) {
+            std::cout << "{\"ok\":false,\"error\":\"" << JsonEscape(message) << "\"}\n";
+        } else {
+            std::cerr << "Error: " << message << "\n";
+        }
+        return 1;
+    };
+
+    std::filesystem::path target = NativePath(Utf8ToWide(dir)) / L".claude" / L"agents" / L"hancho-runner.md";
+    const std::string targetUtf8 = WideToUtf8(target.wstring());
+
+    std::error_code ec;
+    const bool existed = std::filesystem::exists(target, ec);
+    if (!dryRun && existed) {
+        std::filesystem::remove(target, ec);
+        if (ec) return fail("cannot delete " + targetUtf8 + ": " + ec.message());
+        // Remove .claude\agents and .claude only if they became empty; leave other agent files alone.
+        std::filesystem::path agentsDir = target.parent_path();
+        std::filesystem::path claudeDir = agentsDir.parent_path();
+        std::error_code dirEc;
+        if (std::filesystem::is_directory(agentsDir, dirEc) && std::filesystem::is_empty(agentsDir, dirEc)) {
+            std::filesystem::remove(agentsDir, dirEc);
+        }
+        dirEc.clear();
+        if (std::filesystem::is_directory(claudeDir, dirEc) && std::filesystem::is_empty(claudeDir, dirEc)) {
+            std::filesystem::remove(claudeDir, dirEc);
+        }
+    }
+
+    DataDirDeleteOutcome dataOut;
+    dataOut.ok = false;
+    bool dataDirRequested = deleteDataDir;
+    if (deleteDataDir) {
+        std::wstring dataW;
+        std::string dataUtf8;
+        if (!ResolveDataDirForUninstall("", "", dataW, dataUtf8)) {
+            return fail("cannot determine the data directory; pass --data-dir <path>");
+        }
+        dataOut.path = dataUtf8;
+        if (dryRun) {
+            dataOut.ok = true;
+            dataOut.deleted = false;
+        } else {
+            dataOut = DeleteHanchoDataDirectory(dataW);
+            if (!dataOut.ok) return fail(dataOut.error);
+        }
+    }
+
+    const bool removed = existed && !dryRun;
+    if (jsonOutput) {
+        std::cout << "{\"ok\":true,\"path\":\"" << JsonEscape(targetUtf8) << "\""
+                  << ",\"existed\":" << (existed ? "true" : "false")
+                  << ",\"removed\":" << (removed ? "true" : "false")
+                  << ",\"dry_run\":" << (dryRun ? "true" : "false")
+                  << ",\"delete_data_dir\":" << (dataDirRequested ? "true" : "false")
+                  << ",\"data_dir\":\"" << JsonEscape(dataOut.path) << "\""
+                  << ",\"data_dir_deleted\":" << (dataOut.deleted ? "true" : "false")
+                  << "}\n";
+    } else {
+        if (dryRun) {
+            std::cout << (existed ? "Would remove " : "Nothing to remove: not installed at ") << targetUtf8 << "\n";
+        } else if (existed) {
+            std::cout << "Removed " << targetUtf8 << "\n";
+        } else {
+            std::cout << "Nothing to remove: not installed at " << targetUtf8 << "\n";
+        }
+        if (dataDirRequested) {
+            if (dryRun) {
+                std::cout << "[dry-run] Would delete data directory " << dataOut.path << "\n";
+            } else if (dataOut.deleted) {
+                std::cout << "Deleted data directory " << dataOut.path << "\n";
+            } else {
+                std::cout << "Data directory not found (already gone): " << dataOut.path << "\n";
+            }
+        }
     }
     return 0;
 }
@@ -121,36 +342,23 @@ int RunEventCommand(const std::vector<std::string>& args, size_t startIdx, bool 
     if (!status.empty()) data["status"] = status;
 
     if (pipeName.empty()) {
-        DWORD needed = GetEnvironmentVariableW(L"HANCHO_EVENT_PIPE", nullptr, 0);
-        if (needed > 0) {
-            std::wstring buffer(needed, L'\0');
-            DWORD written = GetEnvironmentVariableW(L"HANCHO_EVENT_PIPE", &buffer[0], needed);
-            if (written > 0) {
-                buffer.resize(written);
-                pipeName = WideToUtf8(buffer);
-            }
-        }
+        const char* envPipe = std::getenv("HANCHO_EVENT_PIPE");
+        if (envPipe && *envPipe) pipeName = envPipe;
     }
     if (pipeName.empty()) {
         return fail("HANCHO_EVENT_PIPE is not set (run this inside a Hancho worker or pass --pipe)");
     }
 
-    std::wstring fullPipe = Utf8ToWide(pipeName);
-    if (fullPipe.rfind(L"\\\\.\\pipe\\", 0) != 0) fullPipe = L"\\\\.\\pipe\\" + fullPipe;
-    HANDLE h = CreateFileW(fullPipe.c_str(), GENERIC_WRITE, 0, nullptr, OPEN_EXISTING, 0, nullptr);
-    if (h == INVALID_HANDLE_VALUE) {
-        return fail("cannot open event pipe " + pipeName + " (Win32 error " + std::to_string(GetLastError()) + ")");
-    }
     nlohmann::json event;
     event["schema"] = "hancho.event/1";
     event["kind"] = kind;
     event["data"] = data;
     std::string line = event.dump(-1, ' ', false, nlohmann::json::error_handler_t::replace) + "\n";
-    DWORD bytesWritten = 0;
-    BOOL ok = WriteFile(h, line.data(), static_cast<DWORD>(line.size()), &bytesWritten, nullptr);
-    DWORD lastError = ok ? ERROR_SUCCESS : GetLastError();
-    CloseHandle(h);
-    if (!ok) return fail("cannot write to event pipe (Win32 error " + std::to_string(lastError) + ")");
+    std::string writeError;
+    if (!WriteHanchoEventLine(pipeName, line, writeError)) {
+        return fail(writeError);
+    }
+    size_t bytesWritten = line.size();
 
     if (jsonOutput) {
         std::cout << "{\"ok\":true,\"kind\":\"" << JsonEscape(kind) << "\",\"bytes\":" << bytesWritten << "}\n";
@@ -195,7 +403,7 @@ int RunAdapterCommand(const std::vector<std::string>& args, size_t startIdx, boo
     const std::string testName = name.empty() ? adapter.name : name;
     if (dir.empty()) dir = "tests/adapters/" + testName;
 
-    std::filesystem::path testDir(Utf8ToWide(dir));
+    std::filesystem::path testDir = NativePath(Utf8ToWide(dir));
     std::error_code ec;
     if (!std::filesystem::is_directory(testDir, ec)) {
         return fail("test directory not found: " + dir);
@@ -297,26 +505,1211 @@ int RunAdapterCommand(const std::vector<std::string>& args, size_t startIdx, boo
     return failedFiles == 0 ? 0 : 1;
 }
 
+// ---------------------------------------------------------------------------
+// export: write Hancho data in formats readable without Hancho
+// (doc/design-v3.md 5.4).
+// ---------------------------------------------------------------------------
+
+struct ExportQueueDep {
+    std::string id;
+    std::string on;
+};
+
+struct ExportQueueJob {
+    std::string id;
+    std::string name;
+    std::string summary;
+    std::string command;
+    std::string cwd;
+    std::string state;
+    int timeoutSec = 0;
+    std::map<std::string, std::string> env;
+    std::vector<ExportQueueDep> deps;
+};
+
+std::string ExportJsonStr(const nlohmann::json& j, const char* key) {
+    auto it = j.find(key);
+    if (it == j.end() || !it->is_string()) return std::string();
+    try { return it->get<std::string>(); } catch (...) { return std::string(); }
+}
+
+int ExportJsonInt(const nlohmann::json& j, const char* key, int fallback = 0) {
+    auto it = j.find(key);
+    if (it == j.end()) return fallback;
+    try {
+        if (it->is_number_integer()) return it->get<int>();
+        if (it->is_number_unsigned()) return static_cast<int>(it->get<unsigned>());
+        if (it->is_number_float()) return static_cast<int>(it->get<double>());
+        if (it->is_string()) return std::stoi(it->get<std::string>());
+    } catch (...) {
+    }
+    return fallback;
+}
+
+std::string ExportSlug(const std::string& value, const std::string& fallback) {
+    std::string out;
+    out.reserve(value.size());
+    for (unsigned char c : value) {
+        if (std::isalnum(c) || c == '-' || c == '_' || c == '.' || c >= 0x80) out.push_back(static_cast<char>(c));
+        else out.push_back('_');
+    }
+    if (out.empty() || out == "." || out == "..") return fallback;
+    return out;
+}
+
+std::string ExportLowerAscii(std::string value) {
+    for (auto& c : value) c = static_cast<char>(std::tolower(static_cast<unsigned char>(c)));
+    return value;
+}
+
+std::string ExportExtensionFor(const std::string& format) {
+    if (format == "powershell") return ".ps1";
+    if (format == "bash") return ".sh";
+    if (format == "github-actions") return ".yml";
+    if (format == "jsonl") return ".jsonl";
+    if (format == "json") return ".json";
+    return ".md";
+}
+
+std::string ExportNormalizeQueueFormat(const std::string& raw) {
+    std::string f = ExportLowerAscii(raw);
+    if (f.empty() || f == "script" || f == "ps1" || f == "pwsh" || f == "powershell") return "powershell";
+    if (f == "sh" || f == "shell" || f == "bash") return "bash";
+    if (f == "ci" || f == "github" || f == "github-actions" || f == "yaml" || f == "yml") return "github-actions";
+    if (f == "jsonl" || f == "ndjson") return "jsonl";
+    if (f == "json") return "json";
+    return "";
+}
+
+std::string ExportNormalizeBtFormat(const std::string& raw) {
+    std::string f = ExportLowerAscii(raw);
+    if (f.empty() || f == "md" || f == "markdown") return "markdown";
+    if (f == "json") return "json";
+    return "";
+}
+
+std::string ExportNormalizeKnowledgeFormat(const std::string& raw) {
+    std::string f = ExportLowerAscii(raw);
+    if (f.empty() || f == "md" || f == "markdown") return "markdown";
+    if (f == "jsonl" || f == "ndjson") return "jsonl";
+    return "";
+}
+
+std::string ExportPsQuote(const std::string& s) {
+    std::string out = "'";
+    for (char c : s) {
+        if (c == '\'') out += "''";
+        else out.push_back(c);
+    }
+    out += "'";
+    return out;
+}
+
+std::string ExportBashQuote(const std::string& s) {
+    std::string out = "'";
+    for (char c : s) {
+        if (c == '\'') out += "'\\''";
+        else out.push_back(c);
+    }
+    out += "'";
+    return out;
+}
+
+std::string ExportYamlQuote(const std::string& s) {
+    std::string out = "\"";
+    for (unsigned char c : s) {
+        switch (c) {
+            case '\\': out += "\\\\"; break;
+            case '"': out += "\\\""; break;
+            case '\n': out += "\\n"; break;
+            case '\r': out += "\\r"; break;
+            case '\t': out += "\\t"; break;
+            default:
+                if (c < 0x20) out.push_back(' ');
+                else out.push_back(static_cast<char>(c));
+        }
+    }
+    out += '"';
+    return out;
+}
+
+std::string ExportIndentLines(const std::string& text, const std::string& indent) {
+    std::string out;
+    size_t start = 0;
+    while (start <= text.size()) {
+        size_t end = text.find('\n', start);
+        std::string line = text.substr(start, end == std::string::npos ? std::string::npos : end - start);
+        if (!line.empty() && line.back() == '\r') line.pop_back();
+        out += indent + line + "\r\n";
+        if (end == std::string::npos) break;
+        start = end + 1;
+    }
+    return out;
+}
+
+std::string ExportShort(std::string text, size_t maxLen) {
+    for (auto& c : text) {
+        if (c == '\r' || c == '\n' || c == '\t') c = ' ';
+    }
+    if (text.size() <= maxLen) return text;
+    if (maxLen <= 3) return text.substr(0, maxLen);
+    return text.substr(0, maxLen - 3) + "...";
+}
+
+std::string ExportInlineCode(const std::string& text) {
+    std::string out = text;
+    for (auto& c : out) {
+        if (c == '`' || c == '\r' || c == '\n') c = ' ';
+    }
+    return out;
+}
+
+bool ExportReadJsonFile(const std::wstring& path, nlohmann::json& out) {
+    std::string text = ReadFileUtf8Wide(path);
+    if (text.empty()) return false;
+    out = nlohmann::json::parse(text, nullptr, false);
+    return !out.is_discarded();
+}
+
+void ExportListJsonFiles(const std::wstring& dir, std::vector<std::wstring>& out) {
+    std::error_code ec;
+    std::filesystem::path p = NativePath(dir);
+    if (!std::filesystem::is_directory(p, ec)) return;
+    for (std::filesystem::directory_iterator it(p, ec), end; !ec && it != end; it.increment(ec)) {
+        std::error_code fec;
+        if (!it->is_regular_file(fec)) continue;
+        if (it->path().extension().wstring() == L".json") out.push_back(it->path().wstring());
+    }
+    std::sort(out.begin(), out.end());
+}
+
+bool ExportWriteFile(const std::wstring& path, const std::string& data, std::string& outError) {
+    std::filesystem::path p = NativePath(path);
+    std::error_code ec;
+    if (p.has_parent_path()) {
+        std::filesystem::create_directories(p.parent_path(), ec);
+        if (ec) {
+            outError = "cannot create " + WideToUtf8(p.parent_path().wstring()) + ": " + ec.message();
+            return false;
+        }
+    }
+    std::ofstream out(p, std::ios::binary | std::ios::trunc);
+    if (!out) {
+        outError = "cannot write " + WideToUtf8(path);
+        return false;
+    }
+    out.write(data.data(), static_cast<std::streamsize>(data.size()));
+    if (!out) {
+        outError = "cannot write " + WideToUtf8(path);
+        return false;
+    }
+    return true;
+}
+
+std::vector<ExportQueueJob> ExportParseQueueJobs(const nlohmann::json& queue) {
+    std::vector<ExportQueueJob> jobs;
+    auto jobsIt = queue.find("jobs");
+    if (jobsIt == queue.end() || !jobsIt->is_array()) return jobs;
+    for (const auto& j : *jobsIt) {
+        if (!j.is_object()) continue;
+        ExportQueueJob job;
+        job.id = ExportJsonStr(j, "id");
+        if (job.id.empty()) continue;
+        job.name = ExportJsonStr(j, "name");
+        if (job.name.empty()) job.name = job.id;
+        job.summary = ExportJsonStr(j, "summary");
+        job.command = ExportJsonStr(j, "command");
+        job.cwd = ExportJsonStr(j, "cwd");
+        job.state = ExportJsonStr(j, "state");
+        job.timeoutSec = ExportJsonInt(j, "timeoutSec", ExportJsonInt(j, "timeout_sec", 0));
+        auto envIt = j.find("env");
+        if (envIt != j.end() && envIt->is_object()) {
+            for (auto it = envIt->begin(); it != envIt->end(); ++it) {
+                if (it.value().is_string()) job.env[it.key()] = it.value().get<std::string>();
+                else job.env[it.key()] = it.value().dump();
+            }
+        }
+        auto depIt = j.find("depends_on");
+        if (depIt == j.end()) depIt = j.find("dependsOn");
+        if (depIt != j.end() && depIt->is_array()) {
+            for (const auto& d : *depIt) {
+                ExportQueueDep dep;
+                if (d.is_string()) {
+                    dep.id = d.get<std::string>();
+                    dep.on = "success";
+                } else if (d.is_object()) {
+                    dep.id = ExportJsonStr(d, "id");
+                    dep.on = ExportJsonStr(d, "on");
+                    if (dep.on.empty()) dep.on = "success";
+                }
+                if (!dep.id.empty()) job.deps.push_back(dep);
+            }
+        }
+        jobs.push_back(std::move(job));
+    }
+    return jobs;
+}
+
+// Stable topological order: ties keep the queue file order. Missing dependencies are
+// ignored with a warning; a cycle is reported and the remaining jobs keep file order.
+std::vector<size_t> ExportTopoOrder(const std::vector<ExportQueueJob>& jobs, std::vector<std::string>& warnings) {
+    const size_t n = jobs.size();
+    std::map<std::string, size_t> index;
+    for (size_t i = 0; i < n; ++i) index[jobs[i].id] = i;
+
+    std::vector<std::vector<size_t>> deps(n);
+    std::vector<int> indegree(n, 0);
+    for (size_t i = 0; i < n; ++i) {
+        for (const auto& dep : jobs[i].deps) {
+            auto it = index.find(dep.id);
+            if (it == index.end()) {
+                warnings.push_back("job '" + jobs[i].id + "' depends on missing job '" + dep.id + "' (ignored)");
+                continue;
+            }
+            if (it->second == i) {
+                warnings.push_back("job '" + jobs[i].id + "' depends on itself (ignored)");
+                continue;
+            }
+            deps[i].push_back(it->second);
+            ++indegree[i];
+        }
+    }
+
+    std::vector<bool> done(n, false);
+    std::vector<size_t> order;
+    order.reserve(n);
+    while (order.size() < n) {
+        bool progressed = false;
+        for (size_t i = 0; i < n; ++i) {
+            if (done[i] || indegree[i] != 0) continue;
+            done[i] = true;
+            order.push_back(i);
+            progressed = true;
+            for (size_t j = 0; j < n; ++j) {
+                if (done[j]) continue;
+                for (size_t d : deps[j]) {
+                    if (d == i) --indegree[j];
+                }
+            }
+            break;
+        }
+        if (progressed) continue;
+        std::string cycle;
+        for (size_t i = 0; i < n; ++i) {
+            if (done[i]) continue;
+            if (!cycle.empty()) cycle += ", ";
+            cycle += jobs[i].id;
+            done[i] = true;
+            order.push_back(i);
+        }
+        warnings.push_back("dependency cycle (jobs appended in file order): " + cycle);
+    }
+    return order;
+}
+
+bool ExportDepIsSuccess(const ExportQueueDep& dep) {
+    return dep.on.empty() || dep.on == "success";
+}
+
+std::string ExportQueuePowerShell(const nlohmann::json& queue, const std::vector<ExportQueueJob>& jobs,
+                                  const std::vector<size_t>& order, std::vector<std::string>& warnings) {
+    std::ostringstream os;
+    os << "# Hancho export: task queue \"" << queue.value("name", std::string()) << "\"\r\n";
+    os << "# Generated " << GetCurrentTimestampStr()
+       << ". Runs without Hancho: pwsh -NoProfile -File <this file>\r\n";
+    os << "# Jobs run in dependency order. A failed job marks itself; dependents that need\r\n";
+    os << "# success are skipped, while dependencies declared with on=\"done\" still run.\r\n\r\n";
+    os << "$hanchoFailed = @{}\r\n\r\n";
+
+    for (size_t i : order) {
+        const auto& job = jobs[i];
+        if (job.command.empty()) {
+            warnings.push_back("job '" + job.id + "' has an empty command (exported as skipped)");
+            continue;
+        }
+        os << "function Invoke-HanchoJob" << (i + 1) << " {\r\n";
+        os << "    $LASTEXITCODE = 0\r\n";
+        if (!job.cwd.empty()) os << "    Push-Location -LiteralPath " << ExportPsQuote(job.cwd) << "\r\n";
+        for (const auto& [key, value] : job.env) {
+            os << "    $env:" << key << " = " << ExportPsQuote(value) << "\r\n";
+        }
+        os << ExportIndentLines(job.command, "    ");
+        os << "    $hanchoCode = $LASTEXITCODE\r\n";
+        if (!job.cwd.empty()) os << "    Pop-Location\r\n";
+        os << "    return $hanchoCode\r\n";
+        os << "}\r\n\r\n";
+    }
+
+    std::map<std::string, size_t> index;
+    for (size_t i = 0; i < jobs.size(); ++i) index[jobs[i].id] = i;
+
+    for (size_t i : order) {
+        const auto& job = jobs[i];
+        os << "# " << job.id << ": " << ExportShort(job.name, 120) << "\r\n";
+        os << "$hanchoSkip = $false\r\n";
+        for (const auto& dep : job.deps) {
+            if (!ExportDepIsSuccess(dep)) continue;
+            if (index.find(dep.id) == index.end()) continue;
+            os << "if ($hanchoFailed.ContainsKey(" << ExportPsQuote(dep.id) << ")) { $hanchoSkip = $true }\r\n";
+        }
+        os << "if ($hanchoSkip) {\r\n";
+        os << "    Write-Warning " << ExportPsQuote("skip " + job.id + ": dependency failed") << "\r\n";
+        os << "    $hanchoFailed[" << ExportPsQuote(job.id) << "] = $true\r\n";
+        os << "} else {\r\n";
+        if (job.command.empty()) {
+            os << "    Write-Warning " << ExportPsQuote("skip " + job.id + ": no command") << "\r\n";
+            os << "    $hanchoFailed[" << ExportPsQuote(job.id) << "] = $true\r\n";
+        } else {
+            os << "    $hanchoCode = Invoke-HanchoJob" << (i + 1) << "\r\n";
+            os << "    if ($hanchoCode -ne 0) {\r\n";
+            os << "        Write-Error " << ExportPsQuote("job " + job.id + " failed") << "\r\n";
+            os << "        $hanchoFailed[" << ExportPsQuote(job.id) << "] = $true\r\n";
+            os << "    }\r\n";
+        }
+        os << "}\r\n\r\n";
+    }
+
+    os << "if ($hanchoFailed.Count -gt 0) {\r\n";
+    os << "    Write-Error \"$($hanchoFailed.Count) job(s) failed\"\r\n";
+    os << "    exit 1\r\n";
+    os << "}\r\n";
+    os << "exit 0\r\n";
+    return os.str();
+}
+
+std::string ExportQueueBash(const nlohmann::json& queue, const std::vector<ExportQueueJob>& jobs,
+                            const std::vector<size_t>& order, std::vector<std::string>& warnings) {
+    std::ostringstream os;
+    os << "#!/usr/bin/env bash\r\n";
+    os << "# Hancho export: task queue \"" << queue.value("name", std::string()) << "\"\r\n";
+    os << "# Generated " << GetCurrentTimestampStr() << ". Runs without Hancho: bash <this file>\r\n";
+    os << "# Jobs run in dependency order. A failed job marks itself; dependents that need\r\n";
+    os << "# success are skipped, while dependencies declared with on=\"done\" still run.\r\n\r\n";
+    os << "set -u\r\n";
+    os << "declare -A HANCHO_FAILED=()\r\n\r\n";
+
+    for (size_t i : order) {
+        const auto& job = jobs[i];
+        if (job.command.empty()) {
+            warnings.push_back("job '" + job.id + "' has an empty command (exported as skipped)");
+            continue;
+        }
+        os << "hancho_job_" << (i + 1) << "() {\r\n";
+        os << "    local __hancho_cwd=\"$PWD\" __hancho_rc=0\r\n";
+        if (!job.cwd.empty()) os << "    cd " << ExportBashQuote(job.cwd) << " || return 1\r\n";
+        for (const auto& [key, value] : job.env) {
+            os << "    export " << key << "=" << ExportBashQuote(value) << "\r\n";
+        }
+        os << ExportIndentLines(job.command, "    ");
+        os << "    __hancho_rc=$?\r\n";
+        if (!job.cwd.empty()) os << "    cd \"$__hancho_cwd\"\r\n";
+        os << "    return $__hancho_rc\r\n";
+        os << "}\r\n\r\n";
+    }
+
+    std::map<std::string, size_t> index;
+    for (size_t i = 0; i < jobs.size(); ++i) index[jobs[i].id] = i;
+
+    for (size_t i : order) {
+        const auto& job = jobs[i];
+        os << "# " << job.id << ": " << ExportShort(job.name, 120) << "\r\n";
+        os << "if false; then :\r\n";
+        for (const auto& dep : job.deps) {
+            if (!ExportDepIsSuccess(dep)) continue;
+            auto it = index.find(dep.id);
+            if (it == index.end()) continue;
+            os << "elif [ -n \"${HANCHO_FAILED[" << (it->second + 1) << "]:-}\" ]; then :\r\n";
+        }
+        os << "else\r\n";
+        if (job.command.empty()) {
+            os << "    echo " << ExportBashQuote("skip " + job.id + ": no command") << " >&2\r\n";
+            os << "    HANCHO_FAILED[" << (i + 1) << "]=1\r\n";
+        } else {
+            os << "    if ! hancho_job_" << (i + 1) << "; then\r\n";
+            os << "        echo " << ExportBashQuote("job " + job.id + " failed") << " >&2\r\n";
+            os << "        HANCHO_FAILED[" << (i + 1) << "]=1\r\n";
+            os << "    fi\r\n";
+        }
+        os << "fi\r\n\r\n";
+    }
+
+    os << "if [ \"${#HANCHO_FAILED[@]}\" -ne 0 ]; then\r\n";
+    os << "    echo \"${#HANCHO_FAILED[@]} job(s) failed\" >&2\r\n";
+    os << "    exit 1\r\n";
+    os << "fi\r\n";
+    os << "exit 0\r\n";
+    std::string script = os.str();
+    script.erase(std::remove(script.begin(), script.end(), '\r'), script.end());
+    return script;
+}
+
+std::string ExportCiJobId(const std::string& id, size_t index) {
+    std::string slug;
+    for (unsigned char c : id) {
+        if (std::isalnum(c) || c == '_' || c == '-') slug.push_back(static_cast<char>(c));
+        else slug.push_back('_');
+    }
+    if (slug.empty()) slug = "job";
+    return "job_" + std::to_string(index + 1) + "_" + slug;
+}
+
+std::string ExportQueueGithubActions(const nlohmann::json& queue, const std::vector<ExportQueueJob>& jobs,
+                                     const std::vector<size_t>& order) {
+    std::ostringstream os;
+    os << "# Hancho export: task queue \"" << queue.value("name", std::string()) << "\"\r\n";
+    os << "# Generated " << GetCurrentTimestampStr() << ". A CI workflow skeleton; adjust runs-on and setup.\r\n\r\n";
+    os << "name: " << ExportYamlQuote("hancho " + queue.value("name", std::string())) << "\r\n\r\n";
+    os << "on:\r\n  workflow_dispatch:\r\n\r\n";
+    os << "jobs:\r\n";
+
+    std::map<std::string, size_t> index;
+    for (size_t i = 0; i < jobs.size(); ++i) index[jobs[i].id] = i;
+
+    for (size_t i : order) {
+        const auto& job = jobs[i];
+        os << "  " << ExportCiJobId(job.id, i) << ":\r\n";
+        os << "    name: " << ExportYamlQuote(job.id + ": " + job.name) << "\r\n";
+        os << "    runs-on: ubuntu-latest\r\n";
+        std::vector<std::string> needs;
+        std::vector<std::string> successNeeds;
+        bool anyDone = false;
+        for (const auto& dep : job.deps) {
+            auto it = index.find(dep.id);
+            if (it == index.end() || it->second == i) continue;
+            needs.push_back(ExportCiJobId(dep.id, it->second));
+            if (!ExportDepIsSuccess(dep)) anyDone = true;
+            else successNeeds.push_back(ExportCiJobId(dep.id, it->second));
+        }
+        if (!needs.empty()) {
+            std::string needsYaml;
+            for (size_t k = 0; k < needs.size(); ++k) {
+                if (k) needsYaml += ", ";
+                needsYaml += ExportYamlQuote(needs[k]);
+            }
+            os << "    needs: [" << needsYaml << "]\r\n";
+        }
+        if (anyDone) {
+            std::string condition = "always()";
+            for (const auto& need : successNeeds) {
+                condition += " && needs." + need + ".result == 'success'";
+            }
+            os << "    if: ${{ " << condition << " }}\r\n";
+        }
+        os << "    steps:\r\n";
+        os << "      - name: " << ExportYamlQuote("run " + job.id) << "\r\n";
+        if (!job.cwd.empty()) os << "        working-directory: " << ExportYamlQuote(job.cwd) << "\r\n";
+        if (!job.env.empty()) {
+            os << "        env:\r\n";
+            for (const auto& [key, value] : job.env) {
+                os << "          " << key << ": " << ExportYamlQuote(value) << "\r\n";
+            }
+        }
+        os << "        run: |\r\n";
+        if (job.command.empty()) {
+            os << "          echo " << ExportYamlQuote("no command for " + job.id) << "\r\n";
+        } else {
+            os << ExportIndentLines(job.command, "          ");
+        }
+        os << "\r\n";
+    }
+    std::string workflow = os.str();
+    workflow.erase(std::remove(workflow.begin(), workflow.end(), '\r'), workflow.end());
+    return workflow;
+}
+
+nlohmann::json ExportQueueJobJson(const ExportQueueJob& job, size_t orderIndex) {
+    nlohmann::json o = nlohmann::json::object();
+    o["id"] = job.id;
+    o["name"] = job.name;
+    o["summary"] = job.summary;
+    o["command"] = job.command;
+    o["cwd"] = job.cwd;
+    o["state"] = job.state;
+    o["timeoutSec"] = job.timeoutSec;
+    o["order"] = static_cast<int>(orderIndex);
+    nlohmann::json env = nlohmann::json::object();
+    for (const auto& [key, value] : job.env) env[key] = value;
+    o["env"] = std::move(env);
+    nlohmann::json deps = nlohmann::json::array();
+    for (const auto& dep : job.deps) {
+        nlohmann::json d = nlohmann::json::object();
+        d["id"] = dep.id;
+        d["on"] = dep.on.empty() ? "success" : dep.on;
+        deps.push_back(std::move(d));
+    }
+    o["dependsOn"] = std::move(deps);
+    return o;
+}
+
+std::string ExportQueueJson(const nlohmann::json& queue, const std::vector<ExportQueueJob>& jobs,
+                            const std::vector<size_t>& order) {
+    nlohmann::json o = nlohmann::json::object();
+    o["format"] = "hancho-export/1";
+    o["type"] = "taskqueue";
+    o["name"] = queue.value("name", std::string());
+    o["concurrency"] = ExportJsonInt(queue, "concurrency", 1);
+    o["generatedAt"] = GetCurrentTimestampStr();
+    nlohmann::json arr = nlohmann::json::array();
+    for (size_t k = 0; k < order.size(); ++k) arr.push_back(ExportQueueJobJson(jobs[order[k]], k));
+    o["jobs"] = std::move(arr);
+    return o.dump(2) + "\n";
+}
+
+std::string ExportQueueJsonl(const std::vector<ExportQueueJob>& jobs, const std::vector<size_t>& order) {
+    std::ostringstream os;
+    for (size_t k = 0; k < order.size(); ++k) {
+        os << ExportQueueJobJson(jobs[order[k]], k).dump() << "\n";
+    }
+    return os.str();
+}
+
+std::string ExportBtScalar(const nlohmann::json& node, const char* key) {
+    auto it = node.find(key);
+    if (it == node.end()) return std::string();
+    if (it->is_string()) return it->get<std::string>();
+    if (it->is_boolean()) return it->get<bool>() ? "true" : "false";
+    if (it->is_number_integer()) return std::to_string(it->get<long long>());
+    if (it->is_number_unsigned()) return std::to_string(it->get<unsigned long long>());
+    if (it->is_number_float()) return std::to_string(it->get<double>());
+    return it->dump();
+}
+
+void ExportBtDetail(std::string& md, int depth, const std::string& key, const std::string& value) {
+    if (value.empty()) return;
+    std::string indent(static_cast<size_t>(depth) * 2, ' ');
+    md += indent + "- **" + key + "**: " + value + "\n";
+}
+
+std::string ExportBtNodeDescription(const nlohmann::json& node, const std::string& type) {
+    auto summary = ExportBtScalar(node, "summary");
+    if ((type == "job" || type == "worker") && !summary.empty()) return ExportShort(summary, 200);
+    if (type == "job") return "Run one command.";
+    if (type == "worker") return "Run one LLM worker.";
+    if (type == "wait") return "Wait " + ExportBtScalar(node, "sec") + " second(s).";
+    if (type == "set") {
+        std::string var = ExportBtScalar(node, "var");
+        if (var.empty()) var = ExportBtScalar(node, "name");
+        return "Set `" + ExportInlineCode(var) + "` = `" + ExportInlineCode(ExportBtScalar(node, "value")) + "`.";
+    }
+    if (type == "escalate") return "Ask for a decision: " + ExportShort(ExportBtScalar(node, "question"), 200);
+    if (type == "fail") {
+        std::string detail = ExportBtScalar(node, "detail");
+        if (detail.empty()) detail = ExportBtScalar(node, "reason");
+        return detail.empty() ? "Fail." : "Fail: " + ExportShort(detail, 200);
+    }
+    if (type == "succeed") return "Succeed.";
+    if (type == "sequence") return "Steps, in order.";
+    if (type == "fallback" || type == "selector") return "Try each child until one succeeds.";
+    if (type == "parallel") return "Run children in parallel.";
+    if (type == "if") return "Branch on a condition.";
+    if (type == "retry") return "Retry the child up to " + ExportBtScalar(node, "max") + " time(s).";
+    if (type == "repeat") return "Repeat the child up to " + ExportBtScalar(node, "max") + " time(s).";
+    if (type == "timeout") return "Fail if the child exceeds " + ExportBtScalar(node, "sec") + " second(s).";
+    if (type == "invert") return "Invert the child result.";
+    if (type == "forceSuccess") return "Always succeed after the child finishes.";
+    if (type == "forceFailure") return "Always fail after the child finishes.";
+    if (type == "fileExists") return "Check that a file exists.";
+    if (type == "fileNewer") return "Check that a file is newer than another.";
+    if (type == "outputMatches") return "Check a node's log output.";
+    if (type == "exitCode") return "Check a node's exit code.";
+    if (type == "jsonValue") return "Check a value in a JSON file.";
+    if (type == "var") return "Check a variable.";
+    if (type == "nodeState") return "Check a node's state.";
+    return std::string();
+}
+
+void ExportBtNodeDetails(const nlohmann::json& node, const std::string& type, int depth, std::string& md) {
+    if (type == "job") {
+        ExportBtDetail(md, depth, "Command", "`" + ExportInlineCode(ExportBtScalar(node, "command")) + "`");
+        ExportBtDetail(md, depth, "Working directory", ExportInlineCode(ExportBtScalar(node, "cwd")));
+        std::string timeout = ExportBtScalar(node, "timeoutSec");
+        if (!timeout.empty()) ExportBtDetail(md, depth, "Timeout", timeout + " second(s)");
+        auto envIt = node.find("env");
+        if (envIt != node.end() && envIt->is_object() && !envIt->empty()) {
+            std::string env;
+            for (auto it = envIt->begin(); it != envIt->end(); ++it) {
+                if (!env.empty()) env += ", ";
+                env += it.key() + "=" + (it.value().is_string() ? it.value().get<std::string>() : it.value().dump());
+            }
+            ExportBtDetail(md, depth, "Environment", "`" + ExportInlineCode(env) + "`");
+        }
+        auto successIt = node.find("success");
+        if (successIt != node.end() && successIt->is_object() && !successIt->empty()) {
+            ExportBtDetail(md, depth, "Success check", "`" + ExportInlineCode(successIt->dump()) + "`");
+        }
+    } else if (type == "worker") {
+        ExportBtDetail(md, depth, "Engine", ExportBtScalar(node, "engine"));
+        ExportBtDetail(md, depth, "Model", ExportBtScalar(node, "model"));
+        ExportBtDetail(md, depth, "Prompt", ExportShort(ExportBtScalar(node, "prompt"), 240));
+        ExportBtDetail(md, depth, "Prompt file", ExportBtScalar(node, "promptFile"));
+        std::string timeout = ExportBtScalar(node, "timeoutSec");
+        if (!timeout.empty()) ExportBtDetail(md, depth, "Timeout", timeout + " second(s)");
+        if (node.contains("outputSchema")) ExportBtDetail(md, depth, "Structured output", "yes (see the original JSON)");
+    } else if (type == "escalate") {
+        ExportBtDetail(md, depth, "Question", ExportShort(ExportBtScalar(node, "question"), 400));
+        ExportBtDetail(md, depth, "Guidance", ExportShort(ExportBtScalar(node, "guidance"), 400));
+        auto expectIt = node.find("expect");
+        if (expectIt != node.end() && expectIt->is_array() && !expectIt->empty()) {
+            std::string answers;
+            for (const auto& a : *expectIt) {
+                if (!answers.empty()) answers += ", ";
+                if (a.is_string()) answers += a.get<std::string>();
+                else answers += a.dump();
+            }
+            ExportBtDetail(md, depth, "Allowed answers", answers);
+        }
+        std::string timeout = ExportBtScalar(node, "timeoutSec");
+        if (!timeout.empty()) ExportBtDetail(md, depth, "Timeout", timeout + " second(s)");
+    } else if (type == "set") {
+        std::string var = ExportBtScalar(node, "var");
+        if (var.empty()) var = ExportBtScalar(node, "name");
+        ExportBtDetail(md, depth, "Variable", "`" + ExportInlineCode(var) + "`");
+        ExportBtDetail(md, depth, "Value", "`" + ExportInlineCode(ExportBtScalar(node, "value")) + "`");
+    } else if (type == "wait") {
+        ExportBtDetail(md, depth, "Seconds", ExportBtScalar(node, "sec"));
+    } else if (type == "fail") {
+        std::string detail = ExportBtScalar(node, "detail");
+        if (detail.empty()) detail = ExportBtScalar(node, "reason");
+        ExportBtDetail(md, depth, "Detail", ExportShort(detail, 400));
+    } else if (type == "retry" || type == "repeat") {
+        ExportBtDetail(md, depth, "Max runs", ExportBtScalar(node, "max"));
+        std::string delay = ExportBtScalar(node, "delaySec");
+        if (delay.empty()) delay = ExportBtScalar(node, "retryDelaySec");
+        if (!delay.empty()) ExportBtDetail(md, depth, "Delay", delay + " second(s)");
+    } else if (type == "timeout") {
+        ExportBtDetail(md, depth, "Seconds", ExportBtScalar(node, "sec"));
+    } else if (type == "parallel") {
+        std::string mode = ExportBtScalar(node, "success");
+        if (mode.empty()) mode = "all";
+        ExportBtDetail(md, depth, "Success mode", mode);
+    } else if (type == "fileExists") {
+        ExportBtDetail(md, depth, "Path", "`" + ExportInlineCode(ExportBtScalar(node, "path")) + "`");
+    } else if (type == "fileNewer") {
+        ExportBtDetail(md, depth, "Path", "`" + ExportInlineCode(ExportBtScalar(node, "path")) + "`");
+        ExportBtDetail(md, depth, "Newer than", "`" + ExportInlineCode(ExportBtScalar(node, "than")) + "`");
+    } else if (type == "outputMatches") {
+        ExportBtDetail(md, depth, "Node", ExportBtScalar(node, "node"));
+        ExportBtDetail(md, depth, "Regex", "`" + ExportInlineCode(ExportBtScalar(node, "regex")) + "`");
+    } else if (type == "exitCode") {
+        ExportBtDetail(md, depth, "Node", ExportBtScalar(node, "node"));
+        for (const char* op : {"eq", "ne", "in"}) {
+            std::string v = ExportBtScalar(node, op);
+            if (!v.empty()) ExportBtDetail(md, depth, op, v);
+        }
+    } else if (type == "jsonValue") {
+        ExportBtDetail(md, depth, "File", "`" + ExportInlineCode(ExportBtScalar(node, "file")) + "`");
+        ExportBtDetail(md, depth, "Path", "`" + ExportInlineCode(ExportBtScalar(node, "path")) + "`");
+        for (const char* op : {"eq", "ne", "in", "gt", "lt", "exists"}) {
+            std::string v = ExportBtScalar(node, op);
+            if (!v.empty()) ExportBtDetail(md, depth, op, v);
+        }
+    } else if (type == "var") {
+        std::string name = ExportBtScalar(node, "name");
+        if (name.empty()) name = ExportBtScalar(node, "var");
+        ExportBtDetail(md, depth, "Variable", "`" + ExportInlineCode(name) + "`");
+        for (const char* op : {"eq", "ne", "in", "gt", "lt", "exists"}) {
+            std::string v = ExportBtScalar(node, op);
+            if (!v.empty()) ExportBtDetail(md, depth, op, v);
+        }
+    } else if (type == "nodeState") {
+        ExportBtDetail(md, depth, "Node", ExportBtScalar(node, "node"));
+        std::string state = ExportBtScalar(node, "eq");
+        if (state.empty()) state = ExportBtScalar(node, "state");
+        ExportBtDetail(md, depth, "Expected state", state);
+    }
+}
+
+void ExportBtRenderNode(const nlohmann::json& node, const std::string& path, const std::string& role,
+                        int depth, std::string& md) {
+    if (!node.is_object()) return;
+    std::string type = ExportBtScalar(node, "type");
+    std::string id = ExportBtScalar(node, "id");
+    std::string label = id.empty() ? path : id;
+    std::string indent(static_cast<size_t>(depth) * 2, ' ');
+    md += indent + "- ";
+    if (!role.empty()) md += role + ": ";
+    md += "**" + label + "**";
+    if (!type.empty()) md += " (`" + type + "`)";
+    std::string desc = ExportBtNodeDescription(node, type);
+    if (!desc.empty()) md += " - " + desc;
+    md += "\n";
+    ExportBtNodeDetails(node, type, depth + 1, md);
+
+    auto childrenIt = node.find("children");
+    if (childrenIt != node.end() && childrenIt->is_array()) {
+        for (size_t i = 0; i < childrenIt->size(); ++i) {
+            ExportBtRenderNode((*childrenIt)[i], path + ".children[" + std::to_string(i) + "]", "", depth + 1, md);
+        }
+    }
+    if (node.contains("cond")) {
+        ExportBtRenderNode(node["cond"], path + ".cond", "cond", depth + 1, md);
+    }
+    if (node.contains("then")) {
+        ExportBtRenderNode(node["then"], path + ".then", "then", depth + 1, md);
+    }
+    if (node.contains("else")) {
+        ExportBtRenderNode(node["else"], path + ".else", "else", depth + 1, md);
+    }
+    if (node.contains("child")) {
+        ExportBtRenderNode(node["child"], path + ".child", "child", depth + 1, md);
+    }
+    if (node.contains("until")) {
+        ExportBtRenderNode(node["until"], path + ".until", "until", depth + 1, md);
+    }
+}
+
+std::string ExportBtMarkdown(const nlohmann::json& tree) {
+    std::ostringstream os;
+    std::string id = tree.value("id", std::string());
+    os << "# Behavior tree: " << id << "\n\n";
+    std::string summary = tree.value("summary", std::string());
+    if (!summary.empty()) os << summary << "\n\n";
+    std::string intent = tree.value("intent", std::string());
+    if (!intent.empty()) os << "**Intent:** " << intent << "\n\n";
+    os << "- **Task queue**: `" << ExportInlineCode(tree.value("taskqueue", std::string())) << "`\n";
+    std::string cwd = tree.value("cwd", std::string());
+    if (!cwd.empty()) os << "- **Working directory**: `" << ExportInlineCode(cwd) << "`\n";
+    if (tree.contains("limits") && tree["limits"].is_object()) {
+        os << "- **Limits**: maxNodeRuns=" << ExportBtScalar(tree["limits"], "maxNodeRuns")
+           << ", maxWallSec=" << ExportBtScalar(tree["limits"], "maxWallSec") << "\n";
+    }
+    os << "- **Exported**: " << GetCurrentTimestampStr() << "\n\n";
+    os << "## Runbook\n\n";
+    if (tree.contains("root")) {
+        std::string rootMd;
+        ExportBtRenderNode(tree["root"], "root", "", 0, rootMd);
+        os << rootMd;
+    } else {
+        os << "_No root node in the saved definition._\n";
+    }
+    if (tree.contains("vars") && tree["vars"].is_object() && !tree["vars"].empty()) {
+        os << "\n## Variables\n\n";
+        for (auto it = tree["vars"].begin(); it != tree["vars"].end(); ++it) {
+            os << "- `" << ExportInlineCode(it.key()) << "` = `";
+            if (it.value().is_string()) os << ExportInlineCode(it.value().get<std::string>());
+            else os << ExportInlineCode(it.value().dump());
+            os << "`\n";
+        }
+    }
+    return os.str();
+}
+
+bool ExportKnowledgeActive(const nlohmann::json& body) {
+    auto activeIt = body.find("active");
+    if (activeIt != body.end() && activeIt->is_boolean() && !activeIt->get<bool>()) return false;
+    std::string status = ExportLowerAscii(ExportJsonStr(body, "status"));
+    if (status.empty()) return true;
+    return status == "active" || status == "approved";
+}
+
+struct ExportKnowledgeRecord {
+    std::string id;
+    std::string text;
+    std::string scope;
+    std::string approvedAt;
+    std::string approvedBy;
+    std::string createdAt;
+    std::vector<std::string> tags;
+    nlohmann::json raw;
+};
+
+std::vector<ExportKnowledgeRecord> ExportLoadKnowledge(const std::wstring& path, std::vector<std::string>& warnings) {
+    std::vector<ExportKnowledgeRecord> records;
+    std::ifstream in(NativePath(path), std::ios::binary);
+    if (!in) return records;
+    std::string line;
+    int lineNo = 0;
+    while (std::getline(in, line)) {
+        ++lineNo;
+        if (!line.empty() && line.back() == '\r') line.pop_back();
+        if (line.empty()) continue;
+        nlohmann::json j = nlohmann::json::parse(line, nullptr, false);
+        if (j.is_discarded() || !j.is_object()) {
+            warnings.push_back("knowledge.jsonl:" + std::to_string(lineNo) + ": invalid JSON line (skipped)");
+            continue;
+        }
+        nlohmann::json body = j;
+        auto knIt = j.find("knowledge");
+        if (knIt != j.end() && knIt->is_object()) body = *knIt;
+        auto noteIt = j.find("note");
+        if (body == j && noteIt != j.end() && noteIt->is_object()) body = *noteIt;
+        if (body.is_object()) {
+            for (const char* key : {"approvedBy", "approvedAt", "status", "scope", "sources", "createdAt", "active"}) {
+                if (!body.contains(key) && j.contains(key)) body[key] = j[key];
+            }
+        }
+        if (!body.is_object() || !ExportKnowledgeActive(body)) continue;
+        ExportKnowledgeRecord rec;
+        rec.id = ExportJsonStr(body, "id");
+        rec.scope = ExportJsonStr(body, "scope");
+        rec.approvedAt = ExportJsonStr(body, "approvedAt");
+        if (rec.approvedAt.empty()) rec.approvedAt = ExportJsonStr(body, "createdAt");
+        rec.approvedBy = ExportJsonStr(body, "approvedBy");
+        rec.createdAt = ExportJsonStr(body, "createdAt");
+        rec.text = ExportJsonStr(body, "text");
+        if (rec.text.empty()) rec.text = ExportJsonStr(body, "summary");
+        if (rec.text.empty()) rec.text = ExportJsonStr(body, "title");
+        auto tagsIt = body.find("tags");
+        if (tagsIt != body.end() && tagsIt->is_array()) {
+            for (const auto& tag : *tagsIt) {
+                if (tag.is_string()) rec.tags.push_back(tag.get<std::string>());
+            }
+        }
+        rec.raw = body;
+        records.push_back(std::move(rec));
+    }
+    return records;
+}
+
+std::string ExportKnowledgeMarkdown(const std::vector<ExportKnowledgeRecord>& records) {
+    std::ostringstream os;
+    os << "# Project knowledge (Hancho L3)\n\n";
+    os << "Exported " << GetCurrentTimestampStr()
+       << " from `memory/knowledge.jsonl`. Plain Markdown, ready to paste into `CLAUDE.md` "
+       << "or any agent instructions file.\n\n";
+    if (records.empty()) {
+        os << "_No active L3 knowledge records._\n";
+        return os.str();
+    }
+    for (const auto& rec : records) {
+        os << "## " << (rec.id.empty() ? "Untitled" : rec.id) << "\n\n";
+        if (!rec.scope.empty()) os << "- **Scope**: `" << ExportInlineCode(rec.scope) << "`\n";
+        if (!rec.approvedAt.empty()) {
+            os << "- **Approved**: " << rec.approvedAt;
+            if (!rec.approvedBy.empty()) os << " by " << rec.approvedBy;
+            os << "\n";
+        } else if (!rec.createdAt.empty()) {
+            os << "- **Created**: " << rec.createdAt << "\n";
+        }
+        if (!rec.tags.empty()) {
+            os << "- **Tags**: ";
+            for (size_t i = 0; i < rec.tags.size(); ++i) {
+                if (i) os << ", ";
+                os << rec.tags[i];
+            }
+            os << "\n";
+        }
+        os << "\n" << rec.text << "\n\n";
+    }
+    return os.str();
+}
+
+std::string ExportKnowledgeJsonl(const std::vector<ExportKnowledgeRecord>& records) {
+    std::ostringstream os;
+    for (const auto& rec : records) os << rec.raw.dump() << "\n";
+    return os.str();
+}
+
+int RunExportCommand(const std::vector<std::string>& args, size_t startIdx, bool jsonOutput) {
+    auto fail = [&](const std::string& message) {
+        if (jsonOutput) std::cout << "{\"ok\":false,\"error\":\"" << JsonEscape(message) << "\"}\n";
+        else std::cerr << "Error: " << message << "\n";
+        return 1;
+    };
+
+    auto printHelp = [&]() {
+        if (jsonOutput) {
+            std::cout << "{\"ok\":true,\"command\":\"export\",\"usage\":\"hancho-cli export [queues|bt|knowledge|all|list] [options]\","
+                         "\"options\":[\"--out <path>\",\"--format <fmt>\",\"--taskqueue <name>\",\"--bt <id>\"]}\n";
+            return;
+        }
+        std::cout
+            << "Usage: hancho-cli export [queues|bt|knowledge|all|list] [options]\n\n"
+            << "Write Hancho data in open formats that stay readable without Hancho.\n"
+            << "With no subcommand, exports everything into ./export.\n\n"
+            << "Subcommands:\n"
+            << "  queues [<name>]           Task queue as a dependency-ordered script, CI workflow, or JSON/JSONL\n"
+            << "  bt [<id>]                 Behavior tree as a Markdown runbook (or JSON)\n"
+            << "  knowledge                 L3 project knowledge as Markdown (or JSONL)\n"
+            << "  all                       Everything, into separate subdirectories\n"
+            << "  list                      Show exported data that is available\n\n"
+            << "Options:\n"
+            << "  --out <path>, -o <path>   Output file (single item) or directory (multiple items)\n"
+            << "  --format <fmt>            queues: powershell (default), bash, github-actions, jsonl, json\n"
+            << "                            bt: markdown (default), json\n"
+            << "                            knowledge: markdown (default), jsonl\n"
+            << "  --taskqueue <name>        Queue to export (same as the positional <name>)\n"
+            << "  --bt <id>, --id <id>      Behavior tree to export (same as the positional <id>)\n\n"
+            << "Without --out, a single queue/tree/knowledge export prints to stdout.\n"
+            << "Multiple items are written under export/queues, export/behavior-trees and export/knowledge.md.\n";
+    };
+
+    size_t i = startIdx;
+    std::string op;
+    if (i < args.size() && !args[i].empty() && args[i][0] != '-') op = args[i++];
+
+    std::string outArg;
+    std::string formatArg;
+    std::string queueName;
+    std::string btId;
+    for (; i < args.size(); ++i) {
+        const std::string& a = args[i];
+        if (a == "--help" || a == "-h") {
+            printHelp();
+            return 0;
+        }
+        if ((a == "--out" || a == "-o") && i + 1 < args.size()) outArg = args[++i];
+        else if ((a == "--format" || a == "--fmt") && i + 1 < args.size()) formatArg = args[++i];
+        else if ((a == "--taskqueue" || a == "--queue") && i + 1 < args.size()) queueName = args[++i];
+        else if ((a == "--bt" || a == "--id") && i + 1 < args.size()) btId = args[++i];
+        else if (!a.empty() && a[0] != '-') {
+            if (op.empty()) op = a;
+            else if (op == "queues" || op == "queue") { if (queueName.empty()) queueName = a; }
+            else if (op == "bt" || op == "trees" || op == "tree") { if (btId.empty()) btId = a; }
+        }
+    }
+
+    if (op == "help" || op == "--help" || op == "-h") {
+        printHelp();
+        return 0;
+    }
+    if (op.empty()) op = "all";
+    if (op == "queues") op = "queue";
+    if (op == "trees" || op == "tree") op = "bt";
+    if (op == "l3" || op == "memory") op = "knowledge";
+    if (op != "queue" && op != "bt" && op != "knowledge" && op != "all" && op != "list") {
+        return fail("unknown export target: " + op + " (queues, bt, knowledge, all, list)");
+    }
+
+    const std::wstring queueDir = PathJoinWide(GetLogsDirectoryWide(), L"taskqueues");
+    const std::wstring btDir = PathJoinWide(GetLogsDirectoryWide(), L"behaviortrees");
+    const std::wstring knowledgePath = PathJoinWide(GetEffectiveDataDirectoryWide(), L"memory\\knowledge.jsonl");
+
+    std::vector<std::string> warnings;
+    nlohmann::json result = nlohmann::json::object();
+    result["ok"] = true;
+    result["command"] = "export";
+    result["exported"] = nlohmann::json::array();
+    bool ok = true;
+
+    auto emit = [&](const std::string& type, const std::string& name, const std::string& format,
+                    const std::string& content, const std::string& outPath) -> bool {
+        nlohmann::json item = nlohmann::json::object();
+        item["type"] = type;
+        item["name"] = name;
+        item["format"] = format;
+        if (outPath.empty()) {
+            item["path"] = nullptr;
+            if (jsonOutput) item["content"] = content;
+            else std::cout << content;
+            if (!jsonOutput && !content.empty() && content.back() != '\n') std::cout << "\n";
+        } else {
+            std::wstring abs = ResolveAbsolutePathWide(Utf8ToWide(outPath));
+            std::string err;
+            if (!ExportWriteFile(abs, content, err)) {
+                warnings.push_back(err);
+                ok = false;
+                item["ok"] = false;
+                item["error"] = err;
+            } else {
+                item["ok"] = true;
+                item["path"] = WideToUtf8(abs);
+                if (!jsonOutput) std::cout << "wrote " << WideToUtf8(abs) << "\n";
+            }
+        }
+        result["exported"].push_back(std::move(item));
+        return ok;
+    };
+
+    auto loadQueues = [&](const std::string& only, std::vector<nlohmann::json>& queues) {
+        std::vector<std::wstring> files;
+        ExportListJsonFiles(queueDir, files);
+        for (const auto& file : files) {
+            nlohmann::json q;
+            if (!ExportReadJsonFile(file, q) || !q.is_object()) continue;
+            std::string name = ExportJsonStr(q, "name");
+            if (name.empty()) {
+                std::filesystem::path p = NativePath(file);
+                name = WideToUtf8(p.stem().wstring());
+                q["name"] = name;
+            }
+            if (!only.empty() && name != only) continue;
+            queues.push_back(std::move(q));
+        }
+    };
+
+    auto loadTrees = [&](const std::string& only, std::vector<nlohmann::json>& trees) {
+        std::vector<std::wstring> files;
+        ExportListJsonFiles(btDir, files);
+        for (const auto& file : files) {
+            nlohmann::json t;
+            if (!ExportReadJsonFile(file, t) || !t.is_object()) continue;
+            std::string id = ExportJsonStr(t, "id");
+            if (id.empty() || !t.contains("root")) continue;
+            if (!only.empty() && id != only) continue;
+            trees.push_back(std::move(t));
+        }
+    };
+
+    if (op == "list") {
+        std::vector<nlohmann::json> queues;
+        std::vector<nlohmann::json> trees;
+        loadQueues("", queues);
+        loadTrees("", trees);
+        auto records = ExportLoadKnowledge(knowledgePath, warnings);
+        if (jsonOutput) {
+            nlohmann::json r = nlohmann::json::object();
+            r["ok"] = true;
+            r["taskqueues"] = nlohmann::json::array();
+            for (const auto& q : queues) {
+                nlohmann::json qo = nlohmann::json::object();
+                qo["name"] = q.value("name", std::string());
+                qo["jobs"] = q.contains("jobs") && q["jobs"].is_array() ? static_cast<int>(q["jobs"].size()) : 0;
+                r["taskqueues"].push_back(std::move(qo));
+            }
+            r["behavior_trees"] = nlohmann::json::array();
+            for (const auto& t : trees) r["behavior_trees"].push_back(t.value("id", std::string()));
+            r["knowledge_records"] = static_cast<int>(records.size());
+            std::cout << r.dump(2) << "\n";
+        } else {
+            std::cout << "Task queues:\n";
+            for (const auto& q : queues) {
+                int jobs = q.contains("jobs") && q["jobs"].is_array() ? static_cast<int>(q["jobs"].size()) : 0;
+                std::cout << "  " << q.value("name", std::string()) << " (" << jobs << " job(s))\n";
+            }
+            if (queues.empty()) std::cout << "  (none)\n";
+            std::cout << "Behavior trees:\n";
+            for (const auto& t : trees) std::cout << "  " << t.value("id", std::string()) << "\n";
+            if (trees.empty()) std::cout << "  (none)\n";
+            std::cout << "L3 knowledge records: " << records.size() << "\n";
+        }
+        return 0;
+    }
+
+    if (op == "queue" || op == "all") {
+        std::string format = ExportNormalizeQueueFormat(formatArg);
+        if (format.empty()) {
+            if (op == "all") format = "powershell";
+            else return fail("unknown queue format: " + formatArg + " (powershell, bash, github-actions, jsonl, json)");
+        }
+        std::vector<nlohmann::json> queues;
+        loadQueues(op == "queue" ? queueName : "", queues);
+        if (queues.empty()) {
+            if (op == "queue" && !queueName.empty()) return fail("task queue not found: " + queueName);
+            warnings.push_back("no task queues found");
+        }
+        std::string outBase = outArg;
+        if (op == "all") outBase = outArg.empty() ? "export" : outArg;
+        const bool singleFileOut = !outArg.empty() && (queueName.empty() ? queues.size() == 1 : true);
+
+        for (const auto& q : queues) {
+            std::string name = q.value("name", std::string());
+            auto jobs = ExportParseQueueJobs(q);
+            auto order = ExportTopoOrder(jobs, warnings);
+            std::string content;
+            if (format == "powershell") content = ExportQueuePowerShell(q, jobs, order, warnings);
+            else if (format == "bash") content = ExportQueueBash(q, jobs, order, warnings);
+            else if (format == "github-actions") content = ExportQueueGithubActions(q, jobs, order);
+            else if (format == "jsonl") content = ExportQueueJsonl(jobs, order);
+            else content = ExportQueueJson(q, jobs, order);
+
+            std::string outPath;
+            if (op == "all") {
+                outPath = outBase + "\\queues\\" + ExportSlug(name, "queue") + ExportExtensionFor(format);
+            } else if (!outArg.empty()) {
+                outPath = singleFileOut
+                    ? outArg
+                    : (outArg + "\\" + ExportSlug(name, "queue") + ExportExtensionFor(format));
+            } else if (!queueName.empty()) {
+                outPath = ""; // single named queue to stdout
+            } else {
+                outPath = "export\\queues\\" + ExportSlug(name, "queue") + ExportExtensionFor(format);
+            }
+            emit("taskqueue", name, format, content, outPath);
+        }
+    }
+
+    if (op == "bt" || op == "all") {
+        std::string format = ExportNormalizeBtFormat(formatArg.empty() ? "markdown" : formatArg);
+        if (format.empty()) {
+            if (op == "all") format = "markdown";
+            else return fail("unknown behavior tree format: " + formatArg + " (markdown, json)");
+        }
+        std::vector<nlohmann::json> trees;
+        loadTrees(op == "bt" ? btId : "", trees);
+        if (trees.empty()) {
+            if (op == "bt" && !btId.empty()) return fail("behavior tree not found: " + btId);
+            warnings.push_back("no behavior trees found");
+        }
+        std::string outBase = outArg.empty() ? "export" : outArg;
+        const bool singleFileOut = !outArg.empty() && (btId.empty() ? trees.size() == 1 : true);
+        for (const auto& t : trees) {
+            std::string id = t.value("id", std::string());
+            std::string content = format == "json" ? t.dump(2) + "\n" : ExportBtMarkdown(t);
+            std::string outPath;
+            if (op == "all") {
+                outPath = outBase + "\\behavior-trees\\" + ExportSlug(id, "tree") + (format == "json" ? ".json" : ".md");
+            } else if (!outArg.empty()) {
+                outPath = singleFileOut
+                    ? outArg
+                    : (outArg + "\\" + ExportSlug(id, "tree") + (format == "json" ? ".json" : ".md"));
+            } else if (!btId.empty()) {
+                outPath = "";
+            } else {
+                outPath = "export\\behavior-trees\\" + ExportSlug(id, "tree") + (format == "json" ? ".json" : ".md");
+            }
+            emit("behavior_tree", id, format, content, outPath);
+        }
+    }
+
+    if (op == "knowledge" || op == "all") {
+        std::string format = ExportNormalizeKnowledgeFormat(formatArg.empty() ? "markdown" : formatArg);
+        if (format.empty()) {
+            if (op == "all") format = "markdown";
+            else return fail("unknown knowledge format: " + formatArg + " (markdown, jsonl)");
+        }
+        auto records = ExportLoadKnowledge(knowledgePath, warnings);
+        std::error_code knowledgeEc;
+        if (!std::filesystem::exists(NativePath(knowledgePath), knowledgeEc)) {
+            warnings.push_back("no L3 knowledge file at " + WideToUtf8(knowledgePath));
+        }
+        std::string content = format == "jsonl" ? ExportKnowledgeJsonl(records) : ExportKnowledgeMarkdown(records);
+        std::string outPath;
+        if (op == "all") {
+            std::string outBase = outArg.empty() ? "export" : outArg;
+            outPath = outBase + "\\knowledge" + (format == "jsonl" ? ".jsonl" : ".md");
+        } else {
+            outPath = outArg;
+        }
+        emit("knowledge", "l3", format, content, outPath);
+    }
+
+    if (!warnings.empty()) {
+        result["warnings"] = warnings;
+        if (!jsonOutput) {
+            for (const auto& w : warnings) std::cerr << "Warning: " << w << "\n";
+        }
+    }
+    result["ok"] = ok;
+    if (jsonOutput) std::cout << result.dump(2) << "\n";
+    return ok ? 0 : 1;
+}
+
 std::string ResolveGuiExePathUtf8() {
+#ifdef _WIN32
     wchar_t exePath[MAX_PATH] = {};
     DWORD len = GetModuleFileNameW(nullptr, exePath, MAX_PATH);
     if (len == 0) return "Hancho.exe";
-
     std::wstring current(exePath, len);
     auto slash = current.find_last_of(L"\\/");
     if (slash != std::wstring::npos) {
         std::wstring candidate = current.substr(0, slash + 1) + L"Hancho.exe";
-        if (_wcsicmp(candidate.c_str(), current.c_str()) == 0) {
-            return WideToUtf8(current);
-        }
-        DWORD attr = GetFileAttributesW(candidate.c_str());
-        if (attr != INVALID_FILE_ATTRIBUTES && !(attr & FILE_ATTRIBUTE_DIRECTORY)) {
-            return WideToUtf8(candidate);
-        }
+        if (WideEqualsIgnoreCase(candidate, current)) return WideToUtf8(current);
+        if (PathExistsWide(candidate) && !IsDirectoryWide(candidate)) return WideToUtf8(candidate);
     }
     return WideToUtf8(current);
+#else
+    std::string current = GetExecutablePathUtf8();
+    std::filesystem::path exe(current);
+    std::filesystem::path dir = exe.parent_path();
+    for (const char* name : {"Hancho", "hancho", "Hancho.exe"}) {
+        std::filesystem::path candidate = dir / name;
+        std::error_code ec;
+        if (std::filesystem::is_regular_file(candidate, ec)) return candidate.string();
+    }
+    return current;
+#endif
 }
-
 
 struct McpInstallOutcome {
     bool ok = false;
@@ -410,8 +1803,8 @@ McpInstallOutcome InstallMcpConfig(const std::string& client, const std::string&
     std::string target = explicitPath;
     if (target.empty()) {
         if (opencode) {
-            if (GetFileAttributesW(L"opencode.json") != INVALID_FILE_ATTRIBUTES) target = "opencode.json";
-            else if (GetFileAttributesW(L"opencode.jsonc") != INVALID_FILE_ATTRIBUTES) target = "opencode.jsonc";
+            if (PathExistsWide(L"opencode.json")) target = "opencode.json";
+            else if (PathExistsWide(L"opencode.jsonc")) target = "opencode.jsonc";
             else target = "opencode.json";
         } else {
             target = ".mcp.json";
@@ -447,6 +1840,187 @@ McpInstallOutcome InstallMcpConfig(const std::string& client, const std::string&
     if (!dryRun) WriteFileAtomicWide(targetW, updated);
     out.ok = true;
     out.changed = true;
+    return out;
+}
+
+// Finds `"name": <value>` inside [containerOpen, containerClose] and returns the bounds of the
+// key and the end of its value. String-aware so nested objects and quoted values are safe.
+bool FindJsonEntryBounds(const std::string& json, size_t containerOpen, size_t containerClose,
+                         const std::string& name, size_t& outKeyStart, size_t& outValueEnd) {
+    std::string pattern = "\"" + name + "\"";
+    size_t pos = containerOpen + 1;
+    while (true) {
+        size_t found = json.find(pattern, pos);
+        if (found == std::string::npos || found >= containerClose) return false;
+        size_t after = found + pattern.size();
+        while (after < containerClose && std::isspace(static_cast<unsigned char>(json[after]))) after++;
+        if (after < containerClose && json[after] == ':') {
+            size_t value = after + 1;
+            while (value < containerClose && std::isspace(static_cast<unsigned char>(json[value]))) value++;
+            if (value >= containerClose) return false;
+            size_t end = value;
+            if (json[value] == '{' || json[value] == '[') {
+                const char openCh = json[value];
+                const char closeCh = (openCh == '{') ? '}' : ']';
+                int depth = 0;
+                bool inStr = false;
+                bool esc = false;
+                for (size_t i = value; i < containerClose; ++i) {
+                    char c = json[i];
+                    if (inStr) {
+                        if (esc) esc = false;
+                        else if (c == '\\') esc = true;
+                        else if (c == '"') inStr = false;
+                        continue;
+                    }
+                    if (c == '"') { inStr = true; continue; }
+                    if (c == openCh) depth++;
+                    else if (c == closeCh) {
+                        depth--;
+                        if (depth == 0) { end = i + 1; break; }
+                    }
+                }
+                if (end == value) return false;
+            } else if (json[value] == '"') {
+                size_t i = value + 1;
+                for (; i < containerClose; ++i) {
+                    if (json[i] == '\\') ++i;
+                    else if (json[i] == '"') break;
+                }
+                if (i >= containerClose) return false;
+                end = i + 1;
+            } else {
+                size_t i = value;
+                while (i < containerClose && json[i] != ',' && json[i] != '}' && json[i] != ']' &&
+                       !std::isspace(static_cast<unsigned char>(json[i]))) {
+                    ++i;
+                }
+                end = i;
+            }
+            outKeyStart = found;
+            outValueEnd = end;
+            return true;
+        }
+        pos = found + pattern.size();
+    }
+}
+
+// Removes key and value, taking the adjacent comma with it so the JSON stays valid.
+std::string RemoveJsonEntry(const std::string& json, size_t keyStart, size_t valueEnd) {
+    size_t start = keyStart;
+    size_t end = valueEnd;
+    size_t before = start;
+    while (before > 0 && std::isspace(static_cast<unsigned char>(json[before - 1]))) before--;
+    if (before > 0 && json[before - 1] == ',') {
+        start = before - 1;
+    } else {
+        size_t after = end;
+        while (after < json.size() && std::isspace(static_cast<unsigned char>(json[after]))) after++;
+        if (after < json.size() && json[after] == ',') end = after + 1;
+    }
+    std::string out = json;
+    out.erase(start, end - start);
+    return out;
+}
+
+void FindDataDirArgInJson(const nlohmann::json& value, std::string& out) {
+    if (!out.empty()) return;
+    if (value.is_array()) {
+        for (size_t i = 0; i < value.size(); ++i) {
+            if (value[i].is_string() && value[i].get<std::string>() == "--data-dir" &&
+                i + 1 < value.size() && value[i + 1].is_string()) {
+                out = value[i + 1].get<std::string>();
+                return;
+            }
+            FindDataDirArgInJson(value[i], out);
+        }
+    } else if (value.is_object()) {
+        for (auto it = value.begin(); it != value.end(); ++it) FindDataDirArgInJson(it.value(), out);
+    }
+}
+
+std::string ExtractDataDirArg(const std::string& entryJson) {
+    std::string out;
+    auto parsed = nlohmann::json::parse(entryJson, nullptr, false);
+    if (!parsed.is_discarded()) FindDataDirArgInJson(parsed, out);
+    return out;
+}
+
+struct McpUninstallOutcome {
+    bool ok = false;
+    bool changed = false;
+    bool dryRun = false;
+    bool dataDirRequested = false;
+    bool dataDirDeleted = false;
+    std::string error;
+    std::string targetPath;
+    std::string entryJson;
+    std::string dataDir;
+};
+
+McpUninstallOutcome UninstallMcpConfig(const std::string& client, const std::string& explicitPath,
+                                       const std::string& serverName, bool dryRun, bool deleteDataDir,
+                                       const std::string& explicitDataDir) {
+    McpUninstallOutcome out;
+    out.dryRun = dryRun;
+    out.dataDirRequested = deleteDataDir;
+
+    const bool opencode = (client == "opencode");
+    const std::string container = opencode ? "mcp" : "mcpServers";
+
+    std::string target = explicitPath;
+    if (target.empty()) {
+        if (opencode) {
+            if (PathExistsWide(L"opencode.json")) target = "opencode.json";
+            else if (PathExistsWide(L"opencode.jsonc")) target = "opencode.jsonc";
+            else target = "opencode.json";
+        } else {
+            target = ".mcp.json";
+        }
+    }
+
+    std::wstring targetW = ResolveAbsolutePathWide(Utf8ToWide(target));
+    out.targetPath = WideToUtf8(targetW);
+
+    std::string embeddedDataDir;
+    if (PathExistsWide(targetW)) {
+        std::string content = ReadFileUtf8Wide(targetW);
+        size_t open = 0;
+        size_t close = 0;
+        if (!content.empty() && FindJsonContainerBounds(content, container, open, close)) {
+            size_t keyStart = 0;
+            size_t valueEnd = 0;
+            if (FindJsonEntryBounds(content, open, close, serverName, keyStart, valueEnd)) {
+                out.entryJson = content.substr(keyStart, valueEnd - keyStart);
+                embeddedDataDir = ExtractDataDirArg(out.entryJson);
+                std::string updated = RemoveJsonEntry(content, keyStart, valueEnd);
+                if (!dryRun) WriteFileAtomicWide(targetW, updated);
+                out.changed = true;
+            }
+        }
+    }
+
+    if (deleteDataDir) {
+        std::wstring dataW;
+        std::string dataUtf8;
+        if (!ResolveDataDirForUninstall(explicitDataDir, embeddedDataDir, dataW, dataUtf8)) {
+            out.error = "cannot determine the data directory; pass --data-dir <path>";
+            return out;
+        }
+        out.dataDir = dataUtf8;
+        if (dryRun) {
+            out.dataDirDeleted = false;
+        } else {
+            DataDirDeleteOutcome dataOut = DeleteHanchoDataDirectory(dataW);
+            if (!dataOut.ok) {
+                out.error = dataOut.error;
+                return out;
+            }
+            out.dataDirDeleted = dataOut.deleted;
+        }
+    }
+
+    out.ok = true;
     return out;
 }
 
@@ -511,8 +2085,10 @@ HANCHO-CLI CONCEPTS:
                 .done file to detect completion.
 
 EXIT CODES:
-  0    success / completed
-  1    CLI or configuration error (also: process failure without --wait)
+  0    success / completed (run --exit-on-drain: every job succeeded)
+  1    CLI or configuration error (also: process failure without --wait;
+       run --exit-on-drain: at least one job failed or was blocked)
+  2    run --exit-on-drain only: a job was cancelled or the run was interrupted
   124  wait timed out while the process is still running
        start --wait / wait return the managed process's exit code
 
@@ -528,6 +2104,7 @@ EXAMPLES:
   hancho-cli.exe logs --id 1 --tail 80
   hancho-cli.exe send --id 1 --input "status"
   hancho-cli.exe taskqueue add --file jobs.json --taskqueue main
+  hancho-cli.exe run --file queue.json --exit-on-drain --report junit.xml
   hancho-cli.exe mcp install --client opencode
 
 COMMANDS:
@@ -583,6 +2160,9 @@ COMMANDS:
   clear
       Remove finished processes from the dashboard list.
 
+  top [--once] [--interval <ms>]
+      Terminal view of the headless core (queue and process list). POSIX screen.
+
   event emit --kind <kind> [--text <text>] [--tool <name>] [--activity <a>] [--target <t>]
              [--status <s>] [--data <json>] [--pipe <name>]
       Write one hancho.event/1 line to HANCHO_EVENT_PIPE (set for pipe-mode workers).
@@ -596,7 +2176,9 @@ COMMANDS:
 
   worker stream <id> [--tail <n>] [--type <type>] [--since <seq>] [--summary] [--schema <legacy|v1>]
       View captured JSON streaming events for claude, agy, or opencode workers.
-      --schema v1 returns the stable hancho.event/1 shape from <log>.events.jsonl.
+      --schema v1 (default) returns the stable hancho.event/1 shape from <log>.events.jsonl.
+      --schema legacy returns the deprecated internal type strings and is removed in v0.11.0.
+      With v1, --type matches the kind (tool.call, message, ...).
 
   worker info <id> [--notes "<notes>"] [--goal "<goal>"]
       Update supervisor notes or goal for an ongoing worker.
@@ -606,6 +2188,11 @@ COMMANDS:
       directory). It runs long commands through Hancho and returns a short summary.
       An existing file is not overwritten.
 
+  agent uninstall-template [--path <dir>] [--dry-run] [--delete-data-dir]
+      Remove the hancho-runner subagent written by install-template (the inverse command).
+      Empty .claude\agents and .claude directories are removed too. Add --delete-data-dir
+      to also delete the data directory (kept by default).
+
   mcp install [--client claude|opencode] [--path <file>] [--name <name>] [--data-dir <path>] [--dry-run]
       Register Hancho as an MCP server automatically. Writes or updates
       .mcp.json (Claude Code, default) or opencode.json (--client opencode).
@@ -613,7 +2200,97 @@ COMMANDS:
       project keeps its logs/state/task queues inside that directory.
       --json prints the machine-readable result; --dry-run previews without writing.
 
-TASK QUEUE:
+  mcp uninstall [--client claude|opencode] [--path <file>] [--name <name>] [--data-dir <path>]
+                [--delete-data-dir] [--dry-run]
+      Remove the Hancho entry from the MCP config (the inverse of mcp install).
+      The data directory is kept by default; add --delete-data-dir to delete it too.
+      The data directory is the one embedded by mcp install, --data-dir, or the default.
+
+LEAVING HANCHO (graduation):
+  Stop using Hancho without losing your work:
+    1. hancho-cli.exe export all --out <dir>         # queues, trees and L3 as open files
+    2. hancho-cli.exe mcp uninstall                  # remove MCP registration (keep data)
+    3. hancho-cli.exe agent uninstall-template       # remove hancho-runner.md
+    4. Delete the data directory only if you want to:
+         hancho-cli.exe mcp uninstall --delete-data-dir
+  While you keep it, all Hancho data stays in open formats: queues, behavior trees,
+  events and memory are JSON / JSONL and readable without Hancho.
+  When a harness covers your use, compare it with doc\design-v3.md sections 5.3-5.5
+  (feature map and conditions) before leaving. doc\release-checklist.md records the
+  per-release review of that table.
+
+EXPORT (leave with your data in open formats):
+  export [queues|bt|knowledge|all|list] [--out <path>] [--format <fmt>]
+         [--taskqueue <name>] [--bt <id>]
+      Write queues as dependency-ordered scripts, CI workflow skeletons, or JSON/JSONL;
+      behavior trees as Markdown runbooks; and L3 project knowledge as Markdown ready
+      to paste into CLAUDE.md. With no subcommand, everything goes to .\export.
+      Formats: queues = powershell (default), bash, github-actions, jsonl, json;
+               bt = markdown (default), json; knowledge = markdown (default), jsonl.
+      Without --out, a single queue/tree/knowledge export prints to stdout.
+        hancho-cli.exe export queues main --format powershell
+        hancho-cli.exe export bt my-tree --out runbook.md
+        hancho-cli.exe export knowledge --out project-knowledge.md
+        hancho-cli.exe export all --out export
+
+MEMORY:
+  memory search [query] [filters] [--limit <n>]
+      Search L1 run records, L2 notes and L3 approved knowledge.
+      Filters: --kind run,note,knowledge --scope <scope> --file <path>
+               --job-name <name> --taskqueue <name> --engine <name>
+               --model <name> --outcome <outcome> --failure-class <class>
+               --since <30m|6h|2d|YYYY-MM-DD>
+  memory get <id> [--kind <run|note|knowledge>]
+      Show one memory record in full, with its source file and line.
+  memory brief [--job-name <name>] [--taskqueue <name>] [--file <path>]...
+               [--scope <job,file,taskqueue,project>]... [--budget-chars <n>]
+               [--no-agent-notes]
+      Summarize the records relevant to a job: previous runs, common failures,
+      related notes and project knowledge. Fixed block, no LLM. Sections are
+      trimmed to fit --budget-chars (default 1500), keeping L3 to the end.
+  memory stats [--since <period>] [--job-name <name>] [--taskqueue <name>]
+               [--engine <name>] [--model <name>] [--outcome <outcome>]
+               [--compare-inject]
+      Success rate, duration median/p90, failures and token usage from L1.
+      --compare-inject also compares runs with and without injected memory:
+      retry success rate, failure-class recurrence and added tokens/cost.
+  memory approve <note-id> [--by <name>]
+      Promote an L2 note to L3 knowledge. Human only; this path is not exposed
+      as an MCP tool. Writes memory/knowledge.jsonl with approvedBy / approvedAt.
+  memory note --text <text> [--scope <scope>] [--tag <tag>]...
+              [--source <id>]... [--supersedes <note-id>] [--expires-at <time>]
+              [--author human|hancho]
+      Append an L2 note. scope is project, taskqueue:<name>, job:<name>,
+      file:<path> or engine:<name>. Known secrets (sk-, ghp_, AKIA, Bearer,
+      password=) are redacted before writing; job env is never recorded.
+  memory retract <note-id> [--reason <text>] [--by <name>]
+      Append a retraction for an L2 note. Both stay in notes.jsonl and replay
+      marks the note as retracted.
+  memory rebuild
+      Rebuild memory/index/index.json from memory/records, notes.jsonl and
+      knowledge.jsonl. The index is a derivative and safe to delete.
+
+REMOTE HOSTS:
+  hosts list
+      Show remote hosts registered in <data dir>/hosts.json. Tokens are never
+      printed; list reports whether one is available.
+  hosts add <name> <address> [--token-env VAR] [--token-credential TARGET]
+      Register a host (address: host:port or ws://host:port). The token is read
+      from VAR (default HANCHO_TOKEN_<NAME>), then the Windows Credential Manager
+      target (default Hancho/host/<name>).
+  hosts remove <name>
+  hosts ping <name>
+      Open a WebSocket to the host, authenticate, and send an IPC ping.
+  --host <name>
+      Send this invocation's IPC request to that host instead of the local
+      dashboard (for example: hancho-cli --host buildbox list).
+
+)" R"(TASK QUEUE:
+  run --file <jobs.json> [--taskqueue <name>] [--exit-on-drain] [--report <junit.xml>]
+      CI one-shot: register the queue, wait until no job is pending or running, write a
+      JUnit report, then exit 0 (all succeeded), 1 (failure/blocked) or 2 (cancelled/
+      interrupted). --report implies waiting.
+
   taskqueue add --file <jobs.json> [--taskqueue <name>] [--concurrency <n>] [--notify-file <path>]
                 [--origin-label <text>]
       Register jobs (array, or an object with "jobs"/"taskqueue"/"concurrency").
@@ -621,8 +2298,10 @@ TASK QUEUE:
       or PC_ORIGIN_SESSION), working folder and pid, plus --origin-label (or
       PC_ORIGIN_LABEL). The dashboard shows it in the Origin column.
       Each job needs id, command, summary, timeoutSec; dependsOn replaces '&&'.
-      Optional: cwd, env, dependsOn, idle, maxAttempts, retryDelaySec, success,
+      Optional: cwd, host, env, dependsOn, idle, maxAttempts, retryDelaySec, success,
       killExclude, resources {write,read}, defer, priority, instructionsFile/instructionsText.
+      host runs the job on that registered remote host; logs, events and the done
+      file are mirrored into the local task queue entries.
       resources: jobs whose write/read sets overlap (write/write, write/read) never
       run together, across all queues; read/read may. Paths/globs resolve against
       cwd; a bare file name (Foo.cs) means **/Foo.cs; "@name" is a named lock.
@@ -639,6 +2318,10 @@ TASK QUEUE:
       --origin self keeps only the jobs this session added.
 
   taskqueue get <id> [--rev <n>] [--no-instructions]
+  taskqueue why <id>
+      Why the last attempt failed: failure class, confidence, summary, suggested
+      action, what the agent was doing just before it stopped, and evidence
+      (event seq / log line). Also lists the class of every earlier attempt.
   taskqueue retry <id>
   taskqueue retry --failed [<name>] [--since <period>]
       Retry every failed job at once, optionally only one queue and only jobs
@@ -740,6 +2423,10 @@ SETUP FOR LLM AGENTS:
 "      - Verify success with exit code + filesNewer/outputRegex; observe with\n"
 "        taskqueue_wait / taskqueue_list / taskqueue_graph and logs; retry with\n"
 "        taskqueue_retry. Blocked dependents resume automatically.\n"
+"      - A failed job carries a diagnosis (failure class, summary, lastActivity,\n"
+"        evidence, suggestedAction) in taskqueue_get / taskqueue_wait; use\n"
+"        `hancho-cli taskqueue why <id>` for the same view before choosing the\n"
+"        next step.\n"
 "      - Never poll .done files; use taskqueue_wait or wait_process.\n"
 "      - Delegating to a worker LLM: run_worker blocks until the worker exits and\n"
 "        returns only its final result; the raw stream stays in stream_file.\n"
@@ -812,8 +2499,9 @@ void PrintCliUsageJson() {
     "lifecycle": "start returns immediately unless --wait; use wait --id or the .done file to detect completion."
   },
   "cli_exit_codes": {
-    "0": "success / completed",
-    "1": "CLI or configuration error; also a process failure without --wait",
+    "0": "success / completed; run --exit-on-drain: every job succeeded",
+    "1": "CLI or configuration error; also a process failure without --wait; run --exit-on-drain: a job failed or was blocked",
+    "2": "run --exit-on-drain only: a job was cancelled or the run was interrupted",
     "124": "wait timed out while the process is still running",
     "child_exit_code": "start --wait / wait return the managed process exit code"
   },
@@ -827,6 +2515,7 @@ void PrintCliUsageJson() {
     "hancho-cli.exe logs --id 1 --tail 80",
     "hancho-cli.exe send --id 1 --input \"status\"",
     "hancho-cli.exe taskqueue add --file jobs.json --taskqueue main",
+    "hancho-cli.exe run --file queue.json --exit-on-drain --report junit.xml",
     "hancho-cli.exe mcp install --client opencode"
   ],
   "commands": [
@@ -854,7 +2543,7 @@ void PrintCliUsageJson() {
     {
       "name": "start",
       "aliases": ["run"],
-      "description": "Start a managed process under a Win32 Job Object and display it in the dashboard. Use '--' to pass the command line verbatim. Add --wait (with --wait-ms 0) to block until completion.",
+      "description": "Start a managed process under a Win32 Job Object and display it in the dashboard. Use '--' to pass the command line verbatim. Add --wait (with --wait-ms 0) to block until completion. With --file, 'run' instead registers a task queue, waits until it drains and writes an optional JUnit report (see run: hancho-cli run --file <queue.json> --exit-on-drain --report <junit.xml>).",
       "usage": "hancho-cli start [options] [--wait] [--wait-ms <ms>] -- <command...>",
       "options": [
         {"name": "--cmd", "value": "<command>", "description": "Command line to execute."},
@@ -875,7 +2564,7 @@ void PrintCliUsageJson() {
         {"name": "--wait-ms", "value": "<ms>", "description": "With --wait: maximum wait (0 = unlimited). Without --wait: initial output wait. Default: 500."}
       ]
     },
-    {
+)" R"(    {
       "name": "send",
       "aliases": ["write"],
       "description": "Send text input to a running process's stdin or ConPTY session.",
@@ -917,6 +2606,15 @@ void PrintCliUsageJson() {
       "options": []
     },
     {
+      "name": "top",
+      "description": "Terminal view of the headless core (queue and process list).",
+      "usage": "hancho-cli top [--once] [--interval <ms>]",
+      "options": [
+        {"name": "--once", "description": "Print one snapshot and exit."},
+        {"name": "--interval", "value": "<ms>", "description": "Refresh interval in milliseconds (default: 1000)."}
+      ]
+    },
+    {
       "name": "mcp install",
       "description": "Register Hancho as an MCP server by writing or updating a client config file (.mcp.json for Claude Code, opencode.json for opencode).",
       "usage": "hancho-cli mcp install [--client claude|opencode] [--path <file>] [--name <name>] [--data-dir <path>] [--dry-run] [--json]",
@@ -929,13 +2627,45 @@ void PrintCliUsageJson() {
       ]
     },
     {
+      "name": "mcp uninstall",
+      "description": "Remove Hancho from an MCP client config file (the inverse of mcp install). The data directory is kept unless --delete-data-dir is given.",
+      "usage": "hancho-cli mcp uninstall [--client claude|opencode] [--path <file>] [--name <name>] [--data-dir <path>] [--delete-data-dir] [--dry-run] [--json]",
+      "options": [
+        {"name": "--client", "value": "<claude|opencode>", "description": "Target client. Default: claude."},
+        {"name": "--path", "value": "<file>", "description": "Config file to edit. Default: .mcp.json (claude) or opencode.json (opencode)."},
+        {"name": "--name", "value": "<name>", "description": "MCP server name. Default: hancho."},
+        {"name": "--data-dir", "value": "<path>", "description": "Data directory to delete with --delete-data-dir when the config does not embed one."},
+        {"name": "--delete-data-dir", "description": "Also delete the data directory. Default: keep it."},
+        {"name": "--dry-run", "description": "Report the change without writing or deleting anything."}
+      ]
+    },
+    {
+      "name": "export",
+      "description": "Write Hancho data in open formats readable without Hancho: task queues as dependency-ordered scripts, CI workflow skeletons, or JSON/JSONL; behavior trees as Markdown runbooks; and L3 project knowledge as Markdown ready to paste into CLAUDE.md.",
+      "usage": "hancho-cli export [queues|bt|knowledge|all|list] [--out <path>] [--format <fmt>] [--taskqueue <name>] [--bt <id>] [--json]",
+      "options": [
+        {"name": "--out", "alias": "-o", "value": "<path>", "description": "Output file for a single item, or directory for multiple items / all. Without --out a single item prints to stdout."},
+        {"name": "--format", "value": "<fmt>", "description": "queues: powershell (default), bash, github-actions, jsonl, json; bt: markdown (default), json; knowledge: markdown (default), jsonl."},
+        {"name": "--taskqueue", "value": "<name>", "description": "Task queue to export (same as the positional name)."},
+        {"name": "--bt", "value": "<id>", "description": "Behavior tree to export (same as the positional id)."}
+      ],
+      "subcommands": [
+        {"name": "queues", "usage": "hancho-cli export queues [<name>] [--format <fmt>] [--out <path>]", "description": "Task queue in dependency order as a PowerShell/bash script, a GitHub Actions skeleton, JSONL, or JSON."},
+        {"name": "bt", "usage": "hancho-cli export bt [<id>] [--format markdown|json] [--out <path>]", "description": "Behavior tree as a Markdown runbook (or its open JSON definition)."},
+        {"name": "knowledge", "usage": "hancho-cli export knowledge [--format markdown|jsonl] [--out <path>]", "description": "L3 approved project knowledge as Markdown or JSONL."},
+        {"name": "all", "usage": "hancho-cli export all [--out <dir>]", "description": "Export every queue, behavior tree and L3 record into separate subdirectories. Default target: ./export."},
+        {"name": "list", "usage": "hancho-cli export list [--json]", "description": "List the task queues, behavior trees and L3 record count available in the data directory."}
+      ]
+    },
+    {
       "name": "taskqueue",
       "description": "Manage the persistent task queue: ordered jobs, dependencies, per-job timeouts, success checks and automatic retries.",
-      "usage": "hancho-cli taskqueue <add|list|get|retry|cancel|pause|resume|graph|wait|purge> ...",
+      "usage": "hancho-cli taskqueue <add|list|get|why|retry|cancel|pause|resume|graph|wait|purge> ...",
       "subcommands": [
         {"name": "add", "usage": "hancho-cli taskqueue add --file <jobs.json> [--taskqueue <name>] [--concurrency <n>] [--notify-file <path>] [--origin-label <text>]", "description": "Register jobs. Each job needs id, command, summary and timeoutSec; dependsOn replaces shell chaining. The caller's session id, working folder and --origin-label are recorded as the job's origin."},
         {"name": "list", "usage": "hancho-cli taskqueue list [<name>] [--state <state>] [--since <period>] [--origin <self|label|session>] [--bt <id>]", "description": "List jobs with state, queue, summary and blockedBy. --since keeps only jobs updated within the period (e.g. 30m, 6h, 2d). --origin self keeps only the jobs this session added. --bt <id> lists every job of a behavior tree across its parallel branch queues."},
         {"name": "get", "usage": "hancho-cli taskqueue get <id> [--rev <n>] [--no-instructions]", "description": "Show one job with attempts and instructions."},
+        {"name": "why", "usage": "hancho-cli taskqueue why <id>", "description": "Explain why the last attempt failed: failure class, confidence, summary, suggested action, last activity and evidence (event seq / log line), plus the class of every attempt. Reads the job without instructions."},
         {"name": "retry", "usage": "hancho-cli taskqueue retry <id> | hancho-cli taskqueue retry --failed [<name>] [--since <period>]", "description": "Requeue a failed/blocked/cancelled job; blocked dependents resume automatically. --failed retries every failed job instead, optionally limited to one queue and to jobs that failed within --since (e.g. --since 6h = last 6 hours)."},
         {"name": "cancel", "usage": "hancho-cli taskqueue cancel <id>", "description": "Cancel a job; a running attempt is killed and is not retried."},
         {"name": "pause", "usage": "hancho-cli taskqueue pause <name>", "description": "Stop starting new jobs in the queue; running jobs continue."},
@@ -952,7 +2682,7 @@ void PrintCliUsageJson() {
       "usage": "hancho-cli bt <validate|start|get|list|wait|resume|retry|update|cancel|pause> ...",
       "subcommands": [
         {"name": "validate", "usage": "hancho-cli bt validate --file <bt.json> | --bt <json>", "description": "Check a tree without running it."},
-        {"name": "start", "usage": "hancho-cli bt start --file <bt.json> | --bt <json>", "description": "Register and start a tree."},
+        {"name": "start", "usage": "hancho-cli bt start --file <bt.json> | --bt <json> [--paused true|false]", "description": "Register and start a tree. --paused true registers it paused without creating any jobs."},
         {"name": "wait", "usage": "hancho-cli bt wait --id <id> [--since-version <n>] [--timeout-ms <ms>]", "description": "Long-poll until the tree finishes or waits for a decision (state waitingForLlm, with the decision packet)."},
         {"name": "resume", "usage": "hancho-cli bt resume --id <id> --node <node> --answer <answer> --rationale <text> [--vars <json>]", "description": "Answer an escalate node; rationale is required."},
         {"name": "get", "usage": "hancho-cli bt get --id <id> [--compact]", "description": "Node states, runs, variables and jobs; --compact prints one line per node."},
@@ -992,23 +2722,53 @@ void PrintCliUsageJson() {
     {
       "name": "worker",
       "description": "Inspect and supervise LLM workers (Claude, agy, opencode, codex, aider, ollama) running under Hancho. JSON stream events are parsed into <log>.stream.jsonl, and normalized hancho.event/1 events into <log>.events.jsonl, both visible in the GUI (LLM JSON Stream dialog). Use hancho-cli/Hancho to supervise and watch streams.",
-      "usage": "hancho-cli worker <status|stream|info|install-template> [<id>] [options]",
+      "usage": "hancho-cli worker <status|stream|info|install-template|uninstall-template> [<id>] [options]",
       "subcommands": [
         {"name": "status", "usage": "hancho-cli worker status <id>", "description": "Display current worker status, model, active tool, thoughts, message, supervisor context, and Claude sub-agents (subagents array)."},
-        {"name": "stream", "usage": "hancho-cli worker stream <id> [--tail <n>] [--type <type>] [--since <seq>] [--summary] [--schema <legacy|v1>]", "description": "View captured JSON streaming events from <log>.stream.jsonl (parsed tool_call/tool_result/thinking/message, subagent_start/subagent_end with parent_tool_use_id and agent_id). --schema v1 returns the stable hancho.event/1 shape from <log>.events.jsonl."},
+        {"name": "stream", "usage": "hancho-cli worker stream <id> [--tail <n>] [--type <type>] [--since <seq>] [--summary] [--schema <legacy|v1>]", "description": "View captured JSON streaming events from <log>.stream.jsonl (parsed tool_call/tool_result/thinking/message, subagent_start/subagent_end with parent_tool_use_id and agent_id). --schema v1 (the default) returns the stable hancho.event/1 shape from <log>.events.jsonl; --schema legacy returns the deprecated internal type strings and is removed in v0.11.0."},
         {"name": "info", "usage": "hancho-cli worker info <id> [--notes <notes>] [--goal <goal>]", "description": "Update supervisor instructions, notes, or goals."},
-        {"name": "install-template", "usage": "hancho-cli worker install-template [--path <dir>] [--dry-run] [--json]", "description": "Write .claude/agents/hancho-runner.md (a Claude Code subagent that runs long commands through Hancho) under <dir>. Default: the current directory. An existing file is not overwritten."}
+        {"name": "install-template", "usage": "hancho-cli worker install-template [--path <dir>] [--dry-run] [--json]", "description": "Write .claude/agents/hancho-runner.md (a Claude Code subagent that runs long commands through Hancho) under <dir>. Default: the current directory. An existing file is not overwritten."},
+        {"name": "uninstall-template", "usage": "hancho-cli worker uninstall-template [--path <dir>] [--delete-data-dir] [--dry-run] [--json]", "description": "Remove .claude/agents/hancho-runner.md (the inverse of install-template); empty .claude/agents and .claude directories are removed too. Add --delete-data-dir to also delete the data directory."}
       ],
       "options": [
         {"name": "--tail", "value": "<n>", "description": "For stream: number of recent events."},
-        {"name": "--type", "value": "<type>", "description": "For stream: filter by event type (tool_call/tool_result/thinking/message/...)."},
+        {"name": "--type", "value": "<type>", "description": "For stream: filter by event type in the legacy shape, or by kind when schema is v1 (e.g. tool.call, message)."},
         {"name": "--since", "value": "<seq>", "description": "For stream: only events with seq > N."},
-        {"name": "--summary", "description": "For stream: show summary view."},
-        {"name": "--schema", "value": "<legacy|v1>", "description": "For stream: event shape. 'v1' returns hancho.event/1 from <log>.events.jsonl."},
-        {"name": "--path", "value": "<dir>", "description": "For install-template: project directory that receives .claude/agents/hancho-runner.md. Default: current directory."},
-        {"name": "--dry-run", "description": "For install-template: print the target without writing it."},
+        {"name": "--summary", "description": "For stream: show the text summary (uses the legacy shape)."},
+        {"name": "--schema", "value": "<legacy|v1>", "description": "For stream: event shape. 'v1' (default) returns hancho.event/1 from <log>.events.jsonl; 'legacy' returns the deprecated internal type strings and is removed in v0.11.0."},
+        {"name": "--path", "value": "<dir>", "description": "For install-template/uninstall-template: project directory that holds .claude/agents/hancho-runner.md. Default: current directory."},
+        {"name": "--dry-run", "description": "For install-template/uninstall-template: print the target without writing or deleting it."},
+        {"name": "--delete-data-dir", "description": "For uninstall-template: also delete the data directory (kept by default)."},
         {"name": "--notes", "value": "<text>", "description": "For info: supervisor notes."},
         {"name": "--goal", "value": "<text>", "description": "For info: supervisor goal."}
+      ]
+    },
+    {
+      "name": "memory",
+      "description": "Search, read, summarize and reindex Hancho's persistent memory. L1 run records live in memory/records/*.jsonl, L2 notes in memory/notes.jsonl and L3 approved knowledge in memory/knowledge.jsonl. memory/index/ is a derivative index that can be deleted and rebuilt.",
+      "usage": "hancho-cli memory <search|get|brief|stats|note|retract|approve|rebuild> [options]",
+      "subcommands": [
+        {"name": "search", "usage": "hancho-cli memory search [query] [--kind run,note,knowledge] [--scope <scope>] [--file <path>] [--job-name <name>] [--taskqueue <name>] [--engine <name>] [--model <name>] [--outcome <outcome>] [--failure-class <class>] [--since <period>] [--limit <n>]", "description": "BM25-like keyword search over all layers. Results include id, kind, one-line summary, score and the source file/line for memory get."},
+        {"name": "get", "usage": "hancho-cli memory get <id> [--kind <run|note|knowledge>]", "description": "Show one record in full with its source file and line."},
+        {"name": "brief", "usage": "hancho-cli memory brief [--job-name <name>] [--taskqueue <name>] [--file <path>]... [--scope <scope>]... [--budget-chars <n>] [--no-agent-notes]", "description": "Fixed-shape summary of previous runs, common failures, related notes and project knowledge for a job. Sections are trimmed from the bottom up to fit budgetChars (default 1500), keeping L3 knowledge to the end."},
+        {"name": "stats", "usage": "hancho-cli memory stats [--since <period>] [--job-name <name>] [--taskqueue <name>] [--engine <name>] [--model <name>] [--outcome <outcome>] [--compare-inject]", "description": "Compute success rate, duration median/p90, failure classes and token/cost totals from L1 records. --compare-inject also compares runs with and without injected memory: retry success rate, failure-class recurrence and added tokens/cost."},
+        {"name": "approve", "usage": "hancho-cli memory approve <note-id> [--by <name>]", "description": "Promote an L2 note to L3 project knowledge. Human only: this is intentionally not an MCP tool. Writes memory/knowledge.jsonl with approvedBy and approvedAt and retires the note."},
+        {"name": "note", "usage": "hancho-cli memory note --text <text> [--scope <scope>] [--tag <tag>]... [--source <id>]... [--supersedes <note-id>] [--expires-at <time>] [--author human|hancho]", "description": "Append an L2 note (create). scope is project, taskqueue:<name>, job:<name>, file:<path> or engine:<name>. Known secret shapes are redacted before writing and job env is never recorded. Agent notes are written through the memory_note MCP tool, which enforces sources, 5 per attempt and duplicate suppression."},
+        {"name": "retract", "usage": "hancho-cli memory retract <note-id> [--reason <text>] [--by <name>]", "description": "Append a retraction to memory/notes.jsonl. The original note and the retraction both remain; replay marks the note as retracted."},
+        {"name": "rebuild", "usage": "hancho-cli memory rebuild", "description": "Rebuild memory/index/index.json from the JSONL sources."}
+      ],
+      "options": [
+        {"name": "--limit", "value": "<n>", "description": "For search: maximum results (default 20, max 200)."},
+        {"name": "--budget-chars", "value": "<n>", "description": "For brief: maximum characters (default 1500)."},
+        {"name": "--by", "value": "<name>", "description": "For approve/retract: who performed the action (default cli:human)."},
+        {"name": "--scope", "value": "<scope>", "description": "For note: project, taskqueue:<name>, job:<name>, file:<path> or engine:<name> (default project)."},
+        {"name": "--tag", "value": "<tag>", "description": "For note: tag (repeatable, comma-separated)."},
+        {"name": "--source", "value": "<id>", "description": "For note: existing memory id this note comes from (repeatable, comma-separated)."},
+        {"name": "--supersedes", "value": "<note-id>", "description": "For note: the L2 note this one replaces."},
+        {"name": "--expires-at", "value": "<time>", "description": "For note: expiry timestamp; the note stops being active after it."},
+        {"name": "--author", "value": "<human|hancho>", "description": "For note: author type (agents write through MCP memory_note)."},
+        {"name": "--reason", "value": "<text>", "description": "For retract: why the note is being retracted."},
+        {"name": "--since", "value": "<period>", "description": "Only records newer than a duration (30m, 6h, 2d) or a date/timestamp."}
       ]
     },
     {
@@ -1059,6 +2819,12 @@ void PrintCliUsageJson() {
           "opencode": {"default_path": "opencode.json", "container": "mcp"}
         }
       },
+      "uninstall": {
+        "description": "Removes the MCP server entry (the inverse of mcp install). Keeps the data directory unless --delete-data-dir is given.",
+        "argv": ["hancho-cli.exe", "mcp", "uninstall"],
+        "command": "hancho-cli.exe mcp uninstall",
+        "keep_data_option": "--delete-data-dir"
+      },
       "config_example": {
         "mcpServers": {
           "hancho": {
@@ -1067,8 +2833,19 @@ void PrintCliUsageJson() {
           }
         }
       },
-      "tools": ["start_process", "list_processes", "get_process_output", "send_process_input", "wait_process", "kill_process", "run_worker", "wait_worker", "get_worker_stream", "get_worker_state", "update_worker_info", "taskqueue_add", "taskqueue_list", "taskqueue_get", "taskqueue_retry", "taskqueue_update", "taskqueue_cancel", "taskqueue_pause", "taskqueue_resume", "taskqueue_wait", "taskqueue_purge", "taskqueue_link", "taskqueue_unlink", "taskqueue_graph", "bt_validate", "bt_start", "bt_get", "bt_list", "bt_wait", "bt_resume", "bt_retry", "bt_update", "bt_cancel", "bt_pause"]
+      "tools": ["start_process", "list_processes", "get_process_output", "send_process_input", "wait_process", "kill_process", "run_worker", "wait_worker", "get_worker_stream", "get_worker_state", "update_worker_info", "taskqueue_add", "taskqueue_list", "taskqueue_get", "taskqueue_retry", "taskqueue_update", "taskqueue_cancel", "taskqueue_pause", "taskqueue_resume", "taskqueue_wait", "taskqueue_purge", "taskqueue_link", "taskqueue_unlink", "taskqueue_graph", "memory_search", "memory_get", "memory_brief", "memory_stats", "memory_note", "memory_retract", "bt_validate", "bt_start", "bt_get", "bt_list", "bt_wait", "bt_resume", "bt_retry", "bt_update", "bt_cancel", "bt_pause"]
     }
+  },
+  "leaving": {
+    "description": "How to stop using Hancho without losing work. All data stays in open JSON / JSONL files, readable without Hancho.",
+    "data_formats": "Task queues, behavior trees, stream events and semantic memory are JSON / JSONL under the data directory; nothing is stored in a proprietary database.",
+    "keep_or_delete_data": "The data directory is kept by default. Add --delete-data-dir to mcp uninstall or agent uninstall-template to delete it, or delete the folder yourself.",
+    "steps": [
+      "hancho-cli.exe mcp uninstall",
+      "hancho-cli.exe agent uninstall-template",
+      "hancho-cli.exe mcp uninstall --delete-data-dir   (only if you also want the data gone)."
+    ],
+    "graduation_criteria": "Before leaving, compare your harness with doc/design-v3.md sections 5.3-5.5 (feature map, replacement conditions, review process). doc/release-checklist.md records the per-release review of that table."
   },
   "agent": {
     "purpose": "Reliable execution of CLI workers and build jobs: one OS command per job with timeouts, tree kill, logs, completion markers, and a persistent dependency-aware task queue.",
@@ -1077,7 +2854,7 @@ void PrintCliUsageJson() {
       "hancho-cli_start_example": "hancho-cli start --name opencode --cmd \"opencode run ...\" --json-stream --agent-type opencode --wait --wait-ms 0 --json",
       "notes": [
         "Hancho auto-detects common worker CLIs (claude, agy/antigravity, opencode, codex, aider, ollama) and enables JSON stream parsing if detected.",
-        "Parsed events are written to <logfile>.stream.jsonl, and their normalized hancho.event/1 form to <logfile>.events.jsonl. Use GUI context menu 'LLM JSON Stream Events...' or 'hancho-cli worker stream <id>' (add --schema v1 for the normalized shape).",
+        "Parsed events are written to <logfile>.stream.jsonl, and their normalized hancho.event/1 form to <logfile>.events.jsonl. Use GUI context menu 'LLM JSON Stream Events...' or 'hancho-cli worker stream <id>'. v1 is the default shape; --schema legacy returns the deprecated internal type strings and is removed in v0.11.0.",
         "Model is captured from stream fields (model/modelId/llm.model/metadata.model) when present; hover the agent icon in the stream dialog to see it.",
         "Format reference: doc/LLM-jsonstream-format.md"
       ]
@@ -1437,8 +3214,153 @@ int CompletionExitCode(const std::string& procJson) {
     return static_cast<int>(ec);
 }
 
+// `taskqueue why <id>`: the last attempt's diagnosis plus the class of every attempt
+// (doc/design-v3.md 4.6). Reads the job with taskqueue_get, so no IPC action is added.
+int PrintTaskQueueWhy(const std::string& respJson, bool jsonOutput, const std::string& requestedJobId) {
+    nlohmann::json root = nlohmann::json::parse(respJson, nullptr, false);
+    if (root.is_discarded() || !root.is_object()) {
+        if (jsonOutput) std::cout << "{\"ok\":false,\"error\":\"invalid response\"}\n";
+        else std::cerr << "Error: invalid response from the dashboard.\n";
+        return 1;
+    }
+    if (!root.value("ok", false)) {
+        std::string error = root.value("error", std::string("Unknown error."));
+        if (jsonOutput) std::cout << "{\"ok\":false,\"error\":\"" << JsonEscape(error) << "\"}\n";
+        else std::cerr << "Error: " << error << "\n";
+        return 1;
+    }
+
+    nlohmann::json job = root.contains("job") && root["job"].is_object() ? root["job"] : nlohmann::json::object();
+    std::string jobId = job.value("id", requestedJobId);
+    std::string state = job.value("state", std::string());
+    std::string name = job.value("name", std::string());
+    std::string queue = job.value("taskqueue", std::string());
+
+    nlohmann::json lastFailure;
+    nlohmann::json history = nlohmann::json::array();
+    if (job.contains("attempts") && job["attempts"].is_array()) {
+        for (size_t i = 0; i < job["attempts"].size(); ++i) {
+            const nlohmann::json& a = job["attempts"][i];
+            if (!a.is_object()) continue;
+            auto f = a.find("failure");
+            if (f == a.end() || !f->is_object() || f->empty()) continue;
+            nlohmann::json entry = nlohmann::json::object();
+            entry["attempt"] = a.value("n", static_cast<int>(i) + 1);
+            entry["class"] = f->value("class", std::string());
+            entry["suggestedAction"] = f->value("suggestedAction", std::string());
+            entry["summary"] = f->value("summary", std::string());
+            history.push_back(std::move(entry));
+            lastFailure = *f;
+        }
+    }
+
+    if (jsonOutput) {
+        nlohmann::json out = nlohmann::json::object();
+        out["ok"] = true;
+        out["job"] = jobId;
+        out["name"] = name;
+        out["taskqueue"] = queue;
+        out["state"] = state;
+        out["failure"] = lastFailure.is_object() ? lastFailure : nlohmann::json(nullptr);
+        out["history"] = history;
+        std::cout << out.dump(-1, ' ', false, nlohmann::json::error_handler_t::replace) << "\n";
+        return 0;
+    }
+
+    std::cout << "Job " << jobId;
+    if (!name.empty() && name != jobId) std::cout << " (" << name << ")";
+    std::cout << " [" << state << "]";
+    if (!queue.empty()) std::cout << " queue=" << queue;
+    std::cout << "\n";
+
+    if (!lastFailure.is_object()) {
+        std::cout << "No failure was recorded for this job.\n";
+        if (!history.empty()) {
+            std::cout << "Attempt classes:";
+            for (const auto& h : history) {
+                std::cout << " " << h.value("attempt", 0) << "=" << h.value("class", std::string());
+            }
+            std::cout << "\n";
+        }
+        return 0;
+    }
+
+    std::string failureClass = lastFailure.value("class", std::string());
+    std::string confidence = lastFailure.value("confidence", std::string());
+    std::string summary = lastFailure.value("summary", std::string());
+    std::string action = lastFailure.value("suggestedAction", std::string());
+    std::string retryAt = lastFailure.value("retryAt", std::string());
+
+    std::cout << "Why: " << failureClass;
+    if (!confidence.empty()) std::cout << " (" << confidence << ")";
+    std::cout << "\n";
+    if (!summary.empty()) std::cout << "  " << summary << "\n";
+    std::cout << "Next: " << action;
+    if (!retryAt.empty()) std::cout << " (retry at " << retryAt << ")";
+    std::cout << "\n";
+
+    auto llmGuess = lastFailure.find("llmGuess");
+    if (llmGuess != lastFailure.end() && llmGuess->is_object()) {
+        std::string guessClass = llmGuess->value("class", std::string());
+        std::string guessSummary = llmGuess->value("summary", std::string());
+        std::string guessAction = llmGuess->value("suggestedAction", std::string());
+        std::string rationale = llmGuess->value("rationale", std::string());
+        if (!guessClass.empty()) {
+            std::cout << "LLM guess (reference, confidence low): " << guessClass;
+            if (!guessSummary.empty()) std::cout << " - " << guessSummary;
+            std::cout << "\n";
+            if (!guessAction.empty()) std::cout << "  LLM next: " << guessAction << "\n";
+            if (!rationale.empty()) std::cout << "  Rationale: " << rationale << "\n";
+        }
+    }
+
+    auto activity = lastFailure.find("lastActivity");
+    if (activity != lastFailure.end() && activity->is_object()) {
+        std::string what = activity->value("activity", std::string());
+        std::string target = activity->value("target", std::string());
+        if (!what.empty() || !target.empty()) {
+            std::cout << "Last activity: " << what;
+            if (!target.empty()) std::cout << " " << target;
+            if (activity->contains("sinceSec") && (*activity)["sinceSec"].is_number()) {
+                std::cout << " (" << (*activity)["sinceSec"].get<int64_t>() << "s)";
+            }
+            std::cout << "\n";
+        }
+    }
+
+    auto evidence = lastFailure.find("evidence");
+    if (evidence != lastFailure.end() && evidence->is_array() && !evidence->empty()) {
+        std::cout << "Evidence:\n";
+        for (const auto& e : *evidence) {
+            if (!e.is_object()) continue;
+            if (e.contains("events") && e["events"].is_string()) {
+                std::cout << "  event " << e["events"].get<std::string>()
+                          << " seq " << e.value("seq", static_cast<uint64_t>(0)) << "\n";
+            } else if (e.contains("log") && e["log"].is_string()) {
+                std::cout << "  log   " << e["log"].get<std::string>()
+                          << " line " << e.value("line", 0) << "\n";
+            }
+        }
+    }
+
+    if (!history.empty()) {
+        std::cout << "Attempts:";
+        for (const auto& h : history) {
+            std::cout << " " << h.value("attempt", 0) << "=" << h.value("class", std::string());
+            std::string actionH = h.value("suggestedAction", std::string());
+            if (!actionH.empty()) std::cout << "/" << actionH;
+        }
+        std::cout << "\n";
+    }
+    return 0;
+}
+
 int PrintResponse(const std::string& action, const std::string& respJson, bool jsonOutput,
                   int requestedId = 0, bool waitForCompletion = false) {
+    if (action == "taskqueue_why") {
+        return PrintTaskQueueWhy(respJson, jsonOutput,
+                                 requestedId > 0 ? std::to_string(requestedId) : std::string());
+    }
     if (jsonOutput) {
         std::cout << respJson << "\n";
         bool ok = JsonGetBool(respJson, "ok", false);
@@ -1788,6 +3710,701 @@ static int RunProjectReset(const std::vector<std::string>& args, bool jsonOutput
     return 0;
 }
 
+// hancho-cli top: a small terminal view for headless cores (doc/design-v3.md 2.4).
+// It polls the same `list` request the GUI uses; no local state is kept.
+static int RunTopCommand(const std::vector<std::string>& args, bool jsonOutput) {
+    int intervalMs = 1000;
+    bool once = false;
+    for (size_t i = 2; i < args.size(); ++i) {
+        if (args[i] == "--once") once = true;
+        else if ((args[i] == "--interval" || args[i] == "--interval-ms") && i + 1 < args.size()) {
+            try { intervalMs = std::max(100, std::stoi(args[++i])); } catch (...) {}
+        } else if (!args[i].empty() && args[i][0] != '-') {
+            // Accept an ignored queue name so `top main` works like the other commands.
+        } else {
+            std::cerr << "Error: unknown option for top: " << args[i]
+                      << " (use: hancho-cli top [--once] [--interval <ms>])\n";
+            return 1;
+        }
+    }
+
+    while (true) {
+        std::string resp;
+        std::string err;
+        if (!SendIpcRequest("{\"action\":\"list\"}", resp, err, true)) {
+            std::cerr << "Error: " << err << "\n";
+            return 1;
+        }
+        if (jsonOutput) {
+            std::cout << resp << "\n";
+        } else {
+            nlohmann::json j = nlohmann::json::parse(resp, nullptr, false);
+            if (j.is_discarded() || !j.value("ok", false)) {
+                std::cerr << "Error: invalid response from core\n";
+                return 1;
+            }
+            std::cout << "\x1b[2J\x1b[H";
+            std::cout << "Hancho top  " << GetCurrentTimestampStr()
+                      << "  (Ctrl+C to quit)\n";
+            std::cout << "---- ----  ----------------  ----------  --------  ------------------------------\n";
+            std::cout << " ID  PID   STATE             ELAPSED     CPU       LAST LINE\n";
+            std::cout << "---- ----  ----------------  ----------  --------  ------------------------------\n";
+            if (j.contains("processes") && j["processes"].is_array()) {
+                for (const auto& p : j["processes"]) {
+                    std::string id = std::to_string(p.value("id", 0));
+                    std::string pid = std::to_string(p.value("pid", 0));
+                    std::string state = p.value("state", "");
+                    std::string elapsed = p.value("elapsed_str", p.value("uptime_str", ""));
+                    std::string cpu = p.value("cpu_time_str", "");
+                    std::string last = p.value("last_line", "");
+                    if (last.size() > 30) last = last.substr(last.size() - 30);
+                    std::cout << std::setw(4) << id << " " << std::setw(5) << pid << "  "
+                              << std::left << std::setw(16) << state.substr(0, 16) << "  "
+                              << std::setw(10) << elapsed.substr(0, 10) << "  "
+                              << std::setw(8) << cpu.substr(0, 8) << "  " << last << "\n";
+                }
+            }
+            std::cout.flush();
+        }
+        if (once) return 0;
+        SleepMs(static_cast<uint32_t>(intervalMs));
+    }
+}
+
+// hancho-cli memory stats --compare-inject: memory/records joined with task queue
+// attempts, so retry success and failure recurrence can be compared with and without
+// injected memory (doc/design-v3.md 3.12). Same aggregation as the GUI uses, kept local
+// because
+// hancho-cli does not link taskqueue.cpp and does not include its GUI headers.
+static std::string MemoryInjectCompareJsonCli(const std::string& jobName,
+                                              const std::string& taskqueue,
+                                              const std::string& since) {
+    using json = nlohmann::json;
+    namespace fs = std::filesystem;
+    try {
+        auto lower = [](std::string s) {
+            for (char& c : s) c = static_cast<char>(std::tolower(static_cast<unsigned char>(c)));
+            return s;
+        };
+        auto parseIso = [](const std::string& s) -> int64_t {
+            int y = 0, mo = 0, d = 0, h = 0, mi = 0, se = 0;
+            char sep = 0;
+            if (std::sscanf(s.c_str(), "%d-%d-%d%c%d:%d:%d", &y, &mo, &d, &sep, &h, &mi, &se) < 7) return 0;
+            if (sep != 'T' && sep != ' ') return 0;
+            std::tm tmv = {};
+            tmv.tm_year = y - 1900;
+            tmv.tm_mon = mo - 1;
+            tmv.tm_mday = d;
+            tmv.tm_hour = h;
+            tmv.tm_min = mi;
+            tmv.tm_sec = se;
+            return static_cast<int64_t>(_mkgmtime64(&tmv));
+        };
+        int64_t sinceEpoch = 0;
+        if (!since.empty()) {
+            int64_t secs = 0;
+            if (ParseDurationToSec(since, secs)) {
+                sinceEpoch = static_cast<int64_t>(std::time(nullptr)) - secs;
+            } else {
+                int y = 0, mo = 0, d = 0;
+                if (std::sscanf(since.c_str(), "%d-%d-%d", &y, &mo, &d) == 3) {
+                    std::tm tmv = {};
+                    tmv.tm_year = y - 1900;
+                    tmv.tm_mon = mo - 1;
+                    tmv.tm_mday = d;
+                    sinceEpoch = static_cast<int64_t>(_mkgmtime64(&tmv));
+                }
+            }
+        }
+
+        std::error_code ec;
+        std::map<std::string, bool> refByAttempt;
+        fs::path tqDir = fs::path(GetEffectiveDataDirectoryWide()) / L"taskqueues";
+        if (fs::is_directory(tqDir, ec)) {
+            for (const auto& ent : fs::directory_iterator(tqDir, ec)) {
+                if (ec) break;
+                if (!ent.is_regular_file(ec) || ent.path().extension() != L".json") continue;
+                json tq = json::parse(ReadFileUtf8Wide(ent.path().wstring()), nullptr, false);
+                if (tq.is_discarded() || !tq.is_object()) continue;
+                auto jobs = tq.find("jobs");
+                if (jobs == tq.end() || !jobs->is_array()) continue;
+                for (const auto& job : *jobs) {
+                    if (!job.is_object()) continue;
+                    std::string id = job.value("id", std::string());
+                    auto attempts = job.find("attempts");
+                    if (attempts == job.end() || !attempts->is_array()) continue;
+                    for (const auto& a : *attempts) {
+                        if (!a.is_object()) continue;
+                        auto refs = a.find("memory_refs");
+                        bool has = refs != a.end() && refs->is_array() && !refs->empty();
+                        refByAttempt[id + "|" + std::to_string(a.value("n", 0))] = has;
+                    }
+                }
+            }
+        }
+
+        struct Rec {
+            std::string jobId;
+            std::string failureClass;
+            int attempt = 0;
+            bool injected = false;
+            bool success = false;
+            int64_t tokens = 0;
+            double cost = 0.0;
+        };
+        std::vector<Rec> recs;
+        int64_t unmatched = 0;
+        fs::path recDir = fs::path(GetEffectiveDataDirectoryWide()) / L"memory" / L"records";
+        if (fs::is_directory(recDir, ec)) {
+            for (const auto& ent : fs::directory_iterator(recDir, ec)) {
+                if (ec) break;
+                if (!ent.is_regular_file(ec) || ent.path().extension() != L".jsonl") continue;
+                std::ifstream in(ent.path(), std::ios::binary);
+                std::string line;
+                while (std::getline(in, line)) {
+                    if (!line.empty() && line.back() == '\r') line.pop_back();
+                    if (line.empty()) continue;
+                    json j = json::parse(line, nullptr, false);
+                    if (j.is_discarded() || !j.is_object()) continue;
+                    if (!jobName.empty() && lower(j.value("jobName", std::string())) != lower(jobName)) continue;
+                    if (!taskqueue.empty() && lower(j.value("taskqueue", std::string())) != lower(taskqueue)) continue;
+
+                    Rec r;
+                    r.jobId = j.value("jobId", std::string());
+                    r.attempt = j.value("attempt", 0);
+                    int64_t epoch = parseIso(j.value("start", std::string()));
+                    if (sinceEpoch > 0 && epoch > 0 && epoch < sinceEpoch) continue;
+                    auto failure = j.find("failure");
+                    if (failure != j.end() && failure->is_object()) {
+                        r.failureClass = failure->value("class", std::string());
+                    }
+                    auto usage = j.find("usage");
+                    if (usage != j.end() && usage->is_object()) {
+                        r.tokens = usage->value("totalTokens", static_cast<int64_t>(0));
+                        r.cost = usage->value("costUsd", 0.0);
+                    }
+                    if (r.tokens == 0) r.tokens = j.value("totalTokens", static_cast<int64_t>(0));
+                    std::string outcome = lower(j.value("outcome", std::string()));
+                    bool hasExit = j.contains("exitCode") && j["exitCode"].is_number_integer();
+                    int64_t exitCode = hasExit ? j["exitCode"].get<int64_t>() : 0;
+                    r.success = outcome == "success" || outcome == "succeeded" || outcome == "completed" ||
+                                outcome == "ok" || outcome == "passed" ||
+                                (outcome.empty() && hasExit && exitCode == 0);
+                    auto ref = refByAttempt.find(r.jobId + "|" + std::to_string(r.attempt));
+                    if (ref == refByAttempt.end()) ++unmatched;
+                    else r.injected = ref->second;
+                    recs.push_back(r);
+                }
+            }
+        }
+        std::sort(recs.begin(), recs.end(), [](const Rec& a, const Rec& b) {
+            if (a.jobId != b.jobId) return a.jobId < b.jobId;
+            return a.attempt < b.attempt;
+        });
+
+        struct Bucket {
+            int64_t runs = 0, successes = 0, retries = 0, retrySuccesses = 0;
+            int64_t repeatOpps = 0, repeats = 0, tokens = 0;
+            double cost = 0.0;
+        };
+        Bucket injected, plain;
+        for (size_t i = 0; i < recs.size(); ++i) {
+            const Rec& r = recs[i];
+            Bucket& b = r.injected ? injected : plain;
+            ++b.runs;
+            if (r.success) ++b.successes;
+            b.tokens += r.tokens;
+            b.cost += r.cost;
+            if (r.attempt > 1) {
+                ++b.retries;
+                if (r.success) ++b.retrySuccesses;
+                if (i > 0 && recs[i - 1].jobId == r.jobId && recs[i - 1].attempt == r.attempt - 1 &&
+                    !recs[i - 1].failureClass.empty()) {
+                    ++b.repeatOpps;
+                    if (lower(recs[i - 1].failureClass) == lower(r.failureClass)) ++b.repeats;
+                }
+            }
+        }
+        auto bucketJson = [](const Bucket& b) {
+            json o;
+            o["runs"] = b.runs;
+            o["successes"] = b.successes;
+            o["successRate"] = b.runs > 0 ? std::round((static_cast<double>(b.successes) / b.runs) * 10000.0) / 10000.0 : 0.0;
+            o["retries"] = b.retries;
+            o["retrySuccesses"] = b.retrySuccesses;
+            o["retrySuccessRate"] = b.retries > 0 ? std::round((static_cast<double>(b.retrySuccesses) / b.retries) * 10000.0) / 10000.0 : 0.0;
+            o["failureRepeats"] = b.repeats;
+            o["failureRepeatOpportunities"] = b.repeatOpps;
+            o["failureRepeatRate"] = b.repeatOpps > 0 ? std::round((static_cast<double>(b.repeats) / b.repeatOpps) * 10000.0) / 10000.0 : 0.0;
+            o["totalTokens"] = b.tokens;
+            o["avgTokensPerRun"] = b.runs > 0 ? std::round((static_cast<double>(b.tokens) / b.runs) * 100.0) / 100.0 : 0.0;
+            o["costUsd"] = std::round(b.cost * 10000.0) / 10000.0;
+            o["avgCostPerRun"] = b.runs > 0 ? std::round((b.cost / b.runs) * 10000.0) / 10000.0 : 0.0;
+            return o;
+        };
+        json inj = bucketJson(injected);
+        json plainJson = bucketJson(plain);
+        double tokenDelta = 0.0, costDelta = 0.0, successDelta = 0.0, repeatDelta = 0.0;
+        if (injected.runs > 0 && plain.runs > 0) {
+            tokenDelta = inj.value("avgTokensPerRun", 0.0) - plainJson.value("avgTokensPerRun", 0.0);
+            costDelta = inj.value("avgCostPerRun", 0.0) - plainJson.value("avgCostPerRun", 0.0);
+            successDelta = inj.value("successRate", 0.0) - plainJson.value("successRate", 0.0);
+            repeatDelta = inj.value("failureRepeatRate", 0.0) - plainJson.value("failureRepeatRate", 0.0);
+        }
+        json out;
+        out["ok"] = true;
+        out["compareInject"] = true;
+        out["jobName"] = jobName;
+        out["taskqueue"] = taskqueue;
+        out["since"] = since;
+        out["injected"] = inj;
+        out["notInjected"] = plainJson;
+        out["tokenDeltaPerRun"] = std::round(tokenDelta * 100.0) / 100.0;
+        out["costDeltaPerRun"] = std::round(costDelta * 10000.0) / 10000.0;
+        out["successRateDelta"] = std::round(successDelta * 10000.0) / 10000.0;
+        out["failureRepeatRateDelta"] = std::round(repeatDelta * 10000.0) / 10000.0;
+        out["runsWithoutAttemptMatch"] = unmatched;
+        out["insufficientData"] = injected.runs == 0 || plain.runs == 0;
+        out["injectionDefault"] = "off";
+        return out.dump();
+    } catch (const std::exception& e) {
+        json out;
+        out["ok"] = false;
+        out["error"] = std::string("memory compare failed: ") + e.what();
+        return out.dump();
+    }
+}
+
+static int RunMemoryCompareInject(const std::vector<std::string>& args, bool jsonOutput) {
+    std::string jobName;
+    std::string taskqueue;
+    std::string since;
+    for (size_t i = 3; i < args.size(); ++i) {
+        const std::string& a = args[i];
+        if ((a == "--job-name" || a == "--jobName" || a == "--job") && i + 1 < args.size()) {
+            jobName = args[++i];
+        } else if ((a == "--taskqueue" || a == "--queue") && i + 1 < args.size()) {
+            taskqueue = args[++i];
+        } else if (a == "--since" && i + 1 < args.size()) {
+            since = args[++i];
+        } else if (a == "--compare-inject" || a == "--compareInject") {
+            continue;
+        } else if (a == "--json" || a == "-j") {
+            continue;
+        } else {
+            std::cerr << "Error: unknown option for memory stats --compare-inject: " << a << "\n";
+            return 1;
+        }
+    }
+
+    std::string response = MemoryInjectCompareJsonCli(jobName, taskqueue, since);
+    if (jsonOutput) {
+        std::cout << response << "\n";
+        return 0;
+    }
+
+    nlohmann::json j = nlohmann::json::parse(response, nullptr, false);
+    if (j.is_discarded() || !j.is_object() || !j.value("ok", false)) {
+        std::cerr << "Error: " << (j.is_object() ? j.value("error", std::string("invalid response"))
+                                                 : std::string("invalid response"))
+                  << "\n";
+        return 1;
+    }
+    auto bucket = [](const nlohmann::json& b, const char* label) {
+        double rate = b.value("successRate", 0.0) * 100.0;
+        double retryRate = b.value("retrySuccessRate", 0.0) * 100.0;
+        double repeatRate = b.value("failureRepeatRate", 0.0) * 100.0;
+        char line[512] = {};
+        std::snprintf(line, sizeof(line),
+                      "%-13s runs %lld  success %.1f%%  retries %lld (%.1f%% succeed)  "
+                      "repeat failures %.1f%%  tokens/run %.0f  $/run %.4f\n",
+                      label,
+                      static_cast<long long>(b.value("runs", 0LL)),
+                      rate,
+                      static_cast<long long>(b.value("retries", 0LL)),
+                      retryRate,
+                      repeatRate,
+                      b.value("avgTokensPerRun", 0.0),
+                      b.value("avgCostPerRun", 0.0));
+        std::cout << line;
+    };
+    std::cout << "Memory injection effect";
+    if (!jobName.empty()) std::cout << "  job=" << jobName;
+    if (!taskqueue.empty()) std::cout << "  queue=" << taskqueue;
+    if (!since.empty()) std::cout << "  since=" << since;
+    std::cout << "\n";
+    bucket(j["injected"], "with memory");
+    bucket(j["notInjected"], "without");
+    char delta[256] = {};
+    std::snprintf(delta, sizeof(delta),
+                  "Delta per run: tokens %+.0f  cost $%+.4f  success %+.1f%%  repeat failures %+.1f%%\n",
+                  j.value("tokenDeltaPerRun", 0.0),
+                  j.value("costDeltaPerRun", 0.0),
+                  j.value("successRateDelta", 0.0) * 100.0,
+                  j.value("failureRepeatRateDelta", 0.0) * 100.0);
+    std::cout << delta;
+    if (j.value("insufficientData", false)) {
+        std::cout << "Not enough runs on both sides yet; injection stays off by default.\n";
+    }
+    long long unmatched = j.value("runsWithoutAttemptMatch", 0LL);
+    if (unmatched > 0) {
+        std::cout << unmatched << " run(s) had no matching task queue attempt and count as without memory.\n";
+    }
+    return 0;
+}
+
+static bool WriteTaskQueueRunReport(const std::string& reportPath, const std::string& taskqueue,
+                                    const std::vector<TaskQueueRunJob>& results) {
+    const std::filesystem::path path(Utf8ToWide(ResolveAbsolutePathUtf8(reportPath)));
+    std::error_code ec;
+    if (!path.parent_path().empty()) std::filesystem::create_directories(path.parent_path(), ec);
+    if (ec) return false;
+    WriteFileAtomicWide(path.wstring(), TaskQueueRunJUnitXml(taskqueue, results));
+    return std::filesystem::exists(path, ec) && !ec;
+}
+
+// `hancho-cli run --file queue.json --exit-on-drain --report junit.xml`
+// CI one-shot (doc/design-v3.md 2.3): register the queue, wait until it drains, then
+// write a JUnit report and return 0 (all succeeded), 1 (failure) or 2 (cancelled/interrupted).
+static int RunTaskQueueFileCommand(const std::vector<std::string>& args, bool jsonOutput) {
+    using json = nlohmann::json;
+
+    std::string file;
+    std::string tqName;
+    std::string reportPath;
+    std::string notifyFile;
+    std::string originLabel;
+    int concurrency = 0;
+    bool exitOnDrain = false;
+
+    auto fail = [&](const std::string& message) {
+        if (jsonOutput) {
+            json out;
+            out["ok"] = false;
+            out["error"] = message;
+            std::cout << out.dump() << "\n";
+        } else {
+            std::cerr << "Error: " << message << "\n";
+        }
+        return 1;
+    };
+
+    for (size_t i = 2; i < args.size(); ++i) {
+        const std::string& a = args[i];
+        if (a == "--file" && i + 1 < args.size()) {
+            file = args[++i];
+        } else if ((a == "--taskqueue" || a == "--queue") && i + 1 < args.size()) {
+            tqName = args[++i];
+        } else if (a == "--report" && i + 1 < args.size()) {
+            reportPath = args[++i];
+        } else if (a == "--notify-file" && i + 1 < args.size()) {
+            notifyFile = args[++i];
+        } else if (a == "--origin-label" && i + 1 < args.size()) {
+            originLabel = args[++i];
+        } else if (a == "--concurrency" && i + 1 < args.size()) {
+            try { concurrency = std::stoi(args[++i]); } catch (...) { concurrency = 0; }
+        } else if (a == "--exit-on-drain") {
+            exitOnDrain = true;
+        } else if (!a.empty() && a[0] == '-') {
+            return fail("unknown run option: " + a);
+        }
+    }
+    if (file.empty()) return fail("run requires --file <queue.json>.");
+
+    const std::string content = ReadFileUtf8Wide(ResolveAbsolutePathWide(Utf8ToWide(file)));
+    if (content.empty()) return fail("cannot read queue file: " + file);
+
+    json doc = json::parse(content, nullptr, false);
+    if (doc.is_discarded()) return fail("invalid JSON in " + file);
+
+    auto jsonString = [](const json& object, const char* key, const std::string& def) {
+        auto it = object.find(key);
+        return (it != object.end() && it->is_string()) ? it->get<std::string>() : def;
+    };
+    auto jsonInt = [](const json& object, const char* key, int def) {
+        auto it = object.find(key);
+        return (it != object.end() && it->is_number_integer()) ? it->get<int>() : def;
+    };
+
+    json jobs = json::array();
+    if (doc.is_array()) {
+        jobs = doc;
+    } else if (doc.is_object()) {
+        if (doc.contains("jobs")) {
+            if (!doc["jobs"].is_array()) return fail("jobs must be an array in " + file);
+            jobs = doc["jobs"];
+        }
+        if (tqName.empty()) tqName = jsonString(doc, "taskqueue", "main");
+        if (concurrency == 0) concurrency = jsonInt(doc, "concurrency", 0);
+        if (notifyFile.empty()) notifyFile = jsonString(doc, "notify_file", "");
+    } else {
+        return fail("queue file must be an array or an object with jobs: " + file);
+    }
+    if (tqName.empty()) tqName = "main";
+
+    const bool waitForDrain = exitOnDrain || !reportPath.empty();
+
+    if (!jobs.empty()) {
+        json req;
+        req["action"] = "taskqueue_add";
+        req["taskqueue"] = tqName;
+        req["jobs"] = jobs;
+        req["concurrency"] = concurrency;
+        req["notify_file"] = notifyFile;
+        req["origin"] = json::parse(BuildCallerOriginJson("hancho-cli-cli", originLabel), nullptr, false);
+        std::string resp;
+        std::string err;
+        if (!SendIpcRequest(req.dump(), resp, err, true)) return fail(err);
+        json added = json::parse(resp, nullptr, false);
+        if (added.is_discarded() || !added.is_object() || !added.value("ok", false)) {
+            return fail(added.is_object() ? added.value("error", std::string("taskqueue_add failed"))
+                                          : std::string("invalid taskqueue_add response"));
+        }
+        if (added.contains("taskqueue") && added["taskqueue"].is_string()) {
+            tqName = added["taskqueue"].get<std::string>();
+        }
+    }
+
+    std::vector<TaskQueueRunJob> results;
+    if (!waitForDrain) {
+        if (jsonOutput) {
+            json out;
+            out["ok"] = true;
+            out["taskqueue"] = tqName;
+            out["added"] = jobs.size();
+            std::cout << out.dump() << "\n";
+        } else {
+            std::cout << "Added " << jobs.size() << " job(s) to queue '" << tqName << "'.\n";
+        }
+        return 0;
+    }
+
+    if (jobs.empty()) {
+        // An empty queue is a successful run, but do not silently ignore an existing
+        // queue with jobs that the caller asked to drain.
+        json req;
+        req["action"] = "taskqueue_list";
+        req["taskqueue"] = tqName;
+        std::string resp;
+        std::string err;
+        if (!SendIpcRequest(req.dump(), resp, err, true)) return fail(err);
+        json listed = json::parse(resp, nullptr, false);
+        if (listed.is_discarded() || !listed.is_object() || !listed.value("ok", false)) {
+            return fail(listed.is_object() ? listed.value("error", std::string("taskqueue_list failed"))
+                                           : std::string("invalid taskqueue_list response"));
+        }
+        if (!listed.contains("jobs") || !listed["jobs"].is_array() || listed["jobs"].empty()) {
+            int rc = TaskQueueRunExitCode(results);
+            if (!reportPath.empty() && !WriteTaskQueueRunReport(reportPath, tqName, results)) {
+                return fail("cannot write report: " + reportPath);
+            }
+            if (jsonOutput) {
+                json out;
+                out["ok"] = true;
+                out["taskqueue"] = tqName;
+                out["exitCode"] = rc;
+                out["tests"] = 0;
+                out["report"] = reportPath.empty() ? "" : ResolveAbsolutePathUtf8(reportPath);
+                std::cout << out.dump() << "\n";
+            } else {
+                std::cout << "Queue '" << tqName << "' is empty (0 jobs).\n";
+            }
+            return rc;
+        }
+    }
+
+    int sinceVersion = 0;
+    bool firstWait = true;
+    while (true) {
+        json req;
+        req["action"] = "taskqueue_wait";
+        req["taskqueue"] = tqName;
+        req["since_version"] = sinceVersion;
+        req["timeout_ms"] = firstWait ? 0 : 30000;
+        std::string resp;
+        std::string err;
+        if (!SendIpcRequest(req.dump(), resp, err, true)) {
+            // Losing the server mid-run means the run was interrupted.
+            if (jsonOutput) {
+                json out;
+                out["ok"] = false;
+                out["error"] = err;
+                out["exitCode"] = 2;
+                std::cout << out.dump() << "\n";
+            } else {
+                std::cerr << "Error: " << err << "\n";
+            }
+            return 2;
+        }
+        json waited = json::parse(resp, nullptr, false);
+        if (waited.is_discarded() || !waited.is_object() || !waited.value("ok", false)) {
+            return fail(waited.is_object() ? waited.value("error", std::string("taskqueue_wait failed"))
+                                           : std::string("invalid taskqueue_wait response"));
+        }
+        sinceVersion = waited.value("version", 0);
+        results.clear();
+        if (waited.contains("jobs") && waited["jobs"].is_array()) {
+            for (const auto& job : waited["jobs"]) results.push_back(TaskQueueRunJobFromJson(job));
+        }
+        if (TaskQueueRunDrained(results)) break;
+        firstWait = false;
+    }
+
+    const int exitCode = TaskQueueRunExitCode(results);
+    if (!reportPath.empty() && !WriteTaskQueueRunReport(reportPath, tqName, results)) {
+        return fail("cannot write report: " + reportPath);
+    }
+
+    size_t failures = 0;
+    size_t cancelled = 0;
+    for (const auto& job : results) {
+        if (job.Cancelled()) ++cancelled;
+        else if (job.Failed()) ++failures;
+    }
+    if (jsonOutput) {
+        json out;
+        out["ok"] = true;
+        out["taskqueue"] = tqName;
+        out["exitCode"] = exitCode;
+        out["tests"] = results.size();
+        out["failures"] = failures;
+        out["cancelled"] = cancelled;
+        out["report"] = reportPath.empty() ? "" : ResolveAbsolutePathUtf8(reportPath);
+        std::cout << out.dump() << "\n";
+    } else {
+        std::cout << "Queue '" << tqName << "' drained: " << results.size()
+                  << " job(s), " << failures << " failed, " << cancelled << " cancelled/interrupted.";
+        if (!reportPath.empty()) std::cout << " Report: " << ResolveAbsolutePathUtf8(reportPath);
+        std::cout << "\n";
+    }
+    return exitCode;
+}
+
+int RunHostsCommand(const std::vector<std::string>& args, bool jsonOutput) {
+    const std::string op = args.size() >= 3 ? args[2] : "list";
+    HostRegistry registry;
+    std::string err;
+    if (!registry.Load(err)) {
+        if (jsonOutput) std::cout << "{\"ok\":false,\"error\":\"" << JsonEscape(err) << "\"}\n";
+        else std::cerr << "Error: " << err << "\n";
+        return 1;
+    }
+
+    auto flagValue = [&args](const std::string& flag, const std::string& def) {
+        for (size_t i = 3; i + 1 < args.size(); ++i) {
+            if (args[i] == flag) return args[i + 1];
+        }
+        return def;
+    };
+
+    if (op == "list" || op == "status") {
+        if (jsonOutput) {
+            std::cout << registry.ToJson(true) << "\n";
+        } else {
+            std::cout << "Hosts: " << WideToUtf8(HostRegistry::FilePathWide()) << "\n";
+            auto hosts = registry.List();
+            if (hosts.empty()) std::cout << "  (none)\n";
+            for (const auto& host : hosts) {
+                std::cout << "  " << host.name << "  " << host.address
+                          << "  token=" << (ResolveHostToken(host).empty() ? "missing" : "present");
+                if (!host.enabled) std::cout << "  (disabled)";
+                std::cout << "\n";
+            }
+        }
+        return 0;
+    }
+
+    if (op == "add") {
+        RemoteHost host;
+        size_t positional = 0;
+        for (size_t i = 3; i < args.size(); ++i) {
+            if (!args[i].empty() && args[i][0] == '-') continue;
+            if (i > 3 && (args[i - 1] == "--token-env" || args[i - 1] == "--token-credential")) continue;
+            if (positional == 0) host.name = args[i];
+            else if (positional == 1) host.address = args[i];
+            ++positional;
+        }
+        host.tokenEnv = flagValue("--token-env", "");
+        host.tokenCredential = flagValue("--token-credential", "");
+        for (size_t i = 3; i < args.size(); ++i) {
+            if (args[i] == "--disabled") host.enabled = false;
+        }
+        if (host.name.empty() || host.address.empty()) {
+            if (jsonOutput) std::cout << "{\"ok\":false,\"error\":\"usage: hancho-cli hosts add <name> <address> [--token-env VAR] [--token-credential TARGET]\"}\n";
+            else std::cerr << "Usage: hancho-cli hosts add <name> <address> [--token-env VAR] [--token-credential TARGET]\n";
+            return 1;
+        }
+        if (!registry.Add(host, err)) {
+            if (jsonOutput) std::cout << "{\"ok\":false,\"error\":\"" << JsonEscape(err) << "\"}\n";
+            else std::cerr << "Error: " << err << "\n";
+            return 1;
+        }
+        if (jsonOutput) {
+            std::cout << "{\"ok\":true,\"host\":\"" << JsonEscape(host.name) << "\",\"address\":\""
+                      << JsonEscape(host.address) << "\"}\n";
+        } else {
+            std::cout << "Added host " << host.name << " (" << host.address << ").\n";
+            std::cout << "Set " << (host.tokenEnv.empty() ? DefaultHostTokenEnv(host.name) : host.tokenEnv)
+                      << " or store it in the credential manager, then run: hancho-cli hosts ping "
+                      << host.name << "\n";
+        }
+        return 0;
+    }
+
+    if (op == "remove" || op == "rm") {
+        std::string name;
+        for (size_t i = 3; i < args.size(); ++i) {
+            if (!args[i].empty() && args[i][0] != '-') { name = args[i]; break; }
+        }
+        if (name.empty() || !registry.Remove(name, err)) {
+            if (jsonOutput) std::cout << "{\"ok\":false,\"error\":\"" << JsonEscape(err.empty() ? "host name is required" : err) << "\"}\n";
+            else std::cerr << "Error: " << (err.empty() ? "host name is required" : err) << "\n";
+            return 1;
+        }
+        if (jsonOutput) std::cout << "{\"ok\":true,\"removed\":\"" << JsonEscape(name) << "\"}\n";
+        else std::cout << "Removed host " << name << ".\n";
+        return 0;
+    }
+
+    if (op == "ping" || op == "test") {
+        std::string name;
+        for (size_t i = 3; i < args.size(); ++i) {
+            if (!args[i].empty() && args[i][0] != '-') { name = args[i]; break; }
+        }
+        RemoteHost host;
+        if (name.empty() || !registry.Get(name, host)) {
+            std::string message = name.empty() ? "host name is required" : "host not registered: " + name;
+            if (jsonOutput) std::cout << "{\"ok\":false,\"error\":\"" << JsonEscape(message) << "\"}\n";
+            else std::cerr << "Error: " << message << "\n";
+            return 1;
+        }
+        uint64_t started = GetNowTickMs();
+        std::string response;
+        if (!remote::CallHost(host, "{\"action\":\"ping\"}", response, err)) {
+            if (jsonOutput) std::cout << "{\"ok\":false,\"host\":\"" << JsonEscape(name) << "\",\"error\":\"" << JsonEscape(err) << "\"}\n";
+            else std::cerr << "Error: " << err << "\n";
+            return 1;
+        }
+        uint64_t elapsed = GetNowTickMs() - started;
+        if (jsonOutput) {
+            nlohmann::json out;
+            out["ok"] = true;
+            out["host"] = name;
+            out["latency_ms"] = elapsed;
+            nlohmann::json reply = nlohmann::json::parse(response, nullptr, false);
+            out["response"] = reply.is_discarded() ? nlohmann::json(response) : reply;
+            std::cout << out.dump() << "\n";
+        } else {
+            std::cout << name << " responded in " << elapsed << " ms: " << response << "\n";
+        }
+        return 0;
+    }
+
+    if (jsonOutput) std::cout << "{\"ok\":false,\"error\":\"unknown hosts command: " << JsonEscape(op) << "\"}\n";
+    else std::cerr << "Unknown hosts command: " << op << " (list, add, remove, ping)\n";
+    return 1;
+}
+
 int RunCli(const std::vector<std::string>& rawArgs) {
     std::vector<std::string> args;
     args.push_back(rawArgs.empty() ? "hancho-cli" : rawArgs[0]);
@@ -1795,6 +4412,7 @@ int RunCli(const std::vector<std::string>& rawArgs) {
     bool jsonOutput = false;
     bool waitForCompletion = false;
     std::string dataDirArg;
+    std::string remoteHost;
     for (size_t i = 1; i < rawArgs.size(); ++i) {
         if (rawArgs[i] == "--json" || rawArgs[i] == "-j") {
             jsonOutput = true;
@@ -1802,6 +4420,10 @@ int RunCli(const std::vector<std::string>& rawArgs) {
             dataDirArg = rawArgs[++i];
         } else if (rawArgs[i].rfind("--data-dir=", 0) == 0) {
             dataDirArg = rawArgs[i].substr(11);
+        } else if (rawArgs[i] == "--host" && i + 1 < rawArgs.size()) {
+            remoteHost = rawArgs[++i];
+        } else if (rawArgs[i].rfind("--host=", 0) == 0) {
+            remoteHost = rawArgs[i].substr(7);
         } else {
             args.push_back(rawArgs[i]);
         }
@@ -1830,7 +4452,33 @@ int RunCli(const std::vector<std::string>& rawArgs) {
     std::ostringstream reqJson;
     int requestedId = 0;
 
+    if (subcmd == "export") return RunExportCommand(args, 2, jsonOutput);
     if (subcmd == "reset") return RunProjectReset(args, jsonOutput);
+    if (subcmd == "top") return RunTopCommand(args, jsonOutput);
+    if (subcmd == "hosts") return RunHostsCommand(args, jsonOutput);
+    if (subcmd == "memory") {
+        bool compareInject = false;
+        for (size_t i = 2; i < args.size(); ++i) {
+            if (args[i] == "--compare-inject" || args[i] == "--compareInject") compareInject = true;
+        }
+        if (compareInject && args.size() > 2 && args[2] == "stats") {
+            return RunMemoryCompareInject(args, jsonOutput);
+        }
+        return RunMemoryCli(args, jsonOutput);
+    }
+
+if (subcmd == "run") {
+        // `run` is also an alias for `start`; the CI form is recognised by --file,
+        // --exit-on-drain or --report (doc/design-v3.md 2.3).
+        bool queueRun = false;
+        for (size_t i = 2; i < args.size(); ++i) {
+            if (args[i] == "--file" || args[i] == "--exit-on-drain" || args[i] == "--report") {
+                queueRun = true;
+                break;
+            }
+        }
+        if (queueRun) return RunTaskQueueFileCommand(args, jsonOutput);
+    }
 
 if (subcmd == "start" || subcmd == "run") {
         std::string name;
@@ -2022,8 +4670,8 @@ if (subcmd == "start" || subcmd == "run") {
     }
     else if (subcmd == "mcp") {
         std::string op = (args.size() >= 3) ? args[2] : "";
-        if (op != "install") {
-            std::string msg = "usage: hancho-cli mcp install [--client claude|opencode] [--path <file>] [--name <name>] [--dry-run]";
+        if (op != "install" && op != "uninstall") {
+            std::string msg = "usage: hancho-cli mcp install|uninstall [--client claude|opencode] [--path <file>] [--name <name>] [--dry-run] [--delete-data-dir]";
             if (jsonOutput) std::cout << "{\"ok\":false,\"error\":\"" << JsonEscape(msg) << "\"}\n";
             else std::cerr << msg << "\n";
             return 1;
@@ -2032,17 +4680,67 @@ if (subcmd == "start" || subcmd == "run") {
         std::string installPath;
         std::string serverName = "hancho";
         bool dryRun = false;
+        bool deleteDataDir = false;
         for (size_t i = 3; i < args.size(); ++i) {
             if ((args[i] == "--client" || args[i] == "-c") && i + 1 < args.size()) client = args[++i];
             else if ((args[i] == "--path" || args[i] == "-p") && i + 1 < args.size()) installPath = args[++i];
             else if (args[i] == "--name" && i + 1 < args.size()) serverName = args[++i];
             else if (args[i] == "--dry-run") dryRun = true;
+            else if (args[i] == "--delete-data-dir") deleteDataDir = true;
         }
         if (client != "claude" && client != "opencode") {
             std::string msg = "unknown client '" + client + "' (expected claude or opencode)";
             if (jsonOutput) std::cout << "{\"ok\":false,\"error\":\"" << JsonEscape(msg) << "\"}\n";
             else std::cerr << "Error: " << msg << "\n";
             return 1;
+        }
+        if (op == "uninstall") {
+            McpUninstallOutcome outcome = UninstallMcpConfig(client, installPath, serverName, dryRun,
+                                                             deleteDataDir, dataDirArg);
+            if (!outcome.ok) {
+                if (jsonOutput) {
+                    std::cout << "{\"ok\":false,\"error\":\"" << JsonEscape(outcome.error) << "\"}\n";
+                } else {
+                    std::cerr << "Error: " << outcome.error << "\n";
+                }
+                return 1;
+            }
+            if (jsonOutput) {
+                std::cout << "{\"ok\":true"
+                          << ",\"client\":\"" << JsonEscape(client) << "\""
+                          << ",\"path\":\"" << JsonEscape(outcome.targetPath) << "\""
+                          << ",\"server\":\"" << JsonEscape(serverName) << "\""
+                          << ",\"changed\":" << (outcome.changed ? "true" : "false")
+                          << ",\"dry_run\":" << (outcome.dryRun ? "true" : "false")
+                          << ",\"delete_data_dir\":" << (outcome.dataDirRequested ? "true" : "false")
+                          << ",\"data_dir\":\"" << JsonEscape(outcome.dataDir) << "\""
+                          << ",\"data_dir_deleted\":" << (outcome.dataDirDeleted ? "true" : "false")
+                          << "}\n";
+            } else {
+                if (outcome.dryRun) {
+                    std::cout << "[dry-run] Would " << (outcome.changed ? "remove" : "keep (not registered)")
+                              << " MCP server '" << serverName << "' in " << outcome.targetPath << "\n";
+                } else if (outcome.changed) {
+                    std::cout << "Removed MCP server '" << serverName << "' from " << outcome.targetPath << "\n";
+                } else {
+                    std::cout << "MCP server '" << serverName << "' is not registered in " << outcome.targetPath << "\n";
+                }
+                if (outcome.dataDirRequested) {
+                    if (outcome.dryRun) {
+                        std::cout << "[dry-run] Would delete data directory " << outcome.dataDir << "\n";
+                    } else if (outcome.dataDirDeleted) {
+                        std::cout << "Deleted data directory " << outcome.dataDir << "\n";
+                    } else {
+                        std::cout << "Data directory not found (already gone): " << outcome.dataDir << "\n";
+                    }
+                } else {
+                    std::cout << "Data kept. Pass --delete-data-dir to remove it too.\n";
+                }
+                if (outcome.changed && !outcome.dryRun) {
+                    std::cout << "Restart your LLM client (or reload its MCP servers) to pick it up.\n";
+                }
+            }
+            return 0;
         }
         McpInstallOutcome outcome = InstallMcpConfig(client, installPath, serverName, dryRun,
                                                      ResolveGuiExePathUtf8(), dataDirArg);
@@ -2179,6 +4877,12 @@ if (subcmd == "start" || subcmd == "run") {
                     << "\",\"include_instructions\":" << (includeInstr ? "true" : "false")
                     << ",\"rev\":" << rev << "}";
             subcmd = "taskqueue_get";
+        } else if (op == "why") {
+            std::string id = firstPositional(3);
+            if (id.empty()) return failWith("why requires a job id (e.g. hancho-cli taskqueue why build-1).");
+            reqJson << "{\"action\":\"taskqueue_get\",\"id\":\"" << JsonEscape(id)
+                    << "\",\"include_instructions\":false,\"rev\":0}";
+            subcmd = "taskqueue_why";
         } else if (op == "retry") {
             bool failedMode = false;
             for (size_t i = 3; i < args.size(); ++i) {
@@ -2262,7 +4966,7 @@ if (subcmd == "start" || subcmd == "run") {
             subcmd = "taskqueue_purge";
         } else {
             return failWith("unknown taskqueue command: " + op +
-                            " (add, list, get, retry, cancel, pause, resume, graph, wait, purge)");
+                            " (add, list, get, why, retry, cancel, pause, resume, graph, wait, purge)");
         }
     }
     else if (subcmd == "bt") {
@@ -2271,7 +4975,8 @@ if (subcmd == "start" || subcmd == "run") {
                 << "Usage: hancho-cli bt <subcommand> [options] [--json]\n\n"
                 << "Subcommands:\n"
                 << "  validate  --file <path> | --bt <json>              Validate a behavior tree JSON definition\n"
-                << "  start     --file <path> | --bt <json>              Register and start a behavior tree\n"
+                << "  start     --file <path> | --bt <json> [--paused true|false]\n"
+                << "                                                     Register and start (--paused true: register only)\n"
                 << "  get       --id <id> [--compact]                    Get behavior tree state and node status\n"
                 << "  tasks     --id <id>                                All of the tree's jobs across branch queues\n"
                 << "  list                                               List behavior trees\n"
@@ -2316,6 +5021,7 @@ if (subcmd == "start" || subcmd == "run") {
         bool resetCounters = false;
         bool compact = false;
         bool paused = true;
+        bool startPaused = false;
         uint64_t sinceVersion = 0;
         int timeoutMs = 60000;
 
@@ -2344,8 +5050,10 @@ if (subcmd == "start" || subcmd == "run") {
                 if (i + 1 < args.size() && args[i + 1][0] != '-') {
                     std::string pv = args[++i];
                     paused = (pv != "false" && pv != "0");
+                    startPaused = paused;
                 } else {
                     paused = true;
+                    startPaused = true;
                 }
             } else if ((a == "--since-version" || a == "--since") && i + 1 < args.size()) {
                 try { sinceVersion = static_cast<uint64_t>(std::stoull(args[++i])); } catch (...) {}
@@ -2368,7 +5076,7 @@ if (subcmd == "start" || subcmd == "run") {
             }
             if (!file.empty()) {
                 std::wstring absW = ResolveAbsolutePathWide(Utf8ToWide(file));
-                std::ifstream ifs(absW, std::ios::binary);
+                std::ifstream ifs(NativePath(absW), std::ios::binary);
                 if (!ifs) return false;
                 std::ostringstream ss;
                 ss << ifs.rdbuf();
@@ -2387,7 +5095,10 @@ if (subcmd == "start" || subcmd == "run") {
             }
             jReq["action"] = "bt_" + op;
             jReq["bt"] = text;
-            if (op == "start") jReq["origin"] = nlohmann::json::parse(BuildCallerOriginJson("hancho-cli-cli", ""), nullptr, false);
+            if (op == "start") {
+                jReq["paused"] = startPaused;
+                jReq["origin"] = nlohmann::json::parse(BuildCallerOriginJson("hancho-cli-cli", ""), nullptr, false);
+            }
             subcmd = "bt_" + op;
         } else if (op == "tasks") {
             if (id.empty()) return failWith("tasks requires --id <id>");
@@ -2476,12 +5187,14 @@ if (subcmd == "start" || subcmd == "run") {
         size_t startIdx = (args.size() >= 3 && args[2][0] != '-') ? 3 : 2;
         // Local file write only: no process ID and no IPC.
         if (op == "install-template") return RunAgentInstallTemplate(args, startIdx, jsonOutput);
+        if (op == "uninstall-template") return RunAgentUninstallTemplate(args, startIdx, jsonOutput);
         int id = 0;
         int tail = 50;
         std::string typeFilter;
         uint64_t sinceSeq = 0;
         std::string format = "json";
-        std::string schema;
+        std::string schema = "v1";
+        bool schemaSpecified = false;
         std::string notes;
         std::string goal;
 
@@ -2501,6 +5214,7 @@ if (subcmd == "start" || subcmd == "run") {
                 format = args[++i];
             } else if (a == "--schema" && i + 1 < args.size()) {
                 schema = args[++i];
+                schemaSpecified = true;
             } else if (a == "--notes" && i + 1 < args.size()) {
                 notes = args[++i];
             } else if (a == "--goal" && i + 1 < args.size()) {
@@ -2509,6 +5223,8 @@ if (subcmd == "start" || subcmd == "run") {
                 try { id = std::stoi(a); } catch (...) {}
             }
         }
+
+        if (format == "summary" && !schemaSpecified) schema = "legacy";
 
         if (id <= 0) {
             if (jsonOutput) {
@@ -2558,7 +5274,13 @@ if (subcmd == "start" || subcmd == "run") {
 
     std::string respJson;
     std::string err;
-    if (!SendIpcRequest(reqJson.str(), respJson, err, true)) {
+    bool sent = false;
+    if (!remoteHost.empty()) {
+        sent = remote::CallHost(remoteHost, reqJson.str(), respJson, err);
+    } else {
+        sent = SendIpcRequest(reqJson.str(), respJson, err, true);
+    }
+    if (!sent) {
         if (jsonOutput) {
             std::cout << BuildTransportError(err) << "\n";
         } else {

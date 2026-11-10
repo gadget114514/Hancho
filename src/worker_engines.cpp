@@ -1,4 +1,5 @@
 #include "worker_engines.h"
+#include "platform/platform.h"
 #include "nlohmann/json.hpp"
 
 #include <algorithm>
@@ -9,24 +10,7 @@ namespace pc {
 using nlohmann::json;
 
 std::string QuoteCommandArg(const std::string& s) {
-    std::string out = "\"";
-    size_t backslashes = 0;
-    for (char c : s) {
-        if (c == '\\') {
-            backslashes++;
-            out.push_back(c);
-        } else if (c == '"') {
-            out.append(backslashes + 1, '\\');
-            out.push_back('"');
-            backslashes = 0;
-        } else {
-            backslashes = 0;
-            out.push_back(c);
-        }
-    }
-    out.append(backslashes, '\\');
-    out.push_back('"');
-    return out;
+    return platform::QuoteCommandArg(s);
 }
 
 namespace {
@@ -60,13 +44,7 @@ std::string CollapseSpaces(const std::string& s) {
 }
 
 bool NeedsArgQuoting(const std::string& s) {
-    for (char c : s) {
-        if (std::isspace(static_cast<unsigned char>(c)) ||
-            c == '"' || c == '&' || c == '|' || c == '<' || c == '>' || c == '^' || c == '(' || c == ')') {
-            return true;
-        }
-    }
-    return false;
+    return platform::NeedsCommandArgQuoting(s);
 }
 
 bool IsValidModelCharacters(const std::string& model) {

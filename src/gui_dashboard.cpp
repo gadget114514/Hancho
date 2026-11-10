@@ -1,8 +1,10 @@
 #include "gui_dashboard.h"
 #include "common.h"
 #include "llm_stream.h"
+#include "event_schema.h"
 #include "activity_tree.h"
 #include "bt_debug_view.h"
+#include "memory_search.h"
 #include "TerminalView.h"
 #include "TerminalGridView.h"
 #include "SettingsManager.h"
@@ -815,7 +817,8 @@ enum ControlId {
     IDM_TRAY_GRID_VIEW = 4002,
     IDM_TRAY_HIDE = 4003,
     IDM_TRAY_EXIT = 4004,
-    IDM_TRAY_USAGE = 4005
+    IDM_TRAY_USAGE = 4005,
+    IDM_TRAY_MEMORY = 4006
 };
 
 enum class ShellType {
@@ -899,6 +902,7 @@ struct DashboardState {
     int lastTaskListLang = -1;
     std::vector<std::wstring> lastTaskRows;
     std::wstring lastKpiSignature;
+    std::wstring taskFailureSummary;  // "failed: exit_nonzero ×2" shown in the task list caption
     int lastUsagePanelProcId = -2;
     // JSON stream bottom pane below the process / task lists
     HWND hwndBtnStreamPane = nullptr;
@@ -1393,9 +1397,9 @@ static void UpdateKpiTooltips(DashboardState* st, uint32_t totalTreeProcs,
         L"Tareas en espera de dependencias o bloqueadas por fallo aguas arriba.");
 
     st->kpiTipText[13] = Tr(
-        L"未完了タスク（実行中・待機・保留のうち実行されうるもの）の残り時間の合計。実行中は残りタイムアウト、未起動はタイムアウト値で見積もります。ブロックされて実行されないタスクは含みません。",
-        L"Total remaining time across unfinished tasks that can still run (running, waiting, pending). Running tasks use the remaining timeout; not-yet-started tasks use their timeout. Blocked tasks that will never run are not included.",
-        L"Tiempo restante total de las tareas sin terminar que aún pueden ejecutarse (en ejecución, en espera, pendientes). Las tareas activas usan el tiempo límite restante; las no iniciadas usan su tiempo límite. Las tareas bloqueadas que nunca se ejecutarán no se incluyen.");
+        L"未完了タスク（実行中・待機・保留のうち実行されうるもの）の残り時間の合計。見積もり時間があればそれを使い、なければタイムアウト値で見積もります。ブロックされて実行されないタスクは含みません。",
+        L"Total remaining time across unfinished tasks that can still run (running, waiting, pending). Uses the job's estimate when present, otherwise its timeout. Blocked tasks that will never run are not included.",
+        L"Tiempo restante total de las tareas sin terminar que aún pueden ejecutarse (en ejecución, en espera, pendientes). Usa la estimación del trabajo si existe; si no, su tiempo límite. Las tareas bloqueadas que nunca se ejecutarán no se incluyen.");
     if (tqCounts.sumRemainingSec >= 0) {
         st->kpiTipText[13] += std::wstring(L"\n") + Tr(L"合計残り時間: ", L"Total remaining: ", L"Restante total: ") + FormatRemainingTime(tqCounts.sumRemainingSec);
     }
@@ -1741,7 +1745,11 @@ static void DrawDashboardCanvas(DashboardState* st, HDC hdcWindow) {
                         g_theme.accent, st->hFontUiBold);
     }
     if (st->rcTaskCaption.bottom > st->rcTaskCaption.top) {
-        DrawListCaption(hdc, st->rcTaskCaption, Tr(L"タスクキュー", L"TASK QUEUE", L"COLA DE TAREAS"),
+        std::wstring caption = Tr(L"タスクキュー", L"TASK QUEUE", L"COLA DE TAREAS");
+        if (!st->taskFailureSummary.empty()) {
+            caption += L"    " + st->taskFailureSummary;
+        }
+        DrawListCaption(hdc, st->rcTaskCaption, caption.c_str(),
                         IsDarkThemeActive() ? RGB(255, 190, 90) : RGB(200, 110, 0), st->hFontUiBold);
     }
 
@@ -2414,6 +2422,226 @@ static std::string LastAttemptField(const std::string& jobJson, const std::strin
     return JsonGetString(attempts.back(), key, "");
 }
 
+// The diagnostic attached to the last attempt (doc/design-v3.md 4.3). Empty when the
+// attempt succeeded or predates the classifier.
+static nlohmann::json LastFailureOfJob(const std::string& jobJson) {
+    auto attempts = SplitJsonObjectArray(jobJson, "attempts");
+    if (attempts.empty()) return nlohmann::json();
+    nlohmann::json attempt = nlohmann::json::parse(attempts.back(), nullptr, false);
+    if (!attempt.is_object()) return nlohmann::json();
+    auto failure = attempt.find("failure");
+    if (failure == attempt.end() || !failure->is_object() || failure->empty()) return nlohmann::json();
+    return *failure;
+}
+
+static std::string LastFailureClass(const std::string& jobJson) {
+    nlohmann::json failure = LastFailureOfJob(jobJson);
+    return failure.is_object() ? failure.value("class", std::string()) : std::string();
+}
+
+// "exit_nonzero ×2, timeout ×1" for the task list caption.
+static std::wstring FailureClassSummary(const std::map<std::string, int>& counts) {
+    if (counts.empty()) return L"";
+    std::wstringstream ss;
+    bool first = true;
+    for (const auto& kv : counts) {
+        if (!first) ss << L", ";
+        first = false;
+        ss << Utf8ToWide(kv.first) << L" \u00D7" << kv.second;
+    }
+    return ss.str();
+}
+
+// Failure classes across the jobs of one queue (the task list caption shows the same
+// breakdown for whatever is currently visible). Empty when the queue has no records.
+static std::wstring QueueFailureBreakdown(DashboardState* dash, const std::string& queue) {
+    if (!dash || !dash->tqm) return L"";
+    std::string err;
+    std::string resp = dash->tqm->TaskQueueList(queue, "failed", 0, err);
+    nlohmann::json root = nlohmann::json::parse(resp, nullptr, false);
+    if (root.is_discarded() || !root.is_object()) return L"";
+    auto jobs = root.find("jobs");
+    if (jobs == root.end() || !jobs->is_array()) return L"";
+    std::map<std::string, int> counts;
+    for (const auto& job : *jobs) {
+        if (!job.is_object()) continue;
+        auto attempts = job.find("attempts");
+        if (attempts == job.end() || !attempts->is_array() || attempts->empty()) continue;
+        const nlohmann::json& last = attempts->back();
+        if (!last.is_object()) continue;
+        auto failure = last.find("failure");
+        if (failure == last.end() || !failure->is_object()) continue;
+        std::string cls = failure->value("class", std::string());
+        if (!cls.empty()) ++counts[cls];
+    }
+    std::wstring summary = FailureClassSummary(counts);
+    if (summary.empty()) return L"";
+    return Tr(L"キュー全体の失敗分類: ", L"Failure classes in this queue: ",
+              L"Clases de fallo en esta cola: ") + summary;
+}
+
+
+// The human answer to "why did it fail", used by the task and process detail windows.
+static std::wstring WhyFailureText(const nlohmann::json& failure) {
+    if (!failure.is_object() || failure.empty()) {
+        return Tr(L"この試行の診断はありません。", L"No diagnosis was recorded for this attempt.",
+                  L"No hay diagnóstico para este intento.");
+    }
+    std::wstringstream ss;
+    std::string failureClass = failure.value("class", std::string("unknown"));
+    std::string confidence = failure.value("confidence", std::string());
+    ss << Tr(L"分類: ", L"Class: ", L"Clase: ") << Utf8ToWide(failureClass);
+    if (!confidence.empty()) ss << L" (" << Utf8ToWide(confidence) << L")";
+    ss << L"\r\n";
+    std::string summary = failure.value("summary", std::string());
+    if (!summary.empty()) ss << Tr(L"理由: ", L"Why: ", L"Motivo: ") << Utf8ToWide(summary) << L"\r\n";
+    std::string action = failure.value("suggestedAction", std::string());
+    std::string retryAt = failure.value("retryAt", std::string());
+    if (!action.empty()) {
+        ss << Tr(L"次の手: ", L"Next: ", L"Siguiente: ") << Utf8ToWide(action);
+        if (!retryAt.empty()) ss << L" (" << Tr(L"再試行 ", L"retry at ", L"reintentar ") << Utf8ToWide(retryAt) << L")";
+        ss << L"\r\n";
+    }
+    auto activity = failure.find("lastActivity");
+    if (activity != failure.end() && activity->is_object()) {
+        std::string what = activity->value("activity", std::string());
+        std::string target = activity->value("target", std::string());
+        if (!what.empty() || !target.empty()) {
+            ss << Tr(L"最後の動作: ", L"Last activity: ", L"Última actividad: ") << Utf8ToWide(what);
+            if (!target.empty()) ss << L" " << Utf8ToWide(target);
+            if (activity->contains("sinceSec") && (*activity)["sinceSec"].is_number()) {
+                ss << L" (" << (*activity)["sinceSec"].get<int64_t>() << L"s)";
+            }
+            ss << L"\r\n";
+        }
+    }
+    auto evidence = failure.find("evidence");
+    if (evidence != failure.end() && evidence->is_array() && !evidence->empty()) {
+        ss << Tr(L"証拠 (選ぶと元の行を表示):", L"Evidence (select to view the source line):",
+                 L"Evidencia (seleccione para ver la línea):") << L"\r\n";
+        for (const auto& item : *evidence) {
+            if (!item.is_object()) continue;
+            if (item.contains("events") && item["events"].is_string()) {
+                ss << L"  event " << Utf8ToWide(item["events"].get<std::string>())
+                   << L" seq " << item.value("seq", static_cast<uint64_t>(0)) << L"\r\n";
+            } else if (item.contains("log") && item["log"].is_string()) {
+                ss << L"  log   " << Utf8ToWide(item["log"].get<std::string>())
+                   << L" line " << item.value("line", 0) << L"\r\n";
+            }
+        }
+    }
+    auto llmGuess = failure.find("llmGuess");
+    if (llmGuess != failure.end() && llmGuess->is_object()) {
+        std::string guessClass = llmGuess->value("class", std::string());
+        std::string guessSummary = llmGuess->value("summary", std::string());
+        std::string guessAction = llmGuess->value("suggestedAction", std::string());
+        std::string rationale = llmGuess->value("rationale", std::string());
+        if (!guessClass.empty()) {
+            ss << Tr(L"LLM の見立て (参考・低信頼): ", L"LLM guess (reference, low confidence): ",
+                     L"Conjetura del LLM (referencia, baja confianza): ")
+               << Utf8ToWide(guessClass);
+            if (!guessSummary.empty()) ss << L" - " << Utf8ToWide(guessSummary);
+            ss << L"\r\n";
+            if (!guessAction.empty()) ss << L"  " << Utf8ToWide(guessAction) << L"\r\n";
+            if (!rationale.empty()) ss << L"  " << Utf8ToWide(rationale) << L"\r\n";
+        }
+    }
+    return ss.str();
+}
+
+static std::vector<std::string> ReadTextLines(const std::wstring& pathW) {
+    std::vector<std::string> lines;
+    std::string text = ReadFileUtf8Wide(pathW);
+    if (text.empty()) return lines;
+    size_t pos = 0;
+    while (pos <= text.size()) {
+        size_t nl = text.find('\n', pos);
+        std::string line = nl == std::string::npos ? text.substr(pos) : text.substr(pos, nl - pos);
+        if (!line.empty() && line.back() == '\r') line.pop_back();
+        lines.push_back(std::move(line));
+        if (nl == std::string::npos) break;
+        pos = nl + 1;
+    }
+    return lines;
+}
+
+// Resolve an evidence file against the job cwd when it is relative.
+static std::wstring EvidenceFilePathWide(const nlohmann::json& job, const std::string& file) {
+    if (file.empty()) return L"";
+    if (file.size() > 1 && (file[1] == ':' || file[0] == '\\' || file[0] == '/')) {
+        return Utf8ToWide(file);
+    }
+    std::string cwd = job.is_object() ? job.value("cwd", std::string()) : std::string();
+    if (!cwd.empty()) return Utf8ToWide(cwd + "\\" + file);
+    return Utf8ToWide(file);
+}
+
+// 1-based line of the event with this seq in a .events.jsonl (0 when not found).
+static int FindEventLineBySeq(const std::vector<std::string>& lines, uint64_t seq) {
+    for (size_t i = 0; i < lines.size(); ++i) {
+        nlohmann::json j = nlohmann::json::parse(lines[i], nullptr, false);
+        if (j.is_discarded() || !j.is_object()) continue;
+        auto value = j.find("seq");
+        if (value == j.end() || !value->is_number_integer()) continue;
+        if (value->get<uint64_t>() == seq) return static_cast<int>(i) + 1;
+    }
+    return 0;
+}
+
+static std::wstring EvidenceContextText(const nlohmann::json& job, const nlohmann::json& evidence) {
+    std::string file;
+    int line = 0;
+    if (evidence.contains("events") && evidence["events"].is_string()) {
+        file = evidence["events"].get<std::string>();
+        uint64_t seq = evidence.value("seq", static_cast<uint64_t>(0));
+        std::wstring pathW = EvidenceFilePathWide(job, file);
+        std::vector<std::string> lines = ReadTextLines(pathW);
+        if (lines.empty()) {
+            return Tr(L"証拠のイベントファイルを読めません: ", L"Cannot read the evidence event file: ",
+                      L"No se puede leer el archivo de eventos: ") + Utf8ToWide(file);
+        }
+        line = FindEventLineBySeq(lines, seq);
+        if (line == 0) {
+            return Tr(L"イベント seq ", L"Event seq ", L"Secuencia ") + std::to_wstring(seq) +
+                   Tr(L" はこのファイルに見つかりません: ", L" was not found in this file: ",
+                      L" no se encontró en este archivo: ") + Utf8ToWide(file);
+        }
+        std::wstringstream ss;
+        ss << Utf8ToWide(file) << L"  seq " << seq << L"\r\n\r\n";
+        int from = (std::max)(1, line - 8);
+        int to = (std::min)(static_cast<int>(lines.size()), line + 8);
+        for (int n = from; n <= to; ++n) {
+            ss << (n == line ? L">> " : L"   ") << n << L": " << Utf8ToWide(lines[static_cast<size_t>(n - 1)]) << L"\r\n";
+        }
+        return ss.str();
+    }
+    if (evidence.contains("log") && evidence["log"].is_string()) {
+        file = evidence["log"].get<std::string>();
+        line = evidence.value("line", 0);
+        std::vector<std::string> lines = ReadTextLines(EvidenceFilePathWide(job, file));
+        if (lines.empty()) {
+            return Tr(L"証拠のログを読めません: ", L"Cannot read the evidence log: ",
+                      L"No se puede leer el registro: ") + Utf8ToWide(file);
+        }
+        if (line < 1 || line > static_cast<int>(lines.size())) {
+            return Tr(L"ログ行 ", L"Log line ", L"Línea ") + std::to_wstring(line) +
+                   Tr(L" はこのファイルにありません: ", L" is not in this file: ",
+                      L" no está en este archivo: ") + Utf8ToWide(file);
+        }
+        std::wstringstream ss;
+        ss << Utf8ToWide(file) << L"  line " << line << L"\r\n\r\n";
+        int from = (std::max)(1, line - 8);
+        int to = (std::min)(static_cast<int>(lines.size()), line + 8);
+        for (int n = from; n <= to; ++n) {
+            ss << (n == line ? L">> " : L"   ") << n << L": " << Utf8ToWide(lines[static_cast<size_t>(n - 1)]) << L"\r\n";
+        }
+        return ss.str();
+    }
+    return Tr(L"証拠の場所が記録されていません。", L"This evidence has no source location.",
+              L"Esta evidencia no tiene ubicación.");
+}
+
+
 static std::string TimeOfDayText(const std::string& ts) {
     size_t space = ts.find(' ');
     if (space != std::string::npos && ts.size() >= space + 9) return ts.substr(space + 1);
@@ -2473,11 +2701,973 @@ static std::wstring TaskQueueStateLabel(const std::string& state, const std::str
     return waitingForDeps ? std::wstring(L"pending") : std::wstring(L"waiting");
 }
 
-static void ShowTaskQueueJobDetails(DashboardState* st, const std::string& jobId) {
+// ---------------------------------------------------------------------------
+// Memory dialogs (doc/design-v3.md 3.11, 3.12).
+//
+// "Past runs" is the second tab of a task queue job's detail window. It lists the
+// L1 RunRecords for the same job name, the failure-class trend and related notes.
+// The memory list lets a human retract an L2 note or promote it to L3 knowledge.
+// ---------------------------------------------------------------------------
+
+static std::wstring MemoryDataFilePathWide(const wchar_t* name) {
+    return GetEffectiveDataDirectoryWide() + L"\\memory\\" + name;
+}
+
+static void EnsureMemoryDirectory() {
+    std::wstring dir = GetEffectiveDataDirectoryWide() + L"\\memory";
+    CreateDirectoryW(dir.c_str(), nullptr);
+}
+
+static void AppendMemoryLine(const wchar_t* name, const std::string& line) {
+    EnsureMemoryDirectory();
+    AppendToLogFileWide(MemoryDataFilePathWide(name), line + "\r\n");
+}
+
+static bool RetractMemoryNoteById(const std::string& id, std::string& outError) {
+    if (id.empty()) {
+        outError = WideToUtf8(Tr(L"ノートが選択されていません", L"No note is selected", L"No hay una nota seleccionada"));
+        return false;
+    }
+    nlohmann::json j;
+    j["op"] = "retract";
+    j["id"] = id;
+    j["retractedAt"] = GetCurrentTimestampStr();
+    j["retractedBy"] = "gui";
+    AppendMemoryLine(L"notes.jsonl", j.dump());
+    return true;
+}
+
+static bool PromoteMemoryNoteToL3(const std::string& id, std::string& outError) {
+    std::string resp = memory::GetJson(id, "note");
+    nlohmann::json got = nlohmann::json::parse(resp, nullptr, false);
+    if (got.is_discarded() || !got.is_object() || !got.value("ok", false)) {
+        outError = "note not found: " + id;
+        return false;
+    }
+    nlohmann::json doc = nlohmann::json::object();
+    auto d = got.find("document");
+    if (d != got.end() && d->is_object()) doc = *d;
+    if (doc.contains("note") && doc["note"].is_object()) doc = doc["note"];
+    if (doc.value("text", std::string()).empty()) {
+        outError = "note has no text: " + id;
+        return false;
+    }
+    std::string status = doc.value("status", got.value("status", std::string("active")));
+    if (status == "retracted") {
+        outError = WideToUtf8(Tr(L"取り消されたノートは昇格できません",
+                      L"A retracted note cannot be promoted",
+                      L"Una nota retirada no se puede promover"));
+        return false;
+    }
+    static int seq = 0;
+    ++seq;
+    nlohmann::json kn = doc;
+    kn["schema"] = "hancho.memory.knowledge/1";
+    kn["id"] = "kn_" + GetFileTimestampStr() + "_" + std::to_string(seq);
+    kn["status"] = "active";
+    kn["approvedBy"] = "gui:human";
+    kn["approvedAt"] = GetCurrentTimestampStr();
+    if (!kn.contains("createdAt") || !kn["createdAt"].is_string()) kn["createdAt"] = kn["approvedAt"];
+    AppendMemoryLine(L"knowledge.jsonl", kn.dump());
+
+    // The note is retired once the human-approved copy lives in knowledge.jsonl.
+    nlohmann::json old = doc;
+    old["status"] = "superseded";
+    nlohmann::json upd;
+    upd["op"] = "update";
+    upd["note"] = old;
+    AppendMemoryLine(L"notes.jsonl", upd.dump());
+    return true;
+}
+
+struct PastRunsDlgState {
+    DashboardState* dash = nullptr;
+    HFONT fontUi = nullptr;
+    HWND tab = nullptr;
+    HWND jobEdit = nullptr;
+    HWND summaryEdit = nullptr;
+    HWND list = nullptr;
+    HWND detailEdit = nullptr;
+    HWND whyEdit = nullptr;
+    HWND whyList = nullptr;
+    HWND whyDetail = nullptr;
+    HWND btnClose = nullptr;
+    std::string jobName;
+    std::string taskqueue;
+    std::string jobJson;
+    std::vector<nlohmann::json> runs;
+    nlohmann::json job;
+    nlohmann::json failure;
+    std::vector<nlohmann::json> evidence;
+    int activeTab = 0;
+};
+
+static void PastRunsLayout(HWND hwnd, PastRunsDlgState* ds) {
+    if (!ds) return;
+    RECT rc = {};
+    GetClientRect(hwnd, &rc);
+    int w = rc.right - rc.left;
+    int h = rc.bottom - rc.top;
+    int pad = 12;
+    if (ds->tab) {
+        MoveWindow(ds->tab, pad, pad, (std::max)(200, w - pad * 2), (std::max)(120, h - pad * 2), TRUE);
+    }
+    RECT page = {pad, pad, w - pad, h - pad};
+    if (ds->tab) TabCtrl_AdjustRect(ds->tab, FALSE, &page);
+    int pw = (std::max)(100, static_cast<int>(page.right - page.left));
+    int closeY = (std::max)(static_cast<int>(page.top) + 40, h - pad - 30);
+    int contentH = (std::max)(80, closeY - static_cast<int>(page.top) - 8);
+    if (ds->activeTab == 0) {
+        if (ds->jobEdit) MoveWindow(ds->jobEdit, page.left, page.top, pw, contentH, TRUE);
+    } else if (ds->activeTab == 1) {
+        int sumH = (std::min)(120, (std::max)(60, contentH / 4));
+        if (ds->summaryEdit) MoveWindow(ds->summaryEdit, page.left, page.top, pw, sumH, TRUE);
+        int listY = page.top + sumH + 6;
+        int listH = (std::max)(70, contentH - sumH - 6 - 90);
+        if (ds->list) MoveWindow(ds->list, page.left, listY, pw, listH, TRUE);
+        int detailY = listY + listH + 6;
+        int detailH = (std::max)(40, static_cast<int>(page.top) + contentH - detailY);
+        if (ds->detailEdit) MoveWindow(ds->detailEdit, page.left, detailY, pw, detailH, TRUE);
+    } else {
+        int whyH = (std::min)(150, (std::max)(80, contentH / 3));
+        if (ds->whyEdit) MoveWindow(ds->whyEdit, page.left, page.top, pw, whyH, TRUE);
+        int listY = page.top + whyH + 6;
+        int listH = (std::max)(60, (contentH - whyH - 12) / 2);
+        if (ds->whyList) MoveWindow(ds->whyList, page.left, listY, pw, listH, TRUE);
+        int detailY = listY + listH + 6;
+        int detailH = (std::max)(40, static_cast<int>(page.top) + contentH - detailY);
+        if (ds->whyDetail) MoveWindow(ds->whyDetail, page.left, detailY, pw, detailH, TRUE);
+    }
+    if (ds->btnClose) MoveWindow(ds->btnClose, (std::max)(pad, w - pad - 100), closeY, 100, 28, TRUE);
+}
+
+static void PastRunsSelectTab(HWND hwnd, PastRunsDlgState* ds, int tab) {
+    if (!ds) return;
+    ds->activeTab = tab;
+    if (ds->tab) TabCtrl_SetCurSel(ds->tab, tab);
+    if (ds->jobEdit) ShowWindow(ds->jobEdit, tab == 0 ? SW_SHOW : SW_HIDE);
+    if (ds->summaryEdit) ShowWindow(ds->summaryEdit, tab == 1 ? SW_SHOW : SW_HIDE);
+    if (ds->list) ShowWindow(ds->list, tab == 1 ? SW_SHOW : SW_HIDE);
+    if (ds->detailEdit) ShowWindow(ds->detailEdit, tab == 1 ? SW_SHOW : SW_HIDE);
+    if (ds->whyEdit) ShowWindow(ds->whyEdit, tab == 2 ? SW_SHOW : SW_HIDE);
+    if (ds->whyList) ShowWindow(ds->whyList, tab == 2 ? SW_SHOW : SW_HIDE);
+    if (ds->whyDetail) ShowWindow(ds->whyDetail, tab == 2 ? SW_SHOW : SW_HIDE);
+    PastRunsLayout(hwnd, ds);
+}
+
+static void PastRunsAddColumn(HWND list, int index, const wchar_t* title, int width) {
+    LVCOLUMNW col = {};
+    col.mask = LVCF_TEXT | LVCF_WIDTH;
+    col.pszText = const_cast<wchar_t*>(title);
+    col.cx = width;
+    ListView_InsertColumn(list, index, &col);
+}
+
+static void PastRunsLoad(PastRunsDlgState* ds) {
+    if (!ds || !ds->list) return;
+    memory::Query q;
+    q.jobName = ds->jobName;
+    q.taskqueue = ds->taskqueue;
+    q.kinds.push_back("run");
+    q.limit = 200;
+    std::string resp = memory::SearchJson(q);
+    nlohmann::json j = nlohmann::json::parse(resp, nullptr, false);
+    ds->runs.clear();
+    if (j.is_object()) {
+        auto results = j.find("results");
+        if (results != j.end() && results->is_array()) {
+            for (const auto& hit : *results) {
+                if (hit.is_object() && hit.value("kind", std::string()) == "run") ds->runs.push_back(hit);
+            }
+        }
+    }
+    std::sort(ds->runs.begin(), ds->runs.end(), [](const nlohmann::json& a, const nlohmann::json& b) {
+        return a.value("createdAt", std::string()) > b.value("createdAt", std::string());
+    });
+
+    SendMessageW(ds->list, WM_SETREDRAW, FALSE, 0);
+    ListView_DeleteAllItems(ds->list);
+    for (size_t i = 0; i < ds->runs.size(); ++i) {
+        const auto& r = ds->runs[i];
+        std::wstring timeStr = Utf8ToWide(r.value("createdAt", std::string()));
+        std::wstring outcomeStr = Utf8ToWide(r.value("outcome", std::string()));
+        std::wstring failureStr = Utf8ToWide(r.value("failureClass", std::string()));
+        std::wstring summaryStr = Utf8ToWide(r.value("summary", std::string()));
+        LVITEMW item = {};
+        item.mask = LVIF_TEXT | LVIF_PARAM;
+        item.iItem = static_cast<int>(i);
+        item.pszText = timeStr.data();
+        item.lParam = static_cast<LPARAM>(i);
+        ListView_InsertItem(ds->list, &item);
+        ListView_SetItemText(ds->list, static_cast<int>(i), 1, outcomeStr.data());
+        ListView_SetItemText(ds->list, static_cast<int>(i), 2, failureStr.data());
+        ListView_SetItemText(ds->list, static_cast<int>(i), 3, summaryStr.data());
+    }
+    SendMessageW(ds->list, WM_SETREDRAW, TRUE, 0);
+    InvalidateRect(ds->list, nullptr, TRUE);
+
+    memory::Query statsQuery = q;
+    std::string statsResp = memory::StatsJson(statsQuery);
+    nlohmann::json s = nlohmann::json::parse(statsResp, nullptr, false);
+    double median = 0.0;
+    double p90 = 0.0;
+    if (s.is_object()) {
+        auto dur = s.find("durationSec");
+        if (dur != s.end() && dur->is_object()) {
+            median = dur->value("median", 0.0);
+            p90 = dur->value("p90", 0.0);
+        }
+    }
+
+    std::vector<std::string> trend;
+    std::map<std::string, int> counts;
+    for (auto it = ds->runs.rbegin(); it != ds->runs.rend(); ++it) {
+        std::string fc = it->value("failureClass", std::string());
+        if (fc.empty()) continue;
+        trend.push_back(fc);
+        ++counts[fc];
+    }
+
+    memory::Query nq;
+    nq.kinds.push_back("note");
+    nq.jobName = ds->jobName;
+    nq.taskqueue = ds->taskqueue;
+    nq.limit = 30;
+    nlohmann::json notes = nlohmann::json::parse(memory::SearchJson(nq), nullptr, false);
+
+    std::wstringstream text;
+    text << Tr(L"実行数: ", L"Runs: ", L"Ejecuciones: ")
+         << (s.is_object() ? s.value("runs", static_cast<int64_t>(0)) : static_cast<int64_t>(0))
+         << Tr(L"  成功率: ", L"  success: ", L"  éxito: ")
+         << std::fixed << std::setprecision(1)
+         << (s.is_object() ? s.value("successRate", 0.0) * 100.0 : 0.0) << L"%"
+         << Tr(L"  中央値: ", L"  median: ", L"  mediana: ") << std::setprecision(0) << median << L"s"
+         << L"  p90: " << p90 << L"s"
+         << Tr(L"  トークン: ", L"  tokens: ", L"  tokens: ")
+         << (s.is_object() ? s.value("totalTokens", static_cast<int64_t>(0)) : static_cast<int64_t>(0))
+         << L"\r\n";
+    text << Tr(L"失敗分類の推移 (古い順): ", L"Failure classes (oldest first): ", L"Clases de fallo (más antiguo primero): ");
+    if (trend.empty()) {
+        text << Tr(L"(なし)", L"(none)", L"(ninguna)");
+    } else {
+        for (size_t i = 0; i < trend.size() && i < 20; ++i) {
+            if (i) text << L" → ";
+            text << Utf8ToWide(trend[i]);
+        }
+    }
+    text << L"\r\n";
+    if (!counts.empty()) {
+        text << Tr(L"回数: ", L"Counts: ", L"Recuentos: ");
+        bool first = true;
+        for (const auto& kv : counts) {
+            if (!first) text << L", ";
+            first = false;
+            text << Utf8ToWide(kv.first) << L" ×" << kv.second;
+        }
+        text << L"\r\n";
+    }
+    text << Tr(L"関連ノート:", L"Related notes:", L"Notas relacionadas:");
+    bool anyNote = false;
+    if (notes.is_object()) {
+        auto results = notes.find("results");
+        if (results != notes.end() && results->is_array()) {
+            for (const auto& n : *results) {
+                if (!n.is_object()) continue;
+                if (n.value("kind", std::string()) != "note") continue;
+                text << L"\r\n  - " << Utf8ToWide(n.value("id", std::string())) << L": "
+                     << Utf8ToWide(n.value("summary", std::string()));
+                anyNote = true;
+            }
+        }
+    }
+    if (!anyNote) text << Tr(L" (なし)", L" (none)", L" (ninguna)");
+
+    if (ds->summaryEdit) SetWindowTextW(ds->summaryEdit, text.str().c_str());
+    if (ds->detailEdit && ds->runs.empty()) {
+        SetWindowTextW(ds->detailEdit,
+                       Tr(L"このジョブの実行記録はまだありません。", L"No run records for this job yet.",
+                          L"Aún no hay ejecuciones para esta tarea."));
+    }
+}
+
+// "Why failed" tab: the diagnosis of the last attempt, plus one row per evidence item.
+// Selecting a row shows the surrounding event/log lines with the source line marked.
+static void WhyLoad(PastRunsDlgState* ds) {
+    if (!ds) return;
+    ds->job = nlohmann::json();
+    ds->failure = nlohmann::json();
+    ds->evidence.clear();
+
+    nlohmann::json root = nlohmann::json::parse(ds->jobJson, nullptr, false);
+    if (root.is_object()) {
+        ds->job = root.contains("job") && root["job"].is_object() ? root["job"] : root;
+    }
+    if (ds->job.is_object()) {
+        auto attempts = ds->job.find("attempts");
+        if (attempts != ds->job.end() && attempts->is_array()) {
+            for (const auto& attempt : *attempts) {
+                if (!attempt.is_object()) continue;
+                auto failure = attempt.find("failure");
+                if (failure != attempt.end() && failure->is_object() && !failure->empty()) {
+                    ds->failure = *failure;
+                }
+            }
+        }
+    }
+
+    std::wstring text = WhyFailureText(ds->failure);
+    std::wstring breakdown = QueueFailureBreakdown(ds->dash, ds->taskqueue);
+    if (!breakdown.empty()) text += L"\r\n" + breakdown + L"\r\n";
+    std::string jobState = ds->job.is_object() ? ds->job.value("state", std::string()) : std::string();
+    if (ds->failure.empty() && jobState != "failed" && jobState != "cancelled") {
+        text = Tr(L"このジョブはまだ失敗していません。", L"This job has not failed.",
+                  L"Esta tarea aún no ha fallado.");
+        if (!breakdown.empty()) text += L"\r\n" + breakdown + L"\r\n";
+    }
+    if (ds->whyEdit) SetWindowTextW(ds->whyEdit, text.c_str());
+
+    if (ds->whyList) {
+        SendMessageW(ds->whyList, WM_SETREDRAW, FALSE, 0);
+        ListView_DeleteAllItems(ds->whyList);
+        auto evidence = ds->failure.find("evidence");
+        if (evidence != ds->failure.end() && evidence->is_array()) {
+            for (const auto& item : *evidence) {
+                if (!item.is_object()) continue;
+                std::string kind;
+                std::string file;
+                std::wstring where;
+                if (item.contains("events") && item["events"].is_string()) {
+                    kind = "event";
+                    file = item["events"].get<std::string>();
+                    where = L"seq " + std::to_wstring(item.value("seq", static_cast<uint64_t>(0)));
+                } else if (item.contains("log") && item["log"].is_string()) {
+                    kind = "log";
+                    file = item["log"].get<std::string>();
+                    where = L"line " + std::to_wstring(item.value("line", 0));
+                } else {
+                    continue;
+                }
+                int idx = static_cast<int>(ds->evidence.size());
+                ds->evidence.push_back(item);
+                std::wstring wKind = Utf8ToWide(kind);
+                std::wstring wFile = Utf8ToWide(file);
+                LVITEMW lvi = {};
+                lvi.mask = LVIF_TEXT | LVIF_PARAM;
+                lvi.iItem = idx;
+                lvi.pszText = wKind.data();
+                lvi.lParam = idx;
+                ListView_InsertItem(ds->whyList, &lvi);
+                ListView_SetItemText(ds->whyList, idx, 1, wFile.data());
+                ListView_SetItemText(ds->whyList, idx, 2, where.data());
+            }
+        }
+        SendMessageW(ds->whyList, WM_SETREDRAW, TRUE, 0);
+        InvalidateRect(ds->whyList, nullptr, TRUE);
+        if (!ds->evidence.empty()) {
+            ListView_SetItemState(ds->whyList, 0, LVIS_SELECTED | LVIS_FOCUSED, LVIS_SELECTED | LVIS_FOCUSED);
+        }
+    }
+    if (ds->whyDetail) SetWindowTextW(ds->whyDetail, L"");
+}
+
+static void WhyShowEvidence(PastRunsDlgState* ds, int index) {
+    if (!ds || !ds->whyDetail) return;
+    if (index < 0 || static_cast<size_t>(index) >= ds->evidence.size()) {
+        SetWindowTextW(ds->whyDetail, L"");
+        return;
+    }
+    std::wstring text = EvidenceContextText(ds->job, ds->evidence[static_cast<size_t>(index)]);
+    SetWindowTextW(ds->whyDetail, NormalizeCrLfWide(WideToUtf8(text)).c_str());
+}
+
+static std::string WhyEvidenceOpenPath(PastRunsDlgState* ds, int index) {
+    if (!ds || index < 0 || static_cast<size_t>(index) >= ds->evidence.size()) return "";
+    const nlohmann::json& item = ds->evidence[static_cast<size_t>(index)];
+    std::string file;
+    if (item.contains("events") && item["events"].is_string()) file = item["events"].get<std::string>();
+    else if (item.contains("log") && item["log"].is_string()) file = item["log"].get<std::string>();
+    return file;
+}
+
+static LRESULT CALLBACK PastRunsWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
+    auto* ds = reinterpret_cast<PastRunsDlgState*>(GetWindowLongPtrW(hwnd, GWLP_USERDATA));
+    switch (msg) {
+        case WM_CREATE: {
+            auto* cs = reinterpret_cast<CREATESTRUCTW*>(lParam);
+            ds = reinterpret_cast<PastRunsDlgState*>(cs->lpCreateParams);
+            SetWindowLongPtrW(hwnd, GWLP_USERDATA, reinterpret_cast<LONG_PTR>(ds));
+
+            ds->tab = CreateWindowExW(0, WC_TABCONTROLW, L"",
+                WS_CHILD | WS_VISIBLE | WS_CLIPSIBLINGS,
+                12, 12, 760, 480, hwnd, (HMENU)2700, nullptr, nullptr);
+            TCITEMW tie = {};
+            tie.mask = TCIF_TEXT;
+            tie.pszText = const_cast<wchar_t*>(Tr(L"ジョブ", L"Job", L"Trabajo"));
+            TabCtrl_InsertItem(ds->tab, 0, &tie);
+            tie.pszText = const_cast<wchar_t*>(Tr(L"過去の実行", L"Past runs", L"Ejecuciones"));
+            TabCtrl_InsertItem(ds->tab, 1, &tie);
+            tie.pszText = const_cast<wchar_t*>(Tr(L"なぜ失敗したか", L"Why failed", L"Por qué falló"));
+            TabCtrl_InsertItem(ds->tab, 2, &tie);
+
+            ds->jobEdit = CreateWindowExW(WS_EX_CLIENTEDGE, L"EDIT", Utf8ToWide(ds->jobJson).c_str(),
+                WS_CHILD | WS_VISIBLE | WS_VSCROLL | WS_HSCROLL | ES_MULTILINE | ES_READONLY |
+                    ES_AUTOVSCROLL | ES_AUTOHSCROLL,
+                20, 60, 700, 360, hwnd, (HMENU)2701, nullptr, nullptr);
+
+            ds->summaryEdit = CreateWindowExW(WS_EX_CLIENTEDGE, L"EDIT", L"",
+                WS_CHILD | WS_VSCROLL | ES_MULTILINE | ES_READONLY | ES_AUTOVSCROLL,
+                20, 60, 700, 100, hwnd, (HMENU)2702, nullptr, nullptr);
+
+            ds->list = CreateWindowExW(WS_EX_CLIENTEDGE, WC_LISTVIEWW, L"",
+                WS_CHILD | LVS_REPORT | LVS_SINGLESEL | LVS_SHOWSELALWAYS,
+                20, 166, 700, 180, hwnd, (HMENU)2703, nullptr, nullptr);
+            ListView_SetExtendedListViewStyle(ds->list, LVS_EX_FULLROWSELECT | LVS_EX_GRIDLINES);
+            PastRunsAddColumn(ds->list, 0, Tr(L"開始", L"Started", L"Inicio"), 170);
+            PastRunsAddColumn(ds->list, 1, Tr(L"結果", L"Outcome", L"Resultado"), 90);
+            PastRunsAddColumn(ds->list, 2, Tr(L"失敗分類", L"Failure", L"Fallo"), 170);
+            PastRunsAddColumn(ds->list, 3, Tr(L"概要", L"Summary", L"Resumen"), 520);
+
+            ds->detailEdit = CreateWindowExW(WS_EX_CLIENTEDGE, L"EDIT", L"",
+                WS_CHILD | WS_VSCROLL | WS_HSCROLL | ES_MULTILINE | ES_READONLY |
+                    ES_AUTOVSCROLL | ES_AUTOHSCROLL,
+                20, 352, 700, 120, hwnd, (HMENU)2704, nullptr, nullptr);
+
+            ds->whyEdit = CreateWindowExW(WS_EX_CLIENTEDGE, L"EDIT", L"",
+                WS_CHILD | WS_VSCROLL | ES_MULTILINE | ES_READONLY | ES_AUTOVSCROLL,
+                20, 60, 700, 100, hwnd, (HMENU)2705, nullptr, nullptr);
+
+            ds->whyList = CreateWindowExW(WS_EX_CLIENTEDGE, WC_LISTVIEWW, L"",
+                WS_CHILD | LVS_REPORT | LVS_SINGLESEL | LVS_SHOWSELALWAYS,
+                20, 166, 700, 90, hwnd, (HMENU)2706, nullptr, nullptr);
+            ListView_SetExtendedListViewStyle(ds->whyList, LVS_EX_FULLROWSELECT | LVS_EX_GRIDLINES);
+            PastRunsAddColumn(ds->whyList, 0, Tr(L"種別", L"Kind", L"Tipo"), 70);
+            PastRunsAddColumn(ds->whyList, 1, Tr(L"ファイル", L"File", L"Archivo"), 500);
+            PastRunsAddColumn(ds->whyList, 2, Tr(L"位置", L"Location", L"Ubicación"), 150);
+
+            ds->whyDetail = CreateWindowExW(WS_EX_CLIENTEDGE, L"EDIT", L"",
+                WS_CHILD | WS_VSCROLL | WS_HSCROLL | ES_MULTILINE | ES_READONLY |
+                    ES_AUTOVSCROLL | ES_AUTOHSCROLL,
+                20, 262, 700, 180, hwnd, (HMENU)2707, nullptr, nullptr);
+
+            ds->btnClose = CreateWindowExW(0, L"BUTTON", Tr(L"閉じる", L"Close", L"Cerrar"),
+                WS_CHILD | WS_VISIBLE | BS_PUSHBUTTON, 700, 500, 100, 28, hwnd, (HMENU)IDOK, nullptr, nullptr);
+
+            HWND controls[] = {ds->tab, ds->jobEdit, ds->summaryEdit, ds->list, ds->detailEdit,
+                               ds->whyEdit, ds->whyList, ds->whyDetail, ds->btnClose};
+            for (HWND h : controls) {
+                if (h && ds->fontUi) SendMessageW(h, WM_SETFONT, reinterpret_cast<WPARAM>(ds->fontUi), TRUE);
+            }
+
+            PastRunsLoad(ds);
+            WhyLoad(ds);
+            PastRunsSelectTab(hwnd, ds, ds->activeTab == 1 ? 1 : ds->activeTab == 2 ? 2 : 0);
+            ApplyNativeThemeToWindow(hwnd);
+            return 0;
+        }
+        case WM_NOTIFY: {
+            if (!ds) break;
+            auto* nm = reinterpret_cast<NMHDR*>(lParam);
+            if (nm && nm->hwndFrom == ds->tab && nm->code == TCN_SELCHANGE) {
+                PastRunsSelectTab(hwnd, ds, TabCtrl_GetCurSel(ds->tab));
+                return 0;
+            }
+            if (nm && nm->hwndFrom == ds->list && nm->code == LVN_ITEMCHANGED) {
+                int sel = ListView_GetNextItem(ds->list, -1, LVNI_SELECTED);
+                if (sel >= 0 && static_cast<size_t>(sel) < ds->runs.size() && ds->detailEdit) {
+                    const auto& r = ds->runs[static_cast<size_t>(sel)];
+                    std::string id = r.value("id", std::string());
+                    std::string full = memory::GetJson(id, "run");
+                    nlohmann::json g = nlohmann::json::parse(full, nullptr, false);
+                    std::string dump = full;
+                    if (g.is_object()) {
+                        auto doc = g.find("document");
+                        if (doc != g.end()) dump = doc->dump(2, ' ', false, nlohmann::json::error_handler_t::replace);
+                    }
+                    SetWindowTextW(ds->detailEdit, NormalizeCrLfWide(dump).c_str());
+                }
+                return 0;
+            }
+            if (nm && nm->hwndFrom == ds->whyList && nm->code == LVN_ITEMCHANGED) {
+                int sel = ListView_GetNextItem(ds->whyList, -1, LVNI_SELECTED);
+                WhyShowEvidence(ds, sel);
+                return 0;
+            }
+            if (nm && nm->hwndFrom == ds->whyList && nm->code == NM_DBLCLK) {
+                int sel = ListView_GetNextItem(ds->whyList, -1, LVNI_SELECTED);
+                std::string file = WhyEvidenceOpenPath(ds, sel);
+                if (!file.empty()) {
+                    std::wstring pathW = EvidenceFilePathWide(ds->job, file);
+                    ShellExecuteW(hwnd, L"open", L"notepad.exe", pathW.c_str(), nullptr, SW_SHOWNORMAL);
+                }
+                return 0;
+            }
+            break;
+        }
+        case WM_SIZE:
+            PastRunsLayout(hwnd, ds);
+            return 0;
+        case WM_COMMAND:
+            if (LOWORD(wParam) == IDOK || LOWORD(wParam) == IDCANCEL) {
+                DestroyWindow(hwnd);
+                return 0;
+            }
+            break;
+        case WM_CTLCOLORSTATIC:
+        case WM_CTLCOLOREDIT: {
+            HDC hdc = reinterpret_cast<HDC>(wParam);
+            SetTextColor(hdc, g_theme.text);
+            SetBkColor(hdc, g_theme.panel);
+            return reinterpret_cast<LRESULT>(g_dialogBgBrush);
+        }
+        case WM_ERASEBKGND: {
+            HDC hdc = reinterpret_cast<HDC>(wParam);
+            RECT rc = {};
+            GetClientRect(hwnd, &rc);
+            FillRect(hdc, &rc, g_dialogBgBrush);
+            return 1;
+        }
+        case WM_CLOSE:
+            DestroyWindow(hwnd);
+            return 0;
+        case WM_NCDESTROY:
+            delete ds;
+            SetWindowLongPtrW(hwnd, GWLP_USERDATA, 0);
+            return 0;
+    }
+    return DefWindowProcW(hwnd, msg, wParam, lParam);
+}
+
+static void ShowTaskQueueJobDetails(DashboardState* st, const std::string& jobId, int initialTab = 0) {
     if (!st || !st->tqm || jobId.empty()) return;
     std::string err;
     std::string resp = st->tqm->TaskQueueGet(jobId, true, 0, err);
-    MessageBoxW(st->hwndMain, Utf8ToWide(resp).c_str(), Utf8ToWide(jobId).c_str(), MB_OK | MB_ICONINFORMATION);
+    nlohmann::json job = nlohmann::json::parse(resp, nullptr, false);
+    if (job.is_object() && job.contains("job") && job["job"].is_object()) job = job["job"];
+
+    auto* ds = new PastRunsDlgState();
+    ds->dash = st;
+    ds->fontUi = st->hFontUi;
+    ds->jobJson = resp;
+    ds->jobName = job.is_object() ? job.value("name", std::string()) : std::string();
+    if (ds->jobName.empty()) ds->jobName = jobId;
+    ds->taskqueue = job.is_object() ? job.value("taskqueue", std::string()) : std::string();
+    ds->activeTab = initialTab == 1 ? 1 : initialTab == 2 ? 2 : 0;
+
+    HINSTANCE hInst = GetModuleHandleW(nullptr);
+    static bool registered = false;
+    if (!registered) {
+        WNDCLASSEXW wc = {};
+        wc.cbSize = sizeof(wc);
+        wc.style = CS_HREDRAW | CS_VREDRAW;
+        wc.lpfnWndProc = PastRunsWndProc;
+        wc.hInstance = hInst;
+        wc.hCursor = LoadCursorW(nullptr, IDC_ARROW);
+        wc.hbrBackground = reinterpret_cast<HBRUSH>(COLOR_BTNFACE + 1);
+        wc.lpszClassName = L"HanchoPastRunsWnd";
+        RegisterClassExW(&wc);
+        registered = true;
+    }
+
+    std::wstring title = Tr(L"タスク詳細", L"Task Details", L"Detalles de tarea");
+    title += L" — " + Utf8ToWide(ds->jobName) + L" (" + Utf8ToWide(jobId) + L")";
+    RECT parent = {};
+    GetWindowRect(st->hwndMain, &parent);
+    int dlgW = 860;
+    int dlgH = 640;
+    int x = parent.left + ((parent.right - parent.left) - dlgW) / 2;
+    int y = parent.top + ((parent.bottom - parent.top) - dlgH) / 2;
+    HWND hDlg = CreateWindowExW(WS_EX_DLGMODALFRAME, L"HanchoPastRunsWnd", title.c_str(),
+        WS_OVERLAPPEDWINDOW | WS_VISIBLE, x, y, dlgW, dlgH, st->hwndMain, nullptr, hInst, ds);
+    if (hDlg) {
+        ShowWindow(hDlg, SW_SHOW);
+        SetForegroundWindow(hDlg);
+    } else {
+        delete ds;
+    }
+}
+
+struct MemoryListDlgState {
+    DashboardState* dash = nullptr;
+    HFONT fontUi = nullptr;
+    HWND search = nullptr;
+    HWND author = nullptr;
+    HWND list = nullptr;
+    HWND detail = nullptr;
+    HWND btnSearch = nullptr;
+    HWND btnRetract = nullptr;
+    HWND btnPromote = nullptr;
+    HWND btnRefresh = nullptr;
+    HWND btnCompare = nullptr;
+    HWND btnClose = nullptr;
+    std::vector<nlohmann::json> rows;
+    std::map<std::string, std::string> noteAuthors;
+};
+
+static void MemoryListAddColumn(HWND list, int index, const wchar_t* title, int width) {
+    LVCOLUMNW col = {};
+    col.mask = LVCF_TEXT | LVCF_WIDTH;
+    col.pszText = const_cast<wchar_t*>(title);
+    col.cx = width;
+    ListView_InsertColumn(list, index, &col);
+}
+
+static void LoadMemoryNoteAuthors(MemoryListDlgState* ds) {
+    ds->noteAuthors.clear();
+    std::string content = ReadFileUtf8Wide(MemoryDataFilePathWide(L"notes.jsonl"));
+    size_t start = 0;
+    while (start <= content.size()) {
+        size_t end = content.find('\n', start);
+        std::string line = (end == std::string::npos) ? content.substr(start) : content.substr(start, end - start);
+        start = (end == std::string::npos) ? content.size() + 1 : end + 1;
+        if (!line.empty() && line.back() == '\r') line.pop_back();
+        if (line.empty()) continue;
+        nlohmann::json j = nlohmann::json::parse(line, nullptr, false);
+        if (j.is_discarded() || !j.is_object()) continue;
+        nlohmann::json body = j;
+        auto note = j.find("note");
+        if (note != j.end() && note->is_object()) body = *note;
+        std::string id = body.value("id", std::string());
+        if (id.empty()) continue;
+        auto author = body.find("author");
+        std::string type;
+        if (author != body.end()) {
+            if (author->is_object()) type = author->value("type", std::string());
+            else if (author->is_string()) type = author->get<std::string>();
+        }
+        if (!type.empty()) ds->noteAuthors[id] = type;
+    }
+}
+
+static void MemoryListReload(MemoryListDlgState* ds) {
+    if (!ds || !ds->list) return;
+    LoadMemoryNoteAuthors(ds);
+
+    std::wstring searchText;
+    if (ds->search) {
+        wchar_t buf[1024] = {};
+        GetWindowTextW(ds->search, buf, 1024);
+        searchText = buf;
+    }
+    int authorFilter = ds->author ? ComboBox_GetCurSel(ds->author) : 0;
+
+    memory::Query q;
+    q.text = WideToUtf8(searchText);
+    q.limit = 200;
+    nlohmann::json resp = nlohmann::json::parse(memory::SearchJson(q), nullptr, false);
+    ds->rows.clear();
+
+    SendMessageW(ds->list, WM_SETREDRAW, FALSE, 0);
+    ListView_DeleteAllItems(ds->list);
+    if (resp.is_object()) {
+        auto results = resp.find("results");
+        if (results != resp.end() && results->is_array()) {
+            for (const auto& hit : *results) {
+                if (!hit.is_object()) continue;
+                std::string kind = hit.value("kind", std::string());
+                std::string id = hit.value("id", std::string());
+                std::string authorType;
+                if (kind == "note") {
+                    auto it = ds->noteAuthors.find(id);
+                    authorType = it == ds->noteAuthors.end() ? std::string("agent") : it->second;
+                } else if (kind == "knowledge") {
+                    authorType = "human";
+                } else {
+                    authorType = "hancho";
+                }
+                if (authorFilter == 1 && authorType != "agent") continue;
+                if (authorFilter == 2 && authorType != "human") continue;
+                if (authorFilter == 3 && authorType != "hancho") continue;
+
+                nlohmann::json row = hit;
+                row["_author"] = authorType;
+                int idx = static_cast<int>(ds->rows.size());
+                ds->rows.push_back(row);
+
+                std::wstring wId = Utf8ToWide(id);
+                std::wstring wKind = Utf8ToWide(kind);
+                std::wstring wAuthor = Utf8ToWide(authorType);
+                std::wstring wStatus = Utf8ToWide(hit.value("status", std::string()));
+                std::wstring wScope = Utf8ToWide(hit.value("scope", hit.value("jobName", std::string())));
+                std::wstring wText = Utf8ToWide(hit.value("summary", std::string()));
+                LVITEMW item = {};
+                item.mask = LVIF_TEXT | LVIF_PARAM;
+                item.iItem = idx;
+                item.pszText = wId.data();
+                item.lParam = idx;
+                ListView_InsertItem(ds->list, &item);
+                ListView_SetItemText(ds->list, idx, 1, wKind.data());
+                ListView_SetItemText(ds->list, idx, 2, wAuthor.data());
+                ListView_SetItemText(ds->list, idx, 3, wStatus.data());
+                ListView_SetItemText(ds->list, idx, 4, wScope.data());
+                ListView_SetItemText(ds->list, idx, 5, wText.data());
+            }
+        }
+    }
+    SendMessageW(ds->list, WM_SETREDRAW, TRUE, 0);
+    InvalidateRect(ds->list, nullptr, TRUE);
+    if (ds->detail) SetWindowTextW(ds->detail, L"");
+}
+
+static void MemoryListLayout(HWND hwnd, MemoryListDlgState* ds) {
+    if (!ds) return;
+    RECT rc = {};
+    GetClientRect(hwnd, &rc);
+    int w = rc.right - rc.left;
+    int h = rc.bottom - rc.top;
+    int pad = 12;
+    int topY = pad;
+    int searchW = (std::max)(120, w - pad * 2 - 140 - 170 - 16);
+    if (ds->search) MoveWindow(ds->search, pad, topY, searchW, 26, TRUE);
+    if (ds->btnSearch) MoveWindow(ds->btnSearch, pad + searchW + 6, topY, 80, 26, TRUE);
+    if (ds->author) MoveWindow(ds->author, pad + searchW + 92, topY, 160, 26, TRUE);
+    int btnY = (std::max)(topY + 40, h - pad - 30);
+    int listY = topY + 34;
+    int listH = (std::max)(100, btnY - listY - 8);
+    int listW = (std::max)(200, (w - pad * 2) * 52 / 100);
+    if (ds->list) MoveWindow(ds->list, pad, listY, listW, listH, TRUE);
+    int detailX = pad + listW + 8;
+    int detailW = (std::max)(100, w - pad - detailX);
+    if (ds->detail) MoveWindow(ds->detail, detailX, listY, detailW, listH, TRUE);
+    int curX = pad;
+    if (ds->btnRetract) { MoveWindow(ds->btnRetract, curX, btnY, 110, 28, TRUE); curX += 116; }
+    if (ds->btnPromote) { MoveWindow(ds->btnPromote, curX, btnY, 150, 28, TRUE); curX += 156; }
+    if (ds->btnRefresh) { MoveWindow(ds->btnRefresh, curX, btnY, 100, 28, TRUE); curX += 106; }
+    if (ds->btnCompare) { MoveWindow(ds->btnCompare, curX, btnY, 170, 28, TRUE); curX += 176; }
+    if (ds->btnClose) MoveWindow(ds->btnClose, (std::max)(curX + 10, w - pad - 100), btnY, 100, 28, TRUE);
+}
+
+static LRESULT CALLBACK MemoryListWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
+    auto* ds = reinterpret_cast<MemoryListDlgState*>(GetWindowLongPtrW(hwnd, GWLP_USERDATA));
+    switch (msg) {
+        case WM_CREATE: {
+            auto* cs = reinterpret_cast<CREATESTRUCTW*>(lParam);
+            ds = reinterpret_cast<MemoryListDlgState*>(cs->lpCreateParams);
+            SetWindowLongPtrW(hwnd, GWLP_USERDATA, reinterpret_cast<LONG_PTR>(ds));
+
+            ds->search = CreateWindowExW(WS_EX_CLIENTEDGE, L"EDIT", L"",
+                WS_CHILD | WS_VISIBLE | ES_AUTOHSCROLL,
+                12, 12, 400, 26, hwnd, (HMENU)2801, nullptr, nullptr);
+            ds->btnSearch = CreateWindowExW(0, L"BUTTON", Tr(L"検索", L"Search", L"Buscar"),
+                WS_CHILD | WS_VISIBLE | BS_PUSHBUTTON, 420, 12, 80, 26, hwnd, (HMENU)2809, nullptr, nullptr);
+            ds->author = CreateWindowExW(0, L"COMBOBOX", L"",
+                WS_CHILD | WS_VISIBLE | CBS_DROPDOWNLIST | WS_VSCROLL,
+                506, 12, 160, 200, hwnd, (HMENU)2802, nullptr, nullptr);
+            ComboBox_AddString(ds->author, Tr(L"すべての作者", L"All authors", L"Todos los autores"));
+            ComboBox_AddString(ds->author, Tr(L"agent", L"agent", L"agent"));
+            ComboBox_AddString(ds->author, Tr(L"human", L"human", L"human"));
+            ComboBox_AddString(ds->author, Tr(L"hancho", L"hancho", L"hancho"));
+            ComboBox_SetCurSel(ds->author, 0);
+
+            ds->list = CreateWindowExW(WS_EX_CLIENTEDGE, WC_LISTVIEWW, L"",
+                WS_CHILD | WS_VISIBLE | LVS_REPORT | LVS_SINGLESEL | LVS_SHOWSELALWAYS,
+                12, 46, 500, 400, hwnd, (HMENU)2803, nullptr, nullptr);
+            ListView_SetExtendedListViewStyle(ds->list, LVS_EX_FULLROWSELECT | LVS_EX_GRIDLINES);
+            MemoryListAddColumn(ds->list, 0, L"ID", 150);
+            MemoryListAddColumn(ds->list, 1, Tr(L"種別", L"Kind", L"Tipo"), 80);
+            MemoryListAddColumn(ds->list, 2, Tr(L"作者", L"Author", L"Autor"), 70);
+            MemoryListAddColumn(ds->list, 3, Tr(L"状態", L"Status", L"Estado"), 80);
+            MemoryListAddColumn(ds->list, 4, Tr(L"スコープ", L"Scope", L"Ámbito"), 130);
+            MemoryListAddColumn(ds->list, 5, Tr(L"内容", L"Text", L"Texto"), 360);
+
+            ds->detail = CreateWindowExW(WS_EX_CLIENTEDGE, L"EDIT", L"",
+                WS_CHILD | WS_VISIBLE | WS_VSCROLL | WS_HSCROLL | ES_MULTILINE | ES_READONLY |
+                    ES_AUTOVSCROLL | ES_AUTOHSCROLL,
+                520, 46, 300, 400, hwnd, (HMENU)2807, nullptr, nullptr);
+
+            ds->btnRetract = CreateWindowExW(0, L"BUTTON", Tr(L"ノートを取り消す", L"Retract note", L"Retirar nota"),
+                WS_CHILD | WS_VISIBLE | BS_PUSHBUTTON, 12, 456, 110, 28, hwnd, (HMENU)2804, nullptr, nullptr);
+            ds->btnPromote = CreateWindowExW(0, L"BUTTON", Tr(L"L3 に昇格", L"Promote to L3", L"Promover a L3"),
+                WS_CHILD | WS_VISIBLE | BS_PUSHBUTTON, 128, 456, 150, 28, hwnd, (HMENU)2805, nullptr, nullptr);
+            ds->btnRefresh = CreateWindowExW(0, L"BUTTON", Tr(L"再読み込み", L"Reload", L"Recargar"),
+                WS_CHILD | WS_VISIBLE | BS_PUSHBUTTON, 284, 456, 100, 28, hwnd, (HMENU)2806, nullptr, nullptr);
+            ds->btnCompare = CreateWindowExW(0, L"BUTTON", Tr(L"注入の効果を比較", L"Injection effect", L"Efecto de inyección"),
+                WS_CHILD | WS_VISIBLE | BS_PUSHBUTTON, 390, 456, 170, 28, hwnd, (HMENU)2810, nullptr, nullptr);
+            ds->btnClose = CreateWindowExW(0, L"BUTTON", Tr(L"閉じる", L"Close", L"Cerrar"),
+                WS_CHILD | WS_VISIBLE | BS_PUSHBUTTON, 740, 456, 100, 28, hwnd, (HMENU)IDOK, nullptr, nullptr);
+
+            HWND controls[] = {ds->search, ds->btnSearch, ds->author, ds->list, ds->detail,
+                               ds->btnRetract, ds->btnPromote, ds->btnRefresh, ds->btnCompare, ds->btnClose};
+            for (HWND h : controls) {
+                if (h && ds->fontUi) SendMessageW(h, WM_SETFONT, reinterpret_cast<WPARAM>(ds->fontUi), TRUE);
+            }
+
+            MemoryListReload(ds);
+            ApplyNativeThemeToWindow(hwnd);
+            return 0;
+        }
+        case WM_NOTIFY: {
+            if (!ds) break;
+            auto* nm = reinterpret_cast<NMHDR*>(lParam);
+            if (nm && nm->hwndFrom == ds->list && nm->code == LVN_ITEMCHANGED) {
+                int sel = ListView_GetNextItem(ds->list, -1, LVNI_SELECTED);
+                if (sel >= 0 && static_cast<size_t>(sel) < ds->rows.size() && ds->detail) {
+                    const auto& row = ds->rows[static_cast<size_t>(sel)];
+                    std::string id = row.value("id", std::string());
+                    std::string kind = row.value("kind", std::string());
+                    std::string full = memory::GetJson(id, kind);
+                    nlohmann::json g = nlohmann::json::parse(full, nullptr, false);
+                    std::string dump = full;
+                    if (g.is_object()) {
+                        auto doc = g.find("document");
+                        if (doc != g.end()) dump = doc->dump(2, ' ', false, nlohmann::json::error_handler_t::replace);
+                    }
+                    SetWindowTextW(ds->detail, NormalizeCrLfWide(dump).c_str());
+                }
+                return 0;
+            }
+            break;
+        }
+        case WM_SIZE:
+            MemoryListLayout(hwnd, ds);
+            return 0;
+        case WM_COMMAND: {
+            int id = LOWORD(wParam);
+            if (id == IDOK || id == IDCANCEL) {
+                DestroyWindow(hwnd);
+                return 0;
+            }
+            if (!ds) return 0;
+            if (id == 2809 || id == 2806) {
+                MemoryListReload(ds);
+                return 0;
+            }
+            if (id == 2810) {
+                nlohmann::json c = nlohmann::json::parse(MemoryInjectCompareJson("", "", ""), nullptr, false);
+                std::wstringstream msg;
+                if (c.is_object() && c.value("ok", false)) {
+                    auto lineOf = [](const nlohmann::json& b) {
+                        std::wstringstream line;
+                        line << Tr(L"実行 ", L"runs ", L"ejecuciones ") << b.value("runs", static_cast<int64_t>(0))
+                             << Tr(L"  成功率 ", L"  success ", L"  éxito ")
+                             << std::fixed << std::setprecision(1) << b.value("successRate", 0.0) * 100.0 << L"%"
+                             << Tr(L"  再試行成功率 ", L"  retry success ", L"  éxito de reintento ")
+                             << b.value("retrySuccessRate", 0.0) * 100.0 << L"%"
+                             << Tr(L"  再発率 ", L"  repeat ", L"  repetición ")
+                             << b.value("failureRepeatRate", 0.0) * 100.0 << L"%"
+                             << Tr(L"  トークン/回 ", L"  tokens/run ", L"  tokens/ejecución ")
+                             << std::setprecision(0) << b.value("avgTokensPerRun", 0.0);
+                        return line.str();
+                    };
+                    msg << Tr(L"注入あり: ", L"With memory:    ", L"Con memoria:    ") << lineOf(c["injected"]) << L"\r\n"
+                        << Tr(L"注入なし: ", L"Without memory: ", L"Sin memoria:    ") << lineOf(c["notInjected"]) << L"\r\n\r\n";
+                    msg << Tr(L"差分 (1回あたり): トークン ", L"Delta per run: tokens ", L"Delta por ejecución: tokens ")
+                        << std::fixed << std::setprecision(0) << c.value("tokenDeltaPerRun", 0.0)
+                        << Tr(L" / 費用 $", L" / cost $", L" / coste $")
+                        << std::setprecision(4) << c.value("costDeltaPerRun", 0.0)
+                        << Tr(L" / 成功率 ", L" / success ", L" / éxito ")
+                        << std::setprecision(1) << c.value("successRateDelta", 0.0) * 100.0 << L"%";
+                    if (c.value("insufficientData", false)) {
+                        msg << L"\r\n" << Tr(L"両方の実行がまだ足りません。注入は既定で無効のままです。",
+                                             L"Not enough runs on both sides yet; injection stays off by default.",
+                                             L"Aún no hay suficientes ejecuciones; la inyección sigue desactivada.");
+                    }
+                } else {
+                    msg << Tr(L"比較できませんでした: ", L"Could not compare: ", L"No se pudo comparar: ")
+                        << Utf8ToWide(c.is_object() ? c.value("error", std::string()) : std::string("invalid response"));
+                }
+                MessageBoxW(hwnd, msg.str().c_str(), Tr(L"注入の効果", L"Memory injection effect", L"Efecto de la inyección"),
+                            MB_OK | MB_ICONINFORMATION);
+                return 0;
+            }
+            if (id == 2804 || id == 2805) {
+                int sel = ListView_GetNextItem(ds->list, -1, LVNI_SELECTED);
+                if (sel < 0 || static_cast<size_t>(sel) >= ds->rows.size()) {
+                    MessageBoxW(hwnd, Tr(L"ノートを選択してください", L"Select a note first", L"Selecciona una nota"),
+                                Tr(L"メモリ", L"Memory", L"Memoria"), MB_OK | MB_ICONINFORMATION);
+                    return 0;
+                }
+                const auto& row = ds->rows[static_cast<size_t>(sel)];
+                std::string kind = row.value("kind", std::string());
+                std::string mid = row.value("id", std::string());
+                if (kind != "note") {
+                    MessageBoxW(hwnd, Tr(L"L2 ノートだけが対象です", L"Only L2 notes can be changed",
+                                         L"Solo se pueden cambiar notas L2"),
+                                Tr(L"メモリ", L"Memory", L"Memoria"), MB_OK | MB_ICONINFORMATION);
+                    return 0;
+                }
+                bool promote = (id == 2805);
+                std::wstring question = promote
+                    ? Tr(L"このノートを L3 プロジェクト知識に昇格しますか？",
+                         L"Promote this note to L3 project knowledge?",
+                         L"¿Promover esta nota a conocimiento L3?")
+                    : Tr(L"このノートを取り消しますか？", L"Retract this note?", L"¿Retirar esta nota?");
+                if (MessageBoxW(hwnd, question.c_str(), Tr(L"メモリ", L"Memory", L"Memoria"),
+                                MB_YESNO | MB_ICONQUESTION | MB_DEFBUTTON2) != IDYES) {
+                    return 0;
+                }
+                std::string err;
+                bool ok = promote ? PromoteMemoryNoteToL3(mid, err) : RetractMemoryNoteById(mid, err);
+                if (!ok) {
+                    MessageBoxW(hwnd, Utf8ToWide(err).c_str(), Tr(L"メモリ", L"Memory", L"Memoria"),
+                                MB_OK | MB_ICONERROR);
+                }
+                MemoryListReload(ds);
+                return 0;
+            }
+            break;
+        }
+        case WM_CTLCOLORSTATIC:
+        case WM_CTLCOLOREDIT:
+        case WM_CTLCOLORLISTBOX: {
+            HDC hdc = reinterpret_cast<HDC>(wParam);
+            SetTextColor(hdc, g_theme.text);
+            SetBkColor(hdc, g_theme.panel);
+            return reinterpret_cast<LRESULT>(g_dialogBgBrush);
+        }
+        case WM_ERASEBKGND: {
+            HDC hdc = reinterpret_cast<HDC>(wParam);
+            RECT rc = {};
+            GetClientRect(hwnd, &rc);
+            FillRect(hdc, &rc, g_dialogBgBrush);
+            return 1;
+        }
+        case WM_CLOSE:
+            DestroyWindow(hwnd);
+            return 0;
+        case WM_NCDESTROY:
+            delete ds;
+            SetWindowLongPtrW(hwnd, GWLP_USERDATA, 0);
+            return 0;
+    }
+    return DefWindowProcW(hwnd, msg, wParam, lParam);
+}
+
+static void ShowMemoryListDialog(DashboardState* st) {
+    if (!st || !st->hwndMain) return;
+    auto* ds = new MemoryListDlgState();
+    ds->dash = st;
+    ds->fontUi = st->hFontUi;
+
+    HINSTANCE hInst = GetModuleHandleW(nullptr);
+    static bool registered = false;
+    if (!registered) {
+        WNDCLASSEXW wc = {};
+        wc.cbSize = sizeof(wc);
+        wc.style = CS_HREDRAW | CS_VREDRAW;
+        wc.lpfnWndProc = MemoryListWndProc;
+        wc.hInstance = hInst;
+        wc.hCursor = LoadCursorW(nullptr, IDC_ARROW);
+        wc.hbrBackground = reinterpret_cast<HBRUSH>(COLOR_BTNFACE + 1);
+        wc.lpszClassName = L"HanchoMemoryListWnd";
+        RegisterClassExW(&wc);
+        registered = true;
+    }
+
+    RECT parent = {};
+    GetWindowRect(st->hwndMain, &parent);
+    int dlgW = 900;
+    int dlgH = 560;
+    int x = parent.left + ((parent.right - parent.left) - dlgW) / 2;
+    int y = parent.top + ((parent.bottom - parent.top) - dlgH) / 2;
+    HWND hDlg = CreateWindowExW(WS_EX_DLGMODALFRAME, L"HanchoMemoryListWnd",
+        Tr(L"メモリ一覧", L"Memory List", L"Lista de memoria"),
+        WS_OVERLAPPEDWINDOW | WS_VISIBLE, x, y, dlgW, dlgH, st->hwndMain, nullptr, hInst, ds);
+    if (hDlg) {
+        ShowWindow(hDlg, SW_SHOW);
+        SetForegroundWindow(hDlg);
+    } else {
+        delete ds;
+    }
 }
 
 static void CopyTextToClipboard(HWND hwnd, const std::wstring& text);
@@ -2515,6 +3705,9 @@ static void ShowTaskQueueContextMenu(DashboardState* st, const std::string& jobI
     AppendMenuW(hMenu, MF_STRING, 3105, Tr(L"終了済みを消去", L"Purge finished", L"Purgar finalizados"));
     AppendMenuW(hMenu, MF_SEPARATOR, 0, nullptr);
     AppendMenuW(hMenu, MF_STRING, 3106, Tr(L"詳細を表示", L"Show details", L"Ver detalles"));
+    AppendMenuW(hMenu, MF_STRING, 3114, Tr(L"なぜ失敗したか", L"Why failed", L"Por qué falló"));
+    AppendMenuW(hMenu, MF_STRING, 3112, Tr(L"過去の実行を表示", L"Show past runs", L"Ver ejecuciones anteriores"));
+    AppendMenuW(hMenu, MF_STRING, 3113, Tr(L"メモリ一覧...", L"Memory list...", L"Lista de memoria..."));
     if (resp.find("\"bt\":{") != std::string::npos) {
         AppendMenuW(hMenu, MF_STRING, 3111, Tr(L"ビヘイビアツリーで表示", L"Show in Behavior Tree", L"Ver en el árbol de comportamiento"));
     }
@@ -2557,6 +3750,12 @@ static void ShowTaskQueueContextMenu(DashboardState* st, const std::string& jobI
         }
     } else if (cmd == 3106) {
         ShowTaskQueueJobDetails(st, jobId);
+    } else if (cmd == 3112) {
+        ShowTaskQueueJobDetails(st, jobId, 1);
+    } else if (cmd == 3114) {
+        ShowTaskQueueJobDetails(st, jobId, 2);
+    } else if (cmd == 3113) {
+        ShowMemoryListDialog(st);
     }
     RefreshDashboardData(st);
 }
@@ -2618,12 +3817,18 @@ static void RefreshTaskQueueData(DashboardState* st) {
     std::vector<std::wstring> newRows;  // kTaskListColumns cells per row, flattened
     std::vector<std::wstring> newOriginTips;  // full origin details per row, for the Origin hover tip
     std::unordered_set<std::string> nowRunning;  // jobs running now, to spot the ones that just ended
+    std::map<std::string, int> failureCounts;   // failure class -> jobs, for the list caption
     newRows.reserve(jobs.size() * kTaskListColumns);
     newOriginTips.reserve(jobs.size());
     for (const auto& j : jobs) {
         std::string jobId = JsonGetString(j, "id", "");
         std::string state = JsonGetString(j, "state", "");
         std::string lastReason = LastAttemptReason(j);
+        std::string failureClass;
+        if (state == "failed") {
+            failureClass = LastFailureClass(j);
+            if (!failureClass.empty()) ++failureCounts[failureClass];
+        }
         std::string kind = "other";
         if (state == "running") {
             kind = "running";
@@ -2658,6 +3863,7 @@ static void RefreshTaskQueueData(DashboardState* st) {
             }
         }
         std::wstring stateStr = TaskQueueStateLabel(state, j, stateById);
+        if (!failureClass.empty()) stateStr += L" \u00B7 " + Utf8ToWide(failureClass);
         if (!notes.empty()) stateStr += L" \U0001F4DD";
         std::string attemptStart = LastAttemptField(j, "start");
         std::string attemptEnd = LastAttemptField(j, "end");
@@ -2669,8 +3875,10 @@ static void RefreshTaskQueueData(DashboardState* st) {
                 endStr = Utf8ToWide(TimeOfDayText(attemptEnd));
             } else if (state == "running") {
                 int timeoutSec = static_cast<int>(JsonGetInt(j, "timeout_sec", 0));
-                if (timeoutSec > 0) {
-                    std::string est = AddSecondsToTimestamp(attemptStart, timeoutSec);
+                int estimateSec = static_cast<int>(JsonGetInt(j, "estimate_sec", 0));
+                int budgetSec = estimateSec > 0 ? estimateSec : timeoutSec;
+                if (budgetSec > 0) {
+                    std::string est = AddSecondsToTimestamp(attemptStart, budgetSec);
                     int y = 0, mo = 0, d = 0, h = 0, mi = 0, sec = 0;
                     if (sscanf_s(attemptStart.c_str(), "%d-%d-%d %d:%d:%d", &y, &mo, &d, &h, &mi, &sec) == 6) {
                         struct tm t = {};
@@ -2685,7 +3893,7 @@ static void RefreshTaskQueueData(DashboardState* st) {
                         if (startEpoch != static_cast<time_t>(-1)) {
                             time_t nowEpoch = time(nullptr);
                             int64_t elapsed = static_cast<int64_t>(nowEpoch - startEpoch);
-                            int64_t remSec = static_cast<int64_t>(timeoutSec) - elapsed;
+                            int64_t remSec = static_cast<int64_t>(budgetSec) - elapsed;
                             if (remSec < 0) remSec = 0;
                             if (!est.empty()) {
                                 endStr = L"~" + Utf8ToWide(TimeOfDayText(est)) + L" (" + FormatRemainingTime(remSec) + L")";
@@ -2701,12 +3909,14 @@ static void RefreshTaskQueueData(DashboardState* st) {
             }
         } else if (state == "pending") {
             int timeoutSec = static_cast<int>(JsonGetInt(j, "timeout_sec", 0));
-            if (timeoutSec > 0) {
-                endStr = FormatRemainingTime(timeoutSec);
+            int estimateSec = static_cast<int>(JsonGetInt(j, "estimate_sec", 0));
+            int budgetSec = estimateSec > 0 ? estimateSec : timeoutSec;
+            if (budgetSec > 0) {
+                endStr = FormatRemainingTime(budgetSec);
             }
         }
         // Follow a task only when its process has just started, so a selection made by hand is kept.
-        if (state == "running") {
+        if (state == "running" && JsonGetString(j, "host", "").empty()) {
             auto attemptsSel = SplitJsonObjectArray(j, "attempts");
             if (!attemptsSel.empty()) {
                 int64_t pidSel = JsonGetInt(attemptsSel.back(), "process_id", 0);
@@ -2723,6 +3933,8 @@ static void RefreshTaskQueueData(DashboardState* st) {
             depsStr += L"<- " + Utf8ToWide(blockedBy);
         }
         std::wstring queueStr = Utf8ToWide(JsonGetString(j, "taskqueue", ""));
+        const std::string jobHost = JsonGetString(j, "host", "");
+        if (!jobHost.empty()) queueStr += L" @ " + Utf8ToWide(jobHost);
         std::wstring originTip;
         std::wstring originStr = TaskQueueOriginDisplay(j, originTip);
         newOriginTips.push_back(std::move(originTip));
@@ -2747,10 +3959,16 @@ static void RefreshTaskQueueData(DashboardState* st) {
     st->taskJobStates = std::move(newJobStates);
     st->taskJobProcIds = std::move(newJobProcIds);
     st->taskOriginTips = std::move(newOriginTips);
+    std::wstring failureSummary = FailureClassSummary(failureCounts);
+    if (!failureSummary.empty()) {
+        failureSummary = Tr(L"失敗: ", L"failed: ", L"fallos: ") + failureSummary;
+    }
     if (newRows == st->lastTaskRows && newJobIds == st->taskJobIds &&
+        failureSummary == st->taskFailureSummary &&
         ListView_GetItemCount(st->hwndTaskList) == static_cast<int>(newJobIds.size())) {
         return;
     }
+    st->taskFailureSummary = std::move(failureSummary);
 
     // Rebuilding the list drops the highlight, so remember which job was selected and select it again.
     std::string keepSelectedJob;
@@ -3417,6 +4635,8 @@ struct TaskDetailsDlgState {
     int procId = 0;
     ProcessSnapshot snap;
     std::wstring fullOutput;
+    std::wstring whyText;  // diagnosis of the task-queue attempt that ran this process
+    nlohmann::json failure; // the same diagnosis, attached to the stream JSON tree
     HFONT hFontUi = nullptr;
     HFONT hFontBold = nullptr;
     HFONT hFontMono = nullptr;
@@ -3595,10 +4815,15 @@ static LRESULT CALLBACK TaskDetailsWndProc(HWND hwnd, UINT msg, WPARAM wParam, L
                    << L" (" << Utf8ToWide(FormatDurationSec(ds->snap.elapsedMs)) << L")\r\n"
                    << Tr(L"CPU時間         : ", L"CPU Time        : ", L"Tiempo de CPU   : ") << Utf8ToWide(FormatUptimeHMS(ds->snap.cpuTimeMs)) << L"\r\n"
                    << Tr(L"ログファイル    : ", L"Log File        : ", L"Archivo de log  : ") << Utf8ToWide(ds->snap.logFilePath) << L"\r\n"
-                   << Tr(L"完了ファイル    : ", L"Done File       : ", L"Archivo .done   : ") << Utf8ToWide(ds->snap.doneFilePath) << L"\r\n"
-                   << L"--------------------------------------------------------------------------------\r\n"
-                   << ds->fullOutput;
-                SetWindowTextW(ds->hwndEditInfo, ss.str().c_str());
+                    << Tr(L"完了ファイル    : ", L"Done File       : ", L"Archivo .done   : ") << Utf8ToWide(ds->snap.doneFilePath) << L"\r\n";
+                 if (!ds->whyText.empty()) {
+                     ss << L"--------------------------------------------------------------------------------\r\n"
+                        << Tr(L"なぜ失敗したか:", L"Why it failed:", L"Por qué falló:") << L"\r\n"
+                        << ds->whyText;
+                 }
+                 ss << L"--------------------------------------------------------------------------------\r\n"
+                    << ds->fullOutput;
+                 SetWindowTextW(ds->hwndEditInfo, ss.str().c_str());
             }
 
             ds->hwndBtnCopyCmd = CreateWindowExW(0, L"BUTTON", Tr(L"コマンドラインをコピー", L"Copy Command Line", L"Copiar línea de comandos"),
@@ -3823,6 +5048,31 @@ static LRESULT CALLBACK TaskDetailsWndProc(HWND hwnd, UINT msg, WPARAM wParam, L
     return DefWindowProcW(hwnd, msg, wParam, lParam);
 }
 
+// A process started by a task-queue attempt inherits that attempt's diagnosis, so the
+// process detail window can answer "why did it stop" without opening the job.
+static nlohmann::json FailureForProcess(DashboardState* st, int procId) {
+    if (!st || !st->tqm || procId <= 0) return nlohmann::json();
+    std::string err;
+    std::string resp = st->tqm->TaskQueueList("", "", 0, err);
+    nlohmann::json root = nlohmann::json::parse(resp, nullptr, false);
+    if (root.is_discarded() || !root.is_object()) return nlohmann::json();
+    auto jobs = root.find("jobs");
+    if (jobs == root.end() || !jobs->is_array()) return nlohmann::json();
+    nlohmann::json failure;
+    for (const auto& job : *jobs) {
+        if (!job.is_object()) continue;
+        auto attempts = job.find("attempts");
+        if (attempts == job.end() || !attempts->is_array()) continue;
+        for (const auto& attempt : *attempts) {
+            if (!attempt.is_object()) continue;
+            if (attempt.value("process_id", 0) != procId) continue;
+            auto f = attempt.find("failure");
+            if (f != attempt.end() && f->is_object() && !f->empty()) failure = *f;
+        }
+    }
+    return failure;
+}
+
 static void ShowTaskDetailsDialog(DashboardState* st, int procId) {
     if (!st || !st->pm || procId <= 0) return;
     ProcessSnapshot snap;
@@ -3850,6 +5100,8 @@ static void ShowTaskDetailsDialog(DashboardState* st, int procId) {
     ds->snap = snap;
     ds->hFontUi = st->hFontUi;
     ds->hFontBold = st->hFontUiBold;
+    ds->failure = FailureForProcess(st, procId);
+    ds->whyText = ds->failure.empty() ? L"" : WhyFailureText(ds->failure);
 
     std::string outUtf8;
     st->pm->GetOutput(procId, true, 200, outUtf8);
@@ -3887,16 +5139,20 @@ static void ShowTaskDetailsDialog(DashboardState* st, int procId) {
         }
         root["process"] = proc;
 
-        std::vector<LlmStreamEvent> events;
+        std::vector<LlmStreamEvent> stateEvents;
         LlmAgentState agStateObj;
         if (st->pm) {
-            st->pm->GetAgentStream(procId, 0, "", 0, events, agStateObj);
+            st->pm->GetAgentStream(procId, 1, "", 0, stateEvents, agStateObj);
         }
 
+        auto v1Events = ReadHanchoEventsFile(
+            HanchoEventsFilePathForStream(snap.streamFilePath), 0, "", 0);
         std::string modelForState = agStateObj.model;
         if (modelForState.empty()) {
-            for (const auto& ev : events) {
-                if (!ev.model.empty()) { modelForState = ev.model; break; }
+            for (const auto& ev : v1Events) {
+                if (!ev.contains("agent") || !ev["agent"].is_object()) continue;
+                std::string model = ev["agent"].value("model", std::string());
+                if (!model.empty()) { modelForState = model; break; }
             }
         }
         nlohmann::json agState = nlohmann::json::object();
@@ -3915,37 +5171,9 @@ static void ShowTaskDetailsDialog(DashboardState* st, int procId) {
         root["agentState"] = agState;
 
         nlohmann::json evArray = nlohmann::json::array();
-        for (const auto& ev : events) {
-            nlohmann::json evObj = nlohmann::json::object();
-            evObj["seq"] = ev.seq;
-            evObj["timestamp"] = ev.timestamp;
-            evObj["type"] = ev.type;
-            evObj["agentType"] = ev.agentType;
-            if (!ev.model.empty()) evObj["model"] = ev.model;
-            if (!ev.toolName.empty()) evObj["toolName"] = ev.toolName;
-            if (!ev.toolAction.empty()) evObj["toolAction"] = ev.toolAction;
-            if (!ev.toolInput.empty()) {
-                auto parsedInput = nlohmann::json::parse(ev.toolInput, nullptr, false);
-                if (!parsedInput.is_discarded()) {
-                    evObj["toolInput"] = parsedInput;
-                } else {
-                    evObj["toolInput"] = ev.toolInput;
-                }
-            }
-            if (!ev.content.empty()) {
-                evObj["content"] = ev.content;
-            }
-            if (ev.totalTokens > 0) evObj["totalTokens"] = ev.totalTokens;
-            if (ev.costUsd > 0.0) evObj["costUsd"] = ev.costUsd;
-            if (!ev.rawJson.empty()) {
-                auto parsedRaw = nlohmann::json::parse(ev.rawJson, nullptr, false);
-                if (!parsedRaw.is_discarded()) {
-                    evObj["rawEvent"] = parsedRaw;
-                }
-            }
-            evArray.push_back(evObj);
-        }
+        for (const auto& ev : v1Events) evArray.push_back(ev);
         root["streamEvents"] = evArray;
+        if (!ds->failure.empty()) root["failure"] = ds->failure;
 
         ds->rootJson = std::move(root);
         ds->isJsonMode = true;
@@ -4546,11 +5774,40 @@ struct ActivityRow {
     uint64_t tokAll = 0;     // sub-agent row: its total, which has no split into the other four
 };
 
+// One normalized hancho.event/1 event, shaped for the monitor pane. The pane reads only these,
+// from <log>.events.jsonl; the internal LlmStreamEvent type stays in the stream layer.
+struct MonitorEvent {
+    uint64_t seq = 0;
+    int64_t recvEpochMs = 0;
+    std::string timestamp;
+    std::string kind;
+    std::string agentType;
+    std::string model;
+    std::string agentId;
+    std::string toolUseId;
+    std::string toolName;
+    std::string activity;
+    std::string target;
+    std::string note;
+    std::string text;        // thought / message / error / raw text
+    std::string toolInput;   // data.input, serialized
+    std::string planTarget;  // kind == "plan": "2/5 done: ..."
+    std::string rawJson;
+    nlohmann::json data = nlohmann::json::object();
+    uint64_t inputTokens = 0;
+    uint64_t outputTokens = 0;
+    uint64_t thinkingTokens = 0;
+    uint64_t cacheReadTokens = 0;
+    uint64_t cacheWriteTokens = 0;
+    uint64_t totalTokens = 0;
+    double costUsd = 0.0;
+};
+
 struct LlmStreamDlgState {
     DashboardState* dash = nullptr;
     int procId = 0;
     ProcessSnapshot snap;
-    std::vector<LlmStreamEvent> events;
+    std::vector<MonitorEvent> events;
     std::vector<ActivityRow> rows;     // flat steps, oldest first: the time chart reads these
     std::vector<ActivityTreeRow> treeRows;  // what the list shows, in display order (see BuildMonitorTreeRows)
     ActivityTreeOverrides treeOverrides;    // branches the user opened (true) or closed (false), by sub-agent id
@@ -4562,7 +5819,9 @@ struct LlmStreamDlgState {
     std::string goalJobSummary;
     std::wstring goalJobSuccess;       // "exit 0, output /re/ ..."
     std::wstring goalJobResources;     // "write: ... / read: ..." or "(none)"
+    std::wstring goalJobMemoryRefs;    // ids of the memory records injected into this attempt
     int goalJobMaxAttempts = 0;
+    int goalJobAttempt = -1;
     LlmAgentState agentState;
     HFONT hFontUi = nullptr;
     HFONT hFontBold = nullptr;
@@ -4596,6 +5855,205 @@ struct TimeSpan {
     int64_t lengthMs = 1000;
 };
 
+// ISO 8601 UTC ("2026-11-10T09:12:33.120Z") to epoch milliseconds.
+static int64_t ParseIsoUtcMs(const std::string& ts) {
+    if (ts.size() < 20) return 0;
+    std::tm tmv = {};
+    int millis = 0;
+    if (std::sscanf(ts.c_str(), "%4d-%2d-%2dT%2d:%2d:%2d.%3dZ", &tmv.tm_year, &tmv.tm_mon,
+                    &tmv.tm_mday, &tmv.tm_hour, &tmv.tm_min, &tmv.tm_sec, &millis) < 6) {
+        return 0;
+    }
+    tmv.tm_year -= 1900;
+    tmv.tm_mon -= 1;
+    int64_t sec = static_cast<int64_t>(_mkgmtime64(&tmv));
+    return sec * 1000 + millis;
+}
+
+static std::string MonitorClipUtf8(const std::string& s, size_t maxBytes) {
+    if (s.size() <= maxBytes) return s;
+    size_t n = maxBytes;
+    while (n > 0 && (static_cast<unsigned char>(s[n]) & 0xC0) == 0x80) --n;
+    return s.substr(0, n);
+}
+
+// "2/5 done: fixing tests" from a v1 plan event's data.items.
+static std::string PlanTargetFromItems(const nlohmann::json& items) {
+    if (!items.is_array()) return "";
+    int done = 0;
+    std::string current;
+    for (const auto& item : items) {
+        if (!item.is_object()) continue;
+        std::string status = item.value("status", std::string());
+        if (status == "completed") {
+            ++done;
+        } else if (status == "in_progress" && current.empty()) {
+            current = item.value("content", std::string());
+        }
+    }
+    std::string out = std::to_string(done) + "/" + std::to_string(items.size()) + " done";
+    if (!current.empty()) out += ": " + current;
+    return out;
+}
+
+static MonitorEvent MonitorEventFromJson(const nlohmann::json& j) {
+    MonitorEvent ev;
+    ev.rawJson = j.dump(-1, ' ', false, nlohmann::json::error_handler_t::replace);
+    ev.seq = j.value("seq", uint64_t{0});
+    if (j.contains("ts") && j["ts"].is_string()) {
+        ev.timestamp = j["ts"].get<std::string>();
+        ev.recvEpochMs = ParseIsoUtcMs(ev.timestamp);
+    }
+    ev.kind = j.value("kind", std::string());
+    if (j.contains("agent") && j["agent"].is_object()) {
+        const auto& a = j["agent"];
+        ev.agentType = a.value("type", std::string());
+        ev.model = a.value("model", std::string());
+        ev.agentId = a.value("agentId", std::string());
+    }
+    if (j.contains("data") && j["data"].is_object()) {
+        const auto& d = j["data"];
+        ev.data = d;
+        if (d.contains("tool") && d["tool"].is_string()) ev.toolName = d["tool"].get<std::string>();
+        if (d.contains("activity") && d["activity"].is_string()) ev.activity = d["activity"].get<std::string>();
+        if (d.contains("target") && d["target"].is_string()) ev.target = d["target"].get<std::string>();
+        if (d.contains("note") && d["note"].is_string()) ev.note = d["note"].get<std::string>();
+        if (d.contains("toolUseId") && d["toolUseId"].is_string()) ev.toolUseId = d["toolUseId"].get<std::string>();
+        if (d.contains("input")) ev.toolInput = d["input"].dump();
+        if (d.contains("text") && d["text"].is_string()) ev.text = d["text"].get<std::string>();
+        if (d.contains("message") && d["message"].is_string()) ev.text = d["message"].get<std::string>();
+        if (d.contains("summary") && d["summary"].is_string()) ev.text = d["summary"].get<std::string>();
+        if (d.contains("error") && d["error"].is_string()) ev.text = d["error"].get<std::string>();
+        if (d.contains("items")) ev.planTarget = PlanTargetFromItems(d["items"]);
+        ev.inputTokens = d.value("inputTokens", uint64_t{0});
+        ev.outputTokens = d.value("outputTokens", uint64_t{0});
+        ev.thinkingTokens = d.value("thinkingTokens", uint64_t{0});
+        ev.cacheReadTokens = d.value("cacheReadTokens", uint64_t{0});
+        ev.cacheWriteTokens = d.value("cacheWriteTokens", uint64_t{0});
+        ev.totalTokens = d.value("totalTokens", uint64_t{0});
+        ev.costUsd = d.value("costUsd", 0.0);
+    }
+    return ev;
+}
+
+// The monitor pane's only event source: the normalized .events.jsonl for the process.
+static void LoadMonitorEvents(const ProcessSnapshot& snap, std::vector<MonitorEvent>& out) {
+    out.clear();
+    if (snap.streamFilePath.empty()) return;
+    const std::string eventsPath = HanchoEventsFilePathForStream(snap.streamFilePath);
+    auto raw = ReadHanchoEventsFile(eventsPath, 300, "", 0);
+    out.reserve(raw.size());
+    for (const auto& j : raw) out.push_back(MonitorEventFromJson(j));
+}
+
+// Internal bridge: the sub-agent tree builder still consumes LlmStreamEvent. Used only when the
+// run has sub-agents, and never to read the .stream.jsonl file.
+static LlmStreamEvent ToInternalStreamEvent(const MonitorEvent& m) {
+    LlmStreamEvent ev;
+    ev.seq = m.seq;
+    ev.recvEpochMs = m.recvEpochMs;
+    ev.timestamp = m.timestamp;
+    ev.agentType = m.agentType;
+    ev.model = m.model;
+    ev.agentId = m.agentId;
+    ev.toolUseId = m.toolUseId;
+    ev.inputTokens = m.inputTokens;
+    ev.outputTokens = m.outputTokens;
+    ev.thinkingTokens = m.thinkingTokens;
+    ev.cacheReadTokens = m.cacheReadTokens;
+    ev.cacheWriteTokens = m.cacheWriteTokens;
+    ev.totalTokens = m.totalTokens;
+    ev.costUsd = m.costUsd;
+    if (m.kind == "tool.call") {
+        ev.type = "tool_call";
+        ev.toolName = m.toolName;
+        ev.toolInput = m.toolInput;
+    } else if (m.kind == "plan") {
+        ev.type = "tool_call";
+        ev.toolName = "TodoWrite";
+        nlohmann::json todos = nlohmann::json::object();
+        todos["todos"] = m.data.value("items", nlohmann::json::array());
+        ev.toolInput = todos.dump();
+    } else if (m.kind == "tool.result") {
+        ev.type = "tool_result";
+        ev.content = m.text;
+    } else if (m.kind == "thought") {
+        ev.type = "thinking";
+        ev.content = m.text;
+    } else if (m.kind == "message") {
+        ev.type = "message";
+        ev.content = m.text;
+    } else if (m.kind == "run.ended") {
+        ev.type = "result";
+    } else if (m.kind == "error") {
+        ev.type = "error";
+        ev.content = m.text;
+    } else if (m.kind == "usage") {
+        ev.type = "step";
+    } else {
+        ev.type = "other";
+    }
+    return ev;
+}
+
+// Activity kind/target for a v1 event: the same plain-language steps as DescribeLlmActivity.
+static bool DescribeMonitorActivity(const MonitorEvent& ev, std::string& kind, std::string& target) {
+    kind.clear();
+    target.clear();
+    if (ev.kind == "tool.call") {
+        kind = ev.activity.empty() ? "tool" : ev.activity;
+        target = ev.target;
+    } else if (ev.kind == "plan") {
+        kind = "plan";
+        target = ev.planTarget;
+    } else if (ev.kind == "tool.result") {
+        kind = "waiting_model";
+    } else if (ev.kind == "thought") {
+        kind = "thinking";
+        target = ev.text;
+    } else if (ev.kind == "message") {
+        if (ev.text.empty()) return false;
+        kind = "replying";
+        target = ev.text;
+    } else if (ev.kind == "error") {
+        kind = "error";
+        target = ev.text;
+    } else if (ev.kind == "run.ended") {
+        kind = "done";
+    } else {
+        return false;
+    }
+    for (char& c : target) {
+        if (c == '\r' || c == '\n' || c == '\t') c = ' ';
+    }
+    target = MonitorClipUtf8(target, 300);
+    return true;
+}
+
+// The same compact usage line as LlmEventUsageText, over a normalized event.
+static std::string MonitorEventUsageText(const MonitorEvent& ev) {
+    std::ostringstream o;
+    auto sep = [&]() { if (!o.str().empty()) o << " / "; };
+    auto addCount = [&](const char* label, uint64_t v) {
+        if (v == 0) return;
+        sep();
+        o << label << " " << v;
+    };
+    addCount("in", ev.inputTokens);
+    addCount("out", ev.outputTokens);
+    addCount("think", ev.thinkingTokens);
+    if (ev.inputTokens == 0 && ev.outputTokens == 0 && ev.thinkingTokens == 0) addCount("tok", ev.totalTokens);
+    addCount("cacheR", ev.cacheReadTokens);
+    addCount("cacheW", ev.cacheWriteTokens);
+    if (ev.costUsd > 0.0) {
+        sep();
+        char buf[32];
+        snprintf(buf, sizeof(buf), "$%.4f", ev.costUsd);
+        o << buf;
+    }
+    return o.str();
+}
+
 static TimeSpan ComputeRunSpan(const LlmStreamDlgState* ds) {
     TimeSpan span;
     int64_t start = ds->snap.startEpochSec > 0 ? ds->snap.startEpochSec * 1000
@@ -4615,7 +6073,7 @@ static void TimeAxisExtent(const RECT& rc, int& left, int& right) {
     right = rc.right - 8;
 }
 
-static std::vector<UsageBar> BuildUsageBars(const RECT& rc, const std::vector<LlmStreamEvent>& events, const TimeSpan& span) {
+static std::vector<UsageBar> BuildUsageBars(const RECT& rc, const std::vector<MonitorEvent>& events, const TimeSpan& span) {
     std::vector<UsageBar> bars;
     if (rc.right <= rc.left || rc.bottom <= rc.top) return bars;
 
@@ -4678,8 +6136,8 @@ static COLORREF BlendColor(COLORREF from, COLORREF to, int percentTo) {
                mix(GetBValue(from), GetBValue(to)));
 }
 
-static void DrawUsageGraph(HDC hdc, const RECT& rc, const std::vector<LlmStreamEvent>& events,
-                           const LlmStreamEvent* selected, int selectedIndex, const TimeSpan& span) {
+static void DrawUsageGraph(HDC hdc, const RECT& rc, const std::vector<MonitorEvent>& events,
+                           const MonitorEvent* selected, int selectedIndex, const TimeSpan& span) {
     if (rc.right <= rc.left || rc.bottom <= rc.top) return;
     const COLORREF softLine = BlendColor(g_theme.panel, g_theme.border, 60);
 
@@ -4710,8 +6168,8 @@ static void DrawUsageGraph(HDC hdc, const RECT& rc, const std::vector<LlmStreamE
         return;
     }
 
-    if (selected && !LlmEventUsageText(*selected).empty()) {
-        std::wstring usage = Utf8ToWide(LlmEventUsageText(*selected));
+    if (selected && !MonitorEventUsageText(*selected).empty()) {
+        std::wstring usage = Utf8ToWide(MonitorEventUsageText(*selected));
         RECT valRc = {rc.left + 50, rc.top + 4, rc.right - 8, rc.top + 18};
         SetTextColor(hdc, g_theme.text);
         DrawTextW(hdc, usage.c_str(), -1, &valRc, DT_RIGHT | DT_SINGLELINE | DT_END_ELLIPSIS);
@@ -4727,7 +6185,7 @@ static void DrawUsageGraph(HDC hdc, const RECT& rc, const std::vector<LlmStreamE
     }
 
     // Peak value at the top right, unless the selected event's usage already sits there.
-    if (!(selected && !LlmEventUsageText(*selected).empty())) {
+    if (!(selected && !MonitorEventUsageText(*selected).empty())) {
         std::wstring peakText = maxVal >= 1000 ? std::to_wstring(maxVal / 1000) + L"k" : std::to_wstring(maxVal);
         RECT peakRc = {rc.left + 50, rc.top + 4, rc.right - 8, rc.top + 18};
         SetTextColor(hdc, g_theme.muted);
@@ -4915,7 +6373,7 @@ static std::wstring TokenCountText(uint64_t n) {
 }
 
 // One line on what the agent is doing now, taken from the JSON stream.
-static std::wstring StreamActivityText(const LlmAgentState& as, const std::vector<LlmStreamEvent>& events) {
+static std::wstring StreamActivityText(const LlmAgentState& as, const std::vector<MonitorEvent>& events) {
     std::wstring text;
     if (as.status == "calling_tool" && !as.currentTool.empty()) {
         text = Utf8ToWide(as.currentTool);
@@ -4928,7 +6386,7 @@ static std::wstring StreamActivityText(const LlmAgentState& as, const std::vecto
     else if (as.status == "error") detail = as.lastError;
     if (detail.empty() && !events.empty()) {
         const auto& ev = events.back();
-        detail = !ev.toolAction.empty() ? ev.toolAction : ev.content;
+        detail = !ev.activity.empty() ? ev.activity : ev.text;
     }
     for (char& c : detail) {
         if (c == '\r' || c == '\n' || c == '\t') c = ' ';
@@ -4945,7 +6403,7 @@ static std::wstring TokenCellText(uint64_t n) {
     return n == 0 ? std::wstring(L"-") : TokenCountText(n);
 }
 
-static void AddEventTokens(ActivityRow& row, const LlmStreamEvent& ev) {
+static void AddEventTokens(ActivityRow& row, const MonitorEvent& ev) {
     uint64_t in = ev.inputTokens;
     uint64_t out = ev.outputTokens;
     uint64_t think = ev.thinkingTokens;
@@ -4957,11 +6415,11 @@ static void AddEventTokens(ActivityRow& row, const LlmStreamEvent& ev) {
     row.tokCache += cache;
 }
 
-static std::vector<ActivityRow> BuildActivityRows(const std::vector<LlmStreamEvent>& events, bool running) {
+static std::vector<ActivityRow> BuildActivityRows(const std::vector<MonitorEvent>& events, bool running) {
     std::vector<ActivityRow> rows;
     for (int i = 0; i < static_cast<int>(events.size()); ++i) {
         std::string kind, target;
-        if (!DescribeLlmActivity(events[i], kind, target)) continue;
+        if (!DescribeMonitorActivity(events[i], kind, target)) continue;
         if (!rows.empty() && rows.back().kind == kind && (kind == "thinking" || kind == "replying")) {
             rows.back().lastEvent = i;
             if (rows.back().target.empty()) rows.back().target = target;
@@ -4971,7 +6429,7 @@ static std::vector<ActivityRow> BuildActivityRows(const std::vector<LlmStreamEve
         ActivityRow r;
         r.kind = kind;
         r.target = target;
-        r.description = DescribeLlmNote(events[i]);
+        r.description = events[i].note;
         r.startMs = events[i].recvEpochMs;
         r.endMs = r.startMs;
         r.firstEvent = r.lastEvent = i;
@@ -5136,7 +6594,10 @@ static void BuildMonitorTreeRows(LlmStreamDlgState* ds, bool running) {
         }
         return;
     }
-    ds->treeRows = BuildActivityTree(ds->events, ds->agentState.subagents, NowEpochMs(), running, ds->treeOverrides);
+    std::vector<LlmStreamEvent> internalEvents;
+    internalEvents.reserve(ds->events.size());
+    for (const auto& ev : ds->events) internalEvents.push_back(ToInternalStreamEvent(ev));
+    ds->treeRows = BuildActivityTree(internalEvents, ds->agentState.subagents, NowEpochMs(), running, ds->treeOverrides);
     // The last activity of each agent (root = "") is the one still running, if its agent is.
     std::map<std::string, int> lastOfOwner;
     for (int i = 0; i < static_cast<int>(ds->treeRows.size()); ++i) {
@@ -5285,13 +6746,16 @@ static void ReloadMonitorPane(HWND hwnd, LlmStreamDlgState* ds) {
     const ProcessSnapshot& s = ds->snap;
     bool running = s.state == ProcState::Running;
 
-    if (!s.jobKey.empty() && ds->dash->tqm && ds->goalJobKey != s.jobKey) {
+    if (!s.jobKey.empty() && ds->dash->tqm &&
+        (ds->goalJobKey != s.jobKey || ds->goalJobAttempt != s.attemptN)) {
         std::string err;
         std::string jobResp = ds->dash->tqm->TaskQueueGet(s.jobKey, false, 0, err);
         auto job = nlohmann::json::parse(jobResp, nullptr, false);
         ds->goalJobKey = s.jobKey;
+        ds->goalJobAttempt = s.attemptN;
         ds->goalJobSummary.clear();
         ds->goalJobSuccess.clear();
+        ds->goalJobMemoryRefs.clear();
         ds->goalJobMaxAttempts = 0;
         {
             std::wstring declared = TaskQueueResourcesDisplay(jobResp);
@@ -5313,9 +6777,36 @@ static void ReloadMonitorPane(HWND hwnd, LlmStreamDlgState* ds) {
                 if (re != succ->end() && re->is_string()) ss << Tr(L" + 出力に /", L" + output /", L" + salida /") << Utf8ToWide(re->get<std::string>()) << L"/";
                 ds->goalJobSuccess = ss.str();
             }
+            auto attempts = job.find("attempts");
+            if (attempts != job.end() && attempts->is_array()) {
+                const nlohmann::json* chosen = nullptr;
+                for (const auto& a : *attempts) {
+                    if (!a.is_object()) continue;
+                    if (a.value("n", 0) == s.attemptN) { chosen = &a; break; }
+                }
+                if (!chosen && !attempts->empty() && attempts->back().is_object()) chosen = &attempts->back();
+                if (chosen) {
+                    auto refs = chosen->find("memory_refs");
+                    if (refs != chosen->end() && refs->is_array()) {
+                        std::wstringstream rs;
+                        bool first = true;
+                        for (const auto& id : *refs) {
+                            if (!id.is_string()) continue;
+                            if (!first) rs << L", ";
+                            first = false;
+                            rs << Utf8ToWide(id.get<std::string>());
+                        }
+                        ds->goalJobMemoryRefs = rs.str();
+                    }
+                }
+            }
         }
     }
-    if (s.jobKey.empty()) ds->goalJobKey.clear();
+    if (s.jobKey.empty()) {
+        ds->goalJobKey.clear();
+        ds->goalJobAttempt = -1;
+        ds->goalJobMemoryRefs.clear();
+    }
     std::string goal = s.supervisorGoal;
     if (goal.empty() && !s.jobKey.empty()) goal = ds->goalJobSummary;
 
@@ -5332,9 +6823,8 @@ static void ReloadMonitorPane(HWND hwnd, LlmStreamDlgState* ds) {
     // End condition: the agent's own TODO list, the job's success check, attempts and time limits.
     std::vector<std::wstring> ends;
     for (auto it = ds->events.rbegin(); it != ds->events.rend(); ++it) {
-        std::string kind, target;
-        if (DescribeLlmActivity(*it, kind, target) && kind == "plan" && target.find(" done") != std::string::npos) {
-            ends.push_back(L"📋 TODO " + Utf8ToWide(target));
+        if (it->kind == "plan" && it->planTarget.find(" done") != std::string::npos) {
+            ends.push_back(L"📋 TODO " + Utf8ToWide(it->planTarget));
             break;
         }
     }
@@ -5373,6 +6863,10 @@ static void ReloadMonitorPane(HWND hwnd, LlmStreamDlgState* ds) {
                    L"(not set: hancho-cli worker info <id> --goal, or a task queue job's summary)",
                    L"(sin definir: hancho-cli worker info <id> --goal)");
     hdr << L"\r\n";
+    if (!ds->goalJobMemoryRefs.empty()) {
+        hdr << Tr(L"注入メモリ: ", L"Injected memory: ", L"Memoria inyectada: ")
+            << ds->goalJobMemoryRefs << L"\r\n";
+    }
     if (!s.jobKey.empty()) {
         hdr << Tr(L"リソース: ", L"Resources: ", L"Recursos: ") << ds->goalJobResources << L"\r\n";
     }
@@ -5465,7 +6959,10 @@ static void ReloadStreamDialogData(HWND hwnd, LlmStreamDlgState* ds) {
         return;
     }
     ds->events.clear();
-    ds->dash->pm->GetAgentStream(ds->procId, 300, "", 0, ds->events, ds->agentState);
+    // The live agent state still comes from the tracker; the event list itself is v1 only.
+    std::vector<LlmStreamEvent> stateOnlyEvents;
+    ds->dash->pm->GetAgentStream(ds->procId, 1, "", 0, stateOnlyEvents, ds->agentState);
+    LoadMonitorEvents(ds->snap, ds->events);
 
     std::string modelStr = ds->agentState.model;
     if (modelStr.empty()) {
@@ -5537,15 +7034,15 @@ static void ReloadStreamDialogData(HWND hwnd, LlmStreamDlgState* ds) {
             const auto& ev = ds->events[i];
             std::wstring seqStr = std::to_wstring(ev.seq);
             std::wstring timeStr = Utf8ToWide(ev.timestamp);
-            std::wstring typeStr = Utf8ToWide(ev.type);
+            std::wstring typeStr = Utf8ToWide(ev.kind);
             std::wstring toolStr = Utf8ToWide(ev.toolName);
-            std::wstring actionStr = Utf8ToWide(ev.toolAction);
-            std::string content = ev.content;
+            std::wstring actionStr = Utf8ToWide(ev.activity);
+            std::string content = ev.text;
             if (content.empty() && !ev.toolInput.empty()) content = ev.toolInput;
             if (content.empty() && !ev.rawJson.empty()) content = ev.rawJson;
             std::wstring contentStr = Utf8ToWide(content);
             if (contentStr.size() > 100) contentStr = contentStr.substr(0, 97) + L"...";
-            std::wstring usageStr = Utf8ToWide(LlmEventUsageText(ev));
+            std::wstring usageStr = Utf8ToWide(MonitorEventUsageText(ev));
 
             LVITEMW lvi = {};
             lvi.mask = LVIF_TEXT | LVIF_PARAM;
@@ -5749,25 +7246,25 @@ static LRESULT CALLBACK LlmStreamWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPA
                         evIdx < static_cast<int>(ds->events.size())) {
                         const auto& ev = ds->events[evIdx];
                         std::wstringstream detail;
-                        detail << L"=== Event #" << ev.seq << L" [" << Utf8ToWide(ev.type) << L"] ===\r\n"
+                        detail << L"=== Event #" << ev.seq << L" [" << Utf8ToWide(ev.kind) << L"] ===\r\n"
                                << L"Timestamp : " << Utf8ToWide(ev.timestamp) << L"\r\n"
                                << L"Agent     : " << Utf8ToWide(ev.agentType) << L"\r\n";
                         if (!ev.toolName.empty()) {
                             detail << L"Tool      : " << Utf8ToWide(ev.toolName) << L"\r\n";
                         }
-                        if (!ev.toolAction.empty()) {
-                            detail << L"Action    : " << Utf8ToWide(ev.toolAction) << L"\r\n";
+                        if (!ev.activity.empty()) {
+                            detail << L"Action    : " << Utf8ToWide(ev.activity) << L"\r\n";
                         }
                         if (!ev.toolInput.empty()) {
                             detail << L"Input     : " << Utf8ToWide(ev.toolInput) << L"\r\n";
                         }
-                        if (!ev.content.empty()) {
-                            detail << L"Content   :\r\n" << Utf8ToWide(ev.content) << L"\r\n";
+                        if (!ev.text.empty()) {
+                            detail << L"Content   :\r\n" << Utf8ToWide(ev.text) << L"\r\n";
                         }
                         if (ev.totalTokens > 0) {
                             detail << L"Tokens    : " << ev.totalTokens << L"\r\n";
                         }
-                        std::string usageText = LlmEventUsageText(ev);
+                        std::string usageText = MonitorEventUsageText(ev);
                         if (!usageText.empty()) {
                             detail << L"Usage     : " << Utf8ToWide(usageText) << L"\r\n";
                         }
@@ -5912,7 +7409,7 @@ static LRESULT CALLBACK LlmStreamWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPA
                     const int ti = MonitorRowAt(ds, selIdx);
                     selIdx = (ti >= 0 && !ds->treeRows[ti].isBranch) ? ds->treeRows[ti].firstEvent : -1;
                 }
-                const LlmStreamEvent* sel = (selIdx >= 0 && selIdx < static_cast<int>(ds->events.size()))
+                const MonitorEvent* sel = (selIdx >= 0 && selIdx < static_cast<int>(ds->events.size()))
                     ? &ds->events[selIdx] : nullptr;
                 TimeSpan span = ComputeRunSpan(ds);
                 DrawUsageGraph(hdc, ds->rcUsageGraph, ds->events, sel, selIdx, span);
@@ -6815,6 +8312,7 @@ static void ShowTrayContextMenu(DashboardState* st) {
     AppendMenuW(hMenu, MF_STRING | MF_DEFAULT, IDM_TRAY_RESTORE, Tr(L"ダッシュボードを復元", L"Restore Dashboard", L"Restaurar panel"));
     AppendMenuW(hMenu, MF_STRING, IDM_TRAY_GRID_VIEW, Tr(L"グリッド表示を開く", L"Open Grid View", L"Abrir vista de cuadrícula"));
     AppendMenuW(hMenu, MF_STRING, IDM_TRAY_USAGE, Tr(L"トークン使用量グラフ", L"Token Usage Graph", L"Gráfico de uso de tokens"));
+    AppendMenuW(hMenu, MF_STRING, IDM_TRAY_MEMORY, Tr(L"メモリ一覧...", L"Memory List...", L"Lista de memoria..."));
     if (IsWindowVisible(st->hwndMain)) {
         AppendMenuW(hMenu, MF_STRING, IDM_TRAY_HIDE, Tr(L"タスクトレイに格納", L"Hide to Tray", L"Ocultar en bandeja"));
     }
@@ -6841,9 +8339,30 @@ static void ShowTrayContextMenu(DashboardState* st) {
         GetClientRect(st->hwndMain, &rcClient);
         LayoutControls(st, rcClient.right, rcClient.bottom);
         InvalidateRect(st->hwndMain, nullptr, FALSE);
+    } else if (cmd == IDM_TRAY_MEMORY) {
+        RestoreFromTray(st);
+        ShowMemoryListDialog(st);
     } else if (cmd == IDM_TRAY_HIDE) {
         HideToTray(st);
     } else if (cmd == IDM_TRAY_EXIT) {
+        // When a dashboard is attached to a --headless core (it runs in the same
+        // process as the core host window), "Exit" only closes the dashboard.
+        // The core and its jobs keep running and can be reattached later with
+        // `Hancho.exe gui`. `Hancho.exe quit` stops the core itself.
+        bool attachedHeadless = false;
+        for (HWND w = FindWindowW(L"HanchoCoreHostWnd", nullptr); w;
+             w = FindWindowExW(nullptr, w, L"HanchoCoreHostWnd", nullptr)) {
+            DWORD ownerPid = 0;
+            GetWindowThreadProcessId(w, &ownerPid);
+            if (ownerPid == GetCurrentProcessId()) {
+                attachedHeadless = true;
+                break;
+            }
+        }
+        if (attachedHeadless) {
+            HideToTray(st);
+            return;
+        }
         st->allowExit = true;
         DestroyWindow(st->hwndMain);
     }
@@ -6922,6 +8441,8 @@ static int ThemeButtonId(UiTheme theme) {
     }
 }
 
+static constexpr int kSettingsTabCount = 5;
+
 struct SettingsDlgState {
     DashboardState* dash = nullptr;
     HWND hwndTitle = nullptr;
@@ -6979,11 +8500,27 @@ struct SettingsDlgState {
       HWND editEndBlinkSec = nullptr;
       HWND lblProcFont = nullptr;
       HWND cmbProcFont = nullptr;
-      HWND lblTaskFont = nullptr;
-      HWND cmbTaskFont = nullptr;
-      HWND tabCtrl = nullptr;
-      std::vector<HWND> tabPages[4];  // controls shown under each tab: 0 appearance, 1 behavior, 2 maintenance, 3 colors
+       HWND lblTaskFont = nullptr;
+       HWND cmbTaskFont = nullptr;
+       HWND hwndAboutTitle = nullptr;
+       HWND hwndAboutVersion = nullptr;
+       HWND hwndAboutDesc = nullptr;
+       HWND tabCtrl = nullptr;
+       // controls shown under each tab: 0 appearance, 1 behavior, 2 maintenance, 3 colors, 4 about
+       std::vector<HWND> tabPages[kSettingsTabCount];
 };
+
+static LRESULT CALLBACK SettingsTabSubclassProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam,
+                                                UINT_PTR, DWORD_PTR) {
+    if (msg == WM_ERASEBKGND) {
+        HDC hdc = reinterpret_cast<HDC>(wParam);
+        RECT rc = {};
+        GetClientRect(hwnd, &rc);
+        FillRect(hdc, &rc, g_dialogBgBrush);
+        return 1;
+    }
+    return DefSubclassProc(hwnd, msg, wParam, lParam);
+}
 
 static void UpdateSettingsDialogTexts(HWND hwnd);
 
@@ -7047,7 +8584,7 @@ static void CommitEndBlinkSettings(SettingsDlgState* ds) {
 // Shows the controls of one tab page and hides the rest.
 static void SelectSettingsTab(SettingsDlgState* ds, int tab) {
     if (!ds) return;
-    for (int p = 0; p < 4; ++p) {
+    for (int p = 0; p < kSettingsTabCount; ++p) {
         for (HWND h : ds->tabPages[p]) ShowWindow(h, p == tab ? SW_SHOW : SW_HIDE);
     }
 }
@@ -7089,19 +8626,31 @@ static void UpdateSettingsDialogTexts(HWND hwnd) {
     SetWindowTextW(ds->chkActivityStyle, Tr(L"実行状態監視ペイン: 行を色分けし、アイコンを表示", L"Execution monitor pane: colour rows and show icons", L"Panel de ejecución: colorear filas y mostrar iconos"));
     SetWindowTextW(ds->btnClose, Tr(L"閉じる", L"Close", L"Cerrar"));
     {
-        const wchar_t* const tabNames[4] = {
+        const wchar_t* const tabNames[kSettingsTabCount] = {
             Tr(L"表示", L"Appearance", L"Apariencia"),
             Tr(L"動作・通知", L"Behavior & alerts", L"Comportamiento y avisos"),
             Tr(L"管理", L"Maintenance", L"Mantenimiento"),
             Tr(L"色", L"Colors", L"Colores"),
+            Tr(L"バージョン情報", L"About", L"Acerca de"),
         };
-        for (int t = 0; t < 4; ++t) {
+        for (int t = 0; t < kSettingsTabCount; ++t) {
             std::wstring name = tabNames[t];
             TCITEMW ti = {};
             ti.mask = TCIF_TEXT;
             ti.pszText = name.data();
             TabCtrl_SetItem(ds->tabCtrl, t, &ti);
         }
+    }
+    if (ds->hwndAboutTitle) SetWindowTextW(ds->hwndAboutTitle, L"Hancho");
+    if (ds->hwndAboutVersion) {
+        std::wstring version = Tr(L"バージョン ", L"Version ", L"Versión ") + Utf8ToWide(PC_VERSION);
+        SetWindowTextW(ds->hwndAboutVersion, version.c_str());
+    }
+    if (ds->hwndAboutDesc) {
+        SetWindowTextW(ds->hwndAboutDesc, Tr(
+            L"Native Win32 マルチ LLM プロセス・ConPTY マネージャー",
+            L"Native Win32 multi-LLM process & ConPTY manager",
+            L"Gestor nativo Win32 de procesos multi-LLM y ConPTY"));
     }
     SetWindowTextW(ds->chkEndBlink, Tr(L"プロセス・タスク終了時に一覧の行を点滅させる", L"Blink list rows when a process or task ends", L"Hacer parpadear las filas al terminar un proceso o tarea"));
     SetWindowTextW(ds->lblEndBlinkSec, Tr(L"点滅秒数 (1〜60, 既定 5):", L"Blink duration (seconds, 1-60, default 5):", L"Duración del parpadeo (segundos, 1-60, predeterminado 5):"));
@@ -7190,10 +8739,11 @@ static LRESULT CALLBACK SettingsWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPAR
             SendMessageW(ds->hwndTitle, WM_SETFONT, (WPARAM)ds->dash->hFontUiBold, TRUE);
 
             ds->tabCtrl = CreateWindowExW(0, WC_TABCONTROLW, L"",
-                WS_CHILD | WS_VISIBLE | WS_TABSTOP | TCS_TABS | TCS_SINGLELINE,
+                WS_CHILD | WS_VISIBLE | WS_TABSTOP | WS_CLIPSIBLINGS | TCS_TABS | TCS_SINGLELINE | TCS_OWNERDRAWFIXED,
                 8, 8, 684, 760, hwnd, (HMENU)IDC_SET_TAB, hInst, nullptr);
             SendMessageW(ds->tabCtrl, WM_SETFONT, (WPARAM)ds->dash->hFontUi, TRUE);
-            for (int t = 0; t < 4; ++t) {
+            SetWindowSubclass(ds->tabCtrl, SettingsTabSubclassProc, 1, 0);
+            for (int t = 0; t < kSettingsTabCount; ++t) {
                 TCITEMW ti = {};
                 ti.mask = TCIF_TEXT;
                 ti.pszText = const_cast<LPWSTR>(L"");
@@ -7378,6 +8928,14 @@ static LRESULT CALLBACK SettingsWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPAR
                 SendMessageW(ds->cmbTaskFont, CB_ADDSTRING, 0, reinterpret_cast<LPARAM>(item.c_str()));
             }
 
+            // About page: product name, version and a one-line description.
+            ds->hwndAboutTitle = CreateWindowExW(0, L"STATIC", L"", WS_CHILD | SS_LEFT,
+                18, 48, 500, 34, hwnd, nullptr, hInst, nullptr);
+            ds->hwndAboutVersion = CreateWindowExW(0, L"STATIC", L"", WS_CHILD | SS_LEFT,
+                18, 92, 500, 24, hwnd, nullptr, hInst, nullptr);
+            ds->hwndAboutDesc = CreateWindowExW(0, L"STATIC", L"", WS_CHILD | SS_LEFT,
+                18, 124, 620, 24, hwnd, nullptr, hInst, nullptr);
+
             HWND ctrls[] = { ds->btnJa, ds->btnEn, ds->btnEs, ds->btnSystem, ds->btnDark, ds->btnLight, ds->btnPastel, ds->btnHc,
                              ds->btnMidnight, ds->btnEmber, ds->btnBerry, ds->btnCrimson, ds->btnForest, ds->btnMist,
                              ds->btnPastelBlue, ds->btnPastelOrange, ds->btnPastelPink, ds->btnPastelRed, ds->btnPastelGreen,
@@ -7391,6 +8949,9 @@ static LRESULT CALLBACK SettingsWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPAR
             for (HWND h : ctrls) SendMessageW(h, WM_SETFONT, (WPARAM)ds->dash->hFontUi, TRUE);
             for (HWND h : ds->btnListBg) SendMessageW(h, WM_SETFONT, (WPARAM)ds->dash->hFontUi, TRUE);
             SendMessageW(ds->lblListBg, WM_SETFONT, (WPARAM)ds->dash->hFontUiBold, TRUE);
+            SendMessageW(ds->hwndAboutTitle, WM_SETFONT, (WPARAM)ds->dash->hFontUiBold, TRUE);
+            SendMessageW(ds->hwndAboutVersion, WM_SETFONT, (WPARAM)ds->dash->hFontUi, TRUE);
+            SendMessageW(ds->hwndAboutDesc, WM_SETFONT, (WPARAM)ds->dash->hFontUi, TRUE);
 
             // Sort the controls into their tab pages.
             {
@@ -7416,10 +8977,15 @@ static LRESULT CALLBACK SettingsWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPAR
                     ds->lblRefreshInterval, ds->editRefreshInterval,
                     ds->chkEndBlink, ds->lblEndBlinkSec, ds->editEndBlinkSec });
                 maintenance.insert(maintenance.end(), { ds->btnShell, ds->btnReset, ds->btnClear });
+                auto& about = ds->tabPages[4];
+                about.insert(about.end(), { ds->hwndAboutTitle, ds->hwndAboutVersion, ds->hwndAboutDesc });
             }
             SelectSettingsTab(ds, 0);
             UpdateSettingsDialogTexts(hwnd);
             ApplyNativeThemeToWindow(hwnd);
+            // The tab pages are fully owner-painted with the dialog colours; theming the tab
+            // control would repaint its body with the system (white) background.
+            SetWindowTheme(ds->tabCtrl, L"", L"");
             return 0;
         }
         case WM_NOTIFY: {
@@ -7532,6 +9098,7 @@ static LRESULT CALLBACK SettingsWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPAR
                 ApplyLanguageToUi(ds->dash);
                 UpdateSettingsDialogTexts(hwnd);
                 InvalidateRect(hwnd, nullptr, TRUE);
+                InvalidateRect(ds->tabCtrl, nullptr, TRUE);
                 return 0;
             }
             if (id >= IDC_SET_THEME_SYSTEM && id <= IDC_SET_THEME_PASTEL_YELLOW) {
@@ -7541,6 +9108,7 @@ static LRESULT CALLBACK SettingsWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPAR
                 ApplyListTheme(ds->dash);
                 ApplyNativeThemeToWindow(ds->dash->hwndMain);
                 ApplyNativeThemeToWindow(hwnd);
+                SetWindowTheme(ds->tabCtrl, L"", L"");
                 HWND shellDlg = FindWindowW(L"HanchoShellConfigWnd", nullptr);
                 if (shellDlg) ApplyNativeThemeToWindow(shellDlg);
                 HWND taskDlg = FindWindowW(L"HanchoTaskDetailsWnd", nullptr);
@@ -7548,6 +9116,7 @@ static LRESULT CALLBACK SettingsWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPAR
                 InvalidateRect(ds->dash->hwndMain, nullptr, TRUE);
                 UpdateSettingsDialogTexts(hwnd);
                 InvalidateRect(hwnd, nullptr, TRUE);
+                InvalidateRect(ds->tabCtrl, nullptr, TRUE);
                 return 0;
             }
             if (id >= IDC_SET_LIST_BG_RUNNING && id < IDC_SET_LIST_BG_RUNNING + kListRowKeyCount) {
@@ -7616,6 +9185,43 @@ static LRESULT CALLBACK SettingsWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPAR
         case WM_DRAWITEM: {
             auto* dis = reinterpret_cast<DRAWITEMSTRUCT*>(lParam);
             if (!dis || !ds) break;
+            if (dis->CtlType == ODT_TAB) {
+                wchar_t text[256] = {};
+                TCITEMW tie = {};
+                tie.mask = TCIF_TEXT;
+                tie.pszText = text;
+                tie.cchTextMax = 256;
+                TabCtrl_GetItem(dis->hwndItem, dis->itemID, &tie);
+                const bool selected = (dis->itemState & ODS_SELECTED) != 0 ||
+                                      TabCtrl_GetCurSel(dis->hwndItem) == static_cast<int>(dis->itemID);
+                HBRUSH bgBrush = CreateSolidBrush(selected ? g_theme.panel : g_theme.windowBg);
+                FillRect(dis->hDC, &dis->rcItem, bgBrush);
+                DeleteObject(bgBrush);
+                HPEN borderPen = CreatePen(PS_SOLID, 1, g_theme.border);
+                HGDIOBJ oldPen = SelectObject(dis->hDC, borderPen);
+                HGDIOBJ oldBrush = SelectObject(dis->hDC, GetStockObject(NULL_BRUSH));
+                Rectangle(dis->hDC, dis->rcItem.left, dis->rcItem.top,
+                          dis->rcItem.right, dis->rcItem.bottom);
+                SelectObject(dis->hDC, oldBrush);
+                SelectObject(dis->hDC, oldPen);
+                DeleteObject(borderPen);
+                if (selected) {
+                    RECT bar = dis->rcItem;
+                    bar.top = bar.bottom - 2;
+                    HBRUSH accentBrush = CreateSolidBrush(g_theme.accent);
+                    FillRect(dis->hDC, &bar, accentBrush);
+                    DeleteObject(accentBrush);
+                }
+                SetBkMode(dis->hDC, TRANSPARENT);
+                SetTextColor(dis->hDC, selected ? g_theme.accent : g_theme.text);
+                HFONT oldFont = static_cast<HFONT>(SelectObject(dis->hDC, ds->dash->hFontUi));
+                RECT rcText = dis->rcItem;
+                InflateRect(&rcText, -6, 0);
+                DrawTextW(dis->hDC, text, -1, &rcText,
+                          DT_CENTER | DT_VCENTER | DT_SINGLELINE | DT_END_ELLIPSIS);
+                SelectObject(dis->hDC, oldFont);
+                return TRUE;
+            }
             int id = static_cast<int>(dis->CtlID);
             bool radio = (id >= IDC_SET_LANG_JA && id <= IDC_SET_LANG_ES) ||
                          (id >= IDC_SET_THEME_SYSTEM && id <= IDC_SET_THEME_PASTEL_YELLOW);
@@ -8325,6 +9931,21 @@ static LRESULT CALLBACK DashboardWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPA
     if (msg == quitMessage) {
         if (st) st->allowExit = true;
         PostMessageW(hwnd, WM_CLOSE, 0, 0);
+        return 0;
+    }
+
+    // `Hancho.exe gui` (or an IPC gui_show request) from another process while the
+    // dashboard is hidden in the tray or minimized: bring it back without touching
+    // the running jobs.
+    static const UINT showMessage = RegisterWindowMessageW(L"HanchoShowGui");
+    if (msg == showMessage) {
+        if (st) {
+            RestoreFromTray(st);
+        } else {
+            ShowWindow(hwnd, SW_SHOW);
+            if (IsIconic(hwnd)) ShowWindow(hwnd, SW_RESTORE);
+            SetForegroundWindow(hwnd);
+        }
         return 0;
     }
 

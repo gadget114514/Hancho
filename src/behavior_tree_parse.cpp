@@ -262,6 +262,7 @@ std::unique_ptr<BtNode> ParseNode(const json& j, const std::string& path, const 
         ReqStr(j, "command", path, t, node->command, ctx);
         ReqStr(j, "summary", path, t, node->summary, ctx);
         ReqPosInt(j, "timeoutSec", path, t, node->timeoutSec, ctx);
+        if (j.contains("estimateSec")) ReqPosInt(j, "estimateSec", path, t, node->estimateSec, ctx);
         if (j.contains("instructionsText") && j["instructionsText"].is_string()) node->instructionsText = j["instructionsText"].get<std::string>();
         if (j.contains("instructionsFile") && j["instructionsFile"].is_string()) node->instructionsFile = j["instructionsFile"].get<std::string>();
         ParseJobCommonFields(j, path, *node, ctx);
@@ -271,6 +272,7 @@ std::unique_ptr<BtNode> ParseNode(const json& j, const std::string& path, const 
         if (node->prompt.empty() && node->promptFile.empty()) ctx.AddError(path, "'worker' requires non-empty 'prompt' or 'promptFile'");
         ReqStr(j, "summary", path, t, node->summary, ctx);
         ReqPosInt(j, "timeoutSec", path, t, node->timeoutSec, ctx);
+        if (j.contains("estimateSec")) ReqPosInt(j, "estimateSec", path, t, node->estimateSec, ctx);
         if (j.contains("engine") && j["engine"].is_string()) node->engine = j["engine"].get<std::string>();
         if (j.contains("model") && j["model"].is_string()) node->model = j["model"].get<std::string>();
         if (j.contains("outputSchema")) {

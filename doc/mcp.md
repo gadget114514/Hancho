@@ -21,7 +21,11 @@ Or let `hancho-cli.exe` write the config for you (merges with existing servers, 
 hancho-cli.exe mcp install                     # .mcp.json (Claude Code)
 hancho-cli.exe mcp install --client opencode   # opencode.json
 hancho-cli.exe mcp install --dry-run --json    # preview
+hancho-cli.exe mcp uninstall                   # remove the entry (keeps data)
+hancho-cli.exe mcp uninstall --delete-data-dir # also delete the data directory
 ```
+
+`mcp uninstall` is the inverse of `mcp install`: it removes only the Hancho entry and leaves other servers alone. Data is kept by default; all Hancho data stays in JSON / JSONL and is readable without Hancho. See [design-v3-en.md section 5.3-5.5](design-v3-en.md) for when leaving is the right call.
 
 You can also run the server directly with `Hancho.exe mcp`. It connects to the dashboard over the Named Pipe and automatically launches `Hancho.exe gui` if the dashboard is not running.
 
@@ -53,3 +57,14 @@ You can also run the server directly with `Hancho.exe mcp`. It connects to the d
 | `taskqueue_purge` | Remove finished jobs (`taskqueue`, `states[]`). |
 | `taskqueue_link` / `taskqueue_unlink` | Add/remove one dependency (`job`, `dependsOn`, `on` = `success`\|`done`). |
 | `taskqueue_graph` | Dependency graph with `ready` / `waiting_for` / `dependents`. |
+
+**Memory tools**
+
+| Tool | Description |
+| :--- | :--- |
+| `memory_search` | BM25-like search over L1 runs, L2 notes and L3 knowledge (`query`, `kinds?`, `scope?`, `file?`, `jobName?`, `taskqueue?`, `engine?`, `model?`, `outcome?`, `failureClass?`, `since?`, `limit?`). |
+| `memory_get` | One record in full, with its source file and line (`id`, `kind?`). |
+| `memory_brief` | Fixed-shape summary for a job (`jobName?`, `taskqueue?`, `file?`, `files?`, `scopes?`, `budgetChars?`, `includeAgentNotes?`, `maxPreviousRuns?`): previous runs, common failures, related notes and project knowledge, with an id on every line. |
+| `memory_stats` | L1 statistics: success rate, duration median/p90, failure classes and token/cost totals, grouped by job, engine and model. |
+
+Promotion to L3 project knowledge is human-only (`hancho-cli memory approve <id>` or the GUI). It is intentionally not an MCP tool, so agents cannot approve knowledge.

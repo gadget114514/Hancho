@@ -2,12 +2,19 @@
 
 #include "common.h"
 #include "llm_stream.h"
+#include "platform/platform.h"
+#ifdef _WIN32
 #include "TerminalView.h"
+#endif
 #include <mutex>
 #include <thread>
 #include <memory>
 #include <atomic>
 #include <functional>
+
+#ifndef _WIN32
+class TerminalView;
+#endif
 
 namespace pc {
 
@@ -28,6 +35,10 @@ struct StartProcessRequest {
     std::string jobKey;      // taskqueue job id (display / callback correlation)
     int jobId = 0;           // taskqueue numeric job id
     int attemptN = 0;        // taskqueue attempt number
+    // Remote dispatch only: the instruction text travels with the request so the
+    // remote host can write it under its own data directory.
+    std::string instructionsText;
+    int instructionsRev = 0;
     std::string agentType;   // "claude", "agy", "opencode", "auto", or ""
     bool jsonStream = false; // enable real-time JSONL stream parsing & logging
     std::string supervisorNotes; // context/instructions provided by supervisor LLM
@@ -181,9 +192,10 @@ private:
         DWORD rootPid = 0;
         std::atomic<DWORD> exitCode{STILL_ACTIVE};
 
+#ifdef _WIN32
         HANDLE hProcess = nullptr;
         HANDLE hThread = nullptr;
-        HANDLE hJob = nullptr;
+        std::unique_ptr<platform::IProcessTree> tree;
         HANDLE hStdinWrite = nullptr;
         HANDLE hStdoutRead = nullptr;
         HANDLE hEventPipe = nullptr;   // HANCHO_EVENT_PIPE server, one per process
@@ -200,6 +212,20 @@ private:
         std::unique_ptr<ConPtySession> headlessPty;
         std::unique_ptr<TerminalBuffer> headlessBuffer;
         std::unique_ptr<TerminalEmulator> headlessEmulator;
+#else
+        int stdinFd = -1;
+        int stdoutFd = -1;
+        int ptyFd = -1;
+        bool ptyMode = false;
+        std::unique_ptr<platform::IPty> pty;
+        std::unique_ptr<platform::IProcessTree> tree;
+        std::string eventEndpoint;
+        std::shared_ptr<platform::IIpcServer> eventServer;
+        std::atomic<bool> eventPipeStop{false};
+        std::atomic<LlmStreamTracker*> eventTracker{nullptr};
+        long exitStatus = -1;
+        bool reaped = false;
+#endif
 
         std::string startTimeStr;
         std::string endTimeStr;
@@ -253,7 +279,11 @@ private:
     void UpdateJobMetrics(ManagedProcess& proc);
     void TerminateJobInternal(ManagedProcess& proc, ProcState finalState, const std::string& reasonMsg);
     void NotifyProcessFinished(ManagedProcess& proc, int exitCode, const std::string& endKind);
+#ifdef _WIN32
     static void WriteDoneFile(ManagedProcess& proc, ProcState finalState, DWORD exitCode, const std::string& endTimeStr, uint64_t elapsedMs, const std::string& reasonMsg);
+#else
+    static void WriteDoneFile(ManagedProcess& proc, ProcState finalState, int exitCode, const std::string& endTimeStr, uint64_t elapsedMs, const std::string& reasonMsg);
+#endif
     static ProcessSnapshot BuildSnapshot(ManagedProcess& p, uint64_t now);
     void SaveState();
     void LoadState();

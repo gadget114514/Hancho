@@ -280,7 +280,7 @@ std::string BtManager::Validate(const std::string& jsonText) {
     return out.dump();
 }
 
-std::string BtManager::Start(const std::string& jsonText) {
+std::string BtManager::Start(const std::string& jsonText, bool paused) {
     std::string err;
     std::lock_guard<std::mutex> lock(mutex_);
 
@@ -304,11 +304,15 @@ std::string BtManager::Start(const std::string& jsonText) {
     TreeEntry* entryPtr = entry.get();
     trees_[btId] = std::move(entry);
 
-    DeleteFileW(GetBtEventsFileWide(btId).c_str());
+    RemoveFileWide(GetBtEventsFileWide(btId));
 
     activeLaunchingQueueName_ = entryPtr->tree->TaskQueueName();
-    entryPtr->tree->Start(NowEpochMs());
+    entryPtr->tree->Start(NowEpochMs(), paused);
     activeLaunchingQueueName_.clear();
+    if (paused) {
+        std::string tqErr;
+        tqm_.TaskQueuePause(entryPtr->tree->TaskQueueName(), true, tqErr);
+    }
 
     PersistEntryLocked(*entryPtr);
     return BuildTreeResponseJson(*entryPtr->tree, TreeView::Summary).dump();
