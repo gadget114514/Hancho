@@ -22,8 +22,8 @@
 
 ## Express
 
-- [Hancho-v0.9.1-win64-setup.exe](https://github.com/gadget114514/Hancho/releases/download/v0.9.1/Hancho-v0.9.1-win64-setup.exe) をダウンロードしてインストール
-  （ポータブル版: [Hancho-v0.9.1-win64.zip](https://github.com/gadget114514/Hancho/releases/download/v0.9.1/Hancho-v0.9.1-win64.zip)、全バージョン: [Releases](https://github.com/gadget114514/Hancho/releases)）
+- [Hancho-v0.9.2-win64-setup.exe](https://github.com/gadget114514/Hancho/releases/download/v0.9.2/Hancho-v0.9.2-win64-setup.exe) をダウンロードしてインストール
+  （ポータブル版: [Hancho-v0.9.2-win64.zip](https://github.com/gadget114514/Hancho/releases/download/v0.9.2/Hancho-v0.9.2-win64.zip)、全バージョン: [Releases](https://github.com/gadget114514/Hancho/releases)）
 - LLM に「PATH から hancho を探して、help を読んで使い方を把握して」と伝える
 - LLM に「タスクを作成して、hancho 経由で (opencode|claude|agy|codex) に実行させて」と伝える
 - 以上
@@ -126,6 +126,13 @@ Hancho は生のストリームの隣に、版番号つきのイベント列を�
 （以下の help 本文は英語です）
 
 ## リリースノート
+
+### v0.9.2
+- **安定したイベントスキーマ**: ワーカーの出力を正規化した `hancho.event/1` イベントとして `logs/proc_<id>_<name>.events.jsonl` にも書きます（生の `.stream.jsonl` はそのまま）。`hancho-cli worker stream <id> --schema v1`、または MCP の `get_worker_stream` に `schema: "v1"` を渡して読めます。JSON Schema は `doc/schema/hancho.event.v1.json` に同梱します。
+- **C++ なしで CLI に対応**: `<data-dir>/adapters/<name>.json` を置く（Tier 1: `match`、`rules`、JSON Pointer の `map`）か、`exec` に変換プロセスを指定します（Tier 3: stdin に生の行、stdout に `hancho.event` 行）。`engines.json` に `adapter` と `capabilities` を書けます。
+- **スクリプトからイベントを送信**: pipe モードのワーカーには `HANCHO_EVENT_PIPE` が渡され、`hancho-cli event emit --kind ... --text ...` で書き込めます。`hancho-cli adapter test <name>` は記録した入力と期待する `{kind, data}` を照合します。
+- **ビヘイビアツリーの並列分岐**: `parallel` ノードの子はそれぞれ専用のタスクキューで動くようになり、分岐が実際に同時実行されます。長いキュー名にはハッシュを付けてファイル名の衝突を防ぎます。
+- **ドキュメントと help**: README と `hancho-cli help` に、イベントスキーマ、アダプター、`HANCHO_EVENT_PIPE`、`--schema v1`、`event emit`、`adapter test` を追記しました。
 
 ### v0.9.1
 - **修正: リソース列のヘッダ色**: タスク一覧の「リソース」列のヘッダが、ほかの列と同じテーマ色（オーナードロー）で描画されます。これまではネイティブの既定色でした。
