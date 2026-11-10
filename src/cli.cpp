@@ -499,6 +499,9 @@ HANCHO-CLI CONCEPTS:
   stdin       : pipe mode keeps stdin writable (hancho-cli send) unless --close-stdin;
                 close it for programs that wait for EOF.
   Logs        : logs/proc_<id>_<name>_<timestamp>.log (or --log-file).
+  Streams     : logs/proc_<id>_<name>_stream.jsonl (raw) and
+                logs/proc_<id>_<name>.events.jsonl (normalized hancho.event/1).
+  Adapters    : <data dir>/adapters/<name>.json (Tier 1 declarative or Tier 3 exec).
   Done file   : atomic JSON on exit (logs/proc_<id>.done or --done-file) with
                 state, exit_code, reason, log_file and done_file.
   cwd / env   : --cwd defaults to the caller's directory; PWD and INIT_CWD are
@@ -514,7 +517,9 @@ EXIT CODES:
        start --wait / wait return the managed process's exit code
 
 ENVIRONMENT:
-  HANCHO_LOG_DIR   Override the logs directory (state, logs, queues).
+  HANCHO_LOG_DIR     Override the logs directory (state, logs, queues).
+  HANCHO_EVENT_PIPE  Set by Hancho for pipe-mode workers; hancho-cli event emit
+                     writes hancho.event/1 lines to this pipe.
 
 EXAMPLES:
   hancho-cli.exe list --json
@@ -554,9 +559,11 @@ COMMANDS:
                                  (e.g. "18:30" or "2026-10-22 18:30:00").
                                  If omitted, --timeout shows "remaining N seconds".
          --estimate-end <time>    Alias for --eta
-         --agent-type <claude|agy|antigravity|opencode|codex|aider|ollama>
+         --agent-type <claude|agy|antigravity|opencode|codex|aider|ollama|adapter>
                                   Hint worker type for JSON stream parsing (auto-detected if omitted).
-         --json-stream            Enable JSONL stream parsing and write <log>.stream.jsonl for LLM worker output.
+                                  A name with <data-dir>/adapters/<name>.json uses that Tier 1/3 adapter.
+         --json-stream            Enable JSONL stream parsing; writes <log>.stream.jsonl and the
+                                  normalized <log>.events.jsonl (hancho.event/1) for LLM workers.
          --wait                   Block until process exits (unlimited unless --wait-ms is set)
         --wait-ms <ms>           Max wait when --wait is set; initial output wait otherwise
                                  (default: 500; 0 = unlimited with --wait)
@@ -861,8 +868,8 @@ void PrintCliUsageJson() {
         {"name": "--timeout", "value": "<sec>", "description": "Maximum runtime in seconds (0 = unlimited)."},
         {"name": "--idle-timeout", "value": "<sec>", "description": "Kill if no output for N seconds (0 = unlimited)."},
         {"name": "--eta", "aliases": ["--estimate-end"], "value": "<time>", "description": "Estimated end time shown in gray in the End Time column while the process is running (e.g. '18:30' or '2026-10-22 18:30:00'). If omitted, --timeout causes the column to show remaining seconds."},
-        {"name": "--agent-type", "value": "<claude|agy|antigravity|opencode|codex|aider|ollama>", "description": "Hint worker type for JSON stream parsing (auto-detected if omitted)."},
-        {"name": "--json-stream", "description": "Enable JSONL stream parsing and write <log>.stream.jsonl for LLM worker output."},
+        {"name": "--agent-type", "value": "<claude|agy|antigravity|opencode|codex|aider|ollama|adapter>", "description": "Hint worker type for JSON stream parsing (auto-detected if omitted). A name with <data-dir>/adapters/<name>.json uses that Tier 1/3 adapter."},
+        {"name": "--json-stream", "description": "Enable JSONL stream parsing; writes <log>.stream.jsonl and the normalized <log>.events.jsonl (hancho.event/1) for LLM workers."},
         {"name": "--wait", "description": "Block until the process exits (unlimited unless --wait-ms is set)."},
         {"name": "--wait-ms", "value": "<ms>", "description": "With --wait: maximum wait (0 = unlimited). Without --wait: initial output wait. Default: 500."}
       ]
@@ -982,7 +989,7 @@ void PrintCliUsageJson() {
     },
     {
       "name": "worker",
-      "description": "Inspect and supervise LLM workers (Claude, agy, opencode, codex, aider, ollama) running under Hancho. JSON stream events are parsed into <log>.stream.jsonl and visible in the GUI (LLM JSON Stream dialog). Use hancho-cli/Hancho to supervise and watch streams.",
+      "description": "Inspect and supervise LLM workers (Claude, agy, opencode, codex, aider, ollama) running under Hancho. JSON stream events are parsed into <log>.stream.jsonl, and normalized hancho.event/1 events into <log>.events.jsonl, both visible in the GUI (LLM JSON Stream dialog). Use hancho-cli/Hancho to supervise and watch streams.",
       "usage": "hancho-cli worker <status|stream|info|install-template> [<id>] [options]",
       "subcommands": [
         {"name": "status", "usage": "hancho-cli worker status <id>", "description": "Display current worker status, model, active tool, thoughts, message, supervisor context, and Claude sub-agents (subagents array)."},
@@ -1158,7 +1165,7 @@ void PrintCliUsageJson() {
         "conditions": "fileExists, fileNewer, outputMatches, exitCode, jsonValue, var, nodeState"
       },
       "variables": "${name} expands BT vars; in command it is quoted as one argument. Node variables: ${<id>.state|exitCode|logFile|jobId|runs}, ${<worker>.result} (final response), ${<worker>.output.<path>} (JSON the worker wrote to PC_BT_RESULT_FILE), ${<escalate>.answer}.",
-      "engines": "Workers name an engine (claude, agy, opencode, codex, or ones in <data dir>/engines.json) and optionally a model; permission flags live only in the engine definition.",
+      "engines": "Workers name an engine (claude, agy, opencode, codex, or ones in <data dir>/engines.json) and optionally a model; permission flags live only in the engine definition. An engine may also set adapter (a Tier 1/3 file in <data dir>/adapters/) and capabilities (jsonStream, resume, reportsUsage, reportsSubagents, permissionModes).",
       "limits": "retry/repeat max <= 100 (required); limits.maxNodeRuns default 200; limits.maxWallSec default 86400; depth 32; 1000 nodes.",
       "rules": [
         "Write intent (the goal) and, on escalate, question + guidance for your future self.",

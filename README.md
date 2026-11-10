@@ -90,6 +90,17 @@ What stays the same: each step is still a normal task-queue job with its own tim
 - **[Token Optimization Guide](doc/behavior-tree-token-optimization.md)** ([日本語版](doc/behavior-tree-token-optimization-ja.md)): Token-saving principles, `compact: true` in `bt_wait`, escalation line/byte limits, preview truncation, and authoring best practices.
 - **[Architecture & Design Plan](doc/behavior-tree-plan-en.md)** ([日本語版](doc/behavior-tree-plan.md)): Original design specification, execution model, safety limits, and integration with the task queue and dashboard.
 
+## Stable events and adapters
+
+Hancho writes a versioned event stream next to the raw one. For a worker process, `logs/proc_<id>_<name>_stream.jsonl` keeps the CLI's raw lines and `logs/proc_<id>_<name>.events.jsonl` holds normalized `hancho.event/1` events (`tool.call`, `tool.result`, `usage`, `run.ended`, ...). The schema is published as [doc/schema/hancho.event.v1.json](doc/schema/hancho.event.v1.json).
+
+- `hancho-cli worker stream <id> --schema v1` returns the normalized events from `.events.jsonl`.
+- MCP `get_worker_stream` takes `schema: "v1"` for the same shape.
+- Add a CLI without C++ by dropping `<data-dir>/adapters/<name>.json` (Tier 1: `match`, `rules`, JSON Pointer `map`), or point `exec` at a converter process (Tier 3: raw lines on stdin, `hancho.event` lines on stdout).
+- `engines.json` may set `adapter` and `capabilities` (`jsonStream`, `resume`, `reportsUsage`, `reportsSubagents`, `permissionModes`).
+- Wrapper scripts can write events directly: pipe-mode workers get `HANCHO_EVENT_PIPE`, and `hancho-cli event emit --kind message --text "..."` writes to it.
+- `hancho-cli adapter test <name>` checks recorded inputs against expected `{kind, data}` pairs under `tests/adapters/<name>/`.
+
 ## Documentation
 
 | Document | Contents |
@@ -105,6 +116,7 @@ What stays the same: each step is still a normal task-queue job with its own tim
 | [Data Directory](doc/data-directory.md) | Project-local, git-managed `--data-dir` |
 | [Pros/Cons](doc/pros-cons-comparison.md) | When to use Hancho vs. sub-agents and alternatives |
 | [Critical Comparison](doc/critical-comparison.md) | A skeptical look at Hancho's limits and when not to use it |
+| [Hancho v3 Design](doc/design-v3-en.md) | Event schema and adapters, headless/remote, semantic memory, failure analysis, graduation guide |
 | [tools/ww](tools/ww/README-ww.md) | Optional, independent task-card runner template (not part of Hancho) |
 
 ---
@@ -215,6 +227,9 @@ USAGE:
   Hancho.exe [gui] [--data-dir <path>]
       Launch the live Win32 Dashboard GUI and Named Pipe server.
 
+  Hancho.exe quit
+      Quit the running GUI, including one hidden in the system tray (its tray icon is removed).
+
   Hancho.exe mcp [--data-dir <path>]
       Run as a Model Context Protocol (MCP) stdio server for Claude.
       Automatically connects to (or launches) the Win32 GUI Dashboard.
@@ -240,6 +255,7 @@ WORKING MODEL (LLM orchestration):
     Supervisor LLM (Claude Code, opencode, ...)
       |  start_process   -> one long-running worker command
       |  taskqueue_add   -> ordered/dependent worker jobs
+      |  bt_start        -> a behavior tree: steps, branches, retries, checks
       v
     Hancho
       |  owns processes, timeouts, logs, retries, state
@@ -264,6 +280,12 @@ WORKING MODEL (LLM orchestration):
     5. On failure, fix the cause and call taskqueue_retry. Blocked dependents
        resume automatically.
     6. Keep the supervisor context small: read artifacts, not raw transcripts.
+    7. When the next step depends on results (build -> fix -> rebuild loops,
+       test -> fix -> retest, "if this file says X then ..."), do not watch and
+       add jobs by hand: write the whole plan as a behavior tree (BT) and submit
+       it once with bt_start. Hancho runs it, adding each step as an
+       ordinary job, and returns to you only when a decision is needed
+       (escalate) or the tree finishes. See BEHAVIOR TREES below.
 
 CONSOLE CLIENT / CLI SETUP:
   Use hancho-cli.exe for CLI commands (start, list, logs, send, wait, kill, kill-all, clear).
@@ -297,7 +319,7 @@ MCP SERVER SETUP:
     - The dashboard auto-starts on first use and owns the Named Pipe server.
     - Logs, state and task queues live under logs/ (override: HANCHO_LOG_DIR).
 
-  MCP tools (24):
+  MCP tools (34):
     Process (6):
       start_process, list_processes, get_process_output, send_process_input,
       wait_process, kill_process
@@ -308,26 +330,66 @@ MCP SERVER SETUP:
       taskqueue_update, taskqueue_cancel, taskqueue_pause, taskqueue_resume,
       taskqueue_wait, taskqueue_purge, taskqueue_link, taskqueue_unlink,
       taskqueue_graph
+    Behavior tree (10):
+      bt_validate, bt_start, bt_get, bt_list, bt_wait, bt_resume, bt_retry,
+      bt_update, bt_cancel, bt_pause
 
   HOW TO USE (decision guide):
     - One command, e.g. a build script, CLI worker or shell -> start_process
     - One task for a worker LLM, final result only         -> run_worker
       Harnesses do not see this as a native sub-agent; a thin custom agent that
       calls run_worker makes it one, at the cost of the wrapper's tokens.
-    - Multiple steps, order, dependencies or retries      -> taskqueue_add + dependsOn
+    - Multiple steps, fixed order or dependencies         -> taskqueue_add + dependsOn
+    - Steps whose next step depends on results: branches,
+      fix loops, checks, worker LLM steps, your decisions -> bt_start + bt_wait
     - Never write &&, ||, a single &, PowerShell ';', newline chains or polling
       loops. ChainGuard rejects them: one job = one command with its own timeoutSec.
     - Required taskqueue job fields: id, command, summary, timeoutSec.
       Optional: cwd, env, dependsOn, idle, maxAttempts, retryDelaySec, success,
       killExclude, resources {write,read}, priority, instructionsFile / instructionsText.
     - resources: jobs whose write/read sets overlap never run together (read/read is
-      fine). Paths/globs resolve against cwd; a bare file name (Foo.cs) means
-      **/Foo.cs; "@name" is a named lock.
+      fine). Paths/globs resolve against cwd; "@name" is a named lock.
     - Success is verified: exit code AND optional filesNewer / outputRegex.
     - States: waiting = queued and ready; pending = dependencies not satisfied;
       blocked = a dependency failed; running; succeeded; failed; cancelled.
     - Observe with taskqueue_wait / taskqueue_list / taskqueue_graph; after fixing
       the cause use taskqueue_retry (blocked dependents resume automatically).
+
+  BEHAVIOR TREES (bt_*):
+    A behavior tree is one JSON document describing the whole workflow. Leaves run
+    work (job = one command, worker = one task for a worker LLM); composites decide
+    what runs next (sequence, fallback, parallel, if, retry, repeat, timeout);
+    conditions check results (fileExists, fileNewer, outputMatches, exitCode,
+    jsonValue, var, nodeState); escalate hands a decision back to you.
+    Flow:
+      1. bt_validate (optional), then bt_start {bt: {...}} or {file: "plan.json"}.
+      2. Loop on bt_wait {id, sinceVersion, timeoutMs}. It returns when the tree
+         finishes or waits for you (state "waitingForLlm" + a decision packet).
+      3. Answer with bt_resume {id, node, answer, rationale}. The packet holds the
+         question, guidance, allowed answers and the logs/files/vars you asked to
+         include, so you can decide even after your context was compacted.
+      4. On failure read bt_get {id, compact: true}; fix the cause (bt_update for
+         a non-running node's definition) and call bt_retry {id, from}.
+    Rules:
+      - retry / repeat need "max". Jobs need command, summary, timeoutSec; workers
+        need prompt, summary, timeoutSec and optionally engine / model (claude,
+        agy, opencode, codex or ones defined in <data dir>\engines.json).
+      - Write "intent" (the goal) and, on escalate, "question" + "guidance" for
+        your future self. ${name} expands variables; in command it is quoted as
+        one argument. Do not retry BT jobs with taskqueue_retry; use bt_retry.
+    Minimal example (build, and on failure let a worker fix it, up to 3 times):
+      {"id": "fix-build", "summary": "Build and fix", "intent": "Release build passes",
+       "cwd": "D:/repo",
+       "root": {"type": "retry", "max": 3, "child": {"type": "fallback", "children": [
+         {"type": "job", "id": "build", "summary": "Build", "timeoutSec": 1800,
+          "command": "cmake --build build --config Release"},
+         {"type": "sequence", "children": [
+           {"type": "worker", "id": "fix", "engine": "claude", "summary": "Fix build",
+            "timeoutSec": 3600, "prompt": "Fix the build errors in ${build.logFile}."},
+           {"type": "fail"}]}]}}}
+    Full format, every node type and three complete examples:
+      doc\behavior-tree.md (English), doc\behavior-tree-ja.md (Japanese), in the
+      Hancho installation folder. `hancho-cli.exe bt --help` lists the CLI.
 
   For the full machine-readable guide (agent.quick_start, decision, states):
     hancho-cli.exe help --json
@@ -383,6 +445,9 @@ HANCHO-CLI CONCEPTS:
   stdin       : pipe mode keeps stdin writable (hancho-cli send) unless --close-stdin;
                 close it for programs that wait for EOF.
   Logs        : logs/proc_<id>_<name>_<timestamp>.log (or --log-file).
+  Streams     : logs/proc_<id>_<name>_stream.jsonl (raw) and
+                logs/proc_<id>_<name>.events.jsonl (normalized hancho.event/1).
+  Adapters    : <data dir>/adapters/<name>.json (Tier 1 declarative or Tier 3 exec).
   Done file   : atomic JSON on exit (logs/proc_<id>.done or --done-file) with
                 state, exit_code, reason, log_file and done_file.
   cwd / env   : --cwd defaults to the caller's directory; PWD and INIT_CWD are
@@ -398,7 +463,9 @@ EXIT CODES:
        start --wait / wait return the managed process's exit code
 
 ENVIRONMENT:
-  HANCHO_LOG_DIR   Override the logs directory (state, logs, queues).
+  HANCHO_LOG_DIR     Override the logs directory (state, logs, queues).
+  HANCHO_EVENT_PIPE  Set by Hancho for pipe-mode workers; hancho-cli event emit
+                     writes hancho.event/1 lines to this pipe.
 
 EXAMPLES:
   hancho-cli.exe list --json
@@ -438,9 +505,11 @@ COMMANDS:
                                  (e.g. "18:30" or "2026-10-22 18:30:00").
                                  If omitted, --timeout shows "remaining N seconds".
          --estimate-end <time>    Alias for --eta
-         --agent-type <claude|agy|antigravity|opencode|codex|aider|ollama>
+         --agent-type <claude|agy|antigravity|opencode|codex|aider|ollama|adapter>
                                   Hint worker type for JSON stream parsing (auto-detected if omitted).
-         --json-stream            Enable JSONL stream parsing and write <log>.stream.jsonl for LLM worker output.
+                                  A name with <data-dir>/adapters/<name>.json uses that Tier 1/3 adapter.
+         --json-stream            Enable JSONL stream parsing; writes <log>.stream.jsonl and the
+                                  normalized <log>.events.jsonl (hancho.event/1) for LLM workers.
          --wait                   Block until process exits (unlimited unless --wait-ms is set)
         --wait-ms <ms>           Max wait when --wait is set; initial output wait otherwise
                                  (default: 500; 0 = unlimited with --wait)
@@ -460,14 +529,28 @@ COMMANDS:
   clear
       Remove finished processes from the dashboard list.
 
+  event emit --kind <kind> [--text <text>] [--tool <name>] [--activity <a>] [--target <t>]
+             [--status <s>] [--data <json>] [--pipe <name>]
+      Write one hancho.event/1 line to HANCHO_EVENT_PIPE (set for pipe-mode workers).
+
+  adapter test <name> [--file <adapter.json>] [--dir <test-dir>]
+      Run the Tier 1 declarative adapter against tests/adapters/<name>/*.input.jsonl and
+      *.expected.jsonl (each expected line is {kind, data}).
+
   worker status <id>
       Show current worker status, active tool, thoughts, message, and supervisor context.
 
-  worker stream <id> [--tail <n>] [--type <type>] [--since <seq>] [--summary]
+  worker stream <id> [--tail <n>] [--type <type>] [--since <seq>] [--summary] [--schema <legacy|v1>]
       View captured JSON streaming events for claude, agy, or opencode workers.
+      --schema v1 returns the stable hancho.event/1 shape from <log>.events.jsonl.
 
   worker info <id> [--notes "<notes>"] [--goal "<goal>"]
       Update supervisor notes or goal for an ongoing worker.
+
+  agent install-template [--path <dir>] [--dry-run]
+      Write the hancho-runner subagent to <dir>\.claude\agents\hancho-runner.md (default: the current
+      directory). It runs long commands through Hancho and returns a short summary.
+      An existing file is not overwritten.
 
   mcp install [--client claude|opencode] [--path <file>] [--name <name>] [--data-dir <path>] [--dry-run]
       Register Hancho as an MCP server automatically. Writes or updates
@@ -478,7 +561,11 @@ COMMANDS:
 
 TASK QUEUE:
   taskqueue add --file <jobs.json> [--taskqueue <name>] [--concurrency <n>] [--notify-file <path>]
+                [--origin-label <text>]
       Register jobs (array, or an object with "jobs"/"taskqueue"/"concurrency").
+      Each job records its origin: the caller's session id (CLAUDE_CODE_SESSION_ID
+      or PC_ORIGIN_SESSION), working folder and pid, plus --origin-label (or
+      PC_ORIGIN_LABEL). The dashboard shows it in the Origin column.
       Each job needs id, command, summary, timeoutSec; dependsOn replaces '&&'.
       Optional: cwd, env, dependsOn, idle, maxAttempts, retryDelaySec, success,
       killExclude, resources {write,read}, defer, priority, instructionsFile/instructionsText.
@@ -491,16 +578,41 @@ TASK QUEUE:
       overlapping card) goes back to pending after delaySec without using up
       maxAttempts; after limit deferrals (0 = no limit) it is an ordinary failure.
 
-  taskqueue list [<name>] [--state <state>]
-      List jobs with state, queue, summary and blockedBy.
+  taskqueue list [<name>] [--state <state>] [--since <period>] [--origin <self|label|session>]
+      List jobs with state, queue, summary and blockedBy. --since keeps only
+      jobs updated within the period (30m, 6h, 2d), e.g. --since 6h.
+      --origin self keeps only the jobs this session added.
 
   taskqueue get <id> [--rev <n>] [--no-instructions]
   taskqueue retry <id>
+  taskqueue retry --failed [<name>] [--since <period>]
+      Retry every failed job at once, optionally only one queue and only jobs
+      that failed within the period, e.g. `taskqueue retry --failed --since 6h`
+      retries the failures of the last 6 hours. Blocked dependents resume.
   taskqueue cancel <id>
   taskqueue pause|resume <name>
   taskqueue graph [<name>] [--root <id>]     (ready, waiting_for, resource_wait, retry_in_sec, blocked)
   taskqueue wait <name> [--since <version>] [--timeout-ms <ms>]
   taskqueue purge <name> [--states succeeded,failed,cancelled]
+  taskqueue purge [<name>] --older-than-days <N>   (finished jobs not updated for N days; all queues if <name> omitted)
+  reset [--yes]                                    (delete ALL project data in the data directory; lists targets without --yes; refused while running)
+
+BEHAVIOR TREES (for LLM agents; next step depends on results):
+  bt validate|start --file <bt.json>    Check / register and run a behavior tree
+  bt wait --id <id> [--since-version <n>] [--timeout-ms <ms>]
+      Long-poll until the tree finishes or waits for your decision (escalate).
+  bt resume --id <id> --node <node> --answer <a> --rationale <why> [--vars <json>]
+  bt get --id <id> [--compact]  |  bt list
+  bt retry --id <id> [--from <node>] [--reset-counters]
+  bt update --id <id> [--node <node>] (--file <path> | --bt <json> | --patch <json>)
+  bt cancel --id <id>  |  bt pause --id <id> [--paused true|false]
+      Leaves: job (one command), worker (one task for a worker LLM; engine/model);
+      composites: sequence, fallback, parallel, if, retry/repeat (max required),
+      timeout; conditions: fileExists, fileNewer, outputMatches, exitCode,
+      jsonValue, var, nodeState; escalate returns a decision packet to you.
+      Each leaf runs as an ordinary task-queue job; retry BT jobs with bt retry,
+      not taskqueue retry. Full format and examples: doc\behavior-tree.md in the
+      installation folder; `hancho-cli bt --help` for all options.
 
   start/run ... --allow-chain
       Allow a chained command (&&, ||, &, ';') as a single process. Task-queue
@@ -530,7 +642,7 @@ SETUP FOR LLM AGENTS:
       {
         "mcpServers": {
           "hancho": {
-            "command": "<path-to>\\Hancho.exe",
+            "command": "D:\\wsgit\\Hancho\\build\\Release\\Hancho.exe",
             "args": ["mcp"]
           }
         }
@@ -553,6 +665,12 @@ SETUP FOR LLM AGENTS:
         does not run the work itself, chain commands, or fabricate success.
       - One job = one command. Use start_process for a single worker; use
         taskqueue_add with dependsOn for multiple steps or dependencies.
+      - When the next step depends on results (build -> fix -> rebuild,
+        test -> fix -> retest, branch on a file's content), do not watch and
+        add jobs by hand: write the plan as a behavior tree and submit it once
+        with bt_start, then loop on bt_wait and answer escalations with
+        bt_resume (answer + rationale). See BEHAVIOR TREES above and
+        doc\behavior-tree.md.
       - Each job needs a one-line summary and its own timeoutSec. Pass detailed
         instructions via instructionsFile/instructionsText; the worker reads
         {instructions} / PC_JOB_INSTRUCTIONS and writes artifacts.
@@ -574,7 +692,7 @@ SETUP FOR LLM AGENTS:
         and returns the result. The wrapper costs extra tokens; calling run_worker
         directly is cheapest.
 
-    MCP tools (24):
+    MCP tools (34):
       Process:    start_process, list_processes, get_process_output,
                   send_process_input, wait_process, kill_process
       Worker:     run_worker, wait_worker, get_worker_stream, get_worker_state,
@@ -583,6 +701,8 @@ SETUP FOR LLM AGENTS:
                   taskqueue_update, taskqueue_cancel, taskqueue_pause, taskqueue_resume,
                   taskqueue_wait, taskqueue_purge, taskqueue_link, taskqueue_unlink,
                   taskqueue_graph
+      Behavior tree: bt_validate, bt_start, bt_get, bt_list, bt_wait, bt_resume,
+                  bt_retry, bt_update, bt_cancel, bt_pause
 
 NOTE:
   The GUI dashboard is provided by Hancho.exe, which is auto-started
