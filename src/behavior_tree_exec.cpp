@@ -169,7 +169,8 @@ void BehaviorTree::Impl::TickNode(BehaviorTree& bt, BtNode& node, int64_t nowMs)
                 return;
             }
 
-            BtJobSpec spec{bt.id_, node.id, node.nodeKey, node.runs, proposedId, expCmd, expSummary,
+            BtJobSpec spec{bt.id_, node.id, node.nodeKey, node.runs, proposedId, node.queueName,
+                           expCmd, expSummary,
                            expCwd, node.timeoutSec, std::move(expEnv), node.success, node.idle,
                            std::move(expRes), expInstr, node.maxAttempts};
             node.isWorkerJob = false;
@@ -192,7 +193,8 @@ void BehaviorTree::Impl::TickNode(BehaviorTree& bt, BtNode& node, int64_t nowMs)
                 ? node.model
                 : ((node.engine.empty() || node.engine == bt.workerDefaults_.engine) ? bt.workerDefaults_.model : "");
 
-            BtWorkerSpec wspec{bt.id_, node.id, node.nodeKey, node.runs, proposedId, effEng, effMod,
+            BtWorkerSpec wspec{bt.id_, node.id, node.nodeKey, node.runs, proposedId, node.queueName,
+                               effEng, effMod,
                                expPrompt, expSummary, expCwd, node.timeoutSec, std::move(expEnv),
                                node.success, node.idle, std::move(expRes), node.outputSchema};
             node.isWorkerJob = true;

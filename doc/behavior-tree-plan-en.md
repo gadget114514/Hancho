@@ -94,7 +94,7 @@ What PC does in this example: build → if it fails, pick the erroring file name
 |---|---|
 | `sequence` | Run children in order. Fails if any fails; succeeds if all succeed. |
 | `fallback` | Run children in order. Succeeds if any succeeds; fails if all fail (alias `selector`). |
-| `parallel` | Start children at the same time. `success: "all"` (default) / `"any"` / a number. Cancel the rest once the outcome is decided. Concurrency follows the task queue's `concurrency` and resource locks. |
+| `parallel` | Start children at the same time. `success: "all"` (default) / `"any"` / a number. Cancel the rest once the outcome is decided. Each child runs in its own queue derived from the tree id and the branch, so the children actually run in parallel; resource locks can still serialize them. |
 | `if` | If `cond` (a condition node) succeeds, run `then`; otherwise `else` (treated as success when omitted). |
 
 **Decorators**
@@ -197,7 +197,7 @@ Node: `idle` / `running` / `succeeded` / `failed` / `skipped`.
 
 ### 5.3 Mapping to Jobs
 
-- Each time a `job` node runs, it registers a job `<BT id>.<node id>.<n>` in the BT's `taskqueue` (default `bt-<BT id>`). `n` increments each time it is re-run by `retry` / `repeat`.
+- Each time a `job` node runs, it registers a job `<BT id>.<node id>.<n>` in the BT's `taskqueue` (default `bt-<BT id>`). `n` increments each time it is re-run by `retry` / `repeat`. A `parallel` child uses its own queue named `<taskqueue>.p<hash>` so the branches really run in parallel.
 - Give the job side a `bt: { id, node, run }` so `taskqueue_get` (MCP / CLI) can go back to the BT. Do not show it in the GUI (chapter 8).
 - The task queue's own re-execution (`maxAttempts`) defaults to 1 for BT jobs. Infrastructure failures (`interrupted` from a PC restart, `deferred`) are not counted, as now. "What to do on failure" is written in the BT's `retry` / `fallback`.
 - Rejecting `taskqueue_retry` / `taskqueue_update` on a BT job from outside the BT and telling the caller to use `bt_retry` (so it does not diverge from the BT state). `taskqueue_cancel` is allowed and treated as a node failure.

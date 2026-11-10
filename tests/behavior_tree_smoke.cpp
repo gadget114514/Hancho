@@ -219,6 +219,13 @@ int main() {
         bt.SetJobRunner(&runner);
         bt.Start(1000);
         Check(runner.startedJobs.size() == 2, "parallel started both j1 and j2");
+        Check(runner.startedJobs.size() == 2 &&
+                  !runner.startedJobs[0].queueName.empty() &&
+                  runner.startedJobs[0].queueName != runner.startedJobs[1].queueName,
+              "parallel children get distinct queues");
+        Check(bt.TaskQueueName() != runner.startedJobs[0].queueName &&
+                  bt.TaskQueueName() != runner.startedJobs[1].queueName,
+              "parallel child queues differ from the tree queue");
         bt.OnJobFinished("par-any-1", true, 0, "", "", 1100);
         Check(bt.State() == "succeeded", "parallel any succeeded when j1 succeeded");
         Check(runner.WasCancelled("par-any-2"), "parallel any cancelled remaining running job j2");
@@ -244,6 +251,25 @@ int main() {
         bt2.OnJobFinished("par-all-1", false, 1, "", "fail", 1100);
         Check(bt2.State() == "failed" && runner2.WasCancelled("par-all-2"),
               "parallel all failed when j1 failed and cancelled j2");
+
+        // Serial nodes never run together, so they stay on the tree queue (no extra queues).
+        std::string serialBt = R"({
+            "id": "serial-q",
+            "root": {
+                "type": "sequence",
+                "children": [
+                    { "type": "job", "id": "s1", "summary": "S1", "command": "c1", "timeoutSec": 60 },
+                    { "type": "job", "id": "s2", "summary": "S2", "command": "c2", "timeoutSec": 60 }
+                ]
+            }
+        })";
+        FakeJobRunner runner3;
+        BehaviorTree bt3;
+        bt3.LoadDefinition(serialBt, &catalog, err);
+        bt3.SetJobRunner(&runner3);
+        bt3.Start(1000);
+        Check(runner3.startedJobs.size() == 1 && runner3.startedJobs[0].queueName.empty(),
+              "sequence job stays on the tree queue");
     }
 
     // 4. if/else, repeat until, timeout cancelling a job, wait via OnTimer

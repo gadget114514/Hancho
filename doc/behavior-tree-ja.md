@@ -63,7 +63,7 @@ Hancho のビヘイビアツリー (BT) は、条件分岐 (`if`/`fallback`)、�
 | `root` | **必須** | — | ルートノードオブジェクト。 |
 | `summary` | 任意 | `""` | BT 全体の 1 行要約。 |
 | `intent` | 任意 | `""` | 作業全体の目的 (1 段落)。`escalate` の判断パケットに含まれる。 |
-| `taskqueue` | 任意 | `"bt-" + id` | BT のジョブを登録するタスクキュー名。 |
+| `taskqueue` | 任意 | `"bt-" + id` | BT のジョブを登録するタスクキュー名。`parallel` の子はこの名前に `.p<hash>` を付けた専用キューを使う。 |
 | `cwd` | 任意 | `""` | 各ノードおよび相対パスの基準作業ディレクトリ。 |
 | `notifyFile` | 任意 | `""` | `escalated` / `btFailed` / `btSucceeded` 発生時にアトミック更新される通知ファイル。 |
 | `limits.maxNodeRuns` | 任意 | `200` | BT 全体の `job` + `worker` 起動上限 (`1..10000`)。 |
@@ -86,7 +86,7 @@ Hancho のビヘイビアツリー (BT) は、条件分岐 (`if`/`fallback`)、�
 |---|---|---|
 | `sequence` | `"children": [...]` (非空配列) | 子を順番に実行。すべて成功すれば `succeeded`、1 つでも失敗した時点で `failed`。 |
 | `fallback` (別名 `selector`) | `"children": [...]` (非空配列) | 子を順番に実行し、最初に成功した時点で `succeeded`。すべて失敗したときのみ `failed`。 |
-| `parallel` | `"children": [...]` (非空配列) | 全子ノードを同時起動。任意 `"success"`: `"all"` (既定)、`"any"`、または整数 `1..N` (成功が必要な子の数)。結果確定時に残りの実行中子ノードをキャンセル。 |
+| `parallel` | `"children": [...]` (非空配列) | 全子ノードを同時起動。任意 `"success"`: `"all"` (既定)、`"any"`、または整数 `1..N` (成功が必要な子の数)。結果確定時に残りの実行中子ノードをキャンセル。子ごとに専用のタスクキュー（ツリーIDと分岐から決まる）が割り当てられ、実際に並列実行される（リソースロックが競合すれば待機）。 |
 | `if` | `"cond"`, `"then"`, 任意 `"else"` | `"cond"` を評価し、成功なら `"then"`、失敗なら `"else"` (省略時は即 `succeeded`) を実行。 |
 | `retry` | `"child"` | 必須 `"max"` (`1..100`)、任意 `"delaySec"` (または `"retryDelaySec"`, 既定 `0`)。`"child"` が失敗する間、最大 `"max"` 回まで実行する。 |
 | `repeat` | `"child"`, 任意 `"until"` | 必須 `"max"` (`1..100`)、任意 `"delaySec"` (既定 `0`)。`"child"` が成功するたびに反復。`"until"` がある場合は各成功後に `"until"` を評価し、`"until"` が成功すれば `succeeded` (`"max"` 回以内に `"until"` が成功しなければ `failed`)。`"until"` 省略時は `"max"` 回成功で `succeeded`。`"child"` が失敗したら即 `failed`。 |

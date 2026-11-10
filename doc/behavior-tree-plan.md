@@ -94,7 +94,7 @@
 |---|---|
 | `sequence` | 子を順に実行。1 つでも失敗したら失敗。全部成功で成功 |
 | `fallback` | 子を順に実行。1 つでも成功したら成功。全部失敗で失敗 (別名 `selector`) |
-| `parallel` | 子を同時に開始。`success: "all"` (既定) / `"any"` / 数値。決着したら残りをキャンセル。同時数はタスクキューの `concurrency` とリソースロックに従う |
+| `parallel` | 子を同時に開始。`success: "all"` (既定) / `"any"` / 数値。決着したら残りをキャンセル。子ごとに専用のタスクキュー（ツリーIDと分岐から決まる）が割り当てられ、実際に並列実行される。リソースロックが競合すれば待つ |
 | `if` | `cond` (条件ノード) が成功なら `then`、失敗なら `else` (省略時は成功扱い) |
 
 **デコレーター**
@@ -197,7 +197,7 @@ BT 全体: `running` / `waitingForLlm` (どこかの枝が `escalate` で止ま�
 
 ### 5.3 ジョブとの対応
 
-- `job` ノードを実行するたびに、BT の `taskqueue` (既定 `bt-<BT id>`) にジョブ `<BT id>.<node id>.<n>` を登録する。`n` は `retry` / `repeat` で再実行されるたびに 1 増える。
+- `job` ノードを実行するたびに、BT の `taskqueue` (既定 `bt-<BT id>`) にジョブ `<BT id>.<node id>.<n>` を登録する。`n` は `retry` / `repeat` で再実行されるたびに 1 増える。`parallel` の子は `<taskqueue>.p<hash>` という専用キューを使い、枝が実際に並列で走る。
 - ジョブ側に `bt: { id, node, run }` を持たせ、`taskqueue_get` (MCP / CLI) から BT に戻れるようにする。GUI には出さない (8 章)。
 - タスクキュー自身の再実行 (`maxAttempts`) は、BT のジョブでは既定 1。インフラ的な失敗 (PC 再起動による `interrupted`、`deferred`) は今と同じく数えない。「失敗したらどうするか」は BT の `retry` / `fallback` に書く。
 - BT 外から BT のジョブを `taskqueue_retry` / `taskqueue_update` するのは拒否し、`bt_retry` を使うよう返す (BT の状態とずれないように)。`taskqueue_cancel` は許可し、ノードの失敗として扱う。

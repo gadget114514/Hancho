@@ -45,6 +45,9 @@ struct BtNode {
     std::string type;     // normalized type ("selector" -> "fallback" in exec, raw kept in rawDef)
     std::string role;     // "", "child", "cond", "then", "else", "until"
     int depth = 1;
+    // Task queue this node's jobs run in. Empty means the tree's queue. Each child of a
+    // parallel node gets its own queue so the harness's "parallel" actually runs in parallel.
+    std::string queueName;
 
     // Original JSON definition of this node (without runtime "status", children kept for rebuild)
     json rawDef;
@@ -213,6 +216,8 @@ std::unique_ptr<BtNode> ParseSingleNodeJson(const json& j,
                                             const std::string& btCwd,
                                             const std::vector<std::string>& existingIdsOutsideTarget,
                                             int existingNodesOutsideTarget,
+                                            const std::string& baseQueue,
+                                            const std::string& queueScope,
                                             std::string& outError);
 
 } // namespace pc

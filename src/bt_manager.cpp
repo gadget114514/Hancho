@@ -204,7 +204,8 @@ std::string BtManager::UniqueJobId(const std::string& proposedId) const {
 }
 
 std::string BtManager::StartJob(const BtJobSpec& spec) {
-    std::string queueName = LookupQueueNameForBtLocked(spec.btId);
+    std::string queueName = !spec.queueName.empty() ? spec.queueName
+                                                    : LookupQueueNameForBtLocked(spec.btId);
     const std::string jobId = UniqueJobId(spec.proposedJobId);
 
     nlohmann::json jobJson = BuildAddBtJobJson(
@@ -235,7 +236,8 @@ std::string BtManager::StartJob(const BtJobSpec& spec) {
 }
 
 std::string BtManager::StartWorker(const BtWorkerSpec& spec) {
-    std::string queueName = LookupQueueNameForBtLocked(spec.btId);
+    std::string queueName = !spec.queueName.empty() ? spec.queueName
+                                                    : LookupQueueNameForBtLocked(spec.btId);
     const std::string jobId = UniqueJobId(spec.proposedJobId);
 
     std::wstring resultFileW = GetBtResultFileWide(spec.btId, jobId);

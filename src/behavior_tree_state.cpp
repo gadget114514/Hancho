@@ -383,6 +383,7 @@ bool CheckNotRunningForUpdate(const BtNode& oldNode,
 
 void CopyNodeDefinitionRecursive(BtNode& dst, const BtNode& src) {
     dst.rawDef = src.rawDef;
+    dst.queueName = src.queueName;
     dst.parallelSuccessMode = src.parallelSuccessMode;
     dst.parallelSuccessCount = src.parallelSuccessCount;
     dst.maxCount = src.maxCount;
@@ -519,7 +520,8 @@ bool BehaviorTree::UpdateDefinition(const std::string& jsonText,
 
     auto parsedNode = ParseSingleNodeJson(
         nodeJson, target->pathKey, target->role, target->depth,
-        catalog_, workerDefaults_, cwd_, outsideIds, outsideCount, err);
+        catalog_, workerDefaults_, cwd_, outsideIds, outsideCount,
+        taskqueue_, target->queueName, err);
     if (!parsedNode) {
         return false;
     }

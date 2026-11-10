@@ -44,6 +44,7 @@ struct BtJobSpec {
     std::string nodeKey;
     int run = 1;
     std::string proposedJobId;
+    std::string queueName;  // empty: the tree's queue
     std::string command;
     std::string summary;
     std::string cwd;
@@ -62,6 +63,7 @@ struct BtWorkerSpec {
     std::string nodeKey;
     int run = 1;
     std::string proposedJobId;
+    std::string queueName;  // empty: the tree's queue
     std::string engine;
     std::string model;
     std::string prompt;

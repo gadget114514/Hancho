@@ -1,6 +1,8 @@
 #include "behavior_tree_internal.h"
 #include "common.h"
 
+#include <cstdint>
+#include <cstdio>
 #include <set>
 #include <sstream>
 
@@ -12,6 +14,7 @@ struct ParseContext {
     const IBtEngineCatalog* catalog = nullptr;
     BtWorkerDefaults workerDefaults;
     std::string btCwd;
+    std::string baseQueue;  // tree-level task queue; parallel children get "<baseQueue>.p<hash>"
     std::set<std::string> seenIds;
     int nodeCount = 0;
     std::vector<std::string> errors;
@@ -20,6 +23,26 @@ struct ParseContext {
         errors.push_back(path + ": " + msg);
     }
 };
+
+// Stable 8-hex FNV-1a hash. Used to keep per-parallel queue names short and deterministic:
+// queue files truncate names to 32 chars, so the branch identity must fit in a few bytes.
+std::string ShortHashHex(const std::string& s) {
+    uint32_t hash = 2166136261u;
+    for (unsigned char c : s) {
+        hash ^= c;
+        hash *= 16777619u;
+    }
+    char buf[9] = {};
+    std::snprintf(buf, sizeof(buf), "%08x", hash);
+    return buf;
+}
+
+// Queue scope of a parallel child: keep the parent scope when nested, then add this branch.
+std::string ParallelChildQueue(const ParseContext& ctx, const std::string& parentScope,
+                               const std::string& parallelPath, size_t childIndex) {
+    const std::string& base = parentScope.empty() ? ctx.baseQueue : parentScope;
+    return base + ".p" + ShortHashHex(parallelPath + "#" + std::to_string(childIndex));
+}
 
 std::string JsonToStrValue(const json& v) {
     if (v.is_string()) return v.get<std::string>();
@@ -137,11 +160,12 @@ bool ParseComparisonOps(const json& j, BtNode& node) {
 }
 
 std::unique_ptr<BtNode> ParseNode(const json& j, const std::string& path, const std::string& role,
-                                  int depth, ParseContext& ctx) {
+                                  int depth, ParseContext& ctx, const std::string& queueScope) {
     auto node = std::make_unique<BtNode>();
     node->pathKey = path;
     node->role = role;
     node->depth = depth;
+    node->queueName = queueScope;
 
     ctx.nodeCount++;
     if (ctx.nodeCount > 1000) { ctx.AddError(path, "tree exceeds maximum node count (1000)"); return node; }
@@ -174,7 +198,7 @@ std::unique_ptr<BtNode> ParseNode(const json& j, const std::string& path, const 
             ctx.AddError(path, std::string("missing required object '") + key + "'");
             return;
         }
-        outSlot = ParseNode(j[key], path + "." + key, childRole, depth + 1, ctx);
+        outSlot = ParseNode(j[key], path + "." + key, childRole, depth + 1, ctx, queueScope);
     };
 
     if (t == "sequence" || t == "fallback" || t == "parallel") {
@@ -183,7 +207,14 @@ std::unique_ptr<BtNode> ParseNode(const json& j, const std::string& path, const 
         } else {
             size_t idx = 0;
             for (const auto& c : j["children"]) {
-                node->children.push_back(ParseNode(c, path + ".children[" + std::to_string(idx++) + "]", "", depth + 1, ctx));
+                // A parallel node's children may run at the same time, so each gets its own
+                // queue. Serial composites keep the current scope.
+                std::string childScope = (t == "parallel")
+                    ? ParallelChildQueue(ctx, queueScope, path, idx)
+                    : queueScope;
+                node->children.push_back(ParseNode(c, path + ".children[" + std::to_string(idx) + "]", "",
+                                                   depth + 1, ctx, childScope));
+                idx++;
             }
         }
         if (t == "parallel" && j.contains("success")) {
@@ -207,7 +238,7 @@ std::unique_ptr<BtNode> ParseNode(const json& j, const std::string& path, const 
         requireChildObj("then", "then", node->thenChild);
         if (j.contains("else")) {
             if (!j["else"].is_object()) ctx.AddError(path + ".else", "must be a node object");
-            else node->elseChild = ParseNode(j["else"], path + ".else", "else", depth + 1, ctx);
+            else node->elseChild = ParseNode(j["else"], path + ".else", "else", depth + 1, ctx, queueScope);
         }
     } else if (t == "retry" || t == "repeat") {
         if (!j.contains("max") || !j["max"].is_number_integer()) {
@@ -220,7 +251,7 @@ std::unique_ptr<BtNode> ParseNode(const json& j, const std::string& path, const 
         requireChildObj("child", "child", node->singleChild);
         if (t == "repeat" && j.contains("until")) {
             if (!j["until"].is_object()) ctx.AddError(path + ".until", "must be a node object");
-            else node->untilChild = ParseNode(j["until"], path + ".until", "until", depth + 1, ctx);
+            else node->untilChild = ParseNode(j["until"], path + ".until", "until", depth + 1, ctx, queueScope);
         }
     } else if (t == "invert" || t == "forceSuccess" || t == "forceFailure") {
         requireChildObj("child", "child", node->singleChild);
@@ -412,7 +443,7 @@ bool ParseTreeDocument(const std::string& jsonText, const IBtEngineCatalog* cata
     }
     if (doc.contains("vars") && !doc["vars"].is_object()) ctx.AddError("vars", "must be an object");
     if (!doc.contains("root") || !doc["root"].is_object()) ctx.AddError("root", "missing required object 'root'");
-    else ParseNode(doc["root"], "root", "", 1, ctx);
+    else ParseNode(doc["root"], "root", "", 1, ctx, std::string());
 
     if (!ctx.errors.empty()) { outErrors = std::move(ctx.errors); return false; }
     return true;
@@ -450,6 +481,7 @@ bool BehaviorTree::LoadDefinition(const std::string& jsonText,
     intent_ = doc.value("intent", std::string());
     taskqueue_ = doc.value("taskqueue", "bt-" + id_);
     if (taskqueue_.empty()) taskqueue_ = "bt-" + id_;
+    ctx.baseQueue = taskqueue_;
     cwd_ = doc.value("cwd", std::string());
     notifyFile_ = doc.value("notifyFile", std::string());
 
@@ -485,7 +517,7 @@ bool BehaviorTree::LoadDefinition(const std::string& jsonText,
     nextEventSeq_ = 1;
     version_ = 0;
 
-    impl_->root = ParseNode(doc["root"], "root", "", 1, ctx);
+    impl_->root = ParseNode(doc["root"], "root", "", 1, ctx, std::string());
     return true;
 }
 
@@ -498,17 +530,20 @@ std::unique_ptr<BtNode> ParseSingleNodeJson(const json& j,
                                             const std::string& btCwd,
                                             const std::vector<std::string>& existingIdsOutsideTarget,
                                             int existingNodesOutsideTarget,
+                                            const std::string& baseQueue,
+                                            const std::string& queueScope,
                                             std::string& outError) {
     ParseContext ctx;
     ctx.catalog = catalog;
     ctx.workerDefaults = workerDefaults;
     ctx.btCwd = btCwd;
+    ctx.baseQueue = baseQueue;
     for (const auto& id : existingIdsOutsideTarget) {
         if (!id.empty()) ctx.seenIds.insert(id);
     }
     ctx.nodeCount = existingNodesOutsideTarget;
 
-    auto node = ParseNode(j, path, role, depth, ctx);
+    auto node = ParseNode(j, path, role, depth, ctx, queueScope);
     if (!ctx.errors.empty()) {
         std::ostringstream oss;
         for (size_t i = 0; i < ctx.errors.size(); ++i) {

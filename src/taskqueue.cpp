@@ -40,6 +40,24 @@ TaskQueueState TaskQueueStateFromString(const std::string& s) {
 // File system locations
 // ---------------------------------------------------------------------------
 
+// SanitizeFileNameComponent truncates long names to 32 chars, which would make two queues
+// whose names share a prefix (e.g. per-parallel queues of one tree) collide on disk.
+// Append a hash of the full name when it was truncated so the file stays unique.
+static std::wstring QueueNameComponentWide(const std::string& name) {
+    std::string s = SanitizeFileNameComponent(name);
+    if (name.size() > 32) {
+        uint32_t hash = 2166136261u;
+        for (unsigned char c : name) {
+            hash ^= c;
+            hash *= 16777619u;
+        }
+        char buf[16] = {};
+        std::snprintf(buf, sizeof(buf), "-%08x", hash);
+        s += buf;
+    }
+    return Utf8ToWide(s);
+}
+
 std::wstring TaskQueueManager::GetTaskQueuesDirWide() {
     std::wstring dir = GetLogsDirectoryWide();
     dir += L"\\taskqueues";
@@ -48,11 +66,11 @@ std::wstring TaskQueueManager::GetTaskQueuesDirWide() {
 }
 
 std::wstring TaskQueueManager::GetTaskQueueFileWide(const std::string& name) {
-    return GetTaskQueuesDirWide() + L"\\" + Utf8ToWide(SanitizeFileNameComponent(name)) + L".json";
+    return GetTaskQueuesDirWide() + L"\\" + QueueNameComponentWide(name) + L".json";
 }
 
 std::wstring TaskQueueManager::GetInstructionsDirWide(const std::string& name) {
-    std::wstring base = GetTaskQueuesDirWide() + L"\\" + Utf8ToWide(SanitizeFileNameComponent(name));
+    std::wstring base = GetTaskQueuesDirWide() + L"\\" + QueueNameComponentWide(name);
     CreateDirectoryW(base.c_str(), nullptr);
     std::wstring dir = base + L"\\instructions";
     CreateDirectoryW(dir.c_str(), nullptr);
@@ -65,7 +83,7 @@ std::wstring TaskQueueManager::GetInstructionsFileWide(const std::string& name, 
 }
 
 std::wstring TaskQueueManager::GetTaskEventsFileWide(const std::string& name) {
-    return GetLogsDirectoryWide() + L"\\taskqueue-" + Utf8ToWide(SanitizeFileNameComponent(name)) + L".events.jsonl";
+    return GetLogsDirectoryWide() + L"\\taskqueue-" + QueueNameComponentWide(name) + L".events.jsonl";
 }
 
 // ---------------------------------------------------------------------------
