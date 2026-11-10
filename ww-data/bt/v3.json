@@ -1,0 +1,439 @@
+{
+  "id": "v3",
+  "summary": "Hancho v3 implementation (split cards)",
+  "intent": "Implement the five v3 design themes one card at a time, using ww task cards, then build the Release targets.",
+  "taskqueue": "bt-v3",
+  "cwd": "D:/wsgit/Hancho",
+  "limits": {
+    "maxNodeRuns": 30,
+    "maxWallSec": 604800
+  },
+  "worker": {
+    "engine": "opencode"
+  },
+  "root": {
+    "type": "sequence",
+    "children": [
+      {
+        "id": "cards",
+        "type": "parallel",
+        "success": "all",
+        "children": [
+          {
+            "id": "ww-010",
+            "type": "job",
+            "summary": "ww card 010-v1-consumers",
+            "command": "D:\\wsgit\\Hancho\\tools\\ww\\ww-run.cmd 010 -Shared -Engine opencode -Root D:\\wsgit\\Hancho -JsonStdout",
+            "cwd": "D:\\wsgit\\Hancho",
+            "timeoutSec": 12600,
+            "resources": {
+              "write": [
+                "src/gui_dashboard.cpp",
+                "src/mcp_server.cpp",
+                "src/behavior_tree_cond.cpp",
+                "tests"
+              ],
+              "read": [
+                "doc/design-v3.md",
+                "doc/design-v3-en.md",
+                "src/event_schema.h"
+              ]
+            }
+          },
+          {
+            "id": "ww-011",
+            "type": "job",
+            "summary": "ww card 011-legacy-retirement",
+            "command": "D:\\wsgit\\Hancho\\tools\\ww\\ww-run.cmd 011 -Shared -Engine opencode -Root D:\\wsgit\\Hancho -JsonStdout",
+            "cwd": "D:\\wsgit\\Hancho",
+            "timeoutSec": 9000,
+            "resources": {
+              "write": [
+                "src/cli.cpp",
+                "src/mcp_server.cpp",
+                "**/readme.md",
+                "**/readme-ja.md",
+                "doc/llm-jsonstream-format.md",
+                "tests"
+              ],
+              "read": [
+                "doc/design-v3.md",
+                "doc/design-v3-en.md",
+                "doc/schema/hancho.event.v1.json"
+              ]
+            }
+          },
+          {
+            "id": "ww-020",
+            "type": "job",
+            "summary": "ww card 020-headless-core",
+            "command": "D:\\wsgit\\Hancho\\tools\\ww\\ww-run.cmd 020 -Shared -Engine opencode -Root D:\\wsgit\\Hancho -JsonStdout",
+            "cwd": "D:\\wsgit\\Hancho",
+            "timeoutSec": 16200,
+            "resources": {
+              "write": [
+                "src/main.cpp",
+                "src/process_manager.cpp",
+                "src/process_manager.h",
+                "src/ipc_server.cpp",
+                "src/ipc_server.h",
+                "src/gui_dashboard.cpp",
+                "tests",
+                "**/cmakelists.txt"
+              ],
+              "read": [
+                "doc/design-v3.md",
+                "doc/design-v3-en.md"
+              ]
+            }
+          },
+          {
+            "id": "ww-021",
+            "type": "job",
+            "summary": "ww card 021-ci-run-junit",
+            "command": "D:\\wsgit\\Hancho\\tools\\ww\\ww-run.cmd 021 -Shared -Engine opencode -Root D:\\wsgit\\Hancho -JsonStdout",
+            "cwd": "D:\\wsgit\\Hancho",
+            "timeoutSec": 10800,
+            "resources": {
+              "write": [
+                "src/cli.cpp",
+                "src/taskqueue.cpp",
+                "src/taskqueue.h",
+                "tests"
+              ],
+              "read": [
+                "doc/design-v3.md",
+                "doc/design-v3-en.md"
+              ]
+            }
+          },
+          {
+            "id": "ww-022",
+            "type": "job",
+            "summary": "ww card 022-platform-abstraction",
+            "command": "D:\\wsgit\\Hancho\\tools\\ww\\ww-run.cmd 022 -Shared -Engine opencode -Root D:\\wsgit\\Hancho -JsonStdout",
+            "cwd": "D:\\wsgit\\Hancho",
+            "timeoutSec": 23400,
+            "resources": {
+              "write": [
+                "src",
+                "include",
+                "**/cmakelists.txt",
+                "tests"
+              ],
+              "read": [
+                "doc/design-v3.md",
+                "doc/design-v3-en.md"
+              ]
+            }
+          },
+          {
+            "id": "ww-023",
+            "type": "job",
+            "summary": "ww card 023-posix-headless",
+            "command": "D:\\wsgit\\Hancho\\tools\\ww\\ww-run.cmd 023 -Shared -Engine opencode -Root D:\\wsgit\\Hancho -JsonStdout",
+            "cwd": "D:\\wsgit\\Hancho",
+            "timeoutSec": 30600,
+            "resources": {
+              "write": [
+                "src",
+                "include",
+                "tests",
+                "**/cmakelists.txt",
+                "doc"
+              ],
+              "read": [
+                "doc/design-v3.md",
+                "doc/design-v3-en.md"
+              ]
+            }
+          },
+          {
+            "id": "ww-024",
+            "type": "job",
+            "summary": "ww card 024-remote-hosts",
+            "command": "D:\\wsgit\\Hancho\\tools\\ww\\ww-run.cmd 024 -Shared -Engine opencode -Root D:\\wsgit\\Hancho -JsonStdout",
+            "cwd": "D:\\wsgit\\Hancho",
+            "timeoutSec": 19800,
+            "resources": {
+              "write": [
+                "src",
+                "include",
+                "tests",
+                "**/cmakelists.txt",
+                "doc"
+              ],
+              "read": [
+                "doc/design-v3.md",
+                "doc/design-v3-en.md"
+              ]
+            }
+          },
+          {
+            "id": "ww-030",
+            "type": "job",
+            "summary": "ww card 030-memory-runrecord",
+            "command": "D:\\wsgit\\Hancho\\tools\\ww\\ww-run.cmd 030 -Shared -Engine opencode -Root D:\\wsgit\\Hancho -JsonStdout",
+            "cwd": "D:\\wsgit\\Hancho",
+            "timeoutSec": 13800,
+            "resources": {
+              "write": [
+                "src",
+                "tests",
+                "**/cmakelists.txt"
+              ],
+              "read": [
+                "doc/design-v3.md",
+                "doc/design-v3-en.md",
+                "doc/schema/hancho.event.v1.json"
+              ]
+            }
+          },
+          {
+            "id": "ww-031",
+            "type": "job",
+            "summary": "ww card 031-memory-notes",
+            "command": "D:\\wsgit\\Hancho\\tools\\ww\\ww-run.cmd 031 -Shared -Engine opencode -Root D:\\wsgit\\Hancho -JsonStdout",
+            "cwd": "D:\\wsgit\\Hancho",
+            "timeoutSec": 13800,
+            "resources": {
+              "write": [
+                "src",
+                "tests",
+                "**/cmakelists.txt"
+              ],
+              "read": [
+                "doc/design-v3.md",
+                "doc/design-v3-en.md"
+              ]
+            }
+          },
+          {
+            "id": "ww-032",
+            "type": "job",
+            "summary": "ww card 032-memory-knowledge",
+            "command": "D:\\wsgit\\Hancho\\tools\\ww\\ww-run.cmd 032 -Shared -Engine opencode -Root D:\\wsgit\\Hancho -JsonStdout",
+            "cwd": "D:\\wsgit\\Hancho",
+            "timeoutSec": 9000,
+            "resources": {
+              "write": [
+                "src",
+                "tests",
+                "**/cmakelists.txt",
+                "doc"
+              ],
+              "read": [
+                "doc/design-v3.md",
+                "doc/design-v3-en.md"
+              ]
+            }
+          },
+          {
+            "id": "ww-033",
+            "type": "job",
+            "summary": "ww card 033-memory-search",
+            "command": "D:\\wsgit\\Hancho\\tools\\ww\\ww-run.cmd 033 -Shared -Engine opencode -Root D:\\wsgit\\Hancho -JsonStdout",
+            "cwd": "D:\\wsgit\\Hancho",
+            "timeoutSec": 16200,
+            "resources": {
+              "write": [
+                "src",
+                "tests",
+                "**/cmakelists.txt"
+              ],
+              "read": [
+                "doc/design-v3.md",
+                "doc/design-v3-en.md"
+              ]
+            }
+          },
+          {
+            "id": "ww-034",
+            "type": "job",
+            "summary": "ww card 034-memory-brief",
+            "command": "D:\\wsgit\\Hancho\\tools\\ww\\ww-run.cmd 034 -Shared -Engine opencode -Root D:\\wsgit\\Hancho -JsonStdout",
+            "cwd": "D:\\wsgit\\Hancho",
+            "timeoutSec": 12600,
+            "resources": {
+              "write": [
+                "src",
+                "tests",
+                "**/cmakelists.txt",
+                "doc"
+              ],
+              "read": [
+                "doc/design-v3.md",
+                "doc/design-v3-en.md"
+              ]
+            }
+          },
+          {
+            "id": "ww-035",
+            "type": "job",
+            "summary": "ww card 035-memory-gui",
+            "command": "D:\\wsgit\\Hancho\\tools\\ww\\ww-run.cmd 035 -Shared -Engine opencode -Root D:\\wsgit\\Hancho -JsonStdout",
+            "cwd": "D:\\wsgit\\Hancho",
+            "timeoutSec": 12600,
+            "resources": {
+              "write": [
+                "src/gui_dashboard.cpp",
+                "src/cli.cpp",
+                "src/taskqueue.cpp",
+                "src/taskqueue.h",
+                "tests"
+              ],
+              "read": [
+                "doc/design-v3.md",
+                "doc/design-v3-en.md"
+              ]
+            }
+          },
+          {
+            "id": "ww-040",
+            "type": "job",
+            "summary": "ww card 040-failure-classifier",
+            "command": "D:\\wsgit\\Hancho\\tools\\ww\\ww-run.cmd 040 -Shared -Engine opencode -Root D:\\wsgit\\Hancho -JsonStdout",
+            "cwd": "D:\\wsgit\\Hancho",
+            "timeoutSec": 16200,
+            "resources": {
+              "write": [
+                "src/taskqueue.cpp",
+                "src/taskqueue.h",
+                "src/llm_stream.cpp",
+                "src/llm_stream.h",
+                "tests",
+                "**/cmakelists.txt"
+              ],
+              "read": [
+                "doc/design-v3.md",
+                "doc/design-v3-en.md",
+                "doc/schema/hancho.event.v1.json"
+              ]
+            }
+          },
+          {
+            "id": "ww-041",
+            "type": "job",
+            "summary": "ww card 041-retry-policy",
+            "command": "D:\\wsgit\\Hancho\\tools\\ww\\ww-run.cmd 041 -Shared -Engine opencode -Root D:\\wsgit\\Hancho -JsonStdout",
+            "cwd": "D:\\wsgit\\Hancho",
+            "timeoutSec": 7800,
+            "resources": {
+              "write": [
+                "src/taskqueue.cpp",
+                "src/taskqueue.h",
+                "tests"
+              ],
+              "read": [
+                "doc/design-v3.md",
+                "doc/design-v3-en.md"
+              ]
+            }
+          },
+          {
+            "id": "ww-042",
+            "type": "job",
+            "summary": "ww card 042-failure-display",
+            "command": "D:\\wsgit\\Hancho\\tools\\ww\\ww-run.cmd 042 -Shared -Engine opencode -Root D:\\wsgit\\Hancho -JsonStdout",
+            "cwd": "D:\\wsgit\\Hancho",
+            "timeoutSec": 11400,
+            "resources": {
+              "write": [
+                "src/cli.cpp",
+                "src/gui_dashboard.cpp",
+                "src/mcp_server.cpp",
+                "src/behavior_tree_cond.cpp",
+                "tests"
+              ],
+              "read": [
+                "doc/design-v3.md",
+                "doc/design-v3-en.md"
+              ]
+            }
+          },
+          {
+            "id": "ww-043",
+            "type": "job",
+            "summary": "ww card 043-failure-rules",
+            "command": "D:\\wsgit\\Hancho\\tools\\ww\\ww-run.cmd 043 -Shared -Engine opencode -Root D:\\wsgit\\Hancho -JsonStdout",
+            "cwd": "D:\\wsgit\\Hancho",
+            "timeoutSec": 11400,
+            "resources": {
+              "write": [
+                "src",
+                "tests",
+                "doc"
+              ],
+              "read": [
+                "doc/design-v3.md",
+                "doc/design-v3-en.md"
+              ]
+            }
+          },
+          {
+            "id": "ww-050",
+            "type": "job",
+            "summary": "ww card 050-export",
+            "command": "D:\\wsgit\\Hancho\\tools\\ww\\ww-run.cmd 050 -Shared -Engine opencode -Root D:\\wsgit\\Hancho -JsonStdout",
+            "cwd": "D:\\wsgit\\Hancho",
+            "timeoutSec": 11400,
+            "resources": {
+              "write": [
+                "src/cli.cpp",
+                "src/taskqueue.cpp",
+                "src/taskqueue.h",
+                "src/behavior_tree.cpp",
+                "src/behavior_tree.h",
+                "tests",
+                "doc"
+              ],
+              "read": [
+                "doc/design-v3.md",
+                "doc/design-v3-en.md"
+              ]
+            }
+          },
+          {
+            "id": "ww-051",
+            "type": "job",
+            "summary": "ww card 051-uninstall-graduation",
+            "command": "D:\\wsgit\\Hancho\\tools\\ww\\ww-run.cmd 051 -Shared -Engine opencode -Root D:\\wsgit\\Hancho -JsonStdout",
+            "cwd": "D:\\wsgit\\Hancho",
+            "timeoutSec": 7800,
+            "resources": {
+              "write": [
+                "src/cli.cpp",
+                "src/mcp_server.cpp",
+                "**/readme.md",
+                "**/readme-ja.md",
+                "doc",
+                "tests"
+              ],
+              "read": [
+                "doc/design-v3.md",
+                "doc/design-v3-en.md"
+              ]
+            }
+          }
+        ]
+      },
+      {
+        "id": "verify-build",
+        "type": "job",
+        "summary": "Verify: build the Release targets",
+        "command": "cmake --build build --config Release",
+        "cwd": "D:/wsgit/Hancho",
+        "timeoutSec": 3600,
+        "resources": {
+          "write": [
+            "build"
+          ],
+          "read": [
+            "src",
+            "CMakeLists.txt"
+          ]
+        }
+      }
+    ]
+  }
+}

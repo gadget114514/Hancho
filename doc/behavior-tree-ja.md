@@ -218,6 +218,7 @@ Hancho のビヘイビアツリー (BT) は、条件分岐 (`if`/`fallback`)、�
 - **`bt_update`** (`id`, 任意 `node`, `bt`/`patch`/`file`): `running` でないノードの定義を差し替えます。永続化状態と整合させるため、木構造 (`type`・`id`・子の数とスロット) の変更は拒否されます。
 - **`bt_cancel`** (`id`): BT を `cancelled` にし、実行中の BT ジョブをすべてキャンセルします。
 - **`bt_pause`** (`id`, `paused`): BT と対応タスクキューを一時停止 (`paused`) または再開 (`running`) します。
+- **`bt tasks`** (`id`): ツリーの全ジョブを、並列分岐のキューをまたいで一覧します。CLI では `hancho-cli taskqueue list --bt <id>` でも同じ一覧を出せます。
 - **タスクキュー側の保護**: BT が起動したジョブに対する MCP / CLI からの `taskqueue_retry`・`taskqueue_update` は `"this job is managed by a behavior tree; use bt_retry"` で拒否されます。
 
 ---

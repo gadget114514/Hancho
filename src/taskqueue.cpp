@@ -1740,7 +1740,7 @@ std::string TaskQueueManager::AddBtJob(const std::string& taskqueue, const std::
 }
 
 std::string TaskQueueManager::TaskQueueList(const std::string& taskqueue, const std::string& state, int64_t sinceSec, std::string& outError,
-                                            const std::string& origin) {
+                                            const std::string& origin, const std::string& btId) {
     outError.clear();
     std::lock_guard<std::mutex> lock(mutex_);
     struct ListedJob { std::string queue; TaskQueueJob job; };
@@ -1751,6 +1751,7 @@ std::string TaskQueueManager::TaskQueueList(const std::string& taskqueue, const 
         for (const auto& job : tq.jobs) {
             if (!state.empty() && job.state != state) continue;
             if (!origin.empty() && !OriginMatches(job.origin, origin)) continue;
+            if (!btId.empty() && job.bt.id != btId) continue;
             if (sinceSec > 0) {
                 const int64_t ts = ParseTimestampStrToEpoch(job.updatedAt);
                 if (ts <= 0 || ts < cutoff) continue;

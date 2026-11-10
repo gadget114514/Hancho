@@ -210,7 +210,7 @@ public:
     // origin (optional) keeps only jobs whose origin label, session or host session matches
     // (session ids also match by prefix); "pid:<n>" matches the origin process id.
     std::string TaskQueueList(const std::string& taskqueue, const std::string& state, int64_t sinceSec, std::string& outError,
-                              const std::string& origin = "");
+                              const std::string& origin = "", const std::string& btId = "");
     static TaskQueueOrigin ParseOriginJson(const std::string& json);
     static std::string OriginToJson(const TaskQueueOrigin& origin);
     static bool OriginMatches(const TaskQueueOrigin& origin, const std::string& filter);

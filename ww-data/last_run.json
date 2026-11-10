@@ -1,0 +1,18 @@
+﻿{
+    "Worktree":  null,
+    "Minutes":  1.9,
+    "Engine":  "claude",
+    "Shared":  true,
+    "Started":  "2026-11-10T12:08:07",
+    "EditViolations":  [
+
+                       ],
+    "Log":  "D:\\wsgit\\Hancho\\ww-data\\logs\\010-20261110-120807.log",
+    "Task":  "010",
+    "Ended":  "2026-11-10T12:09:58",
+    "Card":  "010-v1-consumers.md",
+    "ReportsWritten":  [
+
+                       ],
+    "ExitCode":  0
+}

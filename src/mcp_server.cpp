@@ -15,6 +15,12 @@
 
 namespace pc {
 
+// Event shape that get_worker_stream returns when the caller does not pass `schema`. "legacy" is
+// the internal LlmStreamEvent shape; "v1" is hancho.event/1 from .events.jsonl. Both stay
+// available by passing `schema` explicitly. To make v1 the default, change this to "v1" and update
+// the `schema` description in the get_worker_stream tool definition to match.
+static constexpr const char* kWorkerStreamDefaultSchema = "legacy";
+
 // The top-level JSON-RPC fields of one request line. Parsed with nlohmann::json so that keys
 // inside "params" (e.g. a tool argument named "id") are never mistaken for the request's own;
 // the MCP TypeScript SDK writes "id" after "params".
@@ -438,7 +444,8 @@ int RunMcpServer() {
                 << "\"taskqueue\":{\"type\":\"string\",\"description\":\"Optional task queue name (all queues when omitted)\"},"
                 << "\"state\":{\"type\":\"string\",\"description\":\"Optional state filter: pending, running, succeeded, failed, blocked, cancelled\"},"
                 << "\"since\":{\"type\":\"string\",\"description\":\"Optional time window: only jobs updated within this period, e.g. 30m, 6h, 2d\"},"
-                << "\"origin\":{\"type\":\"string\",\"description\":\"Optional: 'self' for only the jobs your session added, or an origin label or session id (prefix)\"}"
+                << "\"origin\":{\"type\":\"string\",\"description\":\"Optional: 'self' for only the jobs your session added, or an origin label or session id (prefix)\"},"
+                << "\"bt\":{\"type\":\"string\",\"description\":\"Optional behavior-tree id: list every job of that tree across its parallel branch queues\"}"
                 << "}}"
                 << "},"
                 << "{"
@@ -711,7 +718,7 @@ int RunMcpServer() {
                 if (typeFilter.empty()) typeFilter = JsonGetString(argsJson, "filter", "");
                 int64_t sinceSeq = JsonGetInt(argsJson, "since_seq", 0);
                 std::string format = JsonGetString(argsJson, "format", "json");
-                std::string schema = JsonGetString(argsJson, "schema", "");
+                std::string schema = JsonGetString(argsJson, "schema", kWorkerStreamDefaultSchema);
                 ipcReq << "{\"action\":\"get_agent_stream\",\"id\":" << id
                        << ",\"tail\":" << tail
                        << ",\"type\":\"" << JsonEscape(typeFilter) << "\""
@@ -784,7 +791,8 @@ int RunMcpServer() {
                        << ",\"since\":\"" << JsonEscape(JsonGetString(argsJson, "since", "")) << "\"";
                 std::string originFilter = JsonGetString(argsJson, "origin", "");
                 if (originFilter == "self") originFilter = CallerSelfOriginFilter();
-                ipcReq << ",\"origin\":\"" << JsonEscape(originFilter) << "\"}";
+                ipcReq << ",\"origin\":\"" << JsonEscape(originFilter) << "\""
+                       << ",\"bt\":\"" << JsonEscape(JsonGetString(argsJson, "bt", "")) << "\"}";
             }
             else if (toolName == "taskqueue_get") {
                 bool includeInstr = JsonGetBool(argsJson, "includeInstructions",

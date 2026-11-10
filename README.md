@@ -25,8 +25,8 @@ The dashboard has an **execution monitor pane** below the process and task lists
 
 ## Express
 
-- Download and install [Hancho-v0.9.2-win64-setup.exe](https://github.com/gadget114514/Hancho/releases/download/v0.9.2/Hancho-v0.9.2-win64-setup.exe)
-  (portable: [Hancho-v0.9.2-win64.zip](https://github.com/gadget114514/Hancho/releases/download/v0.9.2/Hancho-v0.9.2-win64.zip), all versions: [Releases](https://github.com/gadget114514/Hancho/releases))
+- Download and install [Hancho-v0.9.3-win64-setup.exe](https://github.com/gadget114514/Hancho/releases/download/v0.9.3/Hancho-v0.9.3-win64-setup.exe)
+  (portable: [Hancho-v0.9.3-win64.zip](https://github.com/gadget114514/Hancho/releases/download/v0.9.3/Hancho-v0.9.3-win64.zip), all versions: [Releases](https://github.com/gadget114514/Hancho/releases))
 - In your llm, "find hancho in PATH, then read help to use it" 
 - In your llm, "create task and use (opencode|claude|agy|codex) to execute the task via hancho" 
 - That's all
@@ -122,6 +122,9 @@ Hancho writes a versioned event stream next to the raw one. For a worker process
 ---
 
 ## Release Notes
+
+### v0.9.3
+- **BT-wide task list**: `hancho-cli bt tasks --id <id>`, `taskqueue list --bt <id>` and MCP `taskqueue_list` with `bt` list every job of a behavior tree across its parallel branch queues. Parallel branches keep their own queues (and their own concurrency); the dashboard already shows all queues together.
 
 ### v0.9.2
 - **Stable event schema**: worker output is also written as normalized `hancho.event/1` events to `logs/proc_<id>_<name>.events.jsonl`, next to the raw `.stream.jsonl`. Read them with `hancho-cli worker stream <id> --schema v1` or MCP `get_worker_stream` with `schema: "v1"`. The JSON Schema ships in `doc/schema/hancho.event.v1.json`.
@@ -228,7 +231,7 @@ Older versions: [Releases](https://github.com/gadget114514/Hancho/releases)
 ## Appendix: `Hancho.exe --help`
 
 ```text
-Hancho 0.9.1 - Native Win32 Multi-LLM Process & ConPTY Manager + Live GUI Dashboard
+Hancho 0.9.3 - Native Win32 Multi-LLM Process & ConPTY Manager + Live GUI Dashboard
 
 USAGE:
   Hancho.exe [gui] [--data-dir <path>]
@@ -407,7 +410,7 @@ MCP SERVER SETUP:
 ## Appendix: `hancho-cli.exe help` output
 
 ```text
-hancho-cli 0.9.1 - Hancho console client
+hancho-cli 0.9.3 - Hancho console client
 
 USAGE:
   hancho-cli [--json] <command> [options]
@@ -585,9 +588,10 @@ TASK QUEUE:
       overlapping card) goes back to pending after delaySec without using up
       maxAttempts; after limit deferrals (0 = no limit) it is an ordinary failure.
 
-  taskqueue list [<name>] [--state <state>] [--since <period>] [--origin <self|label|session>]
+  taskqueue list [<name>] [--state <state>] [--since <period>] [--origin <self|label|session>] [--bt <id>]
       List jobs with state, queue, summary and blockedBy. --since keeps only
       jobs updated within the period (30m, 6h, 2d), e.g. --since 6h.
+      --bt <id> lists every job of a behavior tree across its parallel branch queues.
       --origin self keeps only the jobs this session added.
 
   taskqueue get <id> [--rev <n>] [--no-instructions]

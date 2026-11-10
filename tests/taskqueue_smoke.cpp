@@ -180,6 +180,31 @@ int main() {
     }
 
     {
+        // BT-wide list filter: taskqueue_list --bt <id> spans the tree's parallel branch queues.
+        TaskQueueBtRef refA;
+        refA.id = "tree-a-" + std::to_string(GetCurrentProcessId());
+        refA.node = "n1";
+        refA.run = 1;
+        TaskQueueBtRef refB;
+        refB.id = "tree-b-" + std::to_string(GetCurrentProcessId());
+        refB.node = "n1";
+        refB.run = 1;
+        std::string jobAId = "B1-" + std::to_string(GetCurrentProcessId());
+        std::string jobBId = "B2-" + std::to_string(GetCurrentProcessId());
+        std::string btJobA = "{\"id\":\"" + jobAId + "\",\"command\":\"cmd /c exit 0\",\"summary\":\"bt job a\",\"timeoutSec\":30}";
+        std::string btJobB = "{\"id\":\"" + jobBId + "\",\"command\":\"cmd /c exit 0\",\"summary\":\"bt job b\",\"timeoutSec\":30}";
+        Check(JsonGetBool(tqm.AddBtJob("btqa", btJobA, refA, err), "ok", false), "BT job A added: " + err);
+        std::string bResp = tqm.AddBtJob("btqb", btJobB, refB, err);
+        Check(JsonGetBool(bResp, "ok", false), "BT job B added: " + bResp + " " + err);
+        auto listHas = [&](const std::string& btId, const std::string& jobId) {
+            std::string resp = tqm.TaskQueueList("", "", 0, err, "", btId);
+            return resp.find("\"id\":\"" + jobId + "\"") != std::string::npos;
+        };
+        Check(listHas(refA.id, jobAId) && !listHas(refA.id, jobBId), "BT filter keeps only the tree's jobs");
+        Check(listHas(refB.id, jobBId) && !listHas(refB.id, jobAId), "BT filter separates trees");
+    }
+
+    {
         TaskQueueCounts cBefore = tqm.GetJobCounts();
         Check(cBefore.total > 0, "GetJobCounts returned non-empty total");
         Check(cBefore.succeeded >= 3, "GetJobCounts accurately counted succeeded jobs");

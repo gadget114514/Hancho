@@ -22,8 +22,8 @@
 
 ## Express
 
-- [Hancho-v0.9.2-win64-setup.exe](https://github.com/gadget114514/Hancho/releases/download/v0.9.2/Hancho-v0.9.2-win64-setup.exe) をダウンロードしてインストール
-  （ポータブル版: [Hancho-v0.9.2-win64.zip](https://github.com/gadget114514/Hancho/releases/download/v0.9.2/Hancho-v0.9.2-win64.zip)、全バージョン: [Releases](https://github.com/gadget114514/Hancho/releases)）
+- [Hancho-v0.9.3-win64-setup.exe](https://github.com/gadget114514/Hancho/releases/download/v0.9.3/Hancho-v0.9.3-win64-setup.exe) をダウンロードしてインストール
+  （ポータブル版: [Hancho-v0.9.3-win64.zip](https://github.com/gadget114514/Hancho/releases/download/v0.9.3/Hancho-v0.9.3-win64.zip)、全バージョン: [Releases](https://github.com/gadget114514/Hancho/releases)）
 - LLM に「PATH から hancho を探して、help を読んで使い方を把握して」と伝える
 - LLM に「タスクを作成して、hancho 経由で (opencode|claude|agy|codex) に実行させて」と伝える
 - 以上
@@ -126,6 +126,9 @@ Hancho は生のストリームの隣に、版番号つきのイベント列を�
 （以下の help 本文は英語です）
 
 ## リリースノート
+
+### v0.9.3
+- **BT 全体のタスク一覧**: `hancho-cli bt tasks --id <id>`、`taskqueue list --bt <id>`、MCP `taskqueue_list` の `bt` で、ビヘイビアツリーの全ジョブを並列分岐のキューをまたいで一覧できます。並列分岐は専用キュー（と専用の並列度）を保ち、ダッシュボードは元々すべてのキューをまとめて表示します。
 
 ### v0.9.2
 - **安定したイベントスキーマ**: ワーカーの出力を正規化した `hancho.event/1` イベントとして `logs/proc_<id>_<name>.events.jsonl` にも書きます（生の `.stream.jsonl` はそのまま）。`hancho-cli worker stream <id> --schema v1`、または MCP の `get_worker_stream` に `schema: "v1"` を渡して読めます。JSON Schema は `doc/schema/hancho.event.v1.json` に同梱します。
@@ -232,7 +235,7 @@ Hancho は生のストリームの隣に、版番号つきのイベント列を�
 ## 付録: `Hancho.exe --help` の出力
 
 ```text
-Hancho 0.9.1 - Native Win32 Multi-LLM Process & ConPTY Manager + Live GUI Dashboard
+Hancho 0.9.3 - Native Win32 Multi-LLM Process & ConPTY Manager + Live GUI Dashboard
 
 USAGE:
   Hancho.exe [gui] [--data-dir <path>]
@@ -411,7 +414,7 @@ MCP SERVER SETUP:
 ## 付録: `hancho-cli.exe help` の出力
 
 ```text
-hancho-cli 0.9.1 - Hancho console client
+hancho-cli 0.9.3 - Hancho console client
 
 USAGE:
   hancho-cli [--json] <command> [options]
@@ -589,9 +592,10 @@ TASK QUEUE:
       overlapping card) goes back to pending after delaySec without using up
       maxAttempts; after limit deferrals (0 = no limit) it is an ordinary failure.
 
-  taskqueue list [<name>] [--state <state>] [--since <period>] [--origin <self|label|session>]
+  taskqueue list [<name>] [--state <state>] [--since <period>] [--origin <self|label|session>] [--bt <id>]
       List jobs with state, queue, summary and blockedBy. --since keeps only
       jobs updated within the period (30m, 6h, 2d), e.g. --since 6h.
+      --bt <id> lists every job of a behavior tree across its parallel branch queues.
       --origin self keeps only the jobs this session added.
 
   taskqueue get <id> [--rev <n>] [--no-instructions]

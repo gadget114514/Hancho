@@ -224,6 +224,7 @@ When execution reaches an `escalate` node:
 - **`bt_update`** (`id`, optional `node`, `bt`/`patch`/`file`): Replaces the definition of nodes that are **not `running`**. The tree shape (`type`, `id`, child slots, and `children` count) must remain identical so persisted runtime state stays valid.
 - **`bt_cancel`** (`id`): Marks the tree `cancelled` and cancels all currently running BT jobs in the task queue.
 - **`bt_pause`** (`id`, `paused`): Pauses or resumes the tree (`paused` <-> `running`) and pauses/resumes its task queue.
+- **`bt tasks`** (`id`): Lists every task-queue job of the tree across its parallel branch queues. `hancho-cli taskqueue list --bt <id>` does the same from the CLI.
 - **Task-queue protection**: Calling `taskqueue_retry` or `taskqueue_update` via MCP/CLI on a BT-owned job is rejected with `"this job is managed by a behavior tree; use bt_retry"`.
 
 ---

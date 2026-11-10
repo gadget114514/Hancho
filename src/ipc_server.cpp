@@ -557,7 +557,8 @@ std::string IpcServer::HandleRequestJson(const std::string& reqJson) {
             } else {
                 resp = tqm_.TaskQueueList(JsonGetString(reqJson, "taskqueue", ""),
                                           JsonGetString(reqJson, "state", ""), sinceSec, err,
-                                          JsonGetString(reqJson, "origin", ""));
+                                          JsonGetString(reqJson, "origin", ""),
+                                          JsonGetString(reqJson, "bt", ""));
             }
         } else if (action == "taskqueue_get") {
             resp = tqm_.TaskQueueGet(JsonGetString(reqJson, "id", ""),

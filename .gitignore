@@ -441,3 +441,9 @@ dist/
 
 # Self-test fixtures (tools/ww/*.selftest.ps1)
 scratch/
+
+# ww task-card run data
+ww-data/logs/
+ww-data/running/
+ww-data/jobs/
+ww-data/stall-state.json

@@ -1,0 +1,25 @@
+﻿{
+    "Started":  "2026-11-10T12:10:35",
+    "Log":  "D:\\wsgit\\Hancho\\ww-data\\logs\\010-20261110-121035.log",
+    "Engine":  "claude",
+    "Reads":  [
+                  "doc/design-v3.md",
+                  "doc/design-v3-en.md",
+                  "src/event_schema.h"
+              ],
+    "Task":  "010",
+    "OpencodePid":  null,
+    "Card":  "010-v1-consumers.md",
+    "Worktree":  null,
+    "Host":  976,
+    "WorkerPid":  null,
+    "Shared":  true,
+    "Progress":  "D:\\wsgit\\Hancho\\ww-data\\logs\\010-20261110-121035.progress.log",
+    "Events":  "D:\\wsgit\\Hancho\\ww-data\\logs\\010-20261110-121035.events.jsonl",
+    "Edits":  [
+                  "src/gui_dashboard.cpp",
+                  "src/mcp_server.cpp",
+                  "src/behavior_tree_cond.cpp",
+                  "tests/"
+              ]
+}

@@ -632,9 +632,10 @@ TASK QUEUE:
       overlapping card) goes back to pending after delaySec without using up
       maxAttempts; after limit deferrals (0 = no limit) it is an ordinary failure.
 
-  taskqueue list [<name>] [--state <state>] [--since <period>] [--origin <self|label|session>]
+  taskqueue list [<name>] [--state <state>] [--since <period>] [--origin <self|label|session>] [--bt <id>]
       List jobs with state, queue, summary and blockedBy. --since keeps only
       jobs updated within the period (30m, 6h, 2d), e.g. --since 6h.
+      --bt <id> lists every job of a behavior tree across its parallel branch queues.
       --origin self keeps only the jobs this session added.
 
   taskqueue get <id> [--rev <n>] [--no-instructions]
@@ -933,7 +934,7 @@ void PrintCliUsageJson() {
       "usage": "hancho-cli taskqueue <add|list|get|retry|cancel|pause|resume|graph|wait|purge> ...",
       "subcommands": [
         {"name": "add", "usage": "hancho-cli taskqueue add --file <jobs.json> [--taskqueue <name>] [--concurrency <n>] [--notify-file <path>] [--origin-label <text>]", "description": "Register jobs. Each job needs id, command, summary and timeoutSec; dependsOn replaces shell chaining. The caller's session id, working folder and --origin-label are recorded as the job's origin."},
-        {"name": "list", "usage": "hancho-cli taskqueue list [<name>] [--state <state>] [--since <period>] [--origin <self|label|session>]", "description": "List jobs with state, queue, summary and blockedBy. --since keeps only jobs updated within the period (e.g. 30m, 6h, 2d). --origin self keeps only the jobs this session added."},
+        {"name": "list", "usage": "hancho-cli taskqueue list [<name>] [--state <state>] [--since <period>] [--origin <self|label|session>] [--bt <id>]", "description": "List jobs with state, queue, summary and blockedBy. --since keeps only jobs updated within the period (e.g. 30m, 6h, 2d). --origin self keeps only the jobs this session added. --bt <id> lists every job of a behavior tree across its parallel branch queues."},
         {"name": "get", "usage": "hancho-cli taskqueue get <id> [--rev <n>] [--no-instructions]", "description": "Show one job with attempts and instructions."},
         {"name": "retry", "usage": "hancho-cli taskqueue retry <id> | hancho-cli taskqueue retry --failed [<name>] [--since <period>]", "description": "Requeue a failed/blocked/cancelled job; blocked dependents resume automatically. --failed retries every failed job instead, optionally limited to one queue and to jobs that failed within --since (e.g. --since 6h = last 6 hours)."},
         {"name": "cancel", "usage": "hancho-cli taskqueue cancel <id>", "description": "Cancel a job; a running attempt is killed and is not retried."},
@@ -955,6 +956,7 @@ void PrintCliUsageJson() {
         {"name": "wait", "usage": "hancho-cli bt wait --id <id> [--since-version <n>] [--timeout-ms <ms>]", "description": "Long-poll until the tree finishes or waits for a decision (state waitingForLlm, with the decision packet)."},
         {"name": "resume", "usage": "hancho-cli bt resume --id <id> --node <node> --answer <answer> --rationale <text> [--vars <json>]", "description": "Answer an escalate node; rationale is required."},
         {"name": "get", "usage": "hancho-cli bt get --id <id> [--compact]", "description": "Node states, runs, variables and jobs; --compact prints one line per node."},
+        {"name": "tasks", "usage": "hancho-cli bt tasks --id <id> [--json]", "description": "List every task-queue job of the tree across its parallel branch queues."},
         {"name": "list", "usage": "hancho-cli bt list", "description": "All trees and their states."},
         {"name": "retry", "usage": "hancho-cli bt retry --id <id> [--from <node>] [--reset-counters]", "description": "Resume a failed tree from the failed leaf or the given node."},
         {"name": "update", "usage": "hancho-cli bt update --id <id> [--node <node>] --file <path> | --bt <json> | --patch <json>", "description": "Replace the definition of non-running nodes; the tree shape cannot change."},
@@ -2098,7 +2100,7 @@ if (subcmd == "start" || subcmd == "run") {
         };
         // First non-flag argument, skipping the values of flags that take one (e.g. "--since 6h").
         auto positionalSkippingValues = [&args](size_t startIdx) -> std::string {
-            static const char* const valueFlags[] = {"--state", "--since", "--origin", "--rev", "--root", "--states", "--older-than-days"};
+            static const char* const valueFlags[] = {"--state", "--since", "--origin", "--rev", "--root", "--states", "--older-than-days", "--bt"};
             for (size_t i = startIdx; i < args.size(); ++i) {
                 bool isValueFlag = false;
                 for (const char* f : valueFlags) {
@@ -2156,11 +2158,13 @@ if (subcmd == "start" || subcmd == "run") {
             std::string state = argVal("--state", "");
             std::string since = argVal("--since", "");
             std::string originFilter = argVal("--origin", "");
+            std::string btFilter = argVal("--bt", "");
             if (originFilter == "self") originFilter = CallerSelfOriginFilter();
             reqJson << "{\"action\":\"taskqueue_list\",\"taskqueue\":\"" << JsonEscape(tqName)
                     << "\",\"state\":\"" << JsonEscape(state) << "\""
                     << ",\"since\":\"" << JsonEscape(since) << "\""
-                    << ",\"origin\":\"" << JsonEscape(originFilter) << "\"}";
+                    << ",\"origin\":\"" << JsonEscape(originFilter) << "\""
+                    << ",\"bt\":\"" << JsonEscape(btFilter) << "\"}";
             subcmd = "taskqueue_list";
         } else if (op == "get") {
             std::string id = firstPositional(3);
@@ -2269,6 +2273,7 @@ if (subcmd == "start" || subcmd == "run") {
                 << "  validate  --file <path> | --bt <json>              Validate a behavior tree JSON definition\n"
                 << "  start     --file <path> | --bt <json>              Register and start a behavior tree\n"
                 << "  get       --id <id> [--compact]                    Get behavior tree state and node status\n"
+                << "  tasks     --id <id>                                All of the tree's jobs across branch queues\n"
                 << "  list                                               List behavior trees\n"
                 << "  wait      --id <id> [--since-version <n>] [--timeout-ms <ms>]\n"
                 << "                                                     Wait for completion or escalation\n"
@@ -2384,6 +2389,11 @@ if (subcmd == "start" || subcmd == "run") {
             jReq["bt"] = text;
             if (op == "start") jReq["origin"] = nlohmann::json::parse(BuildCallerOriginJson("hancho-cli-cli", ""), nullptr, false);
             subcmd = "bt_" + op;
+        } else if (op == "tasks") {
+            if (id.empty()) return failWith("tasks requires --id <id>");
+            jReq["action"] = "taskqueue_list";
+            jReq["bt"] = id;
+            subcmd = "taskqueue_list";
         } else if (op == "get") {
             if (id.empty()) return failWith("get requires --id <id>");
             jReq["action"] = "bt_get";
