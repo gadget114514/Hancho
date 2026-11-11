@@ -601,7 +601,7 @@ Off by default. Enable it explicitly per job.
 ### 3.11 Display
 
 - **"Past runs" tab in task details**: RunRecords of jobs with the same name, stats, failure-class trend, related notes.
-- **Memory list dialog**: search, retract notes, promote to L3. Filter by author type (agent / human / hancho).
+- **Memory list dialog**: search, retract L2 notes, promote to L3 knowledge. Filter by author type (agent / human / hancho) and by layer (L1 record / L2 note / L3 knowledge). The layer choices show the count of each layer, and a description of the selected layer is shown below.
 - **Execution Monitor pane**: if memory was injected, show its ids under "Goal".
 
 ### 3.12 Measuring the effect
@@ -649,7 +649,7 @@ More memory is not always better. Injection adds tokens, and old records can mis
 | `idle_stall` | Both output and CPU stopped | Retry |
 | `exit_nonzero` | Non-zero exit code matching no other class | Retry |
 | `crash` | Ended by an exception (`0xC0000005`, ...) | Retry; `human` if it repeats |
-| `success_check_failed` | A success condition (`exitCode` / `filesNewer` / `outputRegex`) not met; which one goes in `detail` | Retry |
+| `success_check_failed` | A success condition (`exitCode` / `filesNewer` / `outputRegex` / `testReport`) not met; which one goes in `detail` | Retry |
 | `rate_limited` | A `rate_limit` event with `status` `rejected`, or an equivalent error | `retry_after` (wait until reset; does not use up `maxAttempts`) |
 | `auth_error` | An authentication `error` event or known wording | No retry (`human`) |
 | `permission_denied` | Many `permissionDenials` and no result | No retry (`fix_spec`: review the permission settings) |

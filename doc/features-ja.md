@@ -78,7 +78,7 @@
 
 ## 7. タスクキュー: 順序・依存・タイムアウト・自動再実行
 - ジョブを**1 コマンドずつ**登録すると、Hancho が実行順・同時実行数・優先度を決め、キューを永続化します（`logs/taskqueues/<name>.json`）。
-- ジョブ単位の `timeoutSec`、出力と CPU の両方を見るアイドル検出、成功条件（`exitCode` / `filesNewer` / `outputRegex`）、自動再実行（`maxAttempts`）、依存失敗時の `blocked` を提供します。
+- ジョブ単位の `timeoutSec`、出力と CPU の両方を見るアイドル検出、成功条件（`exitCode` / `filesNewer` / `outputRegex` / JUnit・NUnit XML を読む `testReport`）、自動再実行（`maxAttempts`）、依存失敗時の `blocked` を提供します。
 - **ChainGuard** が `start_process` / `taskqueue_add` / `taskqueue_update` のシェル連鎖と待ちループを拒否します。順序は `dependsOn` で宣言してください。CLI の `--allow-chain` のみ例外（MCP には非公開）。
 - GUI: 左端の表示切替ボタン、または **Ctrl+T** で **2行同時表示 (Two Rows)**、**プロセスのみ (Processes Only)**、**タスクのみ (Tasks Only)** を順次トグル切り替え。2行表示時は水平スプリッターバーをドラッグして各領域の高さを自在に調整できます。実行中のジョブは上位に表示され、失敗は低彩度の赤、タイムアウトは低彩度のアンバーで表示されます。
 - 詳細は [タスクキュー](taskqueue-ja.md) を参照。

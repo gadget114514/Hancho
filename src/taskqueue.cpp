@@ -15,6 +15,9 @@
 #include <chrono>
 #include <set>
 #include <regex>
+#include <filesystem>
+#include <mutex>
+#include <unordered_map>
 #include <stdexcept>
 
 namespace pc {
@@ -309,6 +312,7 @@ static std::string NormalizeJobJsonKeys(const std::string& in) {
         {"exitCode", "exit_code"},
         {"filesNewer", "files_newer"},
         {"outputRegex", "output_regex"},
+        {"testReport", "test_report"},
         {"budgetChars", "budget_chars"},
         {"includeAgentNotes", "include_agent_notes"},
         {"waitForRateLimit", "wait_for_rate_limit"}
@@ -819,6 +823,7 @@ static std::string SuccessConditionOf(const std::string& detail) {
         return "filesNewer";
     }
     if (detail.find("output_regex") != std::string::npos) return "outputRegex";
+    if (detail.rfind("test report", 0) == 0) return "testReport";
     if (detail.rfind("exit code ", 0) == 0) return "exitCode";
     return "";
 }
@@ -1564,6 +1569,7 @@ static std::string SuccessToJson(const TaskQueueSuccess& s) {
         << ",\"output_regex\":";
     if (s.outputRegex.empty()) oss << "null";
     else oss << "\"" << JsonEscape(s.outputRegex) << "\"";
+    if (!s.testReport.empty()) oss << ",\"test_report\":\"" << JsonEscape(s.testReport) << "\"";
     oss << "}";
     return oss.str();
 }
@@ -1829,6 +1835,7 @@ static TaskQueueJob ParseJob(const std::string& j) {
     job.success.exitCode = static_cast<int>(JsonFieldInt(successObj, "exit_code", 0));
     job.success.filesNewer = JsonFieldStrArray(successObj, "files_newer");
     job.success.outputRegex = JsonFieldStr(successObj, "output_regex", "");
+    job.success.testReport = JsonFieldStr(successObj, "test_report", "");
     std::string deferErr;
     if (!ParseDeferChecked(j, job.success.exitCode, job.defer, deferErr)) job.defer = TaskQueueDefer();
     job.killExclude = JsonFieldStrArray(j, "kill_exclude");
@@ -2339,6 +2346,112 @@ bool TaskQueueManager::IsDepSatisfied(const TaskQueueJob& dep, const std::string
 // Resource locks (doc/resource-locks.md)
 // ---------------------------------------------------------------------------
 
+static void ReplaceAllInPlace(std::string& s, const std::string& from, const std::string& to) {
+    size_t pos = 0;
+    while ((pos = s.find(from, pos)) != std::string::npos) {
+        s.replace(pos, from.size(), to);
+        pos += to.size();
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Test reports (success.testReport). A small tag scanner, not a full XML parser: it reads
+// JUnit <testcase> (failed when it holds <failure> or <error>, skipped with <skipped>) and
+// NUnit 2/3 <test-case result="..."> elements.
+
+static std::string XmlAttr(const std::string& tag, const std::string& name) {
+    size_t pos = 0;
+    while ((pos = tag.find(name, pos)) != std::string::npos) {
+        const bool startOk = pos > 0 && std::isspace(static_cast<unsigned char>(tag[pos - 1]));
+        size_t eq = pos + name.size();
+        while (eq < tag.size() && std::isspace(static_cast<unsigned char>(tag[eq]))) ++eq;
+        if (!startOk || eq >= tag.size() || tag[eq] != '=') { pos += name.size(); continue; }
+        size_t q = eq + 1;
+        while (q < tag.size() && std::isspace(static_cast<unsigned char>(tag[q]))) ++q;
+        if (q >= tag.size() || (tag[q] != '"' && tag[q] != '\'')) return "";
+        size_t end = tag.find(tag[q], q + 1);
+        if (end == std::string::npos) return "";
+        std::string v = tag.substr(q + 1, end - q - 1);
+        static const std::pair<const char*, const char*> kEnt[] = {
+            {"&lt;", "<"}, {"&gt;", ">"}, {"&quot;", "\""}, {"&apos;", "'"}, {"&amp;", "&"}};
+        for (const auto& e : kEnt) ReplaceAllInPlace(v, e.first, e.second);
+        return v;
+    }
+    return "";
+}
+
+// Next element start tag at or after pos whose name is one of `names`. Returns the tag text
+// (between '<' and '>') and sets pos past it; "" when none is left.
+static std::string NextXmlTag(const std::string& xml, size_t& pos, std::string& outName) {
+    while ((pos = xml.find('<', pos)) != std::string::npos) {
+        size_t end = xml.find('>', pos);
+        if (end == std::string::npos) { pos = std::string::npos; return ""; }
+        std::string tag = xml.substr(pos + 1, end - pos - 1);
+        pos = end + 1;
+        if (tag.empty() || tag[0] == '?' || tag[0] == '!') continue;
+        size_t n = 0;
+        while (n < tag.size() && !std::isspace(static_cast<unsigned char>(tag[n])) && tag[n] != '/') ++n;
+        outName = tag.substr(0, n);
+        return tag;
+    }
+    return "";
+}
+
+bool ParseTestReport(const std::string& xml, TestReportSummary& out) {
+    out = TestReportSummary();
+    const size_t kMaxNames = 5;
+    auto addFailed = [&out, kMaxNames](const std::string& name) {
+        ++out.failed;
+        if (out.failedNames.size() < kMaxNames) out.failedNames.push_back(name.empty() ? "(unnamed)" : name);
+    };
+    size_t pos = 0;
+    std::string name;
+    // JUnit case currently open: its display name and whether it already failed or skipped.
+    bool inCase = false;
+    bool caseFailed = false;
+    bool caseSkipped = false;
+    std::string caseName;
+    auto closeCase = [&]() {
+        if (!inCase) return;
+        ++out.total;
+        if (caseFailed) addFailed(caseName);
+        else if (caseSkipped) ++out.skipped;
+        inCase = false;
+    };
+    while (true) {
+        std::string tag = NextXmlTag(xml, pos, name);
+        if (pos == std::string::npos || (tag.empty() && name.empty())) break;
+        const bool selfClosing = !tag.empty() && tag.back() == '/';
+        if (name == "testcase") {
+            closeCase();
+            std::string cls = XmlAttr(tag, "classname");
+            std::string nm = XmlAttr(tag, "name");
+            caseName = cls.empty() ? nm : cls + "." + nm;
+            inCase = true;
+            caseFailed = false;
+            caseSkipped = false;
+            if (selfClosing) closeCase();
+        } else if (name == "/testcase") {
+            closeCase();
+        } else if (inCase && (name == "failure" || name == "error")) {
+            caseFailed = true;
+        } else if (inCase && name == "skipped") {
+            caseSkipped = true;
+        } else if (name == "test-case") {
+            // NUnit 3: result="Passed|Failed|Skipped|Inconclusive|Warning".
+            // NUnit 2: result="Success|Failure|Error|Ignored|..." plus executed="True|False".
+            std::string full = XmlAttr(tag, "fullname");
+            if (full.empty()) full = XmlAttr(tag, "name");
+            std::string result = LowerAscii(XmlAttr(tag, "result"));
+            ++out.total;
+            if (result == "failed" || result == "failure" || result == "error") addFailed(full);
+            else if (result != "passed" && result != "success") ++out.skipped;
+        }
+    }
+    closeCase();
+    return out.total > 0;
+}
+
 static bool IsAbsoluteResourcePath(const std::string& s) {
     return (s.size() >= 2 && s[1] == ':') || (!s.empty() && s[0] == '/');
 }
@@ -2374,13 +2487,64 @@ static std::string NormalizeResourcePath(std::string s) {
     return out;
 }
 
+// Git top level above cwd: the nearest ancestor holding a .git directory or file (a linked
+// worktree has a .git file). Cached, since the scheduler normalizes resources every tick.
+static std::string FindGitRootCached(const std::string& cwd) {
+    static std::mutex mu;
+    static std::unordered_map<std::string, std::string> cache;
+    {
+        std::lock_guard<std::mutex> lock(mu);
+        auto it = cache.find(cwd);
+        if (it != cache.end()) return it->second;
+    }
+    std::string root = cwd;
+    try {
+        std::error_code ec;
+        std::filesystem::path p{std::u8string(cwd.begin(), cwd.end())};
+        for (int depth = 0; depth < 64 && !p.empty(); ++depth) {
+            if (std::filesystem::exists(p / ".git", ec)) {
+                const std::u8string u = p.u8string();
+                root.assign(u.begin(), u.end());
+                break;
+            }
+            std::filesystem::path parent = p.parent_path();
+            if (parent == p) break;
+            p = parent;
+        }
+    } catch (const std::exception&) {
+        root = cwd;
+    }
+    std::lock_guard<std::mutex> lock(mu);
+    cache[cwd] = root;
+    return root;
+}
+
 std::string NormalizeResource(const std::string& resource, const std::string& cwd) {
+    return NormalizeResource(resource, cwd, "");
+}
+
+std::string NormalizeResource(const std::string& resource, const std::string& cwd,
+                              const std::string& host) {
     std::string s = TrimJsonStr(resource);
     for (auto& c : s) {
         if (c == '\\') c = '/';
         else c = static_cast<char>(std::tolower(static_cast<unsigned char>(c)));
     }
-    if (!s.empty() && s[0] == '@') return s;
+    if (!s.empty() && s[0] == '@') {
+        if (s.find('{') != std::string::npos) {
+            const std::string trimmedCwd = TrimJsonStr(cwd);
+            const std::string cwdNorm = NormalizeResourcePath(trimmedCwd);
+            ReplaceAllInPlace(s, "{cwd}", cwdNorm);
+            if (s.find("{root}") != std::string::npos) {
+                // A remote cwd is not a local path, so it cannot be walked here.
+                std::string root = (host.empty() && !trimmedCwd.empty())
+                                       ? NormalizeResourcePath(FindGitRootCached(trimmedCwd))
+                                       : cwdNorm;
+                ReplaceAllInPlace(s, "{root}", root);
+            }
+        }
+        return s;
+    }
     // A bare file name (no '/') can live anywhere below cwd, as tools/ww reads it: Foo.cs -> **/foo.cs.
     if (!s.empty() && s.find('/') == std::string::npos && s != "**" && s != "." && s != ".." &&
         !IsAbsoluteResourcePath(s)) {
@@ -2497,13 +2661,13 @@ bool FindResourceConflict(const TaskQueueResources& a, const std::string& cwdA,
     // The same path means different things on different machines.
     if (hostA != hostB) return false;
     if (a.empty() || b.empty()) return false;
-    auto norm = [](const std::vector<std::string>& v, const std::string& cwd) {
+    auto norm = [](const std::vector<std::string>& v, const std::string& cwd, const std::string& host) {
         std::vector<std::string> out;
-        for (const auto& r : v) out.push_back(NormalizeResource(r, cwd));
+        for (const auto& r : v) out.push_back(NormalizeResource(r, cwd, host));
         return out;
     };
-    std::vector<std::string> aw = norm(a.write, cwdA), ar = norm(a.read, cwdA);
-    std::vector<std::string> bw = norm(b.write, cwdB), br = norm(b.read, cwdB);
+    std::vector<std::string> aw = norm(a.write, cwdA, hostA), ar = norm(a.read, cwdA, hostA);
+    std::vector<std::string> bw = norm(b.write, cwdB, hostB), br = norm(b.read, cwdB, hostB);
     auto check = [&](const std::vector<std::string>& x, const std::vector<std::string>& xRaw,
                      const std::vector<std::string>& y) {
         for (size_t i = 0; i < x.size(); ++i) {
@@ -2810,6 +2974,7 @@ static bool ParseNewJob(const std::string& rawJson, const std::string& taskqueue
     job.success.exitCode = static_cast<int>(JsonFieldInt(successObj, "exit_code", 0));
     job.success.filesNewer = JsonFieldStrArray(successObj, "files_newer");
     job.success.outputRegex = JsonFieldStr(successObj, "output_regex", "");
+    job.success.testReport = JsonFieldStr(successObj, "test_report", "");
     job.killExclude = JsonFieldStrArray(j, "kill_exclude");
     std::string resErr;
     if (!ParseResourcesChecked(j, job.resources, resErr)) {
@@ -3399,6 +3564,7 @@ std::string TaskQueueManager::TaskQueueUpdate(const std::string& id, const std::
         job->success.exitCode = static_cast<int>(JsonFieldInt(successObj, "exit_code", job->success.exitCode));
         job->success.filesNewer = JsonFieldStrArray(successObj, "files_newer");
         job->success.outputRegex = JsonFieldStr(successObj, "output_regex", "");
+        job->success.testReport = JsonFieldStr(successObj, "test_report", "");
     }
     if (HasJsonKey(patchJson, "defer")) {
         TaskQueueDefer d;
@@ -3949,6 +4115,33 @@ bool TaskQueueManager::EvaluateSuccess(const TaskQueueJob& job, TaskQueueAttempt
             }
         } catch (const std::regex_error&) {
             detail = "invalid output_regex";
+            return false;
+        }
+    }
+    if (!job.success.testReport.empty() && job.host.empty()) {
+        const std::string& rel = job.success.testReport;
+        std::wstring pathW = ResolveJobPathWide(job, rel);
+        uint64_t fileTime = 0;
+        if (!PathExistsWide(pathW)) {
+            detail = "test report missing: " + rel;
+            return false;
+        }
+        if (GetFileMtimeWide(pathW, fileTime) && attempt.startFiletime > 0 && fileTime <= attempt.startFiletime) {
+            detail = "test report not newer than attempt start: " + rel;
+            return false;
+        }
+        TestReportSummary sum;
+        if (!ParseTestReport(ReadFileUtf8Wide(pathW), sum)) {
+            detail = "test report has no test cases: " + rel;
+            return false;
+        }
+        if (sum.failed > 0) {
+            detail = "test report: " + std::to_string(sum.failed) + " of " + std::to_string(sum.total) +
+                     " tests failed";
+            for (size_t i = 0; i < sum.failedNames.size(); ++i) {
+                detail += (i == 0 ? ": " : ", ") + sum.failedNames[i];
+            }
+            if (static_cast<int>(sum.failedNames.size()) < sum.failed) detail += ", ...";
             return false;
         }
     }

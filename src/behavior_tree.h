@@ -30,6 +30,7 @@ struct BtJobSuccess {
     int exitCode = 0;
     std::vector<std::string> filesNewer;
     std::string outputRegex;
+    std::string testReport;
 };
 
 struct BtJobResources {

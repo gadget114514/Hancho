@@ -36,12 +36,22 @@ task declares what it touches, and only tasks whose declarations overlap are ser
 | Form | Meaning |
 |---|---|
 | `@name` (`@build`, `@git`) | Named lock. Exact, case-insensitive match. Shared globally, independent of `cwd`. |
+| `@name:{root}`, `@name:{cwd}` | Scoped named lock. `{root}` becomes the git top level above the job's `cwd` (the nearest folder with a `.git` directory or file, so each linked worktree is its own root; `cwd` itself when there is none or the job runs on a remote host). `{cwd}` becomes the normalized `cwd`. Jobs in different checkouts then hold different locks. |
 | Path (`src/a.cpp`, `C:\proj\src`) | File or directory; a directory covers everything below it. Relative paths are made absolute against the job's `cwd` (kept relative when `cwd` is empty). |
 | Bare file name (`Foo.cs`, `*.md`) | No `/`: the name anywhere below `cwd`, i.e. `**/Foo.cs` (same as ww). `**` alone is the whole `cwd`. |
 | Glob (`src/**/*.cpp`, `doc/*`) | `*` (within one segment), `**` (across segments), `?`. |
 
 Paths are normalized before comparison: `\` -> `/`, ASCII lower case, `.` / `..` resolved,
 trailing `/` removed (Windows semantics).
+
+Choosing the scope of a heavy external tool (an IDE or editor that locks its project, a
+build daemon, an emulator, a tool with one licence):
+
+- The tool allows one instance per machine: `@tool`.
+- The tool allows one instance per project folder, and each worktree may run its own:
+  `@tool:{root}`. Jobs in the same checkout wait for each other; jobs in other worktrees do not.
+- To verify such a tool headlessly, run its batch/CLI mode as a job with the same lock and
+  check the result with `success.testReport` (JUnit or NUnit XML) instead of the exit code.
 
 ### 2.2 Conflict rule
 

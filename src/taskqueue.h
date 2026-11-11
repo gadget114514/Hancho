@@ -71,7 +71,20 @@ struct TaskQueueSuccess {
     int exitCode = 0;
     std::vector<std::string> filesNewer;
     std::string outputRegex;
+    // JUnit or NUnit XML written by the job (relative to cwd). It must be newer than the
+    // attempt start, contain at least one test case, and have no failed ones.
+    std::string testReport;
 };
+
+// Result of reading a test report (JUnit <testcase>, NUnit 2/3 <test-case>).
+struct TestReportSummary {
+    int total = 0;
+    int failed = 0;
+    int skipped = 0;
+    std::vector<std::string> failedNames; // first few failed test names
+};
+// Pure parser, exposed for tests. False when the text has no recognizable test cases.
+bool ParseTestReport(const std::string& xml, TestReportSummary& out);
 
 struct TaskQueueDependency {
     std::string id;
@@ -88,7 +101,12 @@ struct TaskQueueResources {
 };
 
 // Resource helpers, exposed for tests.
+// A named lock may contain {cwd} (the job's cwd) or {root} (the git top level above cwd,
+// found by walking up to a .git dir or file; cwd itself when there is none, or for a
+// remote host). "@editor:{root}" is then one lock per checkout or worktree.
 std::string NormalizeResource(const std::string& resource, const std::string& cwd);
+std::string NormalizeResource(const std::string& resource, const std::string& cwd,
+                              const std::string& host);
 bool ResourcesOverlap(const std::string& a, const std::string& b); // both normalized
 bool FindResourceConflict(const TaskQueueResources& a, const std::string& cwdA,
                           const TaskQueueResources& b, const std::string& cwdB,

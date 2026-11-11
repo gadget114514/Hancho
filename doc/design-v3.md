@@ -601,7 +601,7 @@ U1 のレコード:
 ### 3.11 表示
 
 - **タスク詳細の「過去の実行」タブ**: 同じ名前のジョブの RunRecord 一覧と集計、失敗分類の推移、関連ノート。
-- **メモリ一覧のダイアログ**: 検索、ノートの取り消し、L3 への昇格。作者の種類（agent / human / hancho）で絞り込めます。
+- **メモリ一覧のダイアログ**: 検索、L2 note の取り消し、L3 knowledge への昇格。作者の種類（agent / human / hancho）とレイヤー（L1 record / L2 note / L3 knowledge）で絞り込めます。レイヤーの選択肢には各レイヤーの件数が表示され、選択中のレイヤーの説明がその下に出ます。
 - **実行状態監視ペイン**: 注入したメモリがあれば、その id を「目標」の下に出します。
 
 ### 3.12 効果の測り方
@@ -649,7 +649,7 @@ U1 のレコード:
 | `idle_stall` | 出力も CPU も止まった | 再試行 |
 | `exit_nonzero` | 終了コードが 0 以外で、ほかの分類に当たらない | 再試行 |
 | `crash` | 例外による終了（`0xC0000005` など） | 再試行。続けば `human` |
-| `success_check_failed` | 成功条件のどれか（`exitCode` / `filesNewer` / `outputRegex`）が満たされない。どれかを `detail` に書く | 再試行 |
+| `success_check_failed` | 成功条件のどれか（`exitCode` / `filesNewer` / `outputRegex` / `testReport`）が満たされない。どれかを `detail` に書く | 再試行 |
 | `rate_limited` | `rate_limit` イベントの `status` が `rejected`、またはそれに相当するエラー | `retry_after`（リセット時刻まで待つ。`maxAttempts` を消費しない） |
 | `auth_error` | 認証エラーの `error` イベント、決まった文言 | 再試行しない（`human`） |
 | `permission_denied` | `permissionDenials` が多く、成果がない | 再試行しない（`fix_spec`: 権限の設定を見直す） |

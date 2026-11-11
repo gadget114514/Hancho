@@ -674,6 +674,47 @@ int main() {
     Check(JsonGetBool(add3, "ok", false), "F added: " + err);
     Check(WaitForState(tqm, "F", "succeeded", 20000), "F succeeded because it wrote the file");
 
+    // success.testReport: the job writes a JUnit file; a failed test case fails the job and
+    // the failed test name ends up in the diagnosis.
+    WriteFileAtomicWide(workDir + L"/junit-pass.src",
+        "<?xml version=\"1.0\"?><testsuite tests=\"2\"><testcase classname=\"A\" name=\"one\"/>"
+        "<testcase classname=\"A\" name=\"two\"></testcase></testsuite>\n");
+    WriteFileAtomicWide(workDir + L"/junit-fail.src",
+        "<testsuite><testcase classname=\"A\" name=\"ok\"/><testcase classname=\"A\" name=\"broken\">"
+        "<failure message=\"x\">boom</failure></testcase></testsuite>\n");
+    {
+        std::string jobsTr = "["
+            "{\"id\":\"TRP\",\"command\":\"cmd /c type junit-pass.src>tr-pass.xml\",\"summary\":\"report passes\","
+            "\"timeoutSec\":30,\"maxAttempts\":1,\"success\":{\"testReport\":\"tr-pass.xml\"},"
+            "\"cwd\":\"" + JsonEscape(workUtf8) + "\"},"
+            "{\"id\":\"TRF\",\"command\":\"cmd /c type junit-fail.src>tr-fail.xml\",\"summary\":\"report fails\","
+            "\"timeoutSec\":30,\"maxAttempts\":1,\"success\":{\"testReport\":\"tr-fail.xml\"},"
+            "\"cwd\":\"" + JsonEscape(workUtf8) + "\"},"
+            "{\"id\":\"TRM\",\"command\":\"cmd /c exit 0\",\"summary\":\"report missing\","
+            "\"timeoutSec\":30,\"maxAttempts\":1,\"success\":{\"testReport\":\"tr-missing.xml\"},"
+            "\"cwd\":\"" + JsonEscape(workUtf8) + "\"}"
+            "]";
+        std::string addTr = tqm.TaskQueueAdd("trq", jobsTr, 0, "", err);
+        Check(JsonGetBool(addTr, "ok", false), "testReport jobs added: " + err);
+        Check(WaitForState(tqm, "TRP", "succeeded", 20000), "TRP succeeded with an all-pass JUnit report");
+        Check(WaitForState(tqm, "TRF", "failed", 20000), "TRF failed because a test case failed");
+        Check(WaitForState(tqm, "TRM", "failed", 20000), "TRM failed because the report is missing");
+        auto fj = nlohmann::json::parse(tqm.TaskQueueGet("TRF", false, 0, err), nullptr, false);
+        if (fj.is_object() && fj.contains("job") && fj["job"].is_object()) fj = fj["job"];
+        std::string cond, detail;
+        if (fj.is_object() && fj.contains("attempts") && fj["attempts"].is_array() && !fj["attempts"].empty()) {
+            const auto& a = fj["attempts"][0];
+            if (a.contains("failure") && a["failure"].is_object() && a["failure"].contains("detail") &&
+                a["failure"]["detail"].is_object()) {
+                cond = a["failure"]["detail"].value("condition", std::string());
+                detail = a["failure"]["detail"].value("detail", std::string());
+            }
+        }
+        Check(cond == "testReport", "TRF diagnosis names testReport: " + cond);
+        Check(detail.find("A.broken") != std::string::npos && detail.find("1 of 2") != std::string::npos,
+              "TRF diagnosis lists the failed test: " + detail);
+    }
+
     // Instructions versioning: H fails, source changed, retry refreshes to rev 2.
     std::wstring instrPath = workDir + L"\\instr.md";
     WriteFileAtomicWide(instrPath, "# Task H\nDo the thing\n");
@@ -1123,6 +1164,60 @@ int main() {
         Check(FindResourceConflict(r1, "c:/p", w2, "c:/p", res), "read x write conflicts");
         Check(!FindResourceConflict(r1, "c:/p", r2, "c:/p", res), "read x read does not conflict");
         Check(!FindResourceConflict(w1, "c:/p", w2, "c:/p/.claude/worktrees/x", res), "same relative path in another cwd does not conflict");
+    }
+
+    {
+        // Scoped named locks: @name:{root} is one lock per git checkout / worktree.
+        wchar_t tmpW[MAX_PATH] = {};
+        GetTempPathW(MAX_PATH, tmpW);
+        std::wstring base = std::wstring(tmpW) + L"hancho-root-" + std::to_wstring(GetCurrentProcessId());
+        CreateDirectoryW(base.c_str(), nullptr);
+        CreateDirectoryW((base + L"/main").c_str(), nullptr);
+        CreateDirectoryW((base + L"/main/.git").c_str(), nullptr);
+        CreateDirectoryW((base + L"/main/sub").c_str(), nullptr);
+        CreateDirectoryW((base + L"/wt").c_str(), nullptr);
+        WriteFileAtomicWide(base + L"/wt/.git", "gitdir: elsewhere\n");
+        CreateDirectoryW((base + L"/wt/sub").c_str(), nullptr);
+        std::string mainSub = WideToUtf8(base + L"/main/sub");
+        std::string mainDir = WideToUtf8(base + L"/main");
+        std::string wtSub = WideToUtf8(base + L"/wt/sub");
+        std::string rootMain = NormalizeResource("@Editor:{root}", mainSub);
+        Check(rootMain == "@editor:" + NormalizeResource(mainDir, ""), "{root} becomes the git top level: " + rootMain);
+        Check(NormalizeResource("@editor:{root}", mainDir) == rootMain, "{root} is the same from the top and a subfolder");
+        Check(NormalizeResource("@editor:{root}", wtSub) != rootMain, "a worktree (.git file) is its own root");
+        Check(NormalizeResource("@editor:{cwd}", mainSub) == "@editor:" + NormalizeResource(mainSub, ""), "{cwd} becomes the cwd");
+        Check(NormalizeResource("@editor:{root}", "c:/no/such/dir", "remotebox") == "@editor:c:/no/such/dir",
+              "{root} on a remote host stays the cwd");
+        TaskQueueResources e1;
+        e1.write = {"@editor:{root}"};
+        std::string res;
+        Check(FindResourceConflict(e1, mainSub, e1, mainDir, res), "same checkout -> scoped locks conflict");
+        Check(!FindResourceConflict(e1, mainSub, e1, wtSub, res), "different worktrees -> scoped locks do not conflict");
+        TaskQueueResources g1;
+        g1.write = {"@editor"};
+        Check(FindResourceConflict(g1, mainSub, g1, wtSub, res), "unscoped named lock still conflicts across worktrees");
+    }
+
+    {
+        // Test report parser (success.testReport).
+        TestReportSummary sum;
+        Check(ParseTestReport("<testsuites><testsuite><testcase classname=\"a.B\" name=\"x\"/>"
+                              "<testcase name=\"y\"><skipped/></testcase>"
+                              "<testcase classname=\"a.B\" name=\"z &amp; w\"><error/></testcase></testsuite></testsuites>", sum) &&
+              sum.total == 3 && sum.failed == 1 && sum.skipped == 1 &&
+              sum.failedNames.size() == 1 && sum.failedNames[0] == "a.B.z & w",
+              "JUnit: total, skipped and failed names");
+        Check(ParseTestReport("<test-run><test-suite><test-case fullname=\"N.T.Pass\" result=\"Passed\"/>"
+                              "<test-case fullname=\"N.T.Bad\" result=\"Failed\"><failure/></test-case>"
+                              "<test-case fullname=\"N.T.Skip\" result=\"Skipped\"/></test-suite></test-run>", sum) &&
+              sum.total == 3 && sum.failed == 1 && sum.skipped == 1 && sum.failedNames[0] == "N.T.Bad",
+              "NUnit 3: result attribute");
+        Check(ParseTestReport("<test-results><test-case name=\"Old.Ok\" executed=\"True\" result=\"Success\"/>"
+                              "<test-case name=\"Old.Fail\" executed=\"True\" result=\"Failure\"/></test-results>", sum) &&
+              sum.total == 2 && sum.failed == 1 && sum.failedNames[0] == "Old.Fail",
+              "NUnit 2: Success / Failure");
+        Check(!ParseTestReport("<testsuite tests=\"0\"></testsuite>", sum), "a report without test cases is rejected");
+        Check(!ParseTestReport("not xml at all", sum), "garbage is rejected");
     }
 
     std::printf("%s (%d failures)\n", g_failures == 0 ? "ALL PASSED" : "FAILURES", g_failures);

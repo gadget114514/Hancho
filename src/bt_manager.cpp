@@ -68,6 +68,7 @@ nlohmann::json BuildAddBtJobJson(const std::string& jobId,
     succObj["exit_code"] = success.exitCode;
     if (!success.filesNewer.empty()) succObj["files_newer"] = success.filesNewer;
     if (!success.outputRegex.empty()) succObj["output_regex"] = success.outputRegex;
+    if (!success.testReport.empty()) succObj["test_report"] = success.testReport;
     j["success"] = std::move(succObj);
     if (idle.outputSec > 0 || idle.cpuSec > 0) {
         j["idle"] = {

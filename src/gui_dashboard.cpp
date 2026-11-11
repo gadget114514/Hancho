@@ -3290,6 +3290,8 @@ struct MemoryListDlgState {
     DashboardState* dash = nullptr;
     HFONT fontUi = nullptr;
     HWND search = nullptr;
+    HWND layer = nullptr;
+    HWND layerInfo = nullptr;
     HWND author = nullptr;
     HWND list = nullptr;
     HWND detail = nullptr;
@@ -3338,6 +3340,55 @@ static void LoadMemoryNoteAuthors(MemoryListDlgState* ds) {
     }
 }
 
+// Memory layers as the GUI names them. Index 0 of the layer combo is "all"; 1..3 follow this table.
+struct MemoryLayerDef {
+    const char* kind;      // kind in memory_search ("run", "note", "knowledge")
+    const wchar_t* label;  // same in every language
+};
+static const MemoryLayerDef kMemoryLayers[] = {
+    {"run", L"L1 record"},
+    {"note", L"L2 note"},
+    {"knowledge", L"L3 knowledge"},
+};
+
+static std::wstring MemoryLayerLabel(const std::string& kind) {
+    for (const auto& l : kMemoryLayers) {
+        if (kind == l.kind) return l.label;
+    }
+    return Utf8ToWide(kind);
+}
+
+static const wchar_t* MemoryLayerDescription(int layerSel) {
+    switch (layerSel) {
+        case 1:
+            return Tr(L"L1 record: ジョブの試行 1 回ごとに Hancho が自動で残す記録（結果、所要時間、失敗の種類、トークン、編集したファイル）。memory/records/*.jsonl",
+                      L"L1 record: one record per job attempt, written by Hancho (outcome, duration, failure class, tokens, files edited). memory/records/*.jsonl",
+                      L"L1 record: un registro por intento de trabajo, escrito por Hancho (resultado, duración, tipo de fallo, tokens, archivos editados). memory/records/*.jsonl");
+        case 2:
+            return Tr(L"L2 note: エージェントや人が書く短い事実。スコープ付きで、取り消しや置き換えができる。memory/notes.jsonl",
+                      L"L2 note: a short fact written by an agent or a person, with a scope. It can be retracted or superseded. memory/notes.jsonl",
+                      L"L2 note: un hecho breve escrito por un agente o una persona, con ámbito. Se puede retirar o reemplazar. memory/notes.jsonl");
+        case 3:
+            return Tr(L"L3 knowledge: 人が承認して L2 note から昇格させたプロジェクト知識。brief では最後まで残る。memory/knowledge.jsonl",
+                      L"L3 knowledge: project knowledge a person approved by promoting an L2 note. The brief keeps it to the end. memory/knowledge.jsonl",
+                      L"L3 knowledge: conocimiento del proyecto aprobado por una persona al promover una L2 note. El brief lo conserva hasta el final. memory/knowledge.jsonl");
+        default:
+            return Tr(L"L1 record = Hancho が残す実行ごとの記録 / L2 note = エージェントや人が書く短い事実 / L3 knowledge = 人が承認した L2 note",
+                      L"L1 record = per-run record written by Hancho / L2 note = short fact from an agent or a person / L3 knowledge = an L2 note a person approved",
+                      L"L1 record = registro por ejecución de Hancho / L2 note = hecho breve de un agente o persona / L3 knowledge = L2 note aprobada por una persona");
+    }
+}
+
+// Retract and promote only apply to L2 notes.
+static void MemoryListUpdateButtons(MemoryListDlgState* ds) {
+    if (!ds || !ds->list) return;
+    int sel = ListView_GetNextItem(ds->list, -1, LVNI_SELECTED);
+    bool isNote = sel >= 0 && static_cast<size_t>(sel) < ds->rows.size() &&
+                  ds->rows[static_cast<size_t>(sel)].value("kind", std::string()) == "note";
+    if (ds->btnRetract) EnableWindow(ds->btnRetract, isNote);
+    if (ds->btnPromote) EnableWindow(ds->btnPromote, isNote);
+}
+
 static void MemoryListReload(MemoryListDlgState* ds) {
     if (!ds || !ds->list) return;
     LoadMemoryNoteAuthors(ds);
@@ -3349,11 +3400,39 @@ static void MemoryListReload(MemoryListDlgState* ds) {
         searchText = buf;
     }
     int authorFilter = ds->author ? ComboBox_GetCurSel(ds->author) : 0;
+    int layerSel = ds->layer ? ComboBox_GetCurSel(ds->layer) : 0;
+    if (layerSel < 0 || layerSel > 3) layerSel = 0;
 
+    // One search per layer gives the count shown in the layer combo; the selected layer's
+    // result is reused for the list. "All" ranks every layer together in its own search.
     memory::Query q;
     q.text = WideToUtf8(searchText);
     q.limit = 200;
-    nlohmann::json resp = nlohmann::json::parse(memory::SearchJson(q), nullptr, false);
+    nlohmann::json resp;
+    int64_t layerCounts[3] = {0, 0, 0};
+    for (int i = 0; i < 3; ++i) {
+        memory::Query lq = q;
+        lq.kinds = {kMemoryLayers[i].kind};
+        nlohmann::json lr = nlohmann::json::parse(memory::SearchJson(lq), nullptr, false);
+        if (lr.is_object()) layerCounts[i] = lr.value("totalMatched", static_cast<int64_t>(0));
+        if (layerSel == i + 1) resp = lr;
+    }
+    if (layerSel == 0) resp = nlohmann::json::parse(memory::SearchJson(q), nullptr, false);
+
+    if (ds->layer) {
+        ComboBox_ResetContent(ds->layer);
+        std::wstringstream all;
+        all << Tr(L"すべてのレイヤー", L"All layers", L"Todas las capas") << L" ("
+            << (layerCounts[0] + layerCounts[1] + layerCounts[2]) << L")";
+        ComboBox_AddString(ds->layer, all.str().c_str());
+        for (int i = 0; i < 3; ++i) {
+            std::wstringstream s;
+            s << kMemoryLayers[i].label << L" (" << layerCounts[i] << L")";
+            ComboBox_AddString(ds->layer, s.str().c_str());
+        }
+        ComboBox_SetCurSel(ds->layer, layerSel);
+    }
+    if (ds->layerInfo) SetWindowTextW(ds->layerInfo, MemoryLayerDescription(layerSel));
     ds->rows.clear();
 
     SendMessageW(ds->list, WM_SETREDRAW, FALSE, 0);
@@ -3384,10 +3463,17 @@ static void MemoryListReload(MemoryListDlgState* ds) {
                 ds->rows.push_back(row);
 
                 std::wstring wId = Utf8ToWide(id);
-                std::wstring wKind = Utf8ToWide(kind);
+                std::wstring wKind = MemoryLayerLabel(kind);
                 std::wstring wAuthor = Utf8ToWide(authorType);
-                std::wstring wStatus = Utf8ToWide(hit.value("status", std::string()));
-                std::wstring wScope = Utf8ToWide(hit.value("scope", hit.value("jobName", std::string())));
+                std::string status = hit.value("status", std::string());
+                if (status.empty()) status = hit.value("outcome", std::string());
+                std::wstring wStatus = Utf8ToWide(status);
+                std::string scope = hit.value("scope", std::string());
+                if (scope.empty()) {
+                    std::string job = hit.value("jobName", std::string());
+                    if (!job.empty()) scope = "job:" + job;
+                }
+                std::wstring wScope = Utf8ToWide(scope);
                 std::wstring wText = Utf8ToWide(hit.value("summary", std::string()));
                 LVITEMW item = {};
                 item.mask = LVIF_TEXT | LVIF_PARAM;
@@ -3406,6 +3492,7 @@ static void MemoryListReload(MemoryListDlgState* ds) {
     SendMessageW(ds->list, WM_SETREDRAW, TRUE, 0);
     InvalidateRect(ds->list, nullptr, TRUE);
     if (ds->detail) SetWindowTextW(ds->detail, L"");
+    MemoryListUpdateButtons(ds);
 }
 
 static void MemoryListLayout(HWND hwnd, MemoryListDlgState* ds) {
@@ -3416,12 +3503,16 @@ static void MemoryListLayout(HWND hwnd, MemoryListDlgState* ds) {
     int h = rc.bottom - rc.top;
     int pad = 12;
     int topY = pad;
-    int searchW = (std::max)(120, w - pad * 2 - 140 - 170 - 16);
+    int searchW = (std::max)(120, w - pad * 2 - 86 - 186 - 146);
     if (ds->search) MoveWindow(ds->search, pad, topY, searchW, 26, TRUE);
     if (ds->btnSearch) MoveWindow(ds->btnSearch, pad + searchW + 6, topY, 80, 26, TRUE);
-    if (ds->author) MoveWindow(ds->author, pad + searchW + 92, topY, 160, 26, TRUE);
-    int btnY = (std::max)(topY + 40, h - pad - 30);
-    int listY = topY + 34;
+    if (ds->layer) MoveWindow(ds->layer, pad + searchW + 92, topY, 180, 200, TRUE);
+    if (ds->author) MoveWindow(ds->author, pad + searchW + 278, topY, 140, 200, TRUE);
+    int infoY = topY + 32;
+    int infoH = 34;
+    if (ds->layerInfo) MoveWindow(ds->layerInfo, pad, infoY, (std::max)(100, w - pad * 2), infoH, TRUE);
+    int btnY = (std::max)(infoY + infoH + 40, h - pad - 30);
+    int listY = infoY + infoH + 4;
     int listH = (std::max)(100, btnY - listY - 8);
     int listW = (std::max)(200, (w - pad * 2) * 52 / 100);
     if (ds->list) MoveWindow(ds->list, pad, listY, listW, listH, TRUE);
@@ -3449,6 +3540,15 @@ static LRESULT CALLBACK MemoryListWndProc(HWND hwnd, UINT msg, WPARAM wParam, LP
                 12, 12, 400, 26, hwnd, (HMENU)2801, nullptr, nullptr);
             ds->btnSearch = CreateWindowExW(0, L"BUTTON", Tr(L"検索", L"Search", L"Buscar"),
                 WS_CHILD | WS_VISIBLE | BS_PUSHBUTTON, 420, 12, 80, 26, hwnd, (HMENU)2809, nullptr, nullptr);
+            ds->layer = CreateWindowExW(0, L"COMBOBOX", L"",
+                WS_CHILD | WS_VISIBLE | CBS_DROPDOWNLIST | WS_VSCROLL,
+                506, 12, 180, 200, hwnd, (HMENU)2811, nullptr, nullptr);
+            ComboBox_AddString(ds->layer, Tr(L"すべてのレイヤー", L"All layers", L"Todas las capas"));
+            for (const auto& l : kMemoryLayers) ComboBox_AddString(ds->layer, l.label);
+            ComboBox_SetCurSel(ds->layer, 0);
+            ds->layerInfo = CreateWindowExW(0, L"STATIC", L"",
+                WS_CHILD | WS_VISIBLE | SS_LEFT | SS_NOPREFIX,
+                12, 44, 800, 34, hwnd, (HMENU)2812, nullptr, nullptr);
             ds->author = CreateWindowExW(0, L"COMBOBOX", L"",
                 WS_CHILD | WS_VISIBLE | CBS_DROPDOWNLIST | WS_VSCROLL,
                 506, 12, 160, 200, hwnd, (HMENU)2802, nullptr, nullptr);
@@ -3463,7 +3563,7 @@ static LRESULT CALLBACK MemoryListWndProc(HWND hwnd, UINT msg, WPARAM wParam, LP
                 12, 46, 500, 400, hwnd, (HMENU)2803, nullptr, nullptr);
             ListView_SetExtendedListViewStyle(ds->list, LVS_EX_FULLROWSELECT | LVS_EX_GRIDLINES);
             MemoryListAddColumn(ds->list, 0, L"ID", 150);
-            MemoryListAddColumn(ds->list, 1, Tr(L"種別", L"Kind", L"Tipo"), 80);
+            MemoryListAddColumn(ds->list, 1, Tr(L"レイヤー", L"Layer", L"Capa"), 95);
             MemoryListAddColumn(ds->list, 2, Tr(L"作者", L"Author", L"Autor"), 70);
             MemoryListAddColumn(ds->list, 3, Tr(L"状態", L"Status", L"Estado"), 80);
             MemoryListAddColumn(ds->list, 4, Tr(L"スコープ", L"Scope", L"Ámbito"), 130);
@@ -3480,9 +3580,9 @@ static LRESULT CALLBACK MemoryListWndProc(HWND hwnd, UINT msg, WPARAM wParam, LP
                     ES_AUTOVSCROLL | ES_AUTOHSCROLL,
                 520, 46, 300, 400, hwnd, (HMENU)2807, nullptr, nullptr);
 
-            ds->btnRetract = CreateWindowExW(0, L"BUTTON", Tr(L"ノートを取り消す", L"Retract note", L"Retirar nota"),
+            ds->btnRetract = CreateWindowExW(0, L"BUTTON", Tr(L"L2 note を取り消す", L"Retract L2 note", L"Retirar L2 note"),
                 WS_CHILD | WS_VISIBLE | BS_PUSHBUTTON, 12, 456, 110, 28, hwnd, (HMENU)2804, nullptr, nullptr);
-            ds->btnPromote = CreateWindowExW(0, L"BUTTON", Tr(L"L3 に昇格", L"Promote to L3", L"Promover a L3"),
+            ds->btnPromote = CreateWindowExW(0, L"BUTTON", Tr(L"L3 knowledge に昇格", L"Promote to L3 knowledge", L"Promover a L3 knowledge"),
                 WS_CHILD | WS_VISIBLE | BS_PUSHBUTTON, 128, 456, 150, 28, hwnd, (HMENU)2805, nullptr, nullptr);
             ds->btnRefresh = CreateWindowExW(0, L"BUTTON", Tr(L"再読み込み", L"Reload", L"Recargar"),
                 WS_CHILD | WS_VISIBLE | BS_PUSHBUTTON, 284, 456, 100, 28, hwnd, (HMENU)2806, nullptr, nullptr);
@@ -3491,7 +3591,7 @@ static LRESULT CALLBACK MemoryListWndProc(HWND hwnd, UINT msg, WPARAM wParam, LP
             ds->btnClose = CreateWindowExW(0, L"BUTTON", Tr(L"閉じる", L"Close", L"Cerrar"),
                 WS_CHILD | WS_VISIBLE | BS_PUSHBUTTON, 740, 456, 100, 28, hwnd, (HMENU)IDOK, nullptr, nullptr);
 
-            HWND controls[] = {ds->search, ds->btnSearch, ds->author, ds->list, ds->detail,
+            HWND controls[] = {ds->search, ds->btnSearch, ds->layer, ds->layerInfo, ds->author, ds->list, ds->detail,
                                ds->btnRetract, ds->btnPromote, ds->btnRefresh, ds->btnCompare, ds->btnClose};
             for (HWND h : controls) {
                 if (h && ds->fontUi) SendMessageW(h, WM_SETFONT, reinterpret_cast<WPARAM>(ds->fontUi), TRUE);
@@ -3499,8 +3599,8 @@ static LRESULT CALLBACK MemoryListWndProc(HWND hwnd, UINT msg, WPARAM wParam, LP
 
             MemoryListReload(ds);
             ApplyNativeThemeToWindow(hwnd);
-            if (ds->author) {
-                SetWindowTheme(ds->author, IsDarkThemeActive() ? L"DarkMode_CFD" : L"", nullptr);
+            for (HWND combo : {ds->layer, ds->author}) {
+                if (combo) SetWindowTheme(combo, IsDarkThemeActive() ? L"DarkMode_CFD" : L"", nullptr);
             }
             return 0;
         }
@@ -3522,6 +3622,7 @@ static LRESULT CALLBACK MemoryListWndProc(HWND hwnd, UINT msg, WPARAM wParam, LP
                     }
                     SetWindowTextW(ds->detail, NormalizeCrLfWide(dump).c_str());
                 }
+                MemoryListUpdateButtons(ds);
                 return 0;
             }
             break;
@@ -3537,6 +3638,10 @@ static LRESULT CALLBACK MemoryListWndProc(HWND hwnd, UINT msg, WPARAM wParam, LP
             }
             if (!ds) return 0;
             if (id == 2809 || id == 2806) {
+                MemoryListReload(ds);
+                return 0;
+            }
+            if ((id == 2811 || id == 2802) && HIWORD(wParam) == CBN_SELCHANGE) {
                 MemoryListReload(ds);
                 return 0;
             }
@@ -3589,17 +3694,17 @@ static LRESULT CALLBACK MemoryListWndProc(HWND hwnd, UINT msg, WPARAM wParam, LP
                 std::string kind = row.value("kind", std::string());
                 std::string mid = row.value("id", std::string());
                 if (kind != "note") {
-                    MessageBoxW(hwnd, Tr(L"L2 ノートだけが対象です", L"Only L2 notes can be changed",
-                                         L"Solo se pueden cambiar notas L2"),
+                    MessageBoxW(hwnd, Tr(L"L2 note だけが対象です", L"Only L2 notes can be changed",
+                                         L"Solo se pueden cambiar L2 notes"),
                                 Tr(L"メモリ", L"Memory", L"Memoria"), MB_OK | MB_ICONINFORMATION);
                     return 0;
                 }
                 bool promote = (id == 2805);
                 std::wstring question = promote
-                    ? Tr(L"このノートを L3 プロジェクト知識に昇格しますか？",
-                         L"Promote this note to L3 project knowledge?",
-                         L"¿Promover esta nota a conocimiento L3?")
-                    : Tr(L"このノートを取り消しますか？", L"Retract this note?", L"¿Retirar esta nota?");
+                    ? Tr(L"この L2 note を L3 knowledge に昇格しますか？",
+                         L"Promote this L2 note to L3 knowledge?",
+                         L"¿Promover esta L2 note a L3 knowledge?")
+                    : Tr(L"この L2 note を取り消しますか？", L"Retract this L2 note?", L"¿Retirar esta L2 note?");
                 if (MessageBoxW(hwnd, question.c_str(), Tr(L"メモリ", L"Memory", L"Memoria"),
                                 MB_YESNO | MB_ICONQUESTION | MB_DEFBUTTON2) != IDYES) {
                     return 0;
@@ -6784,6 +6889,8 @@ static void ReloadMonitorPane(HWND hwnd, LlmStreamDlgState* ds) {
                 }
                 auto re = succ->find("output_regex");
                 if (re != succ->end() && re->is_string()) ss << Tr(L" + 出力に /", L" + output /", L" + salida /") << Utf8ToWide(re->get<std::string>()) << L"/";
+                auto tr = succ->find("test_report");
+                if (tr != succ->end() && tr->is_string()) ss << Tr(L" + テスト結果: ", L" + test report: ", L" + informe de pruebas: ") << Utf8ToWide(tr->get<std::string>());
                 ds->goalJobSuccess = ss.str();
             }
             auto attempts = job.find("attempts");

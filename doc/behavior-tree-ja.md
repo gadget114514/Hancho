@@ -101,7 +101,7 @@ Hancho のビヘイビアツリー (BT) は、条件分岐 (`if`/`fallback`)、�
 
 | `type` | 必須フィールド | 任意フィールドと動作 |
 |---|---|---|
-| `job` | `"command"`, `"summary"`, `"timeoutSec"` (`> 0`) | 任意: `"estimateSec"`（残り時間・ETA 表示用の見積もり秒数。タイムアウトは別に適用）、`"cwd"`, `"env"`, `"idle"` (`{outputSec, cpuSec}`), `"success"` (`{exitCode, filesNewer, outputRegex}`), `"resources"` (`{write:[...], read:[...]}`), `"instructionsText"`, `"instructionsFile"`, `"maxAttempts"` (既定 `1`), `"capture"`。タスクキューに `<btId>-<連番>` のジョブ ID で登録して起動。起動時に `ChainGuard` が適用され、`&&` / `||` / `;` 等のシェル連結は `launchFailed` となる。 |
+| `job` | `"command"`, `"summary"`, `"timeoutSec"` (`> 0`) | 任意: `"estimateSec"`（残り時間・ETA 表示用の見積もり秒数。タイムアウトは別に適用）、`"cwd"`, `"env"`, `"idle"` (`{outputSec, cpuSec}`), `"success"` (`{exitCode, filesNewer, outputRegex, testReport}`), `"resources"` (`{write:[...], read:[...]}`), `"instructionsText"`, `"instructionsFile"`, `"maxAttempts"` (既定 `1`), `"capture"`。タスクキューに `<btId>-<連番>` のジョブ ID で登録して起動。起動時に `ChainGuard` が適用され、`&&` / `||` / `;` 等のシェル連結は `launchFailed` となる。 |
 | `worker` | `"summary"`, `"timeoutSec"` (`> 0`), `"prompt"` または `"promptFile"` | 任意: `"engine"`, `"model"`, `"outputSchema"` (JSON Schema オブジェクトまたは文字列), `"cwd"`, `"env"`, `"idle"`, `"success"`, `"resources"`, `"maxAttempts"`, `"capture"`。エンジンレジストリ経由で LLM ワーカーを起動する。 |
 | `wait` | `"sec"` (`>= 0`) | `"sec"` 秒待ってから `succeeded` になる。 |
 | `set` | `"var"` (または `"name"`), `"value"` | `"value"` 内の `${...}` を展開して `vars[var]` に格納し、`varSet` イベントを出して即 `succeeded`。 |

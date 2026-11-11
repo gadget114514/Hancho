@@ -101,6 +101,9 @@ void ParseJobCommonFields(const json& j, const std::string& path, BtNode& node, 
             if (s.contains("outputRegex") && s["outputRegex"].is_string()) {
                 node.success.outputRegex = s["outputRegex"].get<std::string>();
             }
+            if (s.contains("testReport") && s["testReport"].is_string()) {
+                node.success.testReport = s["testReport"].get<std::string>();
+            }
             if (s.contains("filesNewer") && s["filesNewer"].is_array()) {
                 for (const auto& f : s["filesNewer"]) {
                     if (f.is_string()) node.success.filesNewer.push_back(f.get<std::string>());
