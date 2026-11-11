@@ -3468,6 +3468,12 @@ static LRESULT CALLBACK MemoryListWndProc(HWND hwnd, UINT msg, WPARAM wParam, LP
             MemoryListAddColumn(ds->list, 3, Tr(L"状態", L"Status", L"Estado"), 80);
             MemoryListAddColumn(ds->list, 4, Tr(L"スコープ", L"Scope", L"Ámbito"), 130);
             MemoryListAddColumn(ds->list, 5, Tr(L"内容", L"Text", L"Texto"), 360);
+            ListView_SetBkColor(ds->list, g_theme.panel);
+            ListView_SetTextBkColor(ds->list, g_theme.panel);
+            ListView_SetTextColor(ds->list, g_theme.listText);
+            if (HWND header = ListView_GetHeader(ds->list)) {
+                ApplyNativeControlTheme(header, IsDarkThemeActive());
+            }
 
             ds->detail = CreateWindowExW(WS_EX_CLIENTEDGE, L"EDIT", L"",
                 WS_CHILD | WS_VISIBLE | WS_VSCROLL | WS_HSCROLL | ES_MULTILINE | ES_READONLY |
@@ -3493,6 +3499,9 @@ static LRESULT CALLBACK MemoryListWndProc(HWND hwnd, UINT msg, WPARAM wParam, LP
 
             MemoryListReload(ds);
             ApplyNativeThemeToWindow(hwnd);
+            if (ds->author) {
+                SetWindowTheme(ds->author, IsDarkThemeActive() ? L"DarkMode_CFD" : L"", nullptr);
+            }
             return 0;
         }
         case WM_NOTIFY: {

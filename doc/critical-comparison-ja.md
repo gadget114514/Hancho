@@ -1,6 +1,6 @@
 # Hancho: 批判的比較
 
-Hancho をあえて辛口に見た文書です。何であるか、何でないか、どこが他の選択肢より弱いか、どういうときに使うべきでないかを書きます。好意的な整理は [Pros/Cons](pros-cons-comparison-ja.md) を参照してください。
+Hancho をあえて辛口に見た文書です。何であるか、何でないか、どこが他の選択肢より弱いか、どういうときに使うべきでないかを書きます。好意的な整理は [Pros/Cons](pros-cons-comparison-ja.md) と [競合比較](competitive-comparison-ja.md) を参照してください。
 
 [README](../README-ja.md) に戻る。
 

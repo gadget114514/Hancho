@@ -128,6 +128,7 @@ All Hancho data is plain JSON / JSONL (task queues, behavior trees, stream event
 | [Data Directory](doc/data-directory.md) | Project-local, git-managed `--data-dir` |
 | [Pros/Cons](doc/pros-cons-comparison.md) | When to use Hancho vs. sub-agents and alternatives |
 | [Critical Comparison](doc/critical-comparison.md) | A skeptical look at Hancho's limits and when not to use it |
+| [Competitive Comparison](doc/competitive-comparison.md) | How Hancho compares with agent frameworks and memory services |
 | [Hancho v3 Design](doc/design-v3-en.md) | Event schema and adapters, headless/remote, semantic memory, failure analysis, graduation guide |
 | [Release Checklist](doc/release-checklist.md) | Per-release review of the graduation feature map and cleanup commands |
 | [tools/ww](tools/ww/README-ww.md) | Optional, independent task-card runner template (not part of Hancho) |

@@ -130,6 +130,7 @@ Hancho のデータはすべて JSON / JSONL（タスクキュー、ビヘイビ
 | [データディレクトリ](doc/data-directory-ja.md) | プロジェクト内・git 管理の `--data-dir` |
 | [Pros/Cons](doc/pros-cons-comparison-ja.md) | サブエージェント等との使い分け |
 | [批判的比較](doc/critical-comparison-ja.md) | Hancho の限界と使うべきでないケースを辛口に整理 |
+| [競合比較](doc/competitive-comparison-ja.md) | エージェントフレームワークやメモリサービスとの位置づけ |
 | [Hancho v3 設計](doc/design-v3.md) | イベントスキーマとアダプター、ヘッドレス/リモート、意味的メモリ、失敗分析、卒業指針 |
 | [リリースチェックリスト](doc/release-checklist-ja.md) | リリースごとの卒業用機能対応表の見直しと片付けコマンドの確認 |
 | [tools/ww](tools/ww/README-ww.md) | 任意・独立のタスクカード実行テンプレート（Hancho の一部ではない） |

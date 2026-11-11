@@ -1,6 +1,6 @@
 # Hancho: A Critical Comparison
 
-A deliberately skeptical look at Hancho: what it is, what it is not, where it is weaker than the alternatives, and when not to use it. For the favorable case, see [Pros/Cons](pros-cons-comparison.md).
+A deliberately skeptical look at Hancho: what it is, what it is not, where it is weaker than the alternatives, and when not to use it. For the favorable case, see [Pros/Cons](pros-cons-comparison.md) and [Competitive Comparison](competitive-comparison.md).
 
 Back to [README](../README.md).
 
