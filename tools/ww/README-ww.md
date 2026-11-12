@@ -278,6 +278,30 @@ Tools\ww\ww-watch.cmd <card-id> [-Engine agy|opencode|claude|codex] [-Model <mod
 > [!NOTE]
 > **`--print-timeout` note**: agy's `--print-timeout` defaults to 5 minutes, which prematurely aborts long operations (like long builds or test suites). `ww-run` passes a long `--print-timeout 180m`, letting `ww-watch` and `Hancho` own the real timeout and stall detection.
 
+## Card estimates
+
+`Estimate N min` in a card is the expected duration of **one agent run of that card**, and it is
+what the Hancho task queue uses as the job's estimate. The timeout is a separate number: the
+queue's `timeout_sec` should be about **twice the estimate** (never below 7200 s), so a slow run
+is not cut off while a stuck run still ends.
+
+Derive the estimate from the card itself, with this rule (5-minute granularity):
+
+```
+estimate = 15 min                      # read the card and the code it touches
+        + 3 min x "やること" items      # each checklist item
+        + 1 min x files touched        # files the card edits
+        + 30 min                       # the card verifies with cmake --build
+        + 20 min                       # the card runs and fixes smoke tests
+```
+
+An **index card** (one whose "やること" lists `ww-data/tasks/<id>-<n>-*.md` children) gets the
+**sum of its children**; it is not run itself.
+
+Keep the estimate honest: a card that has already run is re-estimated from its measured duration
+plus the verification that was skipped, not from a round number. Round numbers (60/90/120/180/240)
+are what made the estimates useless.
+
 ## Exit codes
 
 | Code | Meaning |

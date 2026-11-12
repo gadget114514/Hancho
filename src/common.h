@@ -37,6 +37,7 @@ inline void PostMessageW(HWND, unsigned int, A, B) {}
 #include <vector>
 #include <map>
 #include <cstdint>
+#include <ctime>
 
 namespace pc {
 
@@ -110,6 +111,17 @@ std::wstring ProcStateToDisplayWide(ProcState state, bool isIdleWarning);
 
 // Strip ANSI/VT100 escape codes from ConPTY output for clean display & LLM reading
 std::string StripAnsiCodes(const std::string& input);
+
+// Trims leading and trailing whitespace characters (space, tab, cr, lf)
+std::string Trim(const std::string& s);
+
+inline bool LocalTimeFromSec(const time_t* t, std::tm* out) {
+#ifdef _WIN32
+    return localtime_s(out, t) == 0;
+#else
+    return localtime_r(t, out) != nullptr;
+#endif
+}
 
 // Normalize line endings (\r\n) for Win32 Edit control display
 std::wstring NormalizeCrLfWide(const std::string& utf8Clean);

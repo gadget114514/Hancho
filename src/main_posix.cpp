@@ -47,6 +47,14 @@ int main(int argc, char** argv) {
             dataDir = argv[++i];
         } else if (arg.rfind("--data-dir=", 0) == 0) {
             dataDir = arg.substr(11);
+        } else if (arg == "--webui-port" && i + 1 < argc) {
+            setenv("HANCHO_WEBUI_PORT", argv[++i], 1);
+        } else if (arg.rfind("--webui-port=", 0) == 0) {
+            setenv("HANCHO_WEBUI_PORT", arg.substr(13).c_str(), 1);
+        } else if (arg == "--webui-dir" && i + 1 < argc) {
+            setenv("HANCHO_WEBUI_DIR", argv[++i], 1);
+        } else if (arg.rfind("--webui-dir=", 0) == 0) {
+            setenv("HANCHO_WEBUI_DIR", arg.substr(12).c_str(), 1);
         } else if (arg == "--version" || arg == "-V") {
             std::printf("Hancho %s\n", PC_VERSION);
             return 0;

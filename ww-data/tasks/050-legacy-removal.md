@@ -1,6 +1,6 @@
 # 050 — 旧 `type` 文字列の外部公開の削除
 
-Estimate 120 min
+Estimate 80 min
 Splittable: no
 
 ## 目的

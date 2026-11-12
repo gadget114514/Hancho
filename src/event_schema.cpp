@@ -72,13 +72,18 @@ nlohmann::json PlanItems(const std::string& input) {
         } else {
             item["content"] = "";
         }
+        std::string status = "pending";
         if (todo.contains("status") && todo["status"].is_string()) {
-            item["status"] = todo["status"].get<std::string>();
+            status = todo["status"].get<std::string>();
+            if (status == "done") {
+                status = "completed";
+            } else if (status != "pending" && status != "in_progress" && status != "completed" && status != "cancelled") {
+                status = "pending";
+            }
         } else if (todo.contains("completed") && todo["completed"].is_boolean()) {
-            item["status"] = todo["completed"].get<bool>() ? "completed" : "pending";
-        } else {
-            item["status"] = "pending";
+            status = todo["completed"].get<bool>() ? "completed" : "pending";
         }
+        item["status"] = status;
         items.push_back(std::move(item));
     }
     return items;

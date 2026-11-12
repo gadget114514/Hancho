@@ -390,8 +390,8 @@
           {
             "id": "ww-050",
             "type": "job",
-            "summary": "ww card 050-export",
-            "command": "D:\\wsgit\\Hancho\\tools\\ww\\ww-run.cmd 050 -Shared -Engine opencode -Root D:\\wsgit\\Hancho -JsonStdout",
+            "summary": "ww card 0500-export",
+            "command": "D:\\wsgit\\Hancho\\tools\\ww\\ww-run.cmd 0500 -Shared -Engine opencode -Root D:\\wsgit\\Hancho -JsonStdout",
             "cwd": "D:\\wsgit\\Hancho",
             "timeoutSec": 11400,
             "estimateSec": 9600,
@@ -414,8 +414,8 @@
           {
             "id": "ww-051",
             "type": "job",
-            "summary": "ww card 051-uninstall-graduation",
-            "command": "D:\\wsgit\\Hancho\\tools\\ww\\ww-run.cmd 051 -Shared -Engine opencode -Root D:\\wsgit\\Hancho -JsonStdout",
+            "summary": "ww card 0510-uninstall-graduation",
+            "command": "D:\\wsgit\\Hancho\\tools\\ww\\ww-run.cmd 0510 -Shared -Engine opencode -Root D:\\wsgit\\Hancho -JsonStdout",
             "cwd": "D:\\wsgit\\Hancho",
             "timeoutSec": 7800,
             "estimateSec": 6000,

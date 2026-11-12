@@ -201,8 +201,264 @@ static void CheckTopLevel(const std::string& label, const std::string& agent, co
           label + ": raw carries the stream file name and line");
 }
 
+static bool CheckType(const nlohmann::json& val, const std::string& expected) {
+    if (expected == "string") return val.is_string();
+    if (expected == "integer") return val.is_number_integer();
+    if (expected == "number") return val.is_number();
+    if (expected == "boolean") return val.is_boolean();
+    if (expected == "object") return val.is_object();
+    if (expected == "array") return val.is_array();
+    if (expected == "null") return val.is_null();
+    return false;
+}
+
+static bool CheckPropType(const nlohmann::json& val, const nlohmann::json& propSchema, std::string& err) {
+    if (propSchema.contains("type")) {
+        const auto& t = propSchema["type"];
+        if (t.is_string()) {
+            if (!CheckType(val, t.get<std::string>())) {
+                err = "expected type " + t.get<std::string>();
+                return false;
+            }
+        } else if (t.is_array()) {
+            bool ok = false;
+            for (const auto& item : t) {
+                if (item.is_string() && CheckType(val, item.get<std::string>())) {
+                    ok = true;
+                    break;
+                }
+            }
+            if (!ok) {
+                err = "value does not match allowed types " + t.dump();
+                return false;
+            }
+        }
+    }
+    if (propSchema.contains("minimum") && val.is_number()) {
+        double minVal = propSchema["minimum"].get<double>();
+        if (val.get<double>() < minVal) {
+            err = "value is below minimum";
+            return false;
+        }
+    }
+    if (propSchema.contains("enum") && propSchema["enum"].is_array()) {
+        bool inEnum = false;
+        for (const auto& e : propSchema["enum"]) {
+            if (val == e) {
+                inEnum = true;
+                break;
+            }
+        }
+        if (!inEnum) {
+            err = "value not in enum " + propSchema["enum"].dump();
+            return false;
+        }
+    }
+    return true;
+}
+
+static bool ValidateHanchoEventAgainstSchema(const nlohmann::json& ev, const nlohmann::json& schema, std::string& err) {
+    err.clear();
+    if (!ev.is_object()) {
+        err = "event must be a JSON object";
+        return false;
+    }
+    for (const char* req : {"schema", "seq", "ts", "source", "agent", "kind", "data", "raw"}) {
+        if (!ev.contains(req)) {
+            err = std::string("missing top-level required field: ") + req;
+            return false;
+        }
+    }
+    if (ev["schema"] != "hancho.event/1") {
+        err = "schema must be 'hancho.event/1'";
+        return false;
+    }
+    if (!ev["seq"].is_number_integer() || ev["seq"].get<int64_t>() < 0) {
+        err = "seq must be non-negative integer";
+        return false;
+    }
+    if (!ev["ts"].is_string()) {
+        err = "ts must be string";
+        return false;
+    }
+    if (!ev["source"].is_object() || !ev["source"].contains("processId") || !ev["source"]["processId"].is_number_integer()) {
+        err = "source must be object with integer processId";
+        return false;
+    }
+    if (!ev["agent"].is_object() || !ev["agent"].contains("type") || !ev["agent"]["type"].is_string()) {
+        err = "agent must be object with string type";
+        return false;
+    }
+    if (!ev["raw"].is_object() || !ev["raw"].contains("file") || !ev["raw"]["file"].is_string()) {
+        err = "raw must be object with string file";
+        return false;
+    }
+    if (!ev["kind"].is_string()) {
+        err = "kind must be string";
+        return false;
+    }
+    std::string kind = ev["kind"].get<std::string>();
+    if (!ev["data"].is_object()) {
+        err = "data must be an object";
+        return false;
+    }
+    const auto& data = ev["data"];
+
+    const nlohmann::json* matchingBranch = nullptr;
+    if (schema.contains("allOf") && schema["allOf"].is_array()) {
+        for (const auto& branch : schema["allOf"]) {
+            if (branch.contains("if") && branch["if"].contains("properties") &&
+                branch["if"]["properties"].contains("kind") &&
+                branch["if"]["properties"]["kind"].contains("const")) {
+                if (branch["if"]["properties"]["kind"]["const"] == kind) {
+                    matchingBranch = &branch;
+                    break;
+                }
+            }
+        }
+    }
+    if (!matchingBranch) {
+        err = "unknown kind: " + kind;
+        return false;
+    }
+
+    if (!matchingBranch->contains("then") || !(*matchingBranch)["then"].contains("properties") ||
+        !(*matchingBranch)["then"]["properties"].contains("data")) {
+        err = "schema missing then.properties.data for kind: " + kind;
+        return false;
+    }
+    const auto& dataSchema = (*matchingBranch)["then"]["properties"]["data"];
+    if (dataSchema.contains("required") && dataSchema["required"].is_array()) {
+        for (const auto& req : dataSchema["required"]) {
+            if (!data.contains(req.get<std::string>())) {
+                err = "kind '" + kind + "' missing required data field '" + req.get<std::string>() + "'";
+                return false;
+            }
+        }
+    }
+
+    if (dataSchema.contains("anyOf") && dataSchema["anyOf"].is_array()) {
+        bool anyOk = false;
+        for (const auto& opt : dataSchema["anyOf"]) {
+            if (opt.contains("required") && opt["required"].is_array()) {
+                bool allReq = true;
+                for (const auto& r : opt["required"]) {
+                    if (!data.contains(r.get<std::string>())) { allReq = false; break; }
+                }
+                if (allReq) { anyOk = true; break; }
+            }
+        }
+        if (!anyOk) {
+            err = "kind '" + kind + "' does not satisfy anyOf condition";
+            return false;
+        }
+    }
+
+    const auto& props = dataSchema.contains("properties") ? dataSchema["properties"] : nlohmann::json::object();
+    bool noAdditional = dataSchema.value("additionalProperties", true) == false;
+    if (noAdditional) {
+        for (auto it = data.begin(); it != data.end(); ++it) {
+            if (!props.contains(it.key())) {
+                err = "kind '" + kind + "' contains unknown field in data: '" + it.key() + "'";
+                return false;
+            }
+        }
+    }
+
+    for (auto it = data.begin(); it != data.end(); ++it) {
+        if (props.contains(it.key())) {
+            const auto& propSchema = props[it.key()];
+            std::string propErr;
+            if (!CheckPropType(it.value(), propSchema, propErr)) {
+                err = "kind '" + kind + "' field 'data." + it.key() + "' invalid: " + propErr;
+                return false;
+            }
+            if (propSchema.contains("items") && it.value().is_array()) {
+                const auto& itemSchema = propSchema["items"];
+                bool itemNoAdditional = itemSchema.value("additionalProperties", true) == false;
+                const auto& itemProps = itemSchema.contains("properties") ? itemSchema["properties"] : nlohmann::json::object();
+                for (size_t i = 0; i < it.value().size(); ++i) {
+                    const auto& item = it.value()[i];
+                    if (!item.is_object()) {
+                        err = "kind '" + kind + "' items[" + std::to_string(i) + "] must be object";
+                        return false;
+                    }
+                    if (itemSchema.contains("required") && itemSchema["required"].is_array()) {
+                        for (const auto& r : itemSchema["required"]) {
+                            if (!item.contains(r.get<std::string>())) {
+                                err = "kind '" + kind + "' items[" + std::to_string(i) + "] missing required '" + r.get<std::string>() + "'";
+                                return false;
+                            }
+                        }
+                    }
+                    if (itemNoAdditional) {
+                        for (auto itemIt = item.begin(); itemIt != item.end(); ++itemIt) {
+                            if (!itemProps.contains(itemIt.key())) {
+                                err = "kind '" + kind + "' items[" + std::to_string(i) + "] contains unknown field '" + itemIt.key() + "'";
+                                return false;
+                            }
+                        }
+                    }
+                    for (auto itemIt = item.begin(); itemIt != item.end(); ++itemIt) {
+                        if (itemProps.contains(itemIt.key())) {
+                            std::string subErr;
+                            if (!CheckPropType(itemIt.value(), itemProps[itemIt.key()], subErr)) {
+                                err = "kind '" + kind + "' items[" + std::to_string(i) + "]." + itemIt.key() + " invalid: " + subErr;
+                                return false;
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+    return true;
+}
+
+static nlohmann::json LoadEventSchemaFile(std::string& resolvedPath) {
+    std::vector<std::string> candidates = {
+        "doc/schema/hancho.event.v1.json",
+        "../doc/schema/hancho.event.v1.json",
+        "../../doc/schema/hancho.event.v1.json"
+    };
+    wchar_t modPath[MAX_PATH] = {};
+    DWORD len = GetModuleFileNameW(nullptr, modPath, MAX_PATH);
+    if (len > 0) {
+        std::filesystem::path p(modPath);
+        candidates.push_back((p.parent_path() / "doc/schema/hancho.event.v1.json").string());
+        candidates.push_back((p.parent_path().parent_path() / "doc/schema/hancho.event.v1.json").string());
+        candidates.push_back((p.parent_path().parent_path().parent_path() / "doc/schema/hancho.event.v1.json").string());
+    }
+    for (const auto& c : candidates) {
+        if (std::filesystem::exists(c)) {
+            std::ifstream in(c, std::ios::binary);
+            if (in) {
+                auto j = nlohmann::json::parse(in, nullptr, false);
+                if (j.is_object()) {
+                    resolvedPath = c;
+                    return j;
+                }
+            }
+        }
+    }
+    return nlohmann::json();
+}
+
+static nlohmann::json MakeEnvelope(const std::string& kind, nlohmann::json data) {
+    HanchoEventSource src;
+    src.processId = 12;
+    src.jobId = "j_test";
+    src.attempt = 1;
+    return BuildHanchoEventObject(src, "claude", "claude-test", "sess-1", "", "", 10, 1794300000000,
+                                  kind, std::move(data), "test_stream.jsonl", 1);
+}
+
 int main() {
     SetConsoleOutputCP(CP_UTF8);
+
+    std::string schemaPath;
+    nlohmann::json schemaJson = LoadEventSchemaFile(schemaPath);
+    Check(!schemaJson.empty(), "schema file loaded from " + schemaPath);
 
     Check(HanchoEventsFilePathForStream("logs/proc_12_build_stream.jsonl") ==
               "logs/proc_12_build.events.jsonl",
@@ -361,9 +617,9 @@ int main() {
     turn.content = "turn.started";
     Check(KindOf(turn) == "turn.started", "codex turn.started -> turn.started");
 
-    LlmStreamEvent err = MakeEvent("error", "codex");
-    err.content = "usage limit reached";
-    Check(KindOf(err) == "error" && DataOf(err)["message"] == "usage limit reached",
+    LlmStreamEvent codexErr = MakeEvent("error", "codex");
+    codexErr.content = "usage limit reached";
+    Check(KindOf(codexErr) == "error" && DataOf(codexErr)["message"] == "usage limit reached",
           "codex error -> error with message");
 
     LlmStreamEvent turnEnd = MakeEvent("result", "codex");
@@ -463,6 +719,258 @@ int main() {
           "reader filters by since_seq");
     Check(ReadHanchoEventsFile("", 0, "", 0).empty(),
           "reader returns nothing for an empty path");
+
+    // Schema validation of all generated events:
+    if (!schemaJson.empty()) {
+        std::string err;
+        HanchoEventSource s;
+        s.processId = 12;
+        Check(ValidateHanchoEventAgainstSchema(BuildHanchoEventV1(call, s, "", "stream.jsonl", 1), schemaJson, err),
+              "schema: claude tool.call validates: " + err);
+        Check(ValidateHanchoEventAgainstSchema(BuildHanchoEventV1(result, s, "", "stream.jsonl", 2), schemaJson, err),
+              "schema: claude tool.result validates: " + err);
+        Check(ValidateHanchoEventAgainstSchema(BuildHanchoEventV1(thought, s, "", "stream.jsonl", 3), schemaJson, err),
+              "schema: claude thought validates: " + err);
+        Check(ValidateHanchoEventAgainstSchema(BuildHanchoEventV1(reply, s, "", "stream.jsonl", 4), schemaJson, err),
+              "schema: claude message validates: " + err);
+        Check(ValidateHanchoEventAgainstSchema(BuildHanchoEventV1(plan, s, "", "stream.jsonl", 5), schemaJson, err),
+              "schema: claude plan validates: " + err);
+        Check(ValidateHanchoEventAgainstSchema(BuildHanchoEventV1(init, s, "", "stream.jsonl", 6), schemaJson, err),
+              "schema: claude run.started validates: " + err);
+        Check(ValidateHanchoEventAgainstSchema(BuildHanchoEventV1(limit, s, "", "stream.jsonl", 7), schemaJson, err),
+              "schema: claude rate_limit validates: " + err);
+        Check(ValidateHanchoEventAgainstSchema(BuildHanchoEventV1(subStart, s, "", "stream.jsonl", 8), schemaJson, err),
+              "schema: claude subagent.started validates: " + err);
+        Check(ValidateHanchoEventAgainstSchema(BuildHanchoEventV1(subEnd, s, "", "stream.jsonl", 9), schemaJson, err),
+              "schema: claude subagent.ended validates: " + err);
+        Check(ValidateHanchoEventAgainstSchema(BuildHanchoEventV1(runEnd, s, "", "stream.jsonl", 10), schemaJson, err),
+              "schema: claude run.ended validates: " + err);
+        Check(ValidateHanchoEventAgainstSchema(BuildHanchoEventV1(step, s, "", "stream.jsonl", 11), schemaJson, err),
+              "schema: opencode turn.started validates: " + err);
+        Check(ValidateHanchoEventAgainstSchema(BuildHanchoEventV1(usage, s, "", "stream.jsonl", 12), schemaJson, err),
+              "schema: opencode usage validates: " + err);
+        Check(ValidateHanchoEventAgainstSchema(BuildHanchoEventV1(codexErr, s, "", "stream.jsonl", 13), schemaJson, err),
+              "schema: codex error validates: " + err);
+        Check(ValidateHanchoEventAgainstSchema(BuildHanchoEventV1(unknown, s, "", "stream.jsonl", 14), schemaJson, err),
+              "schema: generic raw validates: " + err);
+
+        // Tracker generated events validation
+        for (size_t i = 0; i < allRead.size(); ++i) {
+            std::string tErr;
+            Check(ValidateHanchoEventAgainstSchema(allRead[i], schemaJson, tErr),
+                  "schema: tracker written event " + std::to_string(i) + " validates: " + tErr);
+        }
+
+        // Adapter expected events validation
+        std::string expectedPath = "tests/adapters/mycli/basic.expected.jsonl";
+        if (std::filesystem::exists(expectedPath)) {
+            std::ifstream inExp(expectedPath);
+            std::string expLine;
+            int adapterCount = 0;
+            while (std::getline(inExp, expLine)) {
+                if (expLine.empty() || expLine == "\r") continue;
+                auto parsed = nlohmann::json::parse(expLine, nullptr, false);
+                if (parsed.is_object() && parsed.contains("kind") && parsed.contains("data")) {
+                    nlohmann::json ev = MakeEnvelope(parsed["kind"].get<std::string>(), parsed["data"]);
+                    std::string aErr;
+                    Check(ValidateHanchoEventAgainstSchema(ev, schemaJson, aErr),
+                          "schema: adapter expected " + parsed["kind"].get<std::string>() + " validates: " + aErr);
+                    adapterCount++;
+                }
+            }
+            Check(adapterCount == 6, "schema: all 6 adapter expected events pass validation");
+        }
+
+        // Real sample events validation from ww-data
+        int realValidated = 0;
+        if (std::filesystem::exists("ww-data")) {
+            for (const auto& entry : std::filesystem::directory_iterator("ww-data")) {
+                if (!entry.is_regular_file()) continue;
+                std::string name = entry.path().filename().string();
+                if (name.rfind("proc_", 0) == 0 && name.size() > 13 &&
+                    name.substr(name.size() - 13) == ".events.jsonl") {
+                    std::ifstream inReal(entry.path());
+                    std::string realLine;
+                    while (std::getline(inReal, realLine)) {
+                        if (realLine.empty() || realLine == "\r") continue;
+                        auto parsed = nlohmann::json::parse(realLine, nullptr, false);
+                        if (parsed.is_object() && parsed.value("schema", "") == "hancho.event/1") {
+                            std::string realErr;
+                            bool ok = ValidateHanchoEventAgainstSchema(parsed, schemaJson, realErr);
+                            if (!ok) {
+                                Check(false, "real sample in " + name + " failed: " + realErr);
+                                break;
+                            }
+                            realValidated++;
+                        }
+                    }
+                }
+            }
+        }
+        if (realValidated > 0) {
+            Check(true, "real samples pass schema validation (" + std::to_string(realValidated) + " events checked)");
+        }
+
+        // Negative tests: verify unknown fields and type errors are rejected
+        // 1. Unknown field in tool.call
+        nlohmann::json badToolCall = MakeEnvelope("tool.call", {
+            {"tool", "Edit"}, {"activity", "edit"}, {"extra_field", 123}
+        });
+        Check(!ValidateHanchoEventAgainstSchema(badToolCall, schemaJson, err) &&
+                  err.find("unknown field in data") != std::string::npos,
+              "negative: tool.call rejects unknown field in data");
+
+        // 2. Invalid activity enum in tool.call
+        nlohmann::json badActivity = MakeEnvelope("tool.call", {
+            {"tool", "Edit"}, {"activity", "invalid_activity"}
+        });
+        Check(!ValidateHanchoEventAgainstSchema(badActivity, schemaJson, err) &&
+                  err.find("activity") != std::string::npos,
+              "negative: tool.call rejects invalid activity enum");
+
+        // 3. Non-string tool name in tool.call
+        nlohmann::json badToolType = MakeEnvelope("tool.call", {
+            {"tool", 42}, {"activity", "edit"}
+        });
+        Check(!ValidateHanchoEventAgainstSchema(badToolType, schemaJson, err),
+              "negative: tool.call rejects non-string tool name");
+
+        // 4. Unknown field in plan data
+        nlohmann::json badPlanExtra = MakeEnvelope("plan", {
+            {"items", nlohmann::json::array()}, {"bogus", true}
+        });
+        Check(!ValidateHanchoEventAgainstSchema(badPlanExtra, schemaJson, err) &&
+                  err.find("unknown field in data") != std::string::npos,
+              "negative: plan rejects unknown field in data");
+
+        // 5. Plan item with unknown status enum
+        nlohmann::json badPlanStatus = MakeEnvelope("plan", {
+            {"items", nlohmann::json::array({
+                {{"content", "build"}, {"status", "not_a_valid_status"}}
+            })}
+        });
+        Check(!ValidateHanchoEventAgainstSchema(badPlanStatus, schemaJson, err) &&
+                  err.find("status") != std::string::npos,
+              "negative: plan rejects invalid status enum in items");
+
+        // 6. Plan item with unknown property
+        nlohmann::json badPlanItemProp = MakeEnvelope("plan", {
+            {"items", nlohmann::json::array({
+                {{"content", "build"}, {"status", "pending"}, {"priority", "high"}}
+            })}
+        });
+        Check(!ValidateHanchoEventAgainstSchema(badPlanItemProp, schemaJson, err) &&
+                  err.find("unknown field") != std::string::npos,
+              "negative: plan rejects unknown property inside items[]");
+
+        // 7. Unknown field in thought data
+        nlohmann::json badThought = MakeEnvelope("thought", {
+            {"text", "thinking"}, {"confidence", 0.9}
+        });
+        Check(!ValidateHanchoEventAgainstSchema(badThought, schemaJson, err) &&
+                  err.find("unknown field in data") != std::string::npos,
+              "negative: thought rejects unknown field in data");
+
+        // 8. Non-string text in message
+        nlohmann::json badMessage = MakeEnvelope("message", {
+            {"text", 12345}
+        });
+        Check(!ValidateHanchoEventAgainstSchema(badMessage, schemaJson, err),
+              "negative: message rejects non-string text");
+
+        // 9. Unknown field in usage data
+        nlohmann::json badUsage = MakeEnvelope("usage", {
+            {"inputTokens", 10}, {"unknownTokenCount", 5}
+        });
+        Check(!ValidateHanchoEventAgainstSchema(badUsage, schemaJson, err) &&
+                  err.find("unknown field in data") != std::string::npos,
+              "negative: usage rejects unknown field in data");
+
+        // 10. Usage with negative token count
+        nlohmann::json badUsageNeg = MakeEnvelope("usage", {
+            {"inputTokens", -1}
+        });
+        Check(!ValidateHanchoEventAgainstSchema(badUsageNeg, schemaJson, err),
+              "negative: usage rejects negative token count");
+
+        // 11. Usage with no token counts at all
+        nlohmann::json badUsageEmpty = MakeEnvelope("usage", {
+            {"costUsd", 0.05}
+        });
+        Check(!ValidateHanchoEventAgainstSchema(badUsageEmpty, schemaJson, err) &&
+                  err.find("anyOf") != std::string::npos,
+              "negative: usage without token count fails anyOf condition");
+
+        // 12. Run.ended with unknown field
+        nlohmann::json badRunEndExtra = MakeEnvelope("run.ended", {
+            {"status", "completed"}, {"unexpected", 1}
+        });
+        Check(!ValidateHanchoEventAgainstSchema(badRunEndExtra, schemaJson, err) &&
+                  err.find("unknown field in data") != std::string::npos,
+              "negative: run.ended rejects unknown field in data");
+
+        // 13. Run.ended with invalid status
+        nlohmann::json badRunEndStatus = MakeEnvelope("run.ended", {
+            {"status", "finished"}
+        });
+        Check(!ValidateHanchoEventAgainstSchema(badRunEndStatus, schemaJson, err) &&
+                  err.find("status") != std::string::npos,
+              "negative: run.ended rejects invalid status");
+
+        // 14. Subagent.started missing required agentId
+        nlohmann::json badSubagentStart = MakeEnvelope("subagent.started", {
+            {"type", "general-purpose"}
+        });
+        Check(!ValidateHanchoEventAgainstSchema(badSubagentStart, schemaJson, err) &&
+                  err.find("missing required") != std::string::npos,
+              "negative: subagent.started rejects missing required agentId");
+
+        // 15. Subagent.ended with unknown field
+        nlohmann::json badSubagentEnd = MakeEnvelope("subagent.ended", {
+            {"agentId", "a1"}, {"status", "completed"}, {"extraMetric", 100}
+        });
+        Check(!ValidateHanchoEventAgainstSchema(badSubagentEnd, schemaJson, err) &&
+                  err.find("unknown field in data") != std::string::npos,
+              "negative: subagent.ended rejects unknown field in data");
+
+        // 16. Error with unknown field
+        nlohmann::json badError = MakeEnvelope("error", {
+            {"message", "err"}, {"stackTrace", "line 1"}
+        });
+        Check(!ValidateHanchoEventAgainstSchema(badError, schemaJson, err) &&
+                  err.find("unknown field in data") != std::string::npos,
+              "negative: error rejects unknown field in data");
+
+        // 17. Raw with unknown field
+        nlohmann::json badRaw = MakeEnvelope("raw", {
+            {"text", "log line"}, {"extra", 42}
+        });
+        Check(!ValidateHanchoEventAgainstSchema(badRaw, schemaJson, err) &&
+                  err.find("unknown field in data") != std::string::npos,
+              "negative: raw rejects unknown field in data");
+
+        // Free-form exception: tool.call input can be arbitrary object or string
+        nlohmann::json freeFormObj = MakeEnvelope("tool.call", {
+            {"tool", "custom_tool"}, {"activity", "tool"},
+            {"input", {{"param1", "value1"}, {"nested", {{"x", 123}}}}}
+        });
+        Check(ValidateHanchoEventAgainstSchema(freeFormObj, schemaJson, err),
+              "free-form exception: tool.call accepts arbitrary object in data.input");
+
+        nlohmann::json freeFormStr = MakeEnvelope("tool.call", {
+            {"tool", "shell"}, {"activity", "command"},
+            {"input", "npm test -- --coverage"}
+        });
+        Check(ValidateHanchoEventAgainstSchema(freeFormStr, schemaJson, err),
+              "free-form exception: tool.call accepts string in data.input");
+
+        nlohmann::json badInputType = MakeEnvelope("tool.call", {
+            {"tool", "shell"}, {"activity", "command"},
+            {"input", 12345}
+        });
+        Check(!ValidateHanchoEventAgainstSchema(badInputType, schemaJson, err),
+              "negative: tool.call rejects number in data.input");
+    }
 
     std::filesystem::remove(streamPath, ec);
     std::filesystem::remove(eventsPath, ec);

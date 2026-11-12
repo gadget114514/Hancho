@@ -18,11 +18,13 @@ bool IpcServer::Start() {
     WriteAuditLog("IPC_LISTEN", "Listening on " + transport_->Endpoint());
     acceptThread_ = std::thread(&IpcServer::AcceptLoop, this);
     StartRemoteListener();
+    StartWebUiServer();
     return true;
 }
 
 void IpcServer::Stop() {
     if (stop_.exchange(true)) return;
+    StopWebUiServer();
     StopRemoteListener();
     if (transport_) transport_->Stop();
     if (acceptThread_.joinable()) acceptThread_.join();

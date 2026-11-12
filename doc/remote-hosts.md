@@ -6,7 +6,9 @@ in the local list. This is step C of `doc/design-v3.md` (2.5).
 ## Model
 
 - The IPC request/response shape does not change. It is carried over TCP as a
-  WebSocket text message: one JSON request, one JSON response, one connection.
+  WebSocket text message. A single persistent WebSocket connection supports
+  multiple concurrent requests multiplexed by request ID (`req_id`), as well
+  as real-time streaming subscriptions for logs and events (`subscribe` / `unsubscribe`).
 - The local dashboard listens on **loopback only** by default. A connection from
   any other address needs a token. TLS is not implemented; use an SSH tunnel
   when the traffic leaves the machine.
@@ -88,8 +90,11 @@ tunnel also arrives as a loopback connection.
 - The job is validated locally (chain guard, required fields) and started on the
   remote host with the remote dashboard's own log and done paths.
 - Dependency ordering is unchanged. Only the launch is remote.
-- `success.filesNewer` is skipped for remote jobs because those paths exist on
-  the other machine; use `success.outputRegex` or check the exit code.
+- `success.filesNewer` is evaluated on the remote host via the `check_files_newer`
+  IPC action (or directly from attempt `.done` metadata). Both file modification
+  times (`mtime`) and the reference process start time are evaluated in the remote
+  host's own clock domain, so clock skew between machines and timezone differences
+  do not cause false failures.
 - Cancelling a remote job sends `kill` to that host.
 
 ## Resource locks
@@ -117,16 +122,43 @@ IPC actions added for hosts:
 - `remote_taskqueues`, `remote_processes` — aggregate one host's view for a
   local tool; every entry carries `host`, and errors stay per host.
 - `get_done` — return the `.done` file content for a process.
+- `check_files_newer` — verify paths exist and are newer than process start on the host.
+
+## Success condition: filesNewer on remote hosts
+
+When a remote job specifies `success.filesNewer`:
+
+- **Host-side evaluation**: Paths are evaluated directly on the machine running the job.
+  Relative paths resolve against the job's `cwd` on the remote host.
+- **Clock domain**: Both the reference start time and the artifact's modification time
+  (`mtime`) are obtained from the remote host's operating system clock.
+- **Clock skew tolerance**: Differences between the local system clock and the remote host's
+  system clock have zero impact on evaluation accuracy because the timestamps are never
+  compared across machine boundaries.
+- **Timezone**: All timestamps and file modification times are handled as 64-bit UTC filetimes
+  (100ns precision). Timezone differences between machines do not cause offsets or false failures.
+- **Fallback**: If `check_files_newer` cannot find a live in-memory process start record on the
+  host (e.g. after a host daemon restart), it falls back to the process start epoch recorded by
+  the host's process manager or the attempt start timestamp sent in the request.
+
+## Streaming & Subscriptions
+
+- A single persistent WebSocket connection supports concurrent request multiplexing using
+  request IDs (`req_id` / `request_id`).
+- Real-time streaming subscriptions (`action: "subscribe"`) continuously push appended lines from
+  remote `.events.jsonl`, `.stream.jsonl`, and `.tail.txt` files to the local dashboard.
+- Subscriptions support sequence-based resumption (`seq`), enabling lossless reconnects and catch-up.
+- The local dashboard's execution monitor pane automatically streams and displays remote job events and
+  status in real time, identically to local jobs.
 
 ## Limitations
 
 - There is no cluster scheduler: a host is chosen by the job, not by Hancho.
-- If the local dashboard restarts while a remote attempt is running, the local
-  attempt is classified as interrupted. The remote process is not reattached;
-  kill it on the host if needed.
-- `success.filesNewer` is not evaluated for remote jobs (see above).
-- Only a single request/response per WebSocket connection is used. Streaming a
-  live log over one long-lived socket is left for a later step.
+- When the local dashboard restarts while a remote attempt is running, Hancho
+  reconnects to the remote process via the host registered in `hosts.json`. The
+  remote attempt's status, full log, normalized events, and `.done` file are
+  fetched and restored to the local task queue. If the host is unreachable or
+  no longer listed in `hosts.json`, the attempt is classified as interrupted.
 
 ## Security notes
 

@@ -26,6 +26,7 @@ namespace pc {
 // classifies the interrupted attempt before those definitions.
 static std::wstring GetTaskQueueLogDirWide();
 static std::wstring GetAttemptLogPathWide(const std::string& jobId, int n);
+static std::wstring GetAttemptDonePathWide(const std::string& jobId, int n);
 static void AppendRunRecordForAttempt(const TaskQueue& tq, const TaskQueueJob& job,
                                       const TaskQueueAttempt& attempt,
                                       const TaskQueueFailureInput& fin,
@@ -1492,13 +1493,22 @@ static std::string AttemptToJson(const TaskQueueAttempt& a) {
     if (!a.remoteHost.empty()) {
         oss << ",\"remote_host\":\"" << JsonEscape(a.remoteHost) << "\""
             << ",\"remote_process_id\":" << a.remoteProcessId;
+        if (!a.remoteJobId.empty()) {
+            oss << ",\"remote_job_id\":\"" << JsonEscape(a.remoteJobId) << "\"";
+        }
+        if (a.remoteAttempt > 0) {
+            oss << ",\"remote_attempt\":" << a.remoteAttempt;
+        }
     }
     oss << ",\"start\":\"" << JsonEscape(a.start) << "\""
         << ",\"end\":\"" << JsonEscape(a.end) << "\""
         << ",\"reason\":\"" << JsonEscape(a.reason) << "\""
         << ",\"exit_code\":" << a.exitCode
-        << ",\"instructions_rev\":" << a.instructionsRev
-        << ",\"last_lines_file\":\"" << JsonEscape(a.lastLinesFile) << "\""
+        << ",\"instructions_rev\":" << a.instructionsRev;
+    if (!a.logFile.empty()) {
+        oss << ",\"log_file\":\"" << JsonEscape(a.logFile) << "\"";
+    }
+    oss << ",\"last_lines_file\":\"" << JsonEscape(a.lastLinesFile) << "\""
         << ",\"check_detail\":\"" << JsonEscape(a.checkDetail) << "\"";
     if (!a.memoryRefs.empty()) oss << ",\"memory_refs\":" << StrArrayToJson(a.memoryRefs);
     if (!a.failure.Empty()) oss << ",\"failure\":" << TaskQueueFailureDiagnosticToJson(a.failure);
@@ -1729,11 +1739,18 @@ static TaskQueueAttempt ParseAttempt(const std::string& j) {
     a.processId = static_cast<int>(JsonFieldInt(j, "process_id", 0));
     a.remoteHost = JsonFieldStr(j, "remote_host", "");
     a.remoteProcessId = static_cast<int>(JsonFieldInt(j, "remote_process_id", 0));
+    a.remoteJobId = JsonFieldStr(j, "remote_job_id", "");
+    a.remoteAttempt = static_cast<int>(JsonFieldInt(j, "remote_attempt", 0));
+    if (!a.remoteHost.empty()) {
+        if (a.remoteJobId.empty()) a.remoteJobId = JsonFieldStr(j, "job_id", "");
+        if (a.remoteAttempt <= 0) a.remoteAttempt = static_cast<int>(JsonFieldInt(j, "attempt", 0));
+    }
     a.start = JsonFieldStr(j, "start", "");
     a.end = JsonFieldStr(j, "end", "");
     a.reason = JsonFieldStr(j, "reason", "");
     a.exitCode = static_cast<int>(JsonFieldInt(j, "exit_code", -1));
     a.instructionsRev = static_cast<int>(JsonFieldInt(j, "instructions_rev", 1));
+    a.logFile = JsonFieldStr(j, "log_file", "");
     a.lastLinesFile = JsonFieldStr(j, "last_lines_file", "");
     a.checkDetail = JsonFieldStr(j, "check_detail", "");
     a.memoryRefs = JsonFieldStrArray(j, "memory_refs");
@@ -1879,6 +1896,12 @@ static TaskQueue ParseQueue(const std::string& content) {
         if (!job.id.empty()) {
             if (job.taskqueue.empty()) job.taskqueue = tq.name;
             if (job.name.empty()) job.name = job.id;
+            for (auto& a : job.attempts) {
+                if (!a.remoteHost.empty()) {
+                    if (a.remoteJobId.empty()) a.remoteJobId = job.id;
+                    if (a.remoteAttempt <= 0) a.remoteAttempt = a.n;
+                }
+            }
             tq.jobs.push_back(job);
         }
     }
@@ -1888,6 +1911,26 @@ static TaskQueue ParseQueue(const std::string& content) {
 } // namespace pc
 
 namespace pc {
+
+static bool IsRemoteHostInHostsJson(const std::string& hostName) {
+    if (hostName.empty()) return false;
+    std::wstring path = (std::filesystem::path(GetEffectiveDataDirectoryWide()) / L"hosts.json").wstring();
+    std::string text = ReadFileUtf8Wide(path);
+    if (Trim(text).empty()) return false;
+    nlohmann::json doc = nlohmann::json::parse(text, nullptr, false);
+    if (!doc.is_object() && !doc.is_array()) return false;
+    const nlohmann::json* list = nullptr;
+    if (doc.is_array()) list = &doc;
+    else if (doc.contains("hosts") && doc["hosts"].is_array()) list = &doc["hosts"];
+    if (!list) return false;
+    for (const auto& item : *list) {
+        if (!item.is_object()) continue;
+        if (item.value("name", "") == hostName) {
+            return item.value("enabled", true);
+        }
+    }
+    return false;
+}
 
 // ---------------------------------------------------------------------------
 // TaskQueueManager: construction / persistence / notifications
@@ -1906,19 +1949,28 @@ TaskQueueManager::TaskQueueManager() {
             for (auto& job : tq.jobs) {
                 if (job.state != "running") continue;
                 if (!job.attempts.empty()) {
+                    TaskQueueAttempt& a = job.attempts.back();
+                    bool isRemote = !a.remoteHost.empty() && a.remoteProcessId > 0;
+                    if (isRemote && IsRemoteHostInHostsJson(a.remoteHost)) {
+                        a.needsRemoteReconnect = true;
+                        if (a.remoteJobId.empty()) a.remoteJobId = job.id;
+                        if (a.remoteAttempt <= 0) a.remoteAttempt = a.n;
+                        continue;
+                    }
                     TaskQueueFailureInput fin;
-                    FillFailureInputBase(fin, job, job.attempts.back());
+                    FillFailureInputBase(fin, job, a);
                     fin.interrupted = true;
                     fin.endKind = "killed";
                     fin.exitCode = -1;
-                    fin.checkDetail = "Hancho restarted";
-                    std::wstring logPath = GetAttemptLogPathWide(job.id, job.attempts.back().n);
+                    fin.checkDetail = isRemote ? ("Remote host '" + a.remoteHost + "' not found in hosts.json")
+                                               : "Hancho restarted";
+                    std::wstring logPath = GetAttemptLogPathWide(job.id, a.n);
                     fin.logFile = WideToUtf8(logPath);
                     FillFailureLog(fin, ReadFileUtf8Wide(logPath));
                     fin.fallbackEventsFile = WideToUtf8(GetTaskEventsFileWide(tq.name));
                     fin.fallbackEventSeq = static_cast<uint64_t>(tq.version + 1);
-                    ApplyAttemptOutcome(tq, job, false, "interrupted", -1, "Hancho restarted", &fin);
-                    AppendRunRecordForAttempt(tq, job, job.attempts.back(), fin,
+                    ApplyAttemptOutcome(tq, job, false, "interrupted", -1, fin.checkDetail, &fin);
+                    AppendRunRecordForAttempt(tq, job, a, fin,
                                               ReadFileUtf8Wide(logPath));
                 } else {
                     job.state = "pending";
@@ -1978,10 +2030,17 @@ void TaskQueueManager::SetBtRetryCallback(BtRetryCallback cb) {
 
 void TaskQueueManager::SetRemoteCallbacks(RemoteStartCallback start, RemotePollCallback poll,
                                           RemoteKillCallback kill) {
-    std::lock_guard<std::mutex> lock(mutex_);
-    remoteStartCb_ = std::move(start);
-    remotePollCb_ = std::move(poll);
-    remoteKillCb_ = std::move(kill);
+    RemotePollCallback pollCopy;
+    {
+        std::lock_guard<std::mutex> lock(mutex_);
+        remoteStartCb_ = std::move(start);
+        remotePollCb_ = std::move(poll);
+        remoteKillCb_ = std::move(kill);
+        pollCopy = remotePollCb_;
+    }
+    if (pollCopy) {
+        ReconnectRemoteJobs();
+    }
 }
 
 void TaskQueueManager::FlushFinishedCallbacks() {
@@ -2131,7 +2190,7 @@ TaskQueueCounts TaskQueueManager::GetJobCounts() const {
 bool TaskQueueManager::FindUnfinishedJobByCommand(const std::string& command, std::string& outJobId) const {
     std::lock_guard<std::mutex> lock(const_cast<std::mutex&>(mutex_));
     for (const auto& [name, tq] : queues_) {
-        (void)name;
+        if (name == "plain") continue;
         for (const auto& job : tq.jobs) {
             if (job.state == "succeeded" || job.state == "cancelled") continue;
             if (job.command == command) {
@@ -3399,6 +3458,7 @@ std::string TaskQueueManager::TaskQueueRetryFailed(const std::string& taskqueue,
         const int64_t cutoff = static_cast<int64_t>(time(nullptr)) - sinceSec;
         for (auto& [name, tq] : queues_) {
             if (!taskqueue.empty() && name != taskqueue) continue;
+            if (taskqueue.empty() && name == "plain") continue;
             bool changed = false;
             for (auto& job : tq.jobs) {
                 if (job.state != "failed") continue;
@@ -4073,6 +4133,20 @@ static uint64_t NowFiletime() {
     return (static_cast<uint64_t>(ft.dwHighDateTime) << 32) | ft.dwLowDateTime;
 }
 
+using RemoteFilesCheckCallback = std::function<bool(
+    const std::string& host,
+    const std::string& cwd,
+    int remoteProcessId,
+    const std::vector<std::string>& files,
+    uint64_t startFiletime,
+    std::string& outDetail)>;
+
+static RemoteFilesCheckCallback g_remoteFilesCheckCb;
+
+void SetRemoteFilesCheckCallback(RemoteFilesCheckCallback cb) {
+    g_remoteFilesCheckCb = std::move(cb);
+}
+
 bool TaskQueueManager::EvaluateSuccess(const TaskQueueJob& job, TaskQueueAttempt& attempt,
                                        const std::string& endKind, int exitCode,
                                        const std::string& logFile, std::string& detail) {
@@ -4085,22 +4159,52 @@ bool TaskQueueManager::EvaluateSuccess(const TaskQueueJob& job, TaskQueueAttempt
         return false;
     }
     // filesNewer names paths on the machine that ran the job. For a remote job those
-    // paths are not local, so the check stays with the remote command / output.
-    for (const auto& rel : job.success.filesNewer) {
-        if (!job.host.empty()) break;
-        std::wstring pathW = ResolveJobPathWide(job, rel);
-        if (!PathExistsWide(pathW)) {
-            detail = "missing file: " + rel;
-            return false;
+    // paths are evaluated on the remote host (doc/design-v3-todo.md 6, card 057).
+    if (!job.host.empty()) {
+        if (!job.success.filesNewer.empty()) {
+            bool evaluatedFromDone = false;
+            std::wstring donePath = GetAttemptDonePathWide(job.id, attempt.n);
+            std::string doneContent = ReadFileUtf8Wide(donePath);
+            if (!doneContent.empty()) {
+                nlohmann::json d = nlohmann::json::parse(doneContent, nullptr, false);
+                if (d.is_object() && d.contains("files_newer") && d["files_newer"].is_object()) {
+                    const auto& fn = d["files_newer"];
+                    bool ok = fn.value("success", false);
+                    if (!ok) {
+                        detail = fn.value("detail", std::string("file not newer than attempt start"));
+                        return false;
+                    }
+                    evaluatedFromDone = true;
+                }
+            }
+
+            if (!evaluatedFromDone) {
+                if (!g_remoteFilesCheckCb) {
+                    detail = "remote files check is not available";
+                    return false;
+                }
+                if (!g_remoteFilesCheckCb(job.host, job.cwd, attempt.remoteProcessId,
+                                          job.success.filesNewer, attempt.startFiletime, detail)) {
+                    return false;
+                }
+            }
         }
-        uint64_t fileTime = 0;
-        if (!GetFileMtimeWide(pathW, fileTime)) {
-            detail = "cannot read mtime: " + rel;
-            return false;
-        }
-        if (attempt.startFiletime > 0 && fileTime <= attempt.startFiletime) {
-            detail = "file not newer than attempt start: " + rel;
-            return false;
+    } else {
+        for (const auto& rel : job.success.filesNewer) {
+            std::wstring pathW = ResolveJobPathWide(job, rel);
+            if (!PathExistsWide(pathW)) {
+                detail = "missing file: " + rel;
+                return false;
+            }
+            uint64_t fileTime = 0;
+            if (!GetFileMtimeWide(pathW, fileTime)) {
+                detail = "cannot read mtime: " + rel;
+                return false;
+            }
+            if (attempt.startFiletime > 0 && fileTime <= attempt.startFiletime) {
+                detail = "file not newer than attempt start: " + rel;
+                return false;
+            }
         }
     }
     if (!job.success.outputRegex.empty()) {
@@ -4366,6 +4470,7 @@ bool TaskQueueManager::BuildLaunchRequest(TaskQueue& tq, TaskQueueJob& job, int 
                 if (!instructionText.empty()) instructionText += "\n\n";
                 instructionText += injected;
             }
+            job.instructions.text = instructionText;
         }
     }
     if (!instructionText.empty()) {
@@ -4528,6 +4633,8 @@ void TaskQueueManager::ProcessSchedulerTick() {
                     if (pid > 0) {
                         job.attempts.back().remoteHost = job.host;
                         job.attempts.back().remoteProcessId = pid;
+                        job.attempts.back().remoteJobId = job.id;
+                        job.attempts.back().remoteAttempt = n;
                         running[tq.name]++;
                     }
                 }
@@ -4557,7 +4664,74 @@ void TaskQueueManager::ProcessSchedulerTick() {
     FlushFinishedCallbacks();
 }
 
+void TaskQueueManager::ReconnectRemoteJobs() {
+    struct Target {
+        std::string host;
+        int remoteId = 0;
+        std::string jobId;
+        int attemptN = 0;
+    };
+    std::vector<Target> targets;
+    RemotePollCallback poll;
+    {
+        std::lock_guard<std::mutex> lock(mutex_);
+        if (!remotePollCb_) return;
+        poll = remotePollCb_;
+        for (auto& [name, tq] : queues_) {
+            (void)name;
+            for (auto& job : tq.jobs) {
+                if (job.state != "running" || job.attempts.empty()) continue;
+                TaskQueueAttempt& a = job.attempts.back();
+                if (!a.needsRemoteReconnect) continue;
+                targets.push_back({a.remoteHost, a.remoteProcessId, job.id, a.n});
+            }
+        }
+    }
+    if (targets.empty()) return;
+
+    for (const auto& target : targets) {
+        RemotePollResult result;
+        std::string err;
+        bool ok = poll(target.host, target.remoteId, result, err);
+
+        std::lock_guard<std::mutex> lock(mutex_);
+        TaskQueue* tq = nullptr;
+        TaskQueueJob* job = FindJob(target.jobId, &tq);
+        if (!job || !tq || job->state != "running" || job->attempts.empty()) continue;
+        TaskQueueAttempt& a = job->attempts.back();
+        if (a.n != target.attemptN || a.remoteProcessId != target.remoteId) continue;
+
+        if (!ok) {
+            TaskQueueFailureInput fin;
+            FillFailureInputBase(fin, *job, a);
+            fin.interrupted = true;
+            fin.endKind = "killed";
+            fin.exitCode = -1;
+            fin.checkDetail = "Remote reconnect failed: " + (err.empty() ? "host unreachable" : err);
+            std::wstring logPath = GetAttemptLogPathWide(job->id, a.n);
+            fin.logFile = WideToUtf8(logPath);
+            FillFailureLog(fin, ReadFileUtf8Wide(logPath));
+            fin.fallbackEventsFile = WideToUtf8(GetTaskEventsFileWide(tq->name));
+            fin.fallbackEventSeq = static_cast<uint64_t>(tq->version + 1);
+            ApplyAttemptOutcome(*tq, *job, false, "interrupted", -1, fin.checkDetail, &fin);
+            AppendRunRecordForAttempt(*tq, *job, a, fin, ReadFileUtf8Wide(logPath));
+            ReevaluateAll();
+            SaveQueue(*tq);
+            WriteAuditLog("REMOTE_RECONNECT_FAILED", target.host + " job " + target.jobId + ": " + err);
+        } else {
+            a.needsRemoteReconnect = false;
+            WriteAuditLog("REMOTE_RECONNECT", target.host + " job " + target.jobId + " reconnected");
+            if (result.finished) {
+                FinishRemoteAttemptLocked(*tq, *job, result);
+            }
+            SaveQueue(*tq);
+        }
+    }
+    FlushFinishedCallbacks();
+}
+
 void TaskQueueManager::PollRemoteJobs() {
+    ReconnectRemoteJobs();
     struct Target {
         std::string host;
         int remoteId = 0;
@@ -4710,23 +4884,388 @@ static void AppendRunRecordForAttempt(const TaskQueue& tq, const TaskQueueJob& j
     in.failureClass = attempt.failure.failureClass;
     in.failureSummary = attempt.failure.summary;
     in.checkDetail = attempt.checkDetail;
+    in.timeoutSec = job.timeoutSec;
     in.processId = attempt.processId;
     in.eventsFile = fin.eventsFile;
     in.logFile = fin.logFile;
     in.lastLinesFile = attempt.lastLinesFile;
     in.logText = logText;
     memory::AppendRunRecordJson(in);
+    CheckAndRecordAutoNotes(job, attempt, fin);
+}
+
+namespace {
+
+struct AutoNoteRun {
+    std::string id;
+    std::string jobId;
+    int attempt = 1;
+    std::string jobName;
+    std::string outcome;
+    int64_t exitCode = 0;
+    std::string failureClass;
+    std::string failureSummary;
+    std::string condition;
+    int64_t durationSec = 0;
+    int timeoutSec = 0;
+    std::vector<std::string> filesEdited;
+    std::string startIso;
+    int64_t startEpoch = 0;
+    bool success = false;
+};
+
+static bool AutoNoteIEquals(const std::string& a, const std::string& b) {
+    return LowerAscii(a) == LowerAscii(b);
+}
+
+static double AutoNotePercentile(const std::vector<double>& sorted, double p) {
+    if (sorted.empty()) return 0.0;
+    if (sorted.size() == 1) return sorted.front();
+    size_t index = static_cast<size_t>(std::ceil(p * static_cast<double>(sorted.size()))) - 1;
+    if (index >= sorted.size()) index = sorted.size() - 1;
+    return sorted[index];
+}
+
+static std::vector<AutoNoteRun> LoadRunsForJob(const std::string& jobName) {
+    std::vector<AutoNoteRun> runs;
+    std::error_code ec;
+    std::filesystem::path recDir = std::filesystem::path(GetEffectiveDataDirectoryWide()) / L"memory" / L"records";
+    if (!std::filesystem::is_directory(recDir, ec)) return runs;
+
+    for (const auto& ent : std::filesystem::directory_iterator(recDir, ec)) {
+        if (ec) break;
+        if (!ent.is_regular_file(ec) || ent.path().extension() != L".jsonl") continue;
+        std::ifstream in(ent.path(), std::ios::binary);
+        std::string line;
+        while (std::getline(in, line)) {
+            if (!line.empty() && line.back() == '\r') line.pop_back();
+            if (line.empty()) continue;
+            nlohmann::json j = nlohmann::json::parse(line, nullptr, false);
+            if (j.is_discarded() || !j.is_object()) continue;
+            std::string jName = j.value("jobName", "");
+            if (!AutoNoteIEquals(jName, jobName)) continue;
+
+            AutoNoteRun r;
+            r.id = j.value("id", "");
+            r.jobId = j.value("jobId", "");
+            r.attempt = static_cast<int>(j.value("attempt", 1));
+            r.jobName = jName;
+            r.outcome = j.value("outcome", "");
+            r.exitCode = j.value("exitCode", 0);
+            r.durationSec = j.value("durationSec", 0);
+            r.timeoutSec = static_cast<int>(j.value("timeoutSec", 0));
+            r.startIso = j.value("start", j.value("createdAt", j.value("end", "")));
+            r.startEpoch = memory_inject_detail::ParseIsoEpoch(r.startIso);
+
+            auto failureIt = j.find("failure");
+            if (failureIt != j.end() && failureIt->is_object()) {
+                r.failureClass = failureIt->value("class", "");
+                r.failureSummary = failureIt->value("summary", "");
+            }
+            if (r.failureClass.empty()) {
+                r.failureClass = j.value("failureClass", "");
+            }
+
+            if (AutoNoteIEquals(r.failureClass, "success_check_failed")) {
+                if (r.failureSummary.find("filesNewer") != std::string::npos ||
+                    r.failureSummary.find("file not newer") != std::string::npos ||
+                    r.failureSummary.find("missing file:") != std::string::npos ||
+                    r.failureSummary.find("cannot read mtime") != std::string::npos) {
+                    r.condition = "filesNewer";
+                } else if (r.failureSummary.find("output_regex") != std::string::npos ||
+                           r.failureSummary.find("outputRegex") != std::string::npos) {
+                    r.condition = "outputRegex";
+                } else if (r.failureSummary.find("test report") != std::string::npos ||
+                           r.failureSummary.find("testReport") != std::string::npos) {
+                    r.condition = "testReport";
+                } else if (r.failureSummary.find("exit code") != std::string::npos ||
+                           r.failureSummary.find("exitCode") != std::string::npos) {
+                    r.condition = "exitCode";
+                }
+            }
+
+            auto feIt = j.find("filesEdited");
+            if (feIt != j.end() && feIt->is_array()) {
+                for (const auto& item : *feIt) {
+                    if (item.is_string()) r.filesEdited.push_back(item.get<std::string>());
+                }
+            }
+
+            std::string lo = LowerAscii(r.outcome);
+            bool hasFailure = !r.failureClass.empty() || (failureIt != j.end() && !failureIt->empty());
+            r.success = !hasFailure && (lo == "success" || lo == "succeeded" || lo == "completed" || lo == "ok" || lo == "passed" || (lo.empty() && r.exitCode == 0));
+            runs.push_back(std::move(r));
+        }
+    }
+
+    std::sort(runs.begin(), runs.end(), [](const AutoNoteRun& a, const AutoNoteRun& b) {
+        if (a.startEpoch != b.startEpoch) return a.startEpoch < b.startEpoch;
+        if (a.startIso != b.startIso) return a.startIso < b.startIso;
+        return a.id < b.id;
+    });
+
+    return runs;
+}
+
+} // namespace
+
+int CheckAndRecordAutoNotes(const TaskQueueJob& job, const TaskQueueAttempt& attempt,
+                           const TaskQueueFailureInput& fin) {
+    if (job.name.empty()) return 0;
+    auto runs = LoadRunsForJob(job.name);
+    const size_t N = runs.size();
+    if (N == 0) return 0;
+
+    // Augment the latest run with condition or timeout if missing from on-disk JSON
+    if (runs.back().condition.empty() && AutoNoteIEquals(runs.back().failureClass, "success_check_failed")) {
+        std::string cond = SuccessConditionOf(fin.checkDetail);
+        if (cond.empty()) cond = SuccessConditionOf(attempt.checkDetail);
+        if (!cond.empty()) runs.back().condition = cond;
+    }
+    if (runs.back().timeoutSec <= 0 && job.timeoutSec > 0) {
+        runs.back().timeoutSec = job.timeoutSec;
+    }
+
+    int notesCreated = 0;
+
+    // Rule 1: Same job name failed 3 times consecutively with the same failure classification.
+    // "同じジョブ名が同じ失敗分類で 3 回続いたとき、「build は直近 3 回 success_check_failed（filesNewer）で失敗」のようなノートを書く。"
+    // "同じノートを繰り返し作らない（条件が継続している間は 1 度だけ出す）。"
+    if (N >= 3) {
+        const auto& r1 = runs[N - 3];
+        const auto& r2 = runs[N - 2];
+        const auto& r3 = runs[N - 1];
+        if (!r1.success && !r2.success && !r3.success &&
+            !r3.failureClass.empty() &&
+            AutoNoteIEquals(r1.failureClass, r3.failureClass) &&
+            AutoNoteIEquals(r2.failureClass, r3.failureClass)) {
+
+            bool alreadyContinuing = false;
+            if (N >= 4) {
+                const auto& r0 = runs[N - 4];
+                if (!r0.success && AutoNoteIEquals(r0.failureClass, r3.failureClass)) {
+                    alreadyContinuing = true;
+                }
+            }
+
+            if (!alreadyContinuing && notesCreated < 5) {
+                std::string condition = r3.condition;
+                if (condition.empty()) condition = r2.condition;
+                if (condition.empty()) condition = r1.condition;
+
+                std::string text = job.name + " は直近 3 回 " + r3.failureClass;
+                if (!condition.empty()) {
+                    text += "（" + condition + "）";
+                }
+                text += "で失敗";
+
+                memory::NoteInput note;
+                note.text = text;
+                note.scope = "job:" + job.name;
+                note.authorType = "hancho";
+                note.sources = {r1.id, r2.id, r3.id};
+                note.tags = {"auto", "failure_streak", r3.failureClass};
+                std::string res = memory::NoteJson(note);
+                nlohmann::json r = nlohmann::json::parse(res, nullptr, false);
+                if (r.value("ok", false) && !r.value("duplicate", false)) {
+                    ++notesCreated;
+                }
+            }
+        }
+    }
+
+    // Rule 2: Duration exceeds 80% of timeout across consecutive attempts.
+    // "所要時間がタイムアウトの 80% を超える試行が続いたとき、p90 と上限を本文にしたノートを書く。"
+    // "同じノートを繰り返し作らない（条件が継続している間は 1 度だけ出す）。"
+    int effTimeout = job.timeoutSec;
+    if (effTimeout <= 0 && runs.back().timeoutSec > 0) effTimeout = runs.back().timeoutSec;
+
+    if (effTimeout > 0 && N >= 2) {
+        double threshold = 0.8 * static_cast<double>(effTimeout);
+        const auto& curr = runs[N - 1];
+        const auto& prev = runs[N - 2];
+        if (static_cast<double>(curr.durationSec) >= threshold &&
+            static_cast<double>(prev.durationSec) >= threshold) {
+
+            bool alreadyContinuing = false;
+            if (N >= 3) {
+                const auto& prev2 = runs[N - 3];
+                if (static_cast<double>(prev2.durationSec) >= threshold) {
+                    alreadyContinuing = true;
+                }
+            }
+
+            if (!alreadyContinuing && notesCreated < 5) {
+                std::vector<double> durations;
+                for (const auto& r : runs) {
+                    if (r.durationSec > 0) durations.push_back(static_cast<double>(r.durationSec));
+                }
+                std::sort(durations.begin(), durations.end());
+                double p90 = AutoNotePercentile(durations, 0.9);
+                int64_t p90Sec = static_cast<int64_t>(p90 + 0.5);
+
+                std::string text = job.name + " は所要時間がタイムアウトに近い（p90 " +
+                                   std::to_string(p90Sec) + " 秒 / 上限 " +
+                                   std::to_string(effTimeout) + " 秒）";
+
+                memory::NoteInput note;
+                note.text = text;
+                note.scope = "job:" + job.name;
+                note.authorType = "hancho";
+                note.sources = {prev.id, curr.id};
+                note.tags = {"auto", "timeout_warning"};
+                std::string res = memory::NoteJson(note);
+                nlohmann::json r = nlohmann::json::parse(res, nullptr, false);
+                if (r.value("ok", false) && !r.value("duplicate", false)) {
+                    ++notesCreated;
+                }
+            }
+        }
+    }
+
+    // Rule 3: Success after failure.
+    // "失敗の後に成功したとき、失敗試行と成功試行の filesEdited の差を「直した可能性のあるファイル」としてノートに書く。"
+    if (N >= 2) {
+        const auto& curr = runs[N - 1];
+        const auto& prev = runs[N - 2];
+        if (curr.success && !prev.success) {
+            std::vector<std::string> diff;
+            for (const auto& f : curr.filesEdited) {
+                if (std::find(prev.filesEdited.begin(), prev.filesEdited.end(), f) == prev.filesEdited.end()) {
+                    diff.push_back(f);
+                }
+            }
+            for (const auto& f : prev.filesEdited) {
+                if (std::find(curr.filesEdited.begin(), curr.filesEdited.end(), f) == curr.filesEdited.end()) {
+                    if (std::find(diff.begin(), diff.end(), f) == diff.end()) {
+                        diff.push_back(f);
+                    }
+                }
+            }
+
+            if (!diff.empty() && notesCreated < 5) {
+                std::string fileList;
+                for (size_t i = 0; i < diff.size(); ++i) {
+                    if (i > 0) fileList += ", ";
+                    fileList += diff[i];
+                }
+
+                std::string text = job.name + " は失敗の後に成功。直した可能性のあるファイル: " + fileList;
+
+                memory::NoteInput note;
+                note.text = text;
+                note.scope = "job:" + job.name;
+                note.authorType = "hancho";
+                note.sources = {prev.id, curr.id};
+                note.tags = {"auto", "fix_diff"};
+                std::string res = memory::NoteJson(note);
+                nlohmann::json r = nlohmann::json::parse(res, nullptr, false);
+                if (r.value("ok", false) && !r.value("duplicate", false)) {
+                    ++notesCreated;
+                }
+            }
+        }
+    }
+
+    return notesCreated;
+}
+
+int CheckAndRecordAutoNotes(const std::string& jobName, int timeoutSec) {
+    TaskQueueJob dummy;
+    dummy.name = jobName;
+    dummy.timeoutSec = timeoutSec;
+    TaskQueueAttempt a;
+    TaskQueueFailureInput fin;
+    return CheckAndRecordAutoNotes(dummy, a, fin);
+}
+
+
+bool TaskQueueManager::RecordPlainRunLocked(const PlainRunState& state, std::string& outError) {
+    outError.clear();
+    std::string qName = state.taskqueue.empty() ? "plain" : state.taskqueue;
+    TaskQueue& tq = queues_[qName];
+    tq.name = qName;
+
+    std::string jobId = state.jobId;
+    if (jobId.empty()) {
+        jobId = IssuePlainJobId(state.processId, state.name);
+    }
+
+    std::string startTs = !state.start.empty() ? state.start : GetCurrentTimestampStr();
+    std::string endTs = !state.end.empty() ? state.end : GetCurrentTimestampStr();
+    bool ok = (state.exitCode == 0);
+
+    TaskQueueAttempt a;
+    a.n = state.attempt <= 0 ? 1 : state.attempt;
+    a.processId = state.processId;
+    a.start = startTs;
+    a.end = endTs;
+    a.exitCode = state.exitCode;
+    a.reason = !state.reason.empty() ? state.reason : (ok ? "ok" : "failed");
+    a.logFile = state.logFile;
+    a.lastLinesFile = state.lastLinesFile;
+    a.checkDetail = state.checkDetail;
+
+    auto it = std::find_if(tq.jobs.begin(), tq.jobs.end(), [&](const TaskQueueJob& j) {
+        return j.id == jobId;
+    });
+    if (it != tq.jobs.end()) {
+        it->state = ok ? "succeeded" : "failed";
+        it->updatedAt = endTs;
+        if (!state.command.empty()) it->command = state.command;
+        if (!state.cwd.empty()) it->cwd = state.cwd;
+        if (!state.summary.empty()) it->summary = state.summary;
+        it->attempts.push_back(a);
+    } else {
+        TaskQueueJob job;
+        job.id = jobId;
+        job.taskqueue = qName;
+        job.name = !state.name.empty() ? state.name : "plain";
+        job.summary = state.summary;
+        job.command = state.command;
+        job.cwd = state.cwd;
+        job.timeoutSec = 0;
+        job.maxAttempts = 1;
+        job.state = ok ? "succeeded" : "failed";
+        job.createdAt = startTs;
+        job.updatedAt = endTs;
+        job.attempts.push_back(a);
+        tq.jobs.push_back(std::move(job));
+    }
+
+    if (!state.logFile.empty()) {
+        std::wstring dstLog = GetAttemptLogPathWide(jobId, a.n);
+        std::error_code ec;
+        if (!std::filesystem::exists(std::filesystem::path(dstLog), ec) &&
+            std::filesystem::exists(std::filesystem::path(Utf8ToWide(state.logFile)), ec)) {
+            EnsureDirectoryWide(PathJoinWide(GetLogsDirectoryWide(), L"taskqueue"));
+            std::filesystem::copy_file(std::filesystem::path(Utf8ToWide(state.logFile)),
+                                       std::filesystem::path(dstLog),
+                                       std::filesystem::copy_options::overwrite_existing, ec);
+        }
+    }
+
+    tq.version++;
+    SaveQueue(tq);
+    return true;
+}
+
+bool TaskQueueManager::RecordPlainRun(const PlainRunState& state, std::string& outError) {
+    std::lock_guard<std::mutex> lock(mutex_);
+    return RecordPlainRunLocked(state, outError);
 }
 
 void TaskQueueManager::OnProcessFinished(int processId, int exitCode, const std::string& endKind) {
     {
         std::lock_guard<std::mutex> lock(mutex_);
+        bool handled = false;
         for (auto& [name, tq] : queues_) {
             (void)name;
             for (auto& job : tq.jobs) {
                 if (job.attempts.empty()) continue;
                 TaskQueueAttempt& a = job.attempts.back();
                 if (a.processId != processId) continue;
+                handled = true;
                 if (job.state != "running" && job.state != "cancelled") return;
 
                 std::wstring logPath = GetAttemptLogPathWide(job.id, a.n);
@@ -4812,6 +5351,38 @@ void TaskQueueManager::OnProcessFinished(int processId, int exitCode, const std:
                 AppendRunRecordForAttempt(tq, job, a, fin, logText);
                 break;
             }
+            if (handled) break;
+        }
+
+        if (!handled) {
+            PlainRunState plain;
+            plain.processId = processId;
+            plain.exitCode = exitCode;
+            plain.reason = (exitCode == 0 ? "ok" : (endKind.empty() ? "failed" : endKind));
+            ProcessSnapshot snap;
+            if (pm_ && pm_->GetSnapshot(processId, snap)) {
+                plain.name = snap.name;
+                plain.command = snap.commandLine;
+                plain.cwd = snap.workingDir;
+                plain.start = snap.startTimeStr;
+                plain.end = !snap.endTimeStr.empty() ? snap.endTimeStr : GetCurrentTimestampStr();
+                plain.summary = snap.supervisorGoal;
+                plain.logFile = snap.logFilePath;
+                if (!snap.jobKey.empty()) plain.jobId = snap.jobKey;
+                if (!snap.lastLinePreview.empty()) {
+                    std::string jobSafe = SanitizeFileNameComponent(plain.jobId.empty() ? ("plain_" + std::to_string(processId)) : plain.jobId);
+                    std::wstring tailPath = PathJoinWide(GetTaskQueueLogDirWide(),
+                        Utf8ToWide(jobSafe) + L".1.tail.txt");
+                    EnsureDirectoryWide(GetTaskQueueLogDirWide());
+                    WriteFileAtomicWide(tailPath, snap.lastLinePreview);
+                    plain.lastLinesFile = WideToUtf8(tailPath);
+                }
+            } else {
+                plain.start = GetCurrentTimestampStr();
+                plain.end = plain.start;
+            }
+            std::string err;
+            RecordPlainRunLocked(plain, err);
         }
     }
     FlushFinishedCallbacks();

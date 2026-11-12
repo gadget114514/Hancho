@@ -1,6 +1,6 @@
 # 054 — memory prune と容量上限
 
-Estimate 120 min
+Estimate 85 min
 Splittable: no
 
 ## 目的

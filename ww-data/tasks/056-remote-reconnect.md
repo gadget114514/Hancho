@@ -1,6 +1,6 @@
 # 056 — リモートプロセスへの再接続
 
-Estimate 240 min
+Estimate 155 min
 Splittable: no
 
 ## 目的
@@ -9,11 +9,10 @@ Splittable: no
 
 ## やること
 
-- [ ] 手元の試行の状態にリモートの jobId / attempt の対応を保存し、再起動後に `hosts.json` から辿って再接続する。
-- [ ] 再接続時にリモートの試行の状態・ログ・イベントを取り寄せ、手元の一覧に復元する。
-- [ ] 再接続できない（ホストに到達しない）ときは、現状どおり `interrupted` に戻す。
-- [ ] `doc/remote-hosts.md` の「再接続しない」の制限を書き換える。
-- [ ] スモークテストを追加する（再起動を模した手元コアの再起動でリモートの状態を復元する）。
+子カードに分解した。個々の作業は子カードで管理する:
+
+- [ ] `ww-data/tasks/056-1-remote-reconnect-path.md` — リモート再接続の対応表と接続経路
+- [ ] `ww-data/tasks/056-2-remote-reconnect-restore.md` — 再接続後の状態復元と文書・スモーク
 
 ## 完了条件
 

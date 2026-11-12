@@ -29,36 +29,33 @@
 
 ## 4. memory prune と容量上限（§3.7）
 
-- `hancho-cli memory prune`: 古い月の L1 ファイルを消す。
-- `memory/` 全体の容量上限の設定と、超えたら古い L1 から削除、L2/L3 は自動で消さず上限接近を警告する。
-- 現状: 未実装。`memory_cli.cpp` の op は `search` / `get` / `brief` / `stats` / `approve` / `note` / `retract` / `rebuild` のみ。
+- `hancho-cli memory prune`: 古い月の L1 ファイルを消す（既定 90 日、`--dry-run` 対応）。
+- `memory/` 全体の容量上限の設定（`config.json` の `memory_max_bytes`）と、超えたら古い L1 から削除、L2/L3 は自動で消さず上限接近を警告する（CLI および GUI 通知）。
+- 現状: 実装済み（カード 054）。`memory stats` にも容量と上限を含める。
 
 ## 5. 埋め込み検索プラグイン（§3.13 M4）
 
 - `IMemoryRanker` を外部プロセスのプラグインで差し替える仕組み。プラグインは stdin で問い合わせと候補を受け取り、stdout にスコアを返す。
-- 現状: 部分的。境界（`src/memory_search.h` の `IMemoryRanker`）はあるが、プラグインを起動して組み込む経路がない。
+- 現状: 実装済み（カード 055-1、055-2）。データディレクトリの `config.json`（または CLI `--ranker`）で外部プラグインを指定可能。プロセスの起動失敗・異常終了・タイムアウト・不正な出力時は組み込み BM25 へ自動フォールバックし、検索を止めない。サンプルプラグインおよびスモークテスト追加済み。
 
 ## 6. リモートの残り（§2.5 段階 C）
 
 基本（`hosts.json`、トークン認証、WebSocket 越しの IPC、ジョブの `host` 指定、ログ・イベント・`.done` の取り寄せ）は実装済み。残るもの:
 
 - 手元のダッシュボードを再起動したときのリモートプロセスへの再接続。現状は手元の試行が `interrupted` になり、再接続しない（[remote-hosts.md](remote-hosts-ja.md) の制限）。
-- リモート実行での `success.filesNewer` の評価。現状は評価しない。
-- WebSocket 1 接続 1 要求・1 応答を越えた、ログやイベントの常時ストリーミング。
+- リモート実行での `success.filesNewer` の評価: 実装済み（カード 057）。ホスト側で `check_files_newer` IPC アクション（または試行の `.done` メタデータ）により評価。ホスト側の時刻系で判定し、時計のずれに影響されない。
+- WebSocket 1 接続 1 要求・1 応答を越えた、ログやイベントの常時ストリーミング: 実装済み（カード 058）。WebSocket 多重化、購読アクション（.events.jsonl / .stream.jsonl / .tail.txt）、seq 再開、監視ペインへの常時ストリーミング反映をサポート。
 
 ## 7. 未決事項（§7）
 
-未決のまま:
+決めたもの（2026-11-11。理由とカードは `doc/design-v3.md` §7 にある）:
 
-- イベントスキーマの JSON Schema を `data` の型まで縛るか。
-- JSON ストリームのない普通のプロセス（キューの外で起動したもの）にも RunRecord を作るか。
-- L3 の昇格を人以外（特定のワーカー）にも許すか。
-- リモートの認証をトークン以外（SSH 鍵の流用など）にも広げるか。
-- `incomplete` と `success_check_failed` の境目をどう決めるか。
-
-決めたもの:
-
-- Linux / macOS の画面: **GUI と TUI の両方を作る**（「`hancho-cli top` だけにするか」を決定）。設計文書 §2.6 の「Linux / macOS の GUI ダッシュボード」の非目標を取り消し、下記 8 に移動。
+- イベントスキーマの JSON Schema: **`data` の型まで縛る**。カード `ww-data/tasks/071-schema-data-types.md`。
+- JSON ストリームのない普通のプロセスにも RunRecord を作る。カード `ww-data/tasks/072-runrecord-plain-process.md`。
+- L3 の昇格: **人に加えて、設定で列挙した特定のワーカーにも許す**。実装済み（カード `ww-data/tasks/073-l3-worker-promotion.md`）。設定 `memory.l3Promoters`、CLI `--by worker:<name>` / `--worker <name>`、MCP `memory_approve` 対応。
+- リモートの認証: **トークンのまま。広げない**（実装なし）。
+- `incomplete` と `success_check_failed` の境目: **証拠ベース**（計画イベントに未完了 TODO が残る積極的な証拠があるときだけ `incomplete`）。`src/taskqueue.cpp` で実装済み（カードなし）。
+- Linux / macOS の画面: **GUI と TUI の両方を作る**（既述）。下記 8 に移動。
 
 ---
 
@@ -66,8 +63,8 @@
 
 POSIX 対応（設計文書 §2.4 段階 B）の進め方を変更します。設計文書は Linux / macOS 向けの画面を「端末向けの簡易表示（`hancho-cli top`）だけ」、GUI ダッシュボードを非目標としていましたが、**両方作る方針に変えます**。
 
-- **GUI**: Linux / macOS 向けのダッシュボードを新しく作る。Windows の Direct2D 版は持ち込まず、コアの IPC クライアントとして GUI を書き直す（設計文書 §2.3 段階 A の「GUI はコアの IPC クライアントにする」を全プラットフォームに広げる）。対応候補は Qt、GTK、Tauri など。実装方法は別途検討する。
-- **TUI**: `hancho-cli top` を簡易表示のままにせず、ダッシュボードと同じ機能の端末向け版として育てる。実装方法は別途検討する。
+- **GUI**: Linux / macOS 向けのダッシュボードを新しく作る。**ブラウザ UI とする**: コアが localhost の HTTP + WebSocket サーバーを立て、同梱の静的 HTML/JS をブラウザに開かせる。ネイティブ GUI（Qt、GTK、Tauri など）は **ペンディング**（ブラウザ UI で足りなかったものが再開条件）。方式・認証・資産同梱・主要 5 機能の実装・ビルドと配布パッケージングの文書化は [browser-ui-ja.md](browser-ui-ja.md)（[English](browser-ui.md) / カード 061-1 〜 061-4）で完了済み。
+- **TUI**: `hancho-cli top` を簡易表示のままにせず、ダッシュボードと同じ機能の端末向け版として育てる。外部ライブラリを追加せず、自前の ANSI/VT100 エスケープシーケンスとプラットフォーム端末制御による単一バイナリ方式を採用（[tui-design-ja.md](tui-design-ja.md) / [English](tui-design.md)、カード 062-1 〜 062-4）。骨格（更新ループ・キー入力・タブ切り替え）、主要 5 画面（Processes, Queue, Monitor, Why, Memory）、ジョブ操作（停止・再試行・取消）、リモートジョブ表示、POSIX 動作確認手順、および出力成型の自動スモークテストを整備完了。
 - 機能の範囲は、Windows 版ダッシュボードの主要機能（プロセス一覧、タスクキュー、実行状態監視ペイン、失敗診断、メモリ一覧）を基準に、Linux / macOS の実情に合わせて削る。
 
 ---
@@ -81,4 +78,4 @@ POSIX 対応（設計文書 §2.4 段階 B）の進め方を変更します。�
 | 3. 自動ノート、4. prune | メモリの運用品質。小さいので先行実装しやすい |
 | 5. 埋め込みプラグイン | 境界だけあり、需要次第 |
 | 6. リモートの残り | 使い込みで判明した不足。需要に応じて |
-| 8. Linux / macOS の GUI と TUI | 方針は決定済み。GUI は IPC クライアント化が前提 |
+| 8. Linux / macOS の GUI と TUI | 方針・方式・認証・主要 5 機能・ビルド配布文書化完了（[browser-ui-ja.md](browser-ui-ja.md)）。GUI はブラウザ UI（ネイティブはペンディング）。TUI は自前 ANSI 方式に決定し、主要 5 画面・ジョブ操作・リモート表示・POSIX 確認手順・自動スモークテストまで完了（[tui-design-ja.md](tui-design-ja.md) / カード 062-1 〜 062-4） |

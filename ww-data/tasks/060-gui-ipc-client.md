@@ -1,6 +1,6 @@
 # 060 — GUI をコアの IPC クライアントにする
 
-Estimate 480 min
+Estimate 300 min
 Splittable: no
 
 ## 目的
@@ -9,11 +9,12 @@ Windows の Direct2D GUI をコアの外に出し、`Hancho.exe --headless` と 
 
 ## やること
 
-- [ ] GUI が直接読んでいるコアの状態を、IPC（Named Pipe 越し）に置き換える。IPC にない要求は足す。
-- [ ] GUI 単体で起動してコアにつなぐ経路を作る。コアがなければ起動を促す。
-- [ ] GUI を閉じてもコアのジョブは止まらないことを確認する。再接続も確認する。
-- [ ] コア単体（`--headless`）で GUI なしの運用が崩れないことを確認する。
-- [ ] GUI を Linux / macOS 向けにも移植可能な構成にするため、OS 依存の描画と IPC 以外の呼び出しを分ける。
+子カードに分解した。個々の作業は子カードで管理する:
+
+- [ ] `ww-data/tasks/060-1-gui-ipc-requests.md` — GUI が必要な IPC 要求の整備
+- [ ] `ww-data/tasks/060-2-gui-ipc-replace.md` — GUI の状態読み取りの IPC 置き換え
+- [ ] `ww-data/tasks/060-3-gui-standalone.md` — GUI 単体起動と再接続の確認
+- [ ] `ww-data/tasks/060-4-gui-headless-split.md` — headless 単独運用の確認と OS 依存の分離
 
 ## 完了条件
 

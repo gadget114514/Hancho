@@ -4,10 +4,15 @@
 #include "event_schema.h"
 #include "activity_tree.h"
 #include "bt_debug_view.h"
+#include "memory_record.h"
 #include "memory_search.h"
 #include "TerminalView.h"
 #include "TerminalGridView.h"
 #include "SettingsManager.h"
+#include "remote_hosts.h"
+#include "ipc_client.h"
+#include "../tests/remote_ws_test.h"
+#include "../tests/gui_platform.h"
 #include "nlohmann/json.hpp"
 #include <commctrl.h>
 #include <windowsx.h>
@@ -847,6 +852,23 @@ enum class ListDisplayMode {
     TaskOnly = 2     // Only Task Queue List
 };
 
+// Sort state of one list column. Clicking a header walks the cycle
+// ascending -> descending -> unsorted -> ascending.
+enum class SortDirection {
+    None = 0,
+    Ascending = 1,
+    Descending = 2
+};
+
+// The next state of the cycle when the same header is clicked again.
+static SortDirection NextSortDirection(SortDirection dir) {
+    switch (dir) {
+        case SortDirection::Ascending: return SortDirection::Descending;
+        case SortDirection::Descending: return SortDirection::None;
+        default: return SortDirection::Ascending;
+    }
+}
+
 struct LlmStreamDlgState;
 
 struct DashboardState {
@@ -869,11 +891,16 @@ struct DashboardState {
     HWND hwndUsagePanel = nullptr;
     bool showUsagePanel = true;
     int usagePanelHeight = 110;
-    int usageRangeIndex = 1;
+    int usageRangeIndex = 0; // 0: 24h (default), 1: 7d, 2: 30d, 3: 12m
     int usageGraphMode = 0; // 0: token kinds (default), 1: by provider/model
     bool restoreUsageGraph = false;
     int64_t llmMaxEvents = kDefaultLlmMaxEvents;  // events kept per stream tracker; -1 = unlimited
     bool resourceLocks = true; // task queue resource locks (doc/resource-locks.md)
+    int64_t memoryMaxBytes = 0; // memory/ capacity limit in bytes; 0 = unlimited
+    uint64_t lastMemoryCheckTickMs = 0;
+    bool memoryNearLimit = false;
+    bool memoryTrayWarned = false;
+    std::wstring memoryWarningText;
     int refreshIntervalMs = kDefaultRefreshIntervalMs; // dashboard + terminal grid refresh period (ms)
     int runningTotalCount = 0;  // processes in Running state + running queue jobs, from the last refresh
     int appliedRefreshMs = 0;   // period currently set on TIMER_REFRESH_ID
@@ -933,7 +960,10 @@ struct DashboardState {
 
     bool hideEndedProcesses = false;
     int sortColumn = 0;        // Default: Column 0 (ID)
-    bool sortAscending = false; // Default: Descending (newest processes at the top)
+    SortDirection sortDirection = SortDirection::Descending; // Default: Descending (newest processes at the top)
+
+    int taskSortColumn = -1;   // -1: the task list keeps its natural order
+    SortDirection taskSortDirection = SortDirection::None;
 
     bool completionSoundEnabled = true;
     std::string completionSoundPath;
@@ -956,6 +986,7 @@ struct DashboardState {
     HFONT hFontTaskList = nullptr;
 
     int selectedProcId = -1;
+    std::string selectedJobKey;
     bool allowExit = false;
     NOTIFYICONDATAW nid = {};
     bool trayAdded = false;
@@ -979,6 +1010,427 @@ struct DashboardState {
 
 static DashboardState* GetState(HWND hwnd) {
     return reinterpret_cast<DashboardState*>(GetWindowLongPtrW(hwnd, GWLP_USERDATA));
+}
+
+// ---------------------------------------------------------------------------
+// IPC client helpers for GUI dashboard (Card 060-2)
+// Replaces direct state reads (st->pm, st->tqm, memory, config) with Named Pipe IPC calls
+// ---------------------------------------------------------------------------
+
+static bool GuiIpcCall(DashboardState* st, const nlohmann::json& req, nlohmann::json& outResp, std::string* outError = nullptr) {
+    std::string resp;
+    std::string err;
+    bool ok = false;
+    if (SendIpcRequest(req.dump(), resp, err, false)) {
+        ok = true;
+    } else if (st && st->ipc) {
+        resp = st->ipc->HandleRequestJson(req.dump());
+        ok = !resp.empty();
+    }
+    if (!ok) {
+        if (outError) *outError = err.empty() ? "IPC request failed" : err;
+        return false;
+    }
+    outResp = nlohmann::json::parse(resp, nullptr, false);
+    if (outResp.is_discarded()) {
+        if (outError) *outError = "Invalid JSON response: " + resp;
+        return false;
+    }
+    return true;
+}
+
+static ProcessSnapshot ProcessSnapshotFromJson(const nlohmann::json& j) {
+    ProcessSnapshot s;
+    if (!j.is_object()) return s;
+    s.id = j.value("id", 0);
+    s.name = j.value("name", "");
+    s.commandLine = j.value("command", "");
+    s.workingDir = j.value("cwd", "");
+    s.mode = StringToExecMode(j.value("mode", "pipe"));
+    s.state = StringToProcState(j.value("state", "completed"));
+    s.rootPid = static_cast<DWORD>(j.value("pid", 0));
+    s.exitCode = (s.state == ProcState::Running) ? STILL_ACTIVE : static_cast<DWORD>(j.value("exit_code", 0));
+    s.startTimeStr = j.value("start_time", "");
+    s.endTimeStr = j.value("end_time", "");
+    s.estimatedEndTimeStr = j.value("estimated_end_time", "");
+    s.elapsedMs = j.value("elapsed_ms", 0ULL);
+    s.cpuTimeMs = j.value("cpu_time_ms", 0ULL);
+    s.idleMs = j.value("idle_ms", 0ULL);
+    s.timeoutSec = j.value("timeout_sec", 0);
+    s.idleTimeoutSec = j.value("idle_timeout_sec", 0);
+    s.treeProcessCount = j.value("tree_procs", 0U);
+    s.treeMemoryBytes = j.value("memory_bytes", 0ULL);
+    s.totalBytesRead = j.value("total_bytes_read", 0ULL);
+    s.logFilePath = j.value("log_file", "");
+    s.doneFilePath = j.value("done_file", "");
+    s.lastLinePreview = j.value("last_line", "");
+    s.jobKey = j.value("job_key", "");
+    s.jobId = j.value("job_id", 0);
+    s.attemptN = j.value("attempt", 0);
+    s.agentType = j.value("agent_type", "");
+    s.agentStatus = j.value("agent_status", "");
+    s.currentTool = j.value("current_tool", "");
+    s.currentToolAction = j.value("current_tool_action", "");
+    s.lastThought = j.value("last_thought", "");
+    s.lastMessage = j.value("last_message", "");
+    s.stepCount = j.value("step_count", 0);
+    s.streamEventCount = j.value("stream_event_count", 0);
+    s.streamFilePath = j.value("stream_file", "");
+    s.supervisorNotes = j.value("supervisor_notes", "");
+    s.supervisorGoal = j.value("supervisor_goal", "");
+    return s;
+}
+
+static std::vector<ProcessSnapshot> FetchProcessSnapshotsIpc(DashboardState* st) {
+    nlohmann::json req = {{"action", "list"}};
+    nlohmann::json resp;
+    if (GuiIpcCall(st, req, resp) && resp.value("ok", false) &&
+        resp.contains("processes") && resp["processes"].is_array()) {
+        std::vector<ProcessSnapshot> list;
+        list.reserve(resp["processes"].size());
+        for (const auto& item : resp["processes"]) {
+            list.push_back(ProcessSnapshotFromJson(item));
+        }
+        return list;
+    }
+    if (st && st->pm) {
+        return st->pm->GetAllSnapshots();
+    }
+    return {};
+}
+
+static bool FetchProcessSnapshotIpc(DashboardState* st, int id, ProcessSnapshot& outSnap) {
+    if (id <= 0) return false;
+    nlohmann::json req = {{"action", "list"}, {"id", id}};
+    nlohmann::json resp;
+    if (GuiIpcCall(st, req, resp) && resp.value("ok", false) &&
+        resp.contains("processes") && resp["processes"].is_array() &&
+        !resp["processes"].empty()) {
+        outSnap = ProcessSnapshotFromJson(resp["processes"][0]);
+        return true;
+    }
+    if (st && st->pm) {
+        return st->pm->GetSnapshot(id, outSnap);
+    }
+    return false;
+}
+
+static bool KillProcessIpc(DashboardState* st, int procId, std::string& outErr) {
+    nlohmann::json req = {{"action", "kill"}, {"id", procId}};
+    nlohmann::json resp;
+    if (GuiIpcCall(st, req, resp, &outErr) && resp.value("ok", false)) {
+        return true;
+    }
+    if (st && st->pm) {
+        return st->pm->KillProcess(procId, outErr);
+    }
+    return false;
+}
+
+static int KillAllRunningIpc(DashboardState* st) {
+    nlohmann::json req = {{"action", "kill_all"}};
+    nlohmann::json resp;
+    if (GuiIpcCall(st, req, resp) && resp.value("ok", false)) {
+        return resp.value("killed_count", 0);
+    }
+    if (st && st->pm) {
+        return st->pm->KillAllRunning();
+    }
+    return 0;
+}
+
+static int ClearFinishedIpc(DashboardState* st) {
+    nlohmann::json req = {{"action", "clear"}};
+    nlohmann::json resp;
+    if (GuiIpcCall(st, req, resp) && resp.value("ok", false)) {
+        return resp.value("cleared_count", 0);
+    }
+    if (st && st->pm) {
+        return st->pm->ClearFinished();
+    }
+    return 0;
+}
+
+static bool RemoveProcessIpc(DashboardState* st, int procId) {
+    nlohmann::json req = {{"action", "remove"}, {"id", procId}};
+    nlohmann::json resp;
+    if (GuiIpcCall(st, req, resp) && resp.value("ok", false)) {
+        return true;
+    }
+    if (st && st->pm) {
+        return st->pm->RemoveProcess(procId);
+    }
+    return false;
+}
+
+static int ResetProcessIdsIpc(DashboardState* st, std::string& outErr) {
+    nlohmann::json req = {{"action", "reset_ids"}};
+    nlohmann::json resp;
+    if (GuiIpcCall(st, req, resp, &outErr) && resp.value("ok", false)) {
+        return resp.value("count", 0);
+    }
+    if (st && st->pm) {
+        return st->pm->ResetProcessIds(outErr);
+    }
+    return -1;
+}
+
+static bool GetProcessOutputIpc(DashboardState* st, int procId, int tail, std::string& outOutput) {
+    nlohmann::json req = {{"action", "logs"}, {"id", procId}, {"tail", tail}};
+    nlohmann::json resp;
+    if (GuiIpcCall(st, req, resp) && resp.value("ok", false)) {
+        outOutput = resp.value("output", "");
+        return true;
+    }
+    if (st && st->pm) {
+        return st->pm->GetOutput(procId, true, tail, outOutput);
+    }
+    return false;
+}
+
+static bool GetAgentStateIpc(DashboardState* st, int procId, LlmAgentState& outState) {
+    nlohmann::json req = {{"action", "get_agent_state"}, {"id", procId}};
+    nlohmann::json resp;
+    if (GuiIpcCall(st, req, resp) && resp.value("ok", false)) {
+        outState.agentType = resp.value("agent_type", "");
+        outState.status = resp.value("status", "");
+        outState.currentTool = resp.value("current_tool", "");
+        outState.currentToolAction = resp.value("current_tool_action", "");
+        outState.lastThought = resp.value("last_thought", "");
+        outState.lastMessage = resp.value("last_message", "");
+        outState.stepCount = resp.value("step_count", 0);
+        outState.eventCount = resp.value("event_count", 0);
+        outState.totalTokens = resp.value("total_tokens", 0ULL);
+        outState.costUsd = resp.value("cost_usd", 0.0);
+        outState.streamFilePath = resp.value("stream_file", "");
+        outState.supervisorNotes = resp.value("supervisor_notes", "");
+        outState.supervisorGoal = resp.value("supervisor_goal", "");
+        outState.updatedAt = resp.value("updated_at", "");
+        return true;
+    }
+    if (st && st->pm) {
+        std::vector<LlmStreamEvent> dummy;
+        return st->pm->GetAgentStream(procId, 1, "", 0, dummy, outState);
+    }
+    return false;
+}
+
+static TaskQueueCounts FetchTaskQueueCountsIpc(DashboardState* st) {
+    nlohmann::json req = {{"action", "taskqueue_counts"}};
+    nlohmann::json resp;
+    if (GuiIpcCall(st, req, resp) && resp.value("ok", false)) {
+        TaskQueueCounts c;
+        if (resp.contains("counts") && resp["counts"].is_object()) {
+            const auto& cnt = resp["counts"];
+            c.running = cnt.value("running", 0);
+            c.waiting = cnt.value("waiting", 0);
+            c.pending = cnt.value("pending", 0);
+            c.blocked = cnt.value("blocked", 0);
+            c.succeeded = cnt.value("succeeded", 0);
+            c.failed = cnt.value("failed", 0);
+            c.cancelled = cnt.value("cancelled", 0);
+            c.total = cnt.value("total", 0);
+        } else {
+            c.running = resp.value("running", 0);
+            c.waiting = resp.value("waiting", 0);
+            c.pending = resp.value("pending", 0);
+            c.blocked = resp.value("blocked", 0);
+            c.succeeded = resp.value("succeeded", 0);
+            c.failed = resp.value("failed", 0);
+            c.cancelled = resp.value("cancelled", 0);
+            c.total = resp.value("total", 0);
+        }
+        return c;
+    }
+    if (st && st->tqm) {
+        return st->tqm->GetJobCounts();
+    }
+    return TaskQueueCounts{};
+}
+
+static std::string TaskQueueListIpc(DashboardState* st, const std::string& taskqueue, const std::string& state, int64_t sinceSec, std::string& outErr, const std::string& origin = "", const std::string& bt = "") {
+    nlohmann::json req = {
+        {"action", "taskqueue_list"},
+        {"taskqueue", taskqueue},
+        {"state", state}
+    };
+    if (sinceSec > 0) req["since_sec"] = sinceSec;
+    if (!origin.empty()) req["origin"] = origin;
+    if (!bt.empty()) req["bt"] = bt;
+    nlohmann::json resp;
+    if (GuiIpcCall(st, req, resp, &outErr)) {
+        return resp.dump();
+    }
+    if (st && st->tqm) {
+        return st->tqm->TaskQueueList(taskqueue, state, sinceSec, outErr, origin, bt);
+    }
+    return "";
+}
+
+static std::string TaskQueueGetIpc(DashboardState* st, const std::string& id, bool includeInstructions, int rev, std::string& outErr) {
+    nlohmann::json req = {
+        {"action", "taskqueue_get"},
+        {"id", id},
+        {"include_instructions", includeInstructions}
+    };
+    if (rev > 0) req["rev"] = rev;
+    nlohmann::json resp;
+    if (GuiIpcCall(st, req, resp, &outErr)) {
+        return resp.dump();
+    }
+    if (st && st->tqm) {
+        return st->tqm->TaskQueueGet(id, includeInstructions, rev, outErr);
+    }
+    return "";
+}
+
+static std::string TaskQueueCancelIpc(DashboardState* st, const std::string& id, std::string& outErr) {
+    nlohmann::json req = {{"action", "taskqueue_cancel"}, {"id", id}};
+    nlohmann::json resp;
+    if (GuiIpcCall(st, req, resp, &outErr)) {
+        return resp.dump();
+    }
+    if (st && st->tqm) {
+        return st->tqm->TaskQueueCancel(id, outErr);
+    }
+    return "";
+}
+
+static std::string TaskQueueRetryIpc(DashboardState* st, const std::string& id, bool resetAttempts, bool refreshInstr, std::string& outErr) {
+    nlohmann::json req = {
+        {"action", "taskqueue_retry"},
+        {"id", id},
+        {"reset_attempts", resetAttempts},
+        {"refresh_instructions", refreshInstr}
+    };
+    nlohmann::json resp;
+    if (GuiIpcCall(st, req, resp, &outErr)) {
+        return resp.dump();
+    }
+    if (st && st->tqm) {
+        return st->tqm->TaskQueueRetry(id, resetAttempts, refreshInstr, TaskQueueCaller::External, outErr);
+    }
+    return "";
+}
+
+static std::string TaskQueuePauseIpc(DashboardState* st, const std::string& queue, bool pause, std::string& outErr) {
+    nlohmann::json req = {
+        {"action", pause ? "taskqueue_pause" : "taskqueue_resume"},
+        {"taskqueue", queue}
+    };
+    nlohmann::json resp;
+    if (GuiIpcCall(st, req, resp, &outErr)) {
+        return resp.dump();
+    }
+    if (st && st->tqm) {
+        return st->tqm->TaskQueuePause(queue, pause, outErr);
+    }
+    return "";
+}
+
+static std::string TaskQueuePurgeIpc(DashboardState* st, const std::string& queue, const std::string& statesJson, std::string& outErr) {
+    nlohmann::json req = {
+        {"action", "taskqueue_purge"},
+        {"taskqueue", queue}
+    };
+    auto parsedStates = nlohmann::json::parse(statesJson, nullptr, false);
+    if (!parsedStates.is_discarded()) {
+        req["states"] = parsedStates;
+    }
+    nlohmann::json resp;
+    if (GuiIpcCall(st, req, resp, &outErr)) {
+        return resp.dump();
+    }
+    if (st && st->tqm) {
+        return st->tqm->TaskQueuePurge(queue, statesJson, outErr);
+    }
+    return "";
+}
+
+static void SetResourceLocksEnabledIpc(DashboardState* st, bool enabled) {
+    nlohmann::json req = {{"action", "taskqueue_resource_locks"}, {"enabled", enabled}};
+    nlohmann::json resp;
+    GuiIpcCall(st, req, resp);
+    if (st && st->tqm) {
+        st->tqm->SetResourceLocksEnabled(enabled);
+    }
+}
+
+static pc::memory::StorageStats GetMemoryStorageStatsIpc(DashboardState* st) {
+    nlohmann::json req = {{"action", "memory_storage_stats"}};
+    nlohmann::json resp;
+    if (GuiIpcCall(st, req, resp) && resp.value("ok", false)) {
+        pc::memory::StorageStats s;
+        s.totalBytes = resp.value("total_bytes", 0ULL);
+        s.limitBytes = resp.value("limit_bytes", 0ULL);
+        s.l1Bytes = resp.value("l1_bytes", 0ULL);
+        s.l2Bytes = resp.value("l2_bytes", 0ULL);
+        s.l3Bytes = resp.value("l3_bytes", 0ULL);
+        s.indexBytes = resp.value("index_bytes", 0ULL);
+        s.otherBytes = resp.value("other_bytes", 0ULL);
+        s.nearLimit = resp.value("near_limit", false);
+        s.exceeded = resp.value("exceeded", false);
+        s.warning = resp.value("warning", "");
+        return s;
+    }
+    return pc::memory::GetMemoryStorageStats();
+}
+
+static std::string MemorySearchIpc(DashboardState* st, const memory::Query& q) {
+    nlohmann::json req = {
+        {"action", "memory_search"},
+        {"text", q.text},
+        {"job_name", q.jobName},
+        {"taskqueue", q.taskqueue},
+        {"limit", q.limit}
+    };
+    if (!q.kinds.empty()) {
+        req["kinds"] = q.kinds;
+    }
+    if (!q.tags.empty()) {
+        req["tags"] = q.tags;
+    }
+    nlohmann::json resp;
+    if (GuiIpcCall(st, req, resp)) {
+        return resp.dump();
+    }
+    return memory::SearchJson(q);
+}
+
+static std::string MemoryGetIpc(DashboardState* st, const std::string& id, const std::string& kind) {
+    nlohmann::json req = {{"action", "memory_get"}, {"id", id}, {"kind", kind}};
+    nlohmann::json resp;
+    if (GuiIpcCall(st, req, resp)) {
+        return resp.dump();
+    }
+    return memory::GetJson(id, kind);
+}
+
+static std::string MemoryStatsIpc(DashboardState* st, const memory::Query& q) {
+    nlohmann::json req = {
+        {"action", "memory_stats"},
+        {"job_name", q.jobName},
+        {"taskqueue", q.taskqueue}
+    };
+    nlohmann::json resp;
+    if (GuiIpcCall(st, req, resp)) {
+        return resp.dump();
+    }
+    return memory::StatsJson(q);
+}
+
+static std::string MemoryInjectCompareIpc(DashboardState* st, const std::string& job, const std::string& tq, const std::string& since) {
+    nlohmann::json req = {
+        {"action", "memory_compare"},
+        {"job", job},
+        {"taskqueue", tq},
+        {"since", since}
+    };
+    nlohmann::json resp;
+    if (GuiIpcCall(st, req, resp)) {
+        return resp.dump();
+    }
+    return MemoryInjectCompareJson(job, tq, since);
 }
 
 static std::wstring StateLabelWide(ProcState state, bool idleWarning) {
@@ -1578,10 +2030,7 @@ static void DrawDashboardCanvas(DashboardState* st, HDC hdcWindow) {
             failedOrKilled++;
         }
     }
-    TaskQueueCounts tqCounts;
-    if (st->tqm) {
-        tqCounts = st->tqm->GetJobCounts();
-    }
+    TaskQueueCounts tqCounts = FetchTaskQueueCountsIpc(st);
     st->activeRunningCount = activeRunning + tqCounts.running;
     // Any process still in the Running state (including idle-waiting ones) or any running queue job.
     st->runningTotalCount = activeRunning + idleWaiting + tqCounts.running;
@@ -1905,6 +2354,9 @@ static void DrawDashboardCanvas(DashboardState* st, HDC hdcWindow) {
     sbLeft << Tr(L"  |  Ctrl+T: プロセス / タスクキュー切替",
                  L"  |  Ctrl+T: switch Processes / Task Queue",
                  L"  |  Ctrl+T: cambiar Procesos / Cola de tareas");
+    if (st->memoryNearLimit && !st->memoryWarningText.empty()) {
+        sbLeft << L"  |  [" << st->memoryWarningText << L"]";
+    }
 
     uint64_t dashElapsedMs = GetNowTickMs() - st->dashboardStartTickMs;
     std::wstringstream sbRight;
@@ -1967,8 +2419,9 @@ static void UpdateListHeaderSortIndicator(DashboardState* st) {
     HWND hHeader = ListView_GetHeader(st->hwndList);
     for (int i = 0; i < 14; ++i) {
         std::wstring title = ColumnTitle(i);
-        if (i == st->sortColumn) {
-            title += st->sortAscending ? L" ▲" : L" ▼";
+        bool sorted = (st->sortDirection != SortDirection::None) && (i == st->sortColumn);
+        if (sorted) {
+            title += (st->sortDirection == SortDirection::Ascending) ? L" ▲" : L" ▼";
         }
         LVCOLUMNW lvc = {};
         lvc.mask = LVCF_TEXT;
@@ -1980,8 +2433,8 @@ static void UpdateListHeaderSortIndicator(DashboardState* st) {
             hdi.mask = HDI_FORMAT;
             if (Header_GetItem(hHeader, i, &hdi)) {
                 hdi.fmt &= ~(HDF_SORTUP | HDF_SORTDOWN);
-                if (i == st->sortColumn) {
-                    hdi.fmt |= st->sortAscending ? HDF_SORTUP : HDF_SORTDOWN;
+                if (sorted) {
+                    hdi.fmt |= (st->sortDirection == SortDirection::Ascending) ? HDF_SORTUP : HDF_SORTDOWN;
                 }
                 Header_SetItem(hHeader, i, &hdi);
             }
@@ -2011,19 +2464,121 @@ static void UpdateTaskListHeaders(DashboardState* st) {
     if (!st || !st->hwndTaskList) return;
     HWND hHeader = ListView_GetHeader(st->hwndTaskList);
     for (int i = 0; i < kTaskListColumns; ++i) {
+        bool sorted = (st->taskSortDirection != SortDirection::None) && (i == st->taskSortColumn);
+        std::wstring title = TaskColumnTitle(i);
+        if (sorted) {
+            title += (st->taskSortDirection == SortDirection::Ascending) ? L" ▲" : L" ▼";
+        }
         LVCOLUMNW lvc = {};
         lvc.mask = LVCF_TEXT;
-        lvc.pszText = const_cast<wchar_t*>(TaskColumnTitle(i));
+        lvc.pszText = title.data();
         ListView_SetColumn(st->hwndTaskList, i, &lvc);
         if (hHeader) {
             HDITEMW hdi = {};
             hdi.mask = HDI_FORMAT;
             if (Header_GetItem(hHeader, i, &hdi)) {
+                hdi.fmt &= ~(HDF_SORTUP | HDF_SORTDOWN);
                 hdi.fmt |= HDF_OWNERDRAW;
+                if (sorted) {
+                    hdi.fmt |= (st->taskSortDirection == SortDirection::Ascending) ? HDF_SORTUP : HDF_SORTDOWN;
+                }
                 Header_SetItem(hHeader, i, &hdi);
             }
         }
     }
+}
+
+// One row of the task list: the cells to show plus the values a sort compares.
+// The two time columns keep the full date and time, because the column itself
+// only shows the time of day.
+struct TaskListRow {
+    std::wstring cells[kTaskListColumns];
+    std::string id;
+    int64_t startKey = 0;  // epoch seconds of the last attempt start (0: not started yet)
+    int64_t endKey = 0;    // epoch seconds of the end, or of the estimated end (0: unknown)
+    std::wstring originTip;
+    std::string kind;      // running / timeout / failed / other, for the row colour
+    int procId = 0;
+};
+
+// Compares two texts the way the list shows them, ignoring case.
+static int CompareCellText(const std::wstring& a, const std::wstring& b) {
+    const int r = _wcsicmp(a.c_str(), b.c_str());
+    return (r < 0) ? -1 : (r > 0 ? 1 : 0);
+}
+
+// Compares two job ids so that "job-2" comes before "job-10": runs of digits
+// compare as numbers, the rest case-insensitively.
+static int CompareJobIds(const std::string& a, const std::string& b) {
+    size_t i = 0, j = 0;
+    while (i < a.size() && j < b.size()) {
+        const unsigned char ca = static_cast<unsigned char>(a[i]);
+        const unsigned char cb = static_cast<unsigned char>(b[j]);
+        if (isdigit(ca) && isdigit(cb)) {
+            size_t si = i, sj = j;
+            while (i < a.size() && isdigit(static_cast<unsigned char>(a[i]))) ++i;
+            while (j < b.size() && isdigit(static_cast<unsigned char>(b[j]))) ++j;
+            while (si + 1 < i && a[si] == '0') ++si;
+            while (sj + 1 < j && b[sj] == '0') ++sj;
+            const size_t la = i - si, lb = j - sj;
+            if (la != lb) return (la < lb) ? -1 : 1;
+            const int c = a.compare(si, la, b, sj, lb);
+            if (c != 0) return (c < 0) ? -1 : 1;
+            continue;
+        }
+        const int la = tolower(ca), lb = tolower(cb);
+        if (la != lb) return (la < lb) ? -1 : 1;
+        ++i;
+        ++j;
+    }
+    if (i < a.size()) return 1;
+    if (j < b.size()) return -1;
+    return 0;
+}
+
+// Compares two rows by one column. A time that is not known sorts last.
+static int CompareTaskRows(const TaskListRow& a, const TaskListRow& b, int col) {
+    int cmp = 0;
+    switch (col) {
+        case 0:  // ID
+            cmp = CompareJobIds(a.id, b.id);
+            break;
+        case 1:  // Summary
+        case 2:  // State
+        case 5:  // Running
+        case 6:  // Depends / Reason
+        case 7:  // Queue
+        case 8:  // Origin
+        case 9:  // Resources
+            cmp = CompareCellText(a.cells[col], b.cells[col]);
+            break;
+        case 3:  // Start: the full date and time of the last attempt
+        case 4:  // End: the full date and time of the end, or of the estimated end
+        {
+            const int64_t ka = (col == 3) ? a.startKey : a.endKey;
+            const int64_t kb = (col == 3) ? b.startKey : b.endKey;
+            if (ka == 0 && kb == 0) cmp = 0;
+            else if (ka == 0) cmp = 1;
+            else if (kb == 0) cmp = -1;
+            else cmp = (ka < kb) ? -1 : (ka > kb ? 1 : 0);
+            break;
+        }
+        default:
+            cmp = 0;
+            break;
+    }
+    if (cmp == 0) cmp = CompareJobIds(a.id, b.id);
+    return cmp;
+}
+
+// Sorts the task rows by one column. SortDirection::None keeps the natural order.
+static void SortTaskRows(std::vector<TaskListRow>& rows, int col, SortDirection dir) {
+    if (dir == SortDirection::None || col < 0 || col >= kTaskListColumns) return;
+    const bool asc = (dir == SortDirection::Ascending);
+    std::stable_sort(rows.begin(), rows.end(), [col, asc](const TaskListRow& a, const TaskListRow& b) {
+        const int cmp = CompareTaskRows(a, b, col);
+        return asc ? (cmp < 0) : (cmp > 0);
+    });
 }
 
 static void UpdateControlTooltip(HWND hwndTip, HWND hwndParent, HWND hwndCtrl, const wchar_t* text) {
@@ -2077,7 +2632,9 @@ static void UpdatePanelToggleLabels(DashboardState* st) {
     }
 }
 
-static void SortSnapshots(std::vector<ProcessSnapshot>& snaps, int col, bool asc) {
+static void SortSnapshots(std::vector<ProcessSnapshot>& snaps, int col, SortDirection dir) {
+    if (dir == SortDirection::None) return;
+    bool asc = (dir == SortDirection::Ascending);
     std::sort(snaps.begin(), snaps.end(), [col, asc](const ProcessSnapshot& a, const ProcessSnapshot& b) {
         int cmp = 0;
         switch (col) {
@@ -2135,25 +2692,14 @@ static void SortSnapshots(std::vector<ProcessSnapshot>& snaps, int col, bool asc
 
 static void PlayCompletionSound(const DashboardState& st) {
     if (!st.completionSoundEnabled) return;
-    if (!st.completionSoundPath.empty()) {
-        std::wstring path = Utf8ToWide(st.completionSoundPath);
-        if (PlaySoundW(path.c_str(), nullptr, SND_FILENAME | SND_ASYNC | SND_NODEFAULT)) {
-            return;
-        }
-    }
-    if (!PlaySoundW(L"Notification.Default", nullptr, SND_ALIAS | SND_ASYNC | SND_NODEFAULT)) {
-        if (!PlaySoundW(L"SystemAsterisk", nullptr, SND_ALIAS | SND_ASYNC | SND_NODEFAULT)) {
-            MessageBeep(MB_ICONASTERISK);
-        }
-    }
+    std::wstring path = st.completionSoundPath.empty() ? std::wstring() : Utf8ToWide(st.completionSoundPath);
+    gui_platform::GetGuiPlatform()->PlayNotificationSound(path, false);
 }
 
 // Played when a process ends without completing successfully (Failed / TimedOut / IdleTimedOut / Killed).
 static void PlayFailureSound(const DashboardState& st) {
     if (!st.completionSoundEnabled) return;
-    if (!PlaySoundW(L"SystemHand", nullptr, SND_ALIAS | SND_ASYNC | SND_NODEFAULT)) {
-        MessageBeep(MB_ICONHAND);
-    }
+    gui_platform::GetGuiPlatform()->PlayNotificationSound(L"", true);
 }
 
 static void PlayProcessEndSound(const DashboardState& st, bool anyFailed) {
@@ -2455,29 +3001,44 @@ static std::wstring FailureClassSummary(const std::map<std::string, int>& counts
 // Failure classes across the jobs of one queue (the task list caption shows the same
 // breakdown for whatever is currently visible). Empty when the queue has no records.
 static std::wstring QueueFailureBreakdown(DashboardState* dash, const std::string& queue) {
-    if (!dash || !dash->tqm) return L"";
-    std::string err;
-    std::string resp = dash->tqm->TaskQueueList(queue, "failed", 0, err);
-    nlohmann::json root = nlohmann::json::parse(resp, nullptr, false);
-    if (root.is_discarded() || !root.is_object()) return L"";
-    auto jobs = root.find("jobs");
-    if (jobs == root.end() || !jobs->is_array()) return L"";
-    std::map<std::string, int> counts;
-    for (const auto& job : *jobs) {
-        if (!job.is_object()) continue;
-        auto attempts = job.find("attempts");
-        if (attempts == job.end() || !attempts->is_array() || attempts->empty()) continue;
-        const nlohmann::json& last = attempts->back();
-        if (!last.is_object()) continue;
-        auto failure = last.find("failure");
-        if (failure == last.end() || !failure->is_object()) continue;
-        std::string cls = failure->value("class", std::string());
-        if (!cls.empty()) ++counts[cls];
+    if (!dash) return L"";
+    nlohmann::json req = {{"action", "taskqueue_diagnose"}, {"taskqueue", queue}, {"breakdown", true}};
+    nlohmann::json resp;
+    if (GuiIpcCall(dash, req, resp) && resp.value("ok", false)) {
+        std::string summary = resp.value("summary", "");
+        if (!summary.empty()) {
+            return Tr(L"キュー全体の失敗分類: ", L"Failure classes in this queue: ",
+                      L"Clases de fallo en esta cola: ") + Utf8ToWide(summary);
+        }
     }
-    std::wstring summary = FailureClassSummary(counts);
-    if (summary.empty()) return L"";
-    return Tr(L"キュー全体の失敗分類: ", L"Failure classes in this queue: ",
-              L"Clases de fallo en esta cola: ") + summary;
+    if (dash->tqm) {
+        std::string err;
+        std::string listResp = dash->tqm->TaskQueueList(queue, "failed", 0, err);
+        nlohmann::json root = nlohmann::json::parse(listResp, nullptr, false);
+        if (!root.is_discarded() && root.is_object()) {
+            auto jobs = root.find("jobs");
+            if (jobs != root.end() && jobs->is_array()) {
+                std::map<std::string, int> counts;
+                for (const auto& job : *jobs) {
+                    if (!job.is_object()) continue;
+                    auto attempts = job.find("attempts");
+                    if (attempts == job.end() || !attempts->is_array() || attempts->empty()) continue;
+                    const nlohmann::json& last = attempts->back();
+                    if (!last.is_object()) continue;
+                    auto failure = last.find("failure");
+                    if (failure == last.end() || !failure->is_object()) continue;
+                    std::string cls = failure->value("class", std::string());
+                    if (!cls.empty()) ++counts[cls];
+                }
+                std::wstring summary = FailureClassSummary(counts);
+                if (!summary.empty()) {
+                    return Tr(L"キュー全体の失敗分類: ", L"Failure classes in this queue: ",
+                              L"Clases de fallo en esta cola: ") + summary;
+                }
+            }
+        }
+    }
+    return L"";
 }
 
 
@@ -2723,10 +3284,20 @@ static void AppendMemoryLine(const wchar_t* name, const std::string& line) {
     AppendToLogFileWide(MemoryDataFilePathWide(name), line + "\r\n");
 }
 
-static bool RetractMemoryNoteById(const std::string& id, std::string& outError) {
+static bool RetractMemoryNoteById(DashboardState* dash, const std::string& id, std::string& outError) {
     if (id.empty()) {
         outError = WideToUtf8(Tr(L"ノートが選択されていません", L"No note is selected", L"No hay una nota seleccionada"));
         return false;
+    }
+    nlohmann::json req = {
+        {"action", "memory_retract"},
+        {"id", id},
+        {"reason", "retracted from gui"},
+        {"retracted_by", "gui"}
+    };
+    nlohmann::json resp;
+    if (GuiIpcCall(dash, req, resp, &outError) && resp.value("ok", false)) {
+        return true;
     }
     nlohmann::json j;
     j["op"] = "retract";
@@ -2737,9 +3308,22 @@ static bool RetractMemoryNoteById(const std::string& id, std::string& outError) 
     return true;
 }
 
-static bool PromoteMemoryNoteToL3(const std::string& id, std::string& outError) {
-    std::string resp = memory::GetJson(id, "note");
-    nlohmann::json got = nlohmann::json::parse(resp, nullptr, false);
+static bool PromoteMemoryNoteToL3(DashboardState* dash, const std::string& id, std::string& outError) {
+    if (id.empty()) {
+        outError = "note id is empty";
+        return false;
+    }
+    nlohmann::json req = {
+        {"action", "memory_promote"},
+        {"id", id},
+        {"approved_by", "gui:human"}
+    };
+    nlohmann::json resp;
+    if (GuiIpcCall(dash, req, resp, &outError) && resp.value("ok", false)) {
+        return true;
+    }
+    std::string respGet = MemoryGetIpc(dash, id, "note");
+    nlohmann::json got = nlohmann::json::parse(respGet, nullptr, false);
     if (got.is_discarded() || !got.is_object() || !got.value("ok", false)) {
         outError = "note not found: " + id;
         return false;
@@ -2870,7 +3454,7 @@ static void PastRunsLoad(PastRunsDlgState* ds) {
     q.taskqueue = ds->taskqueue;
     q.kinds.push_back("run");
     q.limit = 200;
-    std::string resp = memory::SearchJson(q);
+    std::string resp = MemorySearchIpc(ds->dash, q);
     nlohmann::json j = nlohmann::json::parse(resp, nullptr, false);
     ds->runs.clear();
     if (j.is_object()) {
@@ -2907,7 +3491,7 @@ static void PastRunsLoad(PastRunsDlgState* ds) {
     InvalidateRect(ds->list, nullptr, TRUE);
 
     memory::Query statsQuery = q;
-    std::string statsResp = memory::StatsJson(statsQuery);
+    std::string statsResp = MemoryStatsIpc(ds->dash, statsQuery);
     nlohmann::json s = nlohmann::json::parse(statsResp, nullptr, false);
     double median = 0.0;
     double p90 = 0.0;
@@ -2933,7 +3517,7 @@ static void PastRunsLoad(PastRunsDlgState* ds) {
     nq.jobName = ds->jobName;
     nq.taskqueue = ds->taskqueue;
     nq.limit = 30;
-    nlohmann::json notes = nlohmann::json::parse(memory::SearchJson(nq), nullptr, false);
+    nlohmann::json notes = nlohmann::json::parse(MemorySearchIpc(ds->dash, nq), nullptr, false);
 
     std::wstringstream text;
     text << Tr(L"実行数: ", L"Runs: ", L"Ejecuciones: ")
@@ -3012,6 +3596,13 @@ static void WhyLoad(PastRunsDlgState* ds) {
                     ds->failure = *failure;
                 }
             }
+        }
+    }
+    if (ds->failure.empty() && !ds->jobName.empty() && ds->dash) {
+        nlohmann::json req = {{"action", "taskqueue_diagnose"}, {"id", ds->jobName}};
+        nlohmann::json resp;
+        if (GuiIpcCall(ds->dash, req, resp) && resp.value("ok", false) && resp.contains("failure") && resp["failure"].is_object()) {
+            ds->failure = resp["failure"];
         }
     }
 
@@ -3176,7 +3767,7 @@ static LRESULT CALLBACK PastRunsWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPAR
                 if (sel >= 0 && static_cast<size_t>(sel) < ds->runs.size() && ds->detailEdit) {
                     const auto& r = ds->runs[static_cast<size_t>(sel)];
                     std::string id = r.value("id", std::string());
-                    std::string full = memory::GetJson(id, "run");
+                    std::string full = MemoryGetIpc(ds->dash, id, "run");
                     nlohmann::json g = nlohmann::json::parse(full, nullptr, false);
                     std::string dump = full;
                     if (g.is_object()) {
@@ -3197,7 +3788,7 @@ static LRESULT CALLBACK PastRunsWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPAR
                 std::string file = WhyEvidenceOpenPath(ds, sel);
                 if (!file.empty()) {
                     std::wstring pathW = EvidenceFilePathWide(ds->job, file);
-                    ShellExecuteW(hwnd, L"open", L"notepad.exe", pathW.c_str(), nullptr, SW_SHOWNORMAL);
+                    gui_platform::GetGuiPlatform()->OpenFileInEditor(hwnd, pathW);
                 }
                 return 0;
             }
@@ -3238,9 +3829,9 @@ static LRESULT CALLBACK PastRunsWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPAR
 }
 
 static void ShowTaskQueueJobDetails(DashboardState* st, const std::string& jobId, int initialTab = 0) {
-    if (!st || !st->tqm || jobId.empty()) return;
+    if (!st || jobId.empty()) return;
     std::string err;
-    std::string resp = st->tqm->TaskQueueGet(jobId, true, 0, err);
+    std::string resp = TaskQueueGetIpc(st, jobId, true, 0, err);
     nlohmann::json job = nlohmann::json::parse(resp, nullptr, false);
     if (job.is_object() && job.contains("job") && job["job"].is_object()) job = job["job"];
 
@@ -3338,6 +3929,24 @@ static void LoadMemoryNoteAuthors(MemoryListDlgState* ds) {
         }
         if (!type.empty()) ds->noteAuthors[id] = type;
     }
+
+    std::string knContent = ReadFileUtf8Wide(MemoryDataFilePathWide(L"knowledge.jsonl"));
+    start = 0;
+    while (start <= knContent.size()) {
+        size_t end = knContent.find('\n', start);
+        std::string line = (end == std::string::npos) ? knContent.substr(start) : knContent.substr(start, end - start);
+        start = (end == std::string::npos) ? knContent.size() + 1 : end + 1;
+        if (!line.empty() && line.back() == '\r') line.pop_back();
+        if (line.empty()) continue;
+        nlohmann::json j = nlohmann::json::parse(line, nullptr, false);
+        if (j.is_discarded() || !j.is_object()) continue;
+        std::string id = j.value("id", std::string());
+        if (id.empty()) continue;
+        std::string approvedBy = j.value("approvedBy", std::string());
+        if (!approvedBy.empty()) {
+            ds->noteAuthors[id] = approvedBy;
+        }
+    }
 }
 
 // Memory layers as the GUI names them. Index 0 of the layer combo is "all"; 1..3 follow this table.
@@ -3413,11 +4022,11 @@ static void MemoryListReload(MemoryListDlgState* ds) {
     for (int i = 0; i < 3; ++i) {
         memory::Query lq = q;
         lq.kinds = {kMemoryLayers[i].kind};
-        nlohmann::json lr = nlohmann::json::parse(memory::SearchJson(lq), nullptr, false);
+        nlohmann::json lr = nlohmann::json::parse(MemorySearchIpc(ds->dash, lq), nullptr, false);
         if (lr.is_object()) layerCounts[i] = lr.value("totalMatched", static_cast<int64_t>(0));
         if (layerSel == i + 1) resp = lr;
     }
-    if (layerSel == 0) resp = nlohmann::json::parse(memory::SearchJson(q), nullptr, false);
+    if (layerSel == 0) resp = nlohmann::json::parse(MemorySearchIpc(ds->dash, q), nullptr, false);
 
     if (ds->layer) {
         ComboBox_ResetContent(ds->layer);
@@ -3432,7 +4041,25 @@ static void MemoryListReload(MemoryListDlgState* ds) {
         }
         ComboBox_SetCurSel(ds->layer, layerSel);
     }
-    if (ds->layerInfo) SetWindowTextW(ds->layerInfo, MemoryLayerDescription(layerSel));
+    if (ds->layerInfo) {
+        auto mStats = GetMemoryStorageStatsIpc(ds->dash);
+        std::wstringstream info;
+        info << MemoryLayerDescription(layerSel) << L"\r\n"
+             << Tr(L"容量: ", L"Storage: ", L"Almacenamiento: ") << Utf8ToWide(FormatBytes(mStats.totalBytes));
+        if (mStats.limitBytes > 0) {
+            info << L" / " << Utf8ToWide(FormatBytes(mStats.limitBytes));
+            if (mStats.exceeded) {
+                info << L" " << Tr(L"[警告: 上限超過! L2/L3は保護されます]",
+                                   L"[Warning: limit exceeded! L2/L3 preserved]",
+                                   L"[Aviso: ¡límite excedido! L2/L3 protegidos]");
+            } else if (mStats.nearLimit) {
+                info << L" " << Tr(L"[警告: 上限近接 (>=80%)]",
+                                   L"[Warning: near limit (>=80%)]",
+                                   L"[Aviso: cerca del límite (>=80%)]");
+            }
+        }
+        SetWindowTextW(ds->layerInfo, info.str().c_str());
+    }
     ds->rows.clear();
 
     SendMessageW(ds->list, WM_SETREDRAW, FALSE, 0);
@@ -3447,14 +4074,20 @@ static void MemoryListReload(MemoryListDlgState* ds) {
                 std::string authorType;
                 if (kind == "note") {
                     auto it = ds->noteAuthors.find(id);
-                    authorType = it == ds->noteAuthors.end() ? std::string("agent") : it->second;
+                    authorType = it == ds->noteAuthors.end() ? hit.value("author", std::string("agent")) : it->second;
                 } else if (kind == "knowledge") {
-                    authorType = "human";
+                    auto it = ds->noteAuthors.find(id);
+                    if (it != ds->noteAuthors.end() && !it->second.empty()) {
+                        authorType = it->second;
+                    } else {
+                        authorType = hit.value("approvedBy", hit.value("author", std::string("human")));
+                    }
                 } else {
                     authorType = "hancho";
                 }
-                if (authorFilter == 1 && authorType != "agent") continue;
-                if (authorFilter == 2 && authorType != "human") continue;
+                bool isWorker = (authorType.rfind("worker:", 0) == 0);
+                if (authorFilter == 1 && authorType != "agent" && !isWorker) continue;
+                if (authorFilter == 2 && (authorType == "agent" || authorType == "hancho" || isWorker)) continue;
                 if (authorFilter == 3 && authorType != "hancho") continue;
 
                 nlohmann::json row = hit;
@@ -3613,7 +4246,7 @@ static LRESULT CALLBACK MemoryListWndProc(HWND hwnd, UINT msg, WPARAM wParam, LP
                     const auto& row = ds->rows[static_cast<size_t>(sel)];
                     std::string id = row.value("id", std::string());
                     std::string kind = row.value("kind", std::string());
-                    std::string full = memory::GetJson(id, kind);
+                    std::string full = MemoryGetIpc(ds->dash, id, kind);
                     nlohmann::json g = nlohmann::json::parse(full, nullptr, false);
                     std::string dump = full;
                     if (g.is_object()) {
@@ -3646,7 +4279,7 @@ static LRESULT CALLBACK MemoryListWndProc(HWND hwnd, UINT msg, WPARAM wParam, LP
                 return 0;
             }
             if (id == 2810) {
-                nlohmann::json c = nlohmann::json::parse(MemoryInjectCompareJson("", "", ""), nullptr, false);
+                nlohmann::json c = nlohmann::json::parse(MemoryInjectCompareIpc(ds->dash, "", "", ""), nullptr, false);
                 std::wstringstream msg;
                 if (c.is_object() && c.value("ok", false)) {
                     auto lineOf = [](const nlohmann::json& b) {
@@ -3679,24 +4312,33 @@ static LRESULT CALLBACK MemoryListWndProc(HWND hwnd, UINT msg, WPARAM wParam, LP
                     msg << Tr(L"比較できませんでした: ", L"Could not compare: ", L"No se pudo comparar: ")
                         << Utf8ToWide(c.is_object() ? c.value("error", std::string()) : std::string("invalid response"));
                 }
-                MessageBoxW(hwnd, msg.str().c_str(), Tr(L"注入の効果", L"Memory injection effect", L"Efecto de la inyección"),
-                            MB_OK | MB_ICONINFORMATION);
+                gui_platform::GetGuiPlatform()->ShowMessageBox(
+                    hwnd,
+                    Tr(L"注入の効果", L"Memory injection effect", L"Efecto de la inyección"),
+                    msg.str(),
+                    gui_platform::MessageBoxType::Info);
                 return 0;
             }
             if (id == 2804 || id == 2805) {
                 int sel = ListView_GetNextItem(ds->list, -1, LVNI_SELECTED);
                 if (sel < 0 || static_cast<size_t>(sel) >= ds->rows.size()) {
-                    MessageBoxW(hwnd, Tr(L"ノートを選択してください", L"Select a note first", L"Selecciona una nota"),
-                                Tr(L"メモリ", L"Memory", L"Memoria"), MB_OK | MB_ICONINFORMATION);
+                    gui_platform::GetGuiPlatform()->ShowMessageBox(
+                        hwnd,
+                        Tr(L"メモリ", L"Memory", L"Memoria"),
+                        Tr(L"ノートを選択してください", L"Select a note first", L"Selecciona una nota"),
+                        gui_platform::MessageBoxType::Info);
                     return 0;
                 }
                 const auto& row = ds->rows[static_cast<size_t>(sel)];
                 std::string kind = row.value("kind", std::string());
                 std::string mid = row.value("id", std::string());
                 if (kind != "note") {
-                    MessageBoxW(hwnd, Tr(L"L2 note だけが対象です", L"Only L2 notes can be changed",
-                                         L"Solo se pueden cambiar L2 notes"),
-                                Tr(L"メモリ", L"Memory", L"Memoria"), MB_OK | MB_ICONINFORMATION);
+                    gui_platform::GetGuiPlatform()->ShowMessageBox(
+                        hwnd,
+                        Tr(L"メモリ", L"Memory", L"Memoria"),
+                        Tr(L"L2 note だけが対象です", L"Only L2 notes can be changed",
+                           L"Solo se pueden cambiar L2 notes"),
+                        gui_platform::MessageBoxType::Info);
                     return 0;
                 }
                 bool promote = (id == 2805);
@@ -3705,15 +4347,22 @@ static LRESULT CALLBACK MemoryListWndProc(HWND hwnd, UINT msg, WPARAM wParam, LP
                          L"Promote this L2 note to L3 knowledge?",
                          L"¿Promover esta L2 note a L3 knowledge?")
                     : Tr(L"この L2 note を取り消しますか？", L"Retract this L2 note?", L"¿Retirar esta L2 note?");
-                if (MessageBoxW(hwnd, question.c_str(), Tr(L"メモリ", L"Memory", L"Memoria"),
-                                MB_YESNO | MB_ICONQUESTION | MB_DEFBUTTON2) != IDYES) {
+                if (gui_platform::GetGuiPlatform()->ShowMessageBox(
+                        hwnd,
+                        Tr(L"メモリ", L"Memory", L"Memoria"),
+                        question,
+                        gui_platform::MessageBoxType::QuestionYesNo,
+                        true) != gui_platform::MessageBoxResult::Yes) {
                     return 0;
                 }
                 std::string err;
-                bool ok = promote ? PromoteMemoryNoteToL3(mid, err) : RetractMemoryNoteById(mid, err);
+                bool ok = promote ? PromoteMemoryNoteToL3(ds->dash, mid, err) : RetractMemoryNoteById(ds->dash, mid, err);
                 if (!ok) {
-                    MessageBoxW(hwnd, Utf8ToWide(err).c_str(), Tr(L"メモリ", L"Memory", L"Memoria"),
-                                MB_OK | MB_ICONERROR);
+                    gui_platform::GetGuiPlatform()->ShowMessageBox(
+                        hwnd,
+                        Tr(L"メモリ", L"Memory", L"Memoria"),
+                        Utf8ToWide(err),
+                        gui_platform::MessageBoxType::Error);
                 }
                 MemoryListReload(ds);
                 return 0;
@@ -3799,9 +4448,9 @@ static std::wstring TaskListCellText(HWND list, int row, int col) {
 }
 
 static void ShowTaskQueueContextMenu(DashboardState* st, const std::string& jobId, POINT ptScreen, const std::wstring& cellText) {
-    if (!st || !st->tqm || jobId.empty()) return;
+    if (!st || jobId.empty()) return;
     std::string err;
-    std::string resp = st->tqm->TaskQueueGet(jobId, false, 0, err);
+    std::string resp = TaskQueueGetIpc(st, jobId, false, 0, err);
     std::string jobState = JsonGetString(resp, "state", "");
 
     HMENU hMenu = CreatePopupMenu();
@@ -3835,24 +4484,26 @@ static void ShowTaskQueueContextMenu(DashboardState* st, const std::string& jobI
     } else if (cmd == 3110) {
         CopyTextToClipboard(st->hwndMain, cellText);
     } else if (cmd == 3107) {
-        if (MessageBoxW(st->hwndMain,
+        if (gui_platform::GetGuiPlatform()->ShowMessageBox(
+                st->hwndMain,
+                Tr(L"ツリー終了の確認", L"Confirm Kill Tree", L"Confirmar cierre"),
                 Tr(L"このタスクのプロセスツリーを強制終了（ジョブ中断）しますか？",
                    L"Are you sure you want to kill this task's process tree?",
                    L"¿Seguro que desea terminar el árbol de procesos de esta tarea?"),
-                Tr(L"ツリー終了の確認", L"Confirm Kill Tree", L"Confirmar cierre"),
-                MB_YESNO | MB_ICONQUESTION | MB_DEFBUTTON2) == IDYES) {
-            st->tqm->TaskQueueCancel(jobId, err);
+                gui_platform::MessageBoxType::QuestionYesNo,
+                true) == gui_platform::MessageBoxResult::Yes) {
+            TaskQueueCancelIpc(st, jobId, err);
         }
     } else if (cmd == 3101) {
-        st->tqm->TaskQueueRetry(jobId, true, true, err);
+        TaskQueueRetryIpc(st, jobId, true, true, err);
     } else if (cmd == 3102) {
-        st->tqm->TaskQueueCancel(jobId, err);
+        TaskQueueCancelIpc(st, jobId, err);
     } else if (cmd == 3103 || cmd == 3104) {
-        resp = st->tqm->TaskQueueGet(jobId, false, 0, err);
+        resp = TaskQueueGetIpc(st, jobId, false, 0, err);
         std::string tqName = JsonGetString(resp, "taskqueue", "");
-        if (!tqName.empty()) st->tqm->TaskQueuePause(tqName, cmd == 3103, err);
+        if (!tqName.empty()) TaskQueuePauseIpc(st, tqName, cmd == 3103, err);
     } else if (cmd == 3105) {
-        resp = st->tqm->TaskQueueList("", "", 0, err);
+        resp = TaskQueueListIpc(st, "", "", 0, err);
         auto jobs = SplitJsonObjectArray(resp, "jobs");
         std::vector<std::string> queuesDone;
         for (const auto& j : jobs) {
@@ -3860,7 +4511,7 @@ static void ShowTaskQueueContextMenu(DashboardState* st, const std::string& jobI
             if (tqName.empty()) continue;
             if (std::find(queuesDone.begin(), queuesDone.end(), tqName) != queuesDone.end()) continue;
             queuesDone.push_back(tqName);
-            st->tqm->TaskQueuePurge(tqName, "[\"succeeded\",\"failed\",\"cancelled\"]", err);
+            TaskQueuePurgeIpc(st, tqName, "[\"succeeded\",\"failed\",\"cancelled\"]", err);
         }
     } else if (cmd == 3106) {
         ShowTaskQueueJobDetails(st, jobId);
@@ -3874,14 +4525,14 @@ static void ShowTaskQueueContextMenu(DashboardState* st, const std::string& jobI
     RefreshDashboardData(st);
 }
 
-static void RefreshTaskQueueData(DashboardState* st) {
-    if (!st || !st->tqm || !st->hwndTaskList) return;
+static void RefreshTaskQueueData(DashboardState* st, bool force = false) {
+    if (!st || !st->hwndTaskList) return;
     if (st->listDisplayMode == ListDisplayMode::ProcessOnly) return;
     std::string err;
-    std::string resp = st->tqm->TaskQueueList("", "", 0, err);
+    std::string resp = TaskQueueListIpc(st, "", "", 0, err);
     // Nothing to do when the queue is unchanged and no job is running (only running rows show a countdown).
     int lang = static_cast<int>(g_uiLanguage);
-    if (resp == st->lastTaskListJson && lang == st->lastTaskListLang &&
+    if (!force && resp == st->lastTaskListJson && lang == st->lastTaskListLang &&
         resp.find("\"state\":\"running\"") == std::string::npos) {
         return;
     }
@@ -3925,16 +4576,12 @@ static void RefreshTaskQueueData(DashboardState* st) {
     });
 
     // Work out every row first; the list is rebuilt only when some row's text differs from last time.
-    std::vector<std::string> newJobIds;
-    std::vector<std::string> newJobStates;
-    std::vector<int> newJobProcIds;
-    std::vector<std::wstring> newRows;  // kTaskListColumns cells per row, flattened
-    std::vector<std::wstring> newOriginTips;  // full origin details per row, for the Origin hover tip
+    std::vector<TaskListRow> rows;  // one entry per job, in the order the list shows them
     std::unordered_set<std::string> nowRunning;  // jobs running now, to spot the ones that just ended
     std::map<std::string, int> failureCounts;   // failure class -> jobs, for the list caption
-    newRows.reserve(jobs.size() * kTaskListColumns);
-    newOriginTips.reserve(jobs.size());
+    rows.reserve(jobs.size());
     for (const auto& j : jobs) {
+        TaskListRow row;
         std::string jobId = JsonGetString(j, "id", "");
         std::string state = JsonGetString(j, "state", "");
         std::string lastReason = LastAttemptReason(j);
@@ -3949,14 +4596,19 @@ static void RefreshTaskQueueData(DashboardState* st) {
         } else if (state == "failed") {
             kind = (lastReason == "timed_out" || lastReason == "idle_timed_out") ? "timeout" : "failed";
         }
-        newJobIds.push_back(jobId);
+        row.id = jobId;
+        row.kind = kind;
         if (state == "running") nowRunning.insert(jobId);
-        newJobStates.push_back(kind);
         // The process of the latest attempt, so selecting this row can show it in the monitor pane.
         int64_t latestPid = 0;
         auto attemptsOfRow = SplitJsonObjectArray(j, "attempts");
-        if (!attemptsOfRow.empty()) latestPid = JsonGetInt(attemptsOfRow.back(), "process_id", 0);
-        newJobProcIds.push_back(static_cast<int>(latestPid));
+        if (!attemptsOfRow.empty()) {
+            latestPid = JsonGetInt(attemptsOfRow.back(), "process_id", 0);
+            if (latestPid <= 0) {
+                latestPid = JsonGetInt(attemptsOfRow.back(), "remote_process_id", 0);
+            }
+        }
+        row.procId = static_cast<int>(latestPid);
 
         std::wstring idStr = Utf8ToWide(jobId);
         std::wstring summaryStr = Utf8ToWide(JsonGetString(j, "summary", ""));
@@ -3969,7 +4621,7 @@ static void RefreshTaskQueueData(DashboardState* st) {
                 int64_t pidDoing = JsonGetInt(attemptsDoing.back(), "process_id", 0);
                 if (pidDoing > 0) {
                     ProcessSnapshot taskSnap;
-                    if (st->pm->GetSnapshot(static_cast<int>(pidDoing), taskSnap) && taskSnap.state == ProcState::Running) {
+                    if (FetchProcessSnapshotIpc(st, static_cast<int>(pidDoing), taskSnap) && taskSnap.state == ProcState::Running) {
                         taskDoingStr = Utf8ToWide(taskSnap.activity);
                         if (!taskSnap.activityTarget.empty()) taskDoingStr += L" " + Utf8ToWide(taskSnap.activityTarget);
                     }
@@ -3981,6 +4633,9 @@ static void RefreshTaskQueueData(DashboardState* st) {
         if (!notes.empty()) stateStr += L" \U0001F4DD";
         std::string attemptStart = LastAttemptField(j, "start");
         std::string attemptEnd = LastAttemptField(j, "end");
+        // The column shows the time of day only, but the sort uses the full date and time.
+        const int64_t startEpochSec = attemptStart.empty() ? 0 : ParseTimestampStrToEpoch(attemptStart);
+        int64_t endEpochSec = attemptEnd.empty() ? 0 : ParseTimestampStrToEpoch(attemptEnd);
         std::wstring startStr = L"-";
         std::wstring endStr = L"-";
         if (!attemptStart.empty()) {
@@ -4019,6 +4674,8 @@ static void RefreshTaskQueueData(DashboardState* st) {
                     if (endStr.empty() && !est.empty()) {
                         endStr = L"~" + Utf8ToWide(TimeOfDayText(est));
                     }
+                    // The estimated end of the running attempt, with its date.
+                    if (startEpochSec > 0) endEpochSec = startEpochSec + budgetSec;
                 }
             }
         } else if (state == "pending") {
@@ -4027,16 +4684,27 @@ static void RefreshTaskQueueData(DashboardState* st) {
             int budgetSec = estimateSec > 0 ? estimateSec : timeoutSec;
             if (budgetSec > 0) {
                 endStr = FormatRemainingTime(budgetSec);
+                // A job that has not started yet ends this long after it was queued.
+                const int64_t createdEpoch = ParseTimestampStrToEpoch(JsonGetString(j, "created_at", ""));
+                if (createdEpoch > 0) endEpochSec = createdEpoch + budgetSec;
             }
         }
+        row.startKey = startEpochSec;
+        row.endKey = endEpochSec;
         // Follow a task only when its process has just started, so a selection made by hand is kept.
-        if (state == "running" && JsonGetString(j, "host", "").empty()) {
+        if (state == "running") {
+            const std::string jobHost = JsonGetString(j, "host", "");
             auto attemptsSel = SplitJsonObjectArray(j, "attempts");
             if (!attemptsSel.empty()) {
                 int64_t pidSel = JsonGetInt(attemptsSel.back(), "process_id", 0);
+                if (!jobHost.empty() && pidSel <= 0) {
+                    pidSel = JsonGetInt(attemptsSel.back(), "remote_process_id", 0);
+                }
                 if (pidSel > 0 && static_cast<int>(pidSel) != st->lastFollowedProcId) {
                     st->selectedProcId = static_cast<int>(pidSel);
+                    st->selectedJobKey = jobId;
                     st->lastFollowedProcId = static_cast<int>(pidSel);
+                    SyncStreamPane(st);
                 }
             }
         }
@@ -4051,19 +4719,43 @@ static void RefreshTaskQueueData(DashboardState* st) {
         if (!jobHost.empty()) queueStr += L" @ " + Utf8ToWide(jobHost);
         std::wstring originTip;
         std::wstring originStr = TaskQueueOriginDisplay(j, originTip);
-        newOriginTips.push_back(std::move(originTip));
+        row.originTip = std::move(originTip);
         std::wstring resourcesStr = TaskQueueResourcesDisplay(j);
 
-        newRows.push_back(std::move(idStr));
-        newRows.push_back(std::move(summaryStr));
-        newRows.push_back(std::move(stateStr));
-        newRows.push_back(std::move(startStr));
-        newRows.push_back(std::move(endStr));
-        newRows.push_back(std::move(taskDoingStr));
-        newRows.push_back(std::move(depsStr));
-        newRows.push_back(std::move(queueStr));
-        newRows.push_back(std::move(originStr));
-        newRows.push_back(std::move(resourcesStr));
+        row.cells[0] = std::move(idStr);
+        row.cells[1] = std::move(summaryStr);
+        row.cells[2] = std::move(stateStr);
+        row.cells[3] = std::move(startStr);
+        row.cells[4] = std::move(endStr);
+        row.cells[5] = std::move(taskDoingStr);
+        row.cells[6] = std::move(depsStr);
+        row.cells[7] = std::move(queueStr);
+        row.cells[8] = std::move(originStr);
+        row.cells[9] = std::move(resourcesStr);
+        rows.push_back(std::move(row));
+    }
+
+    // The header click picks the column, so the order is applied to the rows here.
+    SortTaskRows(rows, st->taskSortColumn, st->taskSortDirection);
+
+    std::vector<std::string> newJobIds;
+    std::vector<std::string> newJobStates;
+    std::vector<int> newJobProcIds;
+    std::vector<std::wstring> newRows;  // kTaskListColumns cells per row, flattened
+    std::vector<std::wstring> newOriginTips;  // full origin details per row, for the Origin hover tip
+    newJobIds.reserve(rows.size());
+    newJobStates.reserve(rows.size());
+    newJobProcIds.reserve(rows.size());
+    newRows.reserve(rows.size() * kTaskListColumns);
+    newOriginTips.reserve(rows.size());
+    for (const auto& r : rows) {
+        newJobIds.push_back(r.id);
+        newJobStates.push_back(r.kind);
+        newJobProcIds.push_back(r.procId);
+        newOriginTips.push_back(r.originTip);
+        for (int col = 0; col < kTaskListColumns; ++col) {
+            newRows.push_back(r.cells[col]);
+        }
     }
 
     for (const auto& id : st->runningTaskJobs) {
@@ -4244,8 +4936,7 @@ static std::wstring KpiSignature(DashboardState* st) {
             failed++;
         }
     }
-    TaskQueueCounts tq;
-    if (st->tqm) tq = st->tqm->GetJobCounts();
+    TaskQueueCounts tq = FetchTaskQueueCountsIpc(st);
     wchar_t buf[256] = {};
     swprintf_s(buf, L"%d|%zu|%d|%d|%d|%d|%u|%lld|%d|%d|%d|%d|%d|%d|%d|%d|%lld|%lld|",
                static_cast<int>(g_uiLanguage), snaps.size(), running, idle, ok, failed, treeProcs,
@@ -4256,10 +4947,10 @@ static std::wstring KpiSignature(DashboardState* st) {
 }
 
 static void RefreshDashboardData(DashboardState* st) {
-    if (!st || !st->pm) return;
+    if (!st) return;
     // Hidden in the tray: no one sees the lists, so only watch for finished processes (completion sound).
     if (!IsWindowVisible(st->hwndMain) || IsIconic(st->hwndMain)) {
-        st->allSnapshots = st->pm->GetAllSnapshots();
+        st->allSnapshots = FetchProcessSnapshotsIpc(st);
         bool finished = false;
         bool failed = false;
         std::vector<int> endedProcIds;
@@ -4274,11 +4965,29 @@ static void RefreshDashboardData(DashboardState* st) {
         }
         if (finished) PlayProcessEndSound(*st, failed);
         for (int id : endedProcIds) StartProcEndBlink(st, id);
+
+    uint64_t nowTick = GetNowTickMs();
+    if (nowTick - st->lastMemoryCheckTickMs >= 10000) {
+        st->lastMemoryCheckTickMs = nowTick;
+        auto mStats = GetMemoryStorageStatsIpc(st);
+        if (mStats.nearLimit || mStats.exceeded) {
+            st->memoryNearLimit = true;
+            st->memoryWarningText = Utf8ToWide(mStats.warning);
+            if (st->trayAdded && !st->memoryTrayWarned) {
+                gui_platform::GetGuiPlatform()->TrayShowBalloon(st->nid, L"Hancho Memory", st->memoryWarningText, true);
+                st->memoryTrayWarned = true;
+            }
+        } else {
+            st->memoryNearLimit = false;
+            st->memoryWarningText.clear();
+            st->memoryTrayWarned = false;
+        }
+    }
         return;
     }
     // Hold every update while a list scrollbar is dragged; the next tick after release catches up.
     if (g_scrollDragWnd && (g_scrollDragWnd == st->hwndList || g_scrollDragWnd == st->hwndTaskList)) return;
-    st->allSnapshots = st->pm->GetAllSnapshots();
+    st->allSnapshots = FetchProcessSnapshotsIpc(st);
 
     bool processFinished = false;
     bool processFailed = false;
@@ -4301,6 +5010,24 @@ static void RefreshDashboardData(DashboardState* st) {
     }
     for (int id : endedProcIds) StartProcEndBlink(st, id);
 
+    uint64_t nowTick = GetNowTickMs();
+    if (nowTick - st->lastMemoryCheckTickMs >= 10000) {
+        st->lastMemoryCheckTickMs = nowTick;
+        auto mStats = GetMemoryStorageStatsIpc(st);
+        if (mStats.nearLimit || mStats.exceeded) {
+            st->memoryNearLimit = true;
+            st->memoryWarningText = Utf8ToWide(mStats.warning);
+            if (st->trayAdded && !st->memoryTrayWarned) {
+                gui_platform::GetGuiPlatform()->TrayShowBalloon(st->nid, L"Hancho Memory", st->memoryWarningText, true);
+                st->memoryTrayWarned = true;
+            }
+        } else {
+            st->memoryNearLimit = false;
+            st->memoryWarningText.clear();
+            st->memoryTrayWarned = false;
+        }
+    }
+
     st->cachedSnapshots.clear();
     for (const auto& s : st->allSnapshots) {
         if (st->hideEndedProcesses && s.state != ProcState::Running) {
@@ -4309,7 +5036,7 @@ static void RefreshDashboardData(DashboardState* st) {
         st->cachedSnapshots.push_back(s);
     }
 
-    SortSnapshots(st->cachedSnapshots, st->sortColumn, st->sortAscending);
+    SortSnapshots(st->cachedSnapshots, st->sortColumn, st->sortDirection);
 
     auto getNewestId = [&]() -> int {
         int maxId = -1;
@@ -4732,16 +5459,7 @@ static void LayoutControls(DashboardState* st, int width, int height) {
 }
 
 static void CopyTextToClipboard(HWND hwnd, const std::wstring& text) {
-    if (!OpenClipboard(hwnd)) return;
-    EmptyClipboard();
-    size_t bytes = (text.size() + 1) * sizeof(wchar_t);
-    HGLOBAL hg = GlobalAlloc(GMEM_MOVEABLE, bytes);
-    if (hg) {
-        memcpy(GlobalLock(hg), text.c_str(), bytes);
-        GlobalUnlock(hg);
-        SetClipboardData(CF_UNICODETEXT, hg);
-    }
-    CloseClipboard();
+    gui_platform::GetGuiPlatform()->CopyToClipboard(hwnd, text);
 }
 
 struct TaskDetailsDlgState {
@@ -5063,7 +5781,7 @@ static LRESULT CALLBACK TaskDetailsWndProc(HWND hwnd, UINT msg, WPARAM wParam, L
             } else if (id == 2004 && ds) {
                 if (!ds->snap.logFilePath.empty()) {
                     std::wstring logW = Utf8ToWide(ds->snap.logFilePath);
-                    ShellExecuteW(hwnd, L"open", L"notepad.exe", logW.c_str(), nullptr, SW_SHOWNORMAL);
+                    gui_platform::GetGuiPlatform()->OpenFileInEditor(hwnd, logW);
                 }
             } else if (id == 2005 && ds) {
                 if (ds->isJsonMode) {
@@ -5094,7 +5812,7 @@ static LRESULT CALLBACK TaskDetailsWndProc(HWND hwnd, UINT msg, WPARAM wParam, L
             } else if (id == 2007 && ds) {
                 if (!ds->snap.streamFilePath.empty()) {
                     std::wstring streamW = Utf8ToWide(ds->snap.streamFilePath);
-                    ShellExecuteW(hwnd, L"open", L"notepad.exe", streamW.c_str(), nullptr, SW_SHOWNORMAL);
+                    gui_platform::GetGuiPlatform()->OpenFileInEditor(hwnd, streamW);
                 }
             } else if (id == IDOK || id == IDCANCEL) {
                 DestroyWindow(hwnd);
@@ -5165,32 +5883,42 @@ static LRESULT CALLBACK TaskDetailsWndProc(HWND hwnd, UINT msg, WPARAM wParam, L
 // A process started by a task-queue attempt inherits that attempt's diagnosis, so the
 // process detail window can answer "why did it stop" without opening the job.
 static nlohmann::json FailureForProcess(DashboardState* st, int procId) {
-    if (!st || !st->tqm || procId <= 0) return nlohmann::json();
-    std::string err;
-    std::string resp = st->tqm->TaskQueueList("", "", 0, err);
-    nlohmann::json root = nlohmann::json::parse(resp, nullptr, false);
-    if (root.is_discarded() || !root.is_object()) return nlohmann::json();
-    auto jobs = root.find("jobs");
-    if (jobs == root.end() || !jobs->is_array()) return nlohmann::json();
-    nlohmann::json failure;
-    for (const auto& job : *jobs) {
-        if (!job.is_object()) continue;
-        auto attempts = job.find("attempts");
-        if (attempts == job.end() || !attempts->is_array()) continue;
-        for (const auto& attempt : *attempts) {
-            if (!attempt.is_object()) continue;
-            if (attempt.value("process_id", 0) != procId) continue;
-            auto f = attempt.find("failure");
-            if (f != attempt.end() && f->is_object() && !f->empty()) failure = *f;
+    if (!st || procId <= 0) return nlohmann::json();
+    nlohmann::json req = {{"action", "taskqueue_diagnose"}, {"process_id", procId}};
+    nlohmann::json resp;
+    if (GuiIpcCall(st, req, resp) && resp.value("ok", false) && resp.contains("failure") && resp["failure"].is_object()) {
+        return resp["failure"];
+    }
+    if (st->tqm) {
+        std::string err;
+        std::string listResp = st->tqm->TaskQueueList("", "", 0, err);
+        nlohmann::json root = nlohmann::json::parse(listResp, nullptr, false);
+        if (!root.is_discarded() && root.is_object()) {
+            auto jobs = root.find("jobs");
+            if (jobs != root.end() && jobs->is_array()) {
+                nlohmann::json failure;
+                for (const auto& job : *jobs) {
+                    if (!job.is_object()) continue;
+                    auto attempts = job.find("attempts");
+                    if (attempts == job.end() || !attempts->is_array()) continue;
+                    for (const auto& attempt : *attempts) {
+                        if (!attempt.is_object()) continue;
+                        if (attempt.value("process_id", 0) != procId) continue;
+                        auto f = attempt.find("failure");
+                        if (f != attempt.end() && f->is_object() && !f->empty()) failure = *f;
+                    }
+                }
+                return failure;
+            }
         }
     }
-    return failure;
+    return nlohmann::json();
 }
 
 static void ShowTaskDetailsDialog(DashboardState* st, int procId) {
-    if (!st || !st->pm || procId <= 0) return;
+    if (!st || procId <= 0) return;
     ProcessSnapshot snap;
-    if (!st->pm->GetSnapshot(procId, snap)) return;
+    if (!FetchProcessSnapshotIpc(st, procId, snap)) return;
 
     static bool regDone = false;
     HINSTANCE hInst = GetModuleHandleW(nullptr);
@@ -5218,7 +5946,7 @@ static void ShowTaskDetailsDialog(DashboardState* st, int procId) {
     ds->whyText = ds->failure.empty() ? L"" : WhyFailureText(ds->failure);
 
     std::string outUtf8;
-    st->pm->GetOutput(procId, true, 200, outUtf8);
+    GetProcessOutputIpc(st, procId, 200, outUtf8);
     ds->fullOutput = NormalizeCrLfWide(outUtf8);
 
     bool isStream = snap.jsonStream || !snap.agentType.empty() || snap.streamEventCount > 0;
@@ -5253,11 +5981,8 @@ static void ShowTaskDetailsDialog(DashboardState* st, int procId) {
         }
         root["process"] = proc;
 
-        std::vector<LlmStreamEvent> stateEvents;
         LlmAgentState agStateObj;
-        if (st->pm) {
-            st->pm->GetAgentStream(procId, 1, "", 0, stateEvents, agStateObj);
-        }
+        GetAgentStateIpc(st, procId, agStateObj);
 
         auto v1Events = ReadHanchoEventsFile(
             HanchoEventsFilePathForStream(snap.streamFilePath), 0, "", 0);
@@ -5393,9 +6118,9 @@ static const BtDebugNode* BtDebugItemNode(BtDebugDlgState* ds, HTREEITEM h) {
 }
 
 static std::string BtDebugJobState(BtDebugDlgState* ds, const std::string& jobId) {
-    if (!ds->dash || !ds->dash->tqm) return "";
+    if (!ds || !ds->dash) return "";
     std::string err;
-    std::string resp = ds->dash->tqm->TaskQueueGet(jobId, false, 0, err);
+    std::string resp = TaskQueueGetIpc(ds->dash, jobId, false, 0, err);
     if (resp.find("\"ok\":true") == std::string::npos) return "missing";
     return JsonGetString(resp, "state", "");
 }
@@ -5433,9 +6158,9 @@ static void BtDebugShowDetail(BtDebugDlgState* ds) {
     std::string text = n->key + "\n" + n->detailJson;
     for (const auto& jobId : n->jobIds) {
         text += "\n\n--- job " + jobId + " ---\n";
-        if (!ds->dash || !ds->dash->tqm) continue;
+        if (!ds || !ds->dash) continue;
         std::string err;
-        std::string resp = ds->dash->tqm->TaskQueueGet(jobId, false, 0, err);
+        std::string resp = TaskQueueGetIpc(ds->dash, jobId, false, 0, err);
         auto parsed = nlohmann::json::parse(resp, nullptr, false);
         text += parsed.is_discarded() ? resp : parsed.dump(2, ' ', false, nlohmann::json::error_handler_t::replace);
     }
@@ -5743,7 +6468,7 @@ static LRESULT CALLBACK BtDebugWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARA
                 BtDebugReload(ds, true);
             } else if (id == IDC_BTDBG_FOLDER) {
                 CreateDirectoryW(ds->dir.c_str(), nullptr);
-                ShellExecuteW(hwnd, L"open", ds->dir.c_str(), nullptr, nullptr, SW_SHOWNORMAL);
+                gui_platform::GetGuiPlatform()->OpenFolder(hwnd, ds->dir);
             } else if (id == IDOK || id == IDCANCEL) {
                 DestroyWindow(hwnd);
             }
@@ -5951,6 +6676,16 @@ struct LlmStreamDlgState {
     RECT rcUsageGraph = {};
     RECT rcKindChart = {};
     bool embedded = false;   // bottom pane of the main window (follows the selected process)
+    std::shared_ptr<pc::remote::WebSocketClient> wsClient;
+    std::string subscribedJobId;
+    int subscribedAttempt = 0;
+
+    ~LlmStreamDlgState() {
+        if (wsClient) {
+            wsClient->Close();
+            wsClient.reset();
+        }
+    }
 };
 
 struct UsageBar {
@@ -6054,10 +6789,79 @@ static MonitorEvent MonitorEventFromJson(const nlohmann::json& j) {
 static void LoadMonitorEvents(const ProcessSnapshot& snap, std::vector<MonitorEvent>& out) {
     out.clear();
     if (snap.streamFilePath.empty()) return;
-    const std::string eventsPath = HanchoEventsFilePathForStream(snap.streamFilePath);
+    std::string eventsPath = HanchoEventsFilePathForStream(snap.streamFilePath);
+    if (eventsPath.empty()) {
+        eventsPath = snap.streamFilePath;
+    }
     auto raw = ReadHanchoEventsFile(eventsPath, 300, "", 0);
     out.reserve(raw.size());
     for (const auto& j : raw) out.push_back(MonitorEventFromJson(j));
+}
+
+static void UpdateAgentStateFromMonitorEvents(const std::vector<MonitorEvent>& events,
+                                             LlmAgentState& state, bool running) {
+    state = LlmAgentState();
+    state.status = running ? "running" : "idle";
+    std::unordered_map<std::string, LlmSubagentState> subMap;
+
+    for (const auto& ev : events) {
+        if (!ev.agentType.empty()) state.agentType = ev.agentType;
+        if (!ev.model.empty()) state.model = ev.model;
+        if (ev.totalTokens > 0) state.totalTokens += ev.totalTokens;
+        else state.totalTokens += (ev.inputTokens + ev.outputTokens + ev.thinkingTokens + ev.cacheReadTokens + ev.cacheWriteTokens);
+        if (ev.costUsd > 0.0) state.costUsd += ev.costUsd;
+
+        if (ev.kind == "tool.call") {
+            state.toolCalls++;
+            state.currentTool = ev.toolName;
+            state.currentToolAction = ev.activity;
+            state.activity = ev.activity.empty() ? "tool" : ev.activity;
+            state.activityTarget = ev.target;
+            state.activitySinceEpochMs = ev.recvEpochMs > 0 ? ev.recvEpochMs : NowEpochMs();
+            state.status = "calling_tool";
+        } else if (ev.kind == "thought") {
+            state.lastThought = ev.text;
+            state.activity = "thinking";
+            state.activityTarget = ev.text;
+            state.activitySinceEpochMs = ev.recvEpochMs > 0 ? ev.recvEpochMs : NowEpochMs();
+            state.status = "thinking";
+        } else if (ev.kind == "message") {
+            state.lastMessage = ev.text;
+            state.activity = "replying";
+            state.activityTarget = ev.text;
+            state.activitySinceEpochMs = ev.recvEpochMs > 0 ? ev.recvEpochMs : NowEpochMs();
+            state.status = "generating";
+        } else if (ev.kind == "error") {
+            state.lastError = ev.text;
+            state.activity = "error";
+            state.activityTarget = ev.text;
+            state.status = "error";
+        } else if (ev.kind == "run.ended") {
+            state.status = "completed";
+            state.activity = "done";
+        }
+
+        if (!ev.agentId.empty()) {
+            auto& sub = subMap[ev.agentId];
+            sub.id = ev.agentId;
+            if (sub.startedEpochMs == 0) sub.startedEpochMs = ev.recvEpochMs > 0 ? ev.recvEpochMs : NowEpochMs();
+            if (ev.totalTokens > 0) sub.totalTokens += ev.totalTokens;
+            if (ev.kind == "tool.call") {
+                sub.toolUses++;
+                sub.activity = ev.activity;
+                sub.activityTarget = ev.target;
+            }
+            if (ev.kind == "run.ended") {
+                sub.status = "completed";
+                sub.endedEpochMs = ev.recvEpochMs;
+            }
+        }
+    }
+    state.stepCount = state.toolCalls;
+    state.subagents.clear();
+    for (auto& kv : subMap) {
+        state.subagents.push_back(kv.second);
+    }
 }
 
 // Internal bridge: the sub-agent tree builder still consumes LlmStreamEvent. Used only when the
@@ -6860,10 +7664,10 @@ static void ReloadMonitorPane(HWND hwnd, LlmStreamDlgState* ds) {
     const ProcessSnapshot& s = ds->snap;
     bool running = s.state == ProcState::Running;
 
-    if (!s.jobKey.empty() && ds->dash->tqm &&
+    if (!s.jobKey.empty() && ds->dash &&
         (ds->goalJobKey != s.jobKey || ds->goalJobAttempt != s.attemptN)) {
         std::string err;
-        std::string jobResp = ds->dash->tqm->TaskQueueGet(s.jobKey, false, 0, err);
+        std::string jobResp = TaskQueueGetIpc(ds->dash, s.jobKey, false, 0, err);
         auto job = nlohmann::json::parse(jobResp, nullptr, false);
         ds->goalJobKey = s.jobKey;
         ds->goalJobAttempt = s.attemptN;
@@ -7055,30 +7859,166 @@ static void ReloadMonitorPane(HWND hwnd, LlmStreamDlgState* ds) {
 }
 
 static void ReloadStreamDialogData(HWND hwnd, LlmStreamDlgState* ds) {
-    if (!ds || !ds->dash || !ds->dash->pm) return;
-    if (ds->procId <= 0 || !ds->dash->pm->GetSnapshot(ds->procId, ds->snap)) {
-        ds->snap = ProcessSnapshot();
+    if (!ds || !ds->dash) return;
+    bool hasLocalSnap = (ds->procId > 0 && FetchProcessSnapshotIpc(ds->dash, ds->procId, ds->snap));
+    if (hasLocalSnap) {
+        if (ds->wsClient) {
+            ds->wsClient->Close();
+            ds->wsClient.reset();
+            ds->subscribedJobId.clear();
+        }
         ds->events.clear();
-        ds->agentState = LlmAgentState();
-        if (ds->hwndHeader) {
-            SetWindowTextW(ds->hwndHeader, Tr(L"プロセスリストでプロセスを選択してください。",
-                                              L"Select a process in the process list.",
-                                              L"Seleccione un proceso en la lista."));
+        GetAgentStateIpc(ds->dash, ds->procId, ds->agentState);
+        LoadMonitorEvents(ds->snap, ds->events);
+    } else {
+        std::string selectedJob = (!ds->dash->selectedJobKey.empty()) ? ds->dash->selectedJobKey : ds->goalJobKey;
+        bool foundJob = false;
+        if (!selectedJob.empty() && ds->dash) {
+            std::string tqErr;
+            std::string jobResp = TaskQueueGetIpc(ds->dash, selectedJob, true, 0, tqErr);
+            nlohmann::json rootJob = nlohmann::json::parse(jobResp, nullptr, false);
+            nlohmann::json job = (rootJob.is_object() && rootJob.contains("job") && rootJob["job"].is_object()) ? rootJob["job"] : rootJob;
+            if (job.is_object() && job.contains("id")) {
+                foundJob = true;
+                std::string jobId = job.value("id", selectedJob);
+                std::string jobName = job.value("name", jobId);
+                std::string host = job.value("host", "");
+                std::string jobState = job.value("state", "");
+                std::string summary = job.value("summary", "");
+                int timeoutSec = static_cast<int>(job.value("timeout_sec", 0));
+                int idleTimeoutSec = static_cast<int>(job.value("idle_timeout_sec", 0));
+
+                int attemptN = 1;
+                std::string remoteHost = host;
+                int remotePid = 0;
+                std::string startStr;
+                std::string endStr;
+                int exitCode = 0;
+                auto attempts = job.value("attempts", nlohmann::json::array());
+                if (!attempts.empty() && attempts.back().is_object()) {
+                    const auto& a = attempts.back();
+                    attemptN = a.value("n", 1);
+                    if (a.contains("remote_host") && a["remote_host"].is_string()) remoteHost = a["remote_host"].get<std::string>();
+                    if (a.contains("remote_process_id") && a["remote_process_id"].is_number()) remotePid = a["remote_process_id"].get<int>();
+                    startStr = a.value("start", "");
+                    endStr = a.value("end", "");
+                    exitCode = a.value("exit_code", 0);
+                }
+
+                ds->snap = ProcessSnapshot();
+                ds->snap.id = remotePid > 0 ? remotePid : 0;
+                ds->snap.name = jobName;
+                ds->snap.jobKey = jobId;
+                ds->snap.attemptN = attemptN;
+                ds->snap.state = (jobState == "running") ? ProcState::Running : (exitCode != 0 ? ProcState::Failed : ProcState::Completed);
+                ds->snap.exitCode = (jobState == "running") ? STILL_ACTIVE : static_cast<DWORD>(exitCode);
+                ds->snap.supervisorGoal = summary;
+                ds->snap.startTimeStr = startStr;
+                ds->snap.endTimeStr = endStr;
+                ds->snap.timeoutSec = timeoutSec;
+                ds->snap.idleTimeoutSec = idleTimeoutSec;
+                if (!startStr.empty()) {
+                    int64_t ep = ParseTimestampStrToEpoch(startStr);
+                    if (ep > 0) {
+                        ds->snap.startEpochSec = ep;
+                        int64_t nowSec = time(nullptr);
+                        if (jobState == "running") {
+                            ds->snap.elapsedMs = static_cast<uint64_t>((std::max)(int64_t{0}, nowSec - ep) * 1000);
+                        } else if (!endStr.empty()) {
+                            int64_t endEp = ParseTimestampStrToEpoch(endStr);
+                            if (endEp >= ep) {
+                                ds->snap.endEpochSec = endEp;
+                                ds->snap.elapsedMs = static_cast<uint64_t>((endEp - ep) * 1000);
+                            }
+                        }
+                    }
+                }
+
+                std::wstring tqDir = PathJoinWide(GetLogsDirectoryWide(), L"taskqueue");
+                std::wstring eventsPathW = PathJoinWide(tqDir, Utf8ToWide(SanitizeFileNameComponent(jobId)) + L"." + std::to_wstring(attemptN) + L".events.jsonl");
+                ds->snap.streamFilePath = WideToUtf8(eventsPathW);
+
+                // Set up or maintain live streaming subscription when job is running on a remote host
+                if (jobState == "running" && !remoteHost.empty()) {
+                    if (ds->subscribedJobId != jobId || ds->subscribedAttempt != attemptN ||
+                        !ds->wsClient || !ds->wsClient->IsConnected()) {
+                        if (ds->wsClient) {
+                            ds->wsClient->Close();
+                            ds->wsClient.reset();
+                        }
+                        HostRegistry registry;
+                        std::string regErr;
+                        if (registry.Load(regErr)) {
+                            RemoteHost hostEntry;
+                            if (registry.Get(remoteHost, hostEntry)) {
+                                std::string token = ResolveHostToken(hostEntry);
+                                auto client = std::make_shared<pc::remote::WebSocketClient>();
+                                std::string connErr;
+                                if (client->Connect(hostEntry.address, token, 5000, &connErr)) {
+                                    ds->wsClient = client;
+                                    ds->subscribedJobId = jobId;
+                                    ds->subscribedAttempt = attemptN;
+                                    uint64_t sinceSeq = ds->events.empty() ? 0 : ds->events.back().seq;
+                                    HWND targetHwnd = hwnd;
+                                    std::wstring targetEventsW = eventsPathW;
+                                    client->SetStreamCallback([targetHwnd, targetEventsW](
+                                        const std::string& subId, uint64_t seq, const std::string& line, const nlohmann::json& doc) {
+                                        if (!line.empty()) {
+                                            AppendToLogFileWide(targetEventsW, line + "\n");
+                                        }
+                                        if (IsWindow(targetHwnd)) {
+                                            PostMessageW(targetHwnd, WM_USER + 101, 0, 0);
+                                        }
+                                    });
+                                    std::string subId;
+                                    std::string subErr;
+                                    if (remotePid > 0) {
+                                        client->Subscribe("events", remotePid, sinceSeq, subId, subErr, 5000);
+                                    } else {
+                                        client->SubscribeFile(WideToUtf8(eventsPathW), sinceSeq, subId, subErr, 5000);
+                                    }
+                                }
+                            }
+                        }
+                    }
+                } else {
+                    if (ds->wsClient) {
+                        ds->wsClient->Close();
+                        ds->wsClient.reset();
+                        ds->subscribedJobId.clear();
+                    }
+                }
+
+                ds->events.clear();
+                LoadMonitorEvents(ds->snap, ds->events);
+                UpdateAgentStateFromMonitorEvents(ds->events, ds->agentState, jobState == "running");
+            }
         }
-        if (ds->hwndList && ds->lastEventCount != 0) {
-            ListView_DeleteAllItems(ds->hwndList);
-            if (ds->hwndEditPreview) SetWindowTextW(ds->hwndEditPreview, L"");
+
+        if (!foundJob) {
+            if (ds->wsClient) {
+                ds->wsClient->Close();
+                ds->wsClient.reset();
+                ds->subscribedJobId.clear();
+            }
+            ds->snap = ProcessSnapshot();
+            ds->events.clear();
+            ds->agentState = LlmAgentState();
+            if (ds->hwndHeader) {
+                SetWindowTextW(ds->hwndHeader, Tr(L"プロセスリストでプロセスを選択してください。",
+                                                  L"Select a process in the process list.",
+                                                  L"Seleccione un proceso en la lista."));
+            }
+            if (ds->hwndList && ds->lastEventCount != 0) {
+                ListView_DeleteAllItems(ds->hwndList);
+                if (ds->hwndEditPreview) SetWindowTextW(ds->hwndEditPreview, L"");
+            }
+            ds->lastEventCount = 0;
+            ds->lastEventSeq = 0;
+            if (ds->rcUsageGraph.right > ds->rcUsageGraph.left) InvalidateRect(hwnd, &ds->rcUsageGraph, FALSE);
+            return;
         }
-        ds->lastEventCount = 0;
-        ds->lastEventSeq = 0;
-        if (ds->rcUsageGraph.right > ds->rcUsageGraph.left) InvalidateRect(hwnd, &ds->rcUsageGraph, FALSE);
-        return;
     }
-    ds->events.clear();
-    // The live agent state still comes from the tracker; the event list itself is v1 only.
-    std::vector<LlmStreamEvent> stateOnlyEvents;
-    ds->dash->pm->GetAgentStream(ds->procId, 1, "", 0, stateOnlyEvents, ds->agentState);
-    LoadMonitorEvents(ds->snap, ds->events);
 
     std::string modelStr = ds->agentState.model;
     if (modelStr.empty()) {
@@ -7563,7 +8503,7 @@ static LRESULT CALLBACK LlmStreamWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPA
             } else if (id == 2104 && ds) {
                 if (!ds->snap.streamFilePath.empty()) {
                     std::wstring streamW = Utf8ToWide(ds->snap.streamFilePath);
-                    ShellExecuteW(hwnd, L"open", L"notepad.exe", streamW.c_str(), nullptr, SW_SHOWNORMAL);
+                    gui_platform::GetGuiPlatform()->OpenFileInEditor(hwnd, streamW);
                 }
             } else if (id == IDOK || id == IDCANCEL) {
                 if (ds && ds->embedded) {
@@ -7615,6 +8555,9 @@ static LRESULT CALLBACK LlmStreamWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPA
             SetBkColor(hdc, g_theme.panel);
             return reinterpret_cast<LRESULT>(g_dialogBgBrush);
         }
+        case WM_USER + 101:
+            if (ds) ReloadStreamDialogData(hwnd, ds);
+            return 0;
         case WM_CLOSE:
             DestroyWindow(hwnd);
             return 0;
@@ -7623,6 +8566,10 @@ static LRESULT CALLBACK LlmStreamWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPA
                 if (ds->embedded && ds->dash) ds->dash->streamPane = nullptr;
                 if (ds->timerId) KillTimer(hwnd, ds->timerId);
                 if (ds->hFontMono) DeleteObject(ds->hFontMono);
+                if (ds->wsClient) {
+                    ds->wsClient->Close();
+                    ds->wsClient.reset();
+                }
                 delete ds;
             }
             SetWindowLongPtrW(hwnd, GWLP_USERDATA, 0);
@@ -7650,9 +8597,9 @@ static void RegisterLlmStreamClass() {
 }
 
 static void ShowLlmStreamDialog(DashboardState* st, int procId) {
-    if (!st || !st->pm || procId <= 0) return;
+    if (!st || procId <= 0) return;
     ProcessSnapshot snap;
-    if (!st->pm->GetSnapshot(procId, snap)) return;
+    if (!FetchProcessSnapshotIpc(st, procId, snap)) return;
 
     RegisterLlmStreamClass();
     HINSTANCE hInst = GetModuleHandleW(nullptr);
@@ -7716,7 +8663,7 @@ static void EnsureStreamPane(DashboardState* st) {
 static void SyncStreamPane(DashboardState* st) {
     if (!st || !st->streamPane || !st->hwndStreamPane || !IsWindowVisible(st->hwndStreamPane)) return;
     LlmStreamDlgState* ds = st->streamPane;
-    if (ds->procId == st->selectedProcId) return;
+    if (ds->procId == st->selectedProcId && ds->goalJobKey == st->selectedJobKey) return;
     ds->procId = st->selectedProcId;
     ds->lastEventCount = static_cast<size_t>(-1);  // force the list to rebuild
     if (ds->hwndEditPreview) SetWindowTextW(ds->hwndEditPreview, L"");
@@ -7735,9 +8682,9 @@ static void ApplyStreamPaneTheme(DashboardState* st) {
 }
 
 static void ShowTaskContextMenu(DashboardState* st, int procId, POINT ptScreen) {
-    if (!st || !st->pm || procId <= 0) return;
+    if (!st || procId <= 0) return;
     ProcessSnapshot snap;
-    if (!st->pm->GetSnapshot(procId, snap)) return;
+    if (!FetchProcessSnapshotIpc(st, procId, snap)) return;
 
     HMENU hMenu = CreatePopupMenu();
     AppendMenuW(hMenu, MF_STRING, 3001, Tr(L"詳細を表示 (タスク詳細・コマンドライン)...", L"Task Details & Command Line...", L"Detalles de tarea y línea de comandos..."));
@@ -7780,28 +8727,30 @@ static void ShowTaskContextMenu(DashboardState* st, int procId, POINT ptScreen) 
         SyncStreamPane(st);
     } else if (cmd == 3008) {
         std::wstring streamW = Utf8ToWide(snap.streamFilePath);
-        ShellExecuteW(st->hwndMain, L"open", L"notepad.exe", streamW.c_str(), nullptr, SW_SHOWNORMAL);
+        gui_platform::GetGuiPlatform()->OpenFileInEditor(st->hwndMain, streamW);
     } else if (cmd == 3002) {
         CopyTextToClipboard(st->hwndMain, Utf8ToWide(snap.commandLine));
     } else if (cmd == 3003) {
         std::wstring logW = Utf8ToWide(snap.logFilePath);
-        ShellExecuteW(st->hwndMain, L"open", L"notepad.exe", logW.c_str(), nullptr, SW_SHOWNORMAL);
+        gui_platform::GetGuiPlatform()->OpenFileInEditor(st->hwndMain, logW);
     } else if (cmd == 3004) {
-        if (MessageBoxW(st->hwndMain,
+        if (gui_platform::GetGuiPlatform()->ShowMessageBox(
+                st->hwndMain,
+                Tr(L"ツリー終了の確認", L"Confirm Kill Tree", L"Confirmar cierre"),
                 Tr(L"このプロセスツリーを強制終了しますか？",
                    L"Are you sure you want to kill this process tree?",
                    L"¿Seguro que desea terminar este árbol de procesos?"),
-                Tr(L"ツリー終了の確認", L"Confirm Kill Tree", L"Confirmar cierre"),
-                MB_YESNO | MB_ICONQUESTION | MB_DEFBUTTON2) == IDYES) {
+                gui_platform::MessageBoxType::QuestionYesNo,
+                true) == gui_platform::MessageBoxResult::Yes) {
             std::string err;
-            st->pm->KillProcess(procId, err);
+            KillProcessIpc(st, procId, err);
             RefreshDashboardData(st);
         }
     } else if (cmd == 3005) {
-        st->pm->RemoveProcess(procId);
+        RemoveProcessIpc(st, procId);
         RefreshDashboardData(st);
     } else if (cmd == 3006) {
-        st->pm->ClearFinished();
+        ClearFinishedIpc(st);
         RefreshDashboardData(st);
     }
 }
@@ -7860,7 +8809,19 @@ static void LoadShellConfig(DashboardState* st) {
     st->powershellCommand = "powershell.exe";
     st->bashCommand = GetDefaultBashCommand();
 
-    std::string content = ReadFileUtf8Wide(GetConfigFilePathWide());
+    std::string content;
+    nlohmann::json req = {{"action", "config_get"}};
+    nlohmann::json resp;
+    if (GuiIpcCall(st, req, resp) && resp.value("ok", false) && resp.contains("config")) {
+        if (resp["config"].is_string()) {
+            content = resp["config"].get<std::string>();
+        } else if (resp["config"].is_object()) {
+            content = resp["config"].dump();
+        }
+    }
+    if (content.empty()) {
+        content = ReadFileUtf8Wide(GetConfigFilePathWide());
+    }
     if (content.empty()) return;
 
     std::string defShell = JsonGetString(content, "default_shell", "powershell");
@@ -7909,7 +8870,15 @@ static void LoadShellConfig(DashboardState* st) {
     st->llmMaxEvents = ClampLlmMaxEvents(JsonGetInt(content, "llm_max_events", kDefaultLlmMaxEvents));
     SetLlmMaxEvents(st->llmMaxEvents);
     st->resourceLocks = JsonGetBool(content, "resource_locks", true);
-    if (st->tqm) st->tqm->SetResourceLocksEnabled(st->resourceLocks);
+    SetResourceLocksEnabledIpc(st, st->resourceLocks);
+    st->memoryMaxBytes = JsonGetInt(content, "memory_max_bytes", 0);
+    if (st->memoryMaxBytes == 0) {
+        st->memoryMaxBytes = JsonGetInt(content, "memory_limit_bytes", 0);
+    }
+    if (st->memoryMaxBytes == 0) {
+        int64_t mb = JsonGetInt(content, "memory_max_mb", 0);
+        if (mb > 0) st->memoryMaxBytes = mb * 1024LL * 1024LL;
+    }
     st->processListFontPx = ClampListFontPx(static_cast<int>(
         JsonGetInt(content, "process_list_font_px", kDefaultListFontPx)));
     st->taskListFontPx = ClampListFontPx(static_cast<int>(
@@ -7967,13 +8936,22 @@ static void SaveShellConfig(const DashboardState* st) {
         << "  \"restore_usage_graph\": " << (st->restoreUsageGraph ? "true" : "false") << ",\n"
         << "  \"llm_max_events\": " << st->llmMaxEvents << ",\n"
         << "  \"resource_locks\": " << (st->resourceLocks ? "true" : "false") << ",\n"
+        << "  \"memory_max_bytes\": " << st->memoryMaxBytes << ",\n"
         << "  \"process_list_font_px\": " << st->processListFontPx << ",\n"
         << "  \"task_list_font_px\": " << st->taskListFontPx << ",\n"
         << listBg.str()
         << "  \"refresh_interval_ms\": " << st->refreshIntervalMs << "\n"
         << "}\n";
 
-    WriteFileAtomicWide(GetConfigFilePathWide(), ss.str());
+    std::string serialized = ss.str();
+    WriteFileAtomicWide(GetConfigFilePathWide(), serialized);
+
+    nlohmann::json cfgJson = nlohmann::json::parse(serialized, nullptr, false);
+    if (!cfgJson.is_discarded()) {
+        nlohmann::json req = {{"action", "config_set"}, {"config", cfgJson}};
+        nlohmann::json resp;
+        GuiIpcCall(const_cast<DashboardState*>(st), req, resp);
+    }
 }
 
 static void UpdateLaunchButtonLabel(DashboardState* st) {
@@ -8081,7 +9059,7 @@ static void ApplyLanguageToUi(DashboardState* st) {
 }
 
 static void LaunchShellByType(DashboardState* st, ShellType type) {
-    if (!st || !st->pm) return;
+    if (!st) return;
     StartProcessRequest req;
     req.mode = ExecMode::ConPTY;
     if (type == ShellType::Cmd) {
@@ -8096,14 +9074,29 @@ static void LaunchShellByType(DashboardState* st, ShellType type) {
     }
 
     std::string err;
-    int id = st->pm->StartProcess(req, err);
+    int id = -1;
+    if (st->pm) {
+        id = st->pm->StartProcess(req, err);
+    } else {
+        nlohmann::json startReq = {
+            {"action", "start"},
+            {"cmd", req.commandLine},
+            {"name", req.name},
+            {"mode", ExecModeToString(req.mode)},
+            {"wait", false}
+        };
+        nlohmann::json startResp;
+        if (GuiIpcCall(st, startReq, startResp, &err) && startResp.value("ok", false)) {
+            id = startResp.value("id", -1);
+        }
+    }
     if (id < 0) {
         std::wstring werr = Utf8ToWide(err);
-        MessageBoxW(st->hwndMain, werr.c_str(), L"Failed to Start Terminal", MB_ICONERROR);
+        gui_platform::GetGuiPlatform()->ShowMessageBox(st->hwndMain, L"Failed to Start Terminal", werr, gui_platform::MessageBoxType::Error);
     } else {
         st->selectedProcId = id;
         RefreshDashboardData(st);
-        TerminalView* tv = st->pm->GetTerminalView(id);
+        TerminalView* tv = st->pm ? st->pm->GetTerminalView(id) : nullptr;
         if (tv && tv->Hwnd()) {
             SetFocus(tv->Hwnd());
         }
@@ -8380,12 +9373,12 @@ static void InitTrayIcon(DashboardState* st) {
     st->nid.uCallbackMessage = WM_PC_TRAYICON;
     st->nid.hIcon = LoadAppSmallIcon();
     wcscpy_s(st->nid.szTip, L"Hancho — Multi-Terminal ConPTY Dashboard");
-    st->trayAdded = (Shell_NotifyIconW(NIM_ADD, &st->nid) != FALSE);
+    st->trayAdded = gui_platform::GetGuiPlatform()->TrayAdd(st->nid);
 }
 
 static void RemoveTrayIcon(DashboardState* st) {
     if (!st || !st->trayAdded) return;
-    Shell_NotifyIconW(NIM_DELETE, &st->nid);
+    gui_platform::GetGuiPlatform()->TrayDelete(st->nid);
     st->trayAdded = false;
 }
 
@@ -8485,7 +9478,7 @@ static void ShowTrayContextMenu(DashboardState* st) {
 }
 
 static void ResetProcessIdsWithConfirm(DashboardState* st) {
-    if (!st || !st->pm || !st->hwndMain) return;
+    if (!st || !st->hwndMain) return;
     std::wstring title = Tr(L"プロセスIDをリセット", L"Reset Process IDs", L"Restablecer IDs");
     std::wstring msg = Tr(
         L"プロセスIDをリセットしますか？ 終了済みプロセスは #1 から振り直されます。\n"
@@ -8494,13 +9487,15 @@ static void ResetProcessIdsWithConfirm(DashboardState* st) {
         L"All running processes must be stopped first.",
         L"¿Restablecer los IDs? Los procesos finalizados se renumerarán desde #1.\n"
         L"Primero debe detener todos los procesos en ejecución.");
-    if (MessageBoxW(st->hwndMain, msg.c_str(), title.c_str(), MB_YESNO | MB_ICONQUESTION | MB_DEFBUTTON2) != IDYES) {
+    if (gui_platform::GetGuiPlatform()->ShowMessageBox(
+            st->hwndMain, title, msg, gui_platform::MessageBoxType::QuestionYesNo, true) != gui_platform::MessageBoxResult::Yes) {
         return;
     }
     std::string err;
-    int count = st->pm->ResetProcessIds(err);
+    int count = ResetProcessIdsIpc(st, err);
     if (count < 0) {
-        MessageBoxW(st->hwndMain, Utf8ToWide(err).c_str(), title.c_str(), MB_ICONWARNING);
+        gui_platform::GetGuiPlatform()->ShowMessageBox(
+            st->hwndMain, title, Utf8ToWide(err), gui_platform::MessageBoxType::Warning);
     } else {
         st->selectedProcId = -1;
         RefreshDashboardData(st);
@@ -9163,7 +10158,7 @@ static LRESULT CALLBACK SettingsWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPAR
             if (id == IDC_SET_RESOURCE_LOCKS) {
                 ds->dash->resourceLocks =
                     (SendMessageW(ds->chkResourceLocks, BM_GETCHECK, 0, 0) == BST_CHECKED);
-                if (ds->dash->tqm) ds->dash->tqm->SetResourceLocksEnabled(ds->dash->resourceLocks);
+                SetResourceLocksEnabledIpc(ds->dash, ds->dash->resourceLocks);
                 SaveShellConfig(ds->dash);
                 return 0;
             }
@@ -9188,16 +10183,10 @@ static LRESULT CALLBACK SettingsWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPAR
             }
             if (id == IDC_SET_SOUND_BROWSE) {
                 CommitSoundSettings(ds);
-                wchar_t file[MAX_PATH] = {};
-                OPENFILENAMEW ofn = {};
-                ofn.lStructSize = sizeof(ofn);
-                ofn.hwndOwner = hwnd;
-                ofn.lpstrFilter = L"WAV (*.wav)\0*.wav\0All Files (*.*)\0*.*\0";
-                ofn.lpstrFile = file;
-                ofn.nMaxFile = MAX_PATH;
-                ofn.Flags = OFN_FILEMUSTEXIST | OFN_PATHMUSTEXIST;
-                if (GetOpenFileNameW(&ofn)) {
-                    SetWindowTextW(ds->editSound, file);
+                std::wstring picked;
+                if (gui_platform::GetGuiPlatform()->PickOpenFileName(
+                        hwnd, L"WAV (*.wav)\0*.wav\0All Files (*.*)\0*.*\0", picked)) {
+                    SetWindowTextW(ds->editSound, picked.c_str());
                     CommitSoundSettings(ds);
                 }
                 return 0;
@@ -9277,8 +10266,8 @@ static LRESULT CALLBACK SettingsWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPAR
                 return 0;
             }
             if (id == IDC_SET_CLEAR_ENDED) {
-                if (ds->dash && ds->dash->pm) {
-                    ds->dash->pm->ClearFinished();
+                if (ds && ds->dash) {
+                    ClearFinishedIpc(ds->dash);
                     RefreshDashboardData(ds->dash);
                 }
                 return 0;
@@ -9482,9 +10471,9 @@ static void ShowSettingsDialog(DashboardState* st) {
 // ---------------------------------------------------------------------------
 // Token usage panel (docked below the KPI cards)
 // ---------------------------------------------------------------------------
-static const int kUsageRangeCount = 5;
-static const int kUsageRangeSec[kUsageRangeCount] = {1800, 3600, 14400, 43200, 86400};
-static const wchar_t* const kUsageRangeLabels[kUsageRangeCount] = {L"30m", L"1h", L"4h", L"12h", L"24h"};
+static const int kUsageRangeCount = 4;
+static const int64_t kUsageRangeSec[kUsageRangeCount] = {86400, 7 * 86400, 30 * 86400, 365 * 86400};
+static const wchar_t* const kUsageRangeLabels[kUsageRangeCount] = {L"24h", L"7d", L"30d", L"12m"};
 static const COLORREF kUsagePalette[] = {
     RGB(0x4F, 0x8C, 0xFF), RGB(0x3D, 0xD5, 0x98), RGB(0xFF, 0xB4, 0x54),
     RGB(0xFF, 0x6B, 0x6B), RGB(0xB4, 0x7A, 0xFF), RGB(0x2E, 0xC4, 0xE0),
@@ -9640,7 +10629,6 @@ static void DrawUsagePanel(HWND hwnd, HDC hdc, DashboardState* st) {
 
     int64_t now = static_cast<int64_t>(time(nullptr));
     int64_t since = now - kUsageRangeSec[rangeIdx];
-    std::vector<LlmUsagePoint> points = GetLlmUsageHistory(since);
 
     struct KeyStat {
         std::string name;
@@ -9654,31 +10642,223 @@ static void DrawUsagePanel(HWND hwnd, HDC hdc, DashboardState* st) {
     std::unordered_map<std::string, int> keyIndex;
     uint64_t rangeTotal = 0;
     double rangeCost = 0.0;
-    for (const auto& p : points) {
-        std::string name = p.agentType.empty() ? "unknown" : p.agentType;
-        if (!p.model.empty()) name += " / " + p.model;
-        else name += " / (default)";
-        auto it = keyIndex.find(name);
-        int idx;
-        if (it == keyIndex.end()) {
-            idx = static_cast<int>(keys.size());
-            keyIndex[name] = idx;
-            KeyStat ks;
-            ks.name = name;
-            ks.color = ColorForUsageKey(ks.name);
-            keys.push_back(ks);
-        } else {
-            idx = it->second;
+
+    auto getKeyIndex = [&](const std::string& rawName) -> int {
+        auto it = keyIndex.find(rawName);
+        if (it != keyIndex.end()) return it->second;
+        int idx = static_cast<int>(keys.size());
+        keyIndex[rawName] = idx;
+        KeyStat ks;
+        ks.name = rawName;
+        ks.color = ColorForUsageKey(ks.name);
+        keys.push_back(ks);
+        return idx;
+    };
+
+    int nBuckets = 12;
+    double bucketSec = 1.0;
+    int64_t windowStartBucket = 0;
+    std::vector<std::vector<uint64_t>> vals;
+    std::vector<std::vector<uint64_t>> valIn;
+    std::vector<std::vector<uint64_t>> valOut;
+    std::vector<std::vector<uint64_t>> valThink;
+    std::vector<std::vector<uint64_t>> valCache;
+    std::vector<uint64_t> bucketTotal;
+
+    if (rangeIdx == 0) {
+        // 24h: live U0 points (fallback to today's daily log if in-memory history empty)
+        std::vector<LlmUsagePoint> points = GetLlmUsageHistory(since);
+        if (points.empty()) {
+            auto daily = ReadDailyUsageSummary("24h", "");
+            for (const auto& d : daily) {
+                LlmUsagePoint pt;
+                pt.epochSec = d.firstEpochSec > 0 ? d.firstEpochSec : now;
+                pt.inputTokens = d.inputTokens;
+                pt.outputTokens = d.outputTokens;
+                pt.thinkingTokens = d.thinkingTokens;
+                pt.cacheReadTokens = d.cacheReadTokens;
+                pt.cacheWriteTokens = d.cacheWriteTokens;
+                pt.totalTokens = d.totalTokens;
+                pt.costUsd = d.costUsd;
+                pt.agentType = d.engine;
+                pt.model = d.model;
+                points.push_back(pt);
+            }
         }
-        keys[idx].total += p.totalTokens;
-        keys[idx].in += p.inputTokens;
-        keys[idx].out += p.outputTokens;
-        keys[idx].think += p.thinkingTokens;
-        keys[idx].cache += p.cacheReadTokens + p.cacheWriteTokens;
-        rangeTotal += p.totalTokens;
-        rangeCost += p.costUsd;
-        if (keys[idx].firstEpochSec == 0 || p.epochSec < keys[idx].firstEpochSec) keys[idx].firstEpochSec = p.epochSec;
-        if (p.epochSec > keys[idx].lastEpochSec) keys[idx].lastEpochSec = p.epochSec;
+        for (const auto& p : points) {
+            std::string name = p.agentType.empty() ? "unknown" : p.agentType;
+            if (!p.model.empty()) name += " / " + p.model;
+            else name += " / (default)";
+            int idx = getKeyIndex(name);
+            keys[idx].total += p.totalTokens;
+            keys[idx].in += p.inputTokens;
+            keys[idx].out += p.outputTokens;
+            keys[idx].think += p.thinkingTokens;
+            keys[idx].cache += p.cacheReadTokens + p.cacheWriteTokens;
+            rangeTotal += p.totalTokens;
+            rangeCost += p.costUsd;
+            if (keys[idx].firstEpochSec == 0 || p.epochSec < keys[idx].firstEpochSec) keys[idx].firstEpochSec = p.epochSec;
+            if (p.epochSec > keys[idx].lastEpochSec) keys[idx].lastEpochSec = p.epochSec;
+        }
+
+        int gx0_tmp = 58;
+        int splitX_tmp = gx0_tmp + (w - gx0_tmp - 12) * 33 / 100;
+        int graphW_tmp = (splitX_tmp - 6) - gx0_tmp;
+        nBuckets = graphW_tmp / 7;
+        if (nBuckets < 12) nBuckets = 12;
+        if (nBuckets > 96) nBuckets = 96;
+        bucketSec = 86400.0 / nBuckets;
+        if (bucketSec < 1.0) bucketSec = 1.0;
+        int64_t currentBucket = static_cast<int64_t>(now / bucketSec);
+        windowStartBucket = currentBucket - nBuckets + 1;
+
+        vals.assign(nBuckets, std::vector<uint64_t>(keys.size(), 0));
+        valIn.assign(nBuckets, std::vector<uint64_t>(keys.size(), 0));
+        valOut.assign(nBuckets, std::vector<uint64_t>(keys.size(), 0));
+        valThink.assign(nBuckets, std::vector<uint64_t>(keys.size(), 0));
+        valCache.assign(nBuckets, std::vector<uint64_t>(keys.size(), 0));
+        bucketTotal.assign(nBuckets, 0);
+
+        for (const auto& p : points) {
+            int64_t pb = static_cast<int64_t>(p.epochSec / bucketSec);
+            int bi = static_cast<int>(pb - windowStartBucket);
+            if (bi < 0 || bi >= nBuckets) continue;
+            std::string name = p.agentType.empty() ? "unknown" : p.agentType;
+            if (!p.model.empty()) name += " / " + p.model;
+            else name += " / (default)";
+            int k = getKeyIndex(name);
+            uint64_t pt = p.totalTokens;
+            if (pt == 0) pt = p.inputTokens + p.outputTokens + p.thinkingTokens + p.cacheReadTokens + p.cacheWriteTokens;
+            vals[bi][k] += pt;
+            valIn[bi][k] += p.inputTokens;
+            valOut[bi][k] += p.outputTokens;
+            valThink[bi][k] += p.thinkingTokens;
+            valCache[bi][k] += p.cacheReadTokens + p.cacheWriteTokens;
+            bucketTotal[bi] += pt;
+        }
+    } else if (rangeIdx == 1 || rangeIdx == 2) {
+        // 7d or 30d: daily buckets from U1 daily rollups
+        int nDays = (rangeIdx == 1) ? 7 : 30;
+        nBuckets = nDays;
+        std::vector<std::string> dayKeys;
+        dayKeys.reserve(nDays);
+        for (int i = nDays - 1; i >= 0; --i) {
+            time_t t = static_cast<time_t>(now - i * 86400);
+            std::tm tm = {};
+            LocalTimeFromSec(&t, &tm);
+            char buf[32];
+            snprintf(buf, sizeof(buf), "%04d-%02d-%02d", tm.tm_year + 1900, tm.tm_mon + 1, tm.tm_mday);
+            dayKeys.push_back(buf);
+        }
+        std::string sinceStr = dayKeys.front();
+        auto daily = ReadDailyUsageSummary(sinceStr, "");
+
+        for (const auto& d : daily) {
+            std::string name = d.engine.empty() ? "unknown" : d.engine;
+            if (!d.model.empty()) name += " / " + d.model;
+            else name += " / (default)";
+            int idx = getKeyIndex(name);
+            keys[idx].total += d.totalTokens;
+            keys[idx].in += d.inputTokens;
+            keys[idx].out += d.outputTokens;
+            keys[idx].think += d.thinkingTokens;
+            keys[idx].cache += d.cacheReadTokens + d.cacheWriteTokens;
+            rangeTotal += d.totalTokens;
+            rangeCost += d.costUsd;
+            if (d.firstEpochSec > 0 && (keys[idx].firstEpochSec == 0 || d.firstEpochSec < keys[idx].firstEpochSec)) keys[idx].firstEpochSec = d.firstEpochSec;
+            if (d.lastEpochSec > keys[idx].lastEpochSec) keys[idx].lastEpochSec = d.lastEpochSec;
+        }
+
+        vals.assign(nBuckets, std::vector<uint64_t>(keys.size(), 0));
+        valIn.assign(nBuckets, std::vector<uint64_t>(keys.size(), 0));
+        valOut.assign(nBuckets, std::vector<uint64_t>(keys.size(), 0));
+        valThink.assign(nBuckets, std::vector<uint64_t>(keys.size(), 0));
+        valCache.assign(nBuckets, std::vector<uint64_t>(keys.size(), 0));
+        bucketTotal.assign(nBuckets, 0);
+
+        for (const auto& d : daily) {
+            int bi = -1;
+            for (int i = 0; i < nDays; ++i) {
+                if (dayKeys[i] == d.date) { bi = i; break; }
+            }
+            if (bi < 0 || bi >= nBuckets) continue;
+            std::string name = d.engine.empty() ? "unknown" : d.engine;
+            if (!d.model.empty()) name += " / " + d.model;
+            else name += " / (default)";
+            int k = getKeyIndex(name);
+            uint64_t pt = d.totalTokens;
+            if (pt == 0) pt = d.inputTokens + d.outputTokens + d.thinkingTokens + d.cacheReadTokens + d.cacheWriteTokens;
+            vals[bi][k] += pt;
+            valIn[bi][k] += d.inputTokens;
+            valOut[bi][k] += d.outputTokens;
+            valThink[bi][k] += d.thinkingTokens;
+            valCache[bi][k] += d.cacheReadTokens + d.cacheWriteTokens;
+            bucketTotal[bi] += pt;
+        }
+    } else {
+        // 12m: monthly buckets from U1 rollups summed by month
+        nBuckets = 12;
+        std::vector<std::string> monthKeys;
+        monthKeys.reserve(12);
+        time_t nowT = static_cast<time_t>(now);
+        std::tm curTm = {};
+        LocalTimeFromSec(&nowT, &curTm);
+        int curY = curTm.tm_year + 1900;
+        int curM = curTm.tm_mon + 1;
+        for (int i = 11; i >= 0; --i) {
+            int m = curM - i;
+            int y = curY;
+            while (m <= 0) { m += 12; y--; }
+            char buf[16];
+            snprintf(buf, sizeof(buf), "%04d-%02d", y, m);
+            monthKeys.push_back(buf);
+        }
+        std::string sinceStr = monthKeys.front() + "-01";
+        auto daily = ReadDailyUsageSummary(sinceStr, "");
+
+        for (const auto& d : daily) {
+            std::string name = d.engine.empty() ? "unknown" : d.engine;
+            if (!d.model.empty()) name += " / " + d.model;
+            else name += " / (default)";
+            int idx = getKeyIndex(name);
+            keys[idx].total += d.totalTokens;
+            keys[idx].in += d.inputTokens;
+            keys[idx].out += d.outputTokens;
+            keys[idx].think += d.thinkingTokens;
+            keys[idx].cache += d.cacheReadTokens + d.cacheWriteTokens;
+            rangeTotal += d.totalTokens;
+            rangeCost += d.costUsd;
+            if (d.firstEpochSec > 0 && (keys[idx].firstEpochSec == 0 || d.firstEpochSec < keys[idx].firstEpochSec)) keys[idx].firstEpochSec = d.firstEpochSec;
+            if (d.lastEpochSec > keys[idx].lastEpochSec) keys[idx].lastEpochSec = d.lastEpochSec;
+        }
+
+        vals.assign(nBuckets, std::vector<uint64_t>(keys.size(), 0));
+        valIn.assign(nBuckets, std::vector<uint64_t>(keys.size(), 0));
+        valOut.assign(nBuckets, std::vector<uint64_t>(keys.size(), 0));
+        valThink.assign(nBuckets, std::vector<uint64_t>(keys.size(), 0));
+        valCache.assign(nBuckets, std::vector<uint64_t>(keys.size(), 0));
+        bucketTotal.assign(nBuckets, 0);
+
+        for (const auto& d : daily) {
+            std::string ym = d.date.size() >= 7 ? d.date.substr(0, 7) : d.date;
+            int bi = -1;
+            for (int i = 0; i < 12; ++i) {
+                if (monthKeys[i] == ym) { bi = i; break; }
+            }
+            if (bi < 0 || bi >= nBuckets) continue;
+            std::string name = d.engine.empty() ? "unknown" : d.engine;
+            if (!d.model.empty()) name += " / " + d.model;
+            else name += " / (default)";
+            int k = getKeyIndex(name);
+            uint64_t pt = d.totalTokens;
+            if (pt == 0) pt = d.inputTokens + d.outputTokens + d.thinkingTokens + d.cacheReadTokens + d.cacheWriteTokens;
+            vals[bi][k] += pt;
+            valIn[bi][k] += d.inputTokens;
+            valOut[bi][k] += d.outputTokens;
+            valThink[bi][k] += d.thinkingTokens;
+            valCache[bi][k] += d.cacheReadTokens + d.cacheWriteTokens;
+            bucketTotal[bi] += pt;
+        }
     }
 
     SelectObject(hdc, st->hFontUiBold ? st->hFontUiBold : GetStockObject(DEFAULT_GUI_FONT));
@@ -9688,7 +10868,7 @@ static void DrawUsagePanel(HWND hwnd, HDC hdc, DashboardState* st) {
         swprintf_s(cbuf, L"  \x00B7  $%.4f", rangeCost);
         summary += cbuf;
     }
-     RECT sumRc = {closeRc.left - 270, 6, closeRc.left - 116, 24};
+    RECT sumRc = {closeRc.left - 270, 6, closeRc.left - 116, 24};
     SetTextColor(hdc, g_theme.accent);
     DrawTextW(hdc, summary.c_str(), -1, &sumRc, DT_RIGHT | DT_VCENTER | DT_SINGLELINE | DT_END_ELLIPSIS);
     int gx0 = 58;
@@ -9705,8 +10885,7 @@ static void DrawUsagePanel(HWND hwnd, HDC hdc, DashboardState* st) {
         return;
     }
 
-
-    if (points.empty() || keys.empty()) {
+    if (keys.empty()) {
         SetTextColor(hdc, g_theme.muted);
         RECT emptyRc = {gx0, gy0, gx1, gy1};
         const auto& snaps = st->allSnapshots.empty() ? st->cachedSnapshots : st->allSnapshots;
@@ -9722,47 +10901,19 @@ static void DrawUsagePanel(HWND hwnd, HDC hdc, DashboardState* st) {
         return;
     }
 
-    int nBuckets = graphW / 7;
-    if (nBuckets < 12) nBuckets = 12;
-    if (nBuckets > 96) nBuckets = 96;
-    double bucketSec = static_cast<double>(kUsageRangeSec[rangeIdx]) / nBuckets;
-    if (bucketSec < 1.0) bucketSec = 1.0;
-    int64_t nowEpoch = static_cast<int64_t>(time(nullptr));
-    int64_t currentBucket = static_cast<int64_t>(nowEpoch / bucketSec);
-    int64_t windowStartBucket = currentBucket - nBuckets + 1;
-    std::vector<std::vector<uint64_t>> vals(nBuckets, std::vector<uint64_t>(keys.size(), 0));
-    std::vector<std::vector<uint64_t>> valIn(nBuckets, std::vector<uint64_t>(keys.size(), 0));
-    std::vector<std::vector<uint64_t>> valOut(nBuckets, std::vector<uint64_t>(keys.size(), 0));
-    std::vector<std::vector<uint64_t>> valThink(nBuckets, std::vector<uint64_t>(keys.size(), 0));
-    std::vector<std::vector<uint64_t>> valCache(nBuckets, std::vector<uint64_t>(keys.size(), 0));
-    std::vector<uint64_t> bucketTotal(nBuckets, 0);
-    for (const auto& p : points) {
-        int64_t pb = static_cast<int64_t>(p.epochSec / bucketSec);
-        int bi = static_cast<int>(pb - windowStartBucket);
-        if (bi < 0 || bi >= nBuckets) continue;
-        std::string name = p.agentType.empty() ? "unknown" : p.agentType;
-        if (!p.model.empty()) name += " / " + p.model;
-        else name += " / (default)";
-        auto it = keyIndex.find(name);
-        if (it == keyIndex.end()) continue;
-        uint64_t pt = p.totalTokens;
-        if (pt == 0) pt = p.inputTokens + p.outputTokens + p.thinkingTokens + p.cacheReadTokens + p.cacheWriteTokens;
-        vals[bi][it->second] += pt;
-        valIn[bi][it->second] += p.inputTokens;
-        valOut[bi][it->second] += p.outputTokens;
-        valThink[bi][it->second] += p.thinkingTokens;
-        valCache[bi][it->second] += p.cacheReadTokens + p.cacheWriteTokens;
-        bucketTotal[bi] += pt;
-    }
     uint64_t maxBucket = 1;
     for (uint64_t v : bucketTotal) if (v > maxBucket) maxBucket = v;
 
-     // Highlight selected process/job time range in usage graph background.
-    if (selStart > 0 && points.size() > 0) {
-        int64_t ws = static_cast<int64_t>(windowStartBucket * bucketSec);
-        int64_t we = ws + static_cast<int64_t>(nBuckets * bucketSec);
+    // Highlight selected process/job time range in usage graph background.
+    if (selStart > 0 && !keys.empty()) {
+        int64_t ws = since;
+        int64_t we = now;
+        if (rangeIdx == 0) {
+            ws = static_cast<int64_t>(windowStartBucket * bucketSec);
+            we = ws + static_cast<int64_t>(nBuckets * bucketSec);
+        }
         int64_t s = std::max(selStart, ws);
-        int64_t e = std::min(selEnd > 0 ? selEnd : static_cast<int64_t>(time(nullptr)), we);
+        int64_t e = std::min(selEnd > 0 ? selEnd : now, we);
         if (e > s && we > ws) {
             int x0 = gx0 + static_cast<int>((static_cast<double>(s - ws) / (we - ws)) * graphW);
             int x1 = gx0 + static_cast<int>((static_cast<double>(e - ws) / (we - ws)) * graphW);
@@ -9950,16 +11101,25 @@ static void DrawUsagePanel(HWND hwnd, HDC hdc, DashboardState* st) {
     RECT axisL = {gx0, gy1 + 2, gx0 + 80, gy1 + 16};
     RECT axisR = {gx1 - 80, gy1 + 2, gx1, gy1 + 16};
     wchar_t tbuf[32] = {};
+    wchar_t nowBuf[32] = {};
     struct tm tmv = {};
     time_t stv = static_cast<time_t>(since);
     localtime_s(&tmv, &stv);
-    swprintf_s(tbuf, L"%02d:%02d", tmv.tm_hour, tmv.tm_min);
-    DrawTextW(hdc, tbuf, -1, &axisL, DT_LEFT | DT_SINGLELINE);
-     wchar_t nowBuf[32] = {};
     time_t nowT = time(nullptr);
     struct tm nowTm = {};
     localtime_s(&nowTm, &nowT);
-    swprintf_s(nowBuf, L"%02d:%02d", nowTm.tm_hour, nowTm.tm_min);
+
+    if (rangeIdx == 0) {
+        swprintf_s(tbuf, L"%02d:%02d", tmv.tm_hour, tmv.tm_min);
+        swprintf_s(nowBuf, L"%02d:%02d", nowTm.tm_hour, nowTm.tm_min);
+    } else if (rangeIdx == 1 || rangeIdx == 2) {
+        swprintf_s(tbuf, L"%02d/%02d", tmv.tm_mon + 1, tmv.tm_mday);
+        swprintf_s(nowBuf, L"%02d/%02d", nowTm.tm_mon + 1, nowTm.tm_mday);
+    } else {
+        swprintf_s(tbuf, L"%04d-%02d", tmv.tm_year + 1900, tmv.tm_mon + 1);
+        swprintf_s(nowBuf, L"%04d-%02d", nowTm.tm_year + 1900, nowTm.tm_mon + 1);
+    }
+    DrawTextW(hdc, tbuf, -1, &axisL, DT_LEFT | DT_SINGLELINE);
     DrawTextW(hdc, nowBuf, -1, &axisR, DT_RIGHT | DT_SINGLELINE);
 
     SelectObject(hdc, oldFont);
@@ -10419,7 +11579,7 @@ static LRESULT CALLBACK DashboardWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPA
                     if (PtInRect(&tb.rcBorder, pt)) {
                         st->selectedProcId = tb.procId;
                         RefreshDashboardData(st);
-                        TerminalView* tv = st->pm->GetTerminalView(tb.procId);
+                        TerminalView* tv = st->pm ? st->pm->GetTerminalView(tb.procId) : nullptr;
                         if (tv && tv->Hwnd()) {
                             SetFocus(tv->Hwnd());
                         }
@@ -10636,26 +11796,35 @@ static LRESULT CALLBACK DashboardWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPA
                 ShowSettingsDialog(st);
             } else if (id == IDC_BTN_KILL_SEL) {
                 if (st->selectedProcId > 0) {
-                    if (MessageBoxW(hwnd,
+                    if (gui_platform::GetGuiPlatform()->ShowMessageBox(
+                            hwnd,
+                            Tr(L"終了の確認", L"Confirm Kill", L"Confirmar cierre"),
                             Tr(L"このプロセスツリーを強制終了しますか？", L"Are you sure you want to kill this process tree?", L"¿Seguro que desea terminar este árbol de procesos?"),
-                            Tr(L"終了の確認", L"Confirm Kill", L"Confirmar cierre"), MB_YESNO | MB_ICONQUESTION | MB_DEFBUTTON2) == IDYES) {
+                            gui_platform::MessageBoxType::QuestionYesNo,
+                            true) == gui_platform::MessageBoxResult::Yes) {
                         std::string err;
-                        st->pm->KillProcess(st->selectedProcId, err);
+                        KillProcessIpc(st, st->selectedProcId, err);
                         RefreshDashboardData(st);
                     }
                 }
             } else if (id == IDC_BTN_KILL_ALL) {
-                if (MessageBoxW(hwnd,
+                if (gui_platform::GetGuiPlatform()->ShowMessageBox(
+                        hwnd,
+                        Tr(L"全終了の確認", L"Confirm Kill All", L"Confirmar cierre total"),
                         Tr(L"実行中のすべてのプロセスを強制終了しますか？", L"Are you sure you want to kill ALL running processes?", L"¿Seguro que desea terminar TODOS los procesos en ejecución?"),
-                        Tr(L"全終了の確認", L"Confirm Kill All", L"Confirmar cierre total"), MB_YESNO | MB_ICONQUESTION | MB_DEFBUTTON2) == IDYES) {
-                    st->pm->KillAllRunning();
+                        gui_platform::MessageBoxType::QuestionYesNo,
+                        true) == gui_platform::MessageBoxResult::Yes) {
+                    KillAllRunningIpc(st);
                     RefreshDashboardData(st);
                 }
             } else if (id == IDC_BTN_CLEAR) {
-                if (MessageBoxW(hwnd,
+                if (gui_platform::GetGuiPlatform()->ShowMessageBox(
+                        hwnd,
+                        Tr(L"履歴消去の確認", L"Confirm Clear", L"Confirmar borrado"),
                         Tr(L"終了済みプロセスの履歴を消去しますか？", L"Are you sure you want to clear finished process history?", L"¿Seguro que desea borrar el historial de procesos finalizados?"),
-                        Tr(L"履歴消去の確認", L"Confirm Clear", L"Confirmar borrado"), MB_YESNO | MB_ICONQUESTION | MB_DEFBUTTON2) == IDYES) {
-                    st->pm->ClearFinished();
+                        gui_platform::MessageBoxType::QuestionYesNo,
+                        true) == gui_platform::MessageBoxResult::Yes) {
+                    ClearFinishedIpc(st);
                     RefreshDashboardData(st);
                 }
             } else if (id == IDC_BT_DEBUG) {
@@ -10761,18 +11930,33 @@ static LRESULT CALLBACK DashboardWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPA
                     }
                 }
             } else if (nmhdr->idFrom == IDC_LIST_TASKS) {
-                if (nmhdr->code == LVN_ITEMCHANGED) {
+                if (nmhdr->code == LVN_COLUMNCLICK) {
+                    // Clicking a header sorts by that column; the same column cycles
+                    // ascending -> descending -> unsorted.
+                    auto* nmlv = reinterpret_cast<NMLISTVIEW*>(lParam);
+                    int clickedCol = nmlv->iSubItem;
+                    if (clickedCol >= 0 && clickedCol < kTaskListColumns) {
+                        if (st->taskSortColumn == clickedCol) {
+                            st->taskSortDirection = NextSortDirection(st->taskSortDirection);
+                        } else {
+                            st->taskSortColumn = clickedCol;
+                            st->taskSortDirection = SortDirection::Ascending;
+                        }
+                        UpdateTaskListHeaders(st);
+                        RefreshTaskQueueData(st, true);
+                    }
+                } else if (nmhdr->code == LVN_ITEMCHANGED) {
                     // Selecting a task shows its process in the monitor pane below.
                     auto* nmlv = reinterpret_cast<NMLISTVIEW*>(lParam);
                     bool newlySelected = (nmlv->uNewState & LVIS_SELECTED) && !(nmlv->uOldState & LVIS_SELECTED);
                     int idx = nmlv->iItem;
-                    if (newlySelected && idx >= 0 && idx < static_cast<int>(st->taskJobProcIds.size())) {
-                        int pid = st->taskJobProcIds[idx];
-                        if (pid > 0) {
-                            st->selectedProcId = pid;
-                            st->lastFollowedProcId = pid;
-                            SyncStreamPane(st);
-                        }
+                    if (newlySelected && idx >= 0 && idx < static_cast<int>(st->taskJobIds.size())) {
+                        std::string jobId = st->taskJobIds[idx];
+                        st->selectedJobKey = jobId;
+                        int pid = (idx < static_cast<int>(st->taskJobProcIds.size())) ? st->taskJobProcIds[idx] : 0;
+                        st->selectedProcId = pid;
+                        st->lastFollowedProcId = pid;
+                        SyncStreamPane(st);
                     }
                 } else if (nmhdr->code == NM_RCLICK) {
                     auto* nmia = reinterpret_cast<NMITEMACTIVATE*>(lParam);
@@ -10846,14 +12030,16 @@ static LRESULT CALLBACK DashboardWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPA
                 }
             } else if (nmhdr->idFrom == IDC_LIST_PROCS) {
                 if (nmhdr->code == LVN_COLUMNCLICK) {
+                    // Clicking a header sorts by that column; the same column cycles
+                    // ascending -> descending -> unsorted.
                     auto* nmlv = reinterpret_cast<NMLISTVIEW*>(lParam);
                     int clickedCol = nmlv->iSubItem;
                     if (clickedCol >= 0 && clickedCol < 14) {
                         if (st->sortColumn == clickedCol) {
-                            st->sortAscending = !st->sortAscending;
+                            st->sortDirection = NextSortDirection(st->sortDirection);
                         } else {
                             st->sortColumn = clickedCol;
-                            st->sortAscending = false;
+                            st->sortDirection = SortDirection::Ascending;
                         }
                         UpdateListHeaderSortIndicator(st);
                         RefreshDashboardData(st);
@@ -10864,8 +12050,9 @@ static LRESULT CALLBACK DashboardWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPA
                         int procId = static_cast<int>(nmlv->lParam);
                         if (procId > 0 && procId != st->selectedProcId) {
                             st->selectedProcId = procId;
+                            st->selectedJobKey.clear();
                             RefreshDashboardData(st);
-                            TerminalView* tv = st->pm->GetTerminalView(procId);
+                            TerminalView* tv = st->pm ? st->pm->GetTerminalView(procId) : nullptr;
                             if (tv && tv->Hwnd()) {
                                 SetFocus(tv->Hwnd());
                             }
@@ -10978,7 +12165,7 @@ static LRESULT CALLBACK DashboardWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPA
         }
 
         case WM_CLOSE: {
-            if (st && !st->allowExit) {
+            if (st && !st->allowExit && wParam != 1) {
                 HideToTray(st);
                 return 0;
             }
@@ -11035,7 +12222,7 @@ static LRESULT CALLBACK DashboardWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPA
     return DefWindowProcW(hwnd, msg, wParam, lParam);
 }
 
-int RunGuiDashboard(ProcessManager& pm, IpcServer& ipc, TaskQueueManager& tqm) {
+int RunGuiDashboard(ProcessManager* pm, IpcServer* ipc, TaskQueueManager* tqm) {
     SetProcessDPIAware();
 
     INITCOMMONCONTROLSEX icex = {};
@@ -11051,9 +12238,9 @@ int RunGuiDashboard(ProcessManager& pm, IpcServer& ipc, TaskQueueManager& tqm) {
     ApplyTheme();
 
     DashboardState state;
-    state.pm = &pm;
-    state.ipc = &ipc;
-    state.tqm = &tqm;
+    state.pm = pm;
+    state.ipc = ipc;
+    state.tqm = tqm;
     state.guiThreadId = GetCurrentThreadId();
     state.dashboardStartTimeStr = GetCurrentTimestampStr();
     state.dashboardStartTickMs = GetNowTickMs();
@@ -11080,27 +12267,31 @@ int RunGuiDashboard(ProcessManager& pm, IpcServer& ipc, TaskQueueManager& tqm) {
     );
     if (!hwnd) return 1;
 
-    pm.SetTerminalCallbacks(
-        [hwnd](const std::wstring& resolvedCmd,
-               const std::wstring& cwd,
-               std::function<void(const char*, size_t)> onOutput,
-               std::wstring& outError) -> TerminalView* {
-            CreateTermViewParams params;
-            params.resolvedCmd = resolvedCmd;
-            params.cwd = cwd;
-            params.onOutput = std::move(onOutput);
-            SendMessageW(hwnd, WM_PC_CREATE_TERMVIEW, 0, reinterpret_cast<LPARAM>(&params));
-            outError = params.outError;
-            return params.outView;
-        },
-        [hwnd](TerminalView* tv) {
-            if (tv && IsWindow(hwnd)) {
-                PostMessageW(hwnd, WM_PC_DESTROY_TERMVIEW, reinterpret_cast<WPARAM>(tv), 0);
+    if (pm) {
+        pm->SetTerminalCallbacks(
+            [hwnd](const std::wstring& resolvedCmd,
+                   const std::wstring& cwd,
+                   std::function<void(const char*, size_t)> onOutput,
+                   std::wstring& outError) -> TerminalView* {
+                CreateTermViewParams params;
+                params.resolvedCmd = resolvedCmd;
+                params.cwd = cwd;
+                params.onOutput = std::move(onOutput);
+                SendMessageW(hwnd, WM_PC_CREATE_TERMVIEW, 0, reinterpret_cast<LPARAM>(&params));
+                outError = params.outError;
+                return params.outView;
+            },
+            [hwnd](TerminalView* tv) {
+                if (tv && IsWindow(hwnd)) {
+                    PostMessageW(hwnd, WM_PC_DESTROY_TERMVIEW, reinterpret_cast<WPARAM>(tv), 0);
+                }
             }
-        }
-    );
+        );
+    }
 
-    ipc.SetNotifyHwnd(hwnd);
+    if (ipc) {
+        ipc->SetNotifyHwnd(hwnd);
+    }
     ShowWindow(hwnd, SW_SHOW);
     UpdateWindow(hwnd);
     ApplyNativeThemeToWindow(hwnd);
@@ -11131,9 +12322,17 @@ int RunGuiDashboard(ProcessManager& pm, IpcServer& ipc, TaskQueueManager& tqm) {
     }
     if (hAccel) DestroyAcceleratorTable(hAccel);
 
-    pm.SetTerminalCallbacks(nullptr, nullptr);
-    ipc.SetNotifyHwnd(nullptr);
+    if (pm) pm->SetTerminalCallbacks(nullptr, nullptr);
+    if (ipc) ipc->SetNotifyHwnd(nullptr);
     return static_cast<int>(msg.wParam);
+}
+
+int RunGuiDashboard(ProcessManager& pm, IpcServer& ipc, TaskQueueManager& tqm) {
+    return RunGuiDashboard(&pm, &ipc, &tqm);
+}
+
+int RunStandaloneGuiDashboard() {
+    return RunGuiDashboard(nullptr, nullptr, nullptr);
 }
 
 } // namespace pc

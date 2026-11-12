@@ -6,16 +6,23 @@ CLI コマンドは Named Pipe (`\\.\pipe\Hancho_IPC_v1`) を通じて起動中�
 
 > **呼称:** `Hancho.exe` は GUI ダッシュボード / MCP サーバー、`hancho-cli.exe` はそのコンソールクライアントです。
 
-## Linux / macOS: `hancho-cli top`
+## Linux / macOS: `hancho-cli top`（対話型 TUI ダッシュボード）
 
-POSIX ではコアはヘッドレスで動き、CLI は Unix ドメインソケットで接続します。端末向けの簡易表示は `top` です:
+POSIX ではコアはヘッドレスで動き、CLI は Unix ドメインソケットで接続します。端末向けの画面として、Windows 版ダッシュボードと同等の主要 5 画面（Processes, Queue, Monitor, Why, Memory）を備えた対話型 TUI `top` を提供しています:
 
 ```sh
-hancho-cli --data-dir ./ww-data top              # 1 秒ごとに更新
+hancho-cli --data-dir ./ww-data top              # 対話型 TUI を起動（1 秒ごとに自動更新）
+hancho-cli top --interval 500                    # 500ms 間隔で更新
+hancho-cli top --once                            # 1 回だけ整形スナップショットを出力して終了
 hancho-cli top --once --json                     # 1 回だけ JSON で取得
 ```
 
-ビルド手順は [build-posix-ja.md](build-posix-ja.md) を参照してください。
+- **タブ切替**: `Tab` / `Shift+Tab`（巡回切替）、または `1` 〜 `5`（Processes / Queue / Monitor / Why / Memory へ直接切替）
+- **行移動**: `j` / `k` または `Down` / `Up` 矢印キー
+- **ジョブ操作**: `s`（選択プロセスまたは稼働ジョブの停止）、`r`（再実行）、`c`（取り消し）
+- **ヘルプ**: `?` でショートカット一覧を表示、`q` または `Ctrl+C` で終了
+
+詳細な設計・操作一覧および確認手順は [tui-design-ja.md](tui-design-ja.md) を、ビルド手順は [build-posix-ja.md](build-posix-ja.md) を参照してください。
 
 ## バージョン確認（`--version` / `-V` / `version`）
 
@@ -101,9 +108,58 @@ hancho-cli.exe memory get rr_j_7f3a_2
 hancho-cli.exe memory approve nt_01JC9Z --by alice
 ```
 
+`memory search [query] [filters] [--ranker <path>] [--limit <n>]` は L1 実行記録、L2 ノート、L3 承認済みプロジェクト知識を検索します。順位付けは既定で BM25 相当のキーワード検索です。データディレクトリの `config.json` で `"ranker_plugin": "<パス>"` または `{"ranker_plugin": {"path": "<パス>", "timeoutMs": 5000}}` を設定する（または `--ranker <パス>` で指定する）ことで外部ランカープラグインに差し替えられます。プラグインは stdin で `{"query": ..., "candidates": [{"id": ..., "kind": ..., "text": ..., "createdEpoch": ...}]}` を受け取り、stdout に候補ごとのスコア配列（`[score, ...]`、`{"scores": {"<id>": score, ...}}`、または `{"scores": [...]}`）を返します。プラグインの起動失敗、異常終了、タイムアウト、不正な出力のときは検索を止めずに組み込みの BM25 順位付けへ安全にフォールバックし、`rankerWarning` を通知します。サンプルプラグインは `tests/data/sample_ranker.py` および `tests/data/sample_ranker.bat`（POSIX は `.sh`）にあります。
+
 `memory brief` は決まった形（前回の実行 / よくある失敗 / 関連ノート / プロジェクト知識）で、各行に id を付けて出力します。`--budget-chars`（既定 1500）に収めるため下の節から削り、L3 のプロジェクト知識は最後まで残します。`--no-agent-notes` でエージェントが書いた L2 ノートを除けます。ジョブへの自動注入は [taskqueue-ja.md](taskqueue-ja.md) の `memory` フィールドを参照してください。
 
-`memory approve <note-id>` は承認した L2 ノートを L3 のプロジェクト知識として `memory/knowledge.jsonl` に昇格します。`approvedBy` と `approvedAt` を付け、元のノートは退役させます。人が行う経路（GUI のメモリ一覧にも同じ操作があります）で、MCP ツールとしては公開しないためエージェントは昇格できません。ファイルは 1 行 1 事実の JSONL で、git にコミットしてチームで共有する前提です。
+`memory approve <note-id> [--by <name>] [--worker <name>]` は承認した L2 ノートを L3 のプロジェクト知識として `memory/knowledge.jsonl` に昇格します。`approvedBy` と `approvedAt` を付け、元のノートは退役させます。人が行う操作（GUI のメモリ一覧にも同じ操作があります）に加えて、データディレクトリの `config.json` の `memory.l3Promoters`（配列またはカンマ区切り）に指定された特定のワーカーも昇格が許されます（`--by worker:<name>` または `--worker <name>`）。未許可のワーカーは拒否されます。ファイルは 1 行 1 事実の JSONL で、git にコミットしてチームで共有する前提です。
+
+`memory prune [--dry-run] [--days <n>]` は保持期間（既定 90 日）より古い月の L1 ファイル（`memory/records/*.jsonl`）を削除します。また、`config.json` に `memory_max_bytes` が設定されている場合、`memory/` 全体の容量上限を超えたら古い L1 から自動で削除します。L2 ノートと L3 知識は自動では削除されず、上限に近づいたとき（>= 80%）に警告されます。`--dry-run` で実際の削除を行わずに候補一覧と削減見込み容量を確認できます。`memory stats` にも現在の容量と設定上限が出力されます。
+
+**LLM 使用量の集計（`usage stats`）:**
+
+```powershell
+# 日 × エンジン × モデルの内訳（既定）
+hancho-cli.exe usage stats
+
+# 日・月・エンジン・モデル別で集約
+hancho-cli.exe usage stats --group-by day
+hancho-cli.exe usage stats --group-by month
+hancho-cli.exe usage stats --group-by engine
+hancho-cli.exe usage stats --group-by model
+
+# 期間絞り込み
+hancho-cli.exe usage stats --since today
+hancho-cli.exe usage stats --since 7d
+hancho-cli.exe usage stats --since 2026-11-01 --until 2026-11-30
+
+# 機械可読な JSON 出力
+hancho-cli.exe usage stats --group-by day --json
+```
+
+`usage stats` は日次ロールアップ記録（`usage/daily/<YYYY-MM>.jsonl`、スキーマ `hancho.usage.day/1`）を読み、同一キーの差分を合計してトークン内訳（入力・出力・思考・キャッシュ読み書き）と推定費用を返します。費用を報告しないエンジン（`agy` など）には `costKnown: false` が付きます。
+
+**LLM 使用量の書き出し（`usage export`）:**
+
+```powershell
+# CSV で書き出し（既定）
+hancho-cli.exe usage export
+hancho-cli.exe usage export --format csv --out usage.csv
+
+# 月別・エンジン別集約で書き出し
+hancho-cli.exe usage export --format csv --group-by month
+hancho-cli.exe usage export --format json --group-by engine --out engine_usage.json
+```
+
+**月次デルタログの圧縮（`usage compact`）:**
+
+```powershell
+# 全月または特定月を日 × エンジン × モデルの 1 行に圧縮
+hancho-cli.exe usage compact
+hancho-cli.exe usage compact --month 2026-11
+```
+
+月替わり時にも自動で圧縮が行われ、一時ファイル経由のアトミックな置き換えにより、12 か月分でも 1 MB 未満に抑えられます。
 
 **プロジェクト内のデータディレクトリ（git 管理）:**
 

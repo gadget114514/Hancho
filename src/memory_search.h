@@ -1,6 +1,7 @@
 #pragma once
 
 #include <cstdint>
+#include <memory>
 #include <string>
 #include <vector>
 
@@ -19,6 +20,7 @@ struct Query {
     std::string outcome;
     std::string failureClass;
     std::string since;
+    std::vector<std::string> tags;
     int limit = 20;
 };
 
@@ -59,7 +61,8 @@ struct BriefResult {
 struct NoteInput {
     std::string text;
     std::vector<std::string> tags;
-    std::string scope = "project"; // project, taskqueue:<name>, job:<name>, file:<path>, engine:<name>
+    // Empty = project for people, the attempt's job for agents (decided in NoteJson).
+    std::string scope; // project, taskqueue:<name>, job:<name>, file:<path>, engine:<name>
     std::string authorType = "human"; // agent, human or hancho
     std::string authorClient;
     std::string authorSession;
@@ -78,6 +81,31 @@ public:
                       std::vector<double>& outScores,
                       std::string& outError) const = 0;
 };
+
+// External ranker plugin (doc/design-v3.md 3.8). Spawns a child process in the data directory,
+// sends {"query":..., "candidates":[...]} via stdin, and parses candidate scores from stdout JSON.
+class ProcessRanker : public IMemoryRanker {
+public:
+    explicit ProcessRanker(std::string pluginPath, int timeoutMs = 5000);
+    ~ProcessRanker() override = default;
+
+    const char* Name() const override { return "process-plugin"; }
+    const std::string& PluginPath() const { return pluginPath_; }
+    int TimeoutMs() const { return timeoutMs_; }
+
+    bool Rank(const std::string& query,
+              const std::vector<RankCandidate>& candidates,
+              std::vector<double>& outScores,
+              std::string& outError) const override;
+
+private:
+    std::string pluginPath_;
+    int timeoutMs_ = 5000;
+};
+
+std::string GetConfiguredRankerPluginPath();
+int GetConfiguredRankerTimeoutMs();
+std::unique_ptr<IMemoryRanker> CreateConfiguredRanker();
 
 std::string SearchJson(const Query& query, const IMemoryRanker* ranker = nullptr);
 std::string GetJson(const std::string& id, const std::string& kind = "");

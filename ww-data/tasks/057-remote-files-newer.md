@@ -1,6 +1,6 @@
 # 057 — リモート実行での success.filesNewer の評価
 
-Estimate 120 min
+Estimate 85 min
 Splittable: no
 
 ## 目的

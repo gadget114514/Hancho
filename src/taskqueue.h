@@ -272,11 +272,15 @@ struct TaskQueueAttempt {
     // remoteProcessId is the process id on that host.
     std::string remoteHost;
     int remoteProcessId = 0;
+    // Remote job tracking (doc/design-v3.md 2.5, 056-1).
+    std::string remoteJobId;
+    int remoteAttempt = 0;
     std::string start;
     std::string end;
     std::string reason;
     int exitCode = -1;
     int instructionsRev = 1;
+    std::string logFile;
     std::string lastLinesFile;
     std::string checkDetail;
     // Memory ids handed to this attempt (memory_brief). Empty when injection is off.
@@ -289,6 +293,9 @@ struct TaskQueueAttempt {
     uint64_t startEventSeq = 0;
     // Transient (not persisted): last time a remote host was polled.
     uint64_t lastRemotePollMs = 0;
+    // Transient (not persisted): set to true when loaded on restart while running,
+    // indicating reconnect is pending.
+    bool needsRemoteReconnect = false;
 };
 
 // An attempt that ends with one of exitCodes means "nothing ran, try again later" (75 =
@@ -357,6 +364,160 @@ enum TaskQueueCaller {
     Gui = 0,
     External = 1,
 };
+
+// Minimal state of an execution outside a task queue (doc/design-v3.md §7, card 072-1).
+struct PlainRunState {
+    std::string jobId;
+    int attempt = 1;
+    std::string taskqueue = "plain";
+    std::string name;
+    std::string summary;
+    std::string command;
+    std::string cwd;
+    std::string start;
+    std::string end;
+    int exitCode = -1;
+    std::string reason;
+    int processId = 0;
+    std::string logFile;
+    std::string lastLinesFile;
+    std::string checkDetail;
+};
+
+// Generates a unique jobId for a standalone run (e.g. "j_plain_<name>_<pid>_<seq>").
+inline std::string IssuePlainJobId(int processId = 0, const std::string& name = "") {
+    static std::atomic<uint64_t> s_plainSeq{1};
+    uint64_t seq = s_plainSeq.fetch_add(1);
+    std::string base = "j_plain_";
+    if (!name.empty() && name != "plain") {
+        base += SanitizeFileNameComponent(name) + "_";
+    }
+    if (processId > 0) {
+        base += std::to_string(processId) + "_";
+    }
+    base += std::to_string(seq);
+    return base;
+}
+
+// Persists a plain run's state directly into logs/taskqueues/<taskqueue>.json without
+// requiring an active TaskQueueManager instance.
+inline bool SavePlainRunStateDirect(const PlainRunState& state, std::string& outError) {
+    outError.clear();
+    std::string qName = state.taskqueue.empty() ? "plain" : state.taskqueue;
+    std::wstring tqDir = PathJoinWide(GetLogsDirectoryWide(), L"taskqueues");
+    EnsureDirectoryWide(tqDir);
+    std::wstring filePath = PathJoinWide(tqDir, Utf8ToWide(SanitizeFileNameComponent(qName)) + L".json");
+
+    nlohmann::json root;
+    std::string existing = ReadFileUtf8Wide(filePath);
+    if (!existing.empty()) {
+        root = nlohmann::json::parse(existing, nullptr, false);
+    }
+    if (root.is_discarded() || !root.is_object()) {
+        root = nlohmann::json::object();
+        root["name"] = qName;
+        root["concurrency"] = 0;
+        root["paused"] = false;
+        root["version"] = 1;
+        root["notify_file"] = "";
+        root["max_timeout_sec"] = 0;
+        root["default_max_attempts"] = 1;
+        root["jobs"] = nlohmann::json::array();
+    }
+
+    std::string jobId = state.jobId;
+    if (jobId.empty()) {
+        jobId = IssuePlainJobId(state.processId, state.name);
+    }
+
+    std::string startTs = !state.start.empty() ? state.start : GetCurrentTimestampStr();
+    std::string endTs = !state.end.empty() ? state.end : GetCurrentTimestampStr();
+    bool ok = (state.exitCode == 0);
+
+    nlohmann::json attObj;
+    attObj["n"] = state.attempt <= 0 ? 1 : state.attempt;
+    attObj["process_id"] = state.processId;
+    attObj["start"] = startTs;
+    attObj["end"] = endTs;
+    attObj["reason"] = !state.reason.empty() ? state.reason : (ok ? "ok" : "failed");
+    attObj["exit_code"] = state.exitCode;
+    attObj["instructions_rev"] = 1;
+    if (!state.logFile.empty()) attObj["log_file"] = state.logFile;
+    attObj["last_lines_file"] = state.lastLinesFile;
+    attObj["check_detail"] = state.checkDetail;
+
+    if (!root.contains("jobs") || !root["jobs"].is_array()) {
+        root["jobs"] = nlohmann::json::array();
+    }
+    bool found = false;
+    for (auto& j : root["jobs"]) {
+        if (j.is_object() && j.value("id", "") == jobId) {
+            found = true;
+            j["state"] = ok ? "succeeded" : "failed";
+            j["updated_at"] = endTs;
+            if (!state.command.empty()) j["command"] = state.command;
+            if (!state.cwd.empty()) j["cwd"] = state.cwd;
+            if (!state.summary.empty()) j["summary"] = state.summary;
+            if (!j.contains("attempts") || !j["attempts"].is_array()) {
+                j["attempts"] = nlohmann::json::array();
+            }
+            j["attempts"].push_back(attObj);
+            break;
+        }
+    }
+    if (!found) {
+        nlohmann::json jobObj;
+        jobObj["id"] = jobId;
+        jobObj["taskqueue"] = qName;
+        jobObj["name"] = !state.name.empty() ? state.name : "plain";
+        jobObj["summary"] = state.summary;
+        jobObj["instructions"] = {{"source", ""}, {"rev", 1}, {"sha256", ""}, {"text", ""}, {"captured_at", ""}};
+        jobObj["command"] = state.command;
+        jobObj["cwd"] = state.cwd;
+        jobObj["host"] = "";
+        jobObj["env"] = nlohmann::json::object();
+        jobObj["depends_on"] = nlohmann::json::array();
+        jobObj["timeout_sec"] = 0;
+        jobObj["estimate_sec"] = 0;
+        jobObj["idle"] = {{"output_sec", 0}, {"cpu_sec", 0}};
+        jobObj["max_attempts"] = 1;
+        jobObj["retry_delay_sec"] = 0;
+        jobObj["defer"] = {{"exit_codes", nlohmann::json::array()}, {"delay_sec", 60}, {"limit", 60}};
+        jobObj["success"] = {{"exit_code", 0}, {"files_newer", nlohmann::json::array()}, {"output_regex", ""}, {"test_report", ""}};
+        jobObj["kill_exclude"] = nlohmann::json::array();
+        jobObj["resources"] = {{"write", nlohmann::json::array()}, {"read", nlohmann::json::array()}};
+        jobObj["memory"] = {{"inject", false}, {"budget_chars", 1500}, {"scopes", nlohmann::json::array()}, {"include_agent_notes", true}};
+        jobObj["priority"] = 0;
+        jobObj["state"] = ok ? "succeeded" : "failed";
+        jobObj["blocked_by"] = nullptr;
+        jobObj["created_at"] = startTs;
+        jobObj["updated_at"] = endTs;
+        jobObj["notes"] = "";
+        jobObj["attempts"] = nlohmann::json::array({attObj});
+        root["jobs"].push_back(std::move(jobObj));
+    }
+
+    int version = root.value("version", 0) + 1;
+    root["version"] = version;
+
+    std::string text = root.dump(2) + "\r\n";
+    WriteFileAtomicWide(filePath, text);
+
+    if (!state.logFile.empty()) {
+        std::wstring dstLog = PathJoinWide(GetLogsDirectoryWide(), L"taskqueue");
+        EnsureDirectoryWide(dstLog);
+        dstLog = PathJoinWide(dstLog, Utf8ToWide(SanitizeFileNameComponent(jobId)) + L"." +
+                                      std::to_wstring(attObj["n"].get<int>()) + L".log");
+        std::error_code ec;
+        if (!std::filesystem::exists(std::filesystem::path(dstLog), ec) &&
+            std::filesystem::exists(std::filesystem::path(Utf8ToWide(state.logFile)), ec)) {
+            std::filesystem::copy_file(std::filesystem::path(Utf8ToWide(state.logFile)),
+                                       std::filesystem::path(dstLog),
+                                       std::filesystem::copy_options::overwrite_existing, ec);
+        }
+    }
+    return true;
+}
 
 struct TaskQueueJob {
     std::string id;
@@ -602,6 +763,8 @@ public:
     // Installed by IpcServer. Passing empty callbacks makes remote jobs fail to launch.
     void SetRemoteCallbacks(RemoteStartCallback start, RemotePollCallback poll,
                             RemoteKillCallback kill);
+    // Reconnect to remote jobs that were running when Hancho restarted (doc/design-v3.md 2.5).
+    void ReconnectRemoteJobs();
 
     // Task queue operations. Each returns a complete JSON response string
     // ({"ok":true,...} or {"ok":false,"error":"..."}).
@@ -656,6 +819,13 @@ public:
 
     TaskQueueCounts GetJobCounts() const;
 
+    // Plain runs outside a taskqueue (doc/design-v3.md §7, card 072-1).
+    static std::string IssuePlainJobId(int processId = 0, const std::string& name = "") {
+        return pc::IssuePlainJobId(processId, name);
+    }
+    bool RecordPlainRun(const PlainRunState& state, std::string& outError);
+    bool RecordPlainRunLocked(const PlainRunState& state, std::string& outError);
+
     // Returns true and fills outJobId when an unfinished job (pending/running/
     // blocked/failed) uses exactly the given command.
     bool FindUnfinishedJobByCommand(const std::string& command, std::string& outJobId) const;
@@ -669,6 +839,10 @@ public:
 
     // Event notification (events.jsonl + notifyFile). Public for the GUI layer.
     void EmitTaskQueueEvent(const std::string& taskqueue, const std::string& type, const std::string& jobId, int64_t attempt);
+
+    // Polls running jobs on remote hosts (network I/O happens without mutex_) and
+    // finishes the attempts whose remote process is done.
+    void PollRemoteJobs();
 
 private:
     struct LaunchItem {
@@ -712,9 +886,6 @@ private:
                             const std::vector<TaskQueueDependency>& deps,
                             const std::string& ignoreDependency);
     bool BuildLaunchRequest(TaskQueue& tq, TaskQueueJob& job, int attemptN, LaunchItem& out);
-    // Polls running jobs on remote hosts (network I/O happens without mutex_) and
-    // finishes the attempts whose remote process is done.
-    void PollRemoteJobs();
     bool FinishRemoteAttemptLocked(TaskQueue& tq, TaskQueueJob& job, const RemotePollResult& result);
     bool EvaluateSuccess(const TaskQueueJob& job, TaskQueueAttempt& attempt,
                          const std::string& endKind, int exitCode,
@@ -747,6 +918,19 @@ private:
     std::atomic<bool> resourceLocksEnabled_{true};
     std::thread schedulerThread_;
 };
+
+// ---------------------------------------------------------------------------
+// Automatic L2 notes written by Hancho (doc/design-v3.md 3.4)
+//
+// Evaluates 3 deterministic rules after each attempt finishes:
+// 1. Same job name failed 3 times consecutively with the same failure classification.
+// 2. Duration exceeds 80% of timeoutSec across consecutive attempts.
+// 3. Success after failure: records diff of filesEdited as candidate fix files.
+// Returns the number of new notes written to memory/notes.jsonl.
+// ---------------------------------------------------------------------------
+int CheckAndRecordAutoNotes(const TaskQueueJob& job, const TaskQueueAttempt& attempt,
+                           const TaskQueueFailureInput& fin);
+int CheckAndRecordAutoNotes(const std::string& jobName, int timeoutSec = 0);
 
 // ---------------------------------------------------------------------------
 // Memory injection effect (doc/design-v3.md 3.12)

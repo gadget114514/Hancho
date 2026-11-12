@@ -1,9 +1,13 @@
 #include "ipc_server.h"
 #include "bt_manager.h"
 #include "chain_guard.h"
+#include "common.h"
 #include "event_schema.h"
 #include "llm_stream.h"
+#include "memory_record.h"
+#include "memory_search.h"
 #include "remote_hosts.h"
+#include "webui_server.h"
 #include "nlohmann/json.hpp"
 #include <ctime>
 #include <fstream>
@@ -124,11 +128,13 @@ bool IpcServer::Start() {
     stop_ = false;
     acceptThread_ = std::thread(&IpcServer::AcceptLoop, this);
     StartRemoteListener();
+    StartWebUiServer();
     return true;
 }
 
 void IpcServer::Stop() {
     if (stop_.exchange(true)) return;
+    StopWebUiServer();
     StopRemoteListener();
     // Wake up blocking ConnectNamedPipe by opening a dummy connection
     HANDLE hDummy = CreateFileW(GetPipeNameWide().c_str(), GENERIC_READ | GENERIC_WRITE, 0, nullptr, OPEN_EXISTING, 0, nullptr);
@@ -497,6 +503,26 @@ std::string IpcServer::HandleRequestJson(const std::string& reqJson) {
         if (hwnd) PostMessageW(hwnd, WM_PC_IPC_EVENT, 0, 0);
         return "{\"ok\":true,\"cleared_count\":" + std::to_string(count) + "}";
     }
+    else if (action == "remove" || action == "process_remove") {
+        int id = static_cast<int>(JsonGetInt(reqJson, "id", 0));
+        if (id <= 0) {
+            return "{\"ok\":false,\"error\":\"id is required for process removal\"}";
+        }
+        pm_.RemoveProcess(id);
+        HWND hwnd = notifyHwnd_.load();
+        if (hwnd) PostMessageW(hwnd, WM_PC_IPC_EVENT, static_cast<WPARAM>(id), 0);
+        return "{\"ok\":true,\"removed_id\":" + std::to_string(id) + "}";
+    }
+    else if (action == "reset_ids" || action == "process_reset_ids") {
+        std::string err;
+        int count = pm_.ResetProcessIds(err);
+        if (count < 0) {
+            return "{\"ok\":false,\"error\":\"" + JsonEscape(err) + "\"}";
+        }
+        HWND hwnd = notifyHwnd_.load();
+        if (hwnd) PostMessageW(hwnd, WM_PC_IPC_EVENT, 0, 0);
+        return "{\"ok\":true,\"count\":" + std::to_string(count) + "}";
+    }
     else if (action == "wait") {
         int id = static_cast<int>(JsonGetInt(reqJson, "id", 0));
         int waitMs = static_cast<int>(JsonGetInt(reqJson, "wait_ms", 30000));
@@ -583,6 +609,33 @@ std::string IpcServer::HandleRequestJson(const std::string& reqJson) {
         }
         oss << "]}";
         return oss.str();
+    }
+    else if (action == "get_usage_daily") {
+        LlmUsageStatsOptions opts;
+        std::string date = JsonGetString(reqJson, "date", "");
+        if (!date.empty()) {
+            opts.since = date;
+            opts.until = date;
+        }
+        if (opts.since.empty()) {
+            opts.since = JsonGetString(reqJson, "since", "");
+        }
+        if (opts.until.empty()) {
+            opts.until = JsonGetString(reqJson, "until", "");
+        }
+        if (opts.since.empty()) {
+            int64_t sinceSec = JsonGetInt(reqJson, "since_sec", 0);
+            if (sinceSec > 0) {
+                opts.since = std::to_string(sinceSec) + "s";
+            }
+        }
+        opts.groupBy = JsonGetString(reqJson, "groupBy", "");
+        if (opts.groupBy.empty()) {
+            opts.groupBy = JsonGetString(reqJson, "group_by", "");
+        }
+        LlmUsageStatsResult res = QueryUsageStats(opts);
+        nlohmann::json jres = UsageStatsResultToJson(res);
+        return jres.dump();
     }
     else if (action == "get_agent_state") {
         int id = static_cast<int>(JsonGetInt(reqJson, "id", 0));
@@ -736,7 +789,7 @@ std::string IpcServer::HandleRequestJson(const std::string& reqJson) {
         }
         return out.dump();
     }
-    else if (action.rfind("taskqueue_", 0) == 0) {
+    else if (action == "failure_diagnose" || action.rfind("taskqueue_", 0) == 0) {
         std::string err;
         std::string resp;
         if (action == "taskqueue_add") {
@@ -840,6 +893,154 @@ std::string IpcServer::HandleRequestJson(const std::string& reqJson) {
         } else if (action == "taskqueue_graph") {
             resp = tqm_.TaskQueueGraph(JsonGetString(reqJson, "taskqueue", ""),
                                        JsonGetString(reqJson, "root", ""), err);
+        } else if (action == "taskqueue_counts") {
+            TaskQueueCounts c = tqm_.GetJobCounts();
+            nlohmann::json counts;
+            counts["running"] = c.running;
+            counts["waiting"] = c.waiting;
+            counts["pending"] = c.pending;
+            counts["blocked"] = c.blocked;
+            counts["succeeded"] = c.succeeded;
+            counts["failed"] = c.failed;
+            counts["cancelled"] = c.cancelled;
+            counts["total"] = c.total;
+            nlohmann::json out;
+            out["ok"] = true;
+            out["counts"] = counts;
+            out["running"] = c.running;
+            out["waiting"] = c.waiting;
+            out["pending"] = c.pending;
+            out["blocked"] = c.blocked;
+            out["succeeded"] = c.succeeded;
+            out["failed"] = c.failed;
+            out["cancelled"] = c.cancelled;
+            out["total"] = c.total;
+            return out.dump();
+        } else if (action == "taskqueue_resource_locks") {
+            if (reqJson.find("\"enabled\"") != std::string::npos) {
+                bool enabled = JsonGetBool(reqJson, "enabled", true);
+                tqm_.SetResourceLocksEnabled(enabled);
+            }
+            nlohmann::json out;
+            out["ok"] = true;
+            out["enabled"] = tqm_.GetResourceLocksEnabled();
+            return out.dump();
+        } else if (action == "taskqueue_diagnose" || action == "failure_diagnose") {
+            int procId = static_cast<int>(JsonGetInt(reqJson, "process_id", 0));
+            if (procId <= 0) procId = static_cast<int>(JsonGetInt(reqJson, "proc_id", 0));
+            std::string jobId = JsonGetString(reqJson, "job_id", "");
+            if (jobId.empty()) jobId = JsonGetString(reqJson, "id", "");
+            std::string tqName = JsonGetString(reqJson, "taskqueue", "");
+            bool breakdown = JsonGetBool(reqJson, "breakdown", false);
+
+            if (breakdown || (!tqName.empty() && procId <= 0 && jobId.empty())) {
+                std::string listErr;
+                std::string listResp = tqm_.TaskQueueList(tqName, "failed", 0, listErr);
+                nlohmann::json root = nlohmann::json::parse(listResp, nullptr, false);
+                std::map<std::string, int> classCounts;
+                if (root.is_object() && root.contains("jobs") && root["jobs"].is_array()) {
+                    for (const auto& job : root["jobs"]) {
+                        if (!job.is_object()) continue;
+                        auto attempts = job.find("attempts");
+                        if (attempts != job.end() && attempts->is_array()) {
+                            for (const auto& att : *attempts) {
+                                if (!att.is_object()) continue;
+                                auto f = att.find("failure");
+                                if (f != att.end() && f->is_object() && !f->empty()) {
+                                    std::string c = f->value("class", "unknown");
+                                    classCounts[c]++;
+                                }
+                            }
+                        }
+                    }
+                }
+                nlohmann::json classesObj = nlohmann::json::object();
+                std::ostringstream summary;
+                bool first = true;
+                for (const auto& kv : classCounts) {
+                    classesObj[kv.first] = kv.second;
+                    if (!first) summary << ", ";
+                    summary << kv.first << " x" << kv.second;
+                    first = false;
+                }
+                nlohmann::json out;
+                out["ok"] = true;
+                out["taskqueue"] = tqName;
+                out["classes"] = classesObj;
+                out["summary"] = summary.str();
+                return out.dump();
+            }
+
+            if (procId > 0) {
+                std::string listErr;
+                std::string listResp = tqm_.TaskQueueList("", "", 0, listErr);
+                nlohmann::json root = nlohmann::json::parse(listResp, nullptr, false);
+                if (root.is_object() && root.contains("jobs") && root["jobs"].is_array()) {
+                    for (const auto& job : root["jobs"]) {
+                        if (!job.is_object()) continue;
+                        auto attempts = job.find("attempts");
+                        if (attempts == job.end() || !attempts->is_array()) continue;
+                        for (const auto& attempt : *attempts) {
+                            if (!attempt.is_object()) continue;
+                            if (attempt.value("process_id", 0) == procId) {
+                                auto f = attempt.find("failure");
+                                nlohmann::json out;
+                                out["ok"] = true;
+                                out["found"] = true;
+                                out["process_id"] = procId;
+                                out["job_id"] = job.value("id", "");
+                                out["taskqueue"] = job.value("taskqueue", "");
+                                out["attempt"] = attempt.value("attempt", 1);
+                                out["failure"] = (f != attempt.end() && f->is_object()) ? *f : nlohmann::json::object();
+                                return out.dump();
+                            }
+                        }
+                    }
+                }
+                ProcessSnapshot snap;
+                if (pm_.GetSnapshot(procId, snap)) {
+                    nlohmann::json out;
+                    out["ok"] = true;
+                    out["found"] = true;
+                    out["process_id"] = procId;
+                    out["state"] = ProcStateToString(snap.state);
+                    out["exit_code"] = snap.exitCode;
+                    nlohmann::json fail;
+                    fail["class"] = (snap.state == ProcState::TimedOut || snap.state == ProcState::IdleTimedOut) ? "timeout" : (snap.exitCode != 0 ? "exit_nonzero" : "none");
+                    fail["summary"] = snap.lastLinePreview;
+                    out["failure"] = fail;
+                    return out.dump();
+                }
+                return "{\"ok\":false,\"error\":\"process not found: " + std::to_string(procId) + "\"}";
+            }
+
+            if (!jobId.empty()) {
+                std::string getErr;
+                std::string getResp = tqm_.TaskQueueGet(jobId, false, 0, getErr);
+                nlohmann::json root = nlohmann::json::parse(getResp, nullptr, false);
+                nlohmann::json job = (root.is_object() && root.contains("job") && root["job"].is_object()) ? root["job"] : root;
+                if (job.is_object() && job.contains("attempts") && job["attempts"].is_array()) {
+                    nlohmann::json lastFailure = nlohmann::json::object();
+                    int lastAttempt = 0;
+                    for (const auto& att : job["attempts"]) {
+                        if (!att.is_object()) continue;
+                        lastAttempt = att.value("attempt", lastAttempt);
+                        auto f = att.find("failure");
+                        if (f != att.end() && f->is_object() && !f->empty()) {
+                            lastFailure = *f;
+                        }
+                    }
+                    nlohmann::json out;
+                    out["ok"] = true;
+                    out["found"] = true;
+                    out["job_id"] = jobId;
+                    out["attempt"] = lastAttempt;
+                    out["failure"] = lastFailure;
+                    return out.dump();
+                }
+                return "{\"ok\":false,\"error\":\"job not found or has no attempts: " + JsonEscape(jobId) + "\"}";
+            }
+            return "{\"ok\":false,\"error\":\"taskqueue_diagnose requires process_id, job_id, or taskqueue\"}";
         }
         if (!resp.empty()) {
             HWND hwnd = notifyHwnd_.load();
@@ -993,6 +1194,136 @@ std::string IpcServer::HandleRequestJson(const std::string& reqJson) {
         HWND hwnd = notifyHwnd_.load();
         if (hwnd) PostMessageW(hwnd, WM_PC_IPC_EVENT, 0, 0);
         return resp;
+    }
+    else if (action.rfind("memory_", 0) == 0) {
+        if (action == "memory_search") {
+            memory::Query q;
+            std::string qErr;
+            memory::ParseQueryJson(reqJson, q, qErr);
+            if (q.text.empty()) {
+                q.text = JsonGetString(reqJson, "query", "");
+            }
+            if (q.text.empty()) {
+                q.text = JsonGetString(reqJson, "text", "");
+            }
+            return memory::SearchJson(q);
+        } else if (action == "memory_get") {
+            std::string id = JsonGetString(reqJson, "id", "");
+            std::string kind = JsonGetString(reqJson, "kind", "");
+            if (id.empty()) {
+                return "{\"ok\":false,\"error\":\"id is required for memory_get\"}";
+            }
+            return memory::GetJson(id, kind);
+        } else if (action == "memory_stats") {
+            memory::Query q;
+            std::string qErr;
+            memory::ParseQueryJson(reqJson, q, qErr);
+            return memory::StatsJson(q);
+        } else if (action == "memory_storage_stats") {
+            auto stats = memory::GetMemoryStorageStats();
+            nlohmann::json out;
+            out["ok"] = true;
+            out["total_bytes"] = stats.totalBytes;
+            out["limit_bytes"] = stats.limitBytes;
+            out["l1_bytes"] = stats.l1Bytes;
+            out["l2_bytes"] = stats.l2Bytes;
+            out["l3_bytes"] = stats.l3Bytes;
+            out["index_bytes"] = stats.indexBytes;
+            out["other_bytes"] = stats.otherBytes;
+            out["near_limit"] = stats.nearLimit;
+            out["exceeded"] = stats.exceeded;
+            out["warning"] = stats.warning;
+            return out.dump();
+        } else if (action == "memory_retract") {
+            std::string id = JsonGetString(reqJson, "id", "");
+            if (id.empty()) {
+                return "{\"ok\":false,\"error\":\"id is required for memory_retract\"}";
+            }
+            std::string reason = JsonGetString(reqJson, "reason", "");
+            std::string who = JsonGetString(reqJson, "retracted_by", "gui");
+            return memory::RetractJson(id, who, reason);
+        } else if (action == "memory_promote") {
+            std::string id = JsonGetString(reqJson, "id", "");
+            if (id.empty()) {
+                return "{\"ok\":false,\"error\":\"id is required for memory_promote\"}";
+            }
+            std::string approvedBy = JsonGetString(reqJson, "approved_by", "gui:human");
+            return memory::ApproveJson(id, approvedBy);
+        } else if (action == "memory_compare" || action == "memory_inject_compare") {
+            std::string job = JsonGetString(reqJson, "job", "");
+            if (job.empty()) job = JsonGetString(reqJson, "job_name", "");
+            std::string tq = JsonGetString(reqJson, "taskqueue", "");
+            std::string since = JsonGetString(reqJson, "since", "");
+            return MemoryInjectCompareJson(job, tq, since);
+        } else if (action == "memory_prune") {
+            memory::PruneOptions opts;
+            opts.dryRun = JsonGetBool(reqJson, "dry_run", false);
+            opts.retentionDays = static_cast<int>(JsonGetInt(reqJson, "retention_days", 90));
+            return memory::PruneRunRecordsJson(opts);
+        }
+        return "{\"ok\":false,\"error\":\"Unknown memory action: " + JsonEscape(action) + "\"}";
+    }
+    else if (action.rfind("config_", 0) == 0) {
+        std::wstring configPath = PathJoinWide(GetEffectiveDataDirectoryWide(), L"config.json");
+        if (action == "config_get") {
+            std::string content = ReadFileUtf8Wide(configPath);
+            nlohmann::json cfg = nlohmann::json::object();
+            if (!content.empty()) {
+                nlohmann::json parsed = nlohmann::json::parse(content, nullptr, false);
+                if (parsed.is_object()) cfg = parsed;
+            }
+            if (!cfg.contains("resource_locks")) {
+                cfg["resource_locks"] = tqm_.GetResourceLocksEnabled();
+            }
+            if (!cfg.contains("llm_max_events")) {
+                cfg["llm_max_events"] = GetLlmMaxEvents();
+            }
+            if (!cfg.contains("restore_usage_graph")) {
+                cfg["restore_usage_graph"] = IsUsageHistoryPersistence();
+            }
+            nlohmann::json out;
+            out["ok"] = true;
+            out["config"] = cfg;
+            return out.dump();
+        } else if (action == "config_set") {
+            nlohmann::json req = nlohmann::json::parse(reqJson, nullptr, false);
+            if (req.is_discarded() || !req.is_object()) {
+                return "{\"ok\":false,\"error\":\"invalid JSON request\"}";
+            }
+            nlohmann::json patch = nlohmann::json::object();
+            if (req.contains("config") && req["config"].is_object()) {
+                patch = req["config"];
+            } else if (req.contains("patch") && req["patch"].is_object()) {
+                patch = req["patch"];
+            } else {
+                patch = req;
+                patch.erase("action");
+            }
+            std::string content = ReadFileUtf8Wide(configPath);
+            nlohmann::json cfg = nlohmann::json::object();
+            if (!content.empty()) {
+                nlohmann::json parsed = nlohmann::json::parse(content, nullptr, false);
+                if (parsed.is_object()) cfg = parsed;
+            }
+            for (auto it = patch.begin(); it != patch.end(); ++it) {
+                cfg[it.key()] = it.value();
+            }
+            if (cfg.contains("resource_locks") && cfg["resource_locks"].is_boolean()) {
+                tqm_.SetResourceLocksEnabled(cfg["resource_locks"].get<bool>());
+            }
+            if (cfg.contains("llm_max_events") && cfg["llm_max_events"].is_number()) {
+                SetLlmMaxEvents(cfg["llm_max_events"].get<int64_t>());
+            }
+            if (cfg.contains("restore_usage_graph") && cfg["restore_usage_graph"].is_boolean()) {
+                SetUsageHistoryPersistence(cfg["restore_usage_graph"].get<bool>());
+            }
+            WriteFileAtomicWide(configPath, cfg.dump(2));
+            nlohmann::json out;
+            out["ok"] = true;
+            out["config"] = cfg;
+            return out.dump();
+        }
+        return "{\"ok\":false,\"error\":\"Unknown config action: " + JsonEscape(action) + "\"}";
     }
     return "{\"ok\":false,\"error\":\"Unknown IPC action: " + JsonEscape(action) + "\"}";
 }

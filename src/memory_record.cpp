@@ -3,9 +3,11 @@
 
 #include <algorithm>
 #include <cctype>
+#include <chrono>
 #include <cmath>
 #include <cstdint>
 #include <cstdio>
+#include <ctime>
 #include <filesystem>
 #include <map>
 #include <set>
@@ -93,9 +95,17 @@ bool HasPathSeparator(const std::string& s) {
 }
 
 std::string NormalizeSlashes(const std::string& s) {
-    std::string out = s;
-    for (char& c : out) {
-        if (c == '\\') c = '/';
+    std::string out;
+    out.reserve(s.size());
+    for (char c : s) {
+        char ch = (c == '\\') ? '/' : c;
+        if (ch == '/' && !out.empty() && out.back() == '/') {
+            if (out.size() == 1 && out[0] == '/') {
+                out.push_back('/');
+            }
+            continue;
+        }
+        out.push_back(ch);
     }
     return out;
 }
@@ -160,6 +170,15 @@ std::string OutcomeFor(const std::string& reason, const std::string& jobState) {
     if (r == "deferred") return "deferred";
     return "failed";
 }
+
+static bool IsCrashExitCode(int exitCode) {
+    uint32_t u = static_cast<uint32_t>(exitCode);
+    if (u == 0xFFFFFFFFu) return false;
+    if (u >= 0xC0000000u) return true;
+    if (u == 0x40000015u) return true;
+    return false;
+}
+
 
 std::string JStr(const json& j, const char* key) {
     auto it = j.find(key);
@@ -399,6 +418,57 @@ std::vector<std::pair<json, std::string>> LoadExistingRecords() {
 
 } // namespace
 
+std::pair<std::string, std::string> ClassifyDeterministicFailure(
+    const std::string& reason, int exitCode, const std::string& outcome,
+    const std::string& checkDetail, int timeoutSec, int64_t durationSec) {
+
+    std::string r = LowerAscii(reason);
+    std::string outLower = LowerAscii(outcome);
+
+    // 1. launch_error: the process never started
+    if (r == "launch_error" || r == "launcherror" || r == "launch_failed" || r == "launchfailed") {
+        std::string summary = !checkDetail.empty() ? checkDetail : "The process could not be started.";
+        return {"launch_error", summary};
+    }
+
+    // 2. killed: cancelled / killed
+    if (r == "killed" || r == "cancelled" || r == "canceled" || outLower == "cancelled") {
+        return {"killed", "The job was cancelled; the attempt was stopped."};
+    }
+
+    // 3. timeout: attempt timed out
+    if (r == "timed_out" || r == "timedout" || r == "timeout" || (timeoutSec > 0 && durationSec >= timeoutSec)) {
+        std::string summary = timeoutSec > 0
+            ? ("The attempt did not finish within " + std::to_string(timeoutSec) + " s.")
+            : "The attempt timed out.";
+        return {"timeout", summary};
+    }
+
+    // 4. idle_stall: output and CPU activity stopped
+    if (r == "idle_timed_out" || r == "idle_stall") {
+        return {"idle_stall", "Output and CPU activity stopped."};
+    }
+
+    // 5. crash: NTSTATUS exception exit code
+    if (IsCrashExitCode(exitCode)) {
+        char hex[16] = {};
+        std::snprintf(hex, sizeof(hex), "0x%08X", static_cast<unsigned>(exitCode));
+        return {"crash", std::string("The process crashed with exit code ") + hex + "."};
+    }
+
+    // 6. exit_nonzero: process exited with a non-zero code
+    if (exitCode != 0) {
+        return {"exit_nonzero", "Exited with code " + std::to_string(exitCode) + "."};
+    }
+
+    // 7. success_check_failed: exit code was 0 but check condition not met
+    if (!checkDetail.empty()) {
+        return {"success_check_failed", checkDetail};
+    }
+
+    return {"", ""};
+}
+
 std::string RunRecordId(const std::string& jobId, int attempt) {
     return "rr_" + jobId + "_" + std::to_string(attempt);
 }
@@ -594,14 +664,27 @@ nlohmann::json BuildRunRecord(const RunRecordInput& input) {
     out["start"] = start;
     out["end"] = end;
     out["durationSec"] = durationSec;
+    if (input.timeoutSec > 0) out["timeoutSec"] = input.timeoutSec;
     out["outcome"] = OutcomeFor(input.reason, input.jobState);
-    if (!input.failureClass.empty()) {
+    std::string failureClass = input.failureClass;
+    std::string failureSummary = input.failureSummary;
+    if (failureClass.empty() && !IEquals(out["outcome"], "success")) {
+        auto classified = ClassifyDeterministicFailure(
+            input.reason, input.exitCode, out["outcome"], input.checkDetail,
+            input.timeoutSec, durationSec);
+        if (!classified.first.empty()) {
+            failureClass = classified.first;
+            if (failureSummary.empty()) failureSummary = classified.second;
+        }
+    }
+
+    if (!failureClass.empty()) {
         json failure;
-        failure["class"] = input.failureClass;
-        if (!input.failureSummary.empty()) failure["summary"] = input.failureSummary;
+        failure["class"] = failureClass;
+        if (!failureSummary.empty()) failure["summary"] = failureSummary;
         out["failure"] = std::move(failure);
     } else if (!input.checkDetail.empty() &&
-               !IEquals(OutcomeFor(input.reason, input.jobState), "success")) {
+               !IEquals(out["outcome"], "success")) {
         json failure;
         failure["summary"] = input.checkDetail;
         out["failure"] = std::move(failure);
@@ -692,6 +775,10 @@ std::string AppendRunRecordJson(const RunRecordInput& input) {
         AppendToLogFileWide(path, DumpJson(record) + "\r\n");
         out["created"] = true;
         out["path"] = "memory/records/" + month + ".jsonl";
+
+        // Enforce memory capacity limit if configured.
+        EnforceMemoryLimits(false);
+
         return DumpJson(out);
     } catch (const std::exception& e) {
         json out;
@@ -699,6 +786,50 @@ std::string AppendRunRecordJson(const RunRecordInput& input) {
         out["error"] = std::string("memory record append failed: ") + e.what();
         return DumpJson(out);
     }
+}
+
+nlohmann::json BuildPlainRunRecord(const PlainRunRecordInput& input) {
+    RunRecordInput in;
+    in.jobId = !input.jobId.empty() ? input.jobId : ("j_plain_" + std::to_string(input.processId));
+    in.attempt = input.attempt > 0 ? input.attempt : 1;
+    in.taskqueue = !input.taskqueue.empty() ? input.taskqueue : "plain";
+    in.jobName = !input.jobName.empty() ? input.jobName : (!input.command.empty() ? input.command : "plain");
+    in.summary = input.summary;
+    in.command = input.command;
+    in.cwd = input.cwd;
+    in.start = input.start;
+    in.end = input.end;
+    in.exitCode = input.exitCode;
+    in.reason = !input.reason.empty() ? input.reason : (input.exitCode == 0 ? "ok" : "failed");
+    in.jobState = (input.exitCode == 0 && (in.reason == "ok" || in.reason == "success")) ? "succeeded" : "failed";
+    in.timeoutSec = input.timeoutSec;
+    in.processId = input.processId;
+    in.logFile = input.logFile;
+    in.lastLinesFile = input.lastLinesFile;
+    in.checkDetail = input.checkDetail;
+    return BuildRunRecord(in);
+}
+
+std::string AppendPlainRunRecordJson(const PlainRunRecordInput& input) {
+    RunRecordInput in;
+    in.jobId = !input.jobId.empty() ? input.jobId : ("j_plain_" + std::to_string(input.processId));
+    in.attempt = input.attempt > 0 ? input.attempt : 1;
+    in.taskqueue = !input.taskqueue.empty() ? input.taskqueue : "plain";
+    in.jobName = !input.jobName.empty() ? input.jobName : (!input.command.empty() ? input.command : "plain");
+    in.summary = input.summary;
+    in.command = input.command;
+    in.cwd = input.cwd;
+    in.start = input.start;
+    in.end = input.end;
+    in.exitCode = input.exitCode;
+    in.reason = !input.reason.empty() ? input.reason : (input.exitCode == 0 ? "ok" : "failed");
+    in.jobState = (input.exitCode == 0 && (in.reason == "ok" || in.reason == "success")) ? "succeeded" : "failed";
+    in.timeoutSec = input.timeoutSec;
+    in.processId = input.processId;
+    in.logFile = input.logFile;
+    in.lastLinesFile = input.lastLinesFile;
+    in.checkDetail = input.checkDetail;
+    return AppendRunRecordJson(in);
 }
 
 std::string RebuildRunRecordsJson() {
@@ -758,6 +889,7 @@ std::string RebuildRunRecordsJson() {
                     in.instructions = instructions ? JStr(*instructions, "text") : std::string();
                     in.command = JStr(job, "command");
                     in.cwd = JStr(job, "cwd");
+                    in.timeoutSec = static_cast<int>(JInt(job, "timeoutSec", JInt(job, "timeout_sec", 0)));
                     if (bt) {
                         in.btId = JStr(*bt, "id");
                         in.btNode = JStr(*bt, "node");
@@ -789,7 +921,9 @@ std::string RebuildRunRecordsJson() {
                     in.checkDetail = JStr(attempt, "check_detail");
                     in.processId = static_cast<int>(JInt(attempt, "process_id", 0));
                     in.eventsFile = FindEventsFileForProcess(in.processId);
-                    in.logFile = WideToUtf8(AttemptLogPathWide(in.jobId, in.attempt));
+                    std::string attLog = JStr(attempt, "log_file");
+                    if (attLog.empty()) attLog = JStr(attempt, "logFile");
+                    in.logFile = !attLog.empty() ? attLog : WideToUtf8(AttemptLogPathWide(in.jobId, in.attempt));
                     in.lastLinesFile = JStr(attempt, "last_lines_file");
 
                     json record = BuildRunRecord(in);
@@ -863,6 +997,18 @@ std::string RebuildRunRecordsJson() {
         out["totalRecords"] = byId.size();
         out["files"] = byMonth.size();
         out["months"] = std::move(months);
+
+        // Enforce configured retention and capacity limits after rebuild
+        int retDays = GetConfiguredRetentionDays();
+        int64_t limitBytes = GetConfiguredMemoryLimitBytes();
+        if (retDays > 0 || limitBytes > 0) {
+            PruneOptions popt;
+            popt.dryRun = false;
+            popt.retentionDays = retDays;
+            popt.limitBytes = limitBytes;
+            PruneRunRecords(popt);
+        }
+
         return DumpJson(out);
     } catch (const std::exception& e) {
         json out;
@@ -870,6 +1016,278 @@ std::string RebuildRunRecordsJson() {
         out["error"] = std::string("memory record rebuild failed: ") + e.what();
         return DumpJson(out);
     }
+}
+
+int64_t GetConfiguredMemoryLimitBytes() {
+    try {
+        std::wstring configPath = PathJoinWide(GetEffectiveDataDirectoryWide(), L"config.json");
+        std::string content = ReadFileUtf8Wide(configPath);
+        if (content.empty()) return 0;
+        json j = json::parse(content, nullptr, false);
+        if (!j.is_object()) return 0;
+        if (j.contains("memory_max_bytes")) {
+            return JInt(j, "memory_max_bytes", 0);
+        }
+        if (j.contains("memory_limit_bytes")) {
+            return JInt(j, "memory_limit_bytes", 0);
+        }
+        if (j.contains("memory_max_mb")) {
+            return JInt(j, "memory_max_mb", 0) * 1024LL * 1024LL;
+        }
+    } catch (...) {
+    }
+    return 0;
+}
+
+int GetConfiguredRetentionDays() {
+    try {
+        std::wstring configPath = PathJoinWide(GetEffectiveDataDirectoryWide(), L"config.json");
+        std::string content = ReadFileUtf8Wide(configPath);
+        if (content.empty()) return 90;
+        json j = json::parse(content, nullptr, false);
+        if (!j.is_object()) return 90;
+        if (j.contains("memory_retention_days")) {
+            int days = static_cast<int>(JInt(j, "memory_retention_days", 90));
+            return days > 0 ? days : 90;
+        }
+    } catch (...) {
+    }
+    return 90;
+}
+
+MemoryStorageStats GetMemoryStorageStats() {
+    MemoryStorageStats stats;
+    stats.limitBytes = GetConfiguredMemoryLimitBytes();
+    std::error_code ec;
+
+    fs::path memDir = MemoryRoot();
+    if (!fs::exists(memDir, ec)) {
+        return stats;
+    }
+
+    // L1: records/*.jsonl
+    fs::path recDir = RecordsDirectory();
+    if (fs::is_directory(recDir, ec)) {
+        for (const auto& ent : fs::directory_iterator(recDir, ec)) {
+            if (ent.is_regular_file(ec) && ent.path().extension() == L".jsonl") {
+                uintmax_t sz = ent.file_size(ec);
+                if (!ec) stats.l1Bytes += static_cast<int64_t>(sz);
+            }
+        }
+    }
+
+    // L2: notes.jsonl
+    fs::path notesPath = memDir / L"notes.jsonl";
+    if (fs::is_regular_file(notesPath, ec)) {
+        uintmax_t sz = fs::file_size(notesPath, ec);
+        if (!ec) stats.l2Bytes = static_cast<int64_t>(sz);
+    }
+
+    // L3: knowledge.jsonl
+    fs::path knowledgePath = memDir / L"knowledge.jsonl";
+    if (fs::is_regular_file(knowledgePath, ec)) {
+        uintmax_t sz = fs::file_size(knowledgePath, ec);
+        if (!ec) stats.l3Bytes = static_cast<int64_t>(sz);
+    }
+
+    // index/*
+    fs::path indexDir = memDir / L"index";
+    if (fs::is_directory(indexDir, ec)) {
+        for (const auto& ent : fs::directory_iterator(indexDir, ec)) {
+            if (ent.is_regular_file(ec)) {
+                uintmax_t sz = ent.file_size(ec);
+                if (!ec) stats.indexBytes += static_cast<int64_t>(sz);
+            }
+        }
+    }
+
+    stats.totalBytes = stats.l1Bytes + stats.l2Bytes + stats.l3Bytes + stats.indexBytes + stats.otherBytes;
+
+    if (stats.limitBytes > 0) {
+        stats.nearLimit = (stats.totalBytes >= static_cast<int64_t>(stats.limitBytes * 0.8));
+        stats.exceeded = (stats.totalBytes > stats.limitBytes);
+        if (stats.exceeded) {
+            stats.warning = "Memory storage limit exceeded (" + FormatBytes(stats.totalBytes) + " / " +
+                            FormatBytes(stats.limitBytes) + "). L2 notes and L3 knowledge cannot be deleted automatically.";
+        } else if (stats.nearLimit) {
+            stats.warning = "Memory storage is near configured limit (" + FormatBytes(stats.totalBytes) + " / " +
+                            FormatBytes(stats.limitBytes) + ", >= 80%). L2/L3 are preserved.";
+        }
+    }
+
+    return stats;
+}
+
+PruneResult PruneRunRecords(const PruneOptions& options) {
+    PruneResult res;
+    res.dryRun = options.dryRun;
+    res.retentionDays = options.retentionDays;
+
+    try {
+        int64_t nowEpoch = options.nowEpoch > 0 ? options.nowEpoch : static_cast<int64_t>(std::time(nullptr));
+        int64_t cutoffEpoch = (options.retentionDays > 0)
+                                  ? (nowEpoch - static_cast<int64_t>(options.retentionDays) * 86400LL)
+                                  : 0;
+
+        int64_t limitBytes = (options.limitBytes >= 0) ? options.limitBytes : GetConfiguredMemoryLimitBytes();
+        res.limitBytes = limitBytes;
+
+        MemoryStorageStats statsBefore = GetMemoryStorageStats();
+        res.totalBytesBefore = statsBefore.totalBytes;
+
+        fs::path recDir = RecordsDirectory();
+        std::error_code ec;
+        if (!fs::is_directory(recDir, ec)) {
+            res.totalBytesAfter = res.totalBytesBefore;
+            res.nearLimit = statsBefore.nearLimit;
+            res.exceeded = statsBefore.exceeded;
+            res.warning = statsBefore.warning;
+            return res;
+        }
+
+        struct MonthFile {
+            std::string month;
+            fs::path path;
+            int64_t size = 0;
+            int64_t monthEndEpoch = 0;
+            bool pruneRetention = false;
+            bool pruneCapacity = false;
+        };
+
+        std::vector<MonthFile> monthFiles;
+        for (const auto& ent : fs::directory_iterator(recDir, ec)) {
+            if (ec) break;
+            if (!ent.is_regular_file(ec) || ent.path().extension() != L".jsonl") continue;
+            std::string stem = WideToUtf8(ent.path().stem().wstring());
+            int64_t sz = static_cast<int64_t>(ent.file_size(ec));
+            if (ec) sz = 0;
+
+            MonthFile mf;
+            mf.month = stem;
+            mf.path = ent.path();
+            mf.size = sz;
+
+            int y = 0, m = 0;
+            if (sscanf_s(stem.c_str(), "%04d-%02d", &y, &m) == 2 && y > 1900 && m >= 1 && m <= 12) {
+                int nextY = (m == 12) ? y + 1 : y;
+                int nextM = (m == 12) ? 1 : m + 1;
+                char nextBuf[32];
+                snprintf(nextBuf, sizeof(nextBuf), "%04d-%02d-01 00:00:00", nextY, nextM);
+                mf.monthEndEpoch = ParseIsoEpoch(nextBuf);
+            } else {
+                auto ftime = fs::last_write_time(ent.path(), ec);
+                if (!ec) {
+                    auto sctp = std::chrono::time_point_cast<std::chrono::system_clock::duration>(
+                        ftime - fs::file_time_type::clock::now() + std::chrono::system_clock::now());
+                    mf.monthEndEpoch = std::chrono::system_clock::to_time_t(sctp);
+                }
+            }
+
+            if (options.retentionDays > 0 && mf.monthEndEpoch > 0 && mf.monthEndEpoch < cutoffEpoch) {
+                mf.pruneRetention = true;
+            }
+
+            monthFiles.push_back(mf);
+        }
+
+        // Sort month files by month / end time ascending (oldest first)
+        std::sort(monthFiles.begin(), monthFiles.end(), [](const MonthFile& a, const MonthFile& b) {
+            if (a.monthEndEpoch != b.monthEndEpoch) return a.monthEndEpoch < b.monthEndEpoch;
+            return a.month < b.month;
+        });
+
+        int64_t currentBytes = res.totalBytesBefore;
+
+        // First pass: mark retention prune
+        for (auto& mf : monthFiles) {
+            if (mf.pruneRetention) {
+                res.prunedFiles.push_back("memory/records/" + mf.month + ".jsonl");
+                res.prunedMonths.push_back(mf.month);
+                res.bytesFreed += mf.size;
+                currentBytes -= mf.size;
+            }
+        }
+
+        // Second pass: capacity limit prune (oldest remaining L1 files first)
+        if (limitBytes > 0 && currentBytes > limitBytes) {
+            for (auto& mf : monthFiles) {
+                if (mf.pruneRetention) continue; // already marked
+                mf.pruneCapacity = true;
+                res.prunedFiles.push_back("memory/records/" + mf.month + ".jsonl");
+                res.prunedMonths.push_back(mf.month);
+                res.bytesFreed += mf.size;
+                currentBytes -= mf.size;
+                if (currentBytes <= limitBytes) break;
+            }
+        }
+
+        // If not dry-run, actually delete the marked files
+        if (!options.dryRun) {
+            for (const auto& mf : monthFiles) {
+                if (mf.pruneRetention || mf.pruneCapacity) {
+                    fs::remove(mf.path, ec);
+                }
+            }
+        }
+
+        res.totalBytesAfter = res.totalBytesBefore - res.bytesFreed;
+        if (res.totalBytesAfter < 0) res.totalBytesAfter = 0;
+
+        if (limitBytes > 0) {
+            res.nearLimit = (res.totalBytesAfter >= static_cast<int64_t>(limitBytes * 0.8));
+            res.exceeded = (res.totalBytesAfter > limitBytes);
+            if (res.exceeded) {
+                res.warning = "Memory storage exceeds limit (" + FormatBytes(res.totalBytesAfter) + " > " +
+                              FormatBytes(limitBytes) + ") even after deleting L1 records. L2/L3 are preserved.";
+            } else if (res.nearLimit) {
+                res.warning = "Memory storage is near configured limit (" + FormatBytes(res.totalBytesAfter) +
+                              " / " + FormatBytes(limitBytes) + ", >= 80%). L2/L3 are preserved.";
+            }
+        }
+
+        return res;
+    } catch (const std::exception& e) {
+        res.ok = false;
+        res.error = std::string("memory prune failed: ") + e.what();
+        return res;
+    }
+}
+
+std::string PruneRunRecordsJson(const PruneOptions& options) {
+    PruneResult res = PruneRunRecords(options);
+    json out;
+    out["ok"] = res.ok;
+    if (!res.ok) {
+        out["error"] = res.error;
+        return DumpJson(out);
+    }
+    out["dryRun"] = res.dryRun;
+    out["retentionDays"] = res.retentionDays;
+    out["prunedFiles"] = res.prunedFiles;
+    out["prunedMonths"] = res.prunedMonths;
+    out["bytesFreed"] = res.bytesFreed;
+    out["totalBytesBefore"] = res.totalBytesBefore;
+    out["totalBytesAfter"] = res.totalBytesAfter;
+    out["limitBytes"] = res.limitBytes;
+    out["nearLimit"] = res.nearLimit;
+    out["exceeded"] = res.exceeded;
+    if (!res.warning.empty()) out["warning"] = res.warning;
+    return DumpJson(out);
+}
+
+PruneResult EnforceMemoryLimits(bool dryRun) {
+    int64_t limitBytes = GetConfiguredMemoryLimitBytes();
+    if (limitBytes <= 0) {
+        PruneResult r;
+        r.ok = true;
+        r.dryRun = dryRun;
+        return r;
+    }
+    PruneOptions opt;
+    opt.dryRun = dryRun;
+    opt.retentionDays = 0; // only prune to satisfy capacity limit
+    opt.limitBytes = limitBytes;
+    return PruneRunRecords(opt);
 }
 
 } // namespace memory

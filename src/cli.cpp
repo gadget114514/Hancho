@@ -1,11 +1,13 @@
 #include "cli.h"
 #include "common.h"
 #include "event_adapter.h"
+#include "llm_stream.h"
 #include "ipc_client.h"
 #include "memory_cli.h"
 #include "remote_client.h"
 #include "remote_hosts.h"
 #include "taskqueue.h"
+#include "cli_top.h"
 #include "nlohmann/json.hpp"
 #include <iostream>
 #include <sstream>
@@ -20,6 +22,9 @@
 #include <map>
 #include <cstdlib>
 #include <iomanip>
+#ifdef _WIN32
+#include <shellapi.h>
+#endif
 
 namespace pc {
 
@@ -365,6 +370,209 @@ int RunEventCommand(const std::vector<std::string>& args, size_t startIdx, bool 
     } else {
         std::cout << "Emitted " << kind << " to " << pipeName << "\n";
     }
+    return 0;
+}
+
+// hancho-cli usage stats|export|compact [options]
+int RunUsageCommand(const std::vector<std::string>& args, size_t startIdx, bool jsonOutput) {
+    auto printHelp = [&](std::ostream& os) {
+        os << "Usage: hancho-cli usage <subcommand> [options]\n\n"
+           << "Manage and query aggregated LLM token usage and estimated cost statistics.\n\n"
+           << "Subcommands:\n"
+           << "  stats    Query aggregated LLM token usage and estimated cost statistics\n"
+           << "  export   Export LLM token usage in CSV or JSON format\n"
+           << "  compact  Compact monthly delta logs into 1 line per date x engine x model\n\n"
+           << "Options for 'usage stats':\n"
+           << "  --group-by <day|month|engine|model>   Group results by day, month, engine, or model\n"
+           << "  --since <period|date>                 Start of time range (e.g. today, 24h, 7d, 30d, YYYY-MM-DD, YYYY-MM)\n"
+           << "  --until <period|date>                 End of time range (e.g. today, YYYY-MM-DD, YYYY-MM)\n"
+           << "  --json                                Output machine-readable JSON\n\n"
+           << "Options for 'usage export':\n"
+           << "  --format <csv|json>                   Export format (default: csv)\n"
+           << "  --group-by <day|month|engine|model>   Group results by day, month, engine, or model\n"
+           << "  --since <period|date>                 Start of time range (e.g. today, 24h, 7d, 30d, YYYY-MM-DD, YYYY-MM)\n"
+           << "  --until <period|date>                 End of time range (e.g. today, YYYY-MM-DD, YYYY-MM)\n"
+           << "  --out <path>                          Write output to file instead of stdout\n\n"
+           << "Options for 'usage compact':\n"
+           << "  --month <YYYY-MM>                     Compact a specific month (default: all months)\n"
+           << "  --json                                Output machine-readable JSON\n";
+    };
+
+    std::string op = (startIdx < args.size() && args[startIdx][0] != '-') ? args[startIdx] : "stats";
+    size_t optStart = (startIdx < args.size() && args[startIdx][0] != '-') ? startIdx + 1 : startIdx;
+
+    if (op == "--help" || op == "-h" || op == "help") {
+        printHelp(std::cout);
+        return 0;
+    }
+
+    if (op != "stats" && op != "export" && op != "compact") {
+        if (jsonOutput) {
+            std::cout << "{\"ok\":false,\"error\":\"unknown usage subcommand: " << JsonEscape(op) << " (expected: stats, export, compact)\"}\n";
+        } else {
+            std::cerr << "Error: unknown usage subcommand: " << op << " (expected: stats, export, compact)\n";
+            printHelp(std::cerr);
+        }
+        return 1;
+    }
+
+    if (op == "stats") {
+        LlmUsageStatsOptions opts;
+        for (size_t i = optStart; i < args.size(); ++i) {
+            const std::string& a = args[i];
+            if (a == "--help" || a == "-h") {
+                printHelp(std::cout);
+                return 0;
+            } else if ((a == "--group-by" || a == "--groupBy" || a == "-g") && i + 1 < args.size()) {
+                opts.groupBy = args[++i];
+            } else if ((a == "--since" || a == "-s") && i + 1 < args.size()) {
+                opts.since = args[++i];
+            } else if ((a == "--until" || a == "-u") && i + 1 < args.size()) {
+                opts.until = args[++i];
+            } else if (a == "--json" || a == "-j") {
+                jsonOutput = true;
+            } else {
+                if (jsonOutput) {
+                    std::cout << "{\"ok\":false,\"error\":\"unknown option: " << JsonEscape(a) << "\"}\n";
+                } else {
+                    std::cerr << "Error: unknown option: " << a << "\n";
+                }
+                return 1;
+            }
+        }
+
+        LlmUsageStatsResult res = QueryUsageStats(opts);
+        if (jsonOutput) {
+            nlohmann::json jres = UsageStatsResultToJson(res);
+            std::cout << jres.dump(2) << "\n";
+        } else {
+            std::cout << FormatUsageStatsTable(res);
+        }
+        return res.ok ? 0 : 1;
+    }
+
+    if (op == "export") {
+        std::string format = "csv";
+        std::string outPath;
+        LlmUsageStatsOptions opts;
+
+        for (size_t i = optStart; i < args.size(); ++i) {
+            const std::string& a = args[i];
+            if (a == "--help" || a == "-h") {
+                printHelp(std::cout);
+                return 0;
+            } else if ((a == "--format" || a == "-f") && i + 1 < args.size()) {
+                format = args[++i];
+                for (char& c : format) c = static_cast<char>(std::tolower(static_cast<unsigned char>(c)));
+            } else if ((a == "--out" || a == "-o") && i + 1 < args.size()) {
+                outPath = args[++i];
+            } else if ((a == "--group-by" || a == "--groupBy" || a == "-g") && i + 1 < args.size()) {
+                opts.groupBy = args[++i];
+            } else if ((a == "--since" || a == "-s") && i + 1 < args.size()) {
+                opts.since = args[++i];
+            } else if ((a == "--until" || a == "-u") && i + 1 < args.size()) {
+                opts.until = args[++i];
+            } else if (a == "--json" || a == "-j") {
+                format = "json";
+            } else {
+                if (jsonOutput) {
+                    std::cout << "{\"ok\":false,\"error\":\"unknown option: " << JsonEscape(a) << "\"}\n";
+                } else {
+                    std::cerr << "Error: unknown option: " << a << "\n";
+                }
+                return 1;
+            }
+        }
+
+        if (format != "csv" && format != "json") {
+            if (jsonOutput) {
+                std::cout << "{\"ok\":false,\"error\":\"unsupported export format: " << JsonEscape(format) << " (expected: csv, json)\"}\n";
+            } else {
+                std::cerr << "Error: unsupported export format: " << format << " (expected: csv, json)\n";
+            }
+            return 1;
+        }
+
+        LlmUsageStatsResult res = QueryUsageStats(opts);
+        if (!res.ok) {
+            if (jsonOutput) {
+                std::cout << "{\"ok\":false,\"error\":\"" << JsonEscape(res.error) << "\"}\n";
+            } else {
+                std::cerr << "Error: " << res.error << "\n";
+            }
+            return 1;
+        }
+
+        std::string content;
+        if (format == "json") {
+            content = UsageStatsResultToJson(res).dump(2) + "\n";
+        } else {
+            content = FormatUsageStatsCsv(res);
+        }
+
+        if (!outPath.empty()) {
+            std::wstring outW = Utf8ToWide(outPath);
+            WriteFileAtomicWide(outW, content);
+            if (jsonOutput) {
+                std::cout << "{\"ok\":true,\"format\":\"" << format << "\",\"path\":\"" << JsonEscape(outPath) << "\",\"bytes\":" << content.size() << "}\n";
+            } else {
+                std::cout << "Exported usage (" << format << ") to " << outPath << " (" << content.size() << " bytes)\n";
+            }
+        } else {
+            std::cout << content;
+        }
+        return 0;
+    }
+
+    if (op == "compact") {
+        std::string month;
+        for (size_t i = optStart; i < args.size(); ++i) {
+            const std::string& a = args[i];
+            if (a == "--help" || a == "-h") {
+                printHelp(std::cout);
+                return 0;
+            } else if ((a == "--month" || a == "-m") && i + 1 < args.size()) {
+                month = args[++i];
+            } else if (a == "--json" || a == "-j") {
+                jsonOutput = true;
+            } else {
+                if (jsonOutput) {
+                    std::cout << "{\"ok\":false,\"error\":\"unknown option: " << JsonEscape(a) << "\"}\n";
+                } else {
+                    std::cerr << "Error: unknown option: " << a << "\n";
+                }
+                return 1;
+            }
+        }
+
+        LlmUsageCompactResult res = CompactDailyUsage(month);
+        if (!res.ok) {
+            if (jsonOutput) {
+                std::cout << "{\"ok\":false,\"error\":\"" << JsonEscape(res.error) << "\"}\n";
+            } else {
+                std::cerr << "Error: " << res.error << "\n";
+            }
+            return 1;
+        }
+
+        if (jsonOutput) {
+            nlohmann::json j;
+            j["ok"] = true;
+            j["filesProcessed"] = res.filesProcessed;
+            j["filesCompacted"] = res.filesCompacted;
+            j["linesBefore"] = res.linesBefore;
+            j["linesAfter"] = res.linesAfter;
+            j["bytesSaved"] = res.bytesSaved;
+            std::cout << j.dump(2) << "\n";
+        } else {
+            std::cout << "Compacted " << res.filesProcessed << " usage file(s) ("
+                      << res.filesCompacted << " modified): "
+                      << res.linesBefore << " lines -> " << res.linesAfter << " lines (saved "
+                      << res.bytesSaved << " bytes).\n";
+        }
+        return 0;
+    }
+
     return 0;
 }
 
@@ -2064,6 +2272,19 @@ DATA DIRECTORY (per invocation):
       6. Verify: hancho-cli.exe --data-dir <path> help --json prints
          "effective_data_dir", and the dashboard status bar shows the same path.
 
+HOW TO USE HANCHO (process vs task):
+  `start` only launches and supervises one process. It is NOT a Hancho task:
+  it has no job id, task history, success checks, retries or per-model usage.
+  To use Hancho as the orchestration layer, register the work as a task:
+    hancho-cli.exe taskqueue add --file jobs.json --taskqueue main
+    hancho-cli.exe run --file queue.json --exit-on-drain
+    hancho-cli.exe bt start --file tree.json
+  Only taskqueue / behavior-tree jobs appear in the task list and count toward
+  per-engine/model LLM usage. Workers must emit a JSON stream and receive
+  --model (opencode: `opencode run --format json --model <provider/model>`).
+  Use `start --pty` only to host an interactive TUI; treat it as a terminal,
+  not as a tracked task.
+
 HANCHO-CLI CONCEPTS:
   Process IDs : Numeric IDs assigned by the dashboard (#1, #2, ...). Use them with
                 list --id, logs --id, send --id, wait --id and kill --id.
@@ -2105,6 +2326,7 @@ EXAMPLES:
   hancho-cli.exe send --id 1 --input "status"
   hancho-cli.exe taskqueue add --file jobs.json --taskqueue main
   hancho-cli.exe run --file queue.json --exit-on-drain --report junit.xml
+  hancho-cli.exe bt start --file tree.json
   hancho-cli.exe mcp install --client opencode
 
 COMMANDS:
@@ -2116,6 +2338,9 @@ COMMANDS:
 
   start [options] -- <command...>
       Start a managed process (e.g. claude, opencode) under a Win32 Job Object.
+      This is a plain managed process, NOT a task: no job id, task history,
+      success checks, retries or per-model usage. Use `taskqueue add`,
+      `run --file` or `bt start` to register the work as a task.
       Options:
         --cmd "<command>"        Command line to execute
         --name <label>           Display name on dashboard (e.g. "opencode-worker")
@@ -2163,6 +2388,9 @@ COMMANDS:
   top [--once] [--interval <ms>]
       Terminal view of the headless core (queue and process list). POSIX screen.
 
+  web [--print-url]
+      Open the browser UI dashboard (or print URL with session token).
+
   event emit --kind <kind> [--text <text>] [--tool <name>] [--activity <a>] [--target <t>]
              [--status <s>] [--data <json>] [--pipe <name>]
       Write one hancho.event/1 line to HANCHO_EVENT_PIPE (set for pipe-mode workers).
@@ -2174,11 +2402,11 @@ COMMANDS:
   worker status <id>
       Show current worker status, active tool, thoughts, message, and supervisor context.
 
-  worker stream <id> [--tail <n>] [--type <type>] [--since <seq>] [--summary] [--schema <legacy|v1>]
+  worker stream <id> [--tail <n>] [--type <kind>] [--since <seq>] [--summary] [--schema <v1>]
       View captured JSON streaming events for claude, agy, or opencode workers.
       --schema v1 (default) returns the stable hancho.event/1 shape from <log>.events.jsonl.
-      --schema legacy returns the deprecated internal type strings and is removed in v0.11.0.
-      With v1, --type matches the kind (tool.call, message, ...).
+      --schema legacy is not supported (removed in v0.11.0).
+      --type matches the kind (tool.call, message, ...).
 
   worker info <id> [--notes "<notes>"] [--goal "<goal>"]
       Update supervisor notes or goal for an ongoing worker.
@@ -2205,6 +2433,15 @@ COMMANDS:
       Remove the Hancho entry from the MCP config (the inverse of mcp install).
       The data directory is kept by default; add --delete-data-dir to delete it too.
       The data directory is the one embedded by mcp install, --data-dir, or the default.
+
+  usage stats [--group-by day|month|engine|model] [--since <period|date>] [--until <period|date>]
+      Query aggregated LLM token usage and estimated cost statistics from daily rollup logs.
+
+  usage export [--format csv|json] [--group-by day|month|engine|model] [--since <period|date>] [--until <period|date>] [--out <file>]
+      Export LLM token usage to CSV or JSON format.
+
+  usage compact [--month YYYY-MM]
+      Compact monthly daily usage logs into one record per date x engine x model.
 
 LEAVING HANCHO (graduation):
   Stop using Hancho without losing your work:
@@ -2316,6 +2553,9 @@ REMOTE HOSTS:
       jobs updated within the period (30m, 6h, 2d), e.g. --since 6h.
       --bt <id> lists every job of a behavior tree across its parallel branch queues.
       --origin self keeps only the jobs this session added.
+
+  taskqueue record-plain --cmd <cmd> [--name <name>] [--exit-code <n>] [--log <path>] [--summary <text>]
+      Record a plain execution outside a queue into logs/taskqueues/plain.json.
 
   taskqueue get <id> [--rev <n>] [--no-instructions]
   taskqueue why <id>
@@ -2483,6 +2723,7 @@ void PrintCliUsageJson() {
     ]
   },
   "concepts": {
+    "process_vs_task": "A process started with 'start' is not a task: it has no job id, task history, success checks, retries or per-model usage. Register work with 'taskqueue add', 'run --file' or 'bt start' to make it a task. Only taskqueue/behavior-tree jobs appear in task lists and count toward per-engine/model LLM usage. A worker records usage only when it emits a JSON stream and receives --model (opencode: 'opencode run --format json --model <provider/model>'). Use 'start --pty' only to host an interactive TUI.",
     "process_ids": "Numeric IDs assigned by the dashboard (#1, #2, ...); use them with list/logs/send/wait/kill.",
     "data_dir": "Logs, state, task queues and config live in one data directory. Pass --data-dir <path> on every hancho-cli invocation (or embed it with hancho-cli mcp install --data-dir) to keep that data inside the current project for git. Each data directory has its own dashboard instance and Named Pipe.",
     "modes": {
@@ -2516,6 +2757,7 @@ void PrintCliUsageJson() {
     "hancho-cli.exe send --id 1 --input \"status\"",
     "hancho-cli.exe taskqueue add --file jobs.json --taskqueue main",
     "hancho-cli.exe run --file queue.json --exit-on-drain --report junit.xml",
+    "hancho-cli.exe bt start --file tree.json",
     "hancho-cli.exe mcp install --client opencode"
   ],
   "commands": [
@@ -2543,7 +2785,7 @@ void PrintCliUsageJson() {
     {
       "name": "start",
       "aliases": ["run"],
-      "description": "Start a managed process under a Win32 Job Object and display it in the dashboard. Use '--' to pass the command line verbatim. Add --wait (with --wait-ms 0) to block until completion. With --file, 'run' instead registers a task queue, waits until it drains and writes an optional JUnit report (see run: hancho-cli run --file <queue.json> --exit-on-drain --report <junit.xml>).",
+      "description": "Start a managed process under a Win32 Job Object and display it in the dashboard. NOTE: this is a plain managed process, not a task; it has no job id, task history, success checks, retries or per-model usage. Register work with taskqueue add, run --file or bt start to make it a task. Use '--' to pass the command line verbatim. Add --wait (with --wait-ms 0) to block until completion. With --file, 'run' instead registers a task queue, waits until it drains and writes an optional JUnit report (see run: hancho-cli run --file <queue.json> --exit-on-drain --report <junit.xml>).",
       "usage": "hancho-cli start [options] [--wait] [--wait-ms <ms>] -- <command...>",
       "options": [
         {"name": "--cmd", "value": "<command>", "description": "Command line to execute."},
@@ -2607,7 +2849,7 @@ void PrintCliUsageJson() {
     },
     {
       "name": "top",
-      "description": "Terminal view of the headless core (queue and process list).",
+      "description": "Terminal dashboard for headless cores (processes, queues, remote jobs, and interactive operations).",
       "usage": "hancho-cli top [--once] [--interval <ms>]",
       "options": [
         {"name": "--once", "description": "Print one snapshot and exit."},
@@ -2664,6 +2906,7 @@ void PrintCliUsageJson() {
       "subcommands": [
         {"name": "add", "usage": "hancho-cli taskqueue add --file <jobs.json> [--taskqueue <name>] [--concurrency <n>] [--notify-file <path>] [--origin-label <text>]", "description": "Register jobs. Each job needs id, command, summary and timeoutSec; dependsOn replaces shell chaining. The caller's session id, working folder and --origin-label are recorded as the job's origin."},
         {"name": "list", "usage": "hancho-cli taskqueue list [<name>] [--state <state>] [--since <period>] [--origin <self|label|session>] [--bt <id>]", "description": "List jobs with state, queue, summary and blockedBy. --since keeps only jobs updated within the period (e.g. 30m, 6h, 2d). --origin self keeps only the jobs this session added. --bt <id> lists every job of a behavior tree across its parallel branch queues."},
+        {"name": "record-plain", "usage": "hancho-cli taskqueue record-plain --cmd <cmd> [--name <name>] [--exit-code <n>] [--log <path>] [--summary <text>]", "description": "Record a plain execution outside a queue into logs/taskqueues/plain.json."},
         {"name": "get", "usage": "hancho-cli taskqueue get <id> [--rev <n>] [--no-instructions]", "description": "Show one job with attempts and instructions."},
         {"name": "why", "usage": "hancho-cli taskqueue why <id>", "description": "Explain why the last attempt failed: failure class, confidence, summary, suggested action, last activity and evidence (event seq / log line), plus the class of every attempt. Reads the job without instructions."},
         {"name": "retry", "usage": "hancho-cli taskqueue retry <id> | hancho-cli taskqueue retry --failed [<name>] [--since <period>]", "description": "Requeue a failed/blocked/cancelled job; blocked dependents resume automatically. --failed retries every failed job instead, optionally limited to one queue and to jobs that failed within --since (e.g. --since 6h = last 6 hours)."},
@@ -2725,17 +2968,17 @@ void PrintCliUsageJson() {
       "usage": "hancho-cli worker <status|stream|info|install-template|uninstall-template> [<id>] [options]",
       "subcommands": [
         {"name": "status", "usage": "hancho-cli worker status <id>", "description": "Display current worker status, model, active tool, thoughts, message, supervisor context, and Claude sub-agents (subagents array)."},
-        {"name": "stream", "usage": "hancho-cli worker stream <id> [--tail <n>] [--type <type>] [--since <seq>] [--summary] [--schema <legacy|v1>]", "description": "View captured JSON streaming events from <log>.stream.jsonl (parsed tool_call/tool_result/thinking/message, subagent_start/subagent_end with parent_tool_use_id and agent_id). --schema v1 (the default) returns the stable hancho.event/1 shape from <log>.events.jsonl; --schema legacy returns the deprecated internal type strings and is removed in v0.11.0."},
+        {"name": "stream", "usage": "hancho-cli worker stream <id> [--tail <n>] [--type <kind>] [--since <seq>] [--summary] [--schema <v1>]", "description": "View captured JSON streaming events from <log>.events.jsonl (hancho.event/1). --schema legacy is not supported (removed in v0.11.0)."},
         {"name": "info", "usage": "hancho-cli worker info <id> [--notes <notes>] [--goal <goal>]", "description": "Update supervisor instructions, notes, or goals."},
         {"name": "install-template", "usage": "hancho-cli worker install-template [--path <dir>] [--dry-run] [--json]", "description": "Write .claude/agents/hancho-runner.md (a Claude Code subagent that runs long commands through Hancho) under <dir>. Default: the current directory. An existing file is not overwritten."},
         {"name": "uninstall-template", "usage": "hancho-cli worker uninstall-template [--path <dir>] [--delete-data-dir] [--dry-run] [--json]", "description": "Remove .claude/agents/hancho-runner.md (the inverse of install-template); empty .claude/agents and .claude directories are removed too. Add --delete-data-dir to also delete the data directory."}
       ],
       "options": [
         {"name": "--tail", "value": "<n>", "description": "For stream: number of recent events."},
-        {"name": "--type", "value": "<type>", "description": "For stream: filter by event type in the legacy shape, or by kind when schema is v1 (e.g. tool.call, message)."},
+        {"name": "--type", "value": "<kind>", "description": "For stream: filter by event kind (e.g. tool.call, message)."},
         {"name": "--since", "value": "<seq>", "description": "For stream: only events with seq > N."},
-        {"name": "--summary", "description": "For stream: show the text summary (uses the legacy shape)."},
-        {"name": "--schema", "value": "<legacy|v1>", "description": "For stream: event shape. 'v1' (default) returns hancho.event/1 from <log>.events.jsonl; 'legacy' returns the deprecated internal type strings and is removed in v0.11.0."},
+        {"name": "--summary", "description": "For stream: show the text summary."},
+        {"name": "--schema", "value": "<v1>", "description": "For stream: event shape. 'v1' (default) returns hancho.event/1 from <log>.events.jsonl; 'legacy' is not supported (removed in v0.11.0)."},
         {"name": "--path", "value": "<dir>", "description": "For install-template/uninstall-template: project directory that holds .claude/agents/hancho-runner.md. Default: current directory."},
         {"name": "--dry-run", "description": "For install-template/uninstall-template: print the target without writing or deleting it."},
         {"name": "--delete-data-dir", "description": "For uninstall-template: also delete the data directory (kept by default)."},
@@ -2769,6 +3012,24 @@ void PrintCliUsageJson() {
         {"name": "--author", "value": "<human|hancho>", "description": "For note: author type (agents write through MCP memory_note)."},
         {"name": "--reason", "value": "<text>", "description": "For retract: why the note is being retracted."},
         {"name": "--since", "value": "<period>", "description": "Only records newer than a duration (30m, 6h, 2d) or a date/timestamp."}
+      ]
+    },
+    {
+      "name": "usage",
+      "description": "Manage and query aggregated LLM token usage and estimated cost statistics (U1) across daily rollup logs.",
+      "usage": "hancho-cli usage <stats|export|compact> [options]",
+      "subcommands": [
+        {"name": "stats", "usage": "hancho-cli usage stats [--group-by day|month|engine|model] [--since <period|date>] [--until <period|date>]", "description": "Display aggregated LLM token usage and cost from daily rollup logs."},
+        {"name": "export", "usage": "hancho-cli usage export [--format csv|json] [--group-by day|month|engine|model] [--since <period|date>] [--until <period|date>] [--out <path>]", "description": "Export LLM token usage data in CSV or JSON format."},
+        {"name": "compact", "usage": "hancho-cli usage compact [--month <YYYY-MM>]", "description": "Compact monthly daily usage logs into one record per date x engine x model."}
+      ],
+      "options": [
+        {"name": "--group-by", "value": "<day|month|engine|model>", "description": "Group aggregation by day, month, engine, or model."},
+        {"name": "--since", "value": "<period|date>", "description": "Start of time range (e.g. today, 24h, 7d, 30d, YYYY-MM-DD, YYYY-MM)."},
+        {"name": "--until", "value": "<period|date>", "description": "End of time range (e.g. today, YYYY-MM-DD, YYYY-MM)."},
+        {"name": "--format", "value": "<csv|json>", "description": "Export format (default: csv)."},
+        {"name": "--out", "value": "<path>", "description": "Write export to file instead of stdout."},
+        {"name": "--month", "value": "<YYYY-MM>", "description": "Compact a specific month (default: all months)."}
       ]
     },
     {
@@ -2854,7 +3115,7 @@ void PrintCliUsageJson() {
       "hancho-cli_start_example": "hancho-cli start --name opencode --cmd \"opencode run ...\" --json-stream --agent-type opencode --wait --wait-ms 0 --json",
       "notes": [
         "Hancho auto-detects common worker CLIs (claude, agy/antigravity, opencode, codex, aider, ollama) and enables JSON stream parsing if detected.",
-        "Parsed events are written to <logfile>.stream.jsonl, and their normalized hancho.event/1 form to <logfile>.events.jsonl. Use GUI context menu 'LLM JSON Stream Events...' or 'hancho-cli worker stream <id>'. v1 is the default shape; --schema legacy returns the deprecated internal type strings and is removed in v0.11.0.",
+        "Parsed events are written to <logfile>.stream.jsonl, and their normalized hancho.event/1 form to <logfile>.events.jsonl. Use GUI context menu 'LLM JSON Stream Events...' or 'hancho-cli worker stream <id>'. Events use the stable hancho.event/1 shape; legacy type strings were removed in v0.11.0.",
         "Model is captured from stream fields (model/modelId/llm.model/metadata.model) when present; hover the agent icon in the stream dialog to see it.",
         "Format reference: doc/LLM-jsonstream-format.md"
       ]
@@ -3581,36 +3842,8 @@ int PrintResponse(const std::string& action, const std::string& respJson, bool j
             }
             return 0;
         }
-        std::string summary = JsonGetString(respJson, "summary", "");
-        if (!summary.empty()) {
-            std::cout << summary << "\n";
-            return 0;
-        }
-        std::string stateObj = ExtractJsonObject(respJson, "state");
-        if (!stateObj.empty()) {
-            std::cout << "Worker State: [" << JsonGetString(stateObj, "agent_type", "") << "] "
-                      << JsonGetString(stateObj, "status", "") << "\n";
-            std::string curTool = JsonGetString(stateObj, "current_tool", "");
-            if (!curTool.empty()) {
-                std::cout << "  Active Tool: " << curTool << " (" << JsonGetString(stateObj, "current_tool_action", "") << ")\n";
-            }
-        }
-        auto events = ExtractJsonObjectArray(respJson, "events");
-        std::cout << "Events (" << events.size() << "):\n";
-        for (const auto& ev : events) {
-            std::cout << "  #" << JsonGetInt(ev, "seq", 0) << " [" << JsonGetString(ev, "type", "") << "]";
-            std::string tn = JsonGetString(ev, "tool_name", "");
-            if (!tn.empty()) std::cout << " tool=" << tn;
-            std::string ta = JsonGetString(ev, "tool_action", "");
-            if (!ta.empty()) std::cout << " (" << ta << ")";
-            std::string cnt = JsonGetString(ev, "content", "");
-            if (!cnt.empty()) {
-                if (cnt.size() > 80) cnt = cnt.substr(0, 77) + "...";
-                std::cout << " : " << cnt;
-            }
-            std::cout << "\n";
-        }
-        return 0;
+        std::cerr << "Error: unsupported stream schema (only hancho.event/1 is supported).\n";
+        return 1;
     }
 
     if (action == "get_agent_state") {
@@ -3710,65 +3943,71 @@ static int RunProjectReset(const std::vector<std::string>& args, bool jsonOutput
     return 0;
 }
 
-// hancho-cli top: a small terminal view for headless cores (doc/design-v3.md 2.4).
-// It polls the same `list` request the GUI uses; no local state is kept.
-static int RunTopCommand(const std::vector<std::string>& args, bool jsonOutput) {
-    int intervalMs = 1000;
-    bool once = false;
+static int RunWebCommand(const std::vector<std::string>& args, bool jsonOutput) {
+    bool printUrlOnly = false;
     for (size_t i = 2; i < args.size(); ++i) {
-        if (args[i] == "--once") once = true;
-        else if ((args[i] == "--interval" || args[i] == "--interval-ms") && i + 1 < args.size()) {
-            try { intervalMs = std::max(100, std::stoi(args[++i])); } catch (...) {}
-        } else if (!args[i].empty() && args[i][0] != '-') {
-            // Accept an ignored queue name so `top main` works like the other commands.
-        } else {
-            std::cerr << "Error: unknown option for top: " << args[i]
-                      << " (use: hancho-cli top [--once] [--interval <ms>])\n";
-            return 1;
+        if (args[i] == "--print-url" || args[i] == "-p" || args[i] == "--url") {
+            printUrlOnly = true;
         }
     }
 
-    while (true) {
-        std::string resp;
-        std::string err;
-        if (!SendIpcRequest("{\"action\":\"list\"}", resp, err, true)) {
-            std::cerr << "Error: " << err << "\n";
-            return 1;
-        }
-        if (jsonOutput) {
-            std::cout << resp << "\n";
-        } else {
-            nlohmann::json j = nlohmann::json::parse(resp, nullptr, false);
-            if (j.is_discarded() || !j.value("ok", false)) {
-                std::cerr << "Error: invalid response from core\n";
-                return 1;
-            }
-            std::cout << "\x1b[2J\x1b[H";
-            std::cout << "Hancho top  " << GetCurrentTimestampStr()
-                      << "  (Ctrl+C to quit)\n";
-            std::cout << "---- ----  ----------------  ----------  --------  ------------------------------\n";
-            std::cout << " ID  PID   STATE             ELAPSED     CPU       LAST LINE\n";
-            std::cout << "---- ----  ----------------  ----------  --------  ------------------------------\n";
-            if (j.contains("processes") && j["processes"].is_array()) {
-                for (const auto& p : j["processes"]) {
-                    std::string id = std::to_string(p.value("id", 0));
-                    std::string pid = std::to_string(p.value("pid", 0));
-                    std::string state = p.value("state", "");
-                    std::string elapsed = p.value("elapsed_str", p.value("uptime_str", ""));
-                    std::string cpu = p.value("cpu_time_str", "");
-                    std::string last = p.value("last_line", "");
-                    if (last.size() > 30) last = last.substr(last.size() - 30);
-                    std::cout << std::setw(4) << id << " " << std::setw(5) << pid << "  "
-                              << std::left << std::setw(16) << state.substr(0, 16) << "  "
-                              << std::setw(10) << elapsed.substr(0, 10) << "  "
-                              << std::setw(8) << cpu.substr(0, 8) << "  " << last << "\n";
-                }
-            }
-            std::cout.flush();
-        }
-        if (once) return 0;
-        SleepMs(static_cast<uint32_t>(intervalMs));
+    std::wstring dataDir = GetEffectiveDataDirectoryWide();
+    std::wstring tokenPath = PathJoinWide(dataDir, L".webui_token");
+    std::wstring portPath = PathJoinWide(dataDir, L".webui_port");
+
+    std::string token;
+    uint16_t port = 9138;
+
+    std::ifstream tf(tokenPath, std::ios::binary);
+    if (tf) {
+        std::getline(tf, token);
+        while (!token.empty() && (token.back() == '\r' || token.back() == '\n' || token.back() == ' ')) token.pop_back();
     }
+    std::ifstream pf(portPath, std::ios::binary);
+    if (pf) {
+        std::string pStr;
+        std::getline(pf, pStr);
+        try { if (!pStr.empty()) port = static_cast<uint16_t>(std::stoi(pStr)); } catch (...) {}
+    }
+
+    std::string url = "http://127.0.0.1:" + std::to_string(port) + "/";
+    if (!token.empty()) {
+        url += "?token=" + token;
+    }
+
+    if (jsonOutput) {
+        nlohmann::json out;
+        out["ok"] = true;
+        out["url"] = url;
+        out["port"] = port;
+        out["token"] = token;
+        std::cout << out.dump(2) << "\n";
+        return 0;
+    }
+
+    if (printUrlOnly) {
+        std::cout << url << "\n";
+        return 0;
+    }
+
+    std::cout << "Opening Hancho WebUI: " << url << "\n";
+
+#ifdef _WIN32
+    ShellExecuteW(nullptr, L"open", Utf8ToWide(url).c_str(), nullptr, nullptr, SW_SHOWNORMAL);
+#elif defined(__APPLE__)
+    std::string cmd = "open \"" + url + "\" >/dev/null 2>&1 &";
+    (void)std::system(cmd.c_str());
+#else
+    std::string cmd = "xdg-open \"" + url + "\" >/dev/null 2>&1 &";
+    (void)std::system(cmd.c_str());
+#endif
+    return 0;
+}
+
+// hancho-cli top: terminal dashboard for headless cores (doc/design-v3.md 2.4, doc/tui-design-ja.md).
+// Features interactive tab navigation, process/queue monitoring, and raw mode handling.
+static int RunTopCommand(const std::vector<std::string>& args, bool jsonOutput) {
+    return top::RunTopLoop(args, jsonOutput);
 }
 
 // hancho-cli memory stats --compare-inject: memory/records joined with task queue
@@ -4455,7 +4694,9 @@ int RunCli(const std::vector<std::string>& rawArgs) {
     if (subcmd == "export") return RunExportCommand(args, 2, jsonOutput);
     if (subcmd == "reset") return RunProjectReset(args, jsonOutput);
     if (subcmd == "top") return RunTopCommand(args, jsonOutput);
+    if (subcmd == "web" || subcmd == "ui") return RunWebCommand(args, jsonOutput);
     if (subcmd == "hosts") return RunHostsCommand(args, jsonOutput);
+    if (subcmd == "usage") return RunUsageCommand(args, 2, jsonOutput);
     if (subcmd == "memory") {
         bool compareInject = false;
         for (size_t i = 2; i < args.size(); ++i) {
@@ -4851,6 +5092,39 @@ if (subcmd == "start" || subcmd == "run") {
                     << ",\"notify_file\":\"" << JsonEscape(notifyFile) << "\""
                     << ",\"origin\":" << BuildCallerOriginJson("hancho-cli-cli", argVal("--origin-label", "")) << "}";
             subcmd = "taskqueue_add";
+        } else if (op == "record-plain") {
+            std::string cmd = argVal("--cmd", "");
+            std::string name = argVal("--name", "");
+            std::string cwd = argVal("--cwd", "");
+            std::string logFile = argVal("--log", argVal("--log-file", ""));
+            std::string exitCodeStr = argVal("--exit-code", "0");
+            std::string startTs = argVal("--start", "");
+            std::string endTs = argVal("--end", "");
+            std::string jobId = argVal("--job-id", argVal("--id", ""));
+            std::string summary = argVal("--summary", "");
+            int ec = 0;
+            try { ec = std::stoi(exitCodeStr); } catch (...) { ec = 0; }
+            if (cmd.empty() && name.empty()) return failWith("--cmd or --name is required.");
+            PlainRunState st;
+            st.jobId = jobId;
+            st.name = name;
+            st.summary = summary;
+            st.command = cmd;
+            st.cwd = cwd;
+            st.logFile = logFile;
+            st.exitCode = ec;
+            st.start = startTs;
+            st.end = endTs;
+            std::string err;
+            if (!SavePlainRunStateDirect(st, err)) {
+                return failWith(err.empty() ? "failed to save plain run state" : err);
+            }
+            if (jsonOutput) {
+                std::cout << "{\"ok\":true,\"job_id\":\"" << JsonEscape(st.jobId.empty() ? "j_plain" : st.jobId) << "\",\"taskqueue\":\"plain\"}\n";
+            } else {
+                std::cout << "Recorded plain run in taskqueue 'plain'.\n";
+            }
+            return 0;
         } else if (op == "list") {
             std::string tqName = positionalSkippingValues(3);
             std::string state = argVal("--state", "");
@@ -5224,8 +5498,6 @@ if (subcmd == "start" || subcmd == "run") {
             }
         }
 
-        if (format == "summary" && !schemaSpecified) schema = "legacy";
-
         if (id <= 0) {
             if (jsonOutput) {
                 std::cout << "{\"ok\":false,\"error\":\"Process ID required for worker command (e.g. hancho-cli worker status 1).\"}\n";
@@ -5240,6 +5512,22 @@ if (subcmd == "start" || subcmd == "run") {
             reqJson << "{\"action\":\"get_agent_state\",\"id\":" << id << "}";
             subcmd = "get_agent_state";
         } else if (op == "stream" || op == "events") {
+            if (schema == "legacy") {
+                if (jsonOutput) {
+                    std::cout << "{\"ok\":false,\"error\":\"schema 'legacy' is not supported; legacy format was removed in v0.11.0, use 'v1' (hancho.event/1)\"}\n";
+                } else {
+                    std::cerr << "Error: schema 'legacy' is not supported; legacy format was removed in v0.11.0, use 'v1' (hancho.event/1).\n";
+                }
+                return 1;
+            }
+            if (schema != "v1" && schema != "hancho.event/1") {
+                if (jsonOutput) {
+                    std::cout << "{\"ok\":false,\"error\":\"unsupported schema: " + JsonEscape(schema) + "; only 'v1' (hancho.event/1) is supported\"}\n";
+                } else {
+                    std::cerr << "Error: unsupported schema: " + schema + "; only 'v1' (hancho.event/1) is supported.\n";
+                }
+                return 1;
+            }
             reqJson << "{\"action\":\"get_agent_stream\",\"id\":" << id
                     << ",\"tail\":" << tail
                     << ",\"type\":\"" << JsonEscape(typeFilter) << "\""

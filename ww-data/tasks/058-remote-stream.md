@@ -1,6 +1,6 @@
 # 058 — WebSocket 1 本でのログの常時ストリーミング
 
-Estimate 300 min
+Estimate 235 min
 Splittable: no
 
 ## 目的
@@ -9,12 +9,11 @@ Splittable: no
 
 ## やること
 
-- [ ] WebSocket 1 接続で複数の要求を運べるようにする（要求 id の照合）。
-- [ ] 購読のアクションを追加する。リモートの `.stream.jsonl` / `.events.jsonl` / `.tail.txt` への追記を、手元に順序どおり流す。
-- [ ] 購読の切断と再購読（再開位置は seq で指定）を行えるようにする。
-- [ ] 手元のダッシュボードのリモートジョブの監視ペインを、流れてきたデータで更新する。
-- [ ] `doc/remote-hosts.md` の「1 接続 1 要求」の制限を書き換える。
-- [ ] スモークテストを追加する。
+子カードに分解した。個々の作業は子カードで管理する:
+
+- [ ] `ww-data/tasks/058-1-ws-multiplex.md` — WebSocket 1 本での複数要求
+- [ ] `ww-data/tasks/058-2-ws-subscribe.md` — 購読アクションと seq による再開
+- [ ] `ww-data/tasks/058-3-ws-pane-doc.md` — 監視ペインへの反映と文書・スモーク
 
 ## 完了条件
 

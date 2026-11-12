@@ -13,6 +13,9 @@
 #include <cstdio>
 #include <cstdlib>
 #include <fstream>
+#include <filesystem>
+#include <iomanip>
+#include <map>
 #include <regex>
 #include <chrono>
 #include <ctime>
@@ -71,9 +74,33 @@ static std::mutex g_usageHistoryMutex;
 static std::deque<LlmUsagePoint> g_usageHistory;
 static bool g_usageHistoryLoaded = false;
 static bool g_usageHistoryPersist = false;
+static bool g_dailyUsagePersist = true;
 static std::mutex g_usageFileMutex;
 static std::atomic<uint64_t> g_recordCalls{0};
+static std::atomic<int64_t> g_lastUsagePruneSec{0};
 static std::string g_lastSkipReason;
+
+#ifdef _WIN32
+static inline int64_t UtcTimeFromTm(std::tm* tmv) {
+    return static_cast<int64_t>(_mkgmtime64(tmv));
+}
+#else
+static inline int64_t UtcTimeFromTm(std::tm* tmv) {
+    return static_cast<int64_t>(timegm(tmv));
+}
+#endif
+
+static bool IsValidYearMonth(const std::string& ym) {
+    if (ym.size() != 7) return false;
+    for (size_t i = 0; i < 7; ++i) {
+        if (i == 4) {
+            if (ym[i] != '-') return false;
+        } else {
+            if (!std::isdigit(static_cast<unsigned char>(ym[i]))) return false;
+        }
+    }
+    return true;
+}
 
 static std::wstring UsageHistoryPathWide() {
     return PathJoinWide(GetLogsDirectoryWide(), L"usage_history.jsonl");
@@ -112,6 +139,740 @@ static void LoadUsageHistoryLocked() {
 
 } // namespace
 
+std::wstring GetDailyUsageDirWide() {
+    return (std::filesystem::path(GetLogsDirectoryWide()) / L"usage" / L"daily").wstring();
+}
+
+std::wstring GetDailyUsagePathWide(const std::string& yearMonth) {
+    std::string safeYm = IsValidYearMonth(yearMonth) ? yearMonth : SanitizeFileNameComponent(yearMonth);
+    return (std::filesystem::path(GetDailyUsageDirWide()) / (Utf8ToWide(safeYm) + L".jsonl")).wstring();
+}
+
+void SetDailyUsagePersistence(bool enabled) {
+    std::lock_guard<std::mutex> lock(g_usageHistoryMutex);
+    g_dailyUsagePersist = enabled;
+}
+
+bool IsDailyUsagePersistence() {
+    std::lock_guard<std::mutex> lock(g_usageHistoryMutex);
+    return g_dailyUsagePersist;
+}
+
+nlohmann::json DailyUsageRecordToJson(const LlmDailyUsageRecord& rec) {
+    nlohmann::json j;
+    j["schema"] = rec.schema.empty() ? "hancho.usage.day/1" : rec.schema;
+    j["date"] = rec.date;
+    j["tzOffsetMin"] = rec.tzOffsetMin;
+    j["engine"] = rec.engine;
+    j["model"] = rec.model;
+    j["inputTokens"] = rec.inputTokens;
+    j["outputTokens"] = rec.outputTokens;
+    j["thinkingTokens"] = rec.thinkingTokens;
+    j["cacheReadTokens"] = rec.cacheReadTokens;
+    j["cacheWriteTokens"] = rec.cacheWriteTokens;
+    j["totalTokens"] = rec.totalTokens;
+    j["costUsd"] = rec.costUsd;
+    if (!rec.costKnown) {
+        j["costKnown"] = false;
+    }
+    j["runs"] = rec.runs;
+    j["firstEpochSec"] = rec.firstEpochSec;
+    j["lastEpochSec"] = rec.lastEpochSec;
+    return j;
+}
+
+static inline bool EngineReportsCost(const std::string& engine) {
+    return (engine == "claude" || engine == "opencode");
+}
+
+bool ParseDailyUsageRecordJson(const nlohmann::json& j, LlmDailyUsageRecord& out) {
+    if (!j.is_object()) return false;
+    out = LlmDailyUsageRecord{};
+    out.schema = j.value("schema", "hancho.usage.day/1");
+    out.date = j.value("date", std::string());
+    out.tzOffsetMin = j.value("tzOffsetMin", 0);
+    out.engine = j.value("engine", std::string());
+    if (out.engine.empty()) out.engine = j.value("agentType", std::string());
+    out.model = j.value("model", std::string());
+    out.inputTokens = j.value("inputTokens", (uint64_t)0);
+    out.outputTokens = j.value("outputTokens", (uint64_t)0);
+    out.thinkingTokens = j.value("thinkingTokens", (uint64_t)0);
+    out.cacheReadTokens = j.value("cacheReadTokens", (uint64_t)0);
+    out.cacheWriteTokens = j.value("cacheWriteTokens", (uint64_t)0);
+    out.totalTokens = j.value("totalTokens", (uint64_t)0);
+    out.costUsd = j.value("costUsd", 0.0);
+    if (j.contains("costKnown")) {
+        out.costKnown = j.value("costKnown", true);
+    } else {
+        out.costKnown = (out.costUsd > 0.0 || (EngineReportsCost(out.engine) && out.totalTokens == 0));
+    }
+    out.runs = j.value("runs", (uint64_t)0);
+    out.firstEpochSec = j.value("firstEpochSec", (int64_t)0);
+    out.lastEpochSec = j.value("lastEpochSec", (int64_t)0);
+    if (out.firstEpochSec == 0 && j.contains("epochSec")) {
+        out.firstEpochSec = j.value("epochSec", (int64_t)0);
+        if (out.lastEpochSec == 0) out.lastEpochSec = out.firstEpochSec;
+    }
+    return !out.date.empty();
+}
+
+void PruneUsageHistory(int64_t retentionSec, int64_t nowSec) {
+    if (retentionSec <= 0) retentionSec = kUsageDiskRetentionSec;
+    int64_t now = nowSec > 0 ? nowSec : static_cast<int64_t>(time(nullptr));
+    int64_t cutoff = now - retentionSec;
+    std::wstring path = UsageHistoryPathWide();
+
+    std::lock_guard<std::mutex> fileLock(g_usageFileMutex);
+    std::ifstream f(path);
+    if (!f) return;
+
+    std::vector<std::string> keptLines;
+    std::string line;
+    bool droppedAny = false;
+    while (std::getline(f, line)) {
+        if (line.empty()) continue;
+        auto j = nlohmann::json::parse(line, nullptr, false);
+        if (!j.is_object()) continue;
+        int64_t epoch = j.value("epochSec", (int64_t)0);
+        if (epoch >= cutoff) {
+            keptLines.push_back(line);
+        } else {
+            droppedAny = true;
+        }
+    }
+    f.close();
+
+    if (droppedAny) {
+        std::string rewritten;
+        for (const auto& l : keptLines) {
+            rewritten += l;
+            rewritten += "\n";
+        }
+        WriteFileAtomicWide(path, rewritten);
+    }
+}
+
+static std::string DateToLocalStr(int64_t epochSec) {
+    if (epochSec <= 0) return "";
+    time_t t = static_cast<time_t>(epochSec);
+    std::tm tm = {};
+    if (!LocalTimeFromSec(&t, &tm)) return "";
+    char buf[32] = {};
+    std::snprintf(buf, sizeof(buf), "%04d-%02d-%02d",
+                  tm.tm_year + 1900, tm.tm_mon + 1, tm.tm_mday);
+    return std::string(buf);
+}
+
+static std::string NormalizeDateFilter(const std::string& raw, bool isUntil) {
+    if (raw.empty()) return "";
+    std::string s = raw;
+    while (!s.empty() && std::isspace(static_cast<unsigned char>(s.front()))) s.erase(s.begin());
+    while (!s.empty() && std::isspace(static_cast<unsigned char>(s.back()))) s.pop_back();
+    if (s.empty()) return "";
+
+    int64_t nowSec = static_cast<int64_t>(time(nullptr));
+
+    if (s == "today") {
+        return DateToLocalStr(nowSec);
+    }
+    if (s == "yesterday") {
+        return DateToLocalStr(nowSec - 86400);
+    }
+
+    // Check for month duration, e.g. "12m", "1m", or "1mo"
+    if (!s.empty() && (s.back() == 'm' || s.back() == 'M' || (s.size() >= 3 && (s.substr(s.size() - 2) == "mo" || s.substr(s.size() - 2) == "MO")))) {
+        size_t suffixLen = (s.back() == 'm' || s.back() == 'M') ? 1 : 2;
+        std::string digits = s.substr(0, s.size() - suffixLen);
+        bool allDigits = !digits.empty();
+        for (char c : digits) {
+            if (c < '0' || c > '9') { allDigits = false; break; }
+        }
+        if (allDigits) {
+            try {
+                int mCount = std::stoi(digits);
+                time_t nowT = static_cast<time_t>(nowSec);
+                std::tm curTm = {};
+                LocalTimeFromSec(&nowT, &curTm);
+                int curY = curTm.tm_year + 1900;
+                int curM = curTm.tm_mon + 1;
+                int m = curM - mCount;
+                int y = curY;
+                while (m <= 0) { m += 12; y--; }
+                char buf[32];
+                std::snprintf(buf, sizeof(buf), "%04d-%02d-01", y, m);
+                return std::string(buf);
+            } catch (...) {}
+        }
+    }
+
+    int64_t sec = 0;
+    if (ParseDurationToSec(s, sec)) {
+        int64_t targetSec = nowSec > sec ? nowSec - sec : 0;
+        return DateToLocalStr(targetSec);
+    }
+
+    if (IsValidYearMonth(s)) {
+        return isUntil ? (s + "-99") : (s + "-01");
+    }
+
+    if (s.size() == 10 && s[4] == '-' && s[7] == '-') {
+        return s;
+    }
+
+    int64_t epoch = ParseTimestampStrToEpoch(s);
+    if (epoch > 0) {
+        return DateToLocalStr(epoch);
+    }
+
+    return s;
+}
+
+std::vector<LlmDailyUsageRecord> ReadDailyUsageSummary(const std::string& since, const std::string& until) {
+    std::wstring dailyDir = GetDailyUsageDirWide();
+    std::error_code ec;
+    if (!std::filesystem::exists(dailyDir, ec)) {
+        return {};
+    }
+
+    std::string sinceDate = NormalizeDateFilter(since, false);
+    std::string untilDate = NormalizeDateFilter(until, true);
+
+    std::vector<std::filesystem::path> files;
+    for (const auto& entry : std::filesystem::directory_iterator(dailyDir, ec)) {
+        if (!entry.is_regular_file(ec)) continue;
+        if (entry.path().extension() == L".jsonl") {
+            files.push_back(entry.path());
+        }
+    }
+    std::sort(files.begin(), files.end());
+
+    struct RecordKey {
+        std::string date;
+        std::string engine;
+        std::string model;
+        bool operator<(const RecordKey& o) const {
+            if (date != o.date) return date < o.date;
+            if (engine != o.engine) return engine < o.engine;
+            return model < o.model;
+        }
+    };
+    std::map<RecordKey, LlmDailyUsageRecord> agg;
+
+    std::lock_guard<std::mutex> fileLock(g_usageFileMutex);
+    for (const auto& filePath : files) {
+        std::ifstream in(filePath);
+        if (!in) continue;
+        std::string line;
+        while (std::getline(in, line)) {
+            if (line.empty()) continue;
+            auto j = nlohmann::json::parse(line, nullptr, false);
+            if (!j.is_object()) continue;
+            LlmDailyUsageRecord rec;
+            if (!ParseDailyUsageRecordJson(j, rec)) continue;
+
+            if (!sinceDate.empty() && rec.date < sinceDate) continue;
+            if (!untilDate.empty() && rec.date > untilDate) continue;
+
+            RecordKey key{rec.date, rec.engine, rec.model};
+            auto it = agg.find(key);
+            if (it == agg.end()) {
+                if (rec.runs == 0) rec.runs = 1;
+                agg.emplace(key, std::move(rec));
+            } else {
+                auto& ex = it->second;
+                ex.inputTokens += rec.inputTokens;
+                ex.outputTokens += rec.outputTokens;
+                ex.thinkingTokens += rec.thinkingTokens;
+                ex.cacheReadTokens += rec.cacheReadTokens;
+                ex.cacheWriteTokens += rec.cacheWriteTokens;
+                ex.totalTokens += rec.totalTokens;
+                ex.costUsd += rec.costUsd;
+                if (!rec.costKnown) {
+                    ex.costKnown = false;
+                }
+                ex.runs += (rec.runs > 0 ? rec.runs : 1);
+                if (rec.firstEpochSec > 0 && (ex.firstEpochSec == 0 || rec.firstEpochSec < ex.firstEpochSec)) {
+                    ex.firstEpochSec = rec.firstEpochSec;
+                }
+                if (rec.lastEpochSec > 0 && (ex.lastEpochSec == 0 || rec.lastEpochSec > ex.lastEpochSec)) {
+                    ex.lastEpochSec = rec.lastEpochSec;
+                }
+                if (rec.tzOffsetMin != 0 && ex.tzOffsetMin == 0) {
+                    ex.tzOffsetMin = rec.tzOffsetMin;
+                }
+            }
+        }
+    }
+
+    std::vector<LlmDailyUsageRecord> result;
+    result.reserve(agg.size());
+    for (auto& kv : agg) {
+        result.push_back(std::move(kv.second));
+    }
+    return result;
+}
+
+LlmUsageStatsResult QueryUsageStats(const LlmUsageStatsOptions& options) {
+    LlmUsageStatsResult res;
+    res.since = options.since;
+    res.until = options.until;
+    res.groupBy = options.groupBy;
+
+    std::string gb = options.groupBy;
+    for (char& c : gb) c = static_cast<char>(std::tolower(static_cast<unsigned char>(c)));
+
+    if (!gb.empty() && gb != "day" && gb != "month" && gb != "engine" && gb != "model" && gb != "date") {
+        res.ok = false;
+        res.error = "Invalid groupBy: '" + options.groupBy + "'. Must be one of: day, month, engine, model.";
+        return res;
+    }
+
+    auto dailyRecords = ReadDailyUsageSummary(options.since, options.until);
+
+    for (const auto& rec : dailyRecords) {
+        res.totalInputTokens += rec.inputTokens;
+        res.totalOutputTokens += rec.outputTokens;
+        res.totalThinkingTokens += rec.thinkingTokens;
+        res.totalCacheReadTokens += rec.cacheReadTokens;
+        res.totalCacheWriteTokens += rec.cacheWriteTokens;
+        res.totalTokens += rec.totalTokens;
+        res.totalCostUsd += rec.costUsd;
+        if (!rec.costKnown) res.costKnown = false;
+        res.totalRuns += rec.runs;
+        if (rec.firstEpochSec > 0 && (res.firstEpochSec == 0 || rec.firstEpochSec < res.firstEpochSec)) {
+            res.firstEpochSec = rec.firstEpochSec;
+        }
+        if (rec.lastEpochSec > 0 && (res.lastEpochSec == 0 || rec.lastEpochSec > res.lastEpochSec)) {
+            res.lastEpochSec = rec.lastEpochSec;
+        }
+    }
+
+    if (gb.empty()) {
+        res.records = std::move(dailyRecords);
+    } else {
+        std::map<std::string, LlmUsageStatsGroup> groupMap;
+        for (const auto& rec : dailyRecords) {
+            std::string groupKey;
+            if (gb == "day" || gb == "date") {
+                groupKey = rec.date;
+            } else if (gb == "month") {
+                groupKey = rec.date.size() >= 7 ? rec.date.substr(0, 7) : rec.date;
+            } else if (gb == "engine") {
+                groupKey = rec.engine.empty() ? "(unknown)" : rec.engine;
+            } else if (gb == "model") {
+                groupKey = rec.model.empty() ? "(unknown)" : rec.model;
+            }
+
+            auto it = groupMap.find(groupKey);
+            if (it == groupMap.end()) {
+                LlmUsageStatsGroup g;
+                g.key = groupKey;
+                if (gb == "day" || gb == "date") g.date = groupKey;
+                else if (gb == "month") g.month = groupKey;
+                else if (gb == "engine") g.engine = groupKey;
+                else if (gb == "model") g.model = groupKey;
+
+                g.inputTokens = rec.inputTokens;
+                g.outputTokens = rec.outputTokens;
+                g.thinkingTokens = rec.thinkingTokens;
+                g.cacheReadTokens = rec.cacheReadTokens;
+                g.cacheWriteTokens = rec.cacheWriteTokens;
+                g.totalTokens = rec.totalTokens;
+                g.costUsd = rec.costUsd;
+                g.costKnown = rec.costKnown;
+                g.runs = rec.runs;
+                g.firstEpochSec = rec.firstEpochSec;
+                g.lastEpochSec = rec.lastEpochSec;
+                groupMap.emplace(groupKey, std::move(g));
+            } else {
+                auto& g = it->second;
+                g.inputTokens += rec.inputTokens;
+                g.outputTokens += rec.outputTokens;
+                g.thinkingTokens += rec.thinkingTokens;
+                g.cacheReadTokens += rec.cacheReadTokens;
+                g.cacheWriteTokens += rec.cacheWriteTokens;
+                g.totalTokens += rec.totalTokens;
+                g.costUsd += rec.costUsd;
+                if (!rec.costKnown) g.costKnown = false;
+                g.runs += rec.runs;
+                if (rec.firstEpochSec > 0 && (g.firstEpochSec == 0 || rec.firstEpochSec < g.firstEpochSec)) {
+                    g.firstEpochSec = rec.firstEpochSec;
+                }
+                if (rec.lastEpochSec > 0 && (g.lastEpochSec == 0 || rec.lastEpochSec > g.lastEpochSec)) {
+                    g.lastEpochSec = rec.lastEpochSec;
+                }
+            }
+        }
+
+        res.groups.reserve(groupMap.size());
+        for (auto& kv : groupMap) {
+            res.groups.push_back(std::move(kv.second));
+        }
+    }
+
+    return res;
+}
+
+nlohmann::json UsageStatsResultToJson(const LlmUsageStatsResult& res) {
+    nlohmann::json j;
+    j["ok"] = res.ok;
+    if (!res.ok) {
+        j["error"] = res.error;
+        return j;
+    }
+    if (!res.since.empty()) j["since"] = res.since;
+    if (!res.until.empty()) j["until"] = res.until;
+    if (!res.groupBy.empty()) j["groupBy"] = res.groupBy;
+
+    nlohmann::json totals;
+    totals["inputTokens"] = res.totalInputTokens;
+    totals["outputTokens"] = res.totalOutputTokens;
+    totals["thinkingTokens"] = res.totalThinkingTokens;
+    totals["cacheReadTokens"] = res.totalCacheReadTokens;
+    totals["cacheWriteTokens"] = res.totalCacheWriteTokens;
+    totals["totalTokens"] = res.totalTokens;
+    totals["costUsd"] = res.totalCostUsd;
+    if (!res.costKnown) totals["costKnown"] = false;
+    totals["runs"] = res.totalRuns;
+    totals["firstEpochSec"] = res.firstEpochSec;
+    totals["lastEpochSec"] = res.lastEpochSec;
+    j["totals"] = totals;
+
+    if (!res.groups.empty() || !res.groupBy.empty()) {
+        nlohmann::json groups = nlohmann::json::array();
+        for (const auto& g : res.groups) {
+            nlohmann::json gj;
+            gj["key"] = g.key;
+            if (!g.date.empty()) gj["date"] = g.date;
+            if (!g.month.empty()) gj["month"] = g.month;
+            if (!g.engine.empty()) gj["engine"] = g.engine;
+            if (!g.model.empty()) gj["model"] = g.model;
+            gj["inputTokens"] = g.inputTokens;
+            gj["outputTokens"] = g.outputTokens;
+            gj["thinkingTokens"] = g.thinkingTokens;
+            gj["cacheReadTokens"] = g.cacheReadTokens;
+            gj["cacheWriteTokens"] = g.cacheWriteTokens;
+            gj["totalTokens"] = g.totalTokens;
+            gj["costUsd"] = g.costUsd;
+            if (!g.costKnown) gj["costKnown"] = false;
+            gj["runs"] = g.runs;
+            gj["firstEpochSec"] = g.firstEpochSec;
+            gj["lastEpochSec"] = g.lastEpochSec;
+            groups.push_back(gj);
+        }
+        j["groups"] = groups;
+    } else {
+        nlohmann::json recs = nlohmann::json::array();
+        for (const auto& r : res.records) {
+            recs.push_back(DailyUsageRecordToJson(r));
+        }
+        j["records"] = recs;
+    }
+
+    return j;
+}
+
+static std::string FormatNumberWithCommas(uint64_t val) {
+    std::string s = std::to_string(val);
+    int insertPos = static_cast<int>(s.length()) - 3;
+    while (insertPos > 0) {
+        s.insert(insertPos, ",");
+        insertPos -= 3;
+    }
+    return s;
+}
+
+std::string FormatUsageStatsTable(const LlmUsageStatsResult& res) {
+    if (!res.ok) {
+        return "Error: " + res.error + "\n";
+    }
+    if (res.records.empty() && res.groups.empty()) {
+        return "No usage records found.\n";
+    }
+
+    std::ostringstream oss;
+    oss << "LLM Usage Statistics";
+    if (!res.since.empty() || !res.until.empty() || !res.groupBy.empty()) {
+        oss << " (";
+        bool first = true;
+        if (!res.since.empty()) {
+            oss << "since: " << res.since;
+            first = false;
+        }
+        if (!res.until.empty()) {
+            if (!first) oss << ", ";
+            oss << "until: " << res.until;
+            first = false;
+        }
+        if (!res.groupBy.empty()) {
+            if (!first) oss << ", ";
+            oss << "groupBy: " << res.groupBy;
+        }
+        oss << ")";
+    }
+    oss << "\n\n";
+
+    if (!res.groups.empty()) {
+        std::string keyHeader = "Key";
+        if (res.groupBy == "day" || res.groupBy == "date") keyHeader = "Date";
+        else if (res.groupBy == "month") keyHeader = "Month";
+        else if (res.groupBy == "engine") keyHeader = "Engine";
+        else if (res.groupBy == "model") keyHeader = "Model";
+
+        oss << std::left << std::setw(16) << keyHeader
+            << std::right << std::setw(8) << "Runs"
+            << std::setw(14) << "Input"
+            << std::setw(14) << "Output"
+            << std::setw(14) << "Thinking"
+            << std::setw(16) << "Total Tokens"
+            << std::setw(14) << "Cost (USD)" << "\n";
+        oss << std::string(82, '-') << "\n";
+
+        for (const auto& g : res.groups) {
+            std::ostringstream costOss;
+            costOss << "$" << std::fixed << std::setprecision(4) << g.costUsd;
+            if (!g.costKnown) costOss << " (?)";
+
+            oss << std::left << std::setw(16) << g.key
+                << std::right << std::setw(8) << g.runs
+                << std::setw(14) << FormatNumberWithCommas(g.inputTokens)
+                << std::setw(14) << FormatNumberWithCommas(g.outputTokens)
+                << std::setw(14) << FormatNumberWithCommas(g.thinkingTokens)
+                << std::setw(16) << FormatNumberWithCommas(g.totalTokens)
+                << std::setw(14) << costOss.str() << "\n";
+        }
+        oss << std::string(82, '-') << "\n";
+        std::ostringstream totCostOss;
+        totCostOss << "$" << std::fixed << std::setprecision(4) << res.totalCostUsd;
+        if (!res.costKnown) totCostOss << " (?)";
+
+        oss << std::left << std::setw(16) << "Total"
+            << std::right << std::setw(8) << res.totalRuns
+            << std::setw(14) << FormatNumberWithCommas(res.totalInputTokens)
+            << std::setw(14) << FormatNumberWithCommas(res.totalOutputTokens)
+            << std::setw(14) << FormatNumberWithCommas(res.totalThinkingTokens)
+            << std::setw(16) << FormatNumberWithCommas(res.totalTokens)
+            << std::setw(14) << totCostOss.str() << "\n";
+    } else {
+        oss << std::left << std::setw(12) << "Date"
+            << std::setw(12) << "Engine"
+            << std::setw(24) << "Model"
+            << std::right << std::setw(6) << "Runs"
+            << std::setw(14) << "Input"
+            << std::setw(12) << "Output"
+            << std::setw(14) << "Total Tokens"
+            << std::setw(12) << "Cost (USD)" << "\n";
+        oss << std::string(96, '-') << "\n";
+
+        for (const auto& r : res.records) {
+            std::ostringstream costOss;
+            costOss << "$" << std::fixed << std::setprecision(4) << r.costUsd;
+            if (!r.costKnown) costOss << " (?)";
+
+            oss << std::left << std::setw(12) << r.date
+                << std::setw(12) << r.engine
+                << std::setw(24) << r.model
+                << std::right << std::setw(6) << r.runs
+                << std::setw(14) << FormatNumberWithCommas(r.inputTokens)
+                << std::setw(12) << FormatNumberWithCommas(r.outputTokens)
+                << std::setw(14) << FormatNumberWithCommas(r.totalTokens)
+                << std::setw(12) << costOss.str() << "\n";
+        }
+        oss << std::string(96, '-') << "\n";
+        std::ostringstream totCostOss;
+        totCostOss << "$" << std::fixed << std::setprecision(4) << res.totalCostUsd;
+        if (!res.costKnown) totCostOss << " (?)";
+
+        oss << std::left << std::setw(48) << "Total"
+            << std::right << std::setw(6) << res.totalRuns
+            << std::setw(14) << FormatNumberWithCommas(res.totalInputTokens)
+            << std::setw(12) << FormatNumberWithCommas(res.totalOutputTokens)
+            << std::setw(14) << FormatNumberWithCommas(res.totalTokens)
+            << std::setw(12) << totCostOss.str() << "\n";
+    }
+
+    return oss.str();
+}
+
+static std::string CsvEscapeField(const std::string& s) {
+    bool needQuote = false;
+    for (char c : s) {
+        if (c == ',' || c == '"' || c == '\n' || c == '\r') {
+            needQuote = true;
+            break;
+        }
+    }
+    if (!needQuote) return s;
+    std::string out = "\"";
+    for (char c : s) {
+        if (c == '"') out += "\"\"";
+        else out += c;
+    }
+    out += "\"";
+    return out;
+}
+
+std::string FormatUsageStatsCsv(const LlmUsageStatsResult& res) {
+    std::ostringstream oss;
+    std::string gb = res.groupBy;
+    for (char& c : gb) c = static_cast<char>(std::tolower(static_cast<unsigned char>(c)));
+
+    if (!gb.empty() && gb != "date" && !res.groups.empty()) {
+        std::string colName = (gb == "day") ? "date" : gb;
+        oss << colName << ",inputTokens,outputTokens,thinkingTokens,cacheReadTokens,cacheWriteTokens,totalTokens,costUsd,costKnown,runs,firstEpochSec,lastEpochSec\n";
+        for (const auto& g : res.groups) {
+            oss << CsvEscapeField(g.key) << ","
+                << g.inputTokens << ","
+                << g.outputTokens << ","
+                << g.thinkingTokens << ","
+                << g.cacheReadTokens << ","
+                << g.cacheWriteTokens << ","
+                << g.totalTokens << ","
+                << std::fixed << std::setprecision(6) << g.costUsd << ","
+                << (g.costKnown ? "true" : "false") << ","
+                << g.runs << ","
+                << g.firstEpochSec << ","
+                << g.lastEpochSec << "\n";
+        }
+    } else {
+        oss << "date,tzOffsetMin,engine,model,inputTokens,outputTokens,thinkingTokens,cacheReadTokens,cacheWriteTokens,totalTokens,costUsd,costKnown,runs,firstEpochSec,lastEpochSec\n";
+        for (const auto& r : res.records) {
+            oss << CsvEscapeField(r.date) << ","
+                << r.tzOffsetMin << ","
+                << CsvEscapeField(r.engine) << ","
+                << CsvEscapeField(r.model) << ","
+                << r.inputTokens << ","
+                << r.outputTokens << ","
+                << r.thinkingTokens << ","
+                << r.cacheReadTokens << ","
+                << r.cacheWriteTokens << ","
+                << r.totalTokens << ","
+                << std::fixed << std::setprecision(6) << r.costUsd << ","
+                << (r.costKnown ? "true" : "false") << ","
+                << r.runs << ","
+                << r.firstEpochSec << ","
+                << r.lastEpochSec << "\n";
+        }
+    }
+    return oss.str();
+}
+
+LlmUsageCompactResult CompactDailyUsage(const std::string& yearMonth) {
+    LlmUsageCompactResult result;
+    std::wstring dailyDir = GetDailyUsageDirWide();
+    std::error_code ec;
+    if (!std::filesystem::exists(dailyDir, ec)) {
+        return result;
+    }
+
+    std::vector<std::filesystem::path> targetFiles;
+    if (!yearMonth.empty()) {
+        if (!IsValidYearMonth(yearMonth)) {
+            result.ok = false;
+            result.error = "Invalid yearMonth format: '" + yearMonth + "'. Expected YYYY-MM.";
+            return result;
+        }
+        std::filesystem::path p(GetDailyUsagePathWide(yearMonth));
+        if (std::filesystem::exists(p, ec) && std::filesystem::is_regular_file(p, ec)) {
+            targetFiles.push_back(p);
+        } else {
+            return result;
+        }
+    } else {
+        for (const auto& entry : std::filesystem::directory_iterator(dailyDir, ec)) {
+            if (!entry.is_regular_file(ec)) continue;
+            if (entry.path().extension() == L".jsonl") {
+                targetFiles.push_back(entry.path());
+            }
+        }
+        std::sort(targetFiles.begin(), targetFiles.end());
+    }
+
+    struct RecordKey {
+        std::string date;
+        std::string engine;
+        std::string model;
+        bool operator<(const RecordKey& o) const {
+            if (date != o.date) return date < o.date;
+            if (engine != o.engine) return engine < o.engine;
+            return model < o.model;
+        }
+    };
+
+    std::lock_guard<std::mutex> fileLock(g_usageFileMutex);
+    for (const auto& filePath : targetFiles) {
+        result.filesProcessed++;
+        std::ifstream in(filePath, std::ios::binary);
+        if (!in) continue;
+
+        std::string fileData((std::istreambuf_iterator<char>(in)), std::istreambuf_iterator<char>());
+        in.close();
+
+        uint64_t fileBytesBefore = static_cast<uint64_t>(fileData.size());
+        std::istringstream stream(fileData);
+        std::string line;
+        uint64_t linesInFile = 0;
+        std::map<RecordKey, LlmDailyUsageRecord> agg;
+
+        while (std::getline(stream, line)) {
+            if (line.empty()) continue;
+            linesInFile++;
+            auto j = nlohmann::json::parse(line, nullptr, false);
+            if (!j.is_object()) continue;
+            LlmDailyUsageRecord rec;
+            if (!ParseDailyUsageRecordJson(j, rec)) continue;
+
+            RecordKey key{rec.date, rec.engine, rec.model};
+            auto it = agg.find(key);
+            if (it == agg.end()) {
+                if (rec.runs == 0) rec.runs = 1;
+                agg.emplace(key, std::move(rec));
+            } else {
+                auto& ex = it->second;
+                ex.inputTokens += rec.inputTokens;
+                ex.outputTokens += rec.outputTokens;
+                ex.thinkingTokens += rec.thinkingTokens;
+                ex.cacheReadTokens += rec.cacheReadTokens;
+                ex.cacheWriteTokens += rec.cacheWriteTokens;
+                ex.totalTokens += rec.totalTokens;
+                ex.costUsd += rec.costUsd;
+                if (!rec.costKnown) {
+                    ex.costKnown = false;
+                }
+                ex.runs += (rec.runs > 0 ? rec.runs : 1);
+                if (rec.firstEpochSec > 0 && (ex.firstEpochSec == 0 || rec.firstEpochSec < ex.firstEpochSec)) {
+                    ex.firstEpochSec = rec.firstEpochSec;
+                }
+                if (rec.lastEpochSec > 0 && (ex.lastEpochSec == 0 || rec.lastEpochSec > ex.lastEpochSec)) {
+                    ex.lastEpochSec = rec.lastEpochSec;
+                }
+                if (rec.tzOffsetMin != 0 && ex.tzOffsetMin == 0) {
+                    ex.tzOffsetMin = rec.tzOffsetMin;
+                }
+            }
+        }
+
+        result.linesBefore += linesInFile;
+        result.linesAfter += agg.size();
+
+        if (linesInFile > agg.size()) {
+            std::string compactedData;
+            for (const auto& kv : agg) {
+                compactedData += DailyUsageRecordToJson(kv.second).dump(-1, ' ', false, nlohmann::json::error_handler_t::replace);
+                compactedData += "\n";
+            }
+            WriteFileAtomicWide(filePath.wstring(), compactedData);
+            result.filesCompacted++;
+            uint64_t fileBytesAfter = static_cast<uint64_t>(compactedData.size());
+            if (fileBytesBefore > fileBytesAfter) {
+                result.bytesSaved += (fileBytesBefore - fileBytesAfter);
+            }
+        }
+    }
+
+    return result;
+}
+
 void RecordLlmUsagePoint(int64_t epochSec, const LlmUsagePoint& point) {
     g_recordCalls++;
     if (point.totalTokens == 0 && point.inputTokens == 0 && point.outputTokens == 0 &&
@@ -119,9 +880,13 @@ void RecordLlmUsagePoint(int64_t epochSec, const LlmUsagePoint& point) {
         point.costUsd <= 0.0) {
         return;
     }
+    if (epochSec <= 0) {
+        epochSec = static_cast<int64_t>(time(nullptr));
+    }
     LlmUsagePoint p = point;
     p.epochSec = epochSec;
-    bool persist = false;
+    bool persistHistory = false;
+    bool persistDaily = false;
     {
         std::lock_guard<std::mutex> lock(g_usageHistoryMutex);
         LoadUsageHistoryLocked();
@@ -133,9 +898,16 @@ void RecordLlmUsagePoint(int64_t epochSec, const LlmUsagePoint& point) {
         while (g_usageHistory.size() > kMaxUsagePoints) {
             g_usageHistory.pop_front();
         }
-        persist = g_usageHistoryPersist;
+        persistHistory = g_usageHistoryPersist;
+        persistDaily = g_dailyUsagePersist;
     }
-    if (persist) {
+    if (persistHistory) {
+        int64_t lastPrune = g_lastUsagePruneSec.load();
+        if (lastPrune == 0 || std::abs(p.epochSec - lastPrune) >= 3600) {
+            g_lastUsagePruneSec.store(p.epochSec);
+            PruneUsageHistory(kUsageDiskRetentionSec, p.epochSec);
+        }
+
         nlohmann::json j;
         j["epochSec"] = p.epochSec;
         j["inputTokens"] = p.inputTokens;
@@ -148,19 +920,92 @@ void RecordLlmUsagePoint(int64_t epochSec, const LlmUsagePoint& point) {
         j["agentType"] = p.agentType;
         j["model"] = p.model;
         std::string text = j.dump(-1, ' ', false, nlohmann::json::error_handler_t::replace) + "\n";
-        // Separate lock so dashboard reads of the in-memory history never wait on disk I/O.
         std::lock_guard<std::mutex> fileLock(g_usageFileMutex);
-        std::ofstream out(UsageHistoryPathWide(), std::ios::app);
-        if (out) out << text;
+        AppendToLogFileWide(UsageHistoryPathWide(), text);
+    }
+    if (persistDaily) {
+        std::tm local = {};
+        time_t t = static_cast<time_t>(p.epochSec);
+        if (!LocalTimeFromSec(&t, &local)) {
+            local.tm_year = 70;
+            local.tm_mon = 0;
+            local.tm_mday = 1;
+        }
+        char dateBuf[32] = {};
+        std::snprintf(dateBuf, sizeof(dateBuf), "%04d-%02d-%02d",
+                      local.tm_year + 1900, local.tm_mon + 1, local.tm_mday);
+        char ymBuf[16] = {};
+        std::snprintf(ymBuf, sizeof(ymBuf), "%04d-%02d",
+                      local.tm_year + 1900, local.tm_mon + 1);
+
+        static std::string s_lastRecordedYm;
+        static std::atomic<bool> s_checkedPreviousMonths{false};
+        std::string currentYm(ymBuf);
+
+        if (!s_checkedPreviousMonths.exchange(true)) {
+            std::wstring dailyDir = GetDailyUsageDirWide();
+            std::error_code ec;
+            if (std::filesystem::exists(dailyDir, ec)) {
+                for (const auto& entry : std::filesystem::directory_iterator(dailyDir, ec)) {
+                    if (entry.is_regular_file(ec) && entry.path().extension() == L".jsonl") {
+                        std::string stem = WideToUtf8(entry.path().stem().wstring());
+                        if (IsValidYearMonth(stem) && stem < currentYm) {
+                            CompactDailyUsage(stem);
+                        }
+                    }
+                }
+            }
+        } else if (!s_lastRecordedYm.empty() && s_lastRecordedYm != currentYm) {
+            std::string prevYm = s_lastRecordedYm;
+            CompactDailyUsage(prevYm);
+        }
+        s_lastRecordedYm = currentYm;
+
+        std::tm asLocal = local;
+        std::tm asUtc = local;
+        std::time_t localEpoch = std::mktime(&asLocal);
+        int64_t utcEpoch = UtcTimeFromTm(&asUtc);
+        int64_t offsetSec = utcEpoch - static_cast<int64_t>(localEpoch);
+        int tzOffsetMin = static_cast<int>(offsetSec / 60);
+
+        LlmDailyUsageRecord rec;
+        rec.schema = "hancho.usage.day/1";
+        rec.date = dateBuf;
+        rec.tzOffsetMin = tzOffsetMin;
+        rec.engine = p.agentType;
+        rec.model = p.model;
+        rec.inputTokens = p.inputTokens;
+        rec.outputTokens = p.outputTokens;
+        rec.thinkingTokens = p.thinkingTokens;
+        rec.cacheReadTokens = p.cacheReadTokens;
+        rec.cacheWriteTokens = p.cacheWriteTokens;
+        rec.totalTokens = p.totalTokens;
+        rec.costUsd = p.costUsd;
+        rec.costKnown = (p.costUsd > 0.0 || (EngineReportsCost(p.agentType) && p.totalTokens == 0));
+        rec.runs = 1;
+        rec.firstEpochSec = p.epochSec;
+        rec.lastEpochSec = p.epochSec;
+
+        std::string dailyText = DailyUsageRecordToJson(rec).dump(-1, ' ', false, nlohmann::json::error_handler_t::replace) + "\n";
+        std::wstring dailyDir = GetDailyUsageDirWide();
+        EnsureDirectoryWide(dailyDir);
+        std::wstring dailyPath = GetDailyUsagePathWide(ymBuf);
+        std::lock_guard<std::mutex> fileLock(g_usageFileMutex);
+        AppendToLogFileWide(dailyPath, dailyText);
     }
 }
 
 void SetUsageHistoryPersistence(bool enabled) {
-    std::lock_guard<std::mutex> lock(g_usageHistoryMutex);
-    g_usageHistoryPersist = enabled;
+    {
+        std::lock_guard<std::mutex> lock(g_usageHistoryMutex);
+        g_usageHistoryPersist = enabled;
+        if (enabled) {
+            g_usageHistoryLoaded = false;
+            LoadUsageHistoryLocked();
+        }
+    }
     if (enabled) {
-        g_usageHistoryLoaded = false;
-        LoadUsageHistoryLocked();
+        PruneUsageHistory(kUsageDiskRetentionSec);
     }
 }
 

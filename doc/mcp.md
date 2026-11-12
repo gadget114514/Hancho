@@ -66,5 +66,13 @@ You can also run the server directly with `Hancho.exe mcp`. It connects to the d
 | `memory_get` | One record in full, with its source file and line (`id`, `kind?`). |
 | `memory_brief` | Fixed-shape summary for a job (`jobName?`, `taskqueue?`, `file?`, `files?`, `scopes?`, `budgetChars?`, `includeAgentNotes?`, `maxPreviousRuns?`): previous runs, common failures, related notes and project knowledge, with an id on every line. |
 | `memory_stats` | L1 statistics: success rate, duration median/p90, failure classes and token/cost totals, grouped by job, engine and model. |
+| `memory_approve` | Promote an L2 note to L3 project knowledge (`id`, `worker?`, `by?`). Allowed only for specific workers enumerated in `memory.l3Promoters` in `config.json`. |
 
-Promotion to L3 project knowledge is human-only (`hancho-cli memory approve <id>` or the GUI). It is intentionally not an MCP tool, so agents cannot approve knowledge.
+**LLM usage tools**
+
+| Tool | Description |
+| :--- | :--- |
+| `usage_stats` | Query aggregated LLM token usage and estimated cost statistics (U1) across daily rollup logs (`since?`, `until?`, `groupBy?`: `day`\|`month`\|`engine`\|`model`). |
+| `usage_export` | Export aggregated LLM usage to CSV or JSON format (`format?`: `csv`\|`json`, `since?`, `until?`, `groupBy?`, `out?`). |
+
+Promotion to L3 project knowledge is permitted for human operators (`hancho-cli memory approve <id>` or the GUI) and authorized workers listed in `memory.l3Promoters` in `config.json` via MCP tool `memory_approve`. Unauthorized agents and unlisted workers are rejected.

@@ -1,6 +1,6 @@
 # 051 — usage の日次ロールアップ（U1）
 
-Estimate 240 min
+Estimate 230 min
 Splittable: no
 
 ## 目的
@@ -9,12 +9,11 @@ Splittable: no
 
 ## やること
 
-- [ ] `logs/usage_history.jsonl` の無限成長を止める。追記のまま放置しない（7 日より古い行を落として書き直す、または日次集計への置き換え）。
-- [ ] 生ポイントを書くときに、同じローカル日付の `usage/daily/<年-月>.jsonl` へ `{date, tzOffsetMin, engine, model, delta...}` を追記する。
-- [ ] 読むときに同じキー（日 × エンジン × モデル）を合計して `hancho.usage.day/1` 形式で返す。
-- [ ] `hancho-cli usage stats --group-by day|month|engine|model` と MCP `usage_stats` を追加する（`since` / `until` / `groupBy`）。
-- [ ] IPC に U1 用の `get_usage_daily` を追加する（`get_usage_history` は U0 用に残す）。
-- [ ] スモークテストを追加する。
+子カードに分解した。個々の作業は子カードで管理する:
+
+- [ ] `ww-data/tasks/051-1-usage-day-write.md` — usage の日次ファイルへの書き込みと成長止め
+- [ ] `ww-data/tasks/051-2-usage-day-read-cli.md` — 日次集計の読み出しと usage stats / usage_stats
+- [ ] `ww-data/tasks/051-3-usage-ipc-smoke.md` — IPC get_usage_daily とスモークテスト
 
 ## 完了条件
 

@@ -15,6 +15,9 @@
 *.obj
 *.exe
 
+[Ll]ogs/
+ww-data/
+
 # User-specific files (MonoDevelop/Xamarin Studio)
 *.userprefs
 
@@ -447,3 +450,14 @@ ww-data/logs/
 ww-data/running/
 ww-data/jobs/
 ww-data/stall-state.json
+
+# Hancho runtime data (when the data directory is ww-data)
+ww-data/memory/
+ww-data/taskqueue/
+ww-data/taskqueues/
+ww-data/proc_*.events.jsonl
+ww-data/proc_*_stream.jsonl
+ww-data/processes_state.json
+ww-data/taskqueue-*.events.jsonl
+ww-data/hancho_*.log
+ww-data/*.done

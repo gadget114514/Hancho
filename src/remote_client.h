@@ -38,11 +38,18 @@ class RemoteListener {
 public:
     using Handler = std::function<std::string(const std::string& requestJson,
                                               const std::string& peerAddress)>;
+    using HttpHandler = std::function<bool(const std::string& method,
+                                           const std::string& uri,
+                                           const std::string& headers,
+                                           const std::string& body,
+                                           const std::string& peerAddress,
+                                           std::string& outResponse)>;
 
     RemoteListener();
     ~RemoteListener();
 
     void SetHandler(Handler handler);
+    void SetHttpHandler(HttpHandler httpHandler);
 
     // bindHost empty or "*" means 0.0.0.0. token empty means "loopback only".
     bool Start(const std::string& bindHost, uint16_t port, const std::string& token,

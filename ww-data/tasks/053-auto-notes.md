@@ -1,6 +1,6 @@
 # 053 — Hancho が自動で書くノート
 
-Estimate 180 min
+Estimate 90 min
 Splittable: no
 
 ## 目的

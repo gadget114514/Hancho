@@ -22,10 +22,11 @@ static void PrintUsage() {
 "Hancho " PC_VERSION R"( - Native Win32 Multi-LLM Process & ConPTY Manager + Live GUI Dashboard
 
 USAGE:
-  Hancho.exe [gui] [--data-dir <path>]
-      Launch the core and the live Win32 Dashboard GUI.
-      If a core is already running (for example from --headless), the dashboard
-      attaches to it and this process exits.
+  Hancho.exe [gui] [--data-dir <path>] [--auto-start-core] [--no-prompt]
+      Launch the Win32 Dashboard GUI as an independent IPC client.
+      Connects to the running core over Named Pipe. If the core is not running,
+      prompts to start it in headless mode. Closing the GUI leaves jobs
+      running; reopening the GUI reconnects and restores all state.
 
   Hancho.exe --headless [--data-dir <path>]
       Run the core (process manager, task queue, behavior trees) and the Named
@@ -68,6 +69,12 @@ WORKING MODEL (LLM orchestration):
       v
     Worker LLM / build command
       -> one job command; writes artifacts and logs
+
+  IMPORTANT: start_process / `hancho-cli start` only manages a process. It is
+  NOT a task: no job id, task history, success checks, retries or per-model
+  usage. Register work with taskqueue_add (ordered/dependent jobs), run
+  (add + wait + report) or bt_start (behavior tree) to make it a task. Only
+  those jobs appear in task lists and count toward per-engine/model usage.
 
   Assumed structure:
     1. The supervisor plans and declares jobs. It does not run the work itself,
@@ -248,31 +255,34 @@ struct CoreHostContext {
 
 static void CoreHostShowGui(CoreHostContext* ctx) {
     if (!ctx) return;
-    HWND dash = FindOwnWindow(kDashboardClass);
+    HWND dash = FindWindowW(kDashboardClass, nullptr);
     if (dash) {
         if (IsIconic(dash)) ShowWindow(dash, SW_RESTORE);
         else ShowWindow(dash, SW_SHOW);
         SetForegroundWindow(dash);
         return;
     }
-    if (ctx->guiRunning) {
-        ctx->guiShowPending = true;
-        return;
+    // Launch standalone GUI as a separate process
+    wchar_t exePath[MAX_PATH] = {};
+    GetModuleFileNameW(nullptr, exePath, MAX_PATH);
+    std::wstring cmd = L"\"";
+    cmd += exePath;
+    cmd += L"\" gui";
+    if (HasCustomDataDirectory()) {
+        cmd += L" --data-dir \"";
+        cmd += GetEffectiveDataDirectoryWide();
+        cmd += L"\"";
     }
-    if (ctx->guiThread.joinable()) ctx->guiThread.join();
-    ctx->guiRunning = true;
-    CoreHostContext* c = ctx;
-    ctx->guiThread = std::thread([c] {
-        int rc = 0;
-        try {
-            rc = RunGuiDashboard(*c->pm, *c->ipc, *c->tqm);
-        } catch (const std::exception& e) {
-            WriteAuditLog("CRASH_GUARD", std::string("GUI thread exception: ") + e.what());
-        } catch (...) {
-            WriteAuditLog("CRASH_GUARD", "GUI thread exception: unknown");
-        }
-        PostMessageW(c->hwnd, WM_PC_HOST_GUI_CLOSED, static_cast<WPARAM>(rc), 0);
-    });
+    STARTUPINFOW si = {};
+    si.cb = sizeof(si);
+    PROCESS_INFORMATION pi = {};
+    std::vector<wchar_t> cmdBuf(cmd.begin(), cmd.end());
+    cmdBuf.push_back(L'\0');
+    if (CreateProcessW(nullptr, cmdBuf.data(), nullptr, nullptr, FALSE,
+                       0, nullptr, nullptr, &si, &pi)) {
+        CloseHandle(pi.hThread);
+        CloseHandle(pi.hProcess);
+    }
 }
 
 static LRESULT CALLBACK CoreHostWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
@@ -410,14 +420,15 @@ static int RunCoreHost(platform::IInstanceLock* instanceLock, bool showGuiAtStar
 
 // Asks the running core (headless host or dashboard) to exit and waits for it to go.
 static int RunQuitCommand() {
-    HWND target = FindWindowW(kCoreHostClass, nullptr);
-    if (!target) target = FindWindowW(kDashboardClass, nullptr);
-    if (!target) {
+    HWND coreTarget = FindWindowW(kCoreHostClass, nullptr);
+    HWND dashTarget = FindWindowW(kDashboardClass, nullptr);
+    if (!coreTarget && !dashTarget) {
         std::cout << "Hancho is not running" << std::endl;
         return 1;
     }
     UINT quitMessage = RegisterWindowMessageW(L"HanchoQuit");
-    PostMessageW(target, quitMessage, 0, 0);
+    if (coreTarget) PostMessageW(coreTarget, quitMessage, 0, 0);
+    if (dashTarget) PostMessageW(dashTarget, quitMessage, 0, 0);
     for (int i = 0; i < 100 && (FindWindowW(kCoreHostClass, nullptr) ||
                                 FindWindowW(kDashboardClass, nullptr)); ++i) {
         Sleep(100);
@@ -428,6 +439,90 @@ static int RunQuitCommand() {
     }
     std::cout << "Hancho quit" << std::endl;
     return 0;
+}
+
+namespace pc {
+int RunStandaloneGuiDashboard();
+}
+
+static const wchar_t* TrMain(const wchar_t* ja, const wchar_t* en) {
+    LANGID lang = GetUserDefaultUILanguage();
+    if (PRIMARYLANGID(lang) == LANG_JAPANESE) return ja;
+    return en;
+}
+
+static bool PromptAndStartCore(bool autoStart = false, bool noPrompt = false) {
+    if (noPrompt) {
+        std::cerr << "Hancho core is not running. Please start it with: Hancho.exe --headless" << std::endl;
+        return false;
+    }
+
+    if (!autoStart) {
+        const wchar_t* promptMsg = TrMain(
+            L"Hancho コアが起動していません。\n今すぐバックグラウンド（headless モード）でコアを起動しますか？",
+            L"Hancho core is not running.\nWould you like to start the core in headless mode now?"
+        );
+        const wchar_t* title = TrMain(
+            L"Hancho コアの起動確認",
+            L"Hancho Core Not Running"
+        );
+
+        int choice = MessageBoxW(nullptr, promptMsg, title, MB_YESNO | MB_ICONQUESTION);
+        if (choice != IDYES) {
+            std::cerr << "Hancho core is not running. Please start it with: Hancho.exe --headless" << std::endl;
+            return false;
+        }
+    }
+
+    wchar_t exePath[MAX_PATH] = {};
+    GetModuleFileNameW(nullptr, exePath, MAX_PATH);
+
+    std::wstring cmd = L"\"";
+    cmd += exePath;
+    cmd += L"\" --headless";
+    if (HasCustomDataDirectory()) {
+        cmd += L" --data-dir \"";
+        cmd += GetEffectiveDataDirectoryWide();
+        cmd += L"\"";
+    }
+
+    STARTUPINFOW si = {};
+    si.cb = sizeof(si);
+    si.dwFlags = STARTF_USESHOWWINDOW;
+    si.wShowWindow = SW_HIDE;
+    PROCESS_INFORMATION pi = {};
+
+    std::vector<wchar_t> cmdBuf(cmd.begin(), cmd.end());
+    cmdBuf.push_back(L'\0');
+
+    if (!CreateProcessW(nullptr, cmdBuf.data(), nullptr, nullptr, FALSE,
+                        CREATE_NO_WINDOW | DETACHED_PROCESS, nullptr, nullptr, &si, &pi)) {
+        const wchar_t* errText = TrMain(
+            L"Hancho コアの起動に失敗しました。",
+            L"Failed to launch Hancho headless core."
+        );
+        const wchar_t* errTitle = TrMain(L"エラー", L"Error");
+        MessageBoxW(nullptr, errText, errTitle, MB_ICONERROR);
+        return false;
+    }
+    CloseHandle(pi.hThread);
+    CloseHandle(pi.hProcess);
+
+    for (int i = 0; i < 50; ++i) {
+        Sleep(100);
+        std::string resp, err;
+        if (SendIpcRequest("{\"action\":\"ping\"}", resp, err, false)) {
+            return true;
+        }
+    }
+
+    const wchar_t* waitErrText = TrMain(
+        L"Hancho コアの起動待機中にタイムアウトしました。",
+        L"Timed out waiting for Hancho headless core to start."
+    );
+    const wchar_t* errTitle = TrMain(L"エラー", L"Error");
+    MessageBoxW(nullptr, waitErrText, errTitle, MB_ICONERROR);
+    return false;
 }
 
 int main() {
@@ -473,10 +568,22 @@ int main() {
 
     // Like hancho-cli, --json may come before or after the command.
     bool jsonOutput = false;
+    bool autoStartCore = false;
+    bool noPrompt = false;
     std::string firstCmd;
     for (size_t i = 1; i < args.size(); ++i) {
         if (args[i] == "--json" || args[i] == "-j") jsonOutput = true;
-        else if (firstCmd.empty()) firstCmd = args[i];
+        else if (args[i] == "--auto-start-core" || args[i] == "--start-core") autoStartCore = true;
+        else if (args[i] == "--no-prompt" || args[i] == "--no-start-core") noPrompt = true;
+        else if (args[i] == "--webui-port" && i + 1 < args.size()) {
+            _putenv_s("HANCHO_WEBUI_PORT", args[++i].c_str());
+        } else if (args[i].rfind("--webui-port=", 0) == 0) {
+            _putenv_s("HANCHO_WEBUI_PORT", args[i].substr(13).c_str());
+        } else if (args[i] == "--webui-dir" && i + 1 < args.size()) {
+            _putenv_s("HANCHO_WEBUI_DIR", args[++i].c_str());
+        } else if (args[i].rfind("--webui-dir=", 0) == 0) {
+            _putenv_s("HANCHO_WEBUI_DIR", args[i].substr(12).c_str());
+        } else if (firstCmd.empty()) firstCmd = args[i];
     }
     if (firstCmd == "--version" || firstCmd == "-V" || firstCmd == "version") {
         if (jsonOutput) std::cout << "{\"ok\":true,\"program\":\"Hancho\",\"version\":\"" PC_VERSION "\"}" << std::endl;
@@ -494,92 +601,48 @@ int main() {
 
     const bool headlessRequested = (subcmd == "headless" || subcmd == "--headless");
     if (subcmd == "gui" || subcmd == "--gui" || headlessRequested) {
-        // A core may already be running (headless or with a dashboard). For a GUI
-        // launch, ask it to expose the dashboard and let this process exit: the
-        // core stays alive, and jobs keep running.
-        if (!headlessRequested) {
-            std::string resp, err;
-            if (SendIpcRequest("{\"action\":\"gui_show\"}", resp, err, false)) {
-                for (int i = 0; i < 50; ++i) {
-                    if (FindWindowW(kDashboardClass, nullptr)) break;
-                    Sleep(100);
-                }
+        if (headlessRequested) {
+            auto instanceLock = platform::CreateInstanceLock(WideToUtf8(GetGuiMutexNameWide()));
+            std::string lockError;
+            if (!instanceLock || !instanceLock->Acquire(lockError)) {
+                std::cout << "Hancho core is already running" << std::endl;
                 return 0;
             }
-        }
-
-        auto instanceLock = platform::CreateInstanceLock(WideToUtf8(GetGuiMutexNameWide()));
-        std::string lockError;
-        if (!instanceLock || !instanceLock->Acquire(lockError)) {
-            if (!headlessRequested) {
-                // The core may still be starting: wait for its pipe, then attach.
-                std::string resp, err;
-                for (int i = 0; i < 50; ++i) {
-                    if (SendIpcRequest("{\"action\":\"gui_show\"}", resp, err, false)) {
-                        for (int j = 0; j < 50; ++j) {
-                            if (FindWindowW(kDashboardClass, nullptr)) break;
-                            Sleep(100);
-                        }
-                        return 0;
-                    }
-                    Sleep(100);
-                }
-            }
-            std::cout << "Hancho core is already running" << std::endl;
-            return 0;
-        }
-
-        if (headlessRequested) {
             std::cout << "Hancho headless core started (pipe: "
                       << WideToUtf8(GetPipeNameWide()) << ")" << std::endl;
             return RunCoreHost(instanceLock.get(), false);
         }
 
-        // Hide the console window of the GUI daemon instead of calling FreeConsole().
-        // Keeping an allocated (hidden) console in the parent process is required by Windows
-        // so that CreateProcessW + PROC_THREAD_ATTRIBUTE_PSEUDOCONSOLE properly wires
-        // StandardInput/StandardOutput/StandardError in child ConPTY processes!
+        // GUI standalone client launch (doc/design-v3.md §2.3 段階 A, Card 060c):
+        // 1. If a dashboard window is already open, bring it to front and exit.
+        HWND existingDash = FindWindowW(kDashboardClass, nullptr);
+        if (existingDash) {
+            if (IsIconic(existingDash)) ShowWindow(existingDash, SW_RESTORE);
+            else ShowWindow(existingDash, SW_SHOW);
+            SetForegroundWindow(existingDash);
+            return 0;
+        }
+
+        // 2. Check if the Hancho core is running.
+        std::string pingResp, pingErr;
+        bool coreRunning = SendIpcRequest("{\"action\":\"ping\"}", pingResp, pingErr, false);
+
+        // 3. If not running, prompt user to start the core in headless mode.
+        if (!coreRunning) {
+            if (!PromptAndStartCore(autoStartCore, noPrompt)) {
+                return 1;
+            }
+        }
+
+        // 4. Hide the console window of the GUI client process if present.
         HWND hConsole = GetConsoleWindow();
         if (hConsole) {
             ShowWindow(hConsole, SW_HIDE);
-        } else {
-            AllocConsole();
-            hConsole = GetConsoleWindow();
-            if (hConsole) ShowWindow(hConsole, SW_HIDE);
         }
 
-        // Record unhandled C++ exceptions (e.g. from a worker thread) before the process aborts.
-        std::set_terminate([] {
-            WriteAuditLog("CRASH", "std::terminate called: unhandled exception");
-            std::abort();
-        });
-
-        ProcessManager pm;
-        TaskQueueManager tqm;
-        tqm.SetProcessManager(&pm);
-        pm.SetProcessFinishedCallback([&tqm](int pid, int ec, const std::string& kind) {
-            tqm.OnProcessFinished(pid, ec, kind);
-        });
-        BtManager btm(pm, tqm);
-        IpcServer ipc(pm, tqm, &btm);
-        ipc.SetHeadless(false);
-        // `Hancho.exe gui` from another process: restore the existing window.
-        ipc.SetGuiShowCallback([] {
-            HWND dash = FindWindowW(kDashboardClass, nullptr);
-            if (dash) PostMessageW(dash, RegisterWindowMessageW(L"HanchoShowGui"), 0, 0);
-        });
-        ipc.SetShutdownCallback([] {
-            HWND dash = FindWindowW(kDashboardClass, nullptr);
-            if (dash) PostMessageW(dash, RegisterWindowMessageW(L"HanchoQuit"), 0, 0);
-        });
-        ipc.Start();
-        int rc = RunGuiDashboard(pm, ipc, tqm);
-        ipc.Stop();
-        pm.SetProcessFinishedCallback(nullptr);
-        btm.Shutdown();
-        tqm.ShutdownTaskQueueManager();
-        if (instanceLock) instanceLock->Release();
-        return rc;
+        // 5. Run the Win32 GUI Dashboard as an independent IPC client.
+        // Jobs continue running in the core when the dashboard window is closed.
+        return RunStandaloneGuiDashboard();
     }
 
     // Backward-compatible console commands (prefer hancho-cli.exe)

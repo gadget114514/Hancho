@@ -90,4 +90,6 @@ When the rules leave the failure undecided (`class: "unknown"` or `confidence: "
 
 **Events and environment:** each attempt receives `PC_JOB_ID`, `PC_ATTEMPT`, `PC_JOB_SUMMARY`, `PC_JOB_INSTRUCTIONS`, `PC_JOB_INSTRUCTIONS_REV`, plus `PC_PREV_REASON`, `PC_PREV_EXIT`, `PC_PREV_TAIL` on retries. Events are appended to `logs/taskqueue-<name>.events.jsonl`; `notifyFile` is updated for `jobFailed`, `taskqueueStalled` and `taskqueueDrained`.
 
+**Plain Runs (outside queues):** Executions started outside a task queue (`hancho-cli run`, direct IPC / manual invocations) have their minimal state persisted to `logs/taskqueues/plain.json` and are included in `memory rebuild` inputs without impacting queue scheduling. See [plain-runs.md](plain-runs.md) for details.
+
 **GUI:** click the view mode toggle button (leftmost toolbar button) or press **Ctrl+T** to cycle between **Two Rows** (Processes + Tasks), **Processes Only**, and **Tasks Only**. In Two Rows mode, drag the horizontal splitter bar to adjust relative heights. Running jobs are listed first and highlighted; failed rows use a muted red and timed-out rows a muted amber (theme colors).

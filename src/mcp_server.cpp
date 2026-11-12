@@ -2,6 +2,7 @@
 #include "ipc_client.h"
 #include "common.h"
 #include "memory_search.h"
+#include "llm_stream.h"
 #include "nlohmann/json.hpp"
 #include <fstream>
 #include <iostream>
@@ -17,8 +18,8 @@
 namespace pc {
 
 // Event shape that get_worker_stream returns when the caller does not pass `schema`. "v1" is the
-// stable hancho.event/1 shape read from .events.jsonl; "legacy" is the internal LlmStreamEvent
-// shape, deprecated and kept for opt-in use until it is removed in v0.11.0.
+// stable hancho.event/1 shape read from .events.jsonl. The legacy internal LlmStreamEvent shape
+// was removed in v0.11.0.
 static constexpr const char* kWorkerStreamDefaultSchema = "v1";
 
 // The top-level JSON-RPC fields of one request line. Parsed with nlohmann::json so that keys
@@ -414,14 +415,14 @@ int RunMcpServer() {
                 << "},"
                 << "{"
                 << "\"name\":\"get_worker_stream\","
-                << "\"description\":\"Read structured JSON streaming events (tools called, arguments, reasoning/thoughts, assistant responses, status) emitted by Claude, agy, or OpenCode worker agents. Events are automatically captured and saved to logs/proc_<id>_<name>_stream.jsonl. Returns the stable hancho.event/1 shape by default; pass schema='legacy' for the deprecated internal type strings, which are removed in v0.11.0.\","
+                << "\"description\":\"Read structured JSON streaming events (tools called, arguments, reasoning/thoughts, assistant responses, status) emitted by Claude, agy, or OpenCode worker agents. Events are automatically captured and saved to logs/proc_<id>_<name>.events.jsonl. Returns the stable hancho.event/1 shape. Legacy type strings are not supported (removed in v0.11.0).\","
                 << "\"inputSchema\":{\"type\":\"object\",\"properties\":{"
                 << "\"id\":{\"type\":\"integer\",\"description\":\"Managed process ID of the agent\"},"
                 << "\"tail\":{\"type\":\"integer\",\"description\":\"Number of recent events to return (default 50, 0 = all)\"},"
-                << "\"type\":{\"type\":\"string\",\"description\":\"Filter by event type in the legacy shape, or by kind when schema='v1' (the default; e.g. 'tool.call', 'message')\"},"
+                << "\"type\":{\"type\":\"string\",\"description\":\"Filter by event kind (e.g. 'tool.call', 'message')\"},"
                 << "\"since_seq\":{\"type\":\"integer\",\"description\":\"Return only events with sequence number greater than since_seq\"},"
                 << "\"format\":{\"type\":\"string\",\"enum\":[\"json\",\"summary\"],\"description\":\"Return format: 'json' (structured events array, default) or 'summary' (compact text summary)\"},"
-                << "\"schema\":{\"type\":\"string\",\"enum\":[\"legacy\",\"v1\"],\"description\":\"Event shape: 'v1' (default, versioned hancho.event/1 from .events.jsonl) or 'legacy' (deprecated internal type strings; removed in v0.11.0)\"}"
+                << "\"schema\":{\"type\":\"string\",\"enum\":[\"v1\"],\"description\":\"Event shape: 'v1' (default, versioned hancho.event/1 from .events.jsonl). Legacy schema is not supported (removed in v0.11.0).\"}"
                 << "},\"required\":[\"id\"]}"
                 << "},"
                 << "{"
@@ -772,6 +773,38 @@ int RunMcpServer() {
                 << "\"reason\":{\"type\":\"string\",\"description\":\"Why the note is being retracted\"}"
                 << "},\"required\":[\"id\"]}"
                 << "}"
+                << ","
+                << "{"
+                << "\"name\":\"memory_approve\","
+                << "\"description\":\"Promote an L2 note to L3 project knowledge. Allowed for authorized workers listed in memory.l3Promoters in config.json.\","
+                << "\"inputSchema\":{\"type\":\"object\",\"properties\":{"
+                << "\"id\":{\"type\":\"string\",\"description\":\"L2 note id returned by memory_search\"},"
+                << "\"worker\":{\"type\":\"string\",\"description\":\"Worker name (must be listed in memory.l3Promoters)\"},"
+                << "\"by\":{\"type\":\"string\",\"description\":\"Promoter identifier (e.g. worker:<name>)\"}"
+                << "},\"required\":[\"id\"]}"
+                << "}"
+                << ","
+                << "{"
+                << "\"name\":\"usage_stats\","
+                << "\"description\":\"Query aggregated LLM token usage and estimated cost statistics (U1) across daily rollup logs. Returns token breakdowns (input, output, thinking, cache read/write) and cost grouped by day, month, engine, or model.\","
+                << "\"inputSchema\":{\"type\":\"object\",\"properties\":{"
+                << "\"since\":{\"type\":\"string\",\"description\":\"Start of time range (e.g. 'today', '24h', '7d', '30d', 'YYYY-MM-DD', 'YYYY-MM')\"},"
+                << "\"until\":{\"type\":\"string\",\"description\":\"End of time range (e.g. 'today', 'YYYY-MM-DD', 'YYYY-MM')\"},"
+                << "\"groupBy\":{\"type\":\"string\",\"enum\":[\"day\",\"month\",\"engine\",\"model\"],\"description\":\"Optional grouping: 'day', 'month', 'engine', or 'model'. Defaults to date x engine x model records.\"}"
+                << "}}"
+                << "}"
+                << ","
+                << "{"
+                << "\"name\":\"usage_export\","
+                << "\"description\":\"Export aggregated LLM token usage and estimated cost statistics as CSV or JSON format. Can write directly to a file or return content inline.\","
+                << "\"inputSchema\":{\"type\":\"object\",\"properties\":{"
+                << "\"format\":{\"type\":\"string\",\"enum\":[\"csv\",\"json\"],\"description\":\"Export format ('csv' or 'json'). Default is 'csv'.\"},"
+                << "\"since\":{\"type\":\"string\",\"description\":\"Start of time range (e.g. 'today', '24h', '7d', '30d', 'YYYY-MM-DD', 'YYYY-MM')\"},"
+                << "\"until\":{\"type\":\"string\",\"description\":\"End of time range (e.g. 'today', 'YYYY-MM-DD', 'YYYY-MM')\"},"
+                << "\"groupBy\":{\"type\":\"string\",\"enum\":[\"day\",\"month\",\"engine\",\"model\"],\"description\":\"Optional grouping: 'day', 'month', 'engine', or 'model'.\"},"
+                << "\"out\":{\"type\":\"string\",\"description\":\"Optional file path to write export into. If omitted, exported content is returned in the tool response.\"}"
+                << "}}"
+                << "}"
                 << "]}}";
             EmitLine(oss.str());
         }
@@ -781,10 +814,92 @@ int RunMcpServer() {
             WriteAuditLog("MCP_TOOL_CALL", "tool=" + toolName + " args=" + argsJson);
             std::ostringstream ipcReq;
 
+            if (toolName == "usage_stats") {
+                LlmUsageStatsOptions opts;
+                opts.since = JsonGetString(argsJson, "since", "");
+                opts.until = JsonGetString(argsJson, "until", "");
+                opts.groupBy = JsonGetString(argsJson, "groupBy", "");
+                if (opts.groupBy.empty()) {
+                    opts.groupBy = JsonGetString(argsJson, "group_by", "");
+                }
+                LlmUsageStatsResult res = QueryUsageStats(opts);
+                nlohmann::json jres = UsageStatsResultToJson(res);
+                std::string jsonStr = jres.dump();
+                WriteAuditLog("MCP_TOOL_RESP", "tool=" + toolName + " ok=" + (res.ok ? "true" : "false") +
+                                                   " bytes=" + std::to_string(jsonStr.size()));
+                EmitLine(BuildMcpToolResult(rpcId, jsonStr, !res.ok));
+                continue;
+            }
+
+            if (toolName == "usage_export") {
+                std::string fmt = JsonGetString(argsJson, "format", "csv");
+                std::string since = JsonGetString(argsJson, "since", "");
+                std::string until = JsonGetString(argsJson, "until", "");
+                std::string groupBy = JsonGetString(argsJson, "groupBy", "");
+                if (groupBy.empty()) groupBy = JsonGetString(argsJson, "group_by", "");
+                std::string outPath = JsonGetString(argsJson, "out", "");
+
+                LlmUsageStatsOptions opts;
+                opts.since = since;
+                opts.until = until;
+                opts.groupBy = groupBy;
+
+                LlmUsageStatsResult res = QueryUsageStats(opts);
+                if (!res.ok) {
+                    nlohmann::json errObj;
+                    errObj["ok"] = false;
+                    errObj["error"] = res.error;
+                    std::string errStr = errObj.dump();
+                    WriteAuditLog("MCP_TOOL_RESP", "tool=" + toolName + " ok=false");
+                    EmitLine(BuildMcpToolResult(rpcId, errStr, true));
+                    continue;
+                }
+
+                std::string content;
+                if (fmt == "json") {
+                    content = UsageStatsResultToJson(res).dump(2);
+                } else {
+                    content = FormatUsageStatsCsv(res);
+                }
+
+                nlohmann::json resp;
+                resp["ok"] = true;
+                resp["format"] = fmt;
+
+                if (!outPath.empty()) {
+                    std::wstring outPathW = Utf8ToWide(outPath);
+                    WriteFileAtomicWide(outPathW, content);
+                    resp["path"] = outPath;
+                    resp["bytes"] = content.size();
+                } else {
+                    if (fmt == "json") {
+                        resp["data"] = UsageStatsResultToJson(res);
+                    } else {
+                        resp["csv"] = content;
+                    }
+                }
+
+                std::string jsonStr = resp.dump();
+                WriteAuditLog("MCP_TOOL_RESP", "tool=" + toolName + " ok=true bytes=" + std::to_string(jsonStr.size()));
+                EmitLine(BuildMcpToolResult(rpcId, jsonStr, false));
+                continue;
+            }
+
             if (toolName == "memory_search" || toolName == "memory_get" || toolName == "memory_stats" ||
                 toolName == "memory_brief" || toolName == "memory_note" ||
-                toolName == "memory_retract") {
-                std::string memResp = memory::HandleToolCall(toolName, argsJson);
+                toolName == "memory_retract" || toolName == "memory_approve" || toolName == "memory_promote") {
+                std::string callArgs = argsJson;
+                if ((toolName == "memory_approve" || toolName == "memory_promote") && !mcpClient.empty()) {
+                    try {
+                        nlohmann::json j = nlohmann::json::parse(argsJson, nullptr, false);
+                        if (j.is_object() && !j.contains("worker") && !j.contains("by")) {
+                            size_t space = mcpClient.find(' ');
+                            j["client"] = (space == std::string::npos) ? mcpClient : mcpClient.substr(0, space);
+                            callArgs = j.dump();
+                        }
+                    } catch (...) {}
+                }
+                std::string memResp = memory::HandleToolCall(toolName, callArgs);
                 bool ok = JsonGetBool(memResp, "ok", false);
                 WriteAuditLog("MCP_TOOL_RESP", "tool=" + toolName + " ok=" + (ok ? "true" : "false") +
                                                    " bytes=" + std::to_string(memResp.size()));
@@ -855,12 +970,21 @@ int RunMcpServer() {
             }
             else if (toolName == "get_worker_stream" || toolName == "get_agent_stream") {
                 int64_t id = JsonGetInt(argsJson, "id", 0);
+                std::string schema = JsonGetString(argsJson, "schema", kWorkerStreamDefaultSchema);
+                if (schema.empty()) schema = kWorkerStreamDefaultSchema;
+                if (schema == "legacy") {
+                    EmitLine(BuildMcpToolResult(rpcId, "{\"ok\":false,\"error\":\"schema 'legacy' is not supported; legacy format was removed in v0.11.0, use 'v1' (hancho.event/1)\"}", true));
+                    continue;
+                }
+                if (schema != "v1" && schema != "hancho.event/1") {
+                    EmitLine(BuildMcpToolResult(rpcId, "{\"ok\":false,\"error\":\"unsupported schema: " + JsonEscape(schema) + "; only 'v1' (hancho.event/1) is supported\"}", true));
+                    continue;
+                }
                 int64_t tail = JsonGetInt(argsJson, "tail", 50);
                 std::string typeFilter = JsonGetString(argsJson, "type", "");
                 if (typeFilter.empty()) typeFilter = JsonGetString(argsJson, "filter", "");
                 int64_t sinceSeq = JsonGetInt(argsJson, "since_seq", 0);
                 std::string format = JsonGetString(argsJson, "format", "json");
-                std::string schema = JsonGetString(argsJson, "schema", kWorkerStreamDefaultSchema);
                 ipcReq << "{\"action\":\"get_agent_stream\",\"id\":" << id
                        << ",\"tail\":" << tail
                        << ",\"type\":\"" << JsonEscape(typeFilter) << "\""

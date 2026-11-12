@@ -164,7 +164,11 @@ bool SendIpcRequest(const std::string& reqJson, std::string& outRespJson, std::s
     }
 
     CloseHandle(hPipe);
-    return !outRespJson.empty();
+    if (outRespJson.empty()) {
+        outError = "Named Pipe read returned empty response (GetLastError=" + std::to_string(GetLastError()) + ")";
+        return false;
+    }
+    return true;
 }
 
 } // namespace pc

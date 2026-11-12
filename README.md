@@ -25,8 +25,8 @@ The dashboard has an **execution monitor pane** below the process and task lists
 
 ## Express
 
-- Download and install [Hancho-v0.9.4-win64-setup.exe](https://github.com/gadget114514/Hancho/releases/download/v0.9.4/Hancho-v0.9.4-win64-setup.exe)
-  (portable: [Hancho-v0.9.4-win64.zip](https://github.com/gadget114514/Hancho/releases/download/v0.9.4/Hancho-v0.9.4-win64.zip), all versions: [Releases](https://github.com/gadget114514/Hancho/releases))
+- Download and install [Hancho-v0.9.5-win64-setup.exe](https://github.com/gadget114514/Hancho/releases/download/v0.9.5/Hancho-v0.9.5-win64-setup.exe)
+  (portable: [Hancho-v0.9.5-win64.zip](https://github.com/gadget114514/Hancho/releases/download/v0.9.5/Hancho-v0.9.5-win64.zip), all versions: [Releases](https://github.com/gadget114514/Hancho/releases))
 - In your llm, "find hancho in PATH, then read help to use it" 
 - In your llm, "create task and use (opencode|claude|agy|codex) to execute the task via hancho" 
 - That's all
@@ -94,14 +94,14 @@ What stays the same: each step is still a normal task-queue job with its own tim
 
 Hancho writes a versioned event stream next to the raw one. For a worker process, `logs/proc_<id>_<name>_stream.jsonl` keeps the CLI's raw lines and `logs/proc_<id>_<name>.events.jsonl` holds normalized `hancho.event/1` events (`tool.call`, `tool.result`, `usage`, `run.ended`, ...). The schema is published as [doc/schema/hancho.event.v1.json](doc/schema/hancho.event.v1.json).
 
-- `hancho-cli worker stream <id>` returns the normalized events from `.events.jsonl` by default (`--schema legacy` for the old shape).
-- MCP `get_worker_stream` returns the same shape by default (`schema: "legacy"` for the old shape).
+- `hancho-cli worker stream <id>` returns the normalized events from `.events.jsonl` (`hancho.event/1`).
+- MCP `get_worker_stream` returns the same shape (`hancho.event/1`).
 - Add a CLI without C++ by dropping `<data-dir>/adapters/<name>.json` (Tier 1: `match`, `rules`, JSON Pointer `map`), or point `exec` at a converter process (Tier 3: raw lines on stdin, `hancho.event` lines on stdout).
 - `engines.json` may set `adapter` and `capabilities` (`jsonStream`, `resume`, `reportsUsage`, `reportsSubagents`, `permissionModes`).
 - Wrapper scripts can write events directly: pipe-mode workers get `HANCHO_EVENT_PIPE`, and `hancho-cli event emit --kind message --text "..."` writes to it.
 - `hancho-cli adapter test <name>` checks recorded inputs against expected `{kind, data}` pairs under `tests/adapters/<name>/`.
 
-**Default shape and legacy removal.** Both `hancho-cli worker stream` and MCP `get_worker_stream` return `hancho.event/1` by default. The older internal `type` strings are deprecated as of v0.9.3: pass `--schema legacy` (CLI) or `schema: "legacy"` (MCP) to keep reading them through v0.10.x. They are removed in **v0.11.0**. Migration steps and the `type` → `kind` mapping are in [doc/LLM-jsonstream-format.md](doc/LLM-jsonstream-format.md#legacy-type-strings-and-migration-to-hanchoevent1).
+**Event schema and legacy removal.** Both `hancho-cli worker stream` and MCP `get_worker_stream` return `hancho.event/1`. The older internal `type` strings were deprecated in v0.9.3 and removed in **v0.11.0**. Requests passing `--schema legacy` (CLI) or `schema: "legacy"` (MCP) are rejected as unsupported. Migration details and the `type` → `kind` mapping are in [doc/LLM-jsonstream-format.md](doc/LLM-jsonstream-format.md#legacy-type-strings-and-migration-to-hanchoevent1).
 
 ## Leaving Hancho (graduation)
 
@@ -136,6 +136,15 @@ All Hancho data is plain JSON / JSONL (task queues, behavior trees, stream event
 ---
 
 ## Release Notes
+
+### v0.9.5
+- **Browser dashboard**: `hancho-cli web` opens an embedded HTTP + WebSocket dashboard (127.0.0.1:9138, token auth) with the same process / queue / monitor / why / memory views. See `doc/browser-ui.md`.
+- **Interactive TUI**: `hancho-cli top` is now a full terminal dashboard with five tabs, row navigation, stop/retry/cancel, remote jobs and `--once --json`, with no external curses dependency. See `doc/tui-design.md`.
+- **Remote hosts completed**: one persistent WebSocket multiplexes requests and streams logs/events with sequence resume; a restarted local dashboard reattaches to remote attempts, and `success.filesNewer` is evaluated on the remote host's own clock.
+- **Long-term usage**: daily/monthly `hancho.usage.day/1` rollups, `hancho-cli usage stats|export|compact`, MCP `usage_stats` / `usage_export`, IPC `get_usage_daily`, and dashboard range selection. Per-engine/model attribution comes from task-queue / behavior-tree jobs that emit a JSON stream and receive `--model`.
+- **Memory operations**: external ranker plugin with automatic BM25 fallback, `memory prune` with a `memory_max_bytes` cap, L3 promotion by configured workers, and L1 records for plain runs outside task queues (`taskqueue record-plain`, `memory rebuild`).
+- **Checks and safety**: `success.testReport` (JUnit/NUnit) and scoped named resource locks (`@name:{root}`, `@name:{cwd}`); `hancho.event/1` `data` is strictly typed; `--schema legacy` is rejected.
+- **Docs and help**: `hancho-cli help` now states that `start` is a process, not a task, and that task lists and per-model usage require `taskqueue add` / `run` / `bt start`.
 
 ### v0.9.4
 - **Semantic memory**: L1 run records, L2 notes and L3 approved knowledge under `memory/`. `hancho-cli memory search|get|brief|stats|note|approve|rebuild|prune` and MCP `memory_search`, `memory_get`, `memory_brief`, `memory_stats`, `memory_note`, `memory_retract`. `{memory}` injects a bounded brief and records the ids on the attempt.
@@ -572,11 +581,11 @@ COMMANDS:
   worker status <id>
       Show current worker status, active tool, thoughts, message, and supervisor context.
 
-  worker stream <id> [--tail <n>] [--type <type>] [--since <seq>] [--summary] [--schema <legacy|v1>]
+  worker stream <id> [--tail <n>] [--type <kind>] [--since <seq>] [--summary] [--schema <v1>]
       View captured JSON streaming events for claude, agy, or opencode workers.
       --schema v1 (default) returns the stable hancho.event/1 shape from <log>.events.jsonl.
-      --schema legacy returns the deprecated internal type strings and is removed in v0.11.0.
-      With v1, --type matches the kind (tool.call, message, ...).
+      --schema legacy is not supported (removed in v0.11.0).
+      --type matches the kind (tool.call, message, ...).
 
   worker info <id> [--notes "<notes>"] [--goal "<goal>"]
       Update supervisor notes or goal for an ongoing worker.

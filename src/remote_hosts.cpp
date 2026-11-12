@@ -28,14 +28,6 @@ std::string UpperAscii(std::string s) {
     return s;
 }
 
-std::string Trim(const std::string& s) {
-    size_t begin = 0;
-    while (begin < s.size() && std::isspace(static_cast<unsigned char>(s[begin]))) ++begin;
-    size_t end = s.size();
-    while (end > begin && std::isspace(static_cast<unsigned char>(s[end - 1]))) --end;
-    return s.substr(begin, end - begin);
-}
-
 std::string ReadCredentialTarget(const std::string& target) {
 #ifdef _WIN32
     if (target.empty()) return "";

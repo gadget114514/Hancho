@@ -1,23 +1,28 @@
-# 061 — Linux / macOS 向け GUI ダッシュボード
+# 061 — Linux / macOS 向けダッシュボード（ブラウザ UI）
 
-Estimate 480 min
+Estimate 230 min
 Splittable: no
 
 ## 目的
 
-Linux / macOS 向けのダッシュボード GUI を作る（`doc/design-v3-todo.md` 8）。設計文書 §2.6 の非目標は取り消し済み。
+Linux / macOS 向けのダッシュボードを **ブラウザ UI** で作る（`doc/design-v3-todo.md` 8）。ネイティブ GUI（Qt、GTK、Tauri など）は **ペンディング**。設計文書 §2.6 の非目標は取り消し済み。
+
+## 前提
+
+- `058-1-ws-multiplex.md`、`058-2-ws-subscribe.md` — WebSocket 1 本での複数要求と購読（ブラウザの接続経路）
 
 ## やること
 
-- [ ] GUI フレームワークを選定する。候補は Qt、GTK、Tauri など。IPC クライアントとしての実装、配布のしやすさ、依存の重さで比べ、決定を文書化する。
-- [ ] 選定したフレームワークで、プロセス一覧、タスクキュー、実行状態監視ペイン、失敗診断、メモリ一覧を実装する。
-- [ ] コア（`Hancho --headless`）の IPC クライアントとして動かし、GUI を閉じてもジョブが止まらない構成にする。
-- [ ] ビルド手順と配布方法（パッケージ形式）を文書化する。
-- [ ] 機能の範囲は Windows 版を基準に、Linux / macOS の実情に合わせて削る（削ったものは文書に書く）。
+子カードに分解した。個々の作業は子カードで管理する:
+
+- [ ] `ww-data/tasks/061-1-browser-ui-approach.md` — ブラウザ UI の方式の確定
+- [ ] `ww-data/tasks/061-2-browser-ui-skeleton.md` — localhost の HTTP + WebSocket の骨格
+- [ ] `ww-data/tasks/061-3-browser-ui-panes.md` — 5 機能の実装
+- [ ] `ww-data/tasks/061-4-browser-ui-package.md` — ビルドと配布の文書化
 
 ## 完了条件
 
-- Linux と macOS で GUI が起動し、ジョブの一覧・監視・操作ができる。
+- Linux と macOS のブラウザで、ジョブの一覧・監視・操作ができる。ブラウザを閉じてもジョブは止まらない。
 
 ## 参照
 
@@ -26,7 +31,7 @@ Linux / macOS 向けのダッシュボード GUI を作る（`doc/design-v3-todo
 
 ## Authorised edits
 
-- `src/gui_<選定したフレームワーク>*/`
+- `src/`
 - `CMakeLists.txt`
 - `doc/`
 - `tests/`

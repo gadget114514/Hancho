@@ -199,6 +199,14 @@ std::wstring NormalizeCrLfWide(const std::string& utf8Clean) {
     return Utf8ToWide(norm);
 }
 
+std::string Trim(const std::string& s) {
+    size_t start = 0;
+    while (start < s.size() && std::isspace(static_cast<unsigned char>(s[start]))) ++start;
+    size_t end = s.size();
+    while (end > start && std::isspace(static_cast<unsigned char>(s[end - 1]))) --end;
+    return s.substr(start, end - start);
+}
+
 std::string GetLastNonEmptyLine(const std::string& text, size_t maxLen) {
     if (text.empty()) return "";
     int end = static_cast<int>(text.size()) - 1;

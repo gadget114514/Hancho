@@ -173,16 +173,113 @@ int main() {
               guiStatus.value("headless", false),
           "gui_status reports a headless core");
 
+    // 2b. Standalone GUI launch and reconnect (Card 060c)
+    // Verify that launching Hancho.exe gui starts an independent GUI process
+    // connected to the running core, closing it leaves jobs running, and
+    // reopening reconnects.
+    {
+        std::wstring guiCmd = L"\"" + exe + L"\" gui --no-prompt --data-dir \"" + tempDirW + L"\"";
+        std::vector<wchar_t> mutableGuiCmd(guiCmd.begin(), guiCmd.end());
+        mutableGuiCmd.push_back(L'\0');
+
+        STARTUPINFOW guiSi = {};
+        guiSi.cb = sizeof(guiSi);
+        PROCESS_INFORMATION guiPi = {};
+        BOOL guiStarted = CreateProcessW(nullptr, mutableGuiCmd.data(), nullptr, nullptr, FALSE,
+                                         0, nullptr, nullptr, &guiSi, &guiPi);
+        Check(guiStarted != FALSE, "Hancho.exe gui standalone client starts");
+        if (guiStarted) {
+            CloseHandle(guiPi.hThread);
+            Check(guiPi.dwProcessId != pi.dwProcessId, "GUI runs as a separate process from core");
+
+            // Wait for GUI window to appear
+            HWND dashHwnd = nullptr;
+            for (int attempt = 0; attempt < 50; ++attempt) {
+                dashHwnd = FindWindowW(L"HanchoDashboardWnd", nullptr);
+                if (dashHwnd) {
+                    DWORD wndPid = 0;
+                    GetWindowThreadProcessId(dashHwnd, &wndPid);
+                    if (wndPid == guiPi.dwProcessId) break;
+                }
+                Sleep(100);
+            }
+            Check(dashHwnd != nullptr, "standalone GUI creates dashboard window");
+
+            // Close the GUI window using registered HanchoQuit message
+            UINT quitMsg = RegisterWindowMessageW(L"HanchoQuit");
+            if (dashHwnd) PostMessageW(dashHwnd, quitMsg, 0, 0);
+
+            DWORD guiExit = WaitForSingleObject(guiPi.hProcess, 10000);
+            Check(guiExit == WAIT_OBJECT_0, "standalone GUI process exits cleanly when closed");
+            CloseHandle(guiPi.hProcess);
+
+            // Verify core keeps running and answering ping after GUI exits
+            json pingCheck;
+            Check(IpcCall({{"action", "ping"}}, pingCheck) && pingCheck.value("ok", false),
+                  "core keeps running after GUI process exits");
+
+            // Reconnect: Launch GUI a second time while job is running
+            mutableGuiCmd = std::vector<wchar_t>(guiCmd.begin(), guiCmd.end());
+            mutableGuiCmd.push_back(L'\0');
+            PROCESS_INFORMATION guiPi2 = {};
+            BOOL guiReconnected = CreateProcessW(nullptr, mutableGuiCmd.data(), nullptr, nullptr, FALSE,
+                                                 0, nullptr, nullptr, &guiSi, &guiPi2);
+            Check(guiReconnected != FALSE, "GUI reconnects on second launch");
+            if (guiReconnected) {
+                CloseHandle(guiPi2.hThread);
+                HWND dashHwnd2 = nullptr;
+                for (int attempt = 0; attempt < 50; ++attempt) {
+                    dashHwnd2 = FindWindowW(L"HanchoDashboardWnd", nullptr);
+                    if (dashHwnd2) {
+                        DWORD wndPid = 0;
+                        GetWindowThreadProcessId(dashHwnd2, &wndPid);
+                        if (wndPid == guiPi2.dwProcessId) break;
+                    }
+                    Sleep(100);
+                }
+                Check(dashHwnd2 != nullptr, "reconnected GUI creates dashboard window");
+
+                if (dashHwnd2) PostMessageW(dashHwnd2, quitMsg, 0, 0);
+                DWORD guiExit2 = WaitForSingleObject(guiPi2.hProcess, 10000);
+                Check(guiExit2 == WAIT_OBJECT_0, "reconnected GUI process exits cleanly");
+                CloseHandle(guiPi2.hProcess);
+            }
+        }
+    }
+
     // 3. The job keeps running and finishes even though every client (dashboard)
     //    connection was closed in between.
     json waitResp;
     bool waited = IpcCall({{"action", "wait"}, {"id", jobId}, {"wait_ms", 20000}}, waitResp);
+    std::printf("DEBUG: waited=%d waitResp=%s\n", (int)waited, waitResp.dump().c_str());
     Check(waited && waitResp.value("ok", false) && waitResp.value("finished", false),
           "job continues and finishes after client reconnects");
     if (waited && waitResp.contains("process")) {
         Check(waitResp["process"].value("state", "") == "completed",
               "job finished with state=completed");
     }
+
+    // 3b. Headless core task queue operation without GUI (Card 060d)
+    // Verify that the headless core can manage task queues and queue status via IPC
+    // without any GUI or desktop session present.
+    json tqAddResp;
+    json tqJob = {
+        {"id", "headless_smoke_job_1"},
+        {"command", "cmd /c exit 0"},
+        {"summary", "Headless task queue smoke job"}
+    };
+    bool tqAdd = IpcCall({{"action", "taskqueue_add"},
+                          {"taskqueue", "headless_q"},
+                          {"jobs", json::array({tqJob})}},
+                         tqAddResp);
+    std::printf("DEBUG: tqAdd=%d tqAddResp=%s\n", (int)tqAdd, tqAddResp.dump().c_str());
+    Check(tqAdd && tqAddResp.value("ok", false), "headless core accepts taskqueue_add via IPC");
+
+    json tqListResp;
+    bool tqList = IpcCall({{"action", "taskqueue_list"}}, tqListResp);
+    std::printf("DEBUG: tqList=%d tqListResp=%s\n", (int)tqList, tqListResp.dump().c_str());
+    Check(tqList && tqListResp.value("ok", false) && tqListResp["queues"].is_array(),
+          "headless core lists task queues via IPC");
 
     // 4. A client can stop the headless core.
     json quitResp;
@@ -196,6 +293,26 @@ int main() {
     json pingAfter;
     Check(!IpcCall({{"action", "ping"}}, pingAfter) || !pingAfter.value("ok", false),
           "IPC is no longer served after the core exits");
+
+    // 6. Launching GUI standalone with --no-prompt when core is not running exits with error
+    {
+        std::wstring guiCmd = L"\"" + exe + L"\" gui --no-prompt --data-dir \"" + tempDirW + L"\"";
+        std::vector<wchar_t> mutableGuiCmd(guiCmd.begin(), guiCmd.end());
+        mutableGuiCmd.push_back(L'\0');
+
+        STARTUPINFOW guiSi = {};
+        guiSi.cb = sizeof(guiSi);
+        PROCESS_INFORMATION guiPi = {};
+        if (CreateProcessW(nullptr, mutableGuiCmd.data(), nullptr, nullptr, FALSE,
+                           0, nullptr, nullptr, &guiSi, &guiPi)) {
+            CloseHandle(guiPi.hThread);
+            WaitForSingleObject(guiPi.hProcess, 5000);
+            DWORD ec = 0;
+            GetExitCodeProcess(guiPi.hProcess, &ec);
+            CloseHandle(guiPi.hProcess);
+            Check(ec != 0, "GUI exits with error when core is not running and --no-prompt is set");
+        }
+    }
 
     RemoveDirRecursive(tempDirW);
     std::printf("%s (%d passed, %d failures)\n", g_failures ? "FAILED" : "ALL PASSED",

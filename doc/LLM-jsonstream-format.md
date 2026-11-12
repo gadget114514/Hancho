@@ -90,30 +90,28 @@ The parser is permissive and looks for common fields across agents:
 
 ## Legacy `type` strings and migration to `hancho.event/1`
 
-**Decision: `hancho.event/1` is the default schema for both entry points.**
+**Completed migration: `hancho.event/1` is the only external event schema.**
 
-- `hancho-cli worker stream <id>` returns `hancho.event/1` from `<log>.events.jsonl` unless `--schema legacy` is passed.
-- MCP `get_worker_stream` returns `hancho.event/1` unless `schema: "legacy"` is passed.
+- `hancho-cli worker stream <id>` returns `hancho.event/1` from `<log>.events.jsonl`.
+- MCP `get_worker_stream` returns the same `hancho.event/1` shape.
+- Passing `--schema legacy` (CLI) or `schema: "legacy"` (MCP) returns an error indicating the legacy schema is not supported.
 
-The legacy shape is the one built from the internal `LlmStreamEvent.type` strings. It is **deprecated as of v0.9.3** and stays available for at least one more release:
+The legacy shape built from internal `LlmStreamEvent.type` strings was deprecated in v0.9.3 and removed in **v0.11.0**:
 
 | Version | `--schema legacy` / `schema: "legacy"` |
 |---|---|
-| v0.9.3 – v0.10.x | available; returns the old `type` strings |
+| v0.9.3 – v0.10.x | available; returned the old `type` strings |
 | v0.11.0 and later | removed; only `hancho.event/1` is returned |
 
-The raw `.stream.jsonl` file is still written after the legacy view is removed, so no captured data is lost.
+The raw `.stream.jsonl` file is still written after the legacy view was removed, so no captured data is lost.
 
-### Migration steps
+### Completed migration record
 
-1. Drop `--schema legacy` from CLI calls and `schema: "legacy"` from MCP calls. The v1 shape is the default.
-2. Read `kind` instead of `type`, and read the event payload from `data` instead of the old top-level fields.
-3. Change `--type` / MCP `type` filters from legacy type names to v1 kind names. With v1 the filter matches `kind` (for example `tool.call`, not `tool_call`).
-4. Treat an unknown `kind` as `raw`; new kinds may be added within the same schema version.
-5. Keep using `.stream.jsonl` when the original CLI lines are needed; v1 events point back to them through `raw.file` and `raw.line`.
-6. `hancho-cli worker stream --summary` still uses the legacy shape through v0.10.x; pass `--schema legacy` with it, or read the v1 events directly.
-
-Logs written before v0.9.2 have no `.events.jsonl`; use `--schema legacy` to read them from `.stream.jsonl` until v0.11.0.
+1. `--schema legacy` was dropped from CLI calls and `schema: "legacy"` from MCP calls; `hancho.event/1` is the sole external schema.
+2. Consumers read `kind` instead of `type`, and read event payloads from `data` instead of the old top-level fields.
+3. `--type` and MCP `type` filters match v1 `kind` names (for example `tool.call`, not `tool_call`).
+4. Unknown `kind` values are treated as `raw`; new kinds may be added within the same schema version.
+5. Original CLI lines remain accessible in `.stream.jsonl`; v1 events point back to them through `raw.file` and `raw.line`.
 
 ### `type` to `kind` mapping
 
@@ -135,6 +133,17 @@ Logs written before v0.9.2 have no `.events.jsonl`; use `--schema legacy` to rea
 | anything else (for example `user_input`) | `raw` | `text` |
 
 Outer fields also move: `seq` stays `seq`; `timestamp` becomes `ts`; `agentType`, `model`, `sessionId`, `agentId` and `parentAgentId` move under `agent`; process/job/attempt/BT details move under `source`; the source line moves under `raw`.
+
+## Strictly Typed `data` and Schema Validation (`hancho.event/1`)
+
+As defined in `doc/schema/hancho.event.v1.json` and `doc/schema/README.md`:
+
+- **Strict `data` Typing**: For each closed `kind`, the `data` payload defines an explicit property list with `"additionalProperties": false`. Unknown or unexpected fields inside `data` are rejected by schema validators.
+- **`plan` Status Constraints**: Plan items (`items[]`) strictly enforce `required: ["content", "status"]`, where `status` must be one of `"pending"`, `"in_progress"`, `"completed"`, or `"cancelled"`. Unknown fields on item objects are rejected (`additionalProperties: false`).
+- **Free-Form Exception (`data.input`)**:
+  - `tool.call` -> `data.input` (`type: ["object", "string"]`): Tool invocation arguments are tool- and agent-specific. Hancho preserves them as key-value pairs (or raw unparsed string) without imposing tool-specific parameter schemas. Primitive types (number, boolean, null) are rejected.
+  - All other `data` fields must strictly match their kind's schema.
+- **Outer Envelope Minor Changes**: Outer metadata (`source`, `agent`, `raw`) and the top-level object permit additional properties (`additionalProperties: true`) for non-breaking minor additions within v1. Consumers must ignore unknown outer fields.
 
 ## Notes
 

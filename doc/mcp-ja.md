@@ -65,5 +65,13 @@ hancho-cli.exe mcp uninstall --delete-data-dir           # データディレク
 | `memory_get` | 1 件の全文と出典（`id`, `kind?`）。 |
 | `memory_brief` | ジョブに関係する記録を固定形式で要約（`jobName?`, `taskqueue?`, `file?`, `files?`, `scopes?`, `budgetChars?`, `includeAgentNotes?`, `maxPreviousRuns?`）。前回の実行 / よくある失敗 / 関連ノート / プロジェクト知識を、各行に id 付きで返す。 |
 | `memory_stats` | L1 の集計（成功率、所要時間の中央値・p90、失敗分類、トークン数と費用。ジョブ・エンジン・モデル別）。 |
+| `memory_approve` | L2 ノートを L3 プロジェクト知識へ昇格（`id`, `worker?`, `by?`）。`config.json` の `memory.l3Promoters` に指定された許可ワーカーのみ実行可能。未設定または未許可の場合は拒否。 |
 
-L3 のプロジェクト知識への昇格は人だけが行えます（`hancho-cli memory approve <id>` または GUI）。MCP ツールとしては公開しないため、エージェントは承認できません。
+**LLM 使用量集計**
+
+| ツール | 説明 |
+| :--- | :--- |
+| `usage_stats` | 日次ロールアップログから集計した LLM トークン使用量と推定費用を取得（`since?`, `until?`, `groupBy?`: `day`\|`month`\|`engine`\|`model`）。 |
+| `usage_export` | 集計した LLM 使用量を CSV または JSON で書き出し（`format?`: `csv`\|`json`, `since?`, `until?`, `groupBy?`, `out?`）。 |
+
+L3 のプロジェクト知識への昇格は人（`hancho-cli memory approve <id>` または GUI）に加えて、`config.json` の `memory.l3Promoters` に列挙された特定の許可ワーカーのみが MCP の `memory_approve` を通じて行えます。未許可のエージェントは拒否されます。

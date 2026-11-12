@@ -170,6 +170,124 @@ std::vector<LlmUsagePoint> GetLlmUsageHistory(int64_t sinceEpochSec);
 void SetUsageHistoryPersistence(bool enabled);
 bool IsUsageHistoryPersistence();
 
+constexpr int64_t kUsageDiskRetentionSec = 7 * 24 * 60 * 60; // 7 days (U0 on disk)
+
+// Long-term daily LLM usage aggregation record (U1, schema: hancho.usage.day/1).
+// Persisted in usage/daily/<YYYY-MM>.jsonl as an append-log of deltas.
+struct LlmDailyUsageRecord {
+    std::string schema = "hancho.usage.day/1";
+    std::string date;        // "YYYY-MM-DD" local date
+    int tzOffsetMin = 0;     // local timezone offset in minutes from UTC
+    std::string engine;      // agentType ("claude", "agy", "opencode", etc.)
+    std::string model;
+    uint64_t inputTokens = 0;
+    uint64_t outputTokens = 0;
+    uint64_t thinkingTokens = 0;
+    uint64_t cacheReadTokens = 0;
+    uint64_t cacheWriteTokens = 0;
+    uint64_t totalTokens = 0;
+    double costUsd = 0.0;
+    bool costKnown = true;
+    uint64_t runs = 0;
+    int64_t firstEpochSec = 0;
+    int64_t lastEpochSec = 0;
+};
+
+// Serialization / parsing helpers for U1 records.
+nlohmann::json DailyUsageRecordToJson(const LlmDailyUsageRecord& rec);
+bool ParseDailyUsageRecordJson(const nlohmann::json& j, LlmDailyUsageRecord& out);
+
+// Prune logs/usage_history.jsonl dropping lines older than retentionSec (default 7 days).
+void PruneUsageHistory(int64_t retentionSec = kUsageDiskRetentionSec, int64_t nowSec = 0);
+
+// Persistence of daily delta logs (usage/daily/<YYYY-MM>.jsonl). On by default.
+void SetDailyUsagePersistence(bool enabled);
+bool IsDailyUsagePersistence();
+
+// Directory and path helpers for daily usage logs.
+std::wstring GetDailyUsageDirWide();
+std::wstring GetDailyUsagePathWide(const std::string& yearMonth);
+
+// Query options for daily LLM usage stats (U1).
+struct LlmUsageStatsOptions {
+    std::string since;   // "YYYY-MM-DD", "YYYY-MM", "today", "24h", "7d", "30d", etc.
+    std::string until;   // "YYYY-MM-DD", "YYYY-MM", "today", etc.
+    std::string groupBy; // "day", "month", "engine", "model", or "" (default: date x engine x model)
+};
+
+struct LlmUsageStatsGroup {
+    std::string key;     // the grouping key value (date, month, engine, or model)
+    std::string date;    // set if grouped by day
+    std::string month;   // set if grouped by month
+    std::string engine;  // set if grouped by engine
+    std::string model;   // set if grouped by model
+    uint64_t inputTokens = 0;
+    uint64_t outputTokens = 0;
+    uint64_t thinkingTokens = 0;
+    uint64_t cacheReadTokens = 0;
+    uint64_t cacheWriteTokens = 0;
+    uint64_t totalTokens = 0;
+    double costUsd = 0.0;
+    bool costKnown = true;
+    uint64_t runs = 0;
+    int64_t firstEpochSec = 0;
+    int64_t lastEpochSec = 0;
+};
+
+struct LlmUsageStatsResult {
+    bool ok = true;
+    std::string error;
+    std::string since;
+    std::string until;
+    std::string groupBy;
+    std::vector<LlmDailyUsageRecord> records; // hancho.usage.day/1 (when groupBy is empty or date x engine x model)
+    std::vector<LlmUsageStatsGroup> groups;   // when groupBy is "day", "month", "engine", "model"
+    // Grand totals:
+    uint64_t totalInputTokens = 0;
+    uint64_t totalOutputTokens = 0;
+    uint64_t totalThinkingTokens = 0;
+    uint64_t totalCacheReadTokens = 0;
+    uint64_t totalCacheWriteTokens = 0;
+    uint64_t totalTokens = 0;
+    double totalCostUsd = 0.0;
+    bool costKnown = true;
+    uint64_t totalRuns = 0;
+    int64_t firstEpochSec = 0;
+    int64_t lastEpochSec = 0;
+};
+
+// Reads usage/daily/<YYYY-MM>.jsonl files, sums deltas with the same (date, engine, model),
+// and returns unified hancho.usage.day/1 records.
+std::vector<LlmDailyUsageRecord> ReadDailyUsageSummary(const std::string& since = "", const std::string& until = "");
+
+// Evaluates usage stats with filtering and optional grouping (day, month, engine, model).
+LlmUsageStatsResult QueryUsageStats(const LlmUsageStatsOptions& options);
+
+// Serializes LlmUsageStatsResult into JSON (matching doc/design-v3.md 3.6.1).
+nlohmann::json UsageStatsResultToJson(const LlmUsageStatsResult& res);
+
+// Formats LlmUsageStatsResult as human-readable table for CLI stdout.
+std::string FormatUsageStatsTable(const LlmUsageStatsResult& res);
+
+// Formats LlmUsageStatsResult as CSV text.
+std::string FormatUsageStatsCsv(const LlmUsageStatsResult& res);
+
+// Result of compacting monthly daily usage logs.
+struct LlmUsageCompactResult {
+    bool ok = true;
+    std::string error;
+    int filesProcessed = 0;
+    int filesCompacted = 0;
+    uint64_t linesBefore = 0;
+    uint64_t linesAfter = 0;
+    uint64_t bytesSaved = 0;
+};
+
+// Compacts usage/daily/<yearMonth>.jsonl (or all months if yearMonth is empty).
+// Aggregates deltas within each month into 1 line per (date x engine x model),
+// writing to a temp file and replacing atomically.
+LlmUsageCompactResult CompactDailyUsage(const std::string& yearMonth = "");
+
 // Events kept per stream tracker. -1 keeps them all (until memory runs out); otherwise the value
 // is kept within [kMinLlmMaxEvents, kMaxLlmMaxEvents], and any other value (0, other negatives)
 // becomes kMinLlmMaxEvents. Applies to every running process at its next event.

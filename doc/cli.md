@@ -6,17 +6,23 @@ The console client `hancho-cli.exe` communicates with the running GUI Dashboard 
 
 > **Naming:** `Hancho.exe` is the GUI dashboard / MCP server; `hancho-cli.exe` is its console client.
 
-## Linux / macOS: `hancho-cli top`
+## Linux / macOS: `hancho-cli top` (Interactive Terminal Dashboard)
 
-On POSIX the core runs headless and the CLI talks to a Unix domain socket. Use
-`top` for a small terminal view of the queue and running processes:
+On POSIX the core runs headless and the CLI talks to a Unix domain socket. `top` provides an interactive terminal dashboard featuring 5 views equivalent to the desktop dashboard (Processes, Queue, Monitor, Why, Memory):
 
 ```sh
-hancho-cli --data-dir ./ww-data top              # refresh every second
-hancho-cli top --once --json                     # one machine-readable snapshot
+hancho-cli --data-dir ./ww-data top              # interactive TUI (refreshes every 1000ms)
+hancho-cli top --interval 500                    # refresh every 500ms
+hancho-cli top --once                            # emit one formatted snapshot to stdout and exit
+hancho-cli top --once --json                     # one machine-readable JSON snapshot
 ```
 
-Build instructions are in [build-posix.md](build-posix.md).
+- **Tabs**: `Tab` / `Shift+Tab` to cycle, or `1`-`5` to switch directly between Processes, Queue, Monitor, Why, and Memory.
+- **Row navigation**: `j` / `k` or `Down` / `Up` arrow keys.
+- **Job operations**: `s` to stop/kill, `r` to retry, `c` to cancel.
+- **Help**: `?` toggles keyboard shortcut reference, `q` or `Ctrl+C` to quit.
+
+See [tui-design.md](tui-design.md) for full design, shortcuts, and POSIX verification checklist. Build instructions are in [build-posix.md](build-posix.md).
 
 ## Version (`--version` / `-V` / `version`)
 
@@ -148,9 +154,58 @@ hancho-cli.exe memory get rr_j_7f3a_2
 hancho-cli.exe memory approve nt_01JC9Z --by alice
 ```
 
+`memory search [query] [filters] [--ranker <path>] [--limit <n>]` searches L1 run records, L2 notes, and L3 approved knowledge. Ranking uses BM25-like keyword scoring by default. An external ranker plugin process can be specified in `<data-dir>/config.json` via `"ranker_plugin": "<path>"` or `{"ranker_plugin": {"path": "<path>", "timeoutMs": 5000}}` (or overridden on the command line via `--ranker <path>`). The plugin protocol sends `{"query": ..., "candidates": [{"id": ..., "kind": ..., "text": ..., "createdEpoch": ...}]}` via stdin and receives candidate scores on stdout as a JSON array `[<score>, ...]` or `{"scores": {"<id>": <score>, ...}}` / `{"scores": [<score>, ...]}`. If the plugin fails to start, exits abnormally, times out, or produces malformed output, search does not halt; it falls back cleanly to built-in BM25 ranking and reports a `rankerWarning`. Sample plugins are available under `tests/data/sample_ranker.py` and `tests/data/sample_ranker.bat`.
+
 `memory brief` prints the fixed block (previous runs, common failures, related notes, project knowledge) with an id on every line. Sections are trimmed from the bottom up to fit `--budget-chars` (default 1500), keeping L3 project knowledge to the end. `--no-agent-notes` leaves out L2 notes written by agents. Jobs can receive the same brief automatically: see the `memory` job field in [taskqueue.md](taskqueue.md).
 
-`memory approve <note-id>` promotes an approved L2 note to L3 project knowledge in `memory/knowledge.jsonl`, adding `approvedBy` and `approvedAt` and retiring the note. It is the human-only path (the GUI memory list offers the same action); it is deliberately not exposed as an MCP tool, so agents cannot promote. The file is plain JSONL with one approved fact per line, meant to be committed to git and shared with the team.
+`memory approve <note-id> [--by <name>] [--worker <name>]` promotes an approved L2 note to L3 project knowledge in `memory/knowledge.jsonl`, adding `approvedBy` and `approvedAt` and retiring the note. In addition to human operators (CLI/GUI), specific workers enumerated in `<data-dir>/config.json` under `memory.l3Promoters` (array of names or comma-separated string) are authorized to promote notes using `--by worker:<name>` or `--worker <name>`. Unlisted workers and unauthorized callers are rejected. The file is plain JSONL with one approved fact per line, meant to be committed to git and shared with the team.
+
+`memory prune [--dry-run] [--days <n>]` removes L1 run records (`memory/records/*.jsonl`) from months older than the retention period (default 90 days). If `memory_max_bytes` is configured in `config.json`, it also prunes the oldest L1 files when the memory directory exceeds the size limit. L2 notes and L3 knowledge are never deleted automatically; a warning is issued when usage approaches the limit (>= 80%). Use `--dry-run` to preview candidate files without deleting them. `memory stats` also includes current memory usage and configured limits.
+
+**Query LLM usage statistics (`usage stats`):**
+
+```powershell
+# Breakdown by day x engine x model (default)
+hancho-cli.exe usage stats
+
+# Aggregate by day, month, engine, or model
+hancho-cli.exe usage stats --group-by day
+hancho-cli.exe usage stats --group-by month
+hancho-cli.exe usage stats --group-by engine
+hancho-cli.exe usage stats --group-by model
+
+# Time window filtering
+hancho-cli.exe usage stats --since today
+hancho-cli.exe usage stats --since 7d
+hancho-cli.exe usage stats --since 2026-11-01 --until 2026-11-30
+
+# Output machine-readable JSON
+hancho-cli.exe usage stats --group-by day --json
+```
+
+`usage stats` reads daily rollup records (`usage/daily/<YYYY-MM>.jsonl`, schema `hancho.usage.day/1`) and sums deltas across the same key, returning token breakdowns (input, output, thinking, cache read/write) and estimated USD costs. Engines that do not report cost (e.g. `agy`) include `costKnown: false`.
+
+**Export LLM usage data (`usage export`):**
+
+```powershell
+# Export to CSV (default)
+hancho-cli.exe usage export
+hancho-cli.exe usage export --format csv --out usage.csv
+
+# Export grouped by month / engine / day
+hancho-cli.exe usage export --format csv --group-by month
+hancho-cli.exe usage export --format json --group-by engine --out engine_usage.json
+```
+
+**Compact daily usage delta logs (`usage compact`):**
+
+```powershell
+# Compact all months or a specific month into 1 line per date x engine x model
+hancho-cli.exe usage compact
+hancho-cli.exe usage compact --month 2026-11
+```
+
+Compaction runs automatically upon month rollover, aggregating deltas and atomically replacing the file via a temporary file to keep disk usage under 1 MB for 12 months.
 
 **Register as an MCP server automatically (recommended for LLM agents):**
 

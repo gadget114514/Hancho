@@ -22,8 +22,8 @@
 
 ## Express
 
-- [Hancho-v0.9.4-win64-setup.exe](https://github.com/gadget114514/Hancho/releases/download/v0.9.4/Hancho-v0.9.4-win64-setup.exe) をダウンロードしてインストール
-  （ポータブル版: [Hancho-v0.9.4-win64.zip](https://github.com/gadget114514/Hancho/releases/download/v0.9.4/Hancho-v0.9.4-win64.zip)、全バージョン: [Releases](https://github.com/gadget114514/Hancho/releases)）
+- [Hancho-v0.9.5-win64-setup.exe](https://github.com/gadget114514/Hancho/releases/download/v0.9.5/Hancho-v0.9.5-win64-setup.exe) をダウンロードしてインストール
+  （ポータブル版: [Hancho-v0.9.5-win64.zip](https://github.com/gadget114514/Hancho/releases/download/v0.9.5/Hancho-v0.9.5-win64.zip)、全バージョン: [Releases](https://github.com/gadget114514/Hancho/releases)）
 - LLM に「PATH から hancho を探して、help を読んで使い方を把握して」と伝える
 - LLM に「タスクを作成して、hancho 経由で (opencode|claude|agy|codex) に実行させて」と伝える
 - 以上
@@ -96,14 +96,14 @@ MCP ツール `run_worker` は、1つのタスクをワーカーの LLM CLI に�
 
 Hancho は生のストリームの隣に、版番号つきのイベント列を書き出します。ワーカープロセスの `logs/proc_<id>_<name>_stream.jsonl` は CLI の生の行を、`logs/proc_<id>_<name>.events.jsonl` は正規化した `hancho.event/1` イベント（`tool.call`、`tool.result`、`usage`、`run.ended` など）を持ちます。スキーマは [doc/schema/hancho.event.v1.json](doc/schema/hancho.event.v1.json) で配布します。
 
-- `hancho-cli worker stream <id>` は既定で `.events.jsonl` の正規化イベントを表示します（旧形式は `--schema legacy`）。
-- MCP の `get_worker_stream` は既定で同じ形式を返します（旧形式は `schema: "legacy"`）。
+- `hancho-cli worker stream <id>` は `.events.jsonl` の正規化イベント（`hancho.event/1`）を表示します。
+- MCP の `get_worker_stream` は同じ形式（`hancho.event/1`）を返します。
 - C++ を書かずに CLI を追加できます。`<data-dir>/adapters/<name>.json` を置く（Tier 1: `match`、`rules`、JSON Pointer の `map`）か、`exec` に変換プロセスを指定します（Tier 3: stdin に生の行、stdout に `hancho.event` 行）。
 - `engines.json` に `adapter` と `capabilities`（`jsonStream`、`resume`、`reportsUsage`、`reportsSubagents`、`permissionModes`）を書けます。
 - ラッパースクリプトから直接イベントを出せます。pipe モードのワーカーには `HANCHO_EVENT_PIPE` が渡され、`hancho-cli event emit --kind message --text "..."` で書き込めます。
 - `hancho-cli adapter test <name>` は `tests/adapters/<name>/` の入力と期待する `{kind, data}` を照合します。
 
-**既定の形式と旧形式の廃止予定。** `hancho-cli worker stream` と MCP `get_worker_stream` は既定で `hancho.event/1` を返します。以前の内部 `type` 文字列は v0.9.3 で非推奨になりました。`--schema legacy`（CLI）または `schema: "legacy"`（MCP）を渡せば v0.10.x までは引き続き読めますが、**v0.11.0** で削除します。移行手順と `type` → `kind` の対応表は [doc/LLM-jsonstream-format.md](doc/LLM-jsonstream-format.md#legacy-type-strings-and-migration-to-hanchoevent1) にあります。
+**イベント形式と旧形式の削除。** `hancho-cli worker stream` と MCP `get_worker_stream` は `hancho.event/1` を返します。以前の内部 `type` 文字列は v0.9.3 で非推奨になり、**v0.11.0** で削除されました。`--schema legacy`（CLI）または `schema: "legacy"`（MCP）を指定すると非対応エラーとなります。移行記録と `type` → `kind` の対応表は [doc/LLM-jsonstream-format.md](doc/LLM-jsonstream-format.md#legacy-type-strings-and-migration-to-hanchoevent1) にあります。
 
 ## Hancho をやめるとき（卒業）
 
@@ -140,6 +140,15 @@ Hancho のデータはすべて JSON / JSONL（タスクキュー、ビヘイビ
 （以下の help 本文は英語です）
 
 ## リリースノート
+
+### v0.9.5
+- **ブラウザダッシュボード**: `hancho-cli web` で、プロセス / キュー / 監視 / 失敗診断 / メモリの各画面を持つ HTTP + WebSocket ダッシュボード（127.0.0.1:9138、トークン認証）を開けます。`doc/browser-ui-ja.md` を参照。
+- **対話 TUI**: `hancho-cli top` が 5 タブ、行移動、停止 / 再試行 / 取消、リモートジョブ、`--once --json` を備えた端末ダッシュボードになりました。外部 curses 依存はありません。`doc/tui-design-ja.md` を参照。
+- **リモートホストの完成**: 1 本の WebSocket で要求を多重化し、ログ / イベントを seq 再開付きで配信。ローカルダッシュボード再起動後もリモート試行へ再接続し、`success.filesNewer` はリモートホスト側の時計で評価します。
+- **長期使用量集計**: 日次 / 月次の `hancho.usage.day/1` ロールアップ、`hancho-cli usage stats|export|compact`、MCP `usage_stats` / `usage_export`、IPC `get_usage_daily`、ダッシュボードの期間選択。エンジン / モデル別の帰属は、JSON ストリームを出し `--model` を受け取るタスクキュー / ビヘイビアツリージョブから記録されます。
+- **メモリ運用**: 外部ランカープラグイン（失敗時は BM25 に自動フォールバック）、`memory_max_bytes` 上限付きの `memory prune`、設定したワーカーによる L3 昇格、タスクキュー外の通常実行を L1 記録にする仕組み（`taskqueue record-plain`、`memory rebuild`）。
+- **チェックと安全性**: `success.testReport`（JUnit / NUnit）とスコープ付き名前付きリソースロック（`@name:{root}`、`@name:{cwd}`）、`hancho.event/1` の `data` を厳密に型付け、`--schema legacy` を拒否。
+- **ドキュメントと help**: `hancho-cli help` に、`start` はプロセスでありタスクではないこと、タスク一覧とモデル別使用量には `taskqueue add` / `run` / `bt start` が必要であることを明記しました。
 
 ### v0.9.4
 - **意味的メモリ**: L1 実行記録、L2 ノート、L3 承認済み知識を `memory/` に保存。`hancho-cli memory search|get|brief|stats|note|approve|rebuild|prune` と MCP `memory_search` / `memory_get` / `memory_brief` / `memory_stats` / `memory_note` / `memory_retract`。`{memory}` で上限付きの brief を注入し、渡した id を試行に記録します。
@@ -576,11 +585,11 @@ COMMANDS:
   worker status <id>
       Show current worker status, active tool, thoughts, message, and supervisor context.
 
-  worker stream <id> [--tail <n>] [--type <type>] [--since <seq>] [--summary] [--schema <legacy|v1>]
+  worker stream <id> [--tail <n>] [--type <kind>] [--since <seq>] [--summary] [--schema <v1>]
       View captured JSON streaming events for claude, agy, or opencode workers.
       --schema v1 (default) returns the stable hancho.event/1 shape from <log>.events.jsonl.
-      --schema legacy returns the deprecated internal type strings and is removed in v0.11.0.
-      With v1, --type matches the kind (tool.call, message, ...).
+      --schema legacy is not supported (removed in v0.11.0).
+      --type matches the kind (tool.call, message, ...).
 
   worker info <id> [--notes "<notes>"] [--goal "<goal>"]
       Update supervisor notes or goal for an ongoing worker.

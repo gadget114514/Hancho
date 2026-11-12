@@ -1,6 +1,6 @@
 # 052 — usage の書き出しと月次表示（U2/U3）
 
-Estimate 180 min
+Estimate 85 min
 Splittable: no
 
 ## 目的

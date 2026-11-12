@@ -2,7 +2,7 @@
   "$schema": "https://json-schema.org/draft/2020-12/schema",
   "$id": "https://hancho.dev/schema/hancho.event.v1.json",
   "title": "hancho.event/1",
-  "description": "One normalized Hancho event, one JSON object per line in logs/proc_<id>_<name>_events.jsonl. Compatibility rules: adding a field is a minor change within the same version and consumers ignore fields they do not know; changing the meaning of a field or removing it requires hancho.event/2, which is emitted alongside v1 for at least one release; a consumer that receives an unknown kind treats it as raw.",
+  "description": "One normalized Hancho event, one JSON object per line in logs/proc_<id>_<name>.events.jsonl. The data object is strictly typed per event kind; unexpected fields in data are rejected (additionalProperties: false). Free-form exceptions: data.input in tool.call is free-form (object or unparsed string) because tool parameters vary per tool and agent CLI. Compatibility rules: adding a field to the outer envelope is a minor change within the same version and consumers ignore fields they do not know; changing the meaning of a field or removing it requires hancho.event/2, which is emitted alongside v1 for at least one release; a consumer that receives an unknown kind treats it as raw.",
   "type": "object",
   "required": ["schema", "seq", "ts", "source", "agent", "kind", "data", "raw"],
   "properties": {
@@ -87,7 +87,7 @@
     },
     "data": {
       "type": "object",
-      "description": "Fields depend on kind; see the allOf rules below."
+      "description": "Fields depend on kind; strictly typed per kind. See the allOf rules below."
     },
     "raw": {
       "type": "object",
@@ -118,7 +118,8 @@
               "cwd": { "type": "string" },
               "toolsOffered": { "type": "integer", "minimum": 0 },
               "permissionMode": { "type": "string" }
-            }
+            },
+            "additionalProperties": false
           }
         }
       }
@@ -131,7 +132,8 @@
             "type": "object",
             "properties": {
               "messageId": { "type": "string" }
-            }
+            },
+            "additionalProperties": false
           }
         }
       }
@@ -150,9 +152,13 @@
               },
               "toolUseId": { "type": "string" },
               "target": { "type": "string" },
-              "input": {},
+              "input": {
+                "type": ["object", "string"],
+                "description": "Tool invocation arguments. Free-form exception: keys and structure are unconstrained because arguments vary per tool and agent CLI; Hancho preserves them as key-value pairs (or raw string when unparsed) without prescribing tool-specific parameter schemas."
+              },
               "note": { "type": "string" }
-            }
+            },
+            "additionalProperties": false
           }
         }
       }
@@ -169,7 +175,8 @@
               "toolUseId": { "type": "string" },
               "error": { "type": "string" },
               "summary": { "type": "string" }
-            }
+            },
+            "additionalProperties": false
           }
         }
       }
@@ -184,7 +191,8 @@
             "properties": {
               "text": { "type": "string" },
               "truncated": { "type": "boolean" }
-            }
+            },
+            "additionalProperties": false
           }
         }
       }
@@ -199,7 +207,8 @@
             "properties": {
               "text": { "type": "string" },
               "truncated": { "type": "boolean" }
-            }
+            },
+            "additionalProperties": false
           }
         }
       }
@@ -219,12 +228,17 @@
                   "required": ["content", "status"],
                   "properties": {
                     "content": { "type": "string" },
-                    "status": { "type": "string" }
+                    "status": {
+                      "type": "string",
+                      "enum": ["pending", "in_progress", "completed", "cancelled"],
+                      "description": "Item progress status: pending, in_progress, completed, or cancelled."
+                    }
                   },
-                  "additionalProperties": true
+                  "additionalProperties": false
                 }
               }
-            }
+            },
+            "additionalProperties": false
           }
         }
       }
@@ -252,7 +266,8 @@
               "totalTokens": { "type": "integer", "minimum": 0 },
               "costUsd": { "type": "number", "minimum": 0 },
               "cumulative": { "type": "boolean" }
-            }
+            },
+            "additionalProperties": false
           }
         }
       }
@@ -269,7 +284,8 @@
               "window": { "type": "string" },
               "utilization": { "type": "number", "minimum": 0 },
               "resetsAt": { "type": ["integer", "string"] }
-            }
+            },
+            "additionalProperties": false
           }
         }
       }
@@ -286,7 +302,8 @@
               "type": { "type": "string" },
               "description": { "type": "string" },
               "toolUseId": { "type": "string" }
-            }
+            },
+            "additionalProperties": false
           }
         }
       }
@@ -304,7 +321,8 @@
               "tokens": { "type": "integer", "minimum": 0 },
               "toolUses": { "type": "integer", "minimum": 0 },
               "durationMs": { "type": "integer", "minimum": 0 }
-            }
+            },
+            "additionalProperties": false
           }
         }
       }
@@ -322,7 +340,8 @@
               "numTurns": { "type": "integer", "minimum": 0 },
               "durationMs": { "type": "integer", "minimum": 0 },
               "permissionDenials": { "type": "integer", "minimum": 0 }
-            }
+            },
+            "additionalProperties": false
           }
         }
       }
@@ -338,7 +357,8 @@
               "message": { "type": "string" },
               "code": { "type": "string" },
               "retryable": { "type": "boolean" }
-            }
+            },
+            "additionalProperties": false
           }
         }
       }
@@ -352,7 +372,8 @@
             "required": ["text"],
             "properties": {
               "text": { "type": "string" }
-            }
+            },
+            "additionalProperties": false
           }
         }
       }

@@ -1,5 +1,7 @@
 #include "memory_cli.h"
+#include "memory_record.h"
 #include "memory_search.h"
+#include "common.h"
 #include "nlohmann/json.hpp"
 
 #include <algorithm>
@@ -74,12 +76,13 @@ bool UnknownOption(const std::string& arg) {
 
 void PrintMemoryUsage(std::ostream& out) {
     out << "MEMORY:\n"
-        << "  memory search [query] [filters] [--limit <n>]\n"
+        << "  memory search [query] [filters] [--ranker <path>] [--limit <n>]\n"
         << "      Search L1 run records, L2 notes and L3 approved knowledge.\n"
         << "      Filters: --kind run,note,knowledge --scope <scope> --file <path>\n"
         << "               --job-name <name> --taskqueue <name> --engine <name>\n"
         << "               --model <name> --outcome <outcome> --failure-class <class>\n"
         << "               --since <30m|6h|2d|YYYY-MM-DD>\n"
+        << "               --ranker <path> (external ranker plugin override)\n"
         << "  memory get <id> [--kind <run|note|knowledge>]\n"
         << "      Show one memory record in full, with its source file and line.\n"
         << "  memory brief [--job-name <name>] [--taskqueue <name>] [--file <path>]...\n"
@@ -91,8 +94,9 @@ void PrintMemoryUsage(std::ostream& out) {
         << "  memory stats [--since <period>] [--job-name <name>] [--taskqueue <name>]\n"
         << "               [--engine <name>] [--model <name>] [--outcome <outcome>]\n"
         << "      Success rate, duration median/p90, failures and token usage from L1.\n"
-        << "  memory approve <note-id> [--by <name>]\n"
-        << "      Promote an L2 note to L3 knowledge. Human only; agents cannot call this.\n"
+        << "  memory approve <note-id> [--by <name>] [--worker <name>]\n"
+        << "      Promote an L2 note to L3 knowledge. Allowed for humans and\n"
+        << "      authorized workers listed in memory.l3Promoters in config.json.\n"
         << "      Writes memory/knowledge.jsonl with approvedBy / approvedAt.\n"
         << "  memory note --text <text> [--scope <scope>] [--tag <tag>]...\n"
         << "              [--source <id>]... [--supersedes <note-id>] [--expires-at <time>]\n"
@@ -107,6 +111,11 @@ void PrintMemoryUsage(std::ostream& out) {
         << "      Rebuild memory/records/*.jsonl (L1) from logs/taskqueues/*.json and the\n"
         << "      normalized .events.jsonl, then rebuild memory/index/index.json from the\n"
         << "      records, notes.jsonl and knowledge.jsonl. Derived data only.\n"
+        << "  memory prune [--dry-run|-n] [--days <n>]\n"
+        << "      Delete memory/records/*.jsonl (L1) for months older than 90 days (or --days).\n"
+        << "      Also enforces the configured memory/ capacity limit from config.json by\n"
+        << "      pruning oldest L1 files. L2 notes and L3 knowledge are never deleted.\n"
+        << "      --dry-run lists candidates without deleting.\n"
         << "      All commands accept --json / -j.\n";
 }
 
@@ -147,6 +156,10 @@ int PrintSearch(const std::string& response) {
     if (!j.value("ok", false)) {
         std::cerr << "Error: " << Str(j, "error") << "\n";
         return 1;
+    }
+    if (j.contains("rankerWarning") && j["rankerWarning"].is_string()) {
+        std::cerr << "Warning: ranker failed (" << j["rankerWarning"].get<std::string>()
+                  << "), fell back to builtin ranking\n";
     }
     auto results = j.find("results");
     size_t count = 0;
@@ -237,6 +250,26 @@ int PrintStats(const std::string& response) {
         std::cout << "Stored: " << Int(*counts, "run") << " run(s), "
                   << Int(*counts, "note") << " note(s), "
                   << Int(*counts, "knowledge") << " knowledge\n";
+    }
+    auto storage = j.find("storage");
+    if (storage != j.end() && storage->is_object()) {
+        int64_t total = Int(*storage, "totalBytes");
+        int64_t limit = Int(*storage, "limitBytes");
+        std::cout << "Storage: " << FormatBytes(total);
+        if (limit > 0) {
+            std::cout << " / " << FormatBytes(limit) << " ("
+                      << std::fixed << std::setprecision(1) << Num(*storage, "usedPercent") << "%)";
+        } else {
+            std::cout << " (no limit)";
+        }
+        std::cout << " [L1: " << FormatBytes(Int(*storage, "l1Bytes"))
+                  << ", L2: " << FormatBytes(Int(*storage, "l2Bytes"))
+                  << ", L3: " << FormatBytes(Int(*storage, "l3Bytes")) << "]\n";
+        if (storage->value("exceeded", false)) {
+            std::cout << "Warning: memory storage limit exceeded!\n";
+        } else if (storage->value("nearLimit", false)) {
+            std::cout << "Warning: memory storage is near configured limit (>= 80%)\n";
+        }
     }
     auto byJob = j.find("byJobName");
     if (byJob != j.end()) PrintGroups("By job", *byJob);
@@ -352,6 +385,64 @@ int PrintRebuild(const std::string& response) {
     return 0;
 }
 
+int PrintPrune(const std::string& response) {
+    json j = json::parse(response, nullptr, false);
+    if (j.is_discarded() || !j.is_object()) {
+        std::cerr << "Error: invalid response from memory prune\n";
+        return 1;
+    }
+    if (!j.value("ok", false)) {
+        std::cerr << "Error: " << Str(j, "error") << "\n";
+        return 1;
+    }
+    bool dryRun = j.value("dryRun", false);
+    auto files = j.find("prunedFiles");
+    std::vector<std::string> fileList;
+    if (files != j.end() && files->is_array()) {
+        for (const auto& f : *files) {
+            if (f.is_string()) fileList.push_back(f.get<std::string>());
+        }
+    }
+    int64_t freed = Int(j, "bytesFreed");
+    int days = static_cast<int>(Int(j, "retentionDays", 90));
+
+    if (dryRun) {
+        if (fileList.empty()) {
+            std::cout << "Dry run: no memory record files would be pruned (retention: " << days << " days).\n";
+        } else {
+            std::cout << "Dry run: " << fileList.size() << " file(s) would be pruned ("
+                      << FormatBytes(freed) << " would be freed):\n";
+            for (const auto& f : fileList) {
+                std::cout << "  " << f << "\n";
+            }
+        }
+    } else {
+        if (fileList.empty()) {
+            std::cout << "No memory record files older than " << days << " days to prune.\n";
+        } else {
+            std::cout << "Pruned " << fileList.size() << " file(s) ("
+                      << FormatBytes(freed) << " freed):\n";
+            for (const auto& f : fileList) {
+                std::cout << "  " << f << "\n";
+            }
+        }
+    }
+    int64_t remaining = Int(j, "totalBytesAfter");
+    int64_t limit = Int(j, "limitBytes");
+    std::cout << "Current memory storage: " << FormatBytes(remaining);
+    if (limit > 0) {
+        std::cout << " / " << FormatBytes(limit);
+    }
+    std::cout << "\n";
+
+    if (j.value("exceeded", false)) {
+        std::cout << "Warning: memory storage limit exceeded! L2 notes and L3 knowledge are preserved.\n";
+    } else if (j.value("nearLimit", false)) {
+        std::cout << "Warning: memory storage is near configured limit (>= 80%). L2/L3 are preserved.\n";
+    }
+    return 0;
+}
+
 } // namespace
 
 int RunMemoryCli(const std::vector<std::string>& args, bool jsonOutput) {
@@ -364,11 +455,14 @@ int RunMemoryCli(const std::vector<std::string>& args, bool jsonOutput) {
     if (op == "search") {
         memory::Query q;
         bool help = false;
+        std::string rankerPlugin;
         std::vector<std::string> words;
         for (size_t i = 3; i < args.size(); ++i) {
             const std::string& a = args[i];
             if (IsHelp(a)) {
                 help = true;
+            } else if ((a == "--ranker" || a == "--ranker-plugin") && i + 1 < args.size()) {
+                rankerPlugin = args[++i];
             } else if (a == "--limit" && i + 1 < args.size()) {
                 try {
                     q.limit = std::stoi(args[++i]);
@@ -399,7 +493,11 @@ int RunMemoryCli(const std::vector<std::string>& args, bool jsonOutput) {
         }
         if (q.limit <= 0) q.limit = 20;
         if (q.limit > 200) q.limit = 200;
-        std::string response = memory::SearchJson(q);
+        std::unique_ptr<memory::IMemoryRanker> customRanker;
+        if (!rankerPlugin.empty()) {
+            customRanker = std::make_unique<memory::ProcessRanker>(rankerPlugin);
+        }
+        std::string response = memory::SearchJson(q, customRanker.get());
         if (jsonOutput) {
             std::cout << response << "\n";
             return 0;
@@ -539,6 +637,9 @@ int RunMemoryCli(const std::vector<std::string>& args, bool jsonOutput) {
             } else if ((a == "--by" || a == "--approved-by" || a == "--approvedBy") &&
                        i + 1 < args.size()) {
                 approvedBy = args[++i];
+            } else if ((a == "--worker" || a == "-w") && i + 1 < args.size()) {
+                std::string w = args[++i];
+                approvedBy = (w.rfind("worker:", 0) == 0) ? w : ("worker:" + w);
             } else if (UnknownOption(a)) {
                 std::cerr << "Error: unknown option for memory approve: " << a << "\n";
                 return 1;
@@ -662,6 +763,42 @@ int RunMemoryCli(const std::vector<std::string>& args, bool jsonOutput) {
             return 0;
         }
         return PrintRebuild(response);
+    }
+
+    if (op == "prune") {
+        memory::PruneOptions o;
+        bool help = false;
+        for (size_t i = 3; i < args.size(); ++i) {
+            const std::string& a = args[i];
+            if (IsHelp(a)) {
+                help = true;
+            } else if (a == "--dry-run" || a == "-n") {
+                o.dryRun = true;
+            } else if ((a == "--days" || a == "--retention-days" || a == "--retentionDays") && i + 1 < args.size()) {
+                try {
+                    o.retentionDays = std::stoi(args[++i]);
+                } catch (...) {
+                }
+            } else if ((a == "--limit-bytes" || a == "--limitBytes") && i + 1 < args.size()) {
+                try {
+                    o.limitBytes = std::stoll(args[++i]);
+                } catch (...) {
+                }
+            } else if (UnknownOption(a)) {
+                std::cerr << "Error: unknown option for memory prune: " << a << "\n";
+                return 1;
+            }
+        }
+        if (help) {
+            PrintMemoryUsage(std::cout);
+            return 0;
+        }
+        std::string response = memory::PruneRunRecordsJson(o);
+        if (jsonOutput) {
+            std::cout << response << "\n";
+            return 0;
+        }
+        return PrintPrune(response);
     }
 
     std::cerr << "Error: unknown memory command: " << op << "\n";

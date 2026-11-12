@@ -90,4 +90,6 @@ hancho-cli.exe taskqueue wait main --since 0 --timeout-ms 30000
 
 **イベントと環境変数:** 各試行に `PC_JOB_ID`, `PC_ATTEMPT`, `PC_JOB_SUMMARY`, `PC_JOB_INSTRUCTIONS`, `PC_JOB_INSTRUCTIONS_REV`、再実行時は `PC_PREV_REASON`, `PC_PREV_EXIT`, `PC_PREV_TAIL`。イベントは `logs/taskqueue-<name>.events.jsonl` に追記され、`notifyFile` は `jobFailed` / `taskqueueStalled` / `taskqueueDrained` で更新されます。
 
+**キューの外の実行（Plain Runs）:** `hancho-cli run` や手動起動など、タスクキュー外のプロセスも最小状態が `logs/taskqueues/plain.json` に保存され、`memory rebuild` の入力となります。既存キューのスケジューリングには影響しません。詳細は [plain-runs-ja.md](plain-runs-ja.md) を参照。
+
 **GUI:** 左端の表示切替ボタン、または **Ctrl+T** で **2行同時表示 (Two Rows)**、**プロセスのみ (Processes Only)**、**タスクのみ (Tasks Only)** を順次トグル切り替え。2行表示時は水平スプリッターバーをドラッグして各領域の高さを自在に調整できます。実行中は上位・強調表示、失敗は低彩度の赤、タイムアウトは低彩度のアンバー（テーマ色）。

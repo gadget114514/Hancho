@@ -4,6 +4,7 @@
 // a real task queue run through /bin/sh, and one behaviour tree with a job node.
 
 #include "bt_manager.h"
+#include "cli_top.h"
 #include "common.h"
 #include "ipc_server.h"
 #include "platform/platform.h"
@@ -158,6 +159,64 @@ int main() {
                   "BT runs a job node (state=" + state + ")");
         }
         btm.Shutdown();
+    }
+
+    // --- TUI output formatting smoke test (card 062-4) --------------------
+    {
+        // 1. Format and Key parsing helpers
+        Check(top::FormatBytes(1024) == "1.0 KB", "TUI FormatBytes(1024)");
+        Check(top::PadOrTruncate("hello world", 5) == "he...", "TUI PadOrTruncate truncate");
+        Check(top::ParseKeySequence("\x1b[A") == top::TopKey::Up, "TUI ParseKeySequence Up");
+        Check(top::ParseKeySequence("q") == top::TopKey::Quit, "TUI ParseKeySequence Quit");
+        Check(top::ParseKeySequence("s") == top::TopKey::JobStop, "TUI ParseKeySequence Stop");
+        Check(top::ParseKeySequence("r") == top::TopKey::JobRetry, "TUI ParseKeySequence Retry");
+        Check(top::ParseKeySequence("c") == top::TopKey::JobCancel, "TUI ParseKeySequence Cancel");
+
+        // 2. Pure rendering test without live terminal
+        top::TopState state;
+        state.coreConnected = true;
+        state.timestamp = "2026-11-11 19:30:00";
+
+        // Tab 1: Processes
+        state.activeTab = top::TopTab::Processes;
+        std::string renderedProc = top::RenderScreen(state, 80, 24, false);
+        Check(renderedProc.find("Hancho Top") != std::string::npos, "TUI renders Hancho Top title");
+        Check(renderedProc.find("Process List") != std::string::npos, "TUI renders Processes tab header");
+
+        // Tab 2: Queue
+        state.activeTab = top::TopTab::Queue;
+        std::string renderedQ = top::RenderScreen(state, 80, 24, false);
+        Check(renderedQ.find("Task Queue Overview") != std::string::npos, "TUI renders Queue tab header");
+
+        // Tab 3: Monitor
+        state.activeTab = top::TopTab::Monitor;
+        std::string renderedMon = top::RenderScreen(state, 80, 24, false);
+        Check(renderedMon.find("Execution Monitor Stream") != std::string::npos, "TUI renders Monitor tab header");
+
+        // Tab 4: Why / Diagnostics
+        state.activeTab = top::TopTab::Diagnostics;
+        std::string renderedWhy = top::RenderScreen(state, 80, 24, false);
+        Check(renderedWhy.find("Failure Diagnostics (Why)") != std::string::npos, "TUI renders Diagnostics tab header");
+
+        // Tab 5: Memory
+        state.activeTab = top::TopTab::Memory;
+        std::string renderedMem = top::RenderScreen(state, 80, 24, false);
+        Check(renderedMem.find("Memory & Knowledge Records") != std::string::npos, "TUI renders Memory tab header");
+
+        // Job Operations request building
+        std::string req, desc;
+        nlohmann::json qData;
+        qData["jobs"] = nlohmann::json::array();
+        nlohmann::json testJob;
+        testJob["id"] = "posix-smoke-job-1";
+        testJob["state"] = "failed";
+        qData["jobs"].push_back(testJob);
+        state.activeTab = top::TopTab::Queue;
+        state.selectedRow = 0;
+        state.queueData = qData;
+
+        Check(top::BuildJobRetryRequest(state, req, desc), "TUI BuildJobRetryRequest succeeds");
+        Check(req.find("taskqueue_retry") != std::string::npos, "TUI BuildJobRetryRequest action is taskqueue_retry");
     }
 
     tqm.ShutdownTaskQueueManager();

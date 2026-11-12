@@ -12,6 +12,7 @@
 namespace pc {
 
 class BtManager;
+class WebUiServer;
 
 class IpcServer {
 public:
@@ -40,6 +41,10 @@ public:
     void SetHeadless(bool headless) { headless_ = headless; }
     bool IsHeadless() const { return headless_; }
 
+    WebUiServer* GetWebUiServer() { return webUiServer_.get(); }
+    void StartWebUiServer();
+    void StopWebUiServer();
+
     // Execute a JSON request directly against ProcessManager / TaskQueueManager / BtManager
     // and return a JSON response.
     std::string HandleRequestJson(const std::string& reqJson);
@@ -67,6 +72,7 @@ private:
     std::atomic<bool> stop_{false};
     std::thread acceptThread_;
     std::unique_ptr<remote::RemoteListener> remoteListener_;
+    std::unique_ptr<WebUiServer> webUiServer_;
     bool remoteCallbacksInstalled_ = false;
 };
 

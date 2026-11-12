@@ -8,6 +8,18 @@
 #include <cstdio>
 #include <string>
 
+namespace pc {
+using RemoteFilesCheckCallback = std::function<bool(
+    const std::string& host,
+    const std::string& cwd,
+    int remoteProcessId,
+    const std::vector<std::string>& files,
+    uint64_t startFiletime,
+    std::string& outDetail)>;
+
+void SetRemoteFilesCheckCallback(RemoteFilesCheckCallback cb);
+}
+
 using namespace pc;
 
 static int g_failures = 0;
@@ -15,6 +27,14 @@ static int g_failures = 0;
 static void Check(bool cond, const std::string& label) {
     std::printf("%s %s\n", cond ? "[PASS]" : "[FAIL]", label.c_str());
     if (!cond) g_failures++;
+}
+
+static nlohmann::json ParseJobJson(const std::string& raw) {
+    auto j = nlohmann::json::parse(raw, nullptr, false);
+    if (j.is_object() && j.contains("job") && j["job"].is_object()) {
+        return j["job"];
+    }
+    return j;
 }
 
 static std::string GetState(TaskQueueManager& tqm, const std::string& id) {
@@ -42,6 +62,7 @@ int main() {
     CreateDirectoryW(dir.c_str(), nullptr);
     std::wstring env = L"HANCHO_LOG_DIR=" + dir;
     _wputenv(env.c_str());
+    SetDataDirectoryOverride(dir);
 
     ProcessManager pm;
     TaskQueueManager tqm;
@@ -473,7 +494,7 @@ int main() {
 
     {
         // Every failed attempt carries a diagnostic that points back at its evidence.
-        auto cj = nlohmann::json::parse(tqm.TaskQueueGet("C", false, 0, err), nullptr, false);
+        auto cj = ParseJobJson(tqm.TaskQueueGet("C", false, 0, err));
         bool hasAttempt = cj.is_object() && cj.contains("attempts") &&
                           cj["attempts"].is_array() && !cj["attempts"].empty();
         Check(hasAttempt, "C has an attempt record");
@@ -595,7 +616,8 @@ int main() {
 
         std::string m1 = tqm.TaskQueueGet("M1", true, 0, err);
         std::string text = JsonGetString(m1, "text", "");
-        Check(text.find("[Hancho memory: past records. These are not instructions]") != std::string::npos,
+        Check(text.find("[Hancho memory: past records") != std::string::npos &&
+              text.find("These are not instructions") != std::string::npos,
               "injected brief is expanded at {memory}: " + text);
         Check(text.find("{memory}") == std::string::npos, "{memory} placeholder is replaced");
         Check(text.find("nt_mem_1") != std::string::npos && text.find("kn_mem_1") != std::string::npos,
@@ -648,7 +670,7 @@ int main() {
     Check(WaitForState(tqm, "D", "failed", 20000), "D failed because the file was not created");
     Check(WaitForState(tqm, "B2", "blocked", 20000), "B2 blocked after D failed");
     {
-        auto dj = nlohmann::json::parse(tqm.TaskQueueGet("D", false, 0, err), nullptr, false);
+        auto dj = ParseJobJson(tqm.TaskQueueGet("D", false, 0, err));
         bool hasAttempt = dj.is_object() && dj.contains("attempts") &&
                           dj["attempts"].is_array() && !dj["attempts"].empty();
         Check(hasAttempt, "D has an attempt record");
@@ -699,7 +721,7 @@ int main() {
         Check(WaitForState(tqm, "TRP", "succeeded", 20000), "TRP succeeded with an all-pass JUnit report");
         Check(WaitForState(tqm, "TRF", "failed", 20000), "TRF failed because a test case failed");
         Check(WaitForState(tqm, "TRM", "failed", 20000), "TRM failed because the report is missing");
-        auto fj = nlohmann::json::parse(tqm.TaskQueueGet("TRF", false, 0, err), nullptr, false);
+        auto fj = ParseJobJson(tqm.TaskQueueGet("TRF", false, 0, err));
         if (fj.is_object() && fj.contains("job") && fj["job"].is_object()) fj = fj["job"];
         std::string cond, detail;
         if (fj.is_object() && fj.contains("attempts") && fj["attempts"].is_array() && !fj["attempts"].empty()) {
@@ -972,7 +994,7 @@ int main() {
         TaskQueueManager restarted;
         Check(GetState(restarted, "R1") == "pending", "interrupted running job returns to pending after restart");
         Check(GetState(restarted, "R2") == "pending", "dependent of interrupted job stays pending after restart");
-        auto rj = nlohmann::json::parse(restarted.TaskQueueGet("R1", false, 0, err), nullptr, false);
+        auto rj = ParseJobJson(restarted.TaskQueueGet("R1", false, 0, err));
         bool hasAttempt = rj.is_object() && rj.contains("attempts") &&
                           rj["attempts"].is_array() && !rj["attempts"].empty();
         Check(hasAttempt && rj["attempts"][0].contains("failure") &&
@@ -989,6 +1011,521 @@ int main() {
                   "JUnit marks an interrupted job as skipped with the reason");
         }
         restarted.ShutdownTaskQueueManager();
+    }
+
+    // Remote reconnect after restart (056-1, doc/design-v3.md 2.5).
+    {
+        std::wstring hostsFile = (std::filesystem::path(GetEffectiveDataDirectoryWide()) / L"hosts.json").wstring();
+        std::string prevHosts = ReadFileUtf8Wide(hostsFile);
+
+        // Case 1: host not in hosts.json -> returns to pending (interrupted).
+        {
+            DeleteFileW(hostsFile.c_str());
+            std::string qJson =
+                "{\"name\":\"remote_reconnect_q\",\"concurrency\":1,\"paused\":false,\"version\":1,"
+                "\"jobs\":[{\"id\":\"REM1\",\"taskqueue\":\"remote_reconnect_q\",\"command\":\"cmd /c exit 0\","
+                "\"host\":\"box_unknown\",\"state\":\"running\",\"attempts\":[{"
+                "\"n\":1,\"process_id\":0,\"remote_host\":\"box_unknown\",\"remote_process_id\":42,"
+                "\"remote_job_id\":\"REM1\",\"remote_attempt\":1,"
+                "\"start\":\"2026-01-01 00:00:00\",\"end\":\"\",\"reason\":\"\",\"exit_code\":-1}]}]}";
+            WriteFileAtomicWide(TaskQueueManager::GetTaskQueueFileWide("remote_reconnect_q"), qJson);
+            TaskQueueManager restarted;
+            Check(GetState(restarted, "REM1") == "pending",
+                  "remote running job whose host is not in hosts.json returns to pending on restart");
+            auto rj = ParseJobJson(restarted.TaskQueueGet("REM1", false, 0, err));
+            Check(rj.is_object() && rj["attempts"][0]["reason"] == "interrupted" &&
+                      rj["attempts"][0].value("remote_job_id", "") == "REM1" &&
+                      rj["attempts"][0].value("remote_attempt", 0) == 1,
+                  "unreachable remote attempt preserved remote_job_id/remote_attempt and reason=interrupted");
+            restarted.ShutdownTaskQueueManager();
+        }
+
+        // Case 2: host is in hosts.json, but reconnect fails (unreachable) -> interrupted.
+        {
+            std::string hostsJson =
+                "{\"schema\":\"hancho.hosts/1\",\"hosts\":[{\"name\":\"box_offline\",\"address\":\"127.0.0.1:9137\",\"enabled\":true}]}";
+            WriteFileAtomicWide(hostsFile, hostsJson);
+            std::string qJson =
+                "{\"name\":\"remote_reconnect_q\",\"concurrency\":1,\"paused\":false,\"version\":1,"
+                "\"jobs\":[{\"id\":\"REM2\",\"taskqueue\":\"remote_reconnect_q\",\"command\":\"cmd /c exit 0\","
+                "\"host\":\"box_offline\",\"state\":\"running\",\"attempts\":[{"
+                "\"n\":1,\"process_id\":0,\"remote_host\":\"box_offline\",\"remote_process_id\":99,"
+                "\"remote_job_id\":\"REM2\",\"remote_attempt\":1,"
+                "\"start\":\"2026-01-01 00:00:00\",\"end\":\"\",\"reason\":\"\",\"exit_code\":-1}]}]}";
+            WriteFileAtomicWide(TaskQueueManager::GetTaskQueueFileWide("remote_reconnect_q"), qJson);
+            TaskQueueManager restarted;
+            Check(GetState(restarted, "REM2") == "running",
+                  "remote job with registered host stays running pending reconnect");
+            restarted.SetRemoteCallbacks(
+                nullptr,
+                [](const std::string&, int, RemotePollResult&, std::string& errCb) {
+                    errCb = "connection refused";
+                    return false;
+                },
+                nullptr);
+            Check(GetState(restarted, "REM2") == "pending",
+                  "remote job whose host is unreachable becomes interrupted");
+            auto rj = ParseJobJson(restarted.TaskQueueGet("REM2", false, 0, err));
+            Check(rj.is_object() && rj["attempts"][0]["reason"] == "interrupted",
+                  "failed reconnect marks attempt as interrupted");
+            restarted.ShutdownTaskQueueManager();
+        }
+
+        // Case 3: host is in hosts.json and reachable (still running) -> reconnected, stays running.
+        {
+            std::string hostsJson =
+                "{\"schema\":\"hancho.hosts/1\",\"hosts\":[{\"name\":\"box_online\",\"address\":\"127.0.0.1:9137\",\"enabled\":true}]}";
+            WriteFileAtomicWide(hostsFile, hostsJson);
+            std::string qJson =
+                "{\"name\":\"remote_reconnect_q\",\"concurrency\":1,\"paused\":false,\"version\":1,"
+                "\"jobs\":[{\"id\":\"REM3\",\"taskqueue\":\"remote_reconnect_q\",\"command\":\"cmd /c exit 0\","
+                "\"host\":\"box_online\",\"state\":\"running\",\"attempts\":[{"
+                "\"n\":1,\"process_id\":0,\"remote_host\":\"box_online\",\"remote_process_id\":100,"
+                "\"remote_job_id\":\"REM3\",\"remote_attempt\":1,"
+                "\"start\":\"2026-01-01 00:00:00\",\"end\":\"\",\"reason\":\"\",\"exit_code\":-1}]}]}";
+            WriteFileAtomicWide(TaskQueueManager::GetTaskQueueFileWide("remote_reconnect_q"), qJson);
+            TaskQueueManager restarted;
+            bool pollCalled = false;
+            restarted.SetRemoteCallbacks(
+                nullptr,
+                [&pollCalled](const std::string& host, int pid, RemotePollResult& res, std::string&) {
+                    pollCalled = true;
+                    Check(host == "box_online" && pid == 100, "reconnect targets expected host and pid");
+                    res.finished = false;
+                    return true;
+                },
+                nullptr);
+            Check(pollCalled, "reconnect called remote poll");
+            Check(GetState(restarted, "REM3") == "running",
+                  "successfully reconnected remote job stays running");
+            restarted.ShutdownTaskQueueManager();
+        }
+
+        // Case 4: host is in hosts.json and finished while Hancho was offline -> status, log, events, and .done restored.
+        {
+            std::string hostsJson =
+                "{\"schema\":\"hancho.hosts/1\",\"hosts\":[{\"name\":\"box_online\",\"address\":\"127.0.0.1:9137\",\"enabled\":true}]}";
+            WriteFileAtomicWide(hostsFile, hostsJson);
+            std::string qJson =
+                "{\"name\":\"remote_reconnect_q\",\"concurrency\":1,\"paused\":false,\"version\":1,"
+                "\"jobs\":[{\"id\":\"REM4\",\"taskqueue\":\"remote_reconnect_q\",\"command\":\"cmd /c exit 0\","
+                "\"host\":\"box_online\",\"state\":\"running\",\"attempts\":[{"
+                "\"n\":1,\"process_id\":0,\"remote_host\":\"box_online\",\"remote_process_id\":101,"
+                "\"remote_job_id\":\"REM4\",\"remote_attempt\":1,"
+                "\"start\":\"2026-01-01 00:00:00\",\"end\":\"\",\"reason\":\"\",\"exit_code\":-1}]}]}";
+            WriteFileAtomicWide(TaskQueueManager::GetTaskQueueFileWide("remote_reconnect_q"), qJson);
+            TaskQueueManager restarted;
+            const std::string expectedOutput = "remote task line 1\nremote task line 2\nremote task finished successfully\n";
+            const std::string expectedEvents = "{\"schema\":\"hancho.event/1\",\"seq\":1,\"kind\":\"turn.started\"}\n{\"schema\":\"hancho.event/1\",\"seq\":2,\"kind\":\"turn.completed\"}\n";
+            const std::string expectedDone = "{\"exit_code\":0,\"status\":\"ok\"}";
+            restarted.SetRemoteCallbacks(
+                nullptr,
+                [&](const std::string&, int, RemotePollResult& res, std::string&) {
+                    res.finished = true;
+                    res.exitCode = 0;
+                    res.endKind = "completed";
+                    res.output = expectedOutput;
+                    res.eventsJsonl = expectedEvents;
+                    res.doneContent = expectedDone;
+                    return true;
+                },
+                nullptr);
+            Check(GetState(restarted, "REM4") == "succeeded",
+                  "remote job that finished during restart is marked succeeded on reconnect");
+
+            std::wstring logPath = TaskQueueManager::GetAttemptLogFileWide("REM4", 1);
+            std::wstring eventsPath = logPath.substr(0, logPath.size() - 4) + L".events.jsonl";
+            std::wstring donePath = logPath.substr(0, logPath.size() - 4) + L".done";
+            std::wstring tailPath = logPath.substr(0, logPath.size() - 4) + L".tail.txt";
+
+            Check(ReadFileUtf8Wide(logPath) == expectedOutput,
+                  "reconnect restored remote attempt log to disk");
+            Check(ReadFileUtf8Wide(eventsPath) == expectedEvents,
+                  "reconnect restored remote attempt events to disk");
+            Check(ReadFileUtf8Wide(donePath) == expectedDone,
+                  "reconnect restored remote attempt .done file to disk");
+            std::string tailContent = ReadFileUtf8Wide(tailPath);
+            Check(!tailContent.empty() && tailContent.find("remote task finished successfully") != std::string::npos,
+                  "reconnect restored remote attempt tail file");
+
+            auto rj = ParseJobJson(restarted.TaskQueueGet("REM4", false, 0, err));
+            Check(rj.is_object() && rj["state"] == "succeeded", "reconnected job state is succeeded in list");
+            Check(rj["attempts"].is_array() && !rj["attempts"].empty(), "reconnected job has attempts");
+            const auto& a0 = rj["attempts"][0];
+            Check(a0.value("reason", "") == "ok" && a0.value("exit_code", -1) == 0,
+                  "reconnected attempt has reason=ok and exit_code=0");
+            Check(a0.value("remote_host", "") == "box_online" &&
+                  a0.value("remote_job_id", "") == "REM4" &&
+                  a0.value("remote_attempt", 0) == 1 &&
+                  a0.value("remote_process_id", 0) == 101,
+                  "reconnected attempt preserved remote host, process ID, job ID, and attempt number");
+            Check(!a0.value("end", "").empty(), "reconnected attempt has recorded end timestamp");
+
+            restarted.ShutdownTaskQueueManager();
+
+            // Verify persistence: restart again, job and its restored state remain intact.
+            {
+                TaskQueueManager reloaded;
+                Check(GetState(reloaded, "REM4") == "succeeded",
+                      "reconnected job remains succeeded across subsequent restart");
+                auto rjReloaded = ParseJobJson(reloaded.TaskQueueGet("REM4", false, 0, err));
+                Check(rjReloaded.is_object() && rjReloaded["attempts"][0].value("reason", "") == "ok",
+                      "persisted attempt remains intact across subsequent restart");
+                reloaded.ShutdownTaskQueueManager();
+            }
+
+            DeleteFileW(logPath.c_str());
+            DeleteFileW(eventsPath.c_str());
+            DeleteFileW(donePath.c_str());
+            DeleteFileW(tailPath.c_str());
+        }
+
+        // Case 5: remote job continues running across restart, then finishes on subsequent poll.
+        {
+            std::string hostsJson =
+                "{\"schema\":\"hancho.hosts/1\",\"hosts\":[{\"name\":\"box_online\",\"address\":\"127.0.0.1:9137\",\"enabled\":true}]}";
+            WriteFileAtomicWide(hostsFile, hostsJson);
+            std::string qJson =
+                "{\"name\":\"remote_reconnect_q\",\"concurrency\":1,\"paused\":false,\"version\":1,"
+                "\"jobs\":[{\"id\":\"REM5\",\"taskqueue\":\"remote_reconnect_q\",\"command\":\"cmd /c exit 0\","
+                "\"host\":\"box_online\",\"state\":\"running\",\"attempts\":[{"
+                "\"n\":1,\"process_id\":0,\"remote_host\":\"box_online\",\"remote_process_id\":102,"
+                "\"remote_job_id\":\"REM5\",\"remote_attempt\":1,"
+                "\"start\":\"2026-01-01 00:00:00\",\"end\":\"\",\"reason\":\"\",\"exit_code\":-1}]}]}";
+            WriteFileAtomicWide(TaskQueueManager::GetTaskQueueFileWide("remote_reconnect_q"), qJson);
+            TaskQueueManager restarted;
+            int pollCount = 0;
+            const std::string expectedOutput = "REM5 output log\nfinished\n";
+            const std::string expectedEvents = "{\"schema\":\"hancho.event/1\",\"seq\":1,\"kind\":\"turn.completed\"}\n";
+            const std::string expectedDone = "{\"exit_code\":0}";
+            restarted.SetRemoteCallbacks(
+                nullptr,
+                [&](const std::string&, int, RemotePollResult& res, std::string&) {
+                    pollCount++;
+                    if (pollCount == 1) {
+                        res.finished = false;
+                        return true;
+                    }
+                    res.finished = true;
+                    res.exitCode = 0;
+                    res.endKind = "completed";
+                    res.output = expectedOutput;
+                    res.eventsJsonl = expectedEvents;
+                    res.doneContent = expectedDone;
+                    return true;
+                },
+                nullptr);
+            Check(GetState(restarted, "REM5") == "running",
+                  "reconnected remote job that is still running remains running");
+            restarted.PollRemoteJobs();
+            Check(GetState(restarted, "REM5") == "succeeded",
+                  "reconnected job marked succeeded after completing on subsequent poll");
+
+            std::wstring logPath = TaskQueueManager::GetAttemptLogFileWide("REM5", 1);
+            std::wstring eventsPath = logPath.substr(0, logPath.size() - 4) + L".events.jsonl";
+            std::wstring donePath = logPath.substr(0, logPath.size() - 4) + L".done";
+            std::wstring tailPath = logPath.substr(0, logPath.size() - 4) + L".tail.txt";
+
+            Check(ReadFileUtf8Wide(logPath) == expectedOutput,
+                  "subsequent poll restored remote attempt log to disk");
+            Check(ReadFileUtf8Wide(eventsPath) == expectedEvents,
+                  "subsequent poll restored remote attempt events to disk");
+            Check(ReadFileUtf8Wide(donePath) == expectedDone,
+                  "subsequent poll restored remote attempt .done file to disk");
+
+            restarted.ShutdownTaskQueueManager();
+            DeleteFileW(logPath.c_str());
+            DeleteFileW(eventsPath.c_str());
+            DeleteFileW(donePath.c_str());
+            DeleteFileW(tailPath.c_str());
+        }
+
+        // Case 6: remote job that failed on the host while Hancho was offline -> restored as failed with failure logs.
+        {
+            std::string hostsJson =
+                "{\"schema\":\"hancho.hosts/1\",\"hosts\":[{\"name\":\"box_online\",\"address\":\"127.0.0.1:9137\",\"enabled\":true}]}";
+            WriteFileAtomicWide(hostsFile, hostsJson);
+            std::string qJson =
+                "{\"name\":\"remote_reconnect_q\",\"concurrency\":1,\"paused\":false,\"version\":1,"
+                "\"jobs\":[{\"id\":\"REM6\",\"taskqueue\":\"remote_reconnect_q\",\"command\":\"cmd /c exit 0\",\"max_attempts\":1,"
+                "\"host\":\"box_online\",\"state\":\"running\",\"attempts\":[{"
+                "\"n\":1,\"process_id\":0,\"remote_host\":\"box_online\",\"remote_process_id\":103,"
+                "\"remote_job_id\":\"REM6\",\"remote_attempt\":1,"
+                "\"start\":\"2026-01-01 00:00:00\",\"end\":\"\",\"reason\":\"\",\"exit_code\":-1}]}]}";
+            WriteFileAtomicWide(TaskQueueManager::GetTaskQueueFileWide("remote_reconnect_q"), qJson);
+            TaskQueueManager restarted;
+            const std::string failOutput = "fatal error: remote build compilation failed\n";
+            restarted.SetRemoteCallbacks(
+                nullptr,
+                [&](const std::string&, int, RemotePollResult& res, std::string&) {
+                    res.finished = true;
+                    res.exitCode = 1;
+                    res.endKind = "failed";
+                    res.output = failOutput;
+                    res.doneContent = "{\"exit_code\":1,\"status\":\"failed\"}";
+                    return true;
+                },
+                nullptr);
+            Check(GetState(restarted, "REM6") == "failed",
+                  "remote job that failed during restart is restored with failed state on reconnect");
+            std::wstring logPath = TaskQueueManager::GetAttemptLogFileWide("REM6", 1);
+            Check(ReadFileUtf8Wide(logPath) == failOutput,
+                  "reconnect restored failed remote attempt log to disk");
+            auto rj = ParseJobJson(restarted.TaskQueueGet("REM6", false, 0, err));
+            Check(rj.is_object() && rj["attempts"][0].value("exit_code", -1) == 1,
+                  "restored failed remote attempt preserves exit code 1");
+            restarted.ShutdownTaskQueueManager();
+            DeleteFileW(logPath.c_str());
+            std::wstring donePath = logPath.substr(0, logPath.size() - 4) + L".done";
+            std::wstring tailPath = logPath.substr(0, logPath.size() - 4) + L".tail.txt";
+            DeleteFileW(donePath.c_str());
+            DeleteFileW(tailPath.c_str());
+        }
+
+        if (!prevHosts.empty()) {
+            WriteFileAtomicWide(hostsFile, prevHosts);
+        } else {
+            DeleteFileW(hostsFile.c_str());
+        }
+        DeleteFileW(TaskQueueManager::GetTaskQueueFileWide("remote_reconnect_q").c_str());
+    }
+
+    // Remote success.filesNewer evaluation (057, doc/design-v3-todo.md 6).
+    {
+        std::wstring hostsFile = (std::filesystem::path(GetEffectiveDataDirectoryWide()) / L"hosts.json").wstring();
+        std::string prevHosts = ReadFileUtf8Wide(hostsFile);
+        std::string hostsJson =
+            "{\"schema\":\"hancho.hosts/1\",\"hosts\":[{\"name\":\"box_online\",\"address\":\"127.0.0.1:9137\",\"enabled\":true}]}";
+        WriteFileAtomicWide(hostsFile, hostsJson);
+
+        // Case 1: Remote job with files_newer succeeds when host reports files are newer.
+        {
+            std::string qJson =
+                "{\"name\":\"remote_fn_q\",\"concurrency\":1,\"paused\":false,\"version\":1,"
+                "\"jobs\":[{\"id\":\"RFN1\",\"taskqueue\":\"remote_fn_q\",\"command\":\"cmd /c exit 0\","
+                "\"host\":\"box_online\",\"state\":\"running\","
+                "\"success\":{\"exit_code\":0,\"files_newer\":[\"artifact_ok.txt\"]},"
+                "\"attempts\":[{"
+                "\"n\":1,\"process_id\":0,\"remote_host\":\"box_online\",\"remote_process_id\":201,"
+                "\"remote_job_id\":\"RFN1\",\"remote_attempt\":1,"
+                "\"start\":\"2026-01-01 00:00:00\",\"end\":\"\",\"reason\":\"\",\"exit_code\":-1}]}]}";
+            WriteFileAtomicWide(TaskQueueManager::GetTaskQueueFileWide("remote_fn_q"), qJson);
+            TaskQueueManager restarted;
+            bool checkCalled = false;
+            std::string checkedHost;
+            std::vector<std::string> checkedFiles;
+            SetRemoteFilesCheckCallback([&](const std::string& host, const std::string&,
+                                            int pid, const std::vector<std::string>& files,
+                                            uint64_t, std::string& outDetail) -> bool {
+                checkCalled = true;
+                checkedHost = host;
+                checkedFiles = files;
+                (void)pid;
+                (void)outDetail;
+                return true;
+            });
+            restarted.SetRemoteCallbacks(
+                nullptr,
+                [&](const std::string&, int, RemotePollResult& res, std::string&) {
+                    res.finished = true;
+                    res.exitCode = 0;
+                    res.endKind = "completed";
+                    res.output = "build completed successfully\n";
+                    res.doneContent = "{\"exit_code\":0,\"status\":\"ok\"}";
+                    return true;
+                },
+                nullptr);
+            Check(checkCalled && checkedHost == "box_online", "remote files_newer calls host check callback");
+            Check(checkedFiles.size() == 1 && checkedFiles[0] == "artifact_ok.txt", "remote files_newer checks configured path");
+            Check(GetState(restarted, "RFN1") == "succeeded", "remote job with satisfied files_newer succeeds");
+
+            restarted.ShutdownTaskQueueManager();
+            std::wstring logPath = TaskQueueManager::GetAttemptLogFileWide("RFN1", 1);
+            DeleteFileW(logPath.c_str());
+            std::wstring donePath = logPath.substr(0, logPath.size() - 4) + L".done";
+            std::wstring tailPath = logPath.substr(0, logPath.size() - 4) + L".tail.txt";
+            DeleteFileW(donePath.c_str());
+            DeleteFileW(tailPath.c_str());
+        }
+
+        // Case 2: Remote job with files_newer fails when host reports missing file.
+        {
+            std::string qJson =
+                "{\"name\":\"remote_fn_q\",\"concurrency\":1,\"paused\":false,\"version\":1,"
+                "\"jobs\":[{\"id\":\"RFN2\",\"taskqueue\":\"remote_fn_q\",\"command\":\"cmd /c exit 0\",\"max_attempts\":1,"
+                "\"host\":\"box_online\",\"state\":\"running\","
+                "\"success\":{\"exit_code\":0,\"files_newer\":[\"missing_artifact.txt\"]},"
+                "\"attempts\":[{"
+                "\"n\":1,\"process_id\":0,\"remote_host\":\"box_online\",\"remote_process_id\":202,"
+                "\"remote_job_id\":\"RFN2\",\"remote_attempt\":1,"
+                "\"start\":\"2026-01-01 00:00:00\",\"end\":\"\",\"reason\":\"\",\"exit_code\":-1}]}]}";
+            WriteFileAtomicWide(TaskQueueManager::GetTaskQueueFileWide("remote_fn_q"), qJson);
+            TaskQueueManager restarted;
+            SetRemoteFilesCheckCallback([&](const std::string&, const std::string&,
+                                            int, const std::vector<std::string>& files,
+                                            uint64_t, std::string& outDetail) -> bool {
+                outDetail = "missing file: " + (files.empty() ? "" : files[0]);
+                return false;
+            });
+            restarted.SetRemoteCallbacks(
+                nullptr,
+                [&](const std::string&, int, RemotePollResult& res, std::string&) {
+                    res.finished = true;
+                    res.exitCode = 0;
+                    res.endKind = "completed";
+                    res.output = "build finished without producing output\n";
+                    res.doneContent = "{\"exit_code\":0,\"status\":\"ok\"}";
+                    return true;
+                },
+                nullptr);
+            Check(GetState(restarted, "RFN2") == "failed", "remote job fails when files_newer file is missing on host");
+            std::string err;
+            auto rj = ParseJobJson(restarted.TaskQueueGet("RFN2", false, 0, err));
+            Check(rj.is_object() && rj["attempts"][0].value("reason", "") == "checkFailed",
+                  "attempt reason is checkFailed on missing files_newer");
+            if (rj.is_object() && rj.contains("diagnostic") && rj["diagnostic"].is_object()) {
+                const auto& diag = rj["diagnostic"];
+                Check(diag.value("class", "") == "success_check_failed",
+                      "failure diagnostic class is success_check_failed");
+                Check(diag.value("detail", nlohmann::json::object()).value("condition", "") == "filesNewer",
+                      "failure diagnostic condition is filesNewer");
+            }
+
+            restarted.ShutdownTaskQueueManager();
+            std::wstring logPath = TaskQueueManager::GetAttemptLogFileWide("RFN2", 1);
+            DeleteFileW(logPath.c_str());
+            std::wstring donePath = logPath.substr(0, logPath.size() - 4) + L".done";
+            std::wstring tailPath = logPath.substr(0, logPath.size() - 4) + L".tail.txt";
+            DeleteFileW(donePath.c_str());
+            DeleteFileW(tailPath.c_str());
+        }
+
+        // Case 3: Remote job with files_newer fails when host reports file not newer than start.
+        {
+            std::string qJson =
+                "{\"name\":\"remote_fn_q\",\"concurrency\":1,\"paused\":false,\"version\":1,"
+                "\"jobs\":[{\"id\":\"RFN3\",\"taskqueue\":\"remote_fn_q\",\"command\":\"cmd /c exit 0\",\"max_attempts\":1,"
+                "\"host\":\"box_online\",\"state\":\"running\","
+                "\"success\":{\"exit_code\":0,\"files_newer\":[\"stale_artifact.txt\"]},"
+                "\"attempts\":[{"
+                "\"n\":1,\"process_id\":0,\"remote_host\":\"box_online\",\"remote_process_id\":203,"
+                "\"remote_job_id\":\"RFN3\",\"remote_attempt\":1,"
+                "\"start\":\"2026-01-01 00:00:00\",\"end\":\"\",\"reason\":\"\",\"exit_code\":-1}]}]}";
+            WriteFileAtomicWide(TaskQueueManager::GetTaskQueueFileWide("remote_fn_q"), qJson);
+            TaskQueueManager restarted;
+            SetRemoteFilesCheckCallback([&](const std::string&, const std::string&,
+                                            int, const std::vector<std::string>& files,
+                                            uint64_t, std::string& outDetail) -> bool {
+                outDetail = "file not newer than attempt start: " + (files.empty() ? "" : files[0]);
+                return false;
+            });
+            restarted.SetRemoteCallbacks(
+                nullptr,
+                [&](const std::string&, int, RemotePollResult& res, std::string&) {
+                    res.finished = true;
+                    res.exitCode = 0;
+                    res.endKind = "completed";
+                    res.output = "build exited without touching stale file\n";
+                    res.doneContent = "{\"exit_code\":0,\"status\":\"ok\"}";
+                    return true;
+                },
+                nullptr);
+            Check(GetState(restarted, "RFN3") == "failed", "remote job fails when files_newer file is not newer than start");
+            std::string err;
+            auto rj = ParseJobJson(restarted.TaskQueueGet("RFN3", false, 0, err));
+            Check(rj.is_object() && rj["attempts"][0].value("reason", "") == "checkFailed",
+                  "attempt reason is checkFailed on stale files_newer");
+
+            restarted.ShutdownTaskQueueManager();
+            std::wstring logPath = TaskQueueManager::GetAttemptLogFileWide("RFN3", 1);
+            DeleteFileW(logPath.c_str());
+            std::wstring donePath = logPath.substr(0, logPath.size() - 4) + L".done";
+            std::wstring tailPath = logPath.substr(0, logPath.size() - 4) + L".tail.txt";
+            DeleteFileW(donePath.c_str());
+            DeleteFileW(tailPath.c_str());
+        }
+
+        // Case 4: Remote job files_newer evaluated from .done file content without callback.
+        {
+            std::string qJson =
+                "{\"name\":\"remote_fn_q\",\"concurrency\":1,\"paused\":false,\"version\":1,"
+                "\"jobs\":[{\"id\":\"RFN4\",\"taskqueue\":\"remote_fn_q\",\"command\":\"cmd /c exit 0\","
+                "\"host\":\"box_online\",\"state\":\"running\","
+                "\"success\":{\"exit_code\":0,\"files_newer\":[\"done_embedded.txt\"]},"
+                "\"attempts\":[{"
+                "\"n\":1,\"process_id\":0,\"remote_host\":\"box_online\",\"remote_process_id\":204,"
+                "\"remote_job_id\":\"RFN4\",\"remote_attempt\":1,"
+                "\"start\":\"2026-01-01 00:00:00\",\"end\":\"\",\"reason\":\"\",\"exit_code\":-1}]}]}";
+            WriteFileAtomicWide(TaskQueueManager::GetTaskQueueFileWide("remote_fn_q"), qJson);
+            TaskQueueManager restarted;
+            SetRemoteFilesCheckCallback(nullptr); // No callback installed
+            restarted.SetRemoteCallbacks(
+                nullptr,
+                [&](const std::string&, int, RemotePollResult& res, std::string&) {
+                    res.finished = true;
+                    res.exitCode = 0;
+                    res.endKind = "completed";
+                    res.output = "build done\n";
+                    res.doneContent = "{\"exit_code\":0,\"files_newer\":{\"success\":true}}";
+                    return true;
+                },
+                nullptr);
+            Check(GetState(restarted, "RFN4") == "succeeded",
+                  "remote job files_newer succeeded directly via .done file metadata");
+
+            restarted.ShutdownTaskQueueManager();
+            std::wstring logPath = TaskQueueManager::GetAttemptLogFileWide("RFN4", 1);
+            DeleteFileW(logPath.c_str());
+            std::wstring donePath = logPath.substr(0, logPath.size() - 4) + L".done";
+            std::wstring tailPath = logPath.substr(0, logPath.size() - 4) + L".tail.txt";
+            DeleteFileW(donePath.c_str());
+            DeleteFileW(tailPath.c_str());
+        }
+
+        // Case 5: When neither callback nor .done metadata is available, remote files_newer fails gracefully.
+        {
+            std::string qJson =
+                "{\"name\":\"remote_fn_q\",\"concurrency\":1,\"paused\":false,\"version\":1,"
+                "\"jobs\":[{\"id\":\"RFN5\",\"taskqueue\":\"remote_fn_q\",\"command\":\"cmd /c exit 0\",\"max_attempts\":1,"
+                "\"host\":\"box_online\",\"state\":\"running\","
+                "\"success\":{\"exit_code\":0,\"files_newer\":[\"no_cb.txt\"]},"
+                "\"attempts\":[{"
+                "\"n\":1,\"process_id\":0,\"remote_host\":\"box_online\",\"remote_process_id\":205,"
+                "\"remote_job_id\":\"RFN5\",\"remote_attempt\":1,"
+                "\"start\":\"2026-01-01 00:00:00\",\"end\":\"\",\"reason\":\"\",\"exit_code\":-1}]}]}";
+            WriteFileAtomicWide(TaskQueueManager::GetTaskQueueFileWide("remote_fn_q"), qJson);
+            TaskQueueManager restarted;
+            SetRemoteFilesCheckCallback(nullptr);
+            restarted.SetRemoteCallbacks(
+                nullptr,
+                [&](const std::string&, int, RemotePollResult& res, std::string&) {
+                    res.finished = true;
+                    res.exitCode = 0;
+                    res.endKind = "completed";
+                    res.output = "build done without remote files check\n";
+                    res.doneContent = "{\"exit_code\":0,\"status\":\"ok\"}";
+                    return true;
+                },
+                nullptr);
+            Check(GetState(restarted, "RFN5") == "failed",
+                  "remote job fails when remote files check mechanism is unavailable");
+
+            restarted.ShutdownTaskQueueManager();
+            std::wstring logPath = TaskQueueManager::GetAttemptLogFileWide("RFN5", 1);
+            DeleteFileW(logPath.c_str());
+            std::wstring donePath = logPath.substr(0, logPath.size() - 4) + L".done";
+            std::wstring tailPath = logPath.substr(0, logPath.size() - 4) + L".tail.txt";
+            DeleteFileW(donePath.c_str());
+            DeleteFileW(tailPath.c_str());
+        }
+
+        SetRemoteFilesCheckCallback(nullptr);
+        if (!prevHosts.empty()) {
+            WriteFileAtomicWide(hostsFile, prevHosts);
+        } else {
+            DeleteFileW(hostsFile.c_str());
+        }
+        DeleteFileW(TaskQueueManager::GetTaskQueueFileWide("remote_fn_q").c_str());
     }
 
     {
@@ -1218,6 +1755,207 @@ int main() {
               "NUnit 2: Success / Failure");
         Check(!ParseTestReport("<testsuite tests=\"0\"></testsuite>", sum), "a report without test cases is rejected");
         Check(!ParseTestReport("not xml at all", sum), "garbage is rejected");
+    }
+
+    {
+        // Hancho auto-notes test (doc/design-v3.md 3.4, task 053)
+        std::wstring autoRecDir = dir + L"\\memory\\records";
+        EnsureDirectoryWide(autoRecDir);
+
+        // Rule 1: Same job name failed 3 times consecutively with same failure classification.
+        AppendToLogFileWide(autoRecDir + L"\\2026-11.jsonl",
+            "{\"schema\":\"hancho.memory.run/1\",\"id\":\"rr_auto_1\",\"jobId\":\"j_a1\","
+            "\"jobName\":\"build\",\"taskqueue\":\"main\",\"attempt\":1,\"outcome\":\"failed\","
+            "\"failure\":{\"class\":\"success_check_failed\",\"summary\":\"filesNewer missing\"},"
+            "\"start\":\"2026-11-10T11:00:00Z\",\"durationSec\":10}\r\n"
+            "{\"schema\":\"hancho.memory.run/1\",\"id\":\"rr_auto_2\",\"jobId\":\"j_a2\","
+            "\"jobName\":\"build\",\"taskqueue\":\"main\",\"attempt\":1,\"outcome\":\"failed\","
+            "\"failure\":{\"class\":\"success_check_failed\",\"summary\":\"filesNewer missing\"},"
+            "\"start\":\"2026-11-10T11:05:00Z\",\"durationSec\":10}\r\n"
+            "{\"schema\":\"hancho.memory.run/1\",\"id\":\"rr_auto_3\",\"jobId\":\"j_a3\","
+            "\"jobName\":\"build\",\"taskqueue\":\"main\",\"attempt\":1,\"outcome\":\"failed\","
+            "\"failure\":{\"class\":\"success_check_failed\",\"summary\":\"filesNewer missing\"},"
+            "\"start\":\"2026-11-10T11:10:00Z\",\"durationSec\":10}\r\n");
+
+        int n1 = CheckAndRecordAutoNotes("build", 0);
+        Check(n1 == 1, "auto-notes: 3 consecutive failures trigger Rule 1");
+
+        // Verify retrieval via search
+        memory::Query q;
+        q.kinds = {"note"};
+        q.jobName = "build";
+        std::string sres = memory::SearchJson(q);
+        auto sj = nlohmann::json::parse(sres, nullptr, false);
+        Check(sj.value("ok", false) && sj.value("totalMatched", 0) >= 1, "memory search finds auto note");
+
+        // Verify note contents
+        std::string noteId;
+        if (sj.contains("results") && !sj["results"].empty()) {
+            noteId = sj["results"][0].value("id", "");
+            std::string text = sj["results"][0].value("summary", sj["results"][0].value("text", ""));
+            Check(text.find("build は直近 3 回 success_check_failed（filesNewer）で失敗") != std::string::npos,
+                  "Rule 1 text matches expected wording");
+        }
+        if (!noteId.empty()) {
+            std::string noteJson = memory::GetJson(noteId, "note");
+            auto nj = nlohmann::json::parse(noteJson, nullptr, false);
+            std::string authorType;
+            if (nj.contains("document") && nj["document"].is_object()) {
+                if (nj["document"].contains("author") && nj["document"]["author"].is_object()) {
+                    authorType = nj["document"]["author"].value("type", "");
+                }
+            } else if (nj.contains("author") && nj["author"].is_object()) {
+                authorType = nj["author"].value("type", "");
+            }
+            Check(authorType == "hancho", "auto-note author is hancho");
+            auto docObj = nj.contains("document") ? nj["document"] : nj;
+            auto sources = docObj.value("sources", nlohmann::json::array());
+            Check(sources.size() == 3 && sources[0] == "rr_auto_1" && sources[2] == "rr_auto_3",
+                  "auto-note sources has 3 RunRecord ids");
+        }
+
+        // Rule 1 continuing: 4th consecutive failure should NOT create duplicate note
+        AppendToLogFileWide(autoRecDir + L"\\2026-11.jsonl",
+            "{\"schema\":\"hancho.memory.run/1\",\"id\":\"rr_auto_4\",\"jobId\":\"j_a4\","
+            "\"jobName\":\"build\",\"taskqueue\":\"main\",\"attempt\":1,\"outcome\":\"failed\","
+            "\"failure\":{\"class\":\"success_check_failed\",\"summary\":\"filesNewer missing\"},"
+            "\"start\":\"2026-11-10T11:15:00Z\",\"durationSec\":10}\r\n");
+        int n1_dup = CheckAndRecordAutoNotes("build", 0);
+        Check(n1_dup == 0, "auto-notes: 4th consecutive failure does not duplicate note");
+
+        // Rule 2: Duration exceeds 80% timeout across consecutive attempts
+        AppendToLogFileWide(autoRecDir + L"\\2026-11.jsonl",
+            "{\"schema\":\"hancho.memory.run/1\",\"id\":\"rr_slow_1\",\"jobId\":\"j_s1\","
+            "\"jobName\":\"test\",\"taskqueue\":\"main\",\"attempt\":1,\"outcome\":\"succeeded\","
+            "\"exitCode\":0,\"durationSec\":1600,\"timeoutSec\":1800,"
+            "\"start\":\"2026-11-10T12:00:00Z\"}\r\n"
+            "{\"schema\":\"hancho.memory.run/1\",\"id\":\"rr_slow_2\",\"jobId\":\"j_s2\","
+            "\"jobName\":\"test\",\"taskqueue\":\"main\",\"attempt\":1,\"outcome\":\"succeeded\","
+            "\"exitCode\":0,\"durationSec\":1700,\"timeoutSec\":1800,"
+            "\"start\":\"2026-11-10T12:30:00Z\"}\r\n");
+
+        int n2 = CheckAndRecordAutoNotes("test", 1800);
+        Check(n2 == 1, "auto-notes: consecutive slow attempts trigger Rule 2");
+
+        q.jobName = "test";
+        sres = memory::SearchJson(q);
+        sj = nlohmann::json::parse(sres, nullptr, false);
+        if (sj.contains("results") && !sj["results"].empty()) {
+            std::string text = sj["results"][0].value("summary", sj["results"][0].value("text", ""));
+            Check(text.find("test は所要時間がタイムアウトに近い") != std::string::npos &&
+                  text.find("上限 1800 秒") != std::string::npos,
+                  "Rule 2 text matches p90 and timeout limit wording");
+        }
+
+        // Rule 2 continuing: 3rd consecutive slow attempt does not duplicate note
+        AppendToLogFileWide(autoRecDir + L"\\2026-11.jsonl",
+            "{\"schema\":\"hancho.memory.run/1\",\"id\":\"rr_slow_3\",\"jobId\":\"j_s3\","
+            "\"jobName\":\"test\",\"taskqueue\":\"main\",\"attempt\":1,\"outcome\":\"succeeded\","
+            "\"exitCode\":0,\"durationSec\":1650,\"timeoutSec\":1800,"
+            "\"start\":\"2026-11-10T13:00:00Z\"}\r\n");
+        int n2_dup = CheckAndRecordAutoNotes("test", 1800);
+        Check(n2_dup == 0, "auto-notes: continuing slow attempts do not duplicate note");
+
+        // Rule 3: Success after failure (diff of filesEdited)
+        AppendToLogFileWide(autoRecDir + L"\\2026-11.jsonl",
+            "{\"schema\":\"hancho.memory.run/1\",\"id\":\"rr_fix_1\",\"jobId\":\"j_f1\","
+            "\"jobName\":\"lint\",\"taskqueue\":\"main\",\"attempt\":1,\"outcome\":\"failed\","
+            "\"exitCode\":1,\"filesEdited\":[\"src/foo.cpp\"],"
+            "\"failure\":{\"class\":\"exit_nonzero\",\"summary\":\"lint error\"},"
+            "\"start\":\"2026-11-10T14:00:00Z\",\"durationSec\":5}\r\n"
+            "{\"schema\":\"hancho.memory.run/1\",\"id\":\"rr_fix_2\",\"jobId\":\"j_f2\","
+            "\"jobName\":\"lint\",\"taskqueue\":\"main\",\"attempt\":1,\"outcome\":\"succeeded\","
+            "\"exitCode\":0,\"filesEdited\":[\"src/foo.cpp\",\"src/bar.cpp\"],"
+            "\"start\":\"2026-11-10T14:05:00Z\",\"durationSec\":5}\r\n");
+
+        int n3 = CheckAndRecordAutoNotes("lint", 0);
+        Check(n3 == 1, "auto-notes: success after failure triggers Rule 3");
+
+        q.jobName = "lint";
+        sres = memory::SearchJson(q);
+        sj = nlohmann::json::parse(sres, nullptr, false);
+        if (sj.contains("results") && !sj["results"].empty()) {
+            std::string text = sj["results"][0].value("summary", sj["results"][0].value("text", ""));
+            Check(text.find("lint は失敗の後に成功。直した可能性のあるファイル: src/bar.cpp") != std::string::npos,
+                  "Rule 3 text lists filesEdited diff");
+        }
+
+        // Verify memory_brief includes the auto-notes
+        memory::BriefOptions bo;
+        bo.jobName = "build";
+        memory::BriefResult brief = memory::BuildBrief(bo);
+        Check(brief.ok, "memory brief succeeds with auto-notes");
+        Check(brief.text.find("Related notes") != std::string::npos &&
+              brief.text.find("build は直近 3 回") != std::string::npos,
+              "memory brief includes auto-notes in Related notes");
+    }
+
+    {
+        // 072-1 Plain run state (runs outside a queue)
+        std::string jid1 = TaskQueueManager::IssuePlainJobId(1234, "build");
+        std::string jid2 = TaskQueueManager::IssuePlainJobId(1234, "build");
+        Check(jid1.find("j_plain_") == 0 && jid1.find("build_1234_") != std::string::npos, "IssuePlainJobId formats correctly with name and pid");
+        Check(jid1 != jid2, "IssuePlainJobId generates unique sequence numbers");
+
+        // RecordPlainRun test
+        TaskQueueManager plainTqm;
+        PlainRunState run;
+        run.jobId = "j_plain_manual_1";
+        run.name = "deploy";
+        run.command = "deploy.cmd --prod";
+        run.cwd = "D:/wsgit/app";
+        run.start = "2026-11-10 15:00:00";
+        run.end = "2026-11-10 15:01:00";
+        run.exitCode = 0;
+        run.processId = 555;
+        std::string recErr;
+        bool ok = plainTqm.RecordPlainRun(run, recErr);
+        Check(ok, "RecordPlainRun succeeds");
+        std::wstring plainFilePath = PathJoinWide(GetLogsDirectoryWide(), L"taskqueues\\plain.json");
+        Check(std::filesystem::exists(plainFilePath), "plain.json exists on disk");
+
+        // Verify plain.json contents
+        std::string plainJson = ReadFileUtf8Wide(plainFilePath);
+        auto parsedPlain = nlohmann::json::parse(plainJson, nullptr, false);
+        Check(!parsedPlain.is_discarded() && parsedPlain.value("name", "") == "plain", "plain.json has name 'plain'");
+        bool foundJob = false;
+        if (parsedPlain.contains("jobs") && parsedPlain["jobs"].is_array()) {
+            for (const auto& j : parsedPlain["jobs"]) {
+                if (j.value("id", "") == "j_plain_manual_1") {
+                    foundJob = true;
+                    Check(j.value("command", "") == "deploy.cmd --prod", "plain job command preserved");
+                    Check(j.value("state", "") == "succeeded", "plain job exit 0 has state succeeded");
+                    auto atts = j.value("attempts", nlohmann::json::array());
+                    Check(atts.size() == 1 && atts[0].value("exit_code", -1) == 0 && atts[0].value("process_id", 0) == 555,
+                          "plain job attempt facts preserved");
+                    break;
+                }
+            }
+        }
+        Check(foundJob, "j_plain_manual_1 found in plain.json");
+
+        // OnProcessFinished with an unqueued PID automatically records plain run
+        plainTqm.OnProcessFinished(8888, 1, "failed");
+        plainJson = ReadFileUtf8Wide(plainFilePath);
+        parsedPlain = nlohmann::json::parse(plainJson, nullptr, false);
+        bool foundUnqueued = false;
+        if (parsedPlain.contains("jobs") && parsedPlain["jobs"].is_array()) {
+            for (const auto& j : parsedPlain["jobs"]) {
+                auto atts = j.value("attempts", nlohmann::json::array());
+                if (!atts.empty() && atts[0].value("process_id", 0) == 8888) {
+                    foundUnqueued = true;
+                    Check(j.value("state", "") == "failed", "unqueued exit 1 has state failed");
+                    Check(atts[0].value("exit_code", 0) == 1, "attempt exit_code 1");
+                    break;
+                }
+            }
+        }
+        Check(foundUnqueued, "unqueued process finished is automatically recorded into plain.json");
+
+        // Existing queue isolation: retry --failed ignores plain queue
+        std::string retryErr;
+        std::string retryResp = plainTqm.TaskQueueRetryFailed("", 0, false, false, retryErr);
+        Check(retryResp.find("j_plain_") == std::string::npos, "TaskQueueRetryFailed ignores plain jobs");
     }
 
     std::printf("%s (%d failures)\n", g_failures == 0 ? "ALL PASSED" : "FAILURES", g_failures);

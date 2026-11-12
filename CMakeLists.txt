@@ -1,5 +1,5 @@
 cmake_minimum_required(VERSION 3.20)
-project(Hancho VERSION 0.9.4 LANGUAGES CXX)
+project(Hancho VERSION 0.9.5 LANGUAGES CXX)
 
 set(CMAKE_CXX_STANDARD 20)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
@@ -29,6 +29,8 @@ add_executable(Hancho
     src/chain_guard.cpp
     src/ipc_server.cpp
     src/ipc_server_remote.cpp
+    src/webui_server.cpp
+    src/webui_assets.cpp
     src/ipc_client.cpp
     src/remote_client.cpp
     src/remote_hosts.cpp
@@ -126,6 +128,12 @@ add_executable(hancho-cli
     src/memory_cli.cpp
     src/memory_search.cpp
     src/memory_record.cpp
+    src/llm_stream.cpp
+    src/llm_stream_claude.cpp
+    src/llm_stream_opencode.cpp
+    src/llm_stream_agy.cpp
+    src/llm_stream_codex.cpp
+    src/event_schema.cpp
     src/common.cpp
     src/hancho-cli.rc
     src/agent_template.rc
@@ -583,6 +591,8 @@ add_executable(bt_ipc_smoke
     tests/bt_ipc_smoke.cpp
     src/ipc_server.cpp
     src/ipc_server_remote.cpp
+    src/webui_server.cpp
+    src/webui_assets.cpp
     src/remote_client.cpp
     src/remote_hosts.cpp
     src/bt_manager.cpp
@@ -747,6 +757,58 @@ target_link_libraries(platform_abstraction_smoke PRIVATE
     psapi
 )
 
+# Unit / smoke test for GUI platform abstraction layer (tests/gui_platform.h, Card 060d).
+add_executable(gui_platform_smoke
+    tests/gui_platform_smoke.cpp
+)
+
+target_include_directories(gui_platform_smoke PRIVATE
+    src
+    include
+    tests
+)
+
+if(MSVC)
+    target_compile_options(gui_platform_smoke PRIVATE /W4 /utf-8 /EHsc)
+endif()
+
+target_link_libraries(gui_platform_smoke PRIVATE
+    user32
+    shell32
+    advapi32
+    comdlg32
+    winmm
+)
+
+# Smoke test for browser UI skeleton (HTTP + WebSocket server, Card 061b).
+add_executable(webui_smoke
+    tests/webui_smoke.cpp
+    src/webui_server.cpp
+    src/webui_assets.cpp
+    src/remote_client.cpp
+    src/remote_hosts.cpp
+    src/common.cpp
+    src/platform/platform_windows.cpp
+)
+
+target_include_directories(webui_smoke PRIVATE
+    src
+    include
+    tests
+)
+
+if(MSVC)
+    target_compile_options(webui_smoke PRIVATE /W4 /utf-8 /EHsc)
+endif()
+
+target_link_libraries(webui_smoke PRIVATE
+    ws2_32
+    crypt32
+    advapi32
+    shell32
+    user32
+)
+
 
 else()
     # POSIX headless core and CLI (doc/design-v3.md 2.4). There is no GUI here:
@@ -762,6 +824,8 @@ else()
         src/ipc_server.cpp
         src/ipc_server_posix.cpp
         src/ipc_server_remote.cpp
+        src/webui_server.cpp
+        src/webui_assets.cpp
         src/ipc_client_posix.cpp
         src/remote_client.cpp
         src/remote_hosts.cpp
@@ -806,6 +870,12 @@ else()
         src/memory_cli.cpp
         src/memory_search.cpp
         src/memory_record.cpp
+        src/llm_stream.cpp
+        src/llm_stream_claude.cpp
+        src/llm_stream_opencode.cpp
+        src/llm_stream_agy.cpp
+        src/llm_stream_codex.cpp
+        src/event_schema.cpp
         src/common_posix.cpp
         src/platform/platform_posix.cpp
     )
@@ -833,4 +903,19 @@ else()
     target_include_directories(platform_abstraction_smoke PRIVATE src include)
     target_compile_options(platform_abstraction_smoke PRIVATE -Wall -Wextra -Wno-unused-parameter)
     target_link_libraries(platform_abstraction_smoke PRIVATE Threads::Threads util)
+
+    # Browser UI skeleton smoke test (Card 061b)
+    add_executable(webui_smoke
+        tests/webui_smoke.cpp
+        src/webui_server.cpp
+        src/webui_assets.cpp
+        src/remote_client.cpp
+        src/remote_hosts.cpp
+        src/common_posix.cpp
+        src/platform/platform_posix.cpp
+    )
+    target_compile_definitions(webui_smoke PRIVATE ${PC_VERSION_DEFINITIONS})
+    target_include_directories(webui_smoke PRIVATE src include tests)
+    target_compile_options(webui_smoke PRIVATE -Wall -Wextra -Wno-unused-parameter)
+    target_link_libraries(webui_smoke PRIVATE Threads::Threads util)
 endif()
