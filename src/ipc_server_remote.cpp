@@ -534,12 +534,12 @@ void IpcServer::StopRemoteListener() {
     }
 }
 
-void IpcServer::StartWebUiServer() {
+void IpcServer::StartWebUiServer(const std::string& token) {
     auto webui = std::make_unique<WebUiServer>([this](const std::string& reqJson) {
         return HandleRequestJson(reqJson);
     });
     std::string err;
-    if (!webui->Start(0, "", "", &err)) {
+    if (!webui->Start(0, token, "", &err)) {
         WriteAuditLog("WEBUI_START_FAILED", err.empty() ? "cannot start WebUI" : err);
         return;
     }
@@ -551,6 +551,23 @@ void IpcServer::StopWebUiServer() {
         webUiServer_->Stop();
         webUiServer_.reset();
     }
+}
+
+void IpcServer::ScheduleWebUiRestart() {
+    if (webuiRestartThread_.joinable()) {
+        webuiRestartThread_.join();
+    }
+    webuiRestartThread_ = std::thread([this]() {
+        // Let the config_set reply reach the caller before closing its connection.
+        SleepMs(250);
+        if (stop_.load()) return;
+        // Keep the session token so an open browser tab keeps working after the
+        // listener moves to a new port or scope.
+        std::string token = webUiServer_ ? webUiServer_->GetToken() : std::string();
+        StopWebUiServer();
+        if (stop_.load()) return;
+        StartWebUiServer(token);
+    });
 }
 
 } // namespace pc

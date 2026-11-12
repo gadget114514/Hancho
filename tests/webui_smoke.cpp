@@ -30,6 +30,7 @@ constexpr int SOCKET_ERROR = -1;
 #include <thread>
 #include <chrono>
 #include <fstream>
+#include <filesystem>
 #include <iostream>
 
 using namespace pc;
@@ -178,6 +179,15 @@ std::string SendWsFrame(SOCKET s, const std::string& payload) {
 
 int main() {
     InitSockets();
+
+    wchar_t tempBase[MAX_PATH] = {};
+    GetTempPathW(MAX_PATH, tempBase);
+    std::wstring tempDirW = std::wstring(tempBase) + L"pc_webui_smoke_" +
+                            std::to_wstring(GetCurrentProcessId());
+    std::error_code ec;
+    std::filesystem::remove_all(tempDirW, ec);
+    std::filesystem::create_directories(tempDirW, ec);
+    SetDataDirectoryOverride(tempDirW);
 
     std::printf("Running WebUI smoke tests...\n");
 
@@ -457,6 +467,66 @@ int main() {
     Check(!PathExistsWide(tokenFile), ".webui_token file cleaned up on shutdown");
     Check(!PathExistsWide(portFile), ".webui_port file cleaned up on shutdown");
 
+    // Config-driven exposure: enabled=false, LAN scope, and allowed hosts/origins.
+    std::wstring configPath = PathJoinWide(tempDirW, L"config.json");
+    auto writeConfig = [&](const std::string& text) {
+        WriteFileAtomicWide(configPath, text);
+    };
+
+    {
+        writeConfig(R"({"webui":{"enabled":false}})");
+        WebUiServer disabledServer(mockIpcHandler);
+        std::string err;
+        Check(disabledServer.Start(testPort + 1, testToken, "", &err),
+              "Start returns true when webui.enabled=false: " + err);
+        Check(!disabledServer.IsRunning(), "webui.enabled=false does not listen");
+        Check(!PathExistsWide(PathJoinWide(tempDirW, L".webui_token")),
+              "disabled WebUI leaves no .webui_token");
+    }
+
+    {
+        writeConfig(R"({"webui":{"enabled":true,"scope":"lan","host":"0.0.0.0","allowed_hosts":["hancho.example"],"allowed_origins":["http://hancho.example:19140"]}})");
+        WebUiServer lanServer(mockIpcHandler);
+        std::string err;
+        Check(lanServer.Start(testPort + 2, testToken, "", &err),
+              "LAN-scope server starts: " + err);
+        Check(lanServer.IsRunning(), "LAN-scope server is running");
+
+        auto get = [&](const std::string& host, const std::string& origin) {
+            std::string req = "GET /?token=" + testToken + " HTTP/1.1\r\nHost: " + host + "\r\n";
+            if (!origin.empty()) req += "Origin: " + origin + "\r\n";
+            req += "\r\n";
+            return HttpExchange(static_cast<uint16_t>(testPort + 2), req);
+        };
+
+        Check(get("hancho.example:19140", "").find("200 OK") != std::string::npos,
+              "LAN scope accepts an allowed hostname");
+        Check(get("evil.example:19140", "").find("403 Forbidden") != std::string::npos,
+              "LAN scope rejects an unknown hostname");
+        Check(get("192.168.1.50:19140", "").find("200 OK") != std::string::npos,
+              "LAN scope accepts an IP literal Host");
+        Check(get("hancho.example:19140", "http://hancho.example:19140").find("200 OK") != std::string::npos,
+              "LAN scope accepts an allowed Origin");
+        Check(get("hancho.example:19140", "http://evil.example").find("403 Forbidden") != std::string::npos,
+              "LAN scope rejects a foreign Origin");
+        lanServer.Stop();
+    }
+
+    {
+        writeConfig(R"({"webui":{"enabled":true,"scope":"loopback"}})");
+        WebUiServer loopServer(mockIpcHandler);
+        std::string err;
+        Check(loopServer.Start(testPort + 3, testToken, "", &err),
+              "loopback-scope server starts: " + err);
+        std::string req = "GET /?token=" + testToken +
+                          " HTTP/1.1\r\nHost: evil.example:19141\r\n\r\n";
+        std::string resp = HttpExchange(static_cast<uint16_t>(testPort + 3), req);
+        Check(resp.find("403 Forbidden") != std::string::npos,
+              "loopback scope rejects a non-loopback Host");
+        loopServer.Stop();
+    }
+
+    std::filesystem::remove_all(tempDirW, ec);
     std::printf("\nWebUI smoke tests finished: %d passed, %d failed\n", g_passes, g_failures);
     return (g_failures == 0) ? 0 : 1;
 }

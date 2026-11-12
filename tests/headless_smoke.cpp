@@ -84,6 +84,16 @@ std::wstring ExePath() {
     return path;
 }
 
+HWND FindProcessWindow(const wchar_t* className, DWORD pid) {
+    HWND w = nullptr;
+    while ((w = FindWindowExW(nullptr, w, className, nullptr)) != nullptr) {
+        DWORD owner = 0;
+        GetWindowThreadProcessId(w, &owner);
+        if (owner == pid) return w;
+    }
+    return nullptr;
+}
+
 } // namespace
 
 int main() {
@@ -142,8 +152,9 @@ int main() {
     //    being closed and reopened.
     json startResp;
     bool startOk = IpcCall({{"action", "start"},
-                            {"cmd", "cmd /c ping -n 4 127.0.0.1"},
+                            {"cmd", "cmd /c ping -n 12 127.0.0.1 >nul 2>&1"},
                             {"name", "headless_smoke_job"},
+                            {"allow_chain", true},
                             {"wait", false}},
                            startResp);
     int jobId = startOk ? startResp.value("id", 0) : 0;
@@ -195,12 +206,8 @@ int main() {
             // Wait for GUI window to appear
             HWND dashHwnd = nullptr;
             for (int attempt = 0; attempt < 50; ++attempt) {
-                dashHwnd = FindWindowW(L"HanchoDashboardWnd", nullptr);
-                if (dashHwnd) {
-                    DWORD wndPid = 0;
-                    GetWindowThreadProcessId(dashHwnd, &wndPid);
-                    if (wndPid == guiPi.dwProcessId) break;
-                }
+                dashHwnd = FindProcessWindow(L"HanchoDashboardWnd", guiPi.dwProcessId);
+                if (dashHwnd) break;
                 Sleep(100);
             }
             Check(dashHwnd != nullptr, "standalone GUI creates dashboard window");
@@ -229,12 +236,8 @@ int main() {
                 CloseHandle(guiPi2.hThread);
                 HWND dashHwnd2 = nullptr;
                 for (int attempt = 0; attempt < 50; ++attempt) {
-                    dashHwnd2 = FindWindowW(L"HanchoDashboardWnd", nullptr);
-                    if (dashHwnd2) {
-                        DWORD wndPid = 0;
-                        GetWindowThreadProcessId(dashHwnd2, &wndPid);
-                        if (wndPid == guiPi2.dwProcessId) break;
-                    }
+                    dashHwnd2 = FindProcessWindow(L"HanchoDashboardWnd", guiPi2.dwProcessId);
+                    if (dashHwnd2) break;
                     Sleep(100);
                 }
                 Check(dashHwnd2 != nullptr, "reconnected GUI creates dashboard window");
@@ -250,8 +253,9 @@ int main() {
     // 3. The job keeps running and finishes even though every client (dashboard)
     //    connection was closed in between.
     json waitResp;
-    bool waited = IpcCall({{"action", "wait"}, {"id", jobId}, {"wait_ms", 20000}}, waitResp);
-    std::printf("DEBUG: waited=%d waitResp=%s\n", (int)waited, waitResp.dump().c_str());
+    std::string waitErr;
+    bool waited = IpcCall({{"action", "wait"}, {"id", jobId}, {"wait_ms", 20000}}, waitResp, &waitErr);
+    std::printf("DEBUG: waited=%d err=%s waitResp=%s\n", (int)waited, waitErr.c_str(), waitResp.dump().c_str());
     Check(waited && waitResp.value("ok", false) && waitResp.value("finished", false),
           "job continues and finishes after client reconnects");
     if (waited && waitResp.contains("process")) {
@@ -266,7 +270,8 @@ int main() {
     json tqJob = {
         {"id", "headless_smoke_job_1"},
         {"command", "cmd /c exit 0"},
-        {"summary", "Headless task queue smoke job"}
+        {"summary", "Headless task queue smoke job"},
+        {"timeout_sec", 30}
     };
     bool tqAdd = IpcCall({{"action", "taskqueue_add"},
                           {"taskqueue", "headless_q"},
@@ -278,7 +283,8 @@ int main() {
     json tqListResp;
     bool tqList = IpcCall({{"action", "taskqueue_list"}}, tqListResp);
     std::printf("DEBUG: tqList=%d tqListResp=%s\n", (int)tqList, tqListResp.dump().c_str());
-    Check(tqList && tqListResp.value("ok", false) && tqListResp["queues"].is_array(),
+    Check(tqList && tqListResp.value("ok", false) && tqListResp.contains("jobs") &&
+              tqListResp["jobs"].is_array(),
           "headless core lists task queues via IPC");
 
     // 4. A client can stop the headless core.

@@ -48,6 +48,12 @@ USAGE:
       Show the version.
 
 OPTIONS (per launch):
+  --webui-host <host>       WebUI bind address: 127.0.0.1 (default) or 0.0.0.0 for LAN.
+  --webui-scope <scope>     loopback (default), lan, or custom. Also config.json "webui.scope".
+  --webui-allowed-hosts <csv>    Extra hostnames allowed in Host/Origin (LAN scope).
+  --webui-allowed-origins <csv>  Extra exact origins allowed (LAN scope).
+  --webui-port <port>       WebUI port (default 9138).
+  --webui-disable           Do not start the browser UI.
   --data-dir <path>   Store logs, state, task queues and config in <path>.
                       Use a project-local directory to git-manage them. Each
                       data dir gets its own dashboard instance (separate pipe).
@@ -583,6 +589,26 @@ int main() {
             _putenv_s("HANCHO_WEBUI_DIR", args[++i].c_str());
         } else if (args[i].rfind("--webui-dir=", 0) == 0) {
             _putenv_s("HANCHO_WEBUI_DIR", args[i].substr(12).c_str());
+        } else if (args[i] == "--webui-host" && i + 1 < args.size()) {
+            _putenv_s("HANCHO_WEBUI_HOST", args[++i].c_str());
+        } else if (args[i].rfind("--webui-host=", 0) == 0) {
+            _putenv_s("HANCHO_WEBUI_HOST", args[i].substr(13).c_str());
+        } else if (args[i] == "--webui-scope" && i + 1 < args.size()) {
+            _putenv_s("HANCHO_WEBUI_SCOPE", args[++i].c_str());
+        } else if (args[i].rfind("--webui-scope=", 0) == 0) {
+            _putenv_s("HANCHO_WEBUI_SCOPE", args[i].substr(14).c_str());
+        } else if (args[i] == "--webui-allowed-hosts" && i + 1 < args.size()) {
+            _putenv_s("HANCHO_WEBUI_ALLOWED_HOSTS", args[++i].c_str());
+        } else if (args[i].rfind("--webui-allowed-hosts=", 0) == 0) {
+            _putenv_s("HANCHO_WEBUI_ALLOWED_HOSTS", args[i].substr(23).c_str());
+        } else if (args[i] == "--webui-allowed-origins" && i + 1 < args.size()) {
+            _putenv_s("HANCHO_WEBUI_ALLOWED_ORIGINS", args[++i].c_str());
+        } else if (args[i].rfind("--webui-allowed-origins=", 0) == 0) {
+            _putenv_s("HANCHO_WEBUI_ALLOWED_ORIGINS", args[i].substr(25).c_str());
+        } else if (args[i] == "--webui-disable") {
+            _putenv_s("HANCHO_WEBUI_DISABLE", "1");
+        } else if (args[i] == "--webui-enable") {
+            _putenv_s("HANCHO_WEBUI_DISABLE", "0");
         } else if (firstCmd.empty()) firstCmd = args[i];
     }
     if (firstCmd == "--version" || firstCmd == "-V" || firstCmd == "version") {

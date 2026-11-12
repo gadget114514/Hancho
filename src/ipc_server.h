@@ -42,8 +42,11 @@ public:
     bool IsHeadless() const { return headless_; }
 
     WebUiServer* GetWebUiServer() { return webUiServer_.get(); }
-    void StartWebUiServer();
+    void StartWebUiServer(const std::string& token = std::string());
     void StopWebUiServer();
+    // Stops and restarts the WebUI server after a "webui" config change.
+    // Runs on a short-lived helper thread so the config_set reply is sent first.
+    void ScheduleWebUiRestart();
 
     // Execute a JSON request directly against ProcessManager / TaskQueueManager / BtManager
     // and return a JSON response.
@@ -73,6 +76,7 @@ private:
     std::thread acceptThread_;
     std::unique_ptr<remote::RemoteListener> remoteListener_;
     std::unique_ptr<WebUiServer> webUiServer_;
+    std::thread webuiRestartThread_;
     bool remoteCallbacksInstalled_ = false;
 };
 

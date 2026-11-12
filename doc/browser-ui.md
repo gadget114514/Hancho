@@ -49,7 +49,7 @@ The backend server for the browser UI on Linux and macOS will **not** be a separ
 
 ### 1.3 Port and Protocol Multiplexing
 
-- **Default Port**: `9138` (configurable via `config.json` `webui_port` or `--webui-port`).
+- **Default Port**: `9138` (configurable via `config.json` `webui.port`, `--webui-port`, or `HANCHO_WEBUI_PORT`).
 - **HTTP / WebSocket Multiplexing on the Same Port**:
   - Regular HTTP requests (`GET /`, `GET /assets/*`) return static UI assets (HTML / JS / CSS / SVG).
   - HTTP requests with an `Upgrade: websocket` header trigger the WebSocket handshake and switch to the Hancho IPC protocol (JSON-RPC multiplexing and streaming subscriptions).
@@ -67,11 +67,49 @@ hancho-cli ui
 
 This helper reads the active session token and port from the data directory and opens `http://127.0.0.1:<port>/?token=<token>` in the system's default browser (`xdg-open` / `open` / `ShellExecute`).
 
+### 1.5 Exposure Settings (`config.json` -> `webui`)
+
+The server is loopback-only by default. Exposure is controlled by the `webui` object in `<data-dir>/config.json`:
+
+```json
+{
+  "webui": {
+    "enabled": true,
+    "scope": "lan",
+    "host": "0.0.0.0",
+    "port": 9138,
+    "allowed_hosts": ["desktop-abc", "desktop-abc.local"],
+    "allowed_origins": ["http://desktop-abc:9138"]
+  }
+}
+```
+
+| Field | Values | Meaning |
+|---|---|---|
+| `enabled` | `true` / `false` | Start the browser UI. |
+| `scope` | `loopback` (default), `lan`, `custom` | `loopback` binds `127.0.0.1` and accepts only loopback `Host` / `Origin`. `lan` / `custom` bind `host` and accept IP literals plus `allowed_hosts` / `allowed_origins`. |
+| `host` | `0.0.0.0`, `127.0.0.1`, an IP, or a hostname | Bind address for `lan` / `custom`. `0.0.0.0` listens on all interfaces. |
+| `port` | `1..65535` | Listen port (default `9138`). |
+| `allowed_hosts` | hostnames | Extra names accepted in `Host` / `Origin` (for example a machine name). |
+| `allowed_origins` | exact origins | Extra `http(s)://host:port` origins accepted. |
+
+Environment overrides (for headless/test use): `HANCHO_WEBUI_HOST`, `HANCHO_WEBUI_SCOPE`, `HANCHO_WEBUI_ALLOWED_HOSTS`, `HANCHO_WEBUI_ALLOWED_ORIGINS`, `HANCHO_WEBUI_PORT`, `HANCHO_WEBUI_DISABLE`. CLI flags map to the same variables (`--webui-host`, `--webui-scope`, `--webui-allowed-hosts`, `--webui-allowed-origins`, `--webui-port`, `--webui-disable`).
+
+Changing `webui` through `config_set` restarts the listener in the background. On the Windows dashboard, Settings -> Maintenance exposes Enabled, Exposure (Loopback / LAN), and Allowed hosts; `port` and `allowed_origins` stay in `config.json`.
+
+**Security:** `lan` / `custom` intentionally relax the localhost-only restriction. The session token is still required for non-loopback clients, but there is no TLS. Use this only on a trusted LAN or VPN, and open the port explicitly on Windows, for example:
+
+```powershell
+New-NetFirewallRule -DisplayName "Hancho WebUI" -Direction Inbound -LocalPort 9138 -Protocol TCP -Action Allow
+```
+
+For access over the internet, prefer an SSH tunnel or VPN (6.3.4).
+
 ---
 
 ## 2. Localhost Authentication and Security
 
-Although the browser UI listens exclusively on localhost (`127.0.0.1`), it must defend against malicious scripts on other browser tabs (DNS Rebinding, CSRF, Cross-Site WebSocket Hijacking) as well as unprivileged local processes.
+By default the browser UI listens only on localhost (`127.0.0.1`). It still defends against malicious scripts on other browser tabs (DNS Rebinding, CSRF, Cross-Site WebSocket Hijacking) and unprivileged local processes. When `webui.scope` is `lan` or `custom`, the `Host` / `Origin` allowlist below is widened as configured.
 
 ### 2.1 Threat Model
 
@@ -121,9 +159,10 @@ Although the browser UI listens exclusively on localhost (`127.0.0.1`), it must 
 ### 2.5 Defense-in-Depth
 
 1. **`Host` Header Check**:
-   - Every request must have a `Host` header matching `localhost`, `127.0.0.1`, or `[::1]` (with port). Any other host receives `403 Forbidden` (neutralizing DNS Rebinding).
+   - In the default `loopback` scope, every request must have a `Host` header matching `localhost`, `127.0.0.1`, or `[::1]` (with port).
+   - In `lan` / `custom` scope, loopback, IP literals (for example `192.168.1.20:9138`), and the configured `allowed_hosts` are accepted; other hostnames receive `403 Forbidden`.
 2. **`Origin` Header Check**:
-   - If an `Origin` header is present, it must match `http://localhost:*` or `http://127.0.0.1:*`. Any foreign origin is rejected immediately.
+   - If an `Origin` header is present, it must be loopback, an IP literal, an exact `allowed_origins` entry, or a host in `allowed_hosts`. Any other origin is rejected immediately.
 
 ---
 
@@ -447,8 +486,18 @@ hancho-cli web
   hancho-cli web --json
   ```
 
-#### 6.3.4 Remote Access via SSH Tunneling
-For security, the browser UI listens strictly on `127.0.0.1`. To access a remote Hancho instance from your local workstation:
+#### 6.3.4 Remote Access (LAN, VPN, or SSH Tunneling)
+
+**LAN access.** Put this in `<data-dir>/config.json` and restart Hancho:
+
+```json
+{ "webui": { "enabled": true, "scope": "lan", "host": "0.0.0.0", "port": 9138,
+             "allowed_hosts": ["desktop-abc"] } }
+```
+
+Then open `http://<windows-ip>:9138/?token=<token>` from another device. Add `allowed_hosts` if you use a machine name instead of an IP, and allow the port in Windows Firewall. The token is required for non-loopback clients.
+
+**SSH tunnel (recommended over untrusted networks).** The default `loopback` scope is the safest choice for remote administration:
 
 1. **Establish an SSH Port Forward**:
    ```bash

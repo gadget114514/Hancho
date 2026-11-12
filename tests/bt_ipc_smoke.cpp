@@ -60,6 +60,14 @@ void RemoveDirRecursive(const std::wstring& dir) {
     RemoveDirectoryW(dir.c_str());
 }
 
+// Stream messages carry the normalized event under "data"; direct callbacks may carry it at top level.
+std::string StreamEventKind(const json& doc) {
+    if (doc.contains("data") && doc["data"].is_object()) {
+        return doc["data"].value("kind", "");
+    }
+    return doc.value("kind", "");
+}
+
 struct IpcTestHarness {
     ProcessManager pm;
     TaskQueueManager tqm;
@@ -1021,7 +1029,7 @@ int main() {
                 std::lock_guard<std::mutex> lock(streamMtx);
                 Check(streamedDocs.size() == 1, "Initial plan event received over stream");
                 if (!streamedDocs.empty()) {
-                    Check(streamedDocs[0].value("kind", "") == "plan", "Streamed event 1 kind is plan");
+                    Check(StreamEventKind(streamedDocs[0]) == "plan", "Streamed event 1 kind is plan");
                 }
             }
 
@@ -1043,9 +1051,9 @@ int main() {
                 std::lock_guard<std::mutex> lock(streamMtx);
                 Check(streamedDocs.size() == 4, "All 4 streamed events received live without polling (got " + std::to_string(streamedDocs.size()) + ")");
                 if (streamedDocs.size() >= 4) {
-                    Check(streamedDocs[1].value("kind", "") == "thought", "Event 2 is thought");
-                    Check(streamedDocs[2].value("kind", "") == "tool.call", "Event 3 is tool.call");
-                    Check(streamedDocs[3].value("kind", "") == "run.ended", "Event 4 is run.ended");
+                    Check(StreamEventKind(streamedDocs[1]) == "thought", "Event 2 is thought");
+                    Check(StreamEventKind(streamedDocs[2]) == "tool.call", "Event 3 is tool.call");
+                    Check(StreamEventKind(streamedDocs[3]) == "run.ended", "Event 4 is run.ended");
                 }
             }
 
@@ -1062,8 +1070,15 @@ int main() {
         // Verify all new IPC requests needed by GUI client:
         // process remove & reset_ids, taskqueue_counts, taskqueue_resource_locks,
         // taskqueue_diagnose / failure_diagnose, memory_* actions, config_get & config_set.
+        // Use an isolated data directory so the harness does not pick up jobs
+        // created by the harness that is still alive above.
         // -------------------------------------------------------------------
         {
+            std::wstring guiIpcDirW = PathJoinWide(tempDirW, L"gui_ipc");
+            RemoveDirRecursive(guiIpcDirW);
+            EnsureDirectoryWide(guiIpcDirW);
+            SetDataDirectoryOverride(guiIpcDirW);
+            {
             IpcTestHarness h;
 
             // 1. taskqueue_counts
@@ -1111,6 +1126,9 @@ int main() {
             // 6. config_get and config_set
             json cfgGet = h.Call({{"action", "config_get"}});
             Check(cfgGet.value("ok", false) && cfgGet.contains("config"), "config_get ok");
+            Check(cfgGet["config"].contains("webui") &&
+                  cfgGet["config"]["webui"].value("scope", "") == "loopback",
+                  "config_get includes webui exposure defaults");
             json cfgSet = h.Call({{"action", "config_set"}, {"patch", {{"default_shell", "powershell"}, {"test_setting", 42}}}});
             Check(cfgSet.value("ok", false) && cfgSet["config"].value("test_setting", 0) == 42, "config_set patch ok");
             json cfgGetAfter = h.Call({{"action", "config_get"}});
@@ -1160,6 +1178,9 @@ int main() {
                   "GUI IPC: memory_storage_stats returns storage stats");
             json memSearch2 = h.Call({{"action", "memory_search"}, {"text", ""}, {"limit", 10}});
             Check(memSearch2.is_object(), "GUI IPC: memory_search returns object");
+            }
+            SetDataDirectoryOverride(tempDirW);
+            RemoveDirRecursive(guiIpcDirW);
         }
     }
 

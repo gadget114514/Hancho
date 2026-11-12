@@ -1749,7 +1749,9 @@ bool RemoteListener::Start(const std::string& bindHost, uint16_t port, const std
 
     const bool anyAddress = bindHost.empty() || bindHost == "*" || bindHost == "0.0.0.0";
     addrinfo hints = {};
-    hints.ai_family = AF_UNSPEC;
+    // "0.0.0.0" / "*" / empty mean the IPv4 wildcard in this code base. Prefer AF_INET
+    // so a plain IPv4 LAN client can connect (getaddrinfo would otherwise return :: first).
+    hints.ai_family = anyAddress ? AF_INET : AF_UNSPEC;
     hints.ai_socktype = SOCK_STREAM;
     hints.ai_flags = AI_PASSIVE;
     addrinfo* result = nullptr;

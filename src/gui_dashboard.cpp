@@ -818,6 +818,9 @@ enum ControlId {
     IDC_SET_TAB = 6053,
     IDC_SET_PROC_FONT = 6054,
     IDC_SET_TASK_FONT = 6055,
+    IDC_SET_WEBUI_ENABLED = 6059,
+    IDC_SET_WEBUI_SCOPE = 6060,
+    IDC_SET_WEBUI_ALLOWED_HOSTS = 6061,
     IDM_TRAY_RESTORE = 4001,
     IDM_TRAY_GRID_VIEW = 4002,
     IDM_TRAY_HIDE = 4003,
@@ -8944,13 +8947,29 @@ static void SaveShellConfig(const DashboardState* st) {
         << "}\n";
 
     std::string serialized = ss.str();
-    WriteFileAtomicWide(GetConfigFilePathWide(), serialized);
-
     nlohmann::json cfgJson = nlohmann::json::parse(serialized, nullptr, false);
     if (!cfgJson.is_discarded()) {
-        nlohmann::json req = {{"action", "config_set"}, {"config", cfgJson}};
+        // Preserve settings managed outside the dashboard (webui, memory, ...).
+        // The old config is read before writing so this save does not drop them.
+        std::string oldContent = ReadFileUtf8Wide(GetConfigFilePathWide());
+        nlohmann::json oldJson = nlohmann::json::parse(oldContent, nullptr, false);
+        if (oldJson.is_object()) {
+            for (auto it = oldJson.begin(); it != oldJson.end(); ++it) {
+                if (!cfgJson.contains(it.key())) cfgJson[it.key()] = it.value();
+            }
+        }
+        serialized = cfgJson.dump(2);
+        WriteFileAtomicWide(GetConfigFilePathWide(), serialized);
+
+        // The file already carries "webui"; do not send it back as a patch or an
+        // unrelated settings save would restart the WebUI listener.
+        nlohmann::json ipcJson = cfgJson;
+        ipcJson.erase("webui");
+        nlohmann::json req = {{"action", "config_set"}, {"config", ipcJson}};
         nlohmann::json resp;
         GuiIpcCall(const_cast<DashboardState*>(st), req, resp);
+    } else {
+        WriteFileAtomicWide(GetConfigFilePathWide(), serialized);
     }
 }
 
@@ -9609,6 +9628,13 @@ struct SettingsDlgState {
       HWND chkEndBlink = nullptr;
       HWND lblEndBlinkSec = nullptr;
       HWND editEndBlinkSec = nullptr;
+      HWND lblWebUiTitle = nullptr;
+      HWND chkWebUi = nullptr;
+      HWND lblWebUiScope = nullptr;
+      HWND cmbWebUiScope = nullptr;
+      HWND lblWebUiAllowedHosts = nullptr;
+      HWND editWebUiAllowedHosts = nullptr;
+      nlohmann::json webuiConfig;
       HWND lblProcFont = nullptr;
       HWND cmbProcFont = nullptr;
        HWND lblTaskFont = nullptr;
@@ -9700,6 +9726,86 @@ static void SelectSettingsTab(SettingsDlgState* ds, int tab) {
     }
 }
 
+static std::string TrimWebUiItem(const std::string& s) {
+    size_t b = s.find_first_not_of(" \t\r\n");
+    if (b == std::string::npos) return "";
+    size_t e = s.find_last_not_of(" \t\r\n");
+    return s.substr(b, e - b + 1);
+}
+
+static void LoadWebUiDialogConfig(SettingsDlgState* ds) {
+    if (!ds) return;
+    ds->webuiConfig = nlohmann::json::object();
+    std::string content = ReadFileUtf8Wide(GetConfigFilePathWide());
+    nlohmann::json cfg = nlohmann::json::parse(content, nullptr, false);
+    if (cfg.is_object() && cfg.contains("webui") && cfg["webui"].is_object()) {
+        ds->webuiConfig = cfg["webui"];
+    }
+    const bool enabled = ds->webuiConfig.value("enabled", true);
+    const std::string scope = ds->webuiConfig.value("scope", "loopback");
+    if (ds->chkWebUi) {
+        SendMessageW(ds->chkWebUi, BM_SETCHECK, enabled ? BST_CHECKED : BST_UNCHECKED, 0);
+    }
+    if (ds->cmbWebUiScope) {
+        const bool lan = (scope == "lan" || scope == "custom");
+        SendMessageW(ds->cmbWebUiScope, CB_SETCURSEL, lan ? 1 : 0, 0);
+    }
+    std::string hosts;
+    if (ds->webuiConfig.contains("allowed_hosts") && ds->webuiConfig["allowed_hosts"].is_array()) {
+        for (const auto& item : ds->webuiConfig["allowed_hosts"]) {
+            if (!item.is_string()) continue;
+            if (!hosts.empty()) hosts += ", ";
+            hosts += item.get<std::string>();
+        }
+    }
+    if (ds->editWebUiAllowedHosts) {
+        SetWindowTextW(ds->editWebUiAllowedHosts, Utf8ToWide(hosts).c_str());
+    }
+}
+
+static void ApplyWebUiDialogConfig(SettingsDlgState* ds) {
+    if (!ds || !ds->dash) return;
+    nlohmann::json webui = ds->webuiConfig.is_object() ? ds->webuiConfig : nlohmann::json::object();
+    const bool enabled = !ds->chkWebUi ||
+        (SendMessageW(ds->chkWebUi, BM_GETCHECK, 0, 0) == BST_CHECKED);
+    const int scopeSel = ds->cmbWebUiScope
+        ? static_cast<int>(SendMessageW(ds->cmbWebUiScope, CB_GETCURSEL, 0, 0))
+        : 0;
+    const std::string scope = (scopeSel == 1) ? "lan" : "loopback";
+    webui["enabled"] = enabled;
+    webui["scope"] = scope;
+    if (scope == "lan") {
+        const std::string host = webui.value("host", "0.0.0.0");
+        if (host.empty() || host == "127.0.0.1" || host == "localhost") {
+            webui["host"] = "0.0.0.0";
+        }
+    } else {
+        webui["host"] = "127.0.0.1";
+    }
+
+    nlohmann::json hosts = nlohmann::json::array();
+    if (ds->editWebUiAllowedHosts) {
+        wchar_t buf[1024] = {};
+        GetWindowTextW(ds->editWebUiAllowedHosts, buf, 1024);
+        std::string text = WideToUtf8(buf);
+        size_t start = 0;
+        while (start <= text.size()) {
+            size_t comma = text.find(',', start);
+            std::string item = TrimWebUiItem(text.substr(
+                start, comma == std::string::npos ? std::string::npos : comma - start));
+            if (!item.empty()) hosts.push_back(item);
+            if (comma == std::string::npos) break;
+            start = comma + 1;
+        }
+    }
+    webui["allowed_hosts"] = hosts;
+    ds->webuiConfig = webui;
+
+    nlohmann::json req = {{"action", "config_set"}, {"patch", {{"webui", webui}}}};
+    nlohmann::json resp;
+    GuiIpcCall(ds->dash, req, resp);
+}
+
 static void UpdateSettingsDialogTexts(HWND hwnd) {
     auto* ds = reinterpret_cast<SettingsDlgState*>(GetWindowLongPtrW(hwnd, GWLP_USERDATA));
     if (!ds) return;
@@ -9765,6 +9871,31 @@ static void UpdateSettingsDialogTexts(HWND hwnd) {
     }
     SetWindowTextW(ds->chkEndBlink, Tr(L"プロセス・タスク終了時に一覧の行を点滅させる", L"Blink list rows when a process or task ends", L"Hacer parpadear las filas al terminar un proceso o tarea"));
     SetWindowTextW(ds->lblEndBlinkSec, Tr(L"点滅秒数 (1〜60, 既定 5):", L"Blink duration (seconds, 1-60, default 5):", L"Duración del parpadeo (segundos, 1-60, predeterminado 5):"));
+    if (ds->lblWebUiTitle) {
+        SetWindowTextW(ds->lblWebUiTitle, Tr(L"ブラウザ UI (WebUI)", L"Browser UI (WebUI)", L"Interfaz web (WebUI)"));
+    }
+    if (ds->chkWebUi) {
+        SetWindowTextW(ds->chkWebUi, Tr(L"ブラウザ UI を有効にする", L"Enable the browser UI", L"Activar la interfaz web"));
+    }
+    if (ds->lblWebUiScope) {
+        SetWindowTextW(ds->lblWebUiScope, Tr(L"公開範囲:", L"Exposure:", L"Exposición:"));
+    }
+    if (ds->cmbWebUiScope) {
+        int sel = static_cast<int>(SendMessageW(ds->cmbWebUiScope, CB_GETCURSEL, 0, 0));
+        if (sel < 0) sel = 0;
+        SendMessageW(ds->cmbWebUiScope, CB_RESETCONTENT, 0, 0);
+        SendMessageW(ds->cmbWebUiScope, CB_ADDSTRING, 0,
+            (LPARAM)Tr(L"ローカルのみ (127.0.0.1)", L"Loopback only (127.0.0.1)", L"Solo local (127.0.0.1)"));
+        SendMessageW(ds->cmbWebUiScope, CB_ADDSTRING, 0,
+            (LPARAM)Tr(L"LAN (0.0.0.0)", L"LAN (0.0.0.0)", L"LAN (0.0.0.0)"));
+        SendMessageW(ds->cmbWebUiScope, CB_SETCURSEL, sel, 0);
+    }
+    if (ds->lblWebUiAllowedHosts) {
+        SetWindowTextW(ds->lblWebUiAllowedHosts, Tr(
+            L"追加で許可するホスト名 (カンマ区切り、LAN 時):",
+            L"Extra allowed hostnames (comma separated, LAN only):",
+            L"Nombres de host adicionales (separados por comas, solo LAN):"));
+    }
     SetWindowTextW(ds->lblEventRetention, Tr(
         L"イベント保持件数 (100〜100000, -1 = 無制限: メモリを使い切る恐れあり):",
         L"Events kept per process (100-100000, -1 = unlimited: may use up memory):",
@@ -10023,6 +10154,23 @@ static LRESULT CALLBACK SettingsWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPAR
                 560, 399, 110, 24, hwnd, (HMENU)IDC_SET_END_BLINK_SECONDS, hInst, nullptr);
             SetWindowTextW(ds->editEndBlinkSec, std::to_wstring(ds->dash->endBlinkSeconds).c_str());
 
+            ds->lblWebUiTitle = CreateWindowExW(0, L"STATIC", L"", WS_CHILD | WS_VISIBLE,
+                18, 100, 640, 20, hwnd, nullptr, hInst, nullptr);
+            ds->chkWebUi = CreateWindowExW(0, L"BUTTON", L"", WS_CHILD | WS_VISIBLE | WS_TABSTOP | BS_AUTOCHECKBOX,
+                18, 126, 520, 24, hwnd, (HMENU)IDC_SET_WEBUI_ENABLED, hInst, nullptr);
+            ds->lblWebUiScope = CreateWindowExW(0, L"STATIC", L"", WS_CHILD | WS_VISIBLE,
+                18, 160, 260, 20, hwnd, nullptr, hInst, nullptr);
+            ds->cmbWebUiScope = CreateWindowExW(WS_EX_CLIENTEDGE, L"COMBOBOX", L"",
+                WS_CHILD | WS_VISIBLE | WS_TABSTOP | CBS_DROPDOWNLIST | WS_VSCROLL,
+                18, 184, 260, 200, hwnd, (HMENU)IDC_SET_WEBUI_SCOPE, hInst, nullptr);
+            SendMessageW(ds->cmbWebUiScope, CB_ADDSTRING, 0, (LPARAM)L"Loopback only (127.0.0.1)");
+            SendMessageW(ds->cmbWebUiScope, CB_ADDSTRING, 0, (LPARAM)L"LAN (0.0.0.0)");
+            ds->lblWebUiAllowedHosts = CreateWindowExW(0, L"STATIC", L"", WS_CHILD | WS_VISIBLE,
+                18, 218, 640, 20, hwnd, nullptr, hInst, nullptr);
+            ds->editWebUiAllowedHosts = CreateWindowExW(WS_EX_CLIENTEDGE, L"EDIT", L"",
+                WS_CHILD | WS_VISIBLE | WS_TABSTOP | ES_AUTOHSCROLL,
+                18, 242, 520, 26, hwnd, (HMENU)IDC_SET_WEBUI_ALLOWED_HOSTS, hInst, nullptr);
+
             ds->lblProcFont = CreateWindowExW(0, L"STATIC", L"", WS_CHILD | WS_VISIBLE,
                 18, 458, 530, 20, hwnd, nullptr, hInst, nullptr);
             ds->cmbProcFont = CreateWindowExW(WS_EX_CLIENTEDGE, L"COMBOBOX", L"",
@@ -10056,10 +10204,13 @@ static LRESULT CALLBACK SettingsWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPAR
                              ds->chkResourceLocks, ds->chkActivityStyle, ds->lblEventRetention, ds->editEventRetention,
                              ds->lblRefreshInterval, ds->editRefreshInterval, ds->btnListBgReset,
                              ds->chkEndBlink, ds->lblEndBlinkSec, ds->editEndBlinkSec,
+                             ds->lblWebUiTitle, ds->chkWebUi, ds->lblWebUiScope, ds->cmbWebUiScope,
+                             ds->lblWebUiAllowedHosts, ds->editWebUiAllowedHosts,
                              ds->lblProcFont, ds->cmbProcFont, ds->lblTaskFont, ds->cmbTaskFont };
             for (HWND h : ctrls) SendMessageW(h, WM_SETFONT, (WPARAM)ds->dash->hFontUi, TRUE);
             for (HWND h : ds->btnListBg) SendMessageW(h, WM_SETFONT, (WPARAM)ds->dash->hFontUi, TRUE);
             SendMessageW(ds->lblListBg, WM_SETFONT, (WPARAM)ds->dash->hFontUiBold, TRUE);
+            SendMessageW(ds->lblWebUiTitle, WM_SETFONT, (WPARAM)ds->dash->hFontUiBold, TRUE);
             SendMessageW(ds->hwndAboutTitle, WM_SETFONT, (WPARAM)ds->dash->hFontUiBold, TRUE);
             SendMessageW(ds->hwndAboutVersion, WM_SETFONT, (WPARAM)ds->dash->hFontUi, TRUE);
             SendMessageW(ds->hwndAboutDesc, WM_SETFONT, (WPARAM)ds->dash->hFontUi, TRUE);
@@ -10088,11 +10239,15 @@ static LRESULT CALLBACK SettingsWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPAR
                     ds->lblRefreshInterval, ds->editRefreshInterval,
                     ds->chkEndBlink, ds->lblEndBlinkSec, ds->editEndBlinkSec });
                 maintenance.insert(maintenance.end(), { ds->btnShell, ds->btnReset, ds->btnClear });
+                maintenance.insert(maintenance.end(), {
+                    ds->lblWebUiTitle, ds->chkWebUi, ds->lblWebUiScope, ds->cmbWebUiScope,
+                    ds->lblWebUiAllowedHosts, ds->editWebUiAllowedHosts });
                 auto& about = ds->tabPages[4];
                 about.insert(about.end(), { ds->hwndAboutTitle, ds->hwndAboutVersion, ds->hwndAboutDesc });
             }
             SelectSettingsTab(ds, 0);
             UpdateSettingsDialogTexts(hwnd);
+            LoadWebUiDialogConfig(ds);
             ApplyNativeThemeToWindow(hwnd);
             // The tab pages are fully owner-painted with the dialog colours; theming the tab
             // control would repaint its body with the system (white) background.
@@ -10153,6 +10308,18 @@ static LRESULT CALLBACK SettingsWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPAR
                     (SendMessageW(ds->chkRestoreUsageGraph, BM_GETCHECK, 0, 0) == BST_CHECKED);
                 SetUsageHistoryPersistence(ds->dash->restoreUsageGraph);
                 SaveShellConfig(ds->dash);
+                return 0;
+            }
+            if (id == IDC_SET_WEBUI_ENABLED) {
+                ApplyWebUiDialogConfig(ds);
+                return 0;
+            }
+            if (id == IDC_SET_WEBUI_SCOPE) {
+                if (HIWORD(wParam) == CBN_SELCHANGE) ApplyWebUiDialogConfig(ds);
+                return 0;
+            }
+            if (id == IDC_SET_WEBUI_ALLOWED_HOSTS) {
+                if (HIWORD(wParam) == EN_KILLFOCUS) ApplyWebUiDialogConfig(ds);
                 return 0;
             }
             if (id == IDC_SET_RESOURCE_LOCKS) {

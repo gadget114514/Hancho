@@ -134,6 +134,7 @@ bool IpcServer::Start() {
 
 void IpcServer::Stop() {
     if (stop_.exchange(true)) return;
+    if (webuiRestartThread_.joinable()) webuiRestartThread_.join();
     StopWebUiServer();
     StopRemoteListener();
     // Wake up blocking ConnectNamedPipe by opening a dummy connection
@@ -1281,6 +1282,18 @@ std::string IpcServer::HandleRequestJson(const std::string& reqJson) {
             if (!cfg.contains("restore_usage_graph")) {
                 cfg["restore_usage_graph"] = IsUsageHistoryPersistence();
             }
+            if (!cfg.contains("webui") || !cfg["webui"].is_object()) {
+                cfg["webui"] = nlohmann::json::object();
+            }
+            {
+                nlohmann::json& w = cfg["webui"];
+                if (!w.contains("enabled")) w["enabled"] = true;
+                if (!w.contains("scope")) w["scope"] = "loopback";
+                if (!w.contains("host")) w["host"] = "0.0.0.0";
+                if (!w.contains("port")) w["port"] = 9138;
+                if (!w.contains("allowed_hosts")) w["allowed_hosts"] = nlohmann::json::array();
+                if (!w.contains("allowed_origins")) w["allowed_origins"] = nlohmann::json::array();
+            }
             nlohmann::json out;
             out["ok"] = true;
             out["config"] = cfg;
@@ -1317,7 +1330,9 @@ std::string IpcServer::HandleRequestJson(const std::string& reqJson) {
             if (cfg.contains("restore_usage_graph") && cfg["restore_usage_graph"].is_boolean()) {
                 SetUsageHistoryPersistence(cfg["restore_usage_graph"].get<bool>());
             }
+            const bool webuiChanged = patch.contains("webui");
             WriteFileAtomicWide(configPath, cfg.dump(2));
+            if (webuiChanged) ScheduleWebUiRestart();
             nlohmann::json out;
             out["ok"] = true;
             out["config"] = cfg;

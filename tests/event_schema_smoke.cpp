@@ -421,6 +421,9 @@ static nlohmann::json LoadEventSchemaFile(std::string& resolvedPath) {
         "../doc/schema/hancho.event.v1.json",
         "../../doc/schema/hancho.event.v1.json"
     };
+#ifdef PC_REPO_DIR
+    candidates.insert(candidates.begin(), std::string(PC_REPO_DIR) + "/doc/schema/hancho.event.v1.json");
+#endif
     wchar_t modPath[MAX_PATH] = {};
     DWORD len = GetModuleFileNameW(nullptr, modPath, MAX_PATH);
     if (len > 0) {

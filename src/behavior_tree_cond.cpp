@@ -17,6 +17,19 @@ bool ReadFileMtime(const std::wstring& pathW, uint64_t& outFiletime) {
     return GetFileMtimeWide(pathW, outFiletime);
 }
 
+// fileExists accepts a simple glob in the final path component (docs/behavior-tree-plan.md).
+bool PathOrGlobExists(const std::wstring& fullPathW) {
+    if (fullPathW.find(L'*') == std::wstring::npos &&
+        fullPathW.find(L'?') == std::wstring::npos) {
+        return PathExistsWide(fullPathW);
+    }
+    size_t slash = fullPathW.find_last_of(L"\\/");
+    std::wstring dir = (slash == std::wstring::npos) ? L"." : fullPathW.substr(0, slash);
+    std::wstring pattern = (slash == std::wstring::npos) ? fullPathW : fullPathW.substr(slash + 1);
+    if (dir.empty()) dir = (slash == 0 && fullPathW.size() > 1 && fullPathW[0] == L'/') ? L"/" : L".";
+    return !ListDirectoryWide(dir, pattern).empty();
+}
+
 bool TryParseDouble(const json& v, double& out) {
     if (v.is_number()) {
         out = v.get<double>();
@@ -226,7 +239,7 @@ bool BehaviorTree::Impl::EvaluateCondition(BehaviorTree& bt, BtNode& node, int64
             return finishCond(false, "undefinedVar: " + undefVar);
         }
         std::wstring fullW = ResolveBtPathWide(bt.cwd_, relPath);
-        bool found = PathExistsWide(fullW);
+        bool found = PathOrGlobExists(fullW);
         return finishCond(found);
     }
 

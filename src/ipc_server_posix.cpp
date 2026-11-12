@@ -24,6 +24,7 @@ bool IpcServer::Start() {
 
 void IpcServer::Stop() {
     if (stop_.exchange(true)) return;
+    if (webuiRestartThread_.joinable()) webuiRestartThread_.join();
     StopWebUiServer();
     StopRemoteListener();
     if (transport_) transport_->Stop();

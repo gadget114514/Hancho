@@ -115,7 +115,7 @@ Hancho のビヘイビアツリー (BT) は、条件分岐 (`if`/`fallback`)、�
 
 | `type` | 必須フィールド | 動作 |
 |---|---|---|
-| `fileExists` | `"path"` | `cwd` 基準のファイルが存在すれば成功。 |
+| `fileExists` | `"path"` | `cwd` 基準のファイルが存在すれば成功。末尾の要素では単純な glob（例: `*.json`）も使えます。 |
 | `fileNewer` | `"path"`, `"than"` | `"path"` が `"than"` (別ファイルパス、または `"${build.start}"` のような ISO-8601 時刻文字列) より新しければ成功。 |
 | `outputMatches` | `"node"`, `"regex"` | 任意 `"lines"` (既定 `200`)。指定ノードの直近ログ末尾 `"lines"` 行に正規表現がマッチすれば成功。 |
 | `exitCode` | `"node"`, および `"eq"` / `"ne"` / `"in"` のいずれか | 指定ノードの直近終了コードを比較。 |

@@ -115,7 +115,7 @@ Condition leaves complete in the same tick they are evaluated (`succeeded` when 
 
 | `type` | Required Fields | Behavior |
 |---|---|---|
-| `fileExists` | `"path"` | Succeeds if the file (resolved against `cwd`) exists on disk. |
+| `fileExists` | `"path"` | Succeeds if the file (resolved against `cwd`) exists on disk; a simple glob in the final component is allowed (e.g. `*.json`). |
 | `fileNewer` | `"path"`, `"than"` | Succeeds if `"path"` is newer than `"than"`, where `"than"` is either another file path or an ISO-8601 timestamp such as `"${build.start}"`. |
 | `outputMatches` | `"node"`, `"regex"` | Optional `"lines"` (default `200`). Succeeds if `std::regex_search` matches the last `"lines"` lines of `"node"`'s log file. |
 | `exitCode` | `"node"`, and one of `"eq"`, `"ne"`, `"in"` | Compares the last exit code of `"node"`. |

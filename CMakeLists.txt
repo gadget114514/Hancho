@@ -314,6 +314,8 @@ add_executable(event_schema_smoke
     src/common.cpp
 )
 
+target_compile_definitions(event_schema_smoke PRIVATE PC_REPO_DIR="${CMAKE_CURRENT_SOURCE_DIR}")
+
 # Headless smoke test for the Tier 1 declarative adapters (src/event_adapter.cpp).
 add_executable(event_adapter_smoke
     tests/event_adapter_smoke.cpp
@@ -780,6 +782,31 @@ target_link_libraries(gui_platform_smoke PRIVATE
     winmm
 )
 
+# Smoke test for the hancho-cli top TUI helpers and renderer (Cards 062-1, 062-2).
+add_executable(cli_top_smoke
+    tests/cli_top_smoke.cpp
+    src/common.cpp
+    src/ipc_client.cpp
+)
+
+target_include_directories(cli_top_smoke PRIVATE
+    src
+    include
+    tests
+)
+
+if(MSVC)
+    target_compile_options(cli_top_smoke PRIVATE /W4 /utf-8 /EHsc)
+endif()
+
+target_link_libraries(cli_top_smoke PRIVATE
+    user32
+    shell32
+    advapi32
+    crypt32
+    ws2_32
+)
+
 # Smoke test for browser UI skeleton (HTTP + WebSocket server, Card 061b).
 add_executable(webui_smoke
     tests/webui_smoke.cpp
@@ -903,6 +930,17 @@ else()
     target_include_directories(platform_abstraction_smoke PRIVATE src include)
     target_compile_options(platform_abstraction_smoke PRIVATE -Wall -Wextra -Wno-unused-parameter)
     target_link_libraries(platform_abstraction_smoke PRIVATE Threads::Threads util)
+
+    # hancho-cli top TUI helpers and renderer (Cards 062-1, 062-2).
+    add_executable(cli_top_smoke
+        tests/cli_top_smoke.cpp
+        src/common_posix.cpp
+        src/ipc_client_posix.cpp
+    )
+    target_compile_definitions(cli_top_smoke PRIVATE ${PC_VERSION_DEFINITIONS})
+    target_include_directories(cli_top_smoke PRIVATE src include tests)
+    target_compile_options(cli_top_smoke PRIVATE -Wall -Wextra -Wno-unused-parameter)
+    target_link_libraries(cli_top_smoke PRIVATE Threads::Threads util)
 
     # Browser UI skeleton smoke test (Card 061b)
     add_executable(webui_smoke

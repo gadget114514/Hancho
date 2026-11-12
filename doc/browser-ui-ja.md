@@ -49,7 +49,7 @@ Linux / macOS におけるブラウザ UI のバックエンドサーバーは�
 
 ### 1.3 ポートとプロトコルの多重化
 
-- **既定ポート**: `9138`（`config.json` の `webui_port` または `--webui-port` で変更可能）。
+- **既定ポート**: `9138`（`config.json` の `webui.port`、`--webui-port`、または `HANCHO_WEBUI_PORT` で変更可能）。
 - **HTTP / WebSocket 同一ポート多重化**:
   - `GET /` や `GET /assets/*` 等の通常 HTTP リクエストに対しては、静的 UI 資産（HTML / JS / CSS / SVG）を返します。
   - `Upgrade: websocket` ヘッダーを含む HTTP 要求に対しては、WebSocket ハンドシェイクを行い、既存の Hancho IPC プロトコル（JSON RPC 多重化およびログ・イベントのストリーミング購読）に切り替えます。
@@ -67,11 +67,49 @@ hancho-cli ui
 
 このコマンドは、稼働中のコアのデータディレクトリからトークンとポートを読み取り、OS 既定のブラウザ（`xdg-open` / `open` / Windows の場合は `ShellExecute`）で `http://127.0.0.1:<port>/?token=<token>` を開きます。
 
+### 1.5 公開設定（`config.json` の `webui`）
+
+既定ではループバック専用です。公開範囲は `<data-dir>/config.json` の `webui` オブジェクトで制御します:
+
+```json
+{
+  "webui": {
+    "enabled": true,
+    "scope": "lan",
+    "host": "0.0.0.0",
+    "port": 9138,
+    "allowed_hosts": ["desktop-abc", "desktop-abc.local"],
+    "allowed_origins": ["http://desktop-abc:9138"]
+  }
+}
+```
+
+| フィールド | 値 | 意味 |
+|---|---|---|
+| `enabled` | `true` / `false` | ブラウザ UI を起動する。 |
+| `scope` | `loopback`（既定）、`lan`、`custom` | `loopback` は `127.0.0.1` にバインドし、ループバックの `Host` / `Origin` だけを許可。`lan` / `custom` は `host` にバインドし、IP リテラルと `allowed_hosts` / `allowed_origins` を許可。 |
+| `host` | `0.0.0.0`、`127.0.0.1`、IP、ホスト名 | `lan` / `custom` のバインド先。`0.0.0.0` は全インターフェース。 |
+| `port` | `1..65535` | 待ち受けポート（既定 `9138`）。 |
+| `allowed_hosts` | ホスト名 | `Host` / `Origin` で追加許可する名前（マシン名など）。 |
+| `allowed_origins` | 完全なオリジン | 追加許可する `http(s)://host:port`。 |
+
+環境変数でも上書きできます（ヘッドレス / テスト用）: `HANCHO_WEBUI_HOST`、`HANCHO_WEBUI_SCOPE`、`HANCHO_WEBUI_ALLOWED_HOSTS`、`HANCHO_WEBUI_ALLOWED_ORIGINS`、`HANCHO_WEBUI_PORT`、`HANCHO_WEBUI_DISABLE`。CLI フラグ（`--webui-host`、`--webui-scope`、`--webui-allowed-hosts`、`--webui-allowed-origins`、`--webui-port`、`--webui-disable`）は同じ変数に反映されます。
+
+`config_set` で `webui` を変更すると、リスナーはバックグラウンドで自動的に再起動します。Windows ダッシュボードの「設定」→「管理」タブに、有効 / 無効、公開範囲（ローカル / LAN）、追加許可ホストの設定があります。`port` と `allowed_origins` は `config.json` で指定します。
+
+**セキュリティ:** `lan` / `custom` はローカルホスト限定の制限を意図的に緩めます。非ループバック接続にもセッショントークンは必須ですが TLS はありません。信頼できる LAN または VPN でのみ使い、Windows ではポートを明示的に許可してください:
+
+```powershell
+New-NetFirewallRule -DisplayName "Hancho WebUI" -Direction Inbound -LocalPort 9138 -Protocol TCP -Action Allow
+```
+
+インターネット経由で使う場合は SSH トンネルまたは VPN を推奨します（6.3.4）。
+
 ---
 
 ## 2. localhost の認証とセキュリティ設計
 
-ブラウザ UI はローカルホスト（`127.0.0.1`）でのみ待ち受けますが、同一マシン上で動く別ユーザーのプロセスや、悪意ある Web サイトからの攻撃（DNS Rebinding、CSRF、WebSocket ハイジャック）を確実に防ぐ必要があります。
+ブラウザ UI は既定ではローカルホスト（`127.0.0.1`）でのみ待ち受けます。同一マシン上で動く別ユーザーのプロセスや、悪意ある Web サイトからの攻撃（DNS Rebinding、CSRF、WebSocket ハイジャック）を防ぐ必要があります。`webui.scope` が `lan` / `custom` のときは、下記の `Host` / `Origin` 許可範囲が設定に従って広がります。
 
 ### 2.1 脅威モデル
 
@@ -125,11 +163,11 @@ hancho-cli ui
 ### 2.5 防御機構の詳細
 
 1. **`Host` ヘッダー検証**:
-   - すべての HTTP / WebSocket リクエストにおいて、`Host` ヘッダーが `localhost`、`127.0.0.1`、`[::1]`（およびポート番号）であるかを検査します。
-   - 不一致の場合は `403 Forbidden` を返して遮断します（DNS Rebinding 攻撃の無効化）。
+   - 既定の `loopback` スコープでは、`Host` ヘッダーが `localhost`、`127.0.0.1`、`[::1]`（およびポート番号）であるかを検査します。
+   - `lan` / `custom` スコープでは、ループバック、IP リテラル（例: `192.168.1.20:9138`）、および設定した `allowed_hosts` を許可します。それ以外のホスト名は `403 Forbidden` で遮断します。
 2. **`Origin` ヘッダー検証**:
-   - `Origin` ヘッダーが存在する場合、オリジンが `http://localhost:*` または `http://127.0.0.1:*` であるかを検査します。
-   - 外部ドメイン（例: `http://evil.com`）からの接続は直ちに拒否します。
+   - `Origin` ヘッダーが存在する場合、ループバック、IP リテラル、`allowed_origins` の完全一致、または `allowed_hosts` のホストであるかを検査します。
+   - それ以外のオリジン（例: `http://evil.com`）からの接続は直ちに拒否します。
 
 ---
 
@@ -465,8 +503,18 @@ hancho-cli web
   # {"ok": true, "port": 9138, "token": "...", "url": "http://127.0.0.1:9138/?token=..."}
   ```
 
-#### 6.3.4 リモートサーバー・クラウド VM での利用（SSH トンネリング）
-ブラウザ UI はセキュリティを最優先し、外部ネットワークにはポートを直接公開せずローカルホスト（`127.0.0.1`）のみで待ち受けます。リモートサーバー上の Hancho ダッシュボードを手元の PC から安全に操作するには、SSH ポートフォワードを利用します。
+#### 6.3.4 リモートアクセス（LAN・VPN・SSH トンネリング）
+
+**LAN アクセス。** `<data-dir>/config.json` に次を書き、Hancho を再起動します:
+
+```json
+{ "webui": { "enabled": true, "scope": "lan", "host": "0.0.0.0", "port": 9138,
+             "allowed_hosts": ["desktop-abc"] } }
+```
+
+別の端末から `http://<Windows の IP>:9138/?token=<token>` を開きます。IP ではなくマシン名でアクセスする場合は `allowed_hosts` に追加し、Windows Firewall でポートを許可してください。非ループバック接続にはトークンが必要です。
+
+**SSH トンネル（信頼できないネットワークでは推奨）。** 既定の `loopback` スコープが最も安全です:
 
 1. **手元の PC から SSH トンネルを開設**:
    ```bash

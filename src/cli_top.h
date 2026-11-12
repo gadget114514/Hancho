@@ -632,13 +632,29 @@ inline bool BuildJobCancelRequest(const TopState& state, std::string& outReq, st
     return false;
 }
 
+// Strip ANSI escape sequences so no-color output still contains the text.
+inline std::string StripAnsiSequences(const std::string& s) {
+    std::string out;
+    out.reserve(s.size());
+    for (size_t i = 0; i < s.size();) {
+        if (s[i] == '\x1b' && i + 1 < s.size() && s[i + 1] == '[') {
+            i += 2;
+            while (i < s.size() && !(s[i] >= '@' && s[i] <= '~')) ++i;
+            if (i < s.size()) ++i;
+        } else {
+            out.push_back(s[i++]);
+        }
+    }
+    return out;
+}
+
 // Render screen content as pure string (decoupled from I/O for unit testability)
 inline std::string RenderScreen(const TopState& state, int width, int height, bool useColor = true) {
     std::ostringstream out;
 
     // ANSI sequence shortcuts
     auto code = [useColor](const std::string& ansi) -> std::string {
-        return useColor ? ansi : "";
+        return useColor ? ansi : StripAnsiSequences(ansi);
     };
     auto reset = [useColor]() -> std::string {
         return useColor ? "\x1b[0m" : "";
@@ -800,7 +816,7 @@ inline std::string RenderScreen(const TopState& state, int width, int height, bo
                 }
             }
         } else {
-            out << "   (no active processes)\n";
+            out << "   (No running or recent processes)\n";
             linesRendered++;
         }
     } else if (state.activeTab == TopTab::Queue) {
@@ -912,7 +928,7 @@ inline std::string RenderScreen(const TopState& state, int width, int height, bo
                 }
             }
         } else {
-            out << "   (no jobs in queue)\n";
+            out << "   (Queue is empty)\n";
             linesRendered++;
         }
     } else if (state.activeTab == TopTab::Monitor) {
@@ -1040,7 +1056,7 @@ inline std::string RenderScreen(const TopState& state, int width, int height, bo
                 linesRendered++;
             }
         } else {
-            out << "   (no event stream or log records available for this process)\n";
+            out << "   (No agent events recorded yet)\n";
             linesRendered++;
         }
     } else if (state.activeTab == TopTab::Diagnostics) {
@@ -1209,7 +1225,7 @@ inline std::string RenderScreen(const TopState& state, int width, int height, bo
                 }
             }
         } else {
-            out << "   (no failure records detected - all jobs succeeded or queue is clean)\n";
+            out << "   (No failed jobs recorded)\n";
             linesRendered++;
         }
     } else if (state.activeTab == TopTab::Memory) {
@@ -1312,7 +1328,7 @@ inline std::string RenderScreen(const TopState& state, int width, int height, bo
                 }
             }
         } else {
-            out << "   (no memory records found)\n";
+            out << "   (No memory records found)\n";
             linesRendered++;
         }
     }

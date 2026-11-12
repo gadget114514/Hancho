@@ -44,7 +44,9 @@ void RunPart2Tests(const std::string& tempDirUtf8, const std::wstring& tempDirW)
         bt.SetJobRunner(&runner);
         bt.Start(1000);
 
-        // Write after_j1.txt while j1 is running so its mtime is strictly newer than old.txt and j1.start
+        // Write after_j1.txt while j1 is running so its mtime is strictly newer than old.txt and j1.start.
+        // Windows file timestamps can share a tick; wait one tick before writing the newer file.
+        Sleep(50);
         WriteFileAtomicWide(tempDirW + L"\\after_j1.txt", "newer content");
 
         bt.OnJobFinished("cond-test-1", true, 0, "", "Line 1\nPASS_TOKEN_42\nDone", 1500);
