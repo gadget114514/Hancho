@@ -844,6 +844,8 @@ public:
     // finishes the attempts whose remote process is done.
     void PollRemoteJobs();
 
+    std::string JobToJson(const TaskQueueJob& job, bool includeInstructions = true) const;
+
 private:
     struct LaunchItem {
         std::string taskqueue;
@@ -893,7 +895,6 @@ private:
 
     void EmitEventLocked(TaskQueue& tq, const std::string& type, const std::string& jobId, int64_t attempt,
                          const TaskQueueFailureDiagnostic* failure = nullptr);
-    std::string JobToJson(const TaskQueueJob& job, bool includeInstructions) const;
     static std::string BuildError(const std::string& msg);
 
     ProcessManager* pm_ = nullptr;

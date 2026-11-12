@@ -83,3 +83,16 @@
 - **ChainGuard** rejects shell chains and wait loops in `start_process` / `taskqueue_add`; use `dependsOn` instead. CLI `--allow-chain` is the only escape hatch (never exposed over MCP).
 - GUI: click the leftmost view mode toggle button or press **Ctrl+T** to cycle between **Two Rows** (Processes + Tasks), **Processes Only**, and **Tasks Only**. In Two Rows mode, drag the horizontal splitter bar to adjust relative heights. Running jobs are listed first and highlighted; failed rows are muted red and timed-out rows muted amber (theme-based, low saturation).
 - See [Task Queue](taskqueue.md) for the data model and examples.
+
+## 9. Audit LLM: Supervisor LLM Monitoring and Closed-Loop Feedback
+- **Supervisor Auditor Role**: An objective third-party engine that audits the Supervisor LLM's orchestration decisions (task decomposition, timing estimates, failure retry strategies).
+- **5 Core Audit Metrics**:
+  1. Execution duration vs pre-run estimate (`estimate_sec`) divergence.
+  2. Unmodified retry detection (preventing repetitive failing loops without code edits).
+  3. Command design and task granularity (ChainGuard compliance and avoiding deadlock risks).
+  4. Token consumption and context hygiene (preventing ingestion of raw verbose logs).
+  5. Resource contention and lock serialization.
+- **Two Feedback Channels**:
+  - **Hint Window (Pop-up Toast)**: Non-intrusive toasts with one-click prompt copy buttons for human guidance.
+  - **MCP Response Injection**: Attaching actionable `"audit"` guidance objects directly into `taskqueue_wait` returns.
+- See [Audit LLM Specification](audit-llm.md) for details.

@@ -22,8 +22,8 @@
 
 ## Express
 
-- [Hancho-v0.9.5-win64-setup.exe](https://github.com/gadget114514/Hancho/releases/download/v0.9.5/Hancho-v0.9.5-win64-setup.exe) をダウンロードしてインストール
-  （ポータブル版: [Hancho-v0.9.5-win64.zip](https://github.com/gadget114514/Hancho/releases/download/v0.9.5/Hancho-v0.9.5-win64.zip)、全バージョン: [Releases](https://github.com/gadget114514/Hancho/releases)）
+- [Hancho-v0.9.6-win64-setup.exe](https://github.com/gadget114514/Hancho/releases/download/v0.9.6/Hancho-v0.9.6-win64-setup.exe) をダウンロードしてインストール
+  （ポータブル版: [Hancho-v0.9.6-win64.zip](https://github.com/gadget114514/Hancho/releases/download/v0.9.6/Hancho-v0.9.6-win64.zip)、全バージョン: [Releases](https://github.com/gadget114514/Hancho/releases)）
 - LLM に「PATH から hancho を探して、help を読んで使い方を把握して」と伝える
 - LLM に「タスクを作成して、hancho 経由で (opencode|claude|agy|codex) に実行させて」と伝える
 - 以上
@@ -140,6 +140,12 @@ Hancho のデータはすべて JSON / JSONL（タスクキュー、ビヘイビ
 （以下の help 本文は英語です）
 
 ## リリースノート
+
+### v0.9.6
+- **Audit LLM / Supervisor フィードバック（プレビュー）**: `estimateSec` を持つジョブは、実実行時間・比率・`accurate` / `diverged_over` / `diverged_under`・具体的な助言を含む `timing_feedback` を返すようになりました。Windows ダッシュボードには見積もり乖離を知らせる Supervisor ガイダンス・ヒントウインドウを追加し、修正用プロンプトのワンクリックコピーと自動消去に対応。詳細は `doc/audit-llm-ja.md`。
+- **WebUI 公開設定**: `<data-dir>/config.json` の `webui` で `enabled`、`scope`（`loopback` / `lan` / `custom`）、`host`、`port`、`allowed_hosts`、`allowed_origins` を設定できます。既定はループバック専用のまま。LAN モードは `0.0.0.0` にバインドし、トークン認証を維持しつつ、IP リテラルと設定したホスト名を許可します。`config_set` で即時反映。設定 → 管理タブから有効/無効、公開範囲、許可ホストを変更できます。
+- **ヘルプとスモークテスト**: `hancho-cli help` に、`start` はプロセスでありタスクではないこと、タスク一覧とモデル別使用量には `taskqueue add` / `run` / `bt start` が必要であることを明記。`fileExists` は末尾要素の glob に対応。v0.9.5 レビューの 5 件（cli_top_smoke 登録、BT IPC のストリーミングとデータディレクトリ分離、headless の待機/エンコーディング、タイムスタンプ競合、イベントスキーマのパス）を修正。
+- **ドキュメント**: Audit LLM 仕様、機能表の更新、アーキテクチャ画像の差し替え。
 
 ### v0.9.5
 - **ブラウザダッシュボード**: `hancho-cli web` で、プロセス / キュー / 監視 / 失敗診断 / メモリの各画面を持つ HTTP + WebSocket ダッシュボード（127.0.0.1:9138、トークン認証）を開けます。`doc/browser-ui-ja.md` を参照。
@@ -308,6 +314,10 @@ WORKING MODEL (LLM orchestration):
     Worker LLM / build command
       -> one job command; writes artifacts and logs
 
+    Audit LLM (監査役 / 品質評価エンジン)
+      -> observes telemetry (timing divergence, thrashing, task hygiene);
+         feeds corrective guidance back to the supervisor via hints & MCP.
+
   Assumed structure:
     1. The supervisor plans and declares jobs. It does not run the work itself,
        does not chain commands, and does not fabricate success.
@@ -331,6 +341,10 @@ WORKING MODEL (LLM orchestration):
        it once with bt_start. Hancho runs it, adding each step as an
        ordinary job, and returns to you only when a decision is needed
        (escalate) or the tree finishes. See BEHAVIOR TREES below.
+    8. The Audit LLM acts as an objective observer of the supervisor's orchestration.
+       It detects execution timing divergences (actual duration vs estimate),
+       prevents unmodified retry loops (thrashing), and closes the feedback loop
+       via popup hints and MCP responses. See doc/audit-llm-ja.md (English: doc/audit-llm.md).
 
 CONSOLE CLIENT / CLI SETUP:
   Use hancho-cli.exe for CLI commands (start, list, logs, send, wait, kill, kill-all, clear).

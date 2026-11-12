@@ -69,6 +69,7 @@ static int ClampRefreshIntervalMs(int ms) {
 }
 constexpr UINT_PTR TIMER_KPI_ANIM_ID  = 2;
 constexpr UINT_PTR TIMER_END_BLINK_ID = 3;     // list rows blinking after a process/task ends
+constexpr UINT_PTR TIMER_HINT_COUNTDOWN_ID = 4; // countdown for supervisor guidance hint popup
 constexpr UINT kEndBlinkTimerMs = 200;         // repaint period while a blink is running
 constexpr ULONGLONG kEndBlinkHalfPeriodMs = 400;  // on/off toggle period of the blink
 constexpr int kDefaultEndBlinkSec = 5;
@@ -769,6 +770,11 @@ enum ControlId {
     IDC_BTN_STREAM_PANE = 1028,
     IDC_BTN_REFRESH = 1029,
     IDC_BT_DEBUG = 1030,  // "BT" toolbar button / Ctrl+Shift+B: behavior tree view
+    IDC_BTN_HINT = 1040,
+    IDC_BTN_SUPERVISOR = 1041,
+    IDC_HINT_COPY = 1042,
+    IDC_HINT_LAUNCH = 1043,
+    IDC_HINT_CLOSE = 1044,
     IDC_SET_LANG_JA = 6001,
     IDC_SET_LANG_EN = 6002,
     IDC_SET_LANG_ES = 6003,
@@ -818,6 +824,9 @@ enum ControlId {
     IDC_SET_TAB = 6053,
     IDC_SET_PROC_FONT = 6054,
     IDC_SET_TASK_FONT = 6055,
+    IDC_SET_SHOW_SUPERVISOR_HINTS = 6056,
+    IDC_SET_HINT_AUTO_DISMISS_SEC = 6057,
+    IDC_SET_SUPERVISOR_COMMAND = 6058,
     IDC_SET_WEBUI_ENABLED = 6059,
     IDC_SET_WEBUI_SCOPE = 6060,
     IDC_SET_WEBUI_ALLOWED_HOSTS = 6061,
@@ -891,6 +900,17 @@ struct DashboardState {
     HWND hwndBtnToggleList = nullptr;
     HWND hwndBtnToggleTerm = nullptr;
     HWND hwndBtnUsage = nullptr;
+    HWND hwndBtnHint = nullptr;
+    HWND hwndBtnSupervisor = nullptr;
+    HWND hwndHintWnd = nullptr;
+    bool showSupervisorHints = true;
+    int hintAutoDismissSec = 6;
+    std::string supervisorCommand = "claude";
+    std::string lastHintSignature;
+    std::wstring currentHintCategory;
+    std::wstring currentHintSummary;
+    std::wstring currentHintPrompt;
+    int hintDismissCountdown = 0;
     HWND hwndUsagePanel = nullptr;
     bool showUsagePanel = true;
     int usagePanelHeight = 110;
@@ -2778,6 +2798,7 @@ static void RefreshDashboardData(DashboardState* st);
 static void SyncStreamPane(DashboardState* st);
 static void EnsureStreamPane(DashboardState* st);
 static void SaveShellConfig(const DashboardState* st);
+static void EvaluateSupervisorHint(DashboardState* st, bool forceShow);
 
 static std::vector<std::string> SplitJsonObjectArray(const std::string& json, const std::string& key) {
     std::vector<std::string> objs;
@@ -5217,6 +5238,9 @@ static void RefreshDashboardData(DashboardState* st) {
         InvalidateRect(st->hwndUsagePanel, nullptr, FALSE);
     }
     SyncStreamPane(st);
+    if (st->showSupervisorHints) {
+        EvaluateSupervisorHint(st, false);
+    }
 }
 
 static void UpdateTaskListColumnWidths(DashboardState* st) {
@@ -5301,6 +5325,8 @@ static void LayoutControls(DashboardState* st, int width, int height) {
         {st->hwndBtnUsage, 28},
         {st->hwndBtnHideTray, 28},
         {st->hwndBtnRefresh, 28},
+        {st->hwndBtnHint, 28},
+        {st->hwndBtnSupervisor, 28},
         {st->hwndClock, 80}
     };
     const int gap = 7;
@@ -8889,6 +8915,9 @@ static void LoadShellConfig(DashboardState* st) {
     st->refreshIntervalMs = ClampRefreshIntervalMs(
         static_cast<int>(JsonGetInt(content, "refresh_interval_ms", kDefaultRefreshIntervalMs)));
     SettingsManager::Instance().SetTabGridRefreshIntervalMs(st->refreshIntervalMs);
+    st->showSupervisorHints = JsonGetBool(content, "show_supervisor_hints", true);
+    st->hintAutoDismissSec = static_cast<int>(JsonGetInt(content, "hint_auto_dismiss_sec", 6));
+    st->supervisorCommand = JsonGetString(content, "supervisor_command", "claude");
     for (int m = 0; m < kListRowModeCount; ++m) {
         for (int k = 0; k < kListRowKeyCount; ++k) {
             COLORREF c = 0;
@@ -8942,6 +8971,9 @@ static void SaveShellConfig(const DashboardState* st) {
         << "  \"memory_max_bytes\": " << st->memoryMaxBytes << ",\n"
         << "  \"process_list_font_px\": " << st->processListFontPx << ",\n"
         << "  \"task_list_font_px\": " << st->taskListFontPx << ",\n"
+        << "  \"show_supervisor_hints\": " << (st->showSupervisorHints ? "true" : "false") << ",\n"
+        << "  \"hint_auto_dismiss_sec\": " << st->hintAutoDismissSec << ",\n"
+        << "  \"supervisor_command\": \"" << JsonEscape(st->supervisorCommand) << "\",\n"
         << listBg.str()
         << "  \"refresh_interval_ms\": " << st->refreshIntervalMs << "\n"
         << "}\n";
@@ -9033,6 +9065,10 @@ static void UpdateToolbarLabels(DashboardState* st) {
         SetWindowTextW(st->hwndBtnToggleTerm, L">_");
     if (st->hwndBtnHideTray)
         SetWindowTextW(st->hwndBtnHideTray, L"⤓");
+    if (st->hwndBtnHint)
+        SetWindowTextW(st->hwndBtnHint, L"💡");
+    if (st->hwndBtnSupervisor)
+        SetWindowTextW(st->hwndBtnSupervisor, L"🤖");
 
     if (st->hwndToolbarTip) {
         if (st->hwndBtnGridView)
@@ -9041,6 +9077,12 @@ static void UpdateToolbarLabels(DashboardState* st) {
         if (st->hwndBtnHideTray)
             UpdateControlTooltip(st->hwndToolbarTip, st->hwndMain, st->hwndBtnHideTray,
                 Tr(L"トレイに格納", L"Tray", L"Bandeja"));
+        if (st->hwndBtnHint)
+            UpdateControlTooltip(st->hwndToolbarTip, st->hwndMain, st->hwndBtnHint,
+                Tr(L"Supervisor ガイダンス・ヒント", L"Supervisor Guidance / Hints", L"Guía de Supervisor"));
+        if (st->hwndBtnSupervisor)
+            UpdateControlTooltip(st->hwndToolbarTip, st->hwndMain, st->hwndBtnSupervisor,
+                Tr(L"Supervisor LLM を起動", L"Launch Supervisor LLM", L"Iniciar Supervisor LLM"));
     }
     UpdatePanelToggleLabels(st);
     if (st->hwndBtnViewTasks) {
@@ -9628,6 +9670,11 @@ struct SettingsDlgState {
       HWND chkEndBlink = nullptr;
       HWND lblEndBlinkSec = nullptr;
       HWND editEndBlinkSec = nullptr;
+      HWND chkSupervisorHints = nullptr;
+      HWND lblHintAutoDismissSec = nullptr;
+      HWND editHintAutoDismissSec = nullptr;
+      HWND lblSupervisorCommand = nullptr;
+      HWND editSupervisorCommand = nullptr;
       HWND lblWebUiTitle = nullptr;
       HWND chkWebUi = nullptr;
       HWND lblWebUiScope = nullptr;
@@ -9715,6 +9762,29 @@ static void CommitEndBlinkSettings(SettingsDlgState* ds) {
     const int applied = ClampEndBlinkSeconds(_wtoi(text));
     ds->dash->endBlinkSeconds = applied;
     SetWindowTextW(ds->editEndBlinkSec, std::to_wstring(applied).c_str());
+    SaveShellConfig(ds->dash);
+}
+
+static void CommitSupervisorSettings(SettingsDlgState* ds) {
+    if (!ds || !ds->dash) return;
+    if (ds->chkSupervisorHints) {
+        ds->dash->showSupervisorHints = (SendMessageW(ds->chkSupervisorHints, BM_GETCHECK, 0, 0) == BST_CHECKED);
+    }
+    if (ds->editHintAutoDismissSec) {
+        wchar_t text[64] = {};
+        GetWindowTextW(ds->editHintAutoDismissSec, text, 64);
+        int val = _wtoi(text);
+        if (val < 0) val = 0;
+        if (val > 60) val = 60;
+        ds->dash->hintAutoDismissSec = val;
+        SetWindowTextW(ds->editHintAutoDismissSec, std::to_wstring(val).c_str());
+    }
+    if (ds->editSupervisorCommand) {
+        wchar_t text[512] = {};
+        GetWindowTextW(ds->editSupervisorCommand, text, 512);
+        std::string cmd = WideToUtf8(text);
+        if (!cmd.empty()) ds->dash->supervisorCommand = cmd;
+    }
     SaveShellConfig(ds->dash);
 }
 
@@ -9871,6 +9941,24 @@ static void UpdateSettingsDialogTexts(HWND hwnd) {
     }
     SetWindowTextW(ds->chkEndBlink, Tr(L"プロセス・タスク終了時に一覧の行を点滅させる", L"Blink list rows when a process or task ends", L"Hacer parpadear las filas al terminar un proceso o tarea"));
     SetWindowTextW(ds->lblEndBlinkSec, Tr(L"点滅秒数 (1〜60, 既定 5):", L"Blink duration (seconds, 1-60, default 5):", L"Duración del parpadeo (segundos, 1-60, predeterminado 5):"));
+    if (ds->chkSupervisorHints) {
+        SetWindowTextW(ds->chkSupervisorHints, Tr(
+            L"Supervisor LLM ガイダンス・ヒントを表示 (状態に応じたアドバイス・見積もり乖離検知)",
+            L"Show Supervisor LLM guidance hints (state-dependent tips & timing divergence alerts)",
+            L"Mostrar consejos del Supervisor LLM (avisos de estado y desviación de tiempo)"));
+    }
+    if (ds->lblHintAutoDismissSec) {
+        SetWindowTextW(ds->lblHintAutoDismissSec, Tr(
+            L"ヒント自動消去秒数 (0〜60, 既定 6, 0 = 手動消去のみ):",
+            L"Hint auto-dismiss seconds (0-60, default 6, 0 = manual close only):",
+            L"Segundos para auto-ocultar consejos (0-60, predeterminado 6, 0 = solo manual):"));
+    }
+    if (ds->lblSupervisorCommand) {
+        SetWindowTextW(ds->lblSupervisorCommand, Tr(
+            L"Supervisor 起動コマンド (既定 claude):",
+            L"Supervisor launch command (default claude):",
+            L"Comando de lanzamiento de Supervisor (predeterminado claude):"));
+    }
     if (ds->lblWebUiTitle) {
         SetWindowTextW(ds->lblWebUiTitle, Tr(L"ブラウザ UI (WebUI)", L"Browser UI (WebUI)", L"Interfaz web (WebUI)"));
     }
@@ -10135,6 +10223,7 @@ static LRESULT CALLBACK SettingsWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPAR
             ds->lblListBg = CreateWindowExW(0, L"STATIC", L"", WS_CHILD,
                 18, 48, 640, 20, hwnd, nullptr, hInst, nullptr);
             SendMessageW(ds->lblListBg, WM_SETFONT, (WPARAM)ds->dash->hFontUiBold, TRUE);
+            SendMessageW(ds->lblWebUiTitle, WM_SETFONT, (WPARAM)ds->dash->hFontUiBold, TRUE);
             for (int k = 0; k < kListRowKeyCount; ++k) {
                 ds->btnListBg[k] = CreateWindowExW(0, L"BUTTON", L"", WS_CHILD | WS_VISIBLE | BS_OWNERDRAW,
                     18 + k * 126, 72, 120, 30, hwnd,
@@ -10153,6 +10242,23 @@ static LRESULT CALLBACK SettingsWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPAR
                 WS_CHILD | WS_VISIBLE | WS_TABSTOP | ES_AUTOHSCROLL | ES_NUMBER,
                 560, 399, 110, 24, hwnd, (HMENU)IDC_SET_END_BLINK_SECONDS, hInst, nullptr);
             SetWindowTextW(ds->editEndBlinkSec, std::to_wstring(ds->dash->endBlinkSeconds).c_str());
+
+            ds->chkSupervisorHints = CreateWindowExW(0, L"BUTTON", L"", WS_CHILD | WS_VISIBLE | WS_TABSTOP | BS_AUTOCHECKBOX,
+                18, 436, 640, 24, hwnd, (HMENU)IDC_SET_SHOW_SUPERVISOR_HINTS, hInst, nullptr);
+            SendMessageW(ds->chkSupervisorHints, BM_SETCHECK,
+                ds->dash->showSupervisorHints ? BST_CHECKED : BST_UNCHECKED, 0);
+            ds->lblHintAutoDismissSec = CreateWindowExW(0, L"STATIC", L"", WS_CHILD | WS_VISIBLE,
+                18, 468, 530, 20, hwnd, nullptr, hInst, nullptr);
+            ds->editHintAutoDismissSec = CreateWindowExW(WS_EX_CLIENTEDGE, L"EDIT", L"",
+                WS_CHILD | WS_VISIBLE | WS_TABSTOP | ES_AUTOHSCROLL | ES_NUMBER,
+                560, 465, 110, 24, hwnd, (HMENU)IDC_SET_HINT_AUTO_DISMISS_SEC, hInst, nullptr);
+            SetWindowTextW(ds->editHintAutoDismissSec, std::to_wstring(ds->dash->hintAutoDismissSec).c_str());
+            ds->lblSupervisorCommand = CreateWindowExW(0, L"STATIC", L"", WS_CHILD | WS_VISIBLE,
+                18, 502, 330, 20, hwnd, nullptr, hInst, nullptr);
+            ds->editSupervisorCommand = CreateWindowExW(WS_EX_CLIENTEDGE, L"EDIT", L"",
+                WS_CHILD | WS_VISIBLE | WS_TABSTOP | ES_AUTOHSCROLL,
+                360, 499, 310, 24, hwnd, (HMENU)IDC_SET_SUPERVISOR_COMMAND, hInst, nullptr);
+            SetWindowTextW(ds->editSupervisorCommand, Utf8ToWide(ds->dash->supervisorCommand).c_str());
 
             ds->lblWebUiTitle = CreateWindowExW(0, L"STATIC", L"", WS_CHILD | WS_VISIBLE,
                 18, 100, 640, 20, hwnd, nullptr, hInst, nullptr);
@@ -10204,13 +10310,14 @@ static LRESULT CALLBACK SettingsWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPAR
                              ds->chkResourceLocks, ds->chkActivityStyle, ds->lblEventRetention, ds->editEventRetention,
                              ds->lblRefreshInterval, ds->editRefreshInterval, ds->btnListBgReset,
                              ds->chkEndBlink, ds->lblEndBlinkSec, ds->editEndBlinkSec,
+                             ds->chkSupervisorHints, ds->lblHintAutoDismissSec, ds->editHintAutoDismissSec,
+                             ds->lblSupervisorCommand, ds->editSupervisorCommand,
                              ds->lblWebUiTitle, ds->chkWebUi, ds->lblWebUiScope, ds->cmbWebUiScope,
                              ds->lblWebUiAllowedHosts, ds->editWebUiAllowedHosts,
                              ds->lblProcFont, ds->cmbProcFont, ds->lblTaskFont, ds->cmbTaskFont };
             for (HWND h : ctrls) SendMessageW(h, WM_SETFONT, (WPARAM)ds->dash->hFontUi, TRUE);
             for (HWND h : ds->btnListBg) SendMessageW(h, WM_SETFONT, (WPARAM)ds->dash->hFontUi, TRUE);
             SendMessageW(ds->lblListBg, WM_SETFONT, (WPARAM)ds->dash->hFontUiBold, TRUE);
-            SendMessageW(ds->lblWebUiTitle, WM_SETFONT, (WPARAM)ds->dash->hFontUiBold, TRUE);
             SendMessageW(ds->hwndAboutTitle, WM_SETFONT, (WPARAM)ds->dash->hFontUiBold, TRUE);
             SendMessageW(ds->hwndAboutVersion, WM_SETFONT, (WPARAM)ds->dash->hFontUi, TRUE);
             SendMessageW(ds->hwndAboutDesc, WM_SETFONT, (WPARAM)ds->dash->hFontUi, TRUE);
@@ -10237,7 +10344,9 @@ static LRESULT CALLBACK SettingsWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPAR
                     ds->chkResourceLocks, ds->chkActivityStyle,
                     ds->lblEventRetention, ds->editEventRetention,
                     ds->lblRefreshInterval, ds->editRefreshInterval,
-                    ds->chkEndBlink, ds->lblEndBlinkSec, ds->editEndBlinkSec });
+                    ds->chkEndBlink, ds->lblEndBlinkSec, ds->editEndBlinkSec,
+                    ds->chkSupervisorHints, ds->lblHintAutoDismissSec, ds->editHintAutoDismissSec,
+                    ds->lblSupervisorCommand, ds->editSupervisorCommand });
                 maintenance.insert(maintenance.end(), { ds->btnShell, ds->btnReset, ds->btnClear });
                 maintenance.insert(maintenance.end(), {
                     ds->lblWebUiTitle, ds->chkWebUi, ds->lblWebUiScope, ds->cmbWebUiScope,
@@ -10269,10 +10378,19 @@ static LRESULT CALLBACK SettingsWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPAR
                 if (ds) CommitEventRetention(ds);
                 if (ds) CommitRefreshInterval(ds);
                 if (ds) CommitEndBlinkSettings(ds);
+                if (ds) CommitSupervisorSettings(ds);
                 DestroyWindow(hwnd);
                 return 0;
             }
             if (!ds) return 0;
+            if (id == IDC_SET_SHOW_SUPERVISOR_HINTS) {
+                CommitSupervisorSettings(ds);
+                return 0;
+            }
+            if (id == IDC_SET_HINT_AUTO_DISMISS_SEC || id == IDC_SET_SUPERVISOR_COMMAND) {
+                if (HIWORD(wParam) == EN_KILLFOCUS) CommitSupervisorSettings(ds);
+                return 0;
+            }
             if (id == IDC_SET_END_BLINK_ENABLED) {
                 CommitEndBlinkSettings(ds);
                 return 0;
@@ -11365,6 +11483,484 @@ static LRESULT CALLBACK UsagePanelWndProc(HWND hwnd, UINT msg, WPARAM wParam, LP
     return DefWindowProcW(hwnd, msg, wParam, lParam);
 }
 
+// ---------------------------------------------------------------------------
+// Supervisor Guidance & Audit Hint Window (Card 070)
+// ---------------------------------------------------------------------------
+
+static void LaunchSupervisorTerminal(DashboardState* st) {
+    if (!st) return;
+    std::string cmd = st->supervisorCommand;
+    if (cmd.empty()) cmd = "claude";
+    StartProcessRequest req;
+    req.mode = ExecMode::ConPTY;
+    req.name = "supervisor";
+    req.commandLine = cmd;
+
+    std::string err;
+    int id = -1;
+    if (st->pm) {
+        id = st->pm->StartProcess(req, err);
+    } else {
+        nlohmann::json startReq = {
+            {"action", "start"},
+            {"cmd", req.commandLine},
+            {"name", req.name},
+            {"mode", ExecModeToString(req.mode)},
+            {"wait", false}
+        };
+        nlohmann::json startResp;
+        if (GuiIpcCall(st, startReq, startResp, &err) && startResp.value("ok", false)) {
+            id = startResp.value("id", -1);
+        }
+    }
+    if (id < 0) {
+        std::wstring werr = Utf8ToWide(err);
+        gui_platform::GetGuiPlatform()->ShowMessageBox(st->hwndMain, L"Failed to Launch Supervisor", werr, gui_platform::MessageBoxType::Error);
+    } else {
+        st->selectedProcId = id;
+        RefreshDashboardData(st);
+        TerminalView* tv = st->pm ? st->pm->GetTerminalView(id) : nullptr;
+        if (tv && tv->Hwnd()) {
+            SetFocus(tv->Hwnd());
+        }
+    }
+}
+
+static void RepositionHintWindow(DashboardState* st) {
+    if (!st || !st->hwndHintWnd || !IsWindow(st->hwndHintWnd)) return;
+    RECT rcMain = {};
+    GetWindowRect(st->hwndMain, &rcMain);
+    int hintW = 460;
+    int hintH = 210;
+    int x = rcMain.right - hintW - 20;
+    int y = rcMain.bottom - hintH - 45;
+    if (x < rcMain.left + 10) x = rcMain.left + 10;
+    if (y < rcMain.top + 10) y = rcMain.top + 10;
+    SetWindowPos(st->hwndHintWnd, HWND_TOP, x, y, hintW, hintH, SWP_NOACTIVATE);
+}
+
+struct SupervisorHintInfo {
+    std::string signature;
+    std::wstring category;
+    std::wstring summary;
+    std::wstring prompt;
+};
+
+static SupervisorHintInfo AnalyzeStateForHint(DashboardState* st) {
+    SupervisorHintInfo info;
+    if (!st) return info;
+
+    auto makePrompt = [](const std::wstring& ja, const std::wstring& en, const std::wstring& es) -> std::wstring {
+        if (g_uiLanguage == UiLanguage::Japanese) return ja;
+        if (g_uiLanguage == UiLanguage::Spanish) return es;
+        return en;
+    };
+
+    // 1. Check for Timing Divergence in lastTaskListJson
+    if (!st->lastTaskListJson.empty()) {
+        auto jobs = SplitJsonObjectArray(st->lastTaskListJson, "jobs");
+        for (const auto& j : jobs) {
+            std::string tfKey = "\"timing_feedback\"";
+            size_t tfPos = j.find(tfKey);
+            if (tfPos != std::string::npos) {
+                std::string acc = JsonGetString(j, "accuracy", "");
+                if (acc == "diverged_over" || acc == "diverged_under") {
+                    std::string jid = JsonGetString(j, "id", "");
+                    std::string jname = JsonGetString(j, "name", jid);
+                    int64_t dur = JsonGetInt(j, "duration_sec", 0);
+                    int64_t est = JsonGetInt(j, "estimate_sec", 0);
+                    std::string advice = JsonGetString(j, "advice", "");
+
+                    info.signature = "timing:" + jid + ":" + acc;
+                    info.category = Tr(L"⏱ 見積もり乖離検知 (Audit LLM)",
+                                       L"⏱ Timing Divergence (Audit LLM)",
+                                       L"⏱ Desviación de estimación (Audit LLM)");
+                    if (!advice.empty()) {
+                        info.summary = Utf8ToWide(advice);
+                    } else if (dur > est) {
+                        info.summary = Tr(L"ジョブ '", L"Job '", L"Trabajo '") + Utf8ToWide(jname) +
+                                       Tr(L"' の実所要時間が事前見積もりを大幅に超過しました。",
+                                          L"' actual duration greatly exceeded estimate.",
+                                          L"' la duración real superó ampliamente la estimación.");
+                    } else {
+                        info.summary = Tr(L"ジョブ '", L"Job '", L"Trabajo '") + Utf8ToWide(jname) +
+                                       Tr(L"' の実所要時間は事前見積もりより大幅に短時間でした。",
+                                          L"' actual duration was far below estimate.",
+                                          L"' la duración real fue muy inferior a la estimación.");
+                    }
+                    std::wstring jidW = Utf8ToWide(jid);
+                    info.prompt = makePrompt(
+                        L"hancho-cli taskqueue list を確認してください。ジョブ '" + jidW +
+                        L"' の実所要時間 (" + std::to_wstring(dur) + L"s / 見積もり " + std::to_wstring(est) +
+                        L"s) に基づき、後続ジョブの estimate_sec を再調整し、必要に応じてタスクを分割してください。",
+                        L"Check hancho-cli taskqueue list. Based on job '" + jidW +
+                        L"' actual duration (" + std::to_wstring(dur) + L"s vs estimate " + std::to_wstring(est) +
+                        L"s), recalibrate subsequent estimate_sec and consider task partitioning.",
+                        L"Revise hancho-cli taskqueue list. Según la duración de '" + jidW +
+                        L"' (" + std::to_wstring(dur) + L"s vs " + std::to_wstring(est) +
+                        L"s), recalibre estimate_sec para tareas posteriores.");
+                    return info;
+                }
+            }
+        }
+    }
+
+    // 2. Check for Behavior Tree Escalation (waiting_for_llm)
+    try {
+        std::vector<std::string> btErrors;
+        std::vector<BtDebugNode> trees = LoadBtDebugTrees(GetBehaviorTreesDirWide(), btErrors);
+        std::function<const BtDebugNode*(const BtDebugNode&)> findWaiting = [&](const BtDebugNode& n) -> const BtDebugNode* {
+            if (n.state == "waiting_for_llm" || n.state == "waiting_for_decision" || n.state == "escalated") {
+                return &n;
+            }
+            for (const auto& ch : n.children) {
+                const BtDebugNode* f = findWaiting(ch);
+                if (f) return f;
+            }
+            return nullptr;
+        };
+        for (const auto& root : trees) {
+            const BtDebugNode* waiting = findWaiting(root);
+            if (waiting) {
+                info.signature = "bt:" + waiting->btId + ":" + waiting->nodeId;
+                info.category = Tr(L"🧠 LLM判断要請 (BT Escalation)",
+                                   L"🧠 LLM Decision Required (BT)",
+                                   L"🧠 Decisión LLM Requerida (BT)");
+                std::wstring nodeName = waiting->label.empty() ? Utf8ToWide(waiting->nodeId) : Utf8ToWide(waiting->label);
+                info.summary = Tr(L"ビヘイビアツリー '", L"Behavior tree '", L"Árbol '") +
+                               Utf8ToWide(waiting->btId) + Tr(L"' のノード '", L"' node '", L"' nodo '") +
+                               nodeName +
+                               Tr(L"' が Supervisor LLM の判断を求めて待機しています。",
+                                  L"' is waiting for Supervisor LLM decision.",
+                                  L"' espera decisión del Supervisor LLM.");
+                std::wstring btIdW = Utf8ToWide(waiting->btId);
+                std::wstring nodeW = Utf8ToWide(waiting->nodeId);
+                info.prompt = makePrompt(
+                    L"hancho-cli bt get " + btIdW +
+                    L" でエスカレーションパケットを確認し、結果を hancho-cli bt answer " + btIdW +
+                    L" --node " + nodeW + L" --result <success/failure> で応答してください。",
+                    L"Check escalation details with hancho-cli bt get " + btIdW +
+                    L" and answer with hancho-cli bt answer " + btIdW +
+                    L" --node " + nodeW + L" --result <success/failure>",
+                    L"Revise la escalación con hancho-cli bt get " + btIdW +
+                    L" y responda con hancho-cli bt answer " + btIdW +
+                    L" --node " + nodeW + L" --result <success/failure>");
+                return info;
+            }
+        }
+    } catch (...) {}
+
+    // 3. Check for Failed jobs
+    if (!st->lastTaskListJson.empty()) {
+        auto jobs = SplitJsonObjectArray(st->lastTaskListJson, "jobs");
+        for (const auto& j : jobs) {
+            std::string state = JsonGetString(j, "state", "");
+            if (state == "failed") {
+                std::string jid = JsonGetString(j, "id", "");
+                std::string jname = JsonGetString(j, "name", jid);
+                info.signature = "failed:" + jid;
+                info.category = Tr(L"⚠️ ジョブ失敗検知", L"⚠️ Job Failure Detected", L"⚠️ Fallo de trabajo detectado");
+                info.summary = Tr(L"ジョブ '", L"Job '", L"Trabajo '") + Utf8ToWide(jname) +
+                               Tr(L"' が失敗状態で停止しています。", L"' is in failed state.", L"' está en estado fallido.");
+                std::wstring jidW = Utf8ToWide(jid);
+                info.prompt = makePrompt(
+                    L"hancho-cli taskqueue inspect " + jidW +
+                    L" で失敗診断ログを確認し、修復後に hancho-cli taskqueue requeue " + jidW +
+                    L" を実行してください。",
+                    L"Inspect failure diagnostics via hancho-cli taskqueue inspect " + jidW +
+                    L", resolve the issue, and rerun via hancho-cli taskqueue requeue " + jidW,
+                    L"Inspeccione el fallo con hancho-cli taskqueue inspect " + jidW +
+                    L", solucione el problema y reintente con hancho-cli taskqueue requeue " + jidW);
+                return info;
+            }
+        }
+    }
+
+    // 4. Check for Resource Contention
+    if (!st->lastTaskListJson.empty()) {
+        auto jobs = SplitJsonObjectArray(st->lastTaskListJson, "jobs");
+        for (const auto& j : jobs) {
+            std::string resWait = JsonGetString(j, "resource_wait", "");
+            if (!resWait.empty() && resWait != "null") {
+                std::string jid = JsonGetString(j, "id", "");
+                info.signature = "res:" + resWait + ":" + jid;
+                info.category = Tr(L"🔒 リソース排他待機", L"🔒 Resource Contention", L"🔒 Conflicto de recursos");
+                info.summary = Tr(L"ジョブ '", L"Job '", L"Trabajo '") + Utf8ToWide(jid) +
+                               Tr(L"' がリソース '", L"' is waiting for resource '", L"' espera el recurso '") +
+                               Utf8ToWide(resWait) + Tr(L"' のロック解放を待機しています。", L"'.", L"'.");
+                std::wstring resW = Utf8ToWide(resWait);
+                info.prompt = makePrompt(
+                    L"リソース '" + resW +
+                    L"' の排他競合が発生しています。タスクキュー定義のロック種別 (read/write) または依存順序を見直してください。",
+                    L"Resource lock contention on '" + resW +
+                    L"'. Review lock mode (read/write) or job dependencies in taskqueue definitions.",
+                    L"Conflicto de bloqueo en '" + resW +
+                    L"'. Revise modo de bloqueo (read/write) o dependencias.");
+                return info;
+            }
+        }
+    }
+
+    // 5. Check if all tasks succeeded
+    if (!st->lastTaskListJson.empty()) {
+        auto jobs = SplitJsonObjectArray(st->lastTaskListJson, "jobs");
+        if (!jobs.empty()) {
+            bool allSucceeded = true;
+            for (const auto& j : jobs) {
+                std::string s = JsonGetString(j, "state", "");
+                if (s != "succeeded") { allSucceeded = false; break; }
+            }
+            if (allSucceeded) {
+                info.signature = "all_succeeded:" + std::to_string(jobs.size());
+                info.category = Tr(L"✅ 全タスク完了", L"✅ All Tasks Completed", L"✅ Tareas completadas");
+                info.summary = makePrompt(L"タスクキュー内のすべてのジョブ (" + std::to_wstring(jobs.size()) + L"件) が正常完了しました。",
+                                          L"All " + std::to_wstring(jobs.size()) + L" jobs in task queue succeeded.",
+                                          L"Todos los " + std::to_wstring(jobs.size()) + L" trabajos se completaron con éxito.");
+                info.prompt = makePrompt(
+                    L"全タスクが完了しました。git diff やテスト結果を検証し、コミットまたは次のフェーズ指示を投入してください。",
+                    L"All tasks completed. Verify git diff and test results, then commit or proceed to next phase instructions.",
+                    L"Tareas completadas. Verifique git diff y pruebas, luego confirme o proceda a la siguiente fase.");
+                return info;
+            }
+        }
+    }
+
+    // 6. Idle
+    info.signature = "idle";
+    info.category = Tr(L"💡 Supervisor ガイダンス", L"💡 Supervisor Guidance", L"💡 Guía de Supervisor");
+    info.summary = Tr(L"Hancho は待機状態です。新しい自律タスクまたはコマンドを投入できます。",
+                      L"Hancho is idle. Ready for new autonomous tasks or commands.",
+                      L"Hancho está inactivo. Listo para nuevas tareas o comandos autónomos.");
+    info.prompt = makePrompt(
+        L"hancho-cli taskqueue add または hancho-cli bt run を実行して、自律実行フローを開始してください。",
+        L"Run hancho-cli taskqueue add or hancho-cli bt run to initiate autonomous execution flow.",
+        L"Ejecute hancho-cli taskqueue add o hancho-cli bt run para iniciar el flujo de ejecución.");
+    return info;
+}
+
+struct HintWndState {
+    DashboardState* dash = nullptr;
+    HWND hwndCategory = nullptr;
+    HWND hwndCountdown = nullptr;
+    HWND hwndSummary = nullptr;
+    HWND hwndPromptEdit = nullptr;
+    HWND btnCopyPrompt = nullptr;
+    HWND btnLaunchSupervisor = nullptr;
+    HWND btnClose = nullptr;
+    int copySuccessTicks = 0;
+};
+
+static LRESULT CALLBACK HintWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
+    auto* hs = reinterpret_cast<HintWndState*>(GetWindowLongPtrW(hwnd, GWLP_USERDATA));
+    switch (msg) {
+        case WM_CREATE: {
+            auto* cs = reinterpret_cast<CREATESTRUCTW*>(lParam);
+            hs = reinterpret_cast<HintWndState*>(cs->lpCreateParams);
+            SetWindowLongPtrW(hwnd, GWLP_USERDATA, reinterpret_cast<LONG_PTR>(hs));
+            HINSTANCE hInst = cs->hInstance;
+
+            hs->hwndCategory = CreateWindowExW(0, L"STATIC", L"", WS_CHILD | WS_VISIBLE | SS_LEFT,
+                12, 10, 300, 20, hwnd, nullptr, hInst, nullptr);
+            hs->hwndCountdown = CreateWindowExW(0, L"STATIC", L"", WS_CHILD | WS_VISIBLE | SS_RIGHT,
+                315, 10, 130, 20, hwnd, nullptr, hInst, nullptr);
+            hs->hwndSummary = CreateWindowExW(0, L"STATIC", L"", WS_CHILD | WS_VISIBLE | SS_LEFT,
+                12, 34, 434, 36, hwnd, nullptr, hInst, nullptr);
+            hs->hwndPromptEdit = CreateWindowExW(WS_EX_CLIENTEDGE, L"EDIT", L"",
+                WS_CHILD | WS_VISIBLE | WS_VSCROLL | ES_MULTILINE | ES_READONLY | ES_AUTOVSCROLL,
+                12, 74, 434, 88, hwnd, nullptr, hInst, nullptr);
+
+            hs->btnCopyPrompt = CreateWindowExW(0, L"BUTTON", Tr(L"📋 プロンプトをコピー", L"📋 Copy Prompt", L"📋 Copiar Prompt"),
+                WS_CHILD | WS_VISIBLE | BS_PUSHBUTTON,
+                12, 170, 160, 28, hwnd, (HMENU)IDC_HINT_COPY, hInst, nullptr);
+            hs->btnLaunchSupervisor = CreateWindowExW(0, L"BUTTON", Tr(L"🤖 Supervisor 起動", L"🤖 Launch Supervisor", L"🤖 Iniciar Supervisor"),
+                WS_CHILD | WS_VISIBLE | BS_PUSHBUTTON,
+                180, 170, 190, 28, hwnd, (HMENU)IDC_HINT_LAUNCH, hInst, nullptr);
+            hs->btnClose = CreateWindowExW(0, L"BUTTON", L"✕",
+                WS_CHILD | WS_VISIBLE | BS_PUSHBUTTON,
+                378, 170, 68, 28, hwnd, (HMENU)IDC_HINT_CLOSE, hInst, nullptr);
+
+            if (hs && hs->dash) {
+                SendMessageW(hs->hwndCategory, WM_SETFONT, (WPARAM)hs->dash->hFontUiBold, TRUE);
+                SendMessageW(hs->hwndCountdown, WM_SETFONT, (WPARAM)hs->dash->hFontUi, TRUE);
+                SendMessageW(hs->hwndSummary, WM_SETFONT, (WPARAM)hs->dash->hFontUi, TRUE);
+                SendMessageW(hs->hwndPromptEdit, WM_SETFONT, (WPARAM)hs->dash->hFontUi, TRUE);
+                SendMessageW(hs->btnCopyPrompt, WM_SETFONT, (WPARAM)hs->dash->hFontUi, TRUE);
+                SendMessageW(hs->btnLaunchSupervisor, WM_SETFONT, (WPARAM)hs->dash->hFontUi, TRUE);
+                SendMessageW(hs->btnClose, WM_SETFONT, (WPARAM)hs->dash->hFontUi, TRUE);
+            }
+            ApplyNativeThemeToWindow(hwnd);
+            return 0;
+        }
+        case WM_COMMAND: {
+            int id = LOWORD(wParam);
+            if (id == IDC_HINT_COPY) {
+                if (hs && hs->dash) {
+                    CopyTextToClipboard(hwnd, hs->dash->currentHintPrompt);
+                    SetWindowTextW(hs->btnCopyPrompt, Tr(L"✓ コピー完了!", L"✓ Copied!", L"✓ ¡Copiado!"));
+                    hs->copySuccessTicks = 2;
+                }
+                return 0;
+            }
+            if (id == IDC_HINT_LAUNCH) {
+                if (hs && hs->dash) {
+                    LaunchSupervisorTerminal(hs->dash);
+                }
+                return 0;
+            }
+            if (id == IDC_HINT_CLOSE) {
+                ShowWindow(hwnd, SW_HIDE);
+                KillTimer(hwnd, TIMER_HINT_COUNTDOWN_ID);
+                return 0;
+            }
+            break;
+        }
+        case WM_TIMER: {
+            if (wParam == TIMER_HINT_COUNTDOWN_ID && hs && hs->dash) {
+                if (hs->copySuccessTicks > 0) {
+                    hs->copySuccessTicks--;
+                    if (hs->copySuccessTicks == 0) {
+                        SetWindowTextW(hs->btnCopyPrompt, Tr(L"📋 プロンプトをコピー", L"📋 Copy Prompt", L"📋 Copiar Prompt"));
+                    }
+                }
+                POINT pt = {};
+                GetCursorPos(&pt);
+                RECT rc = {};
+                GetWindowRect(hwnd, &rc);
+                bool hovered = PtInRect(&rc, pt);
+                if (hovered) {
+                    SetWindowTextW(hs->hwndCountdown, Tr(L"(一時停止中)", L"(Paused)", L"(En pausa)"));
+                } else if (hs->dash->hintAutoDismissSec > 0) {
+                    hs->dash->hintDismissCountdown--;
+                    if (hs->dash->hintDismissCountdown <= 0) {
+                        ShowWindow(hwnd, SW_HIDE);
+                        KillTimer(hwnd, TIMER_HINT_COUNTDOWN_ID);
+                    } else {
+                        std::wstring s = Tr(L"自動消去まで ", L"Auto-close in ", L"Cerrar en ") +
+                                         std::to_wstring(hs->dash->hintDismissCountdown) + L"s";
+                        SetWindowTextW(hs->hwndCountdown, s.c_str());
+                    }
+                }
+                return 0;
+            }
+            break;
+        }
+        case WM_ERASEBKGND: {
+            HDC hdc = reinterpret_cast<HDC>(wParam);
+            RECT rc = {};
+            GetClientRect(hwnd, &rc);
+            HBRUSH bgBrush = CreateSolidBrush(g_theme.panel);
+            FillRect(hdc, &rc, bgBrush);
+            DeleteObject(bgBrush);
+            HBRUSH borderBrush = CreateSolidBrush(g_theme.accent ? g_theme.accent : g_theme.border);
+            FrameRect(hdc, &rc, borderBrush);
+            DeleteObject(borderBrush);
+            return 1;
+        }
+        case WM_CTLCOLORSTATIC: {
+            HDC hdc = reinterpret_cast<HDC>(wParam);
+            SetBkMode(hdc, TRANSPARENT);
+            SetTextColor(hdc, g_theme.text);
+            return reinterpret_cast<INT_PTR>(g_dialogBgBrush);
+        }
+        case WM_CTLCOLOREDIT: {
+            HDC hdc = reinterpret_cast<HDC>(wParam);
+            SetBkColor(hdc, g_theme.windowBg);
+            SetTextColor(hdc, g_theme.text);
+            static HBRUSH hEditBg = nullptr;
+            if (hEditBg) DeleteObject(hEditBg);
+            hEditBg = CreateSolidBrush(g_theme.windowBg);
+            return reinterpret_cast<INT_PTR>(hEditBg);
+        }
+        case WM_NCDESTROY: {
+            KillTimer(hwnd, TIMER_HINT_COUNTDOWN_ID);
+            delete hs;
+            SetWindowLongPtrW(hwnd, GWLP_USERDATA, 0);
+            return 0;
+        }
+    }
+    return DefWindowProcW(hwnd, msg, wParam, lParam);
+}
+
+static void EnsureHintWindow(DashboardState* st) {
+    if (!st || !st->hwndMain) return;
+    if (st->hwndHintWnd && IsWindow(st->hwndHintWnd)) return;
+
+    static bool regDone = false;
+    HINSTANCE hInst = GetModuleHandleW(nullptr);
+    if (!regDone) {
+        WNDCLASSEXW wc = {};
+        wc.cbSize = sizeof(wc);
+        wc.style = CS_HREDRAW | CS_VREDRAW;
+        wc.lpfnWndProc = HintWndProc;
+        wc.hInstance = hInst;
+        wc.hCursor = LoadCursorW(nullptr, IDC_ARROW);
+        wc.hbrBackground = g_dialogBgBrush;
+        wc.lpszClassName = L"HanchoHintWnd";
+        RegisterClassExW(&wc);
+        regDone = true;
+    }
+
+    auto* hs = new HintWndState();
+    hs->dash = st;
+
+    RECT rcMain = {};
+    GetWindowRect(st->hwndMain, &rcMain);
+    int hintW = 460;
+    int hintH = 210;
+    int x = rcMain.right - hintW - 20;
+    int y = rcMain.bottom - hintH - 45;
+
+    st->hwndHintWnd = CreateWindowExW(
+        WS_EX_TOPMOST | WS_EX_TOOLWINDOW,
+        L"HanchoHintWnd",
+        L"Hancho Supervisor Hint",
+        WS_POPUP | WS_CLIPCHILDREN | WS_BORDER,
+        x, y, hintW, hintH,
+        st->hwndMain,
+        nullptr,
+        hInst,
+        hs
+    );
+}
+
+static void EvaluateSupervisorHint(DashboardState* st, bool forceShow = false) {
+    if (!st || !st->hwndMain) return;
+    if (!forceShow && !st->showSupervisorHints) return;
+
+    SupervisorHintInfo info = AnalyzeStateForHint(st);
+    if (!forceShow) {
+        if (info.signature == st->lastHintSignature) return;
+        if (info.signature == "idle") return; // Don't pop up spontaneously when idle
+    }
+    st->lastHintSignature = info.signature;
+    st->currentHintCategory = info.category;
+    st->currentHintSummary = info.summary;
+    st->currentHintPrompt = info.prompt;
+
+    EnsureHintWindow(st);
+    RepositionHintWindow(st);
+
+    auto* hs = reinterpret_cast<HintWndState*>(GetWindowLongPtrW(st->hwndHintWnd, GWLP_USERDATA));
+    if (hs) {
+        SetWindowTextW(hs->hwndCategory, info.category.c_str());
+        SetWindowTextW(hs->hwndSummary, info.summary.c_str());
+        SetWindowTextW(hs->hwndPromptEdit, info.prompt.c_str());
+        if (st->hintAutoDismissSec > 0) {
+            st->hintDismissCountdown = st->hintAutoDismissSec;
+            std::wstring cdStr = Tr(L"自動消去まで ", L"Auto-close in ", L"Cerrar en ") +
+                                 std::to_wstring(st->hintDismissCountdown) + L"s";
+            SetWindowTextW(hs->hwndCountdown, cdStr.c_str());
+            SetTimer(st->hwndHintWnd, TIMER_HINT_COUNTDOWN_ID, 1000, nullptr);
+        } else {
+            SetWindowTextW(hs->hwndCountdown, L"");
+            KillTimer(st->hwndHintWnd, TIMER_HINT_COUNTDOWN_ID);
+        }
+    }
+
+    ShowWindow(st->hwndHintWnd, SW_SHOWNOACTIVATE);
+    InvalidateRect(st->hwndHintWnd, nullptr, TRUE);
+}
+
 static LRESULT CALLBACK DashboardWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
     DashboardState* st = GetState(hwnd);
 
@@ -11436,6 +12032,10 @@ static LRESULT CALLBACK DashboardWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPA
                 WS_CHILD | WS_VISIBLE | BS_OWNERDRAW, 0, 0, 150, 24, hwnd, (HMENU)IDC_BTN_VIEW_TASKS, nullptr, nullptr);
             st->hwndBtnRefresh = CreateWindowExW(0, L"BUTTON", L"↻",
                 WS_CHILD | WS_VISIBLE | BS_OWNERDRAW, 0, 0, 28, 24, hwnd, (HMENU)IDC_BTN_REFRESH, nullptr, nullptr);
+            st->hwndBtnHint = CreateWindowExW(0, L"BUTTON", L"💡",
+                WS_CHILD | WS_VISIBLE | BS_OWNERDRAW, 0, 0, 28, 24, hwnd, (HMENU)IDC_BTN_HINT, nullptr, nullptr);
+            st->hwndBtnSupervisor = CreateWindowExW(0, L"BUTTON", L"🤖",
+                WS_CHILD | WS_VISIBLE | BS_OWNERDRAW, 0, 0, 28, 24, hwnd, (HMENU)IDC_BTN_SUPERVISOR, nullptr, nullptr);
             st->hwndClock = CreateWindowExW(0, L"BUTTON", L"",
                 WS_CHILD | WS_VISIBLE | BS_OWNERDRAW, 0, 0, 80, 24, hwnd, (HMENU)IDC_CLOCK, nullptr, nullptr);
             st->hwndBtnUsage = CreateWindowExW(0, L"BUTTON", L"📊",
@@ -11485,6 +12085,8 @@ static LRESULT CALLBACK DashboardWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPA
                 addTool(st->hwndBtnBtView);
                 addTool(st->hwndBtnHideTray);
                 addTool(st->hwndBtnRefresh);
+                addTool(st->hwndBtnHint);
+                addTool(st->hwndBtnSupervisor);
             }
 
             LoadShellConfig(st);
@@ -11563,7 +12165,8 @@ static LRESULT CALLBACK DashboardWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPA
             HWND uiCtrls[] = {
                 st->hwndBtnStart, st->hwndBtnSettings, st->hwndBtnKillAll,
                 st->hwndBtnGridView,
-                st->hwndBtnToggleList, st->hwndBtnToggleTerm, st->hwndBtnStreamPane, st->hwndBtnBtView, st->hwndBtnHideTray, st->hwndBtnRefresh, st->hwndClock,
+                st->hwndBtnToggleList, st->hwndBtnToggleTerm, st->hwndBtnStreamPane, st->hwndBtnBtView, st->hwndBtnHideTray, st->hwndBtnRefresh,
+                st->hwndBtnHint, st->hwndBtnSupervisor, st->hwndClock,
                 st->hwndBtnViewTasks, st->hwndList, st->hwndTaskList, st->hwndTab
             };
             for (HWND h : uiCtrls) {
@@ -11662,9 +12265,19 @@ static LRESULT CALLBACK DashboardWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPA
             return 0;
         }
 
+        case WM_MOVE: {
+            if (st && st->hwndHintWnd && IsWindowVisible(st->hwndHintWnd)) {
+                RepositionHintWindow(st);
+            }
+            break;
+        }
+
         case WM_SIZE: {
             if (st) {
                 LayoutControls(st, LOWORD(lParam), HIWORD(lParam));
+                if (st->hwndHintWnd && IsWindowVisible(st->hwndHintWnd)) {
+                    RepositionHintWindow(st);
+                }
                 InvalidateRect(hwnd, nullptr, FALSE);
             }
             return 0;
@@ -12059,6 +12672,15 @@ static LRESULT CALLBACK DashboardWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPA
                 InvalidateRect(hwnd, nullptr, FALSE);
             } else if (id == IDC_BTN_HIDE_TRAY) {
                 HideToTray(st);
+            } else if (id == IDC_BTN_HINT) {
+                if (st->hwndHintWnd && IsWindowVisible(st->hwndHintWnd)) {
+                    ShowWindow(st->hwndHintWnd, SW_HIDE);
+                    KillTimer(st->hwndHintWnd, TIMER_HINT_COUNTDOWN_ID);
+                } else {
+                    EvaluateSupervisorHint(st, true);
+                }
+            } else if (id == IDC_BTN_SUPERVISOR) {
+                LaunchSupervisorTerminal(st);
             }
             return 0;
         }
@@ -12374,6 +12996,10 @@ static LRESULT CALLBACK DashboardWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPA
             KillTimer(hwnd, TIMER_REFRESH_ID);
             KillTimer(hwnd, TIMER_KPI_ANIM_ID);
             if (st) {
+                if (st->hwndHintWnd) {
+                    DestroyWindow(st->hwndHintWnd);
+                    st->hwndHintWnd = nullptr;
+                }
                 RemoveTrayIcon(st);
                 st->gridView.reset();
                 if (st->hFontUi) DeleteObject(st->hFontUi);

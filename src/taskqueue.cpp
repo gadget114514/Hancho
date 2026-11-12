@@ -19,6 +19,7 @@
 #include <mutex>
 #include <unordered_map>
 #include <stdexcept>
+#include <iomanip>
 
 namespace pc {
 
@@ -2270,6 +2271,51 @@ void TaskQueueManager::SaveQueue(const TaskQueue& tq) {
     WriteFileAtomicWide(GetTaskQueueFileWide(tq.name), oss.str());
 }
 
+static std::string TimingFeedbackToJson(const TaskQueueJob& job) {
+    if (job.estimateSec <= 0 || job.attempts.empty()) return "";
+    const TaskQueueAttempt* finished = nullptr;
+    for (auto it = job.attempts.rbegin(); it != job.attempts.rend(); ++it) {
+        if (!it->start.empty() && !it->end.empty()) {
+            finished = &(*it);
+            break;
+        }
+    }
+    if (!finished) return "";
+
+    int64_t startSec = ParseTimestampStrToEpoch(finished->start);
+    int64_t endSec = ParseTimestampStrToEpoch(finished->end);
+    int64_t durationSec = (endSec >= startSec) ? (endSec - startSec) : 0;
+    double ratio = (job.estimateSec > 0) ? ((double)durationSec / (double)job.estimateSec) : 1.0;
+
+    std::string accuracy = "accurate";
+    std::string advice;
+    if (ratio >= 2.0) {
+        accuracy = "diverged_over";
+        std::ostringstream adv;
+        adv << "Actual duration (" << durationSec << "s) exceeded estimate ("
+            << job.estimateSec << "s) by " << std::fixed << std::setprecision(1) << ratio << "x. "
+            << "Supervisor should calibrate future estimates upward or partition long tasks.";
+        advice = adv.str();
+    } else if (ratio <= 0.35 && durationSec >= 0) {
+        accuracy = "diverged_under";
+        std::ostringstream adv;
+        adv << "Actual duration (" << durationSec << "s) was far below estimate ("
+            << job.estimateSec << "s) (" << std::fixed << std::setprecision(1) << (ratio * 100.0) << "% of estimate). "
+            << "Supervisor should tighten future estimates to optimize queue throughput.";
+        advice = adv.str();
+    } else {
+        advice = "Actual duration matched estimate within normal tolerance (0.35x - 2.0x).";
+    }
+
+    std::ostringstream oss;
+    oss << "{\"duration_sec\":" << durationSec
+        << ",\"estimate_sec\":" << job.estimateSec
+        << ",\"ratio\":" << std::fixed << std::setprecision(2) << ratio
+        << ",\"accuracy\":\"" << accuracy << "\""
+        << ",\"advice\":\"" << JsonEscape(advice) << "\"}";
+    return oss.str();
+}
+
 std::string TaskQueueManager::JobToJson(const TaskQueueJob& job, bool includeInstructions) const {
     std::ostringstream oss;
     oss << "{\"id\":\"" << JsonEscape(job.id) << "\""
@@ -2313,6 +2359,8 @@ std::string TaskQueueManager::JobToJson(const TaskQueueJob& job, bool includeIns
             << "\",\"run\":" << job.bt.run << "}";
     }
     if (!job.origin.empty()) oss << ",\"origin\":" << OriginToJson(job.origin);
+    std::string tf = TimingFeedbackToJson(job);
+    if (!tf.empty()) oss << ",\"timing_feedback\":" << tf;
     oss << "}";
     return oss.str();
 }

@@ -25,8 +25,8 @@ The dashboard has an **execution monitor pane** below the process and task lists
 
 ## Express
 
-- Download and install [Hancho-v0.9.5-win64-setup.exe](https://github.com/gadget114514/Hancho/releases/download/v0.9.5/Hancho-v0.9.5-win64-setup.exe)
-  (portable: [Hancho-v0.9.5-win64.zip](https://github.com/gadget114514/Hancho/releases/download/v0.9.5/Hancho-v0.9.5-win64.zip), all versions: [Releases](https://github.com/gadget114514/Hancho/releases))
+- Download and install [Hancho-v0.9.6-win64-setup.exe](https://github.com/gadget114514/Hancho/releases/download/v0.9.6/Hancho-v0.9.6-win64-setup.exe)
+  (portable: [Hancho-v0.9.6-win64.zip](https://github.com/gadget114514/Hancho/releases/download/v0.9.6/Hancho-v0.9.6-win64.zip), all versions: [Releases](https://github.com/gadget114514/Hancho/releases))
 - In your llm, "find hancho in PATH, then read help to use it" 
 - In your llm, "create task and use (opencode|claude|agy|codex) to execute the task via hancho" 
 - That's all
@@ -136,6 +136,12 @@ All Hancho data is plain JSON / JSONL (task queues, behavior trees, stream event
 ---
 
 ## Release Notes
+
+### v0.9.6
+- **Audit LLM / supervisor feedback (preview)**: every finished job with an `estimateSec` now exposes deterministic `timing_feedback` (actual duration, ratio, `accurate` / `diverged_over` / `diverged_under`, and concrete advice). The Windows dashboard adds a supervisor guidance hint window for timing divergences, with a one-click corrective prompt and configurable auto-dismiss. See `doc/audit-llm.md`.
+- **WebUI exposure settings**: the `<data-dir>/config.json` -> `webui` object controls `enabled`, `scope` (`loopback` / `lan` / `custom`), `host`, `port`, `allowed_hosts` and `allowed_origins`. The default remains loopback-only; LAN mode binds `0.0.0.0`, keeps token authentication, and accepts IP literals plus configured hostnames. Changes apply live through `config_set`. Settings -> Maintenance exposes enable, exposure and allowed hosts.
+- **Help and smoke tests**: `hancho-cli help` states that `start` is a process, not a task, and that task lists / per-model usage require `taskqueue add`, `run` or `bt start`; `fileExists` accepts a final-component glob; fixed the five v0.9.5 review regressions (cli_top_smoke registration, BT IPC streaming and data-dir isolation, headless wait/encoding, timestamp race, event schema path).
+- **Docs**: Audit LLM specification, updated feature tables, and a refreshed architecture image.
 
 ### v0.9.5
 - **Browser dashboard**: `hancho-cli web` opens an embedded HTTP + WebSocket dashboard (127.0.0.1:9138, token auth) with the same process / queue / monitor / why / memory views. See `doc/browser-ui.md`.
@@ -304,6 +310,10 @@ WORKING MODEL (LLM orchestration):
     Worker LLM / build command
       -> one job command; writes artifacts and logs
 
+    Audit LLM (Objective Auditor / Evaluator)
+      -> observes telemetry (timing divergence, thrashing, task hygiene);
+         feeds corrective guidance back to the supervisor via hints & MCP.
+
   Assumed structure:
     1. The supervisor plans and declares jobs. It does not run the work itself,
        does not chain commands, and does not fabricate success.
@@ -327,6 +337,10 @@ WORKING MODEL (LLM orchestration):
        it once with bt_start. Hancho runs it, adding each step as an
        ordinary job, and returns to you only when a decision is needed
        (escalate) or the tree finishes. See BEHAVIOR TREES below.
+    8. The Audit LLM acts as an objective observer of the supervisor's orchestration.
+       It detects execution timing divergences (actual duration vs estimate),
+       prevents unmodified retry loops (thrashing), and closes the feedback loop
+       via popup hints and MCP responses. See doc/audit-llm.md (Japanese: doc/audit-llm-ja.md).
 
 CONSOLE CLIENT / CLI SETUP:
   Use hancho-cli.exe for CLI commands (start, list, logs, send, wait, kill, kill-all, clear).

@@ -840,6 +840,32 @@ int main() {
         std::string resp = tqm.TaskQueueList("estq-" + suffix, "", 0, err);
         Check(resp.find("\"estimate_sec\":300") != std::string::npos,
               "estimate_sec is returned by taskqueue list: " + resp);
+
+        // Verify timing_feedback when an attempt finishes with duration diverging from estimate
+        TaskQueueJob testJob;
+        testJob.id = "TF-1";
+        testJob.estimateSec = 10;
+        TaskQueueAttempt att;
+        att.start = "2026-11-12 10:00:00";
+        att.end = "2026-11-12 10:00:30"; // 30s duration vs 10s estimate -> 3.0x (diverged_over)
+        testJob.attempts.push_back(att);
+        std::string tfJson = tqm.JobToJson(testJob, false);
+        Check(tfJson.find("\"timing_feedback\"") != std::string::npos, "timing_feedback present in JobToJson");
+        Check(tfJson.find("\"accuracy\":\"diverged_over\"") != std::string::npos, "diverged_over detected");
+        Check(tfJson.find("\"ratio\":3.00") != std::string::npos, "ratio 3.00 calculated");
+        Check(tfJson.find("\"duration_sec\":30") != std::string::npos, "duration_sec 30 calculated");
+
+        // Under-estimate: estimate 100s, duration 20s -> 0.2x (diverged_under)
+        testJob.estimateSec = 100;
+        testJob.attempts[0].end = "2026-11-12 10:00:20";
+        tfJson = tqm.JobToJson(testJob, false);
+        Check(tfJson.find("\"accuracy\":\"diverged_under\"") != std::string::npos, "diverged_under detected");
+
+        // Accurate: estimate 30s, duration 30s -> 1.0x (accurate)
+        testJob.estimateSec = 30;
+        testJob.attempts[0].end = "2026-11-12 10:00:30";
+        tfJson = tqm.JobToJson(testJob, false);
+        Check(tfJson.find("\"accuracy\":\"accurate\"") != std::string::npos, "accurate detected within tolerance");
     }
 
     {
