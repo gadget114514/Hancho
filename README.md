@@ -25,8 +25,8 @@ The dashboard has an **execution monitor pane** below the process and task lists
 
 ## Express
 
-- Download and install [Hancho-v0.9.6-win64-setup.exe](https://github.com/gadget114514/Hancho/releases/download/v0.9.6/Hancho-v0.9.6-win64-setup.exe)
-  (portable: [Hancho-v0.9.6-win64.zip](https://github.com/gadget114514/Hancho/releases/download/v0.9.6/Hancho-v0.9.6-win64.zip), all versions: [Releases](https://github.com/gadget114514/Hancho/releases))
+- Download and install [Hancho-v0.9.7-win64-setup.exe](https://github.com/gadget114514/Hancho/releases/download/v0.9.7/Hancho-v0.9.7-win64-setup.exe)
+  (portable: [Hancho-v0.9.7-win64.zip](https://github.com/gadget114514/Hancho/releases/download/v0.9.7/Hancho-v0.9.7-win64.zip), all versions: [Releases](https://github.com/gadget114514/Hancho/releases))
 - In your llm, "find hancho in PATH, then read help to use it" 
 - In your llm, "create task and use (opencode|claude|agy|codex) to execute the task via hancho" 
 - That's all
@@ -136,6 +136,13 @@ All Hancho data is plain JSON / JSONL (task queues, behavior trees, stream event
 ---
 
 ## Release Notes
+
+### v0.9.7
+- **Audit feedback fixes**: `timing_feedback` now measures only the last successful attempt (a fast-failing attempt no longer reports `diverged_under`), ignores runs under 5 seconds for `diverged_under`, and reads its thresholds from `config.json` (`audit_timing_divergence_threshold`, default 2.0; `audit_timing_under_threshold`, default 0.33).
+- **`resource_wait` in `taskqueue list`**: each job shows which job and resource a pending job is waiting for, as `taskqueue graph` already did.
+- **Supervisor hint window**: copy prompts use existing commands (`taskqueue why` / `retry`, `bt get --id`, `bt resume`); behavior-tree escalations are detected again; several divergences / failures / resource waits are shown one after another, a visible hint is no longer replaced automatically, and a condition that comes back is shown again.
+- **Help**: new AUDIT section in `hancho-cli help` and `agent.audit` in `help --json`; `estimateSec` is listed in `taskqueue add`.
+- **Docs**: Audit LLM implementation design (`doc/audit-llm-design.md`).
 
 ### v0.9.6
 - **Audit LLM / supervisor feedback (preview)**: every finished job with an `estimateSec` now exposes deterministic `timing_feedback` (actual duration, ratio, `accurate` / `diverged_over` / `diverged_under`, and concrete advice). The Windows dashboard adds a supervisor guidance hint window for timing divergences, with a one-click corrective prompt and configurable auto-dismiss. See `doc/audit-llm.md`.

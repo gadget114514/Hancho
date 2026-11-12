@@ -22,8 +22,8 @@
 
 ## Express
 
-- [Hancho-v0.9.6-win64-setup.exe](https://github.com/gadget114514/Hancho/releases/download/v0.9.6/Hancho-v0.9.6-win64-setup.exe) をダウンロードしてインストール
-  （ポータブル版: [Hancho-v0.9.6-win64.zip](https://github.com/gadget114514/Hancho/releases/download/v0.9.6/Hancho-v0.9.6-win64.zip)、全バージョン: [Releases](https://github.com/gadget114514/Hancho/releases)）
+- [Hancho-v0.9.7-win64-setup.exe](https://github.com/gadget114514/Hancho/releases/download/v0.9.7/Hancho-v0.9.7-win64-setup.exe) をダウンロードしてインストール
+  （ポータブル版: [Hancho-v0.9.7-win64.zip](https://github.com/gadget114514/Hancho/releases/download/v0.9.7/Hancho-v0.9.7-win64.zip)、全バージョン: [Releases](https://github.com/gadget114514/Hancho/releases)）
 - LLM に「PATH から hancho を探して、help を読んで使い方を把握して」と伝える
 - LLM に「タスクを作成して、hancho 経由で (opencode|claude|agy|codex) に実行させて」と伝える
 - 以上
@@ -140,6 +140,13 @@ Hancho のデータはすべて JSON / JSONL（タスクキュー、ビヘイビ
 （以下の help 本文は英語です）
 
 ## リリースノート
+
+### v0.9.7
+- **Audit フィードバックの修正**: `timing_feedback` は最後に成功した試行だけを計測するようになりました（すぐ失敗した試行で `diverged_under` と判定されなくなりました）。5 秒未満の実行は `diverged_under` にしません。閾値は `config.json` の `audit_timing_divergence_threshold`（既定 2.0）と `audit_timing_under_threshold`（既定 0.33）から読みます。
+- **`taskqueue list` に `resource_wait`**: 待機中のジョブがどのジョブのどのリソースを待っているかを、`taskqueue graph` と同じく一覧でも返します。
+- **Supervisor ヒントウインドウ**: コピー用プロンプトのコマンドを実在するもの（`taskqueue why` / `retry`、`bt get --id`、`bt resume`）に修正。ビヘイビアツリーのエスカレーションを再び検出します。複数の見積もり乖離・失敗・リソース待ちを順に表示し、表示中のヒントは自動では差し替えず、条件が再発したものは再び表示します。
+- **ヘルプ**: `hancho-cli help` に AUDIT 節、`help --json` に `agent.audit` を追加。`taskqueue add` の任意項目に `estimateSec` を記載。
+- **ドキュメント**: Audit LLM の実装設計書（`doc/audit-llm-design.md`）。
 
 ### v0.9.6
 - **Audit LLM / Supervisor フィードバック（プレビュー）**: `estimateSec` を持つジョブは、実実行時間・比率・`accurate` / `diverged_over` / `diverged_under`・具体的な助言を含む `timing_feedback` を返すようになりました。Windows ダッシュボードには見積もり乖離を知らせる Supervisor ガイダンス・ヒントウインドウを追加し、修正用プロンプトのワンクリックコピーと自動消去に対応。詳細は `doc/audit-llm-ja.md`。
