@@ -907,6 +907,9 @@ struct DashboardState {
     int hintAutoDismissSec = 6;
     std::string supervisorCommand = "claude";
     std::string lastHintSignature;
+    // Signatures already popped up. Automatic hints skip them so a second divergence, failure or
+    // contention surfaces while the first one is still in the list. Capped; see EvaluateSupervisorHint.
+    std::unordered_set<std::string> shownHintSignatures;
     std::wstring currentHintCategory;
     std::wstring currentHintSummary;
     std::wstring currentHintPrompt;
@@ -11546,9 +11549,25 @@ struct SupervisorHintInfo {
     std::wstring prompt;
 };
 
-static SupervisorHintInfo AnalyzeStateForHint(DashboardState* st) {
+// skipShown: when true, signatures already shown are passed over so the next item surfaces.
+// activeOut: when non-null, receives every recurring candidate signature whose condition currently holds
+// (including skipped ones), so the caller can forget shown signatures whose condition has gone away.
+static SupervisorHintInfo AnalyzeStateForHint(DashboardState* st, bool skipShown,
+                                              std::unordered_set<std::string>* activeOut) {
     SupervisorHintInfo info;
     if (!st) return info;
+
+    auto isSkipped = [&](const std::string& sig) {
+        return skipShown && st->shownHintSignatures.count(sig) > 0;
+    };
+
+    // Records sig as active, and claims it as the hint when no hint has been claimed yet and it is not skipped.
+    auto claim = [&](const std::string& sig) -> bool {
+        if (activeOut) activeOut->insert(sig);
+        if (!info.signature.empty() || isSkipped(sig)) return false;
+        info.signature = sig;
+        return true;
+    };
 
     auto makePrompt = [](const std::wstring& ja, const std::wstring& en, const std::wstring& es) -> std::wstring {
         if (g_uiLanguage == UiLanguage::Japanese) return ja;
@@ -11571,7 +11590,8 @@ static SupervisorHintInfo AnalyzeStateForHint(DashboardState* st) {
                     int64_t est = JsonGetInt(j, "estimate_sec", 0);
                     std::string advice = JsonGetString(j, "advice", "");
 
-                    info.signature = "timing:" + jid + ":" + acc;
+                    std::string sig = "timing:" + jid + ":" + acc;
+                    if (!claim(sig)) continue;
                     info.category = Tr(L"⏱ 見積もり乖離検知 (Audit LLM)",
                                        L"⏱ Timing Divergence (Audit LLM)",
                                        L"⏱ Desviación de estimación (Audit LLM)");
@@ -11599,7 +11619,6 @@ static SupervisorHintInfo AnalyzeStateForHint(DashboardState* st) {
                         L"Revise hancho-cli taskqueue list. Según la duración de '" + jidW +
                         L"' (" + std::to_wstring(dur) + L"s vs " + std::to_wstring(est) +
                         L"s), recalibre estimate_sec para tareas posteriores.");
-                    return info;
                 }
             }
         }
@@ -11609,20 +11628,21 @@ static SupervisorHintInfo AnalyzeStateForHint(DashboardState* st) {
     try {
         std::vector<std::string> btErrors;
         std::vector<BtDebugNode> trees = LoadBtDebugTrees(GetBehaviorTreesDirWide(), btErrors);
-        std::function<const BtDebugNode*(const BtDebugNode&)> findWaiting = [&](const BtDebugNode& n) -> const BtDebugNode* {
-            if (n.state == "waiting_for_llm" || n.state == "waiting_for_decision" || n.state == "escalated") {
-                return &n;
-            }
-            for (const auto& ch : n.children) {
-                const BtDebugNode* f = findWaiting(ch);
-                if (f) return f;
-            }
-            return nullptr;
+        // Collect every waiting node (pre-order) so that all of them count as active, not only the first.
+        std::vector<const BtDebugNode*> waitingNodes;
+        std::function<void(const BtDebugNode&)> collectWaiting = [&](const BtDebugNode& n) {
+            // An escalate node waiting for an answer keeps node state "running" (behavior_tree_escalate.cpp);
+            // the tree root carries "waitingForLlm", so match escalate nodes by type, not the root's state.
+            // Snake_case names from earlier builds are kept in case persisted states still use them.
+            const bool waiting =
+                (n.type == "escalate" && (n.state == "running" || n.state == "waitingForLlm")) ||
+                n.state == "waiting_for_llm" || n.state == "waiting_for_decision" || n.state == "escalated";
+            if (waiting) waitingNodes.push_back(&n);
+            for (const auto& ch : n.children) collectWaiting(ch);
         };
-        for (const auto& root : trees) {
-            const BtDebugNode* waiting = findWaiting(root);
-            if (waiting) {
-                info.signature = "bt:" + waiting->btId + ":" + waiting->nodeId;
+        for (const auto& root : trees) collectWaiting(root);
+        for (const BtDebugNode* waiting : waitingNodes) {
+            if (claim("bt:" + waiting->btId + ":" + waiting->nodeId)) {
                 info.category = Tr(L"🧠 LLM判断要請 (BT Escalation)",
                                    L"🧠 LLM Decision Required (BT)",
                                    L"🧠 Decisión LLM Requerida (BT)");
@@ -11636,16 +11656,15 @@ static SupervisorHintInfo AnalyzeStateForHint(DashboardState* st) {
                 std::wstring btIdW = Utf8ToWide(waiting->btId);
                 std::wstring nodeW = Utf8ToWide(waiting->nodeId);
                 info.prompt = makePrompt(
-                    L"hancho-cli bt get " + btIdW +
-                    L" でエスカレーションパケットを確認し、結果を hancho-cli bt answer " + btIdW +
-                    L" --node " + nodeW + L" --result <success/failure> で応答してください。",
-                    L"Check escalation details with hancho-cli bt get " + btIdW +
-                    L" and answer with hancho-cli bt answer " + btIdW +
-                    L" --node " + nodeW + L" --result <success/failure>",
-                    L"Revise la escalación con hancho-cli bt get " + btIdW +
-                    L" y responda con hancho-cli bt answer " + btIdW +
-                    L" --node " + nodeW + L" --result <success/failure>");
-                return info;
+                    L"hancho-cli bt get --id " + btIdW +
+                    L" でエスカレーションパケットを確認し、hancho-cli bt resume --id " + btIdW +
+                    L" --node " + nodeW + L" --answer <answer> --rationale <why> で応答してください。",
+                    L"Check escalation details with hancho-cli bt get --id " + btIdW +
+                    L" and answer with hancho-cli bt resume --id " + btIdW +
+                    L" --node " + nodeW + L" --answer <answer> --rationale <why>",
+                    L"Revise la escalación con hancho-cli bt get --id " + btIdW +
+                    L" y responda con hancho-cli bt resume --id " + btIdW +
+                    L" --node " + nodeW + L" --answer <answer> --rationale <why>");
             }
         }
     } catch (...) {}
@@ -11658,20 +11677,20 @@ static SupervisorHintInfo AnalyzeStateForHint(DashboardState* st) {
             if (state == "failed") {
                 std::string jid = JsonGetString(j, "id", "");
                 std::string jname = JsonGetString(j, "name", jid);
-                info.signature = "failed:" + jid;
+                std::string sig = "failed:" + jid;
+                if (!claim(sig)) continue;
                 info.category = Tr(L"⚠️ ジョブ失敗検知", L"⚠️ Job Failure Detected", L"⚠️ Fallo de trabajo detectado");
                 info.summary = Tr(L"ジョブ '", L"Job '", L"Trabajo '") + Utf8ToWide(jname) +
                                Tr(L"' が失敗状態で停止しています。", L"' is in failed state.", L"' está en estado fallido.");
                 std::wstring jidW = Utf8ToWide(jid);
                 info.prompt = makePrompt(
-                    L"hancho-cli taskqueue inspect " + jidW +
-                    L" で失敗診断ログを確認し、修復後に hancho-cli taskqueue requeue " + jidW +
+                    L"hancho-cli taskqueue why " + jidW +
+                    L" で失敗診断を確認し、修復後に hancho-cli taskqueue retry " + jidW +
                     L" を実行してください。",
-                    L"Inspect failure diagnostics via hancho-cli taskqueue inspect " + jidW +
-                    L", resolve the issue, and rerun via hancho-cli taskqueue requeue " + jidW,
-                    L"Inspeccione el fallo con hancho-cli taskqueue inspect " + jidW +
-                    L", solucione el problema y reintente con hancho-cli taskqueue requeue " + jidW);
-                return info;
+                    L"Inspect failure diagnostics via hancho-cli taskqueue why " + jidW +
+                    L", resolve the issue, and rerun via hancho-cli taskqueue retry " + jidW,
+                    L"Inspeccione el fallo con hancho-cli taskqueue why " + jidW +
+                    L", solucione el problema y reintente con hancho-cli taskqueue retry " + jidW);
             }
         }
     }
@@ -11683,7 +11702,8 @@ static SupervisorHintInfo AnalyzeStateForHint(DashboardState* st) {
             std::string resWait = JsonGetString(j, "resource_wait", "");
             if (!resWait.empty() && resWait != "null") {
                 std::string jid = JsonGetString(j, "id", "");
-                info.signature = "res:" + resWait + ":" + jid;
+                std::string sig = "res:" + resWait + ":" + jid;
+                if (!claim(sig)) continue;
                 info.category = Tr(L"🔒 リソース排他待機", L"🔒 Resource Contention", L"🔒 Conflicto de recursos");
                 info.summary = Tr(L"ジョブ '", L"Job '", L"Trabajo '") + Utf8ToWide(jid) +
                                Tr(L"' がリソース '", L"' is waiting for resource '", L"' espera el recurso '") +
@@ -11696,10 +11716,13 @@ static SupervisorHintInfo AnalyzeStateForHint(DashboardState* st) {
                     L"'. Review lock mode (read/write) or job dependencies in taskqueue definitions.",
                     L"Conflicto de bloqueo en '" + resW +
                     L"'. Revise modo de bloqueo (read/write) o dependencias.");
-                return info;
             }
         }
     }
+
+    // A candidate was claimed above (all candidates are collected even after one is claimed);
+    // the fallbacks below only apply when none was.
+    if (!info.signature.empty()) return info;
 
     // 5. Check if all tasks succeeded
     if (!st->lastTaskListJson.empty()) {
@@ -11732,9 +11755,9 @@ static SupervisorHintInfo AnalyzeStateForHint(DashboardState* st) {
                       L"Hancho is idle. Ready for new autonomous tasks or commands.",
                       L"Hancho está inactivo. Listo para nuevas tareas o comandos autónomos.");
     info.prompt = makePrompt(
-        L"hancho-cli taskqueue add または hancho-cli bt run を実行して、自律実行フローを開始してください。",
-        L"Run hancho-cli taskqueue add or hancho-cli bt run to initiate autonomous execution flow.",
-        L"Ejecute hancho-cli taskqueue add o hancho-cli bt run para iniciar el flujo de ejecución.");
+        L"hancho-cli taskqueue add --file <jobs.json> または hancho-cli bt start --file <bt.json> を実行して、自律実行フローを開始してください。",
+        L"Run hancho-cli taskqueue add --file <jobs.json> or hancho-cli bt start --file <bt.json> to initiate autonomous execution flow.",
+        L"Ejecute hancho-cli taskqueue add --file <jobs.json> o hancho-cli bt start --file <bt.json> para iniciar el flujo de ejecución.");
     return info;
 }
 
@@ -11927,12 +11950,29 @@ static void EvaluateSupervisorHint(DashboardState* st, bool forceShow = false) {
     if (!st || !st->hwndMain) return;
     if (!forceShow && !st->showSupervisorHints) return;
 
-    SupervisorHintInfo info = AnalyzeStateForHint(st);
+    std::unordered_set<std::string> activeSignatures;
+    SupervisorHintInfo info = AnalyzeStateForHint(st, !forceShow, &activeSignatures);
+    // A recurring condition that has gone away is forgotten, so it can surface again if it comes back.
+    for (auto it = st->shownHintSignatures.begin(); it != st->shownHintSignatures.end();) {
+        const std::string& s = *it;
+        const bool recurring = s.rfind("timing:", 0) == 0 || s.rfind("bt:", 0) == 0 ||
+                               s.rfind("failed:", 0) == 0 || s.rfind("res:", 0) == 0;
+        if (recurring && activeSignatures.count(s) == 0) {
+            it = st->shownHintSignatures.erase(it);
+        } else {
+            ++it;
+        }
+    }
+    // While the hint window is up, an automatic evaluation leaves it alone; the next item appears after it is hidden.
+    if (!forceShow && st->hwndHintWnd && IsWindow(st->hwndHintWnd) && IsWindowVisible(st->hwndHintWnd)) return;
     if (!forceShow) {
         if (info.signature == st->lastHintSignature) return;
         if (info.signature == "idle") return; // Don't pop up spontaneously when idle
     }
     st->lastHintSignature = info.signature;
+    // Bound the shown set; once full, start over so a long-running session cannot grow it forever.
+    if (st->shownHintSignatures.size() >= 256) st->shownHintSignatures.clear();
+    st->shownHintSignatures.insert(info.signature);
     st->currentHintCategory = info.category;
     st->currentHintSummary = info.summary;
     st->currentHintPrompt = info.prompt;

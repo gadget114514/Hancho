@@ -844,8 +844,10 @@ int main() {
         // Verify timing_feedback when an attempt finishes with duration diverging from estimate
         TaskQueueJob testJob;
         testJob.id = "TF-1";
+        testJob.state = "succeeded";
         testJob.estimateSec = 10;
         TaskQueueAttempt att;
+        att.reason = "ok";
         att.start = "2026-11-12 10:00:00";
         att.end = "2026-11-12 10:00:30"; // 30s duration vs 10s estimate -> 3.0x (diverged_over)
         testJob.attempts.push_back(att);
@@ -866,6 +868,47 @@ int main() {
         testJob.attempts[0].end = "2026-11-12 10:00:30";
         tfJson = tqm.JobToJson(testJob, false);
         Check(tfJson.find("\"accuracy\":\"accurate\"") != std::string::npos, "accurate detected within tolerance");
+
+        // A failed attempt says nothing about the estimate: 2s vs estimate 100 must not be diverged_under.
+        auto tfFor = [&](const std::string& jobState, const std::vector<TaskQueueAttempt>& atts, int64_t estimate) {
+            TaskQueueJob j;
+            j.id = "TF-X";
+            j.state = jobState;
+            j.estimateSec = estimate;
+            j.attempts = atts;
+            return tqm.JobToJson(j, false);
+        };
+        auto attempt = [](const std::string& reason, const std::string& start, const std::string& end) {
+            TaskQueueAttempt a;
+            a.reason = reason;
+            a.start = start;
+            a.end = end;
+            return a;
+        };
+        std::vector<TaskQueueAttempt> failedOnly = {attempt("failed", "2026-11-12 10:00:00", "2026-11-12 10:00:02")};
+        std::string failedJson = tfFor("failed", failedOnly, 100);
+        Check(failedJson.find("\"timing_feedback\"") == std::string::npos,
+              "failed attempt (2s vs estimate 100) produces no timing_feedback: " + failedJson);
+
+        // Even if the job is marked succeeded, a failed attempt is never used for timing.
+        std::string failedOnSucceeded = tfFor("succeeded", failedOnly, 100);
+        Check(failedOnSucceeded.find("\"accuracy\":\"diverged_under\"") == std::string::npos,
+              "failed attempt is not diverged_under: " + failedOnSucceeded);
+
+        // Very short successful run: 3s vs estimate 100 is measurement noise, not diverged_under.
+        std::vector<TaskQueueAttempt> shortOk = {attempt("ok", "2026-11-12 10:00:00", "2026-11-12 10:00:03")};
+        std::string shortJson = tfFor("succeeded", shortOk, 100);
+        Check(shortJson.find("\"accuracy\":\"diverged_under\"") == std::string::npos,
+              "successful 3s attempt vs estimate 100 is not diverged_under: " + shortJson);
+
+        // A failed attempt after a successful one: the successful attempt (30s vs 10s) is the one used.
+        std::vector<TaskQueueAttempt> okThenFailed = {
+            attempt("ok", "2026-11-12 10:00:00", "2026-11-12 10:00:30"),
+            attempt("failed", "2026-11-12 10:01:00", "2026-11-12 10:01:02")};
+        std::string okThenFailedJson = tfFor("succeeded", okThenFailed, 10);
+        Check(okThenFailedJson.find("\"duration_sec\":30") != std::string::npos &&
+                  okThenFailedJson.find("\"accuracy\":\"diverged_over\"") != std::string::npos,
+              "successful attempt is used when a later attempt failed: " + okThenFailedJson);
     }
 
     {
@@ -918,6 +961,12 @@ int main() {
         Check(GetState(tqm, "W2") == "pending", "W2 waits while W1 holds shared.txt");
         std::string g = tqm.TaskQueueGraph("resw", "", err);
         Check(g.find("\"resource_wait\":\"W1: shared.txt\"") != std::string::npos, "graph shows resource_wait for W2");
+        std::string wl = tqm.TaskQueueList("resw", "", 0, err);
+        Check(wl.find("\"resource_wait\":\"W1: shared.txt\"") != std::string::npos,
+              "taskqueue list shows resource_wait for W2: " + wl);
+        Check(wl.find("\"id\":\"W1\"") != std::string::npos &&
+                  wl.find("\"resource_wait\":null") != std::string::npos,
+              "taskqueue list reports null resource_wait for the running job");
         Check(WaitForState(tqm, "W1", "succeeded", 20000), "W1 succeeded");
         Check(WaitForState(tqm, "W2", "succeeded", 20000), "W2 runs after W1 releases shared.txt");
 

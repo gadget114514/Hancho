@@ -2271,16 +2271,69 @@ void TaskQueueManager::SaveQueue(const TaskQueue& tq) {
     WriteFileAtomicWide(GetTaskQueueFileWide(tq.name), oss.str());
 }
 
-static std::string TimingFeedbackToJson(const TaskQueueJob& job) {
-    if (job.estimateSec <= 0 || job.attempts.empty()) return "";
-    const TaskQueueAttempt* finished = nullptr;
-    for (auto it = job.attempts.rbegin(); it != job.attempts.rend(); ++it) {
-        if (!it->start.empty() && !it->end.empty()) {
-            finished = &(*it);
-            break;
+// Timing-divergence thresholds come from the data directory's config.json.
+// JobToJson is called often, so the parsed values are cached and the file is re-read
+// at most every kTimingConfigRefreshSec seconds. A missing or invalid file yields defaults.
+struct TimingThresholds {
+    double over = 2.0;
+    double under = 0.33;
+};
+
+static TimingThresholds LoadTimingThresholds() {
+    static constexpr double kDefaultOver = 2.0;
+    static constexpr double kDefaultUnder = 0.33;
+    static constexpr auto kTimingConfigRefreshInterval = std::chrono::seconds(5);
+    static std::mutex cacheMutex;
+    static TimingThresholds cached;
+    static bool loadedOnce = false;
+    static std::chrono::steady_clock::time_point lastLoad;
+
+    std::lock_guard<std::mutex> lock(cacheMutex);
+    auto now = std::chrono::steady_clock::now();
+    if (loadedOnce && now - lastLoad < kTimingConfigRefreshInterval) return cached;
+    loadedOnce = true;
+    lastLoad = now;
+
+    TimingThresholds t;
+    std::string content = ReadFileUtf8Wide(PathJoinWide(GetEffectiveDataDirectoryWide(), L"config.json"));
+    if (!content.empty()) {
+        nlohmann::json cfg = nlohmann::json::parse(content, nullptr, false);
+        if (cfg.is_object()) {
+            if (cfg.contains("audit_timing_divergence_threshold") &&
+                cfg["audit_timing_divergence_threshold"].is_number()) {
+                double v = cfg["audit_timing_divergence_threshold"].get<double>();
+                if (v > 0.0) t.over = v;
+            }
+            if (cfg.contains("audit_timing_under_threshold") &&
+                cfg["audit_timing_under_threshold"].is_number()) {
+                double v = cfg["audit_timing_under_threshold"].get<double>();
+                if (v > 0.0) t.under = v;
+            }
         }
     }
+    if (t.under >= t.over) {
+        t.over = kDefaultOver;
+        t.under = kDefaultUnder;
+    }
+    cached = t;
+    return cached;
+}
+
+static std::string TimingFeedbackToJson(const TaskQueueJob& job) {
+    if (job.estimateSec <= 0 || job.attempts.empty()) return "";
+    // Only a finished job's successful attempt says anything about the estimate.
+    // Failed, killed, deferred or interrupted attempts are measurement noise here.
+    if (job.state != "succeeded") return "";
+    const TaskQueueAttempt* finished = nullptr;
+    for (auto it = job.attempts.rbegin(); it != job.attempts.rend(); ++it) {
+        if (it->reason != "ok") continue;
+        if (it->start.empty() || it->end.empty()) continue;
+        finished = &(*it);
+        break;
+    }
     if (!finished) return "";
+
+    const TimingThresholds thresholds = LoadTimingThresholds();
 
     int64_t startSec = ParseTimestampStrToEpoch(finished->start);
     int64_t endSec = ParseTimestampStrToEpoch(finished->end);
@@ -2289,14 +2342,15 @@ static std::string TimingFeedbackToJson(const TaskQueueJob& job) {
 
     std::string accuracy = "accurate";
     std::string advice;
-    if (ratio >= 2.0) {
+    if (ratio >= thresholds.over) {
         accuracy = "diverged_over";
         std::ostringstream adv;
         adv << "Actual duration (" << durationSec << "s) exceeded estimate ("
             << job.estimateSec << "s) by " << std::fixed << std::setprecision(1) << ratio << "x. "
             << "Supervisor should calibrate future estimates upward or partition long tasks.";
         advice = adv.str();
-    } else if (ratio <= 0.35 && durationSec >= 0) {
+    } else if (ratio <= thresholds.under && durationSec >= 5) {
+        // Under 5s is too short to be a meaningful divergence signal.
         accuracy = "diverged_under";
         std::ostringstream adv;
         adv << "Actual duration (" << durationSec << "s) was far below estimate ("
@@ -2304,7 +2358,10 @@ static std::string TimingFeedbackToJson(const TaskQueueJob& job) {
             << "Supervisor should tighten future estimates to optimize queue throughput.";
         advice = adv.str();
     } else {
-        advice = "Actual duration matched estimate within normal tolerance (0.35x - 2.0x).";
+        std::ostringstream adv;
+        adv << "Actual duration matched estimate within normal tolerance ("
+            << std::fixed << std::setprecision(2) << thresholds.under << "x - " << thresholds.over << "x).";
+        advice = adv.str();
     }
 
     std::ostringstream oss;
@@ -2825,6 +2882,16 @@ bool TaskQueueManager::FindQueuedResourceConflictLocked(const TaskQueueJob& job,
         }
     }
     return false;
+}
+
+std::string TaskQueueManager::ResourceWaitLocked(const TaskQueueJob& job, bool allSat, int64_t nowMs) const {
+    if (job.state != "pending") return "";
+    std::string holder, resource;
+    if (FindRunningResourceConflictLocked(job, holder, resource)) return holder + ": " + resource;
+    if (allSat && FindQueuedResourceConflictLocked(job, nowMs, holder, resource)) {
+        return holder + " (queued ahead): " + resource;
+    }
+    return "";
 }
 
 bool TaskQueueManager::FindRunningResourceConflictLocked(const TaskQueueJob& job, std::string& outHolder,
@@ -3355,10 +3422,24 @@ std::string TaskQueueManager::TaskQueueList(const std::string& taskqueue, const 
     std::ostringstream oss;
     oss << "{\"ok\":true,\"jobs\":[";
     bool first = true;
+    const int64_t nowMs = static_cast<int64_t>(GetNowTickMs());
     for (const auto& item : listed) {
         if (!first) oss << ",";
         first = false;
-        oss << JobToJson(item.job, false);
+        // Same resource_wait field the graph reports, so hint consumers reading the list see it too.
+        // Null when the job is not waiting on a resource; the list is the only place it is added.
+        bool allSat = true;
+        for (const auto& d : item.job.dependsOn) {
+            const TaskQueueJob* dep = FindJobConst(d.id);
+            if (!dep || !IsDepSatisfied(*dep, d.on)) { allSat = false; break; }
+        }
+        std::string resourceWait = ResourceWaitLocked(item.job, allSat, nowMs);
+        std::string jj = JobToJson(item.job, false);
+        if (!jj.empty() && jj.back() == '}') jj.pop_back();
+        oss << jj << ",\"resource_wait\":";
+        if (resourceWait.empty()) oss << "null";
+        else oss << "\"" << JsonEscape(resourceWait) << "\"";
+        oss << "}";
     }
     oss << "]}";
     return oss.str();
@@ -4134,13 +4215,7 @@ std::string TaskQueueManager::TaskQueueGraph(const std::string& taskqueue, const
                 }
             }
             bool ready = (job.state == "pending") && allSat && job.retryAtMs <= now;
-            std::string resourceWait;
-            if (job.state == "pending") {
-                std::string holder, resource;
-                if (FindRunningResourceConflictLocked(job, holder, resource)) resourceWait = holder + ": " + resource;
-                else if (allSat && FindQueuedResourceConflictLocked(job, now, holder, resource))
-                    resourceWait = holder + " (queued ahead): " + resource;
-            }
+            std::string resourceWait = ResourceWaitLocked(job, allSat, now);
             std::vector<std::string> dependents;
             for (const auto& [n2, tq2] : queues_) {
                 (void)n2;

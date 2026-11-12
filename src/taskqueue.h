@@ -882,6 +882,9 @@ private:
     // A ready job that starts before job (RunsBefore) and conflicts with it: job waits behind it.
     bool FindQueuedResourceConflictLocked(const TaskQueueJob& job, int64_t nowMs, std::string& outHolder,
                                           std::string& outResource) const;
+    // resource_wait text for a job ("holder: resource" or "holder (queued ahead): resource"); empty when none.
+    // Only pending jobs can wait. allSat: all dependencies are satisfied. Caller holds mutex_.
+    std::string ResourceWaitLocked(const TaskQueueJob& job, bool allSat, int64_t nowMs) const;
     bool IsReadyLocked(const TaskQueueJob& job, int64_t nowMs) const;
     static bool RunsBefore(const TaskQueueJob& a, const TaskQueueJob& b);
     bool HasDependencyCycle(const TaskQueue& tq, const std::string& jobId,
