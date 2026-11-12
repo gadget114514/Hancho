@@ -2536,7 +2536,10 @@ REMOTE HOSTS:
       PC_ORIGIN_LABEL). The dashboard shows it in the Origin column.
       Each job needs id, command, summary, timeoutSec; dependsOn replaces '&&'.
       Optional: cwd, host, env, dependsOn, idle, maxAttempts, retryDelaySec, success,
-      killExclude, resources {write,read}, defer, priority, instructionsFile/instructionsText.
+      killExclude, resources {write,read}, defer, priority, estimateSec,
+      instructionsFile/instructionsText.
+      estimateSec is your expected run time; Hancho compares it with the actual
+      duration (see AUDIT below).
       host runs the job on that registered remote host; logs, events and the done
       file are mirrored into the local task queue entries.
       resources: jobs whose write/read sets overlap (write/write, write/read) never
@@ -2551,6 +2554,8 @@ REMOTE HOSTS:
   taskqueue list [<name>] [--state <state>] [--since <period>] [--origin <self|label|session>] [--bt <id>]
       List jobs with state, queue, summary and blockedBy. --since keeps only
       jobs updated within the period (30m, 6h, 2d), e.g. --since 6h.
+      Each job also carries resource_wait ("holder: resource" while a pending
+      job waits for a resource lock, otherwise null) and timing_feedback.
       --bt <id> lists every job of a behavior tree across its parallel branch queues.
       --origin self keeps only the jobs this session added.
 
@@ -2574,6 +2579,31 @@ REMOTE HOSTS:
   taskqueue purge <name> [--states succeeded,failed,cancelled]
   taskqueue purge [<name>] --older-than-days <N>   (finished jobs not updated for N days; all queues if <name> omitted)
   reset [--yes]                                    (delete ALL project data in the data directory; lists targets without --yes; refused while running)
+
+AUDIT (feedback on the supervisor's plan; preview, rule-based, no LLM call yet):
+  timing_feedback
+      Added to every job in taskqueue list / get / wait (and the MCP tools)
+      once the job succeeded and has estimateSec > 0. Fields: duration_sec,
+      estimate_sec, ratio (duration / estimate), accuracy, advice.
+      Only the last successful attempt is measured; failed, killed or deferred
+      attempts are ignored.
+      accuracy:
+        diverged_over   ratio >= audit_timing_divergence_threshold (default 2.0)
+        diverged_under  ratio <= audit_timing_under_threshold (default 0.33)
+                        and the run took at least 5 seconds
+        accurate        otherwise
+      On a divergence, recalibrate estimateSec / timeoutSec of the remaining
+      jobs of the same kind (taskqueue_update), or split long jobs.
+  resource_wait
+      In taskqueue list and graph: the job and resource a pending job is waiting
+      for. Long waits mean overlapping resources; add dependsOn or use read locks.
+  Thresholds (config.json in the data directory, re-read every few seconds):
+      "audit_timing_divergence_threshold": 2.0,
+      "audit_timing_under_threshold": 0.33
+  Dashboard: the supervisor hint window (Settings: show_supervisor_hints,
+      hint_auto_dismiss_sec) shows timing divergences, failed jobs, resource
+      waits and behavior-tree escalations with a prompt you can copy to the
+      supervisor. Design: doc\audit-llm.md, doc\audit-llm-design.md.
 
 BEHAVIOR TREES (for LLM agents; next step depends on results):
   bt validate|start --file <bt.json>    Check / register and run a behavior tree
@@ -2667,6 +2697,10 @@ SETUP FOR LLM AGENTS:
 "        evidence, suggestedAction) in taskqueue_get / taskqueue_wait; use\n"
 "        `hancho-cli taskqueue why <id>` for the same view before choosing the\n"
 "        next step.\n"
+"      - Set estimateSec on jobs. A succeeded job then carries timing_feedback\n"
+"        (accuracy diverged_over / diverged_under / accurate, plus advice);\n"
+"        on a divergence, recalibrate the remaining jobs' estimateSec and\n"
+"        timeoutSec. See AUDIT above.\n"
 "      - Never poll .done files; use taskqueue_wait or wait_process.\n"
 "      - Delegating to a worker LLM: run_worker blocks until the worker exits and\n"
 "        returns only its final result; the raw stream stays in stream_file.\n"
@@ -2905,7 +2939,7 @@ void PrintCliUsageJson() {
       "usage": "hancho-cli taskqueue <add|list|get|why|retry|cancel|pause|resume|graph|wait|purge> ...",
       "subcommands": [
         {"name": "add", "usage": "hancho-cli taskqueue add --file <jobs.json> [--taskqueue <name>] [--concurrency <n>] [--notify-file <path>] [--origin-label <text>]", "description": "Register jobs. Each job needs id, command, summary and timeoutSec; dependsOn replaces shell chaining. The caller's session id, working folder and --origin-label are recorded as the job's origin."},
-        {"name": "list", "usage": "hancho-cli taskqueue list [<name>] [--state <state>] [--since <period>] [--origin <self|label|session>] [--bt <id>]", "description": "List jobs with state, queue, summary and blockedBy. --since keeps only jobs updated within the period (e.g. 30m, 6h, 2d). --origin self keeps only the jobs this session added. --bt <id> lists every job of a behavior tree across its parallel branch queues."},
+        {"name": "list", "usage": "hancho-cli taskqueue list [<name>] [--state <state>] [--since <period>] [--origin <self|label|session>] [--bt <id>]", "description": "List jobs with state, queue, summary and blockedBy. --since keeps only jobs updated within the period (e.g. 30m, 6h, 2d). --origin self keeps only the jobs this session added. --bt <id> lists every job of a behavior tree across its parallel branch queues. Each job also carries resource_wait and, once succeeded with estimateSec, timing_feedback (see audit)."},
         {"name": "record-plain", "usage": "hancho-cli taskqueue record-plain --cmd <cmd> [--name <name>] [--exit-code <n>] [--log <path>] [--summary <text>]", "description": "Record a plain execution outside a queue into logs/taskqueues/plain.json."},
         {"name": "get", "usage": "hancho-cli taskqueue get <id> [--rev <n>] [--no-instructions]", "description": "Show one job with attempts and instructions."},
         {"name": "why", "usage": "hancho-cli taskqueue why <id>", "description": "Explain why the last attempt failed: failure class, confidence, summary, suggested action, last activity and evidence (event seq / log line), plus the class of every attempt. Reads the job without instructions."},
@@ -3228,6 +3262,24 @@ void PrintCliUsageJson() {
       "succeeded": "Success conditions met.",
       "failed": "Attempts exhausted or launch failed.",
       "cancelled": "Cancelled; not retried."
+    },
+    "audit": {
+      "status": "preview; rule-based, no LLM call yet",
+      "timing_feedback": {
+        "where": "Every job in taskqueue list/get/wait (CLI and MCP) once it succeeded and has estimateSec > 0.",
+        "fields": "duration_sec, estimate_sec, ratio (duration/estimate), accuracy, advice",
+        "measured": "Only the last successful attempt; failed, killed and deferred attempts are ignored.",
+        "accuracy": {
+          "diverged_over": "ratio >= audit_timing_divergence_threshold, default 2.0",
+          "diverged_under": "ratio <= audit_timing_under_threshold, default 0.33, and the run took at least 5 seconds",
+          "accurate": "otherwise"
+        },
+        "action": "Recalibrate estimateSec/timeoutSec of the remaining jobs of the same kind (taskqueue_update), or split long jobs."
+      },
+      "resource_wait": "In taskqueue list and graph: 'holder: resource' while a pending job waits for a resource lock, otherwise null. Long waits: add dependsOn or use read locks.",
+      "config": {"audit_timing_divergence_threshold": 2.0, "audit_timing_under_threshold": 0.33, "show_supervisor_hints": true, "hint_auto_dismiss_sec": 6},
+      "dashboard": "The supervisor hint window shows timing divergences, failed jobs, resource waits and behavior-tree escalations with a prompt to copy to the supervisor.",
+      "guide": "doc/audit-llm.md, doc/audit-llm-ja.md and doc/audit-llm-design.md in the Hancho installation folder."
     },
     "quick_start": [
       {"step": "register_mcp", "command": "hancho-cli.exe mcp install"},
