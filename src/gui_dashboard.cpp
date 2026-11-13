@@ -11139,7 +11139,7 @@ static LRESULT CALLBACK SettingsWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPAR
                 behavior.insert(behavior.end(), {
                     ds->hwndSoundLabel, ds->chkSound, ds->editSound, ds->btnBrowseSound, ds->btnTestSound,
                     ds->hwndSoundHint, ds->chkHideEnded, ds->chkUsageGraph, ds->chkRestoreUsageGraph,
-                    ds->chkResourceLocks, ds->chkActivityStyle,
+                    ds->chkResourceLocks, ds->chkActivityStyle, ds->chkShowHiddenTasks,
                     ds->lblEventRetention, ds->editEventRetention,
                     ds->lblRefreshInterval, ds->editRefreshInterval,
                     ds->chkEndBlink, ds->lblEndBlinkSec, ds->editEndBlinkSec,
