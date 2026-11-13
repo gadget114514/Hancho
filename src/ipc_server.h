@@ -102,6 +102,7 @@ private:
     std::unique_ptr<IpmsgNode> ipmsg_;
     std::unique_ptr<IpmsgHandler> ipmsgHandler_;
     std::thread ipmsgRestartThread_;
+    std::mutex ipmsgRestartMutex_;
     bool remoteCallbacksInstalled_ = false;
 };
 

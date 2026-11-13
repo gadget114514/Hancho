@@ -621,6 +621,8 @@ void IpcServer::StopIpmsg() {
 }
 
 void IpcServer::ScheduleIpmsgRestart() {
+    std::lock_guard<std::mutex> lk(ipmsgRestartMutex_);
+    if (stop_.load()) return;
     if (ipmsgRestartThread_.joinable()) {
         ipmsgRestartThread_.join();
     }

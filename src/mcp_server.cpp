@@ -970,7 +970,7 @@ int RunMcpServer() {
                 << ","
                 << "{"
                 << "\"name\":\"chat_handler\","
-                << "\"description\":\"Show or change the LLM that answers incoming Chat messages (the handler). Only the supplied fields are patched. The node re-reads the handler config; poll chat_status to see it applied. LAN only and unencrypted: keep skipPermissions false unless every host is trusted.\","
+                << "\"description\":\"Show or change the LLM that answers incoming Chat messages (the handler). Only the supplied fields are patched. The node re-reads the handler config; poll chat_status to see it applied. LAN only and unencrypted; handler changes are available to any MCP client.\","
                 << "\"inputSchema\":{\"type\":\"object\",\"properties\":{"
                 << "\"enabled\":{\"type\":\"boolean\",\"description\":\"Enable or disable the answering handler\"},"
                 << "\"engine\":{\"type\":\"string\",\"description\":\"Worker engine (claude, agy, opencode, codex, ...)\"},"
@@ -980,7 +980,6 @@ int RunMcpServer() {
                 << "\"instructions\":{\"type\":\"string\",\"description\":\"Extra instructions prepended to the handler prompt\"},"
                 << "\"taskqueue\":{\"type\":\"string\",\"description\":\"Task queue for handler jobs (default chat)\"},"
                 << "\"autoReply\":{\"type\":\"boolean\",\"description\":\"Send the worker's answer back automatically\"},"
-                << "\"skipPermissions\":{\"type\":\"boolean\",\"description\":\"Pass engine permission-bypass flags (dangerous)\"},"
                 << "\"timeoutSec\":{\"type\":\"integer\",\"description\":\"Per-message worker timeout\"},"
                 << "\"maxHops\":{\"type\":\"integer\",\"description\":\"Stop replying after this many LLM reply hops\"},"
                 << "\"concurrency\":{\"type\":\"integer\",\"description\":\"Handler queue concurrency\"}"
@@ -1489,7 +1488,6 @@ int RunMcpServer() {
                     putStr("instructions", nullptr, "instructions");
                     putStr("taskqueue", "taskQueue", "taskqueue");
                     putBool("autoReply", "auto_reply", "auto_reply");
-                    putBool("skipPermissions", "skip_permissions", "skip_permissions");
                     putInt("timeoutSec", "timeout_sec", "timeout_sec");
                     putInt("maxHops", "max_hops", "max_hops");
                     putInt("concurrency", nullptr, "concurrency");

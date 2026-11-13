@@ -4,7 +4,7 @@
 
 **Hancho** は、Claude Code や各種自動化スクリプトから複数のサブプロセス・対話型 CLI エージェント（`opencode`, `claude`, PowerShell, cmd, Git Bash 等）を並列起動・監視・制御し、**状況をひと目で把握できる Native Win32 + Direct2D マルチターミナルダッシュボード GUI** を備えたプロセスマネージャです。
 
-バージョンは `hancho-cli.exe --version` で確認できます（現在: 0.9.1）。
+バージョンは `hancho-cli.exe --version` で確認できます（現在: 0.9.11）。
 
 ### 対象ユーザー
 
@@ -22,8 +22,8 @@
 
 ## Express
 
-- [Hancho-v0.9.10-win64-setup.exe](https://github.com/gadget114514/Hancho/releases/download/v0.9.10/Hancho-v0.9.10-win64-setup.exe) をダウンロードしてインストール
-  （ポータブル版: [Hancho-v0.9.10-win64.zip](https://github.com/gadget114514/Hancho/releases/download/v0.9.10/Hancho-v0.9.10-win64.zip)、全バージョン: [Releases](https://github.com/gadget114514/Hancho/releases)）
+- [Hancho-v0.9.11-win64-setup.exe](https://github.com/gadget114514/Hancho/releases/download/v0.9.11/Hancho-v0.9.11-win64-setup.exe) をダウンロードしてインストール
+  （ポータブル版: [Hancho-v0.9.11-win64.zip](https://github.com/gadget114514/Hancho/releases/download/v0.9.11/Hancho-v0.9.11-win64.zip)、全バージョン: [Releases](https://github.com/gadget114514/Hancho/releases)）
 - LLM に「PATH から hancho を探して、help を読んで使い方を把握して」と伝える
 - LLM に「タスクを作成して、hancho 経由で (opencode|claude|agy|codex) に実行させて」と伝える
 - 以上
@@ -154,6 +154,12 @@ Hancho のデータはすべて JSON / JSONL（タスクキュー、ビヘイビ
 （以下の help 本文は英語です）
 
 ## リリースノート
+
+### v0.9.11
+- **Chat**: IPMsg 互換機能の名称を Chat に統一しました。`hancho-cli chat`（別名 `msg`）、MCP の `chat_*` ツール、単体 `Hancho.exe chat` ウインドウ、ダッシュボードのツールバーが対象です。`doc/ipmsg-ja.md` は `doc/chat-ja.md` になりました。
+- **MCP `chat_handler`**: 受信 Chat に応答する LLM を表示・変更できます（エンジン、モデル、エージェント、cwd、指示、タスクキュー、自動返信、タイムアウト、最大ホップ数、同時実行数）。
+- **Chat の信頼性**: ノード再起動を直列化し、未信頼のメッセージ本文を明確な区切りで囲んでから応答 LLM に渡すようにしました。旧 `ipmsg` のメッセージデータは `chat` へ移動します。
+- **ドキュメント**: CLI・MCP・機能ドキュメントを Chat に合わせて更新しました。
 
 ### v0.9.10
 - **Chat（IPMsg 互換）**: コアが古典的な IPMsg プロトコル（参加通知、メッセージ、開封通知、通常ファイル転送）を UDP/TCP ポート 2426 で話します。既定では無効です。LLM 同士のメッセージング用に `from_agent` / `to_agent` / `reply_to`、`audience`（human / agent）、ホップ数ガードを追加し、ワーカー LLM のハンドラが自動返信します。`hancho-cli chat`（別名 `msg`）、MCP の `chat_*` ツール（応答 LLM を変える `chat_handler` を含む）、単体ダイアログ（`Hancho.exe chat [--tray]`、ダッシュボードのツールバーからも起動可）とトレイ通知を利用できます。詳細は `doc/chat-ja.md`。

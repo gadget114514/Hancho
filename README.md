@@ -4,7 +4,7 @@
 
 **Hancho** is a native Win32 C++ Multi-Terminal ConPTY Process Manager and Dashboard designed for orchestrating, monitoring, and interacting with multiple parallel CLI agents (`claude`, `opencode`, build scripts, and interactive shells) via both **Model Context Protocol (MCP)** and **CLI commands**.
 
-Check the version with `hancho-cli.exe --version` (current: 0.9.1).
+Check the version with `hancho-cli.exe --version` (current: 0.9.11).
 
 ### Who is this for?
 
@@ -25,8 +25,8 @@ The dashboard has an **execution monitor pane** below the process and task lists
 
 ## Express
 
-- Download and install [Hancho-v0.9.10-win64-setup.exe](https://github.com/gadget114514/Hancho/releases/download/v0.9.10/Hancho-v0.9.10-win64-setup.exe)
-  (portable: [Hancho-v0.9.10-win64.zip](https://github.com/gadget114514/Hancho/releases/download/v0.9.10/Hancho-v0.9.10-win64.zip), all versions: [Releases](https://github.com/gadget114514/Hancho/releases))
+- Download and install [Hancho-v0.9.11-win64-setup.exe](https://github.com/gadget114514/Hancho/releases/download/v0.9.11/Hancho-v0.9.11-win64-setup.exe)
+  (portable: [Hancho-v0.9.11-win64.zip](https://github.com/gadget114514/Hancho/releases/download/v0.9.11/Hancho-v0.9.11-win64.zip), all versions: [Releases](https://github.com/gadget114514/Hancho/releases))
 - In your llm, "find hancho in PATH, then read help to use it" 
 - In your llm, "create task and use (opencode|claude|agy|codex) to execute the task via hancho" 
 - That's all
@@ -148,6 +148,12 @@ All Hancho data is plain JSON / JSONL (task queues, behavior trees, stream event
 ---
 
 ## Release Notes
+
+### v0.9.11
+- **Chat**: the IPMsg-compatible feature is now named Chat everywhere: `hancho-cli chat` (alias `msg`), the MCP `chat_*` tools, the standalone `Hancho.exe chat` window and the dashboard toolbar. `doc/ipmsg.md` became `doc/chat.md`.
+- **`chat_handler` MCP tool**: show or change the LLM that answers incoming Chat messages (engine, model, agent, cwd, instructions, taskqueue, auto-reply, timeout, max hops, concurrency).
+- **Chat reliability**: restarting the node is serialised, untrusted message text is delimited before it reaches the answering LLM, and older `ipmsg` message data is moved to `chat`.
+- **Docs**: CLI, MCP and feature docs renamed and updated for Chat.
 
 ### v0.9.10
 - **Chat (IPMsg compatible)**: the core speaks the classic IPMsg protocol (presence, messages, read receipts, regular-file transfer) on UDP/TCP port 2426, off by default. LLM-to-LLM messaging adds `from_agent` / `to_agent` / `reply_to`, an `audience` (human or agent) and a hop guard, and a worker-LLM handler replies automatically. Use `hancho-cli chat` (alias `msg`), the MCP `chat_*` tools (including `chat_handler` to change the answering LLM), or the standalone dialog (`Hancho.exe chat [--tray]`, also on the dashboard toolbar) with tray notifications. See `doc/chat.md`.

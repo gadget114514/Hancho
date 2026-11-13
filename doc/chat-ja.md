@@ -178,7 +178,7 @@ hancho-cli.exe chat handler off
 
 ## MCP ツール
 
-MCP サーバ (`Hancho.exe mcp`) は 10 個のツールを公開します。引数は camelCase (`sinceId`, `messageId`, ...) と snake_case の別名を受け付けます。
+MCP サーバ (`Hancho.exe mcp`) は 11 個のツールを公開します。引数は camelCase (`sinceId`, `messageId`, ...) と snake_case の別名を受け付けます。
 
 | ツール | 用途 |
 | :--- | :--- |
@@ -192,7 +192,7 @@ MCP サーバ (`Hancho.exe mcp`) は 10 個のツールを公開します。引�
 | `chat_read` | 既読にして開封通知を送る（`ids?` または `all`）。 |
 | `chat_download` | ファイルをダウンロード（`messageId`, `fileId?`, `dir?`, `wait?`, `timeoutMs?`）。 |
 | `chat_log` | 会話ログを検索（`since?`, `until?`, `query?`, `peer?`, `agent?`, `event?`, `limit?`）。 |
-| `chat_handler` | 応答 LLM（ハンドラ）を表示・変更（`enabled?`, `engine?`, `model?`, `agent?`, `instructions?`, `taskqueue?`, `autoReply?`, `skipPermissions?`, `timeoutSec?`, `maxHops?`, `concurrency?`）。指定した項目だけを変更し、結果は `chat_status` で確認できます。 |
+| `chat_handler` | 応答 LLM（ハンドラ）を表示・変更（`enabled?`, `engine?`, `model?`, `agent?`, `instructions?`, `taskqueue?`, `autoReply?`, `timeoutSec?`, `maxHops?`, `concurrency?`）。指定した項目だけを変更し、結果は `chat_status` で確認できます。 |
 
 ## LLM 同士のメッセージング
 

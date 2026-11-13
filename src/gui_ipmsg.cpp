@@ -432,7 +432,6 @@ void ApplyDialogTheme(DialogState* st, bool force = false) {
     styleList(st->peers);
     styleList(st->messages);
     styleList(st->files);
-    styleList(st->attachList);
     styleList(st->logList);
     ApplyDashboardNativeTheme(st->hwnd);
     if (p.dark) {
@@ -447,7 +446,6 @@ void ApplyDialogTheme(DialogState* st, bool force = false) {
         themeList(st->messages);
         themeList(st->files);
         themeList(st->logList);
-        themeList(st->attachList);
         // Buttons and the tab strip need an explicit dark-mode theme + change
         // notification; otherwise they keep the light system colours.
         for (HWND child = GetWindow(st->hwnd, GW_CHILD); child; child = GetWindow(child, GW_HWNDNEXT)) {
@@ -455,6 +453,24 @@ void ApplyDialogTheme(DialogState* st, bool force = false) {
             GetClassNameW(child, cls, 64);
             if (_wcsicmp(cls, L"Button") == 0 || _wcsicmp(cls, L"SysTabControl32") == 0) {
                 SetWindowTheme(child, L"DarkMode_Explorer", nullptr);
+                SendMessageW(child, WM_THEMECHANGED, 0, 0);
+            }
+        }
+    } else {
+        auto clearList = [](HWND list) {
+            if (!list) return;
+            SetWindowTheme(list, L"", L"");
+            if (HWND header = ListView_GetHeader(list)) SetWindowTheme(header, L"", L"");
+        };
+        clearList(st->peers);
+        clearList(st->messages);
+        clearList(st->files);
+        clearList(st->logList);
+        for (HWND child = GetWindow(st->hwnd, GW_CHILD); child; child = GetWindow(child, GW_HWNDNEXT)) {
+            wchar_t cls[64] = {};
+            GetClassNameW(child, cls, 64);
+            if (_wcsicmp(cls, L"Button") == 0 || _wcsicmp(cls, L"SysTabControl32") == 0) {
+                SetWindowTheme(child, L"", L"");
                 SendMessageW(child, WM_THEMECHANGED, 0, 0);
             }
         }
@@ -1597,6 +1613,8 @@ void ApplyFont(DialogState* st) {
     auto push = [&](HWND h) { if (h) all.push_back(h); };
     push(st->hwndTab);
     push(st->peersLabel); push(st->peers); push(st->btnRefreshPeers); push(st->peerCount);
+    push(st->handlerLabel); push(st->handlerEngine); push(st->handlerModel);
+    push(st->handlerEnabled); push(st->btnHandlerApply);
     push(st->msgLabel); push(st->messages); push(st->detailLabel); push(st->msgText);
     push(st->filesLabel); push(st->files); push(st->btnDownload); push(st->btnOpenFolder);
     push(st->composeToLabel); push(st->composeTo); push(st->fromAgentLabel);
@@ -2098,7 +2116,8 @@ LRESULT CALLBACK IpmsgWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam)
             if (code != BN_CLICKED) return 0;
             if (IsCheckboxControl(st, reinterpret_cast<HWND>(lParam))) {
                 SetCheck(reinterpret_cast<HWND>(lParam), !GetCheck(reinterpret_cast<HWND>(lParam)));
-                return 0;
+                // IDC_SET_ENABLED also applies the change immediately below.
+                if (id != IDC_SET_ENABLED) return 0;
             }
             switch (id) {
                 case IDC_BTN_REFRESH_PEERS: {

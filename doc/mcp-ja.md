@@ -81,7 +81,7 @@ LAN 専用で暗号化はありません。受信した文章は信頼できな�
 | `chat_read` | 既読にして開封通知を送る（`ids?` または `all`）。 |
 | `chat_download` | 受信メッセージのファイルを取得（`messageId`, `fileId?` = -1 で全部, `dir?`, `wait?`, `timeoutMs?`）。`wait` 指定時も MCP の読み取りループを止めません。 |
 | `chat_log` | 会話ログを検索（`since?` 既定 `7d`, `until?`, `query?`, `peer?`, `agent?`, `event?`, `limit?`）。 |
-| `chat_handler` | 応答 LLM を表示・変更。指定した項目だけを変更（`enabled?`, `engine?`, `model?`, `agent?`, `instructions?`, `taskqueue?`, `autoReply?`, `skipPermissions?`, `timeoutSec?`, `maxHops?`, `concurrency?`）。結果は `chat_status` で確認。 |
+| `chat_handler` | 応答 LLM を表示・変更。指定した項目だけを変更（`enabled?`, `engine?`, `model?`, `agent?`, `cwd?`, `instructions?`, `taskqueue?`, `autoReply?`, `timeoutSec?`, `maxHops?`, `concurrency?`）。結果は `chat_status` で確認。 |
 
 **メモリ操作**
 

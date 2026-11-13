@@ -171,7 +171,7 @@ hancho-cli.exe chat peers
 hancho-cli.exe chat refresh
 hancho-cli.exe chat send 192.168.1.20:2426 "build finished" --from-agent builder --audience human
 hancho-cli.exe chat send local "please review" --to-agent reviewer --audience agent
-hancho-cli.exe chat send 192.168.1.20:2426 "log attached" --file .uild.log
+hancho-cli.exe chat send 192.168.1.20:2426 "log attached" --file .\build.log
 hancho-cli.exe chat inbox --agent builder --unread --limit 20
 hancho-cli.exe chat get 42
 hancho-cli.exe chat wait --agent builder --since 41 --timeout 120

@@ -101,4 +101,4 @@
 - The core speaks the classic IPMsg protocol (presence, messages, read receipts, regular-file transfer) on UDP/TCP port 2426, off by default. Stock IPMsg clients on the same LAN see Hancho as a host.
 - LLM-to-LLM messaging with `from_agent` / `to_agent` / `reply_to`, an `audience` (human or agent) and a hop guard. Incoming messages can be handed to a worker LLM whose JSON answer is sent back as a reply.
 - `hancho-cli chat ...`, the MCP `chat_*` tools, and a standalone dialog (`Hancho.exe chat [--tray]`, also openable from the dashboard toolbar) with tray notifications, a searchable log and settings.
-- Trusted LAN only; nothing is encrypted. See [IP Messenger](chat.md) for the protocol, configuration, security notes and examples.
+- Trusted LAN only; nothing is encrypted. See [Chat](chat.md) for the protocol, configuration, security notes and examples.

@@ -178,7 +178,7 @@ Add `--json` (before or after the command) for the raw IPC reply.
 
 ## MCP tools
 
-The MCP server (`Hancho.exe mcp`) exposes ten tools. They accept camelCase (`sinceId`, `messageId`, ...) and snake_case aliases.
+The MCP server (`Hancho.exe mcp`) exposes eleven tools. They accept camelCase (`sinceId`, `messageId`, ...) and snake_case aliases.
 
 | Tool | Purpose |
 | :--- | :--- |
@@ -192,7 +192,7 @@ The MCP server (`Hancho.exe mcp`) exposes ten tools. They accept camelCase (`sin
 | `chat_read` | Mark messages read and send read receipts (`ids?` or `all`). |
 | `chat_download` | Download files (`messageId`, `fileId?`, `dir?`, `wait?`, `timeoutMs?`). |
 | `chat_log` | Search the conversation log (`since?`, `until?`, `query?`, `peer?`, `agent?`, `event?`, `limit?`). |
-| `chat_handler` | Show or change the answering LLM (`enabled?`, `engine?`, `model?`, `agent?`, `instructions?`, `taskqueue?`, `autoReply?`, `skipPermissions?`, `timeoutSec?`, `maxHops?`, `concurrency?`). Only supplied fields change; `chat_status` shows the result. |
+| `chat_handler` | Show or change the answering LLM (`enabled?`, `engine?`, `model?`, `agent?`, `instructions?`, `taskqueue?`, `autoReply?`, `timeoutSec?`, `maxHops?`, `concurrency?`). Only supplied fields change; `chat_status` shows the result. |
 
 ## LLM to LLM messaging
 

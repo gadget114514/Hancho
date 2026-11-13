@@ -404,6 +404,18 @@ nlohmann::json IpmsgConfig::ToJson() const {
 // Implementation
 // ---------------------------------------------------------------------------
 
+// Older releases stored messages and logs under "ipmsg"; move the directory
+// before the constructor loads messages so the first save cannot overwrite them.
+static void MigrateLegacyChatStore() {
+    std::error_code ec;
+    const std::filesystem::path data = GetEffectiveDataDirectoryWide();
+    const std::filesystem::path chat = data / L"chat";
+    const std::filesystem::path old = data / L"ipmsg";
+    if (!std::filesystem::exists(chat, ec) && std::filesystem::exists(old, ec)) {
+        std::filesystem::rename(old, chat, ec);
+    }
+}
+
 struct IpmsgNode::Impl {
     struct Peer {
         std::string key;  // "ip:port"
@@ -657,6 +669,7 @@ struct IpmsgNode::Impl {
 
     void Load() {
         if (loaded) return;
+        MigrateLegacyChatStore();
         loaded = true;
         std::string content = ReadFileUtf8Wide(StorePath());
         if (content.empty()) return;
@@ -1348,16 +1361,6 @@ IpmsgConfig IpmsgNode::GetConfig() const {
 bool IpmsgNode::Start(const IpmsgConfig& cfgIn, std::string* outError) {
     Stop();
     Impl& d = *impl_;
-    // Older releases stored messages and logs under "ipmsg"; move them once.
-    {
-        std::error_code ec;
-        const std::filesystem::path data = GetEffectiveDataDirectoryWide();
-        const std::filesystem::path chat = data / L"chat";
-        const std::filesystem::path old = data / L"ipmsg";
-        if (!std::filesystem::exists(chat, ec) && std::filesystem::exists(old, ec)) {
-            std::filesystem::rename(old, chat, ec);
-        }
-    }
     EnsureNetworking();
     {
         std::lock_guard<std::mutex> lk(d.mu);
