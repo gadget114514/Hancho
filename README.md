@@ -4,7 +4,7 @@
 
 **Hancho** is a native Win32 C++ Multi-Terminal ConPTY Process Manager and Dashboard designed for orchestrating, monitoring, and interacting with multiple parallel CLI agents (`claude`, `opencode`, build scripts, and interactive shells) via both **Model Context Protocol (MCP)** and **CLI commands**.
 
-Check the version with `hancho-cli.exe --version` (current: 0.9.12).
+Check the version with `hancho-cli.exe --version` (current: 0.9.13).
 
 ### Who is this for?
 
@@ -25,8 +25,8 @@ The dashboard has an **execution monitor pane** below the process and task lists
 
 ## Express
 
-- Download and install [Hancho-v0.9.12-win64-setup.exe](https://github.com/gadget114514/Hancho/releases/download/v0.9.12/Hancho-v0.9.11-win64-setup.exe)
-  (portable: [Hancho-v0.9.12-win64.zip](https://github.com/gadget114514/Hancho/releases/download/v0.9.11/Hancho-v0.9.11-win64.zip), all versions: [Releases](https://github.com/gadget114514/Hancho/releases))
+- Download and install [Hancho-v0.9.13-win64-setup.exe](https://github.com/gadget114514/Hancho/releases/download/v0.9.13/Hancho-v0.9.11-win64-setup.exe)
+  (portable: [Hancho-v0.9.13-win64.zip](https://github.com/gadget114514/Hancho/releases/download/v0.9.11/Hancho-v0.9.11-win64.zip), all versions: [Releases](https://github.com/gadget114514/Hancho/releases))
 - In your llm, "find hancho in PATH, then read help to use it" 
 - In your llm, "create task and use (opencode|claude|agy|codex) to execute the task via hancho" 
 - That's all
@@ -148,6 +148,9 @@ All Hancho data is plain JSON / JSONL (task queues, behavior trees, stream event
 ---
 
 ## Release Notes
+
+### v0.9.13
+- **Chat tray menu**: the exit item is now labelled **Hancho Chat終了** (Quit Hancho Chat) so it is clear that only the Chat window closes and the dashboard/core keeps running.
 
 ### v0.9.12
 - **Chat dialog layout**: messages (list, received body and attachments) on the left, hosts in the upper right and the compose in the lower right.

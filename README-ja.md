@@ -4,7 +4,7 @@
 
 **Hancho** は、Claude Code や各種自動化スクリプトから複数のサブプロセス・対話型 CLI エージェント（`opencode`, `claude`, PowerShell, cmd, Git Bash 等）を並列起動・監視・制御し、**状況をひと目で把握できる Native Win32 + Direct2D マルチターミナルダッシュボード GUI** を備えたプロセスマネージャです。
 
-バージョンは `hancho-cli.exe --version` で確認できます（現在: 0.9.12）。
+バージョンは `hancho-cli.exe --version` で確認できます（現在: 0.9.13）。
 
 ### 対象ユーザー
 
@@ -22,8 +22,8 @@
 
 ## Express
 
-- [Hancho-v0.9.12-win64-setup.exe](https://github.com/gadget114514/Hancho/releases/download/v0.9.12/Hancho-v0.9.11-win64-setup.exe) をダウンロードしてインストール
-  （ポータブル版: [Hancho-v0.9.12-win64.zip](https://github.com/gadget114514/Hancho/releases/download/v0.9.11/Hancho-v0.9.11-win64.zip)、全バージョン: [Releases](https://github.com/gadget114514/Hancho/releases)）
+- [Hancho-v0.9.13-win64-setup.exe](https://github.com/gadget114514/Hancho/releases/download/v0.9.13/Hancho-v0.9.11-win64-setup.exe) をダウンロードしてインストール
+  （ポータブル版: [Hancho-v0.9.13-win64.zip](https://github.com/gadget114514/Hancho/releases/download/v0.9.11/Hancho-v0.9.11-win64.zip)、全バージョン: [Releases](https://github.com/gadget114514/Hancho/releases)）
 - LLM に「PATH から hancho を探して、help を読んで使い方を把握して」と伝える
 - LLM に「タスクを作成して、hancho 経由で (opencode|claude|agy|codex) に実行させて」と伝える
 - 以上
@@ -154,6 +154,9 @@ Hancho のデータはすべて JSON / JSONL（タスクキュー、ビヘイビ
 （以下の help 本文は英語です）
 
 ## リリースノート
+
+### v0.9.13
+- **Chat のトレイメニュー**: 終了項目を **Hancho Chat終了** に変更し、Chat ウインドウだけが閉じてダッシュボード/コアは動き続けることを分かりやすくしました。
 
 ### v0.9.12
 - **Chat ダイアログのレイアウト**: 左にメッセージ（一覧・受信本文・受信添付）、右上にホスト、右下に送信欄。

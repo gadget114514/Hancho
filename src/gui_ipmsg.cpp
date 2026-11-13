@@ -866,7 +866,8 @@ void ShowTrayMenu(DialogState* st) {
     if (!menu) return;
     AppendMenuW(menu, MF_STRING, IDM_TRAY_OPEN, T(L"開く", L"Open", L"Abrir"));
     AppendMenuW(menu, MF_SEPARATOR, 0, nullptr);
-    AppendMenuW(menu, MF_STRING, IDM_TRAY_EXIT, T(L"終了", L"Exit", L"Salir"));
+    AppendMenuW(menu, MF_STRING, IDM_TRAY_EXIT,
+                T(L"Hancho Chat終了", L"Quit Hancho Chat", L"Salir de Hancho Chat"));
     POINT pt = {};
     GetCursorPos(&pt);
     SetForegroundWindow(st->hwnd);
