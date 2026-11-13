@@ -126,11 +126,11 @@ Audit LLM の動作は [設定] ダイアログ（および `logs/config.json`�
   "audit_llm_model": "gemini-3.8-flash-medium",
   "audit_timing_divergence_threshold": 2.0,
   "show_supervisor_hints": true,
-  "hint_auto_dismiss_sec": 6
+  "hint_auto_dismiss_sec": 7
 }
 ```
 
 - **`audit_llm_enabled`**: Audit LLM 機構の有効/無効。
 - **`audit_llm_engine`**: 監査に使用する軽量 CLI エンジン（`agy`, `claude`, `opencode`, `codex`）。
 - **`show_supervisor_hints`**: GUI ダッシュボードのポップアップ Hint ウインドウの表示/非表示。
-- **`hint_auto_dismiss_sec`**: ポップアップが自動消去されるまでの秒数（0 で手動消去のみ）。
+- **`hint_auto_dismiss_sec`**: ポップアップが自動消去されるまでの秒数（既定 7）。-1 で手動で閉じるまで表示、0 で表示しない。

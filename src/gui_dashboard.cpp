@@ -925,7 +925,7 @@ struct DashboardState {
     HWND hwndHintWnd = nullptr;
     HWND hwndHintHistory = nullptr;
     bool showSupervisorHints = true;
-    int hintAutoDismissSec = 6;
+    int hintAutoDismissSec = 7;
     std::string supervisorCommand = "claude";
     std::string lastHintSignature;
     // Signatures already popped up. Automatic hints skip them so a second divergence, failure or
@@ -9185,7 +9185,7 @@ static void LoadShellConfig(DashboardState* st) {
         static_cast<int>(JsonGetInt(content, "refresh_interval_ms", kDefaultRefreshIntervalMs)));
     SettingsManager::Instance().SetTabGridRefreshIntervalMs(st->refreshIntervalMs);
     st->showSupervisorHints = JsonGetBool(content, "show_supervisor_hints", true);
-    st->hintAutoDismissSec = static_cast<int>(JsonGetInt(content, "hint_auto_dismiss_sec", 6));
+    st->hintAutoDismissSec = static_cast<int>(JsonGetInt(content, "hint_auto_dismiss_sec", 7));
     st->supervisorCommand = JsonGetString(content, "supervisor_command", "claude");
     for (int m = 0; m < kListRowModeCount; ++m) {
         for (int k = 0; k < kListRowKeyCount; ++k) {
@@ -10043,9 +10043,13 @@ static void CommitSupervisorSettings(SettingsDlgState* ds) {
         wchar_t text[64] = {};
         GetWindowTextW(ds->editHintAutoDismissSec, text, 64);
         int val = _wtoi(text);
-        if (val < 0) val = 0;
+        if (val < -1) val = -1;
         if (val > 60) val = 60;
         ds->dash->hintAutoDismissSec = val;
+        if (val == 0 && ds->dash->hwndHintWnd) {
+            ShowWindow(ds->dash->hwndHintWnd, SW_HIDE);
+            KillTimer(ds->dash->hwndHintWnd, TIMER_HINT_COUNTDOWN_ID);
+        }
         SetWindowTextW(ds->editHintAutoDismissSec, std::to_wstring(val).c_str());
     }
     if (ds->editSupervisorCommand) {
@@ -10218,9 +10222,9 @@ static void UpdateSettingsDialogTexts(HWND hwnd) {
     }
     if (ds->lblHintAutoDismissSec) {
         SetWindowTextW(ds->lblHintAutoDismissSec, Tr(
-            L"ヒント自動消去秒数 (0〜60, 既定 6, 0 = 手動消去のみ):",
-            L"Hint auto-dismiss seconds (0-60, default 6, 0 = manual close only):",
-            L"Segundos para auto-ocultar consejos (0-60, predeterminado 6, 0 = solo manual):"));
+            L"ヒント自動消去秒数 (-1〜60, 既定 7, -1 = 手動で閉じるまで表示, 0 = 表示しない):",
+            L"Hint auto-dismiss seconds (-1-60, default 7, -1 = keep until closed, 0 = do not show):",
+            L"Segundos para auto-ocultar consejos (-1-60, predeterminado 7, -1 = hasta cerrar, 0 = no mostrar):"));
     }
     if (ds->lblSupervisorCommand) {
         SetWindowTextW(ds->lblSupervisorCommand, Tr(
@@ -12708,6 +12712,8 @@ static void DisplaySupervisorHint(DashboardState* st, const std::wstring& catego
                                   const std::wstring& summary, const std::wstring& prompt,
                                   int autoDismissSec) {
     if (!st || !st->hwndMain) return;
+    // 0 disables the toast; -1 keeps it up until the user closes it.
+    if (autoDismissSec == 0) return;
     st->currentHintCategory = category;
     st->currentHintSummary = summary;
     st->currentHintPrompt = prompt;

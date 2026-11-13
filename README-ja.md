@@ -22,8 +22,8 @@
 
 ## Express
 
-- [Hancho-v0.9.8-win64-setup.exe](https://github.com/gadget114514/Hancho/releases/download/v0.9.8/Hancho-v0.9.8-win64-setup.exe) をダウンロードしてインストール
-  （ポータブル版: [Hancho-v0.9.8-win64.zip](https://github.com/gadget114514/Hancho/releases/download/v0.9.8/Hancho-v0.9.8-win64.zip)、全バージョン: [Releases](https://github.com/gadget114514/Hancho/releases)）
+- [Hancho-v0.9.9-win64-setup.exe](https://github.com/gadget114514/Hancho/releases/download/v0.9.9/Hancho-v0.9.9-win64-setup.exe) をダウンロードしてインストール
+  （ポータブル版: [Hancho-v0.9.9-win64.zip](https://github.com/gadget114514/Hancho/releases/download/v0.9.9/Hancho-v0.9.9-win64.zip)、全バージョン: [Releases](https://github.com/gadget114514/Hancho/releases)）
 - LLM に「PATH から hancho を探して、help を読んで使い方を把握して」と伝える
 - LLM に「タスクを作成して、hancho 経由で (opencode|claude|agy|codex) に実行させて」と伝える
 - 以上
@@ -154,6 +154,9 @@ Hancho のデータはすべて JSON / JSONL（タスクキュー、ビヘイビ
 （以下の help 本文は英語です）
 
 ## リリースノート
+
+### v0.9.9
+- **Supervisor ヒント toast**: 自動消去の既定時間を 7 秒に変更しました（従来 6 秒）。`hint_auto_dismiss_sec` は `-1` で手動で閉じるまで表示、`0` で表示しない、正の値でその秒数後に自動消去します。`config.json` に保存済みの値がある場合はそちらが優先されます。
 
 ### v0.9.8
 - **指定タスク終了後の PC サスペンド**: ジョブに `suspendWhenDone` / `suspendDelaySec` / `suspendHibernate` を付けるか、`hancho-cli power suspend --after-job <id>` で予約できます。対象ジョブと他の全タスクキュー・Hancho 管理プロセスがアイドルになった後、PC をスリープ（または休止）します。新しい作業が始まるとカウントダウンは取り消され、再びアイドルになってから再開します。`power status` / `power cancel`、MCP `power_suspend` / `power_cancel` / `power_status`、`--dry-run` に対応。ローカルホスト専用です。

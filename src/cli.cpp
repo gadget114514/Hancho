@@ -3323,7 +3323,7 @@ void PrintCliUsageJson() {
         "action": "Recalibrate estimateSec/timeoutSec of the remaining jobs of the same kind (taskqueue_update), or split long jobs."
       },
       "resource_wait": "In taskqueue list and graph: 'holder: resource' while a pending job waits for a resource lock, otherwise null. Long waits: add dependsOn or use read locks.",
-      "config": {"audit_timing_divergence_threshold": 2.0, "audit_timing_under_threshold": 0.33, "show_supervisor_hints": true, "hint_auto_dismiss_sec": 6},
+      "config": {"audit_timing_divergence_threshold": 2.0, "audit_timing_under_threshold": 0.33, "show_supervisor_hints": true, "hint_auto_dismiss_sec": 7},
       "dashboard": "The supervisor hint window shows timing divergences, failed jobs, resource waits and behavior-tree escalations with a prompt to copy to the supervisor.",
       "guide": "doc/audit-llm.md, doc/audit-llm-ja.md and doc/audit-llm-design.md in the Hancho installation folder."
     },

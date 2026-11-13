@@ -25,8 +25,8 @@ The dashboard has an **execution monitor pane** below the process and task lists
 
 ## Express
 
-- Download and install [Hancho-v0.9.8-win64-setup.exe](https://github.com/gadget114514/Hancho/releases/download/v0.9.8/Hancho-v0.9.8-win64-setup.exe)
-  (portable: [Hancho-v0.9.8-win64.zip](https://github.com/gadget114514/Hancho/releases/download/v0.9.8/Hancho-v0.9.8-win64.zip), all versions: [Releases](https://github.com/gadget114514/Hancho/releases))
+- Download and install [Hancho-v0.9.9-win64-setup.exe](https://github.com/gadget114514/Hancho/releases/download/v0.9.9/Hancho-v0.9.9-win64-setup.exe)
+  (portable: [Hancho-v0.9.9-win64.zip](https://github.com/gadget114514/Hancho/releases/download/v0.9.9/Hancho-v0.9.9-win64.zip), all versions: [Releases](https://github.com/gadget114514/Hancho/releases))
 - In your llm, "find hancho in PATH, then read help to use it" 
 - In your llm, "create task and use (opencode|claude|agy|codex) to execute the task via hancho" 
 - That's all
@@ -148,6 +148,9 @@ All Hancho data is plain JSON / JSONL (task queues, behavior trees, stream event
 ---
 
 ## Release Notes
+
+### v0.9.9
+- **Supervisor hint toast**: the default auto-dismiss time is now 7 seconds (previously 6). `hint_auto_dismiss_sec` now uses `-1` to keep the toast open until it is closed, `0` to disable the toast, and a positive number for auto-dismiss. A value already stored in `config.json` still overrides the default.
 
 ### v0.9.8
 - **Suspend after a task**: arm a job with `suspendWhenDone` / `suspendDelaySec` / `suspendHibernate`, or run `hancho-cli power suspend --after-job <id>`. The PC sleeps or hibernates after that job and every other task-queue job / Hancho-managed process is idle; new work cancels and restarts the countdown. `power status` / `power cancel`, MCP `power_suspend` / `power_cancel` / `power_status`, and `--dry-run` are included. Local host only.

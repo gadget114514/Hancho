@@ -130,6 +130,6 @@ The Audit LLM and Hint Window are configured via the GUI Settings dialog or in `
   "audit_llm_model": "gemini-3.8-flash-medium",
   "audit_timing_divergence_threshold": 2.0,
   "show_supervisor_hints": true,
-  "hint_auto_dismiss_sec": 6
+  "hint_auto_dismiss_sec": 7
 }
 ```

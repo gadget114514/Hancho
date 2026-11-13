@@ -452,7 +452,7 @@ Supervisor 向けガイド（[mcp-ja.md](mcp-ja.md) と `hancho-cli guide`）に
   "audit_inject_mcp": true,                  // ループ B
   "audit_inject_max": 3,
   "show_supervisor_hints": true,             // ループ A（既存）
-  "hint_auto_dismiss_sec": 6,                // 既存
+  "hint_auto_dismiss_sec": 7,                // 既存
   "supervisor_command": "claude"             // 既存（Hint 窓の Supervisor 起動ボタン）
 }
 ```
