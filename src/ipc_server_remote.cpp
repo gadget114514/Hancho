@@ -1,7 +1,10 @@
 #include "ipc_server.h"
 
+#include "bt_manager.h"
 #include "common.h"
 #include "event_schema.h"
+#include "ipmsg.h"
+#include "ipmsg_handler.h"
 #include "remote_hosts.h"
 #include "webui_server.h"
 #include "nlohmann/json.hpp"
@@ -571,6 +574,60 @@ void IpcServer::ScheduleWebUiRestart() {
         StopWebUiServer();
         if (stop_.load()) return;
         StartWebUiServer(token);
+    });
+}
+
+void IpcServer::StartIpmsg() {
+    if (!ipmsg_) ipmsg_ = std::make_unique<IpmsgNode>();
+    nlohmann::json block = nlohmann::json::object();
+    std::string content =
+        ReadFileUtf8Wide(PathJoinWide(GetEffectiveDataDirectoryWide(), L"config.json"));
+    if (!content.empty()) {
+        nlohmann::json cfg = nlohmann::json::parse(content, nullptr, false);
+        if (cfg.is_object() && cfg.contains("ipmsg") && cfg["ipmsg"].is_object()) {
+            block = cfg["ipmsg"];
+        }
+    }
+    IpmsgConfig cfg = IpmsgConfig::FromJson(block);
+    // The handler keeps its state across node restarts and re-reads the config here.
+    if (ipmsgHandler_) {
+        nlohmann::json handlerBlock =
+            block.is_object() && block.contains("handler") && block["handler"].is_object()
+                ? block["handler"]
+                : nlohmann::json::object();
+        IpmsgHandlerConfig handlerCfg = IpmsgHandlerConfig::FromJson(handlerBlock);
+        ipmsgHandler_->Configure(handlerCfg, WideToUtf8(GetEffectiveDataDirectoryWide()),
+                                 btm_ ? &btm_->Engines() : nullptr);
+        ipmsg_->SetOnMessage([this](const nlohmann::json& message) {
+            if (ipmsgHandler_) ipmsgHandler_->OnMessage(message);
+        });
+    }
+    // Start() stops an existing node itself, so a disabled config also frees the port.
+    if (!cfg.enabled) {
+        StopIpmsg();
+        return;
+    }
+    std::string err;
+    if (!ipmsg_->Start(cfg, &err)) {
+        WriteAuditLog("IPMSG_START_FAILED", err.empty() ? "cannot start IPMsg" : err);
+    }
+}
+
+void IpcServer::StopIpmsg() {
+    if (ipmsg_) ipmsg_->Stop();
+}
+
+void IpcServer::ScheduleIpmsgRestart() {
+    if (ipmsgRestartThread_.joinable()) {
+        ipmsgRestartThread_.join();
+    }
+    ipmsgRestartThread_ = std::thread([this]() {
+        // Let the config_set reply reach the caller before closing its connection.
+        SleepMs(250);
+        if (stop_.load()) return;
+        StopIpmsg();
+        if (stop_.load()) return;
+        StartIpmsg();
     });
 }
 

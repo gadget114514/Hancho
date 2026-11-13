@@ -1,5 +1,5 @@
 cmake_minimum_required(VERSION 3.20)
-project(Hancho VERSION 0.9.9 LANGUAGES CXX)
+project(Hancho VERSION 0.9.10 LANGUAGES CXX)
 
 set(CMAKE_CXX_STANDARD 20)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
@@ -31,6 +31,8 @@ add_executable(Hancho
     src/ipc_server.cpp
     src/ipc_server_remote.cpp
     src/webui_server.cpp
+    src/ipmsg.cpp
+    src/ipmsg_handler.cpp
     src/webui_assets.cpp
     src/ipc_client.cpp
     src/remote_client.cpp
@@ -61,6 +63,7 @@ add_executable(Hancho
     src/bt_manager.cpp
     src/bt_manager_api.cpp
     src/gui_dashboard.cpp
+    src/gui_ipmsg.cpp
     src/app.rc
     src/agent_template.rc
     src/Terminal/src/ConPtySession.cpp
@@ -105,6 +108,7 @@ target_link_libraries(Hancho PRIVATE
     windowscodecs
     crypt32
     ws2_32
+    iphlpapi
     powrprof
     "${CMAKE_CURRENT_SOURCE_DIR}/lib/libsixel.lib"
 )
@@ -598,6 +602,8 @@ add_executable(bt_ipc_smoke
     src/ipc_server.cpp
     src/ipc_server_remote.cpp
     src/webui_server.cpp
+    src/ipmsg.cpp
+    src/ipmsg_handler.cpp
     src/webui_assets.cpp
     src/remote_client.cpp
     src/remote_hosts.cpp
@@ -857,6 +863,8 @@ else()
         src/ipc_server_posix.cpp
         src/ipc_server_remote.cpp
         src/webui_server.cpp
+        src/ipmsg.cpp
+        src/ipmsg_handler.cpp
         src/webui_assets.cpp
         src/ipc_client_posix.cpp
         src/remote_client.cpp

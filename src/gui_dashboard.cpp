@@ -1,3 +1,4 @@
+#include <winsock2.h>
 #include "gui_dashboard.h"
 #include "common.h"
 #include "llm_stream.h"
@@ -16,6 +17,7 @@
 #include "nlohmann/json.hpp"
 #include <commctrl.h>
 #include <windowsx.h>
+#include <iphlpapi.h>
 #include <shellapi.h>
 #include <dwmapi.h>
 #include <uxtheme.h>
@@ -623,6 +625,35 @@ static const wchar_t* Tr(const wchar_t* ja, const wchar_t* en, const wchar_t* es
     return ja;
 }
 
+// Info tip text for a list cell whose column cut the text short.
+static void SetListInfoTip(NMLVGETINFOTIPW* tip, const std::wstring& text) {
+    if (!tip || !tip->pszText || tip->cchTextMax <= 0) return;
+    wcsncpy_s(tip->pszText, static_cast<size_t>(tip->cchTextMax), text.c_str(), _TRUNCATE);
+}
+
+// The whole cell text the control stores, even when the column shows only its start.
+static std::wstring ListViewFullCellText(HWND list, int item, int subItem) {
+    if (!list || item < 0 || subItem < 0) return std::wstring();
+    std::wstring text(256, L'\0');
+    for (;;) {
+        LVITEMW lvi = {};
+        lvi.iSubItem = subItem;
+        lvi.cchTextMax = static_cast<int>(text.size());
+        lvi.pszText = text.data();
+        LRESULT n = SendMessageW(list, LVM_GETITEMTEXTW, static_cast<WPARAM>(item),
+                                 reinterpret_cast<LPARAM>(&lvi));
+        if (n < static_cast<LRESULT>(text.size()) - 1) {
+            text.resize(static_cast<size_t>(n));
+            return text;
+        }
+        if (text.size() >= (1u << 20)) {
+            text.resize(static_cast<size_t>(n));
+            return text;
+        }
+        text.resize(text.size() * 2);
+    }
+}
+
 // Small caption bar above each list so it is clear which list is which.
 static const wchar_t* ProcListCaptionText() {
     return Tr(L"プロセス", L"PROCESSES", L"PROCESOS");
@@ -789,6 +820,7 @@ enum ControlId {
     IDC_BTN_SEARCH_TASK = 1048,
     IDC_EDIT_SEARCH_PROC = 1049,
     IDC_EDIT_SEARCH_TASK = 1050,
+    IDC_BTN_IPMSG = 1051,
     IDC_SET_LANG_JA = 6001,
     IDC_SET_LANG_EN = 6002,
     IDC_SET_LANG_ES = 6003,
@@ -844,6 +876,7 @@ enum ControlId {
     IDC_SET_WEBUI_ENABLED = 6059,
     IDC_SET_WEBUI_SCOPE = 6060,
     IDC_SET_WEBUI_ALLOWED_HOSTS = 6061,
+    IDC_SET_WEBUI_PORT = 6062,
     IDM_TRAY_RESTORE = 4001,
     IDM_TRAY_GRID_VIEW = 4002,
     IDM_TRAY_HIDE = 4003,
@@ -930,6 +963,7 @@ struct DashboardState {
     HWND hwndBtnUsage = nullptr;
     HWND hwndBtnHint = nullptr;
     HWND hwndBtnHistory = nullptr;
+    HWND hwndBtnIpmsg = nullptr;
     HWND hwndHintWnd = nullptr;
     HWND hwndHintHistory = nullptr;
     bool showSupervisorHints = true;
@@ -3798,7 +3832,7 @@ static LRESULT CALLBACK PastRunsWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPAR
             ds->list = CreateWindowExW(WS_EX_CLIENTEDGE, WC_LISTVIEWW, L"",
                 WS_CHILD | LVS_REPORT | LVS_SINGLESEL | LVS_SHOWSELALWAYS,
                 20, 166, 700, 180, hwnd, (HMENU)2703, nullptr, nullptr);
-            ListView_SetExtendedListViewStyle(ds->list, LVS_EX_FULLROWSELECT | LVS_EX_GRIDLINES);
+            ListView_SetExtendedListViewStyle(ds->list, LVS_EX_FULLROWSELECT | LVS_EX_GRIDLINES | LVS_EX_INFOTIP);
             PastRunsAddColumn(ds->list, 0, Tr(L"開始", L"Started", L"Inicio"), 170);
             PastRunsAddColumn(ds->list, 1, Tr(L"結果", L"Outcome", L"Resultado"), 90);
             PastRunsAddColumn(ds->list, 2, Tr(L"失敗分類", L"Failure", L"Fallo"), 170);
@@ -3816,7 +3850,7 @@ static LRESULT CALLBACK PastRunsWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPAR
             ds->whyList = CreateWindowExW(WS_EX_CLIENTEDGE, WC_LISTVIEWW, L"",
                 WS_CHILD | LVS_REPORT | LVS_SINGLESEL | LVS_SHOWSELALWAYS,
                 20, 166, 700, 90, hwnd, (HMENU)2706, nullptr, nullptr);
-            ListView_SetExtendedListViewStyle(ds->whyList, LVS_EX_FULLROWSELECT | LVS_EX_GRIDLINES);
+            ListView_SetExtendedListViewStyle(ds->whyList, LVS_EX_FULLROWSELECT | LVS_EX_GRIDLINES | LVS_EX_INFOTIP);
             PastRunsAddColumn(ds->whyList, 0, Tr(L"種別", L"Kind", L"Tipo"), 70);
             PastRunsAddColumn(ds->whyList, 1, Tr(L"ファイル", L"File", L"Archivo"), 500);
             PastRunsAddColumn(ds->whyList, 2, Tr(L"位置", L"Location", L"Ubicación"), 150);
@@ -3846,6 +3880,16 @@ static LRESULT CALLBACK PastRunsWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPAR
             auto* nm = reinterpret_cast<NMHDR*>(lParam);
             if (nm && nm->hwndFrom == ds->tab && nm->code == TCN_SELCHANGE) {
                 PastRunsSelectTab(hwnd, ds, TabCtrl_GetCurSel(ds->tab));
+                return 0;
+            }
+            if (nm && nm->hwndFrom == ds->list && nm->code == LVN_GETINFOTIPW) {
+                auto* tip = reinterpret_cast<NMLVGETINFOTIPW*>(lParam);
+                SetListInfoTip(tip, ListViewFullCellText(ds->list, tip->iItem, tip->iSubItem));
+                return 0;
+            }
+            if (nm && nm->hwndFrom == ds->whyList && nm->code == LVN_GETINFOTIPW) {
+                auto* tip = reinterpret_cast<NMLVGETINFOTIPW*>(lParam);
+                SetListInfoTip(tip, ListViewFullCellText(ds->whyList, tip->iItem, tip->iSubItem));
                 return 0;
             }
             if (nm && nm->hwndFrom == ds->list && nm->code == LVN_ITEMCHANGED) {
@@ -4291,7 +4335,7 @@ static LRESULT CALLBACK MemoryListWndProc(HWND hwnd, UINT msg, WPARAM wParam, LP
             ds->list = CreateWindowExW(WS_EX_CLIENTEDGE, WC_LISTVIEWW, L"",
                 WS_CHILD | WS_VISIBLE | LVS_REPORT | LVS_SINGLESEL | LVS_SHOWSELALWAYS,
                 12, 46, 500, 400, hwnd, (HMENU)2803, nullptr, nullptr);
-            ListView_SetExtendedListViewStyle(ds->list, LVS_EX_FULLROWSELECT | LVS_EX_GRIDLINES);
+            ListView_SetExtendedListViewStyle(ds->list, LVS_EX_FULLROWSELECT | LVS_EX_GRIDLINES | LVS_EX_INFOTIP);
             MemoryListAddColumn(ds->list, 0, L"ID", 150);
             MemoryListAddColumn(ds->list, 1, Tr(L"レイヤー", L"Layer", L"Capa"), 95);
             MemoryListAddColumn(ds->list, 2, Tr(L"作者", L"Author", L"Autor"), 70);
@@ -4337,6 +4381,11 @@ static LRESULT CALLBACK MemoryListWndProc(HWND hwnd, UINT msg, WPARAM wParam, LP
         case WM_NOTIFY: {
             if (!ds) break;
             auto* nm = reinterpret_cast<NMHDR*>(lParam);
+            if (nm && nm->hwndFrom == ds->list && nm->code == LVN_GETINFOTIPW) {
+                auto* tip = reinterpret_cast<NMLVGETINFOTIPW*>(lParam);
+                SetListInfoTip(tip, ListViewFullCellText(ds->list, tip->iItem, tip->iSubItem));
+                return 0;
+            }
             if (nm && nm->hwndFrom == ds->list && nm->code == LVN_ITEMCHANGED) {
                 int sel = ListView_GetNextItem(ds->list, -1, LVNI_SELECTED);
                 if (sel >= 0 && static_cast<size_t>(sel) < ds->rows.size() && ds->detail) {
@@ -4532,9 +4581,8 @@ static void ShowMemoryListDialog(DashboardState* st) {
 
 static void CopyTextToClipboard(HWND hwnd, const std::wstring& text);
 
-// Column indexes of "Origin" and "Resources" in the task list (see UpdateTaskListColumnWidths).
+// Column index of "Origin" in the task list (see UpdateTaskListColumnWidths).
 static const int kTaskListOriginCol = 8;
-static const int kTaskListResourcesCol = 9;
 
 // Full text of one task-list cell. The control keeps the whole string even when the column is
 // too narrow to draw it, so this is the text that hover and "copy cell" should use.
@@ -5054,10 +5102,12 @@ static std::wstring ShortTarget(const std::string& target, size_t maxChars = 80)
 }
 
 // "✏️ Editing file  src/a.cpp  (1m20s)"; the elapsed time only while it is still going on.
-static std::wstring ActivityLine(const std::string& kind, const std::string& target, int64_t sinceMs, bool ongoing) {
+// targetMaxChars lets the hover tip ask for the whole target instead of the cell's short form.
+static std::wstring ActivityLine(const std::string& kind, const std::string& target, int64_t sinceMs,
+                                 bool ongoing, size_t targetMaxChars = 80) {
     if (kind.empty()) return L"";
     std::wstring line = ActivityLabel(kind);
-    if (!target.empty() && kind != "done" && kind != "waiting_model") line += L"  " + ShortTarget(target);
+    if (!target.empty() && kind != "done" && kind != "waiting_model") line += L"  " + ShortTarget(target, targetMaxChars);
     if (ongoing && sinceMs > 0) line += L"  (" + FormatElapsed(NowEpochMs() - sinceMs) + L")";
     return line;
 }
@@ -5615,6 +5665,7 @@ static void LayoutControls(DashboardState* st, int width, int height) {
         {st->hwndBtnRefresh, 28},
         {st->hwndBtnHint, 28},
         {st->hwndBtnHistory, 28},
+        {st->hwndBtnIpmsg, 28},
         {st->hwndClock, 80}
     };
     const int gap = 7;
@@ -5851,6 +5902,7 @@ struct TaskDetailsDlgState {
     nlohmann::json rootJson;
     std::unordered_map<HTREEITEM, std::string> nodeJsonMap;
     std::unordered_map<HTREEITEM, std::string> nodePathMap;
+    std::unordered_map<HTREEITEM, std::wstring> nodeTipMap;
 };
 
 static void PopulateJsonTreeRecursive(
@@ -5861,6 +5913,7 @@ static void PopulateJsonTreeRecursive(
     const std::string& currentPath,
     std::unordered_map<HTREEITEM, std::string>& nodeJsonMap,
     std::unordered_map<HTREEITEM, std::string>& nodePathMap,
+    std::unordered_map<HTREEITEM, std::wstring>& nodeTipMap,
     int depth = 0
 ) {
     TVINSERTSTRUCTW tvis = {};
@@ -5869,6 +5922,7 @@ static void PopulateJsonTreeRecursive(
     tvis.item.mask = TVIF_TEXT;
 
     std::wstring label;
+    std::wstring fullLabel;
     if (j.is_object()) {
         std::wstringstream ss;
         if (!keyName.empty()) {
@@ -5884,9 +5938,11 @@ static void PopulateJsonTreeRecursive(
         ss << L"[ ... ] (" << j.size() << Tr(L" 要素", L" items", L" elementos") << L")";
         label = ss.str();
     } else if (j.is_string()) {
-        std::string s = j.get<std::string>();
-        if (s.size() > 70) s = s.substr(0, 67) + "...";
-        label = (keyName.empty() ? L"" : Utf8ToWide(keyName) + L": ") + L"\"" + Utf8ToWide(s) + L"\"";
+        const std::string s = j.get<std::string>();
+        fullLabel = (keyName.empty() ? L"" : Utf8ToWide(keyName) + L": ") + L"\"" + Utf8ToWide(s) + L"\"";
+        std::string shown = s;
+        if (shown.size() > 70) shown = shown.substr(0, 67) + "...";
+        label = (keyName.empty() ? L"" : Utf8ToWide(keyName) + L": ") + L"\"" + Utf8ToWide(shown) + L"\"";
     } else if (j.is_number()) {
         label = (keyName.empty() ? L"" : Utf8ToWide(keyName) + L": ") + Utf8ToWide(j.dump());
     } else if (j.is_boolean()) {
@@ -5895,6 +5951,7 @@ static void PopulateJsonTreeRecursive(
         label = (keyName.empty() ? L"" : Utf8ToWide(keyName) + L": ") + L"null";
     }
 
+    if (fullLabel.empty()) fullLabel = label;
     tvis.item.pszText = const_cast<wchar_t*>(label.c_str());
     tvis.item.cchTextMax = static_cast<int>(label.size());
     HTREEITEM hItem = TreeView_InsertItem(hTree, &tvis);
@@ -5906,6 +5963,7 @@ static void PopulateJsonTreeRecursive(
         nodeJsonMap[hItem] = "(JSON serialization error)";
     }
     nodePathMap[hItem] = currentPath;
+    nodeTipMap[hItem] = fullLabel;
 
     if (depth < 2) {
         TreeView_Expand(hTree, hItem, TVE_EXPAND);
@@ -5914,14 +5972,14 @@ static void PopulateJsonTreeRecursive(
     if (j.is_object()) {
         for (auto it = j.begin(); it != j.end(); ++it) {
             std::string subPath = currentPath.empty() ? it.key() : (currentPath + "." + it.key());
-            PopulateJsonTreeRecursive(hTree, hItem, it.value(), it.key(), subPath, nodeJsonMap, nodePathMap, depth + 1);
+            PopulateJsonTreeRecursive(hTree, hItem, it.value(), it.key(), subPath, nodeJsonMap, nodePathMap, nodeTipMap, depth + 1);
         }
     } else if (j.is_array()) {
         size_t idx = 0;
         for (const auto& item : j) {
             std::string itemKey = "[" + std::to_string(idx) + "]";
             std::string subPath = currentPath + itemKey;
-            PopulateJsonTreeRecursive(hTree, hItem, item, itemKey, subPath, nodeJsonMap, nodePathMap, depth + 1);
+            PopulateJsonTreeRecursive(hTree, hItem, item, itemKey, subPath, nodeJsonMap, nodePathMap, nodeTipMap, depth + 1);
             idx++;
         }
     }
@@ -5963,7 +6021,7 @@ static LRESULT CALLBACK TaskDetailsWndProc(HWND hwnd, UINT msg, WPARAM wParam, L
 
             ds->hwndTree = CreateWindowExW(WS_EX_CLIENTEDGE, WC_TREEVIEWW, L"",
                 WS_CHILD | (ds->isJsonMode && ds->showTreeView ? WS_VISIBLE : 0) |
-                TVS_HASLINES | TVS_LINESATROOT | TVS_HASBUTTONS | TVS_SHOWSELALWAYS,
+                TVS_HASLINES | TVS_LINESATROOT | TVS_HASBUTTONS | TVS_SHOWSELALWAYS | TVS_INFOTIP,
                 14, 122, 390, 470, hwnd, (HMENU)2008, nullptr, nullptr);
             TreeView_SetBkColor(ds->hwndTree, g_theme.panel);
             TreeView_SetTextColor(ds->hwndTree, g_theme.listText);
@@ -5975,7 +6033,8 @@ static LRESULT CALLBACK TaskDetailsWndProc(HWND hwnd, UINT msg, WPARAM wParam, L
 
             if (ds->isJsonMode) {
                 SendMessageW(ds->hwndTree, WM_SETREDRAW, FALSE, 0);
-                PopulateJsonTreeRecursive(ds->hwndTree, TVI_ROOT, ds->rootJson, "root", "root", ds->nodeJsonMap, ds->nodePathMap, 0);
+                PopulateJsonTreeRecursive(ds->hwndTree, TVI_ROOT, ds->rootJson, "root", "root",
+                                          ds->nodeJsonMap, ds->nodePathMap, ds->nodeTipMap, 0);
                 SendMessageW(ds->hwndTree, WM_SETREDRAW, TRUE, 0);
                 InvalidateRect(ds->hwndTree, nullptr, TRUE);
 
@@ -6066,6 +6125,13 @@ static LRESULT CALLBACK TaskDetailsWndProc(HWND hwnd, UINT msg, WPARAM wParam, L
                             std::wstring pathLbl = std::wstring(Tr(L"JSON パス: ", L"JSON Path: ", L"Ruta JSON: ")) + Utf8ToWide(itP->second);
                             SetWindowTextW(ds->hwndLblInfo, pathLbl.c_str());
                         }
+                    }
+                } else if (pnmh->code == TVN_GETINFOTIPW) {
+                    // The tree shortens long string values; show the whole value on hover.
+                    auto* tip = reinterpret_cast<NMTVGETINFOTIPW*>(lParam);
+                    auto it = ds->nodeTipMap.find(tip->hItem);
+                    if (it != ds->nodeTipMap.end() && tip->pszText && tip->cchTextMax > 0) {
+                        wcsncpy_s(tip->pszText, static_cast<size_t>(tip->cchTextMax), it->second.c_str(), _TRUNCATE);
                     }
                 }
             }
@@ -7805,15 +7871,17 @@ static std::wstring AgentStatsText(const LlmAgentState& as) {
 
 // The execution monitor pane: goal, where things stand now, and the activity history.
 // Sub-agent status in the user's language, then its tool calls.
+static std::wstring SubagentStatusText(const std::string& kind) {
+    if (kind == "running") return Tr(L"実行中", L"Running", L"En curso");
+    if (kind == "completed") return Tr(L"完了", L"Completed", L"Completado");
+    if (kind == "failed") return Tr(L"失敗", L"Failed", L"Fallido");
+    if (kind == "killed") return Tr(L"強制終了", L"Killed", L"Forzado");
+    if (kind == "stopped") return Tr(L"停止", L"Stopped", L"Detenido");
+    return Utf8ToWide(kind);
+}
+
 static std::wstring SubagentRowDescription(const ActivityTreeRow& t) {
-    std::wstring status;
-    if (t.kind == "running") status = Tr(L"実行中", L"Running", L"En curso");
-    else if (t.kind == "completed") status = Tr(L"完了", L"Completed", L"Completado");
-    else if (t.kind == "failed") status = Tr(L"失敗", L"Failed", L"Fallido");
-    else if (t.kind == "killed") status = Tr(L"強制終了", L"Killed", L"Forzado");
-    else if (t.kind == "stopped") status = Tr(L"停止", L"Stopped", L"Detenido");
-    else status = Utf8ToWide(t.kind);
-    return status + L"  |  " + Tr(L"ツール ", L"Tools ", L"Herramientas ") + std::to_wstring(t.toolUses);
+    return SubagentStatusText(t.kind) + L"  |  " + Tr(L"ツール ", L"Tools ", L"Herramientas ") + std::to_wstring(t.toolUses);
 }
 
 // A tree row shown through the step cells: the same fields ActivityRow has.
@@ -7841,6 +7909,78 @@ static ActivityRow ToActivityRow(const ActivityTreeRow& t) {
         r.description = t.description;
     }
     return r;
+}
+
+// Full detail of one stream event, as shown in the preview pane.
+static std::wstring MonitorEventDetailText(const MonitorEvent& ev) {
+    std::wstringstream detail;
+    detail << L"=== Event #" << ev.seq << L" [" << Utf8ToWide(ev.kind) << L"] ===\r\n"
+           << L"Timestamp : " << Utf8ToWide(ev.timestamp) << L"\r\n"
+           << L"Agent     : " << Utf8ToWide(ev.agentType) << L"\r\n";
+    if (!ev.toolName.empty()) {
+        detail << L"Tool      : " << Utf8ToWide(ev.toolName) << L"\r\n";
+    }
+    if (!ev.activity.empty()) {
+        detail << L"Action    : " << Utf8ToWide(ev.activity) << L"\r\n";
+    }
+    if (!ev.toolInput.empty()) {
+        detail << L"Input     : " << Utf8ToWide(ev.toolInput) << L"\r\n";
+    }
+    if (!ev.text.empty()) {
+        detail << L"Content   :\r\n" << Utf8ToWide(ev.text) << L"\r\n";
+    }
+    if (ev.totalTokens > 0) {
+        detail << L"Tokens    : " << ev.totalTokens << L"\r\n";
+    }
+    std::string usageText = MonitorEventUsageText(ev);
+    if (!usageText.empty()) {
+        detail << L"Usage     : " << Utf8ToWide(usageText) << L"\r\n";
+    }
+    detail << L"\r\n=== Raw JSON ===\r\n"
+           << Utf8ToWide(ev.rawJson) << L"\r\n";
+    return detail.str();
+}
+
+// Everything known about one list row: a sub-agent's summary, or a step's fields plus its event.
+static std::wstring MonitorRowDetailText(const LlmStreamDlgState* ds, int rowIdx) {
+    if (!ds || rowIdx < 0 || rowIdx >= static_cast<int>(ds->treeRows.size())) return std::wstring();
+    const ActivityTreeRow& t = ds->treeRows[rowIdx];
+    const ActivityRow r = ToActivityRow(t);
+    std::wstringstream d;
+    if (t.isBranch) {
+        d << Tr(L"=== サブエージェント ===", L"=== Sub-agent ===", L"=== Subagente ===") << L"\r\n"
+          << Tr(L"説明    : ", L"Description : ", L"Descripción : ") << Utf8ToWide(t.target) << L"\r\n";
+        if (!t.subagentType.empty()) {
+            d << Tr(L"種類    : ", L"Type        : ", L"Tipo        : ") << Utf8ToWide(t.subagentType) << L"\r\n";
+        }
+        d << Tr(L"状態    : ", L"Status      : ", L"Estado      : ") << SubagentStatusText(t.kind) << L"\r\n"
+          << Tr(L"開始    : ", L"Started     : ", L"Inicio      : ") << ActivityRowStartTime(r) << L"\r\n"
+          << Tr(L"所要時間: ", L"Duration    : ", L"Duración    : ") << ActivityRowDuration(r) << L"\r\n"
+          << Tr(L"トークン: ", L"Tokens      : ", L"Tokens      : ") << TokenCellText(t.tokens) << L"\r\n"
+          << Tr(L"ツール  : ", L"Tool calls  : ", L"Herramientas: ") << t.toolUses << L"\r\n";
+        if (!t.agentId.empty()) {
+            d << Tr(L"ID      : ", L"Agent ID    : ", L"ID de agente: ") << Utf8ToWide(t.agentId) << L"\r\n";
+        }
+        return d.str();
+    }
+    d << Tr(L"=== ステップ ===", L"=== Step ===", L"=== Paso ===") << L"\r\n"
+      << Tr(L"種類    : ", L"Kind        : ", L"Tipo        : ") << ActivityLabel(t.kind) << L"\r\n";
+    if (t.count > 1) {
+        d << Tr(L"回数    : ", L"Count       : ", L"Recuento    : ") << t.count << L"\r\n";
+    }
+    d << Tr(L"開始    : ", L"Started     : ", L"Inicio      : ") << ActivityRowStartTime(r) << L"\r\n"
+      << Tr(L"所要時間: ", L"Duration    : ", L"Duración    : ") << ActivityRowDuration(r) << L"\r\n"
+      << Tr(L"トークン: ", L"Tokens      : ", L"Tokens      : ") << TokenCellText(ActivityRowTotalTokens(r)) << L"\r\n";
+    if (!t.target.empty()) {
+        d << Tr(L"対象    : ", L"Target      : ", L"Objetivo    : ") << Utf8ToWide(t.target) << L"\r\n";
+    }
+    if (!t.description.empty()) {
+        d << Tr(L"説明    : ", L"Description : ", L"Descripción : ") << Utf8ToWide(t.description) << L"\r\n";
+    }
+    if (t.firstEvent >= 0 && t.firstEvent < static_cast<int>(ds->events.size())) {
+        d << L"\r\n" << MonitorEventDetailText(ds->events[t.firstEvent]);
+    }
+    return d.str();
 }
 
 // Without sub-agents the tree rows mirror the flat rows, newest first.
@@ -8489,6 +8629,121 @@ static void ReloadStreamDialogData(HWND hwnd, LlmStreamDlgState* ds) {
     }
 }
 
+// Read-only popup for one monitor row: the full text the pane's small preview cannot show.
+struct MonitorDetailDlgState {
+    HFONT fontUi = nullptr;
+    std::wstring text;
+    HWND edit = nullptr;
+    HWND btnCopy = nullptr;
+    HWND btnClose = nullptr;
+};
+
+static LRESULT CALLBACK MonitorDetailWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
+    auto* ds = reinterpret_cast<MonitorDetailDlgState*>(GetWindowLongPtrW(hwnd, GWLP_USERDATA));
+    switch (msg) {
+        case WM_CREATE: {
+            auto* cs = reinterpret_cast<CREATESTRUCTW*>(lParam);
+            ds = reinterpret_cast<MonitorDetailDlgState*>(cs->lpCreateParams);
+            SetWindowLongPtrW(hwnd, GWLP_USERDATA, reinterpret_cast<LONG_PTR>(ds));
+            HINSTANCE hInst = GetModuleHandleW(nullptr);
+            ds->edit = CreateWindowExW(WS_EX_CLIENTEDGE, L"EDIT", ds->text.c_str(),
+                WS_CHILD | WS_VISIBLE | WS_VSCROLL | WS_HSCROLL | ES_MULTILINE | ES_READONLY |
+                ES_AUTOVSCROLL | ES_AUTOHSCROLL,
+                0, 0, 100, 100, hwnd, (HMENU)1, hInst, nullptr);
+            ds->btnCopy = CreateWindowExW(0, L"BUTTON", Tr(L"コピー", L"Copy", L"Copiar"),
+                WS_CHILD | WS_VISIBLE | BS_PUSHBUTTON, 0, 0, 100, 28, hwnd, (HMENU)2, hInst, nullptr);
+            ds->btnClose = CreateWindowExW(0, L"BUTTON", Tr(L"閉じる", L"Close", L"Cerrar"),
+                WS_CHILD | WS_VISIBLE | BS_PUSHBUTTON, 0, 0, 100, 28, hwnd, (HMENU)IDCANCEL, hInst, nullptr);
+            if (ds->fontUi) {
+                SendMessageW(ds->edit, WM_SETFONT, reinterpret_cast<WPARAM>(ds->fontUi), TRUE);
+                SendMessageW(ds->btnCopy, WM_SETFONT, reinterpret_cast<WPARAM>(ds->fontUi), TRUE);
+                SendMessageW(ds->btnClose, WM_SETFONT, reinterpret_cast<WPARAM>(ds->fontUi), TRUE);
+            }
+            return 0;
+        }
+        case WM_SIZE: {
+            if (!ds) return 0;
+            int w = LOWORD(lParam);
+            int h = HIWORD(lParam);
+            const int pad = 10;
+            const int btnH = 28;
+            const int btnW = 110;
+            int editH = (std::max)(60, h - pad * 3 - btnH);
+            MoveWindow(ds->edit, pad, pad, (std::max)(120, w - pad * 2), editH, TRUE);
+            int by = h - pad - btnH;
+            MoveWindow(ds->btnCopy, (std::max)(pad, w - pad - btnW * 2 - 8), by, btnW, btnH, TRUE);
+            MoveWindow(ds->btnClose, (std::max)(pad, w - pad - btnW), by, btnW, btnH, TRUE);
+            return 0;
+        }
+        case WM_COMMAND: {
+            int id = LOWORD(wParam);
+            if (id == 2) {
+                if (ds) CopyTextToClipboard(hwnd, ds->text);
+            } else if (id == IDCANCEL) {
+                DestroyWindow(hwnd);
+            }
+            return 0;
+        }
+        case WM_CTLCOLORSTATIC:
+        case WM_CTLCOLOREDIT: {
+            HDC hdc = reinterpret_cast<HDC>(wParam);
+            SetTextColor(hdc, g_theme.text);
+            SetBkColor(hdc, g_theme.panel);
+            return reinterpret_cast<LRESULT>(g_dialogBgBrush);
+        }
+        case WM_ERASEBKGND: {
+            HDC hdc = reinterpret_cast<HDC>(wParam);
+            RECT rc = {};
+            GetClientRect(hwnd, &rc);
+            FillRect(hdc, &rc, g_dialogBgBrush);
+            return 1;
+        }
+        case WM_CLOSE:
+            DestroyWindow(hwnd);
+            return 0;
+        case WM_NCDESTROY:
+            delete ds;
+            SetWindowLongPtrW(hwnd, GWLP_USERDATA, 0);
+            return 0;
+    }
+    return DefWindowProcW(hwnd, msg, wParam, lParam);
+}
+
+static void ShowMonitorRowDetail(HWND owner, HFONT fontUi, const std::wstring& title, const std::wstring& text) {
+    if (text.empty()) return;
+    HINSTANCE hInst = GetModuleHandleW(nullptr);
+    static bool registered = false;
+    if (!registered) {
+        WNDCLASSEXW wc = {};
+        wc.cbSize = sizeof(wc);
+        wc.style = CS_HREDRAW | CS_VREDRAW;
+        wc.lpfnWndProc = MonitorDetailWndProc;
+        wc.hInstance = hInst;
+        wc.hCursor = LoadCursorW(nullptr, IDC_ARROW);
+        wc.hbrBackground = g_dialogBgBrush;
+        wc.lpszClassName = L"HanchoMonitorDetailWnd";
+        RegisterClassExW(&wc);
+        registered = true;
+    }
+    auto* ds = new MonitorDetailDlgState();
+    ds->fontUi = fontUi;
+    ds->text = text;
+    RECT pr = {};
+    if (owner && IsWindow(owner)) GetWindowRect(owner, &pr);
+    int dlgW = 760;
+    int dlgH = 560;
+    int x = pr.left + ((pr.right - pr.left) - dlgW) / 2;
+    int y = pr.top + ((pr.bottom - pr.top) - dlgH) / 2;
+    HWND dlg = CreateWindowExW(WS_EX_DLGMODALFRAME, L"HanchoMonitorDetailWnd", title.c_str(),
+        WS_OVERLAPPEDWINDOW | WS_VISIBLE, x, y, dlgW, dlgH, owner, nullptr, hInst, ds);
+    if (dlg) {
+        ShowWindow(dlg, SW_SHOW);
+        SetForegroundWindow(dlg);
+    } else {
+        delete ds;
+    }
+}
+
 static LRESULT CALLBACK LlmStreamWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
     auto* ds = reinterpret_cast<LlmStreamDlgState*>(GetWindowLongPtrW(hwnd, GWLP_USERDATA));
     switch (msg) {
@@ -8644,52 +8899,17 @@ static LRESULT CALLBACK LlmStreamWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPA
             if (ds && pnmh && pnmh->hwndFrom == ds->hwndList) {
                 if (pnmh->code == LVN_ITEMCHANGED) {
                     auto* pnmlv = reinterpret_cast<NMLISTVIEW*>(lParam);
-                    int evIdx = pnmlv->iItem;
                     if (ds->embedded) {
                         // lParam is the row's index in ds->treeRows. A sub-agent row has no event of its own.
                         int rowIdx = static_cast<int>(pnmlv->lParam);
                         bool valid = !ds->rebuilding && rowIdx >= 0 && rowIdx < static_cast<int>(ds->treeRows.size());
-                        evIdx = (valid && !ds->treeRows[rowIdx].isBranch) ? ds->treeRows[rowIdx].firstEvent : -1;
-                        if (valid && ds->treeRows[rowIdx].isBranch && (pnmlv->uNewState & LVIS_SELECTED)) {
-                            const auto& t = ds->treeRows[rowIdx];
-                            std::wstringstream sub;
-                            sub << L"=== Sub-agent ===\r\n"
-                                << L"Description : " << Utf8ToWide(t.target) << L"\r\n"
-                                << L"Status      : " << Utf8ToWide(t.kind) << L"\r\n"
-                                << L"Tokens      : " << t.tokens << L"\r\n"
-                                << L"Tool calls  : " << t.toolUses << L"\r\n";
-                            SetWindowTextW(ds->hwndEditPreview, sub.str().c_str());
+                        if (valid && (pnmlv->uNewState & LVIS_SELECTED)) {
+                            std::wstring text = MonitorRowDetailText(ds, rowIdx);
+                            if (!text.empty()) SetWindowTextW(ds->hwndEditPreview, text.c_str());
                         }
-                    }
-                    if ((pnmlv->uNewState & LVIS_SELECTED) && evIdx >= 0 &&
-                        evIdx < static_cast<int>(ds->events.size())) {
-                        const auto& ev = ds->events[evIdx];
-                        std::wstringstream detail;
-                        detail << L"=== Event #" << ev.seq << L" [" << Utf8ToWide(ev.kind) << L"] ===\r\n"
-                               << L"Timestamp : " << Utf8ToWide(ev.timestamp) << L"\r\n"
-                               << L"Agent     : " << Utf8ToWide(ev.agentType) << L"\r\n";
-                        if (!ev.toolName.empty()) {
-                            detail << L"Tool      : " << Utf8ToWide(ev.toolName) << L"\r\n";
-                        }
-                        if (!ev.activity.empty()) {
-                            detail << L"Action    : " << Utf8ToWide(ev.activity) << L"\r\n";
-                        }
-                        if (!ev.toolInput.empty()) {
-                            detail << L"Input     : " << Utf8ToWide(ev.toolInput) << L"\r\n";
-                        }
-                        if (!ev.text.empty()) {
-                            detail << L"Content   :\r\n" << Utf8ToWide(ev.text) << L"\r\n";
-                        }
-                        if (ev.totalTokens > 0) {
-                            detail << L"Tokens    : " << ev.totalTokens << L"\r\n";
-                        }
-                        std::string usageText = MonitorEventUsageText(ev);
-                        if (!usageText.empty()) {
-                            detail << L"Usage     : " << Utf8ToWide(usageText) << L"\r\n";
-                        }
-                        detail << L"\r\n=== Raw JSON ===\r\n"
-                               << Utf8ToWide(ev.rawJson) << L"\r\n";
-                        SetWindowTextW(ds->hwndEditPreview, detail.str().c_str());
+                    } else if ((pnmlv->uNewState & LVIS_SELECTED) && pnmlv->iItem >= 0 &&
+                               pnmlv->iItem < static_cast<int>(ds->events.size())) {
+                        SetWindowTextW(ds->hwndEditPreview, MonitorEventDetailText(ds->events[pnmlv->iItem]).c_str());
                     }
                 } else if (pnmh->code == NM_CLICK && ds->embedded) {
                     // Click on the triangle column of a sub-agent row: open or close it.
@@ -8715,7 +8935,7 @@ static LRESULT CALLBACK LlmStreamWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPA
                     }
                     return 0;
                 } else if (pnmh->code == NM_RCLICK && ds->embedded) {
-                    // Right-click on a step: copy the whole row, or only its full target.
+                    // Right-click on a subtask: show its details, or copy the whole row / its full target.
                     auto* act = reinterpret_cast<NMITEMACTIVATE*>(lParam);
                     if (act->iItem < 0) return 0;
                     const int rowIdx = MonitorRowAt(ds, act->iItem);
@@ -8724,22 +8944,52 @@ static LRESULT CALLBACK LlmStreamWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPA
                     POINT pt = {};
                     GetCursorPos(&pt);
                     HMENU menu = CreatePopupMenu();
+                    AppendMenuW(menu, MF_STRING, 3, Tr(L"詳細を表示", L"Show details", L"Ver detalles"));
+                    AppendMenuW(menu, MF_SEPARATOR, 0, nullptr);
                     AppendMenuW(menu, MF_STRING, 1, Tr(L"行をコピー", L"Copy row", L"Copiar fila"));
                     AppendMenuW(menu, MF_STRING, 2, Tr(L"対象をコピー（全文）", L"Copy target (full text)", L"Copiar objetivo (texto completo)"));
                     int cmd = TrackPopupMenu(menu, TPM_RETURNCMD | TPM_RIGHTBUTTON, pt.x, pt.y, 0, hwnd, nullptr);
                     DestroyMenu(menu);
-                    if (cmd == 1) CopyTextToClipboard(hwnd, ActivityRowCopyText(r));
-                    else if (cmd == 2) CopyTextToClipboard(hwnd, Utf8ToWide(r.target));
+                    if (cmd == 3) {
+                        std::wstring title = ds->treeRows[rowIdx].isBranch
+                            ? Tr(L"サブエージェントの詳細", L"Sub-agent Details", L"Detalles del subagente")
+                            : Tr(L"ステップの詳細", L"Step Details", L"Detalles del paso");
+                        HWND owner = (ds->dash && ds->dash->hwndMain) ? ds->dash->hwndMain : hwnd;
+                        ShowMonitorRowDetail(owner, ds->hFontUi, title, MonitorRowDetailText(ds, rowIdx));
+                    } else if (cmd == 1) {
+                        CopyTextToClipboard(hwnd, ActivityRowCopyText(r));
+                    } else if (cmd == 2) {
+                        CopyTextToClipboard(hwnd, Utf8ToWide(r.target));
+                    }
                     return 0;
-                } else if (pnmh->code == LVN_GETINFOTIPW && ds->embedded) {
-                    // Hover: the full text of the step, not the shortened cell.
+                } else if (pnmh->code == LVN_GETINFOTIPW) {
+                    // Hover: the full text behind the shortened cell (step or raw event).
                     auto* tip = reinterpret_cast<NMLVGETINFOTIPW*>(lParam);
                     int rowIdx = static_cast<int>(tip->lParam);
-                    if (rowIdx >= 0 && rowIdx < static_cast<int>(ds->treeRows.size()) && tip->pszText && tip->cchTextMax > 0) {
-                        const ActivityRow r = ToActivityRow(ds->treeRows[rowIdx]);
-                        std::wstring text = ActivityLabel(r.kind);
-                        if (!r.target.empty()) text += L"\r\n" + Utf8ToWide(r.target);
-                        wcsncpy_s(tip->pszText, tip->cchTextMax, text.c_str(), _TRUNCATE);
+                    if (ds->embedded) {
+                        if (rowIdx >= 0 && rowIdx < static_cast<int>(ds->treeRows.size())) {
+                            const ActivityRow r = ToActivityRow(ds->treeRows[rowIdx]);
+                            std::wstring text;
+                            if (tip->iSubItem == 2) text = ActivityLabel(r.kind);
+                            else if (tip->iSubItem == 3) text = Utf8ToWide(r.description);
+                            else if (tip->iSubItem == 4) text = Utf8ToWide(r.target);
+                            if (text.empty()) {
+                                text = ListViewFullCellText(ds->hwndList, tip->iItem, tip->iSubItem);
+                            }
+                            SetListInfoTip(tip, text);
+                        }
+                    } else if (rowIdx >= 0 && rowIdx < static_cast<int>(ds->events.size())) {
+                        const auto& ev = ds->events[rowIdx];
+                        std::wstring text;
+                        if (tip->iSubItem == 5) {
+                            std::string content = ev.text;
+                            if (content.empty() && !ev.toolInput.empty()) content = ev.toolInput;
+                            if (content.empty() && !ev.rawJson.empty()) content = ev.rawJson;
+                            text = Utf8ToWide(content);
+                        } else {
+                            text = ListViewFullCellText(ds->hwndList, tip->iItem, tip->iSubItem);
+                        }
+                        SetListInfoTip(tip, text);
                     }
                 } else if (pnmh->code == NM_CUSTOMDRAW && ds->embedded) {
                     auto* lvcd = reinterpret_cast<NMLVCUSTOMDRAW*>(lParam);
@@ -9131,6 +9381,42 @@ static std::wstring GetConfigFilePathWide() {
     return GetLogsDirectoryWide() + L"\\config.json";
 }
 
+// Launches the standalone IPMsg dialog. One instance per data dir; a second
+// launch activates the existing window instead of creating another one.
+static void LaunchIpmsgDialog(bool startHidden) {
+    wchar_t exePath[MAX_PATH] = {};
+    GetModuleFileNameW(nullptr, exePath, MAX_PATH);
+    std::wstring cmd = L"\"";
+    cmd += exePath;
+    cmd += L"\" ipmsg";
+    if (startHidden) cmd += L" --tray";
+    if (HasCustomDataDirectory()) {
+        cmd += L" --data-dir \"";
+        cmd += GetEffectiveDataDirectoryWide();
+        cmd += L"\"";
+    }
+    STARTUPINFOW si = {};
+    si.cb = sizeof(si);
+    PROCESS_INFORMATION pi = {};
+    std::vector<wchar_t> buf(cmd.begin(), cmd.end());
+    buf.push_back(L'\0');
+    if (CreateProcessW(nullptr, buf.data(), nullptr, nullptr, FALSE,
+                       CREATE_NO_WINDOW, nullptr, nullptr, &si, &pi)) {
+        CloseHandle(pi.hThread);
+        CloseHandle(pi.hProcess);
+    }
+}
+
+static bool IpmsgEnabledInConfig() {
+    std::string content = ReadFileUtf8Wide(GetConfigFilePathWide());
+    if (content.empty()) return false;
+    nlohmann::json j = nlohmann::json::parse(content, nullptr, false);
+    if (!j.is_object()) return false;
+    auto it = j.find("ipmsg");
+    if (it == j.end() || !it->is_object()) return false;
+    return it->value("enabled", false);
+}
+
 // Sets TIMER_REFRESH_ID to the configured interval, doubled while nothing is running.
 // Only calls SetTimer when the period actually changes.
 static void ApplyDashboardRefreshTimer(DashboardState* st) {
@@ -9403,6 +9689,8 @@ static void UpdateToolbarLabels(DashboardState* st) {
         SetWindowTextW(st->hwndBtnHint, L"💡");
     if (st->hwndBtnHistory)
         SetWindowTextW(st->hwndBtnHistory, L"🕘");
+    if (st->hwndBtnIpmsg)
+        SetWindowTextW(st->hwndBtnIpmsg, L"💬");
 
     if (st->hwndToolbarTip) {
         if (st->hwndBtnGridView)
@@ -9417,6 +9705,9 @@ static void UpdateToolbarLabels(DashboardState* st) {
         if (st->hwndBtnHistory)
             UpdateControlTooltip(st->hwndToolbarTip, st->hwndMain, st->hwndBtnHistory,
                 Tr(L"ヒント履歴", L"Hint History", L"Historial de pistas"));
+        if (st->hwndBtnIpmsg)
+            UpdateControlTooltip(st->hwndToolbarTip, st->hwndMain, st->hwndBtnIpmsg,
+                Tr(L"IPMsg メッセンジャー", L"IPMsg Messenger", L"Mensajero IPMsg"));
     }
     UpdatePanelToggleLabels(st);
     if (st->hwndBtnViewTasks) {
@@ -10013,9 +10304,13 @@ struct SettingsDlgState {
       HWND chkWebUi = nullptr;
       HWND lblWebUiScope = nullptr;
       HWND cmbWebUiScope = nullptr;
-      HWND lblWebUiAllowedHosts = nullptr;
-      HWND editWebUiAllowedHosts = nullptr;
-      nlohmann::json webuiConfig;
+       HWND lblWebUiAllowedHosts = nullptr;
+       HWND editWebUiAllowedHosts = nullptr;
+       HWND lblWebUiPort = nullptr;
+       HWND editWebUiPort = nullptr;
+       HWND lblWebUiUrl = nullptr;
+       HWND editWebUiUrl = nullptr;
+       nlohmann::json webuiConfig;
       HWND lblProcFont = nullptr;
       HWND cmbProcFont = nullptr;
        HWND lblTaskFont = nullptr;
@@ -10141,6 +10436,90 @@ static std::string TrimWebUiItem(const std::string& s) {
     return s.substr(b, e - b + 1);
 }
 
+// Returns the first non-loopback IPv4 address of an active adapter. Used to show the
+// LAN URL in the settings dialog, where 0.0.0.0 is not something a browser can open.
+static std::string DetectLanIpv4() {
+    ULONG size = 16 * 1024;
+    std::vector<BYTE> buf(size);
+    const ULONG flags = GAA_FLAG_SKIP_ANYCAST | GAA_FLAG_SKIP_MULTICAST | GAA_FLAG_SKIP_DNS_SERVER;
+    for (int attempt = 0; attempt < 3; ++attempt) {
+        auto* addrs = reinterpret_cast<IP_ADAPTER_ADDRESSES*>(buf.data());
+        const ULONG ret = GetAdaptersAddresses(AF_INET, flags, nullptr, addrs, &size);
+        if (ret == ERROR_BUFFER_OVERFLOW) {
+            buf.resize(size);
+            continue;
+        }
+        if (ret != NO_ERROR) return "";
+        std::string fallback;
+        for (auto* a = addrs; a; a = a->Next) {
+            if (a->OperStatus != IfOperStatusUp) continue;
+            if (a->IfType == IF_TYPE_SOFTWARE_LOOPBACK) continue;
+            for (auto* ua = a->FirstUnicastAddress; ua; ua = ua->Next) {
+                if (!ua->Address.lpSockaddr || ua->Address.lpSockaddr->sa_family != AF_INET) continue;
+                const auto* in = reinterpret_cast<const sockaddr_in*>(ua->Address.lpSockaddr);
+                const auto* b = reinterpret_cast<const unsigned char*>(&in->sin_addr);
+                char text[32] = {};
+                snprintf(text, sizeof(text), "%u.%u.%u.%u", b[0], b[1], b[2], b[3]);
+                std::string ip = text;
+                if (ip.rfind("127.", 0) == 0 || ip.rfind("169.254.", 0) == 0) continue;
+                // Prefer the adapter that actually carries the default route; virtual
+                // switches often come first in the adapter order.
+                if (a->FirstGatewayAddress) return ip;
+                if (fallback.empty()) fallback = ip;
+            }
+        }
+        return fallback;
+    }
+    return "";
+}
+
+static std::string ReadWebUiSessionToken() {
+    std::string token = ReadFileUtf8Wide(PathJoinWide(GetEffectiveDataDirectoryWide(), L".webui_token"));
+    while (!token.empty() &&
+           (token.back() == '\r' || token.back() == '\n' || token.back() == ' ' || token.back() == '\t')) {
+        token.pop_back();
+    }
+    return token;
+}
+
+// Builds the URL a browser should open, using the port currently typed in the dialog.
+// The token comes from the running server's .webui_token file (same as `hancho-cli web`).
+static std::wstring BuildWebUiAccessUrl(SettingsDlgState* ds) {
+    int port = 9138;
+    if (ds->editWebUiPort) {
+        wchar_t text[32] = {};
+        GetWindowTextW(ds->editWebUiPort, text, 32);
+        const int value = _wtoi(text);
+        if (value > 0 && value <= 65535) port = value;
+    }
+    const bool lan = ds->cmbWebUiScope &&
+        static_cast<int>(SendMessageW(ds->cmbWebUiScope, CB_GETCURSEL, 0, 0)) == 1;
+    std::wstring host = L"127.0.0.1";
+    if (lan) {
+        const std::string ip = DetectLanIpv4();
+        if (!ip.empty()) {
+            host = Utf8ToWide(ip);
+        } else {
+            wchar_t name[MAX_COMPUTERNAME_LENGTH + 1] = {};
+            DWORD len = MAX_COMPUTERNAME_LENGTH + 1;
+            if (GetComputerNameW(name, &len) && len > 0) host = name;
+        }
+    }
+    std::wstring url = L"http://" + host + L":" + std::to_wstring(port) + L"/";
+    const bool enabled = !ds->chkWebUi ||
+        SendMessageW(ds->chkWebUi, BM_GETCHECK, 0, 0) == BST_CHECKED;
+    if (enabled) {
+        const std::string token = ReadWebUiSessionToken();
+        if (!token.empty()) url += L"?token=" + Utf8ToWide(token);
+    }
+    return url;
+}
+
+static void UpdateWebUiAccessUrl(SettingsDlgState* ds) {
+    if (!ds || !ds->editWebUiUrl) return;
+    SetWindowTextW(ds->editWebUiUrl, BuildWebUiAccessUrl(ds).c_str());
+}
+
 static void LoadWebUiDialogConfig(SettingsDlgState* ds) {
     if (!ds) return;
     ds->webuiConfig = nlohmann::json::object();
@@ -10169,6 +10548,15 @@ static void LoadWebUiDialogConfig(SettingsDlgState* ds) {
     if (ds->editWebUiAllowedHosts) {
         SetWindowTextW(ds->editWebUiAllowedHosts, Utf8ToWide(hosts).c_str());
     }
+    int port = 9138;
+    if (ds->webuiConfig.contains("port") && ds->webuiConfig["port"].is_number_integer()) {
+        const int64_t value = ds->webuiConfig["port"].get<int64_t>();
+        if (value > 0 && value <= 65535) port = static_cast<int>(value);
+    }
+    if (ds->editWebUiPort) {
+        SetWindowTextW(ds->editWebUiPort, std::to_wstring(port).c_str());
+    }
+    UpdateWebUiAccessUrl(ds);
 }
 
 static void ApplyWebUiDialogConfig(SettingsDlgState* ds) {
@@ -10207,11 +10595,24 @@ static void ApplyWebUiDialogConfig(SettingsDlgState* ds) {
         }
     }
     webui["allowed_hosts"] = hosts;
+    int port = 9138;
+    if (ds->editWebUiPort) {
+        wchar_t text[32] = {};
+        GetWindowTextW(ds->editWebUiPort, text, 32);
+        const int value = _wtoi(text);
+        if (value > 0 && value <= 65535) {
+            port = value;
+        } else {
+            SetWindowTextW(ds->editWebUiPort, std::to_wstring(port).c_str());
+        }
+    }
+    webui["port"] = port;
     ds->webuiConfig = webui;
 
     nlohmann::json req = {{"action", "config_set"}, {"patch", {{"webui", webui}}}};
     nlohmann::json resp;
     GuiIpcCall(ds->dash, req, resp);
+    UpdateWebUiAccessUrl(ds);
 }
 
 static void UpdateSettingsDialogTexts(HWND hwnd) {
@@ -10322,6 +10723,16 @@ static void UpdateSettingsDialogTexts(HWND hwnd) {
             L"Extra allowed hostnames (comma separated, LAN only):",
             L"Nombres de host adicionales (separados por comas, solo LAN):"));
     }
+    if (ds->lblWebUiPort) {
+        SetWindowTextW(ds->lblWebUiPort, Tr(L"ポート:", L"Port:", L"Puerto:"));
+    }
+    if (ds->lblWebUiUrl) {
+        SetWindowTextW(ds->lblWebUiUrl, Tr(
+            L"アクセス先 (ブラウザで開く URL):",
+            L"Access URL (open it in a browser):",
+            L"URL de acceso (ábrela en el navegador):"));
+    }
+    UpdateWebUiAccessUrl(ds);
     SetWindowTextW(ds->lblEventRetention, Tr(
         L"イベント保持件数 (100〜100000, -1 = 無制限: メモリを使い切る恐れあり):",
         L"Events kept per process (100-100000, -1 = unlimited: may use up memory):",
@@ -10609,11 +11020,21 @@ static LRESULT CALLBACK SettingsWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPAR
                 18, 184, 260, 200, hwnd, (HMENU)IDC_SET_WEBUI_SCOPE, hInst, nullptr);
             SendMessageW(ds->cmbWebUiScope, CB_ADDSTRING, 0, (LPARAM)L"Loopback only (127.0.0.1)");
             SendMessageW(ds->cmbWebUiScope, CB_ADDSTRING, 0, (LPARAM)L"LAN (0.0.0.0)");
+            ds->lblWebUiPort = CreateWindowExW(0, L"STATIC", L"", WS_CHILD | WS_VISIBLE,
+                300, 160, 120, 20, hwnd, nullptr, hInst, nullptr);
+            ds->editWebUiPort = CreateWindowExW(WS_EX_CLIENTEDGE, L"EDIT", L"",
+                WS_CHILD | WS_VISIBLE | WS_TABSTOP | ES_AUTOHSCROLL | ES_NUMBER,
+                300, 184, 110, 26, hwnd, (HMENU)IDC_SET_WEBUI_PORT, hInst, nullptr);
             ds->lblWebUiAllowedHosts = CreateWindowExW(0, L"STATIC", L"", WS_CHILD | WS_VISIBLE,
                 18, 218, 640, 20, hwnd, nullptr, hInst, nullptr);
             ds->editWebUiAllowedHosts = CreateWindowExW(WS_EX_CLIENTEDGE, L"EDIT", L"",
                 WS_CHILD | WS_VISIBLE | WS_TABSTOP | ES_AUTOHSCROLL,
                 18, 242, 520, 26, hwnd, (HMENU)IDC_SET_WEBUI_ALLOWED_HOSTS, hInst, nullptr);
+            ds->lblWebUiUrl = CreateWindowExW(0, L"STATIC", L"", WS_CHILD | WS_VISIBLE,
+                18, 278, 640, 20, hwnd, nullptr, hInst, nullptr);
+            ds->editWebUiUrl = CreateWindowExW(WS_EX_CLIENTEDGE, L"EDIT", L"",
+                WS_CHILD | WS_VISIBLE | ES_AUTOHSCROLL | ES_READONLY,
+                18, 302, 640, 26, hwnd, nullptr, hInst, nullptr);
 
             ds->lblProcFont = CreateWindowExW(0, L"STATIC", L"", WS_CHILD | WS_VISIBLE,
                 18, 458, 530, 20, hwnd, nullptr, hInst, nullptr);
@@ -10652,6 +11073,7 @@ static LRESULT CALLBACK SettingsWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPAR
                              ds->lblSupervisorCommand, ds->editSupervisorCommand,
                              ds->lblWebUiTitle, ds->chkWebUi, ds->lblWebUiScope, ds->cmbWebUiScope,
                              ds->lblWebUiAllowedHosts, ds->editWebUiAllowedHosts,
+                             ds->lblWebUiPort, ds->editWebUiPort, ds->lblWebUiUrl, ds->editWebUiUrl,
                              ds->lblProcFont, ds->cmbProcFont, ds->lblTaskFont, ds->cmbTaskFont };
             for (HWND h : ctrls) SendMessageW(h, WM_SETFONT, (WPARAM)ds->dash->hFontUi, TRUE);
             for (HWND h : ds->btnListBg) SendMessageW(h, WM_SETFONT, (WPARAM)ds->dash->hFontUi, TRUE);
@@ -10688,7 +11110,8 @@ static LRESULT CALLBACK SettingsWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPAR
                 maintenance.insert(maintenance.end(), { ds->btnShell, ds->btnReset, ds->btnClear });
                 maintenance.insert(maintenance.end(), {
                     ds->lblWebUiTitle, ds->chkWebUi, ds->lblWebUiScope, ds->cmbWebUiScope,
-                    ds->lblWebUiAllowedHosts, ds->editWebUiAllowedHosts });
+                    ds->lblWebUiAllowedHosts, ds->editWebUiAllowedHosts,
+                    ds->lblWebUiPort, ds->editWebUiPort, ds->lblWebUiUrl, ds->editWebUiUrl });
                 auto& about = ds->tabPages[4];
                 about.insert(about.end(), { ds->hwndAboutTitle, ds->hwndAboutVersion, ds->hwndAboutDesc });
             }
@@ -10775,6 +11198,10 @@ static LRESULT CALLBACK SettingsWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPAR
                 return 0;
             }
             if (id == IDC_SET_WEBUI_ALLOWED_HOSTS) {
+                if (HIWORD(wParam) == EN_KILLFOCUS) ApplyWebUiDialogConfig(ds);
+                return 0;
+            }
+            if (id == IDC_SET_WEBUI_PORT) {
                 if (HIWORD(wParam) == EN_KILLFOCUS) ApplyWebUiDialogConfig(ds);
                 return 0;
             }
@@ -12319,7 +12746,7 @@ static LRESULT CALLBACK HintHistoryWndProc(HWND hwnd, UINT msg, WPARAM wParam, L
             ds->list = CreateWindowExW(WS_EX_CLIENTEDGE, WC_LISTVIEWW, L"",
                 WS_CHILD | WS_VISIBLE | LVS_REPORT | LVS_SINGLESEL | LVS_SHOWSELALWAYS,
                 12, 12, 860, 170, hwnd, (HMENU)2901, hInst, nullptr);
-            ListView_SetExtendedListViewStyle(ds->list, LVS_EX_FULLROWSELECT | LVS_EX_GRIDLINES);
+            ListView_SetExtendedListViewStyle(ds->list, LVS_EX_FULLROWSELECT | LVS_EX_GRIDLINES | LVS_EX_INFOTIP);
             MemoryListAddColumn(ds->list, 0, Tr(L"時刻", L"Time", L"Hora"), 130);
             MemoryListAddColumn(ds->list, 1, Tr(L"種類", L"Category", L"Categoría"), 190);
             MemoryListAddColumn(ds->list, 2, Tr(L"概要", L"Summary", L"Resumen"), 520);
@@ -12355,6 +12782,11 @@ static LRESULT CALLBACK HintHistoryWndProc(HWND hwnd, UINT msg, WPARAM wParam, L
         case WM_NOTIFY: {
             if (!ds) break;
             auto* nm = reinterpret_cast<NMHDR*>(lParam);
+            if (nm && nm->hwndFrom == ds->list && nm->code == LVN_GETINFOTIPW) {
+                auto* tip = reinterpret_cast<NMLVGETINFOTIPW*>(lParam);
+                SetListInfoTip(tip, ListViewFullCellText(ds->list, tip->iItem, tip->iSubItem));
+                return 0;
+            }
             if (nm && nm->hwndFrom == ds->list && !ds->loading) {
                 if (nm->code == LVN_ITEMCHANGED) {
                     auto* nv = reinterpret_cast<NMLISTVIEW*>(lParam);
@@ -13105,6 +13537,8 @@ static LRESULT CALLBACK DashboardWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPA
                 WS_CHILD | WS_VISIBLE | BS_OWNERDRAW, 0, 0, 28, 24, hwnd, (HMENU)IDC_BTN_HINT, nullptr, nullptr);
             st->hwndBtnHistory = CreateWindowExW(0, L"BUTTON", L"🕘",
                 WS_CHILD | WS_VISIBLE | BS_OWNERDRAW, 0, 0, 28, 24, hwnd, (HMENU)IDC_BTN_HISTORY, nullptr, nullptr);
+            st->hwndBtnIpmsg = CreateWindowExW(0, L"BUTTON", L"💬",
+                WS_CHILD | WS_VISIBLE | BS_OWNERDRAW, 0, 0, 28, 24, hwnd, (HMENU)IDC_BTN_IPMSG, nullptr, nullptr);
             st->hwndClock = CreateWindowExW(0, L"BUTTON", L"",
                 WS_CHILD | WS_VISIBLE | BS_OWNERDRAW, 0, 0, 80, 24, hwnd, (HMENU)IDC_CLOCK, nullptr, nullptr);
             st->hwndBtnUsage = CreateWindowExW(0, L"BUTTON", L"📊",
@@ -13168,16 +13602,18 @@ static LRESULT CALLBACK DashboardWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPA
                 addTool(st->hwndBtnRefresh);
                 addTool(st->hwndBtnHint);
                 addTool(st->hwndBtnHistory);
+                addTool(st->hwndBtnIpmsg);
             }
 
             LoadShellConfig(st);
             UpdateToolbarLabels(st);
             SetWindowTextW(hwnd, MainWindowTitle().c_str());
+            if (IpmsgEnabledInConfig()) LaunchIpmsgDialog(true);
 
             st->hwndList = CreateWindowExW(WS_EX_CLIENTEDGE, WC_LISTVIEWW, L"",
                 WS_CHILD | WS_VISIBLE | LVS_REPORT | LVS_SINGLESEL | LVS_SHOWSELALWAYS,
                 0, 0, 600, 160, hwnd, (HMENU)IDC_LIST_PROCS, nullptr, nullptr);
-            ListView_SetExtendedListViewStyle(st->hwndList, LVS_EX_FULLROWSELECT | LVS_EX_DOUBLEBUFFER);
+            ListView_SetExtendedListViewStyle(st->hwndList, LVS_EX_FULLROWSELECT | LVS_EX_DOUBLEBUFFER | LVS_EX_INFOTIP);
             ApplyListTheme(st);
 
             const int colWidths[14] = {52, 78, 100, 100, 120, 140, 85, 65, 72, 78, 70, 185, 175, 80};
@@ -13247,7 +13683,7 @@ static LRESULT CALLBACK DashboardWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPA
                 st->hwndBtnStart, st->hwndBtnSettings, st->hwndBtnKillAll,
                 st->hwndBtnGridView,
                 st->hwndBtnToggleList, st->hwndBtnToggleTerm, st->hwndBtnStreamPane, st->hwndBtnBtView, st->hwndBtnHideTray, st->hwndBtnRefresh,
-                st->hwndBtnHint, st->hwndBtnHistory, st->hwndClock,
+                st->hwndBtnHint, st->hwndBtnHistory, st->hwndBtnIpmsg, st->hwndClock,
                 st->hwndBtnViewTasks, st->hwndList, st->hwndTaskList, st->hwndTab
             };
             for (HWND h : uiCtrls) {
@@ -13781,6 +14217,8 @@ static LRESULT CALLBACK DashboardWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPA
                 }
             } else if (id == IDC_BTN_HISTORY) {
                 ShowHintHistoryDialog(st);
+            } else if (id == IDC_BTN_IPMSG) {
+                LaunchIpmsgDialog(false);
             } else if (id == IDC_BTN_SEARCH_PROC) {
                 st->showProcSearch = !st->showProcSearch;
                 SetWindowTextW(st->hwndSearchProcBtn, st->showProcSearch ? L"✕" : L"🔍");
@@ -13858,6 +14296,35 @@ static LRESULT CALLBACK DashboardWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPA
                         }
                     }
                 }
+            } else if (nmhdr->idFrom == IDC_LIST_PROCS) {
+                if (nmhdr->code == LVN_GETINFOTIPW) {
+                    // The preview cell shortens the agent activity; rebuild it in full for the tip.
+                    auto* tip = reinterpret_cast<NMLVGETINFOTIPW*>(lParam);
+                    if (tip->iItem >= 0) {
+                        std::wstring text = ListViewFullCellText(st->hwndList, tip->iItem, tip->iSubItem);
+                        if (tip->iSubItem == 11) {
+                            LVITEMW lvi = {};
+                            lvi.mask = LVIF_PARAM;
+                            lvi.iItem = tip->iItem;
+                            int procId = 0;
+                            if (ListView_GetItem(st->hwndList, &lvi)) {
+                                procId = static_cast<int>(lvi.lParam);
+                            }
+                            for (const auto& s : st->cachedSnapshots) {
+                                if (s.id != procId) continue;
+                                if ((s.jsonStream || s.streamEventCount > 0) && !s.activity.empty()) {
+                                    text = ActivityLine(s.activity, s.activityTarget, s.activitySinceEpochMs,
+                                                        s.state == ProcState::Running, 100000);
+                                } else {
+                                    text = Utf8ToWide(s.lastLinePreview);
+                                }
+                                break;
+                            }
+                        }
+                        SetListInfoTip(tip, text);
+                    }
+                    return 0;
+                }
             } else if (nmhdr->idFrom == IDC_LIST_TASKS) {
                 if (nmhdr->code == LVN_COLUMNCLICK) {
                     // Clicking a header sorts by that column; the same column cycles
@@ -13903,15 +14370,17 @@ static LRESULT CALLBACK DashboardWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPA
                         ShowTaskQueueJobDetails(st, st->taskJobIds[idx]);
                     }
                 } else if (nmhdr->code == LVN_GETINFOTIPW) {
-                    // Hover over the Resources cell: show all of it, not only what fits the column.
-                    // Hover over the Origin cell: show who added the job (session, folder, client).
+                    // Hover over any cell whose column cut its text: show the whole text.
+                    // The Origin cell also shows who added the job (session, folder, client).
                     auto* tip = reinterpret_cast<NMLVGETINFOTIPW*>(lParam);
-                    if (tip->iSubItem == kTaskListResourcesCol && tip->pszText && tip->cchTextMax > 0) {
-                        std::wstring full = TaskListCellText(st->hwndTaskList, tip->iItem, tip->iSubItem);
-                        wcsncpy_s(tip->pszText, tip->cchTextMax, full.c_str(), _TRUNCATE);
-                    } else if (tip->iSubItem == kTaskListOriginCol && tip->pszText && tip->cchTextMax > 0 &&
-                               tip->iItem >= 0 && tip->iItem < static_cast<int>(st->taskOriginTips.size())) {
-                        wcsncpy_s(tip->pszText, tip->cchTextMax, st->taskOriginTips[tip->iItem].c_str(), _TRUNCATE);
+                    if (tip->iSubItem == kTaskListOriginCol && tip->iItem >= 0 &&
+                        tip->iItem < static_cast<int>(st->taskOriginTips.size())) {
+                        SetListInfoTip(tip, st->taskOriginTips[tip->iItem]);
+                    } else if (tip->iSubItem >= 0 && tip->iSubItem < kTaskListColumns &&
+                               tip->iItem >= 0 &&
+                               tip->iItem < static_cast<int>(st->lastTaskRows.size() / kTaskListColumns)) {
+                        SetListInfoTip(tip, st->lastTaskRows[static_cast<size_t>(tip->iItem) * kTaskListColumns +
+                                                              static_cast<size_t>(tip->iSubItem)]);
                     }
                 } else if (nmhdr->code == NM_CUSTOMDRAW) {
                     auto* lvcd = reinterpret_cast<NMLVCUSTOMDRAW*>(lParam);

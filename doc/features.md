@@ -96,3 +96,9 @@
   - **Hint Window (Pop-up Toast)**: Non-intrusive toasts with one-click prompt copy buttons for human guidance.
   - **MCP Response Injection**: Attaching actionable `"audit"` guidance objects directly into `taskqueue_wait` returns.
 - See [Audit LLM Specification](audit-llm.md) for details.
+
+## 10. IP Messenger (IPMsg) Compatible LAN Messaging
+- The core speaks the classic IPMsg protocol (presence, messages, read receipts, regular-file transfer) on UDP/TCP port 2426, off by default. Stock IPMsg clients on the same LAN see Hancho as a host.
+- LLM-to-LLM messaging with `from_agent` / `to_agent` / `reply_to`, an `audience` (human or agent) and a hop guard. Incoming messages can be handed to a worker LLM whose JSON answer is sent back as a reply.
+- `hancho-cli msg ...`, the MCP `ipmsg_*` tools, and a standalone dialog (`Hancho.exe ipmsg [--tray]`, also openable from the dashboard toolbar) with tray notifications, a searchable log and settings.
+- Trusted LAN only; nothing is encrypted. See [IP Messenger](ipmsg.md) for the protocol, configuration, security notes and examples.

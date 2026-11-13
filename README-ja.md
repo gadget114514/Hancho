@@ -22,8 +22,8 @@
 
 ## Express
 
-- [Hancho-v0.9.9-win64-setup.exe](https://github.com/gadget114514/Hancho/releases/download/v0.9.9/Hancho-v0.9.9-win64-setup.exe) をダウンロードしてインストール
-  （ポータブル版: [Hancho-v0.9.9-win64.zip](https://github.com/gadget114514/Hancho/releases/download/v0.9.9/Hancho-v0.9.9-win64.zip)、全バージョン: [Releases](https://github.com/gadget114514/Hancho/releases)）
+- [Hancho-v0.9.10-win64-setup.exe](https://github.com/gadget114514/Hancho/releases/download/v0.9.10/Hancho-v0.9.10-win64-setup.exe) をダウンロードしてインストール
+  （ポータブル版: [Hancho-v0.9.10-win64.zip](https://github.com/gadget114514/Hancho/releases/download/v0.9.10/Hancho-v0.9.10-win64.zip)、全バージョン: [Releases](https://github.com/gadget114514/Hancho/releases)）
 - LLM に「PATH から hancho を探して、help を読んで使い方を把握して」と伝える
 - LLM に「タスクを作成して、hancho 経由で (opencode|claude|agy|codex) に実行させて」と伝える
 - 以上
@@ -154,6 +154,14 @@ Hancho のデータはすべて JSON / JSONL（タスクキュー、ビヘイビ
 （以下の help 本文は英語です）
 
 ## リリースノート
+
+### v0.9.10
+- **IP Messenger (IPMsg)**: コアが古典的な IPMsg プロトコル（参加通知、メッセージ、開封通知、通常ファイル転送）を UDP/TCP ポート 2426 で話します。既定では無効です。LLM 同士のメッセージング用に `from_agent` / `to_agent` / `reply_to`、`audience`（human / agent）、ホップ数ガードを追加し、ワーカー LLM のハンドラが自動返信します。`hancho-cli msg`（別名 `ipmsg`）、MCP の `ipmsg_*` ツール、単体ダイアログ（`Hancho.exe ipmsg [--tray]`、ダッシュボードのツールバーからも起動可）とトレイ通知を利用できます。詳細は `doc/ipmsg-ja.md`。
+- **ダッシュボードのホバー**: プロセス・タスク・実行モニタ・ヒント履歴の一覧と JSON ツリーで、省略表示されたセルの全文をツールチップで表示します。
+- **WebUI 設定**: 設定 → 管理タブにポート入力（1〜65535）と、LAN アドレスとセッショントークンを含む読み取り専用のアクセス URL を追加しました。
+- **ダッシュボードのガント**: 6h / 12h / 24h / All の範囲ボタンを追加し、目盛りラベルをローカル時刻の時・日の境界に配置しました。
+- **使用量パネル**: 4h の範囲を追加。未読のヒントがあるとヒント履歴ボタンにバッジを表示します。
+- **実行モニタ**: 一覧のサブタスク／ステップを右クリックすると詳細ウインドウを開きます。説明・状態・時刻・トークン・ツール呼び出し・イベント内容・Raw JSON を表示し、コピーもできます。
 
 ### v0.9.9
 - **Supervisor ヒント toast**: 自動消去の既定時間を 7 秒に変更しました（従来 6 秒）。`hint_auto_dismiss_sec` は `-1` で手動で閉じるまで表示、`0` で表示しない、正の値でその秒数後に自動消去します。`config.json` に保存済みの値がある場合はそちらが優先されます。

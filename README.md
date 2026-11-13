@@ -25,8 +25,8 @@ The dashboard has an **execution monitor pane** below the process and task lists
 
 ## Express
 
-- Download and install [Hancho-v0.9.9-win64-setup.exe](https://github.com/gadget114514/Hancho/releases/download/v0.9.9/Hancho-v0.9.9-win64-setup.exe)
-  (portable: [Hancho-v0.9.9-win64.zip](https://github.com/gadget114514/Hancho/releases/download/v0.9.9/Hancho-v0.9.9-win64.zip), all versions: [Releases](https://github.com/gadget114514/Hancho/releases))
+- Download and install [Hancho-v0.9.10-win64-setup.exe](https://github.com/gadget114514/Hancho/releases/download/v0.9.10/Hancho-v0.9.10-win64-setup.exe)
+  (portable: [Hancho-v0.9.10-win64.zip](https://github.com/gadget114514/Hancho/releases/download/v0.9.10/Hancho-v0.9.10-win64.zip), all versions: [Releases](https://github.com/gadget114514/Hancho/releases))
 - In your llm, "find hancho in PATH, then read help to use it" 
 - In your llm, "create task and use (opencode|claude|agy|codex) to execute the task via hancho" 
 - That's all
@@ -148,6 +148,14 @@ All Hancho data is plain JSON / JSONL (task queues, behavior trees, stream event
 ---
 
 ## Release Notes
+
+### v0.9.10
+- **IP Messenger (IPMsg)**: the core speaks the classic IPMsg protocol (presence, messages, read receipts, regular-file transfer) on UDP/TCP port 2426, off by default. LLM-to-LLM messaging adds `from_agent` / `to_agent` / `reply_to`, an `audience` (human or agent) and a hop guard, and a worker-LLM handler replies automatically. Use `hancho-cli msg` (alias `ipmsg`), the MCP `ipmsg_*` tools, or the standalone dialog (`Hancho.exe ipmsg [--tray]`, also on the dashboard toolbar) with tray notifications. See `doc/ipmsg.md`.
+- **Dashboard hover**: truncated cells in the process, task, monitor and hint lists and in the JSON tree show their full text in a tooltip.
+- **WebUI settings**: Settings -> Maintenance has a port field (1-65535) and a read-only access URL that includes the LAN address and session token.
+- **Dashboard Gantt**: range buttons (6h / 12h / 24h / All) and tick labels placed on local hour / day boundaries.
+- **Usage panel**: added a 4h range. Hints that have not been opened yet show a badge on the hint-history button.
+- **Execution monitor**: right-click a subtask or step in the list to open a details window with its description, status, timing, tokens, tool calls, event content and raw JSON, plus a Copy button.
 
 ### v0.9.9
 - **Supervisor hint toast**: the default auto-dismiss time is now 7 seconds (previously 6). `hint_auto_dismiss_sec` now uses `-1` to keep the toast open until it is closed, `0` to disable the toast, and a positive number for auto-dismiss. A value already stored in `config.json` still overrides the default.

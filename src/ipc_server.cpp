@@ -3,6 +3,8 @@
 #include "chain_guard.h"
 #include "common.h"
 #include "event_schema.h"
+#include "ipmsg.h"
+#include "ipmsg_handler.h"
 #include "llm_stream.h"
 #include "memory_record.h"
 #include "memory_search.h"
@@ -111,11 +113,15 @@ static std::string ExtractRawJsonValue(const std::string& json, const std::strin
 
 IpcServer::IpcServer(ProcessManager& pm, TaskQueueManager& tqm, HWND notifyHwnd)
     : pm_(pm), tqm_(tqm), btm_(nullptr), notifyHwnd_(notifyHwnd) {
+    ipmsg_ = std::make_unique<IpmsgNode>();
+    ipmsgHandler_ = std::make_unique<IpmsgHandler>(tqm_, pm_, ipmsg_.get());
     InstallRemoteCallbacks();
 }
 
 IpcServer::IpcServer(ProcessManager& pm, TaskQueueManager& tqm, BtManager* btm, HWND notifyHwnd)
     : pm_(pm), tqm_(tqm), btm_(btm), notifyHwnd_(notifyHwnd) {
+    ipmsg_ = std::make_unique<IpmsgNode>();
+    ipmsgHandler_ = std::make_unique<IpmsgHandler>(tqm_, pm_, ipmsg_.get());
     InstallRemoteCallbacks();
 }
 
@@ -129,13 +135,17 @@ bool IpcServer::Start() {
     acceptThread_ = std::thread(&IpcServer::AcceptLoop, this);
     StartRemoteListener();
     StartWebUiServer();
+    StartIpmsg();
     return true;
 }
 
 void IpcServer::Stop() {
     if (stop_.exchange(true)) return;
     if (webuiRestartThread_.joinable()) webuiRestartThread_.join();
+    if (ipmsgRestartThread_.joinable()) ipmsgRestartThread_.join();
     StopWebUiServer();
+    StopIpmsg();
+    if (ipmsgHandler_) ipmsgHandler_->Stop();
     StopRemoteListener();
     // Wake up blocking ConnectNamedPipe by opening a dummy connection
     HANDLE hDummy = CreateFileW(GetPipeNameWide().c_str(), GENERIC_READ | GENERIC_WRITE, 0, nullptr, OPEN_EXISTING, 0, nullptr);
@@ -262,6 +272,171 @@ static std::string RedactIpcToken(const std::string& json) {
     if (it == doc.end()) return json;
     doc["token"] = "<redacted>";
     return doc.dump();
+}
+
+static std::string IpmsgReqString(const nlohmann::json& req, const char* key,
+                                  const std::string& def = std::string()) {
+    auto it = req.find(key);
+    if (it != req.end() && it->is_string()) return it->get<std::string>();
+    return def;
+}
+
+static bool IpmsgReqBool(const nlohmann::json& req, const char* key, bool def) {
+    auto it = req.find(key);
+    if (it != req.end() && it->is_boolean()) return it->get<bool>();
+    return def;
+}
+
+static int64_t IpmsgReqInt(const nlohmann::json& req, const char* key, int64_t def) {
+    auto it = req.find(key);
+    if (it == req.end()) return def;
+    if (it->is_number_unsigned()) return static_cast<int64_t>(it->get<uint64_t>());
+    if (it->is_number_integer()) return it->get<int64_t>();
+    if (it->is_number_float()) return static_cast<int64_t>(it->get<double>());
+    if (it->is_string()) {
+        try {
+            return std::stoll(it->get<std::string>());
+        } catch (...) {
+            return def;
+        }
+    }
+    return def;
+}
+
+static uint64_t IpmsgReqUint(const nlohmann::json& req, const char* key, uint64_t def) {
+    auto it = req.find(key);
+    if (it == req.end()) return def;
+    if (it->is_number_unsigned()) return it->get<uint64_t>();
+    if (it->is_number_integer()) {
+        int64_t v = it->get<int64_t>();
+        return v < 0 ? def : static_cast<uint64_t>(v);
+    }
+    if (it->is_number_float()) {
+        double d = it->get<double>();
+        return d < 0 ? def : static_cast<uint64_t>(d);
+    }
+    if (it->is_string()) {
+        try {
+            return std::stoull(it->get<std::string>());
+        } catch (...) {
+            return def;
+        }
+    }
+    return def;
+}
+
+std::string IpcServer::HandleIpmsgAction(const std::string& action, const std::string& reqJson) {
+    nlohmann::json req = nlohmann::json::parse(reqJson, nullptr, false);
+    if (req.is_discarded() || !req.is_object()) {
+        return "{\"ok\":false,\"error\":\"invalid JSON request\"}";
+    }
+    if (!ipmsg_) ipmsg_ = std::make_unique<IpmsgNode>();
+
+    if (action == "ipmsg_status") {
+        nlohmann::json status = ipmsg_->Status();
+        if (ipmsgHandler_) status["handler"] = ipmsgHandler_->StatusJson();
+        return status.dump();
+    }
+    if (action == "ipmsg_enable") {
+        auto it = req.find("enabled");
+        if (it == req.end() || !it->is_boolean()) {
+            return "{\"ok\":false,\"error\":\"enabled (bool) is required for ipmsg_enable\"}";
+        }
+        const bool enabled = it->get<bool>();
+        std::wstring configPath = PathJoinWide(GetEffectiveDataDirectoryWide(), L"config.json");
+        nlohmann::json cfg = nlohmann::json::object();
+        std::string content = ReadFileUtf8Wide(configPath);
+        if (!content.empty()) {
+            nlohmann::json parsed = nlohmann::json::parse(content, nullptr, false);
+            if (parsed.is_object()) cfg = parsed;
+        }
+        if (!cfg.contains("ipmsg") || !cfg["ipmsg"].is_object()) cfg["ipmsg"] = nlohmann::json::object();
+        cfg["ipmsg"]["enabled"] = enabled;
+        WriteFileAtomicWide(configPath, cfg.dump(2));
+        WriteAuditLog("IPMSG_ENABLE", enabled ? "enabled" : "disabled");
+        // Synchronous so the reply reflects the new state (and a freed port).
+        StartIpmsg();
+        nlohmann::json status = ipmsg_->Status();
+        if (ipmsgHandler_) status["handler"] = ipmsgHandler_->StatusJson();
+        return status.dump();
+    }
+    if (action == "ipmsg_peers") {
+        return ipmsg_->Peers().dump();
+    }
+    if (action == "ipmsg_refresh") {
+        return ipmsg_->Refresh().dump();
+    }
+    if (action == "ipmsg_send") {
+        std::vector<std::string> files;
+        if (req.contains("files") && req["files"].is_array()) {
+            for (const auto& f : req["files"]) {
+                if (f.is_string()) files.push_back(f.get<std::string>());
+            }
+        }
+        return ipmsg_->Send(IpmsgReqString(req, "to"), IpmsgReqString(req, "text"),
+                            IpmsgReqString(req, "from_agent"), IpmsgReqString(req, "to_agent"),
+                            IpmsgReqUint(req, "reply_to", 0), files,
+                            IpmsgReqString(req, "audience"),
+                            static_cast<int>(IpmsgReqInt(req, "hops", 0)))
+            .dump();
+    }
+    if (action == "ipmsg_get") {
+        return ipmsg_->Get(IpmsgReqUint(req, "id", 0)).dump();
+    }
+    if (action == "ipmsg_inbox") {
+        return ipmsg_->Inbox(IpmsgReqUint(req, "since_id", 0), IpmsgReqString(req, "agent"),
+                             IpmsgReqBool(req, "include_unaddressed", true),
+                             IpmsgReqBool(req, "unread_only", false),
+                             IpmsgReqBool(req, "include_outgoing", false),
+                             static_cast<size_t>(IpmsgReqUint(req, "limit", 50)),
+                             IpmsgReqBool(req, "mark_read", false))
+            .dump();
+    }
+    if (action == "ipmsg_wait") {
+        int timeoutMs = static_cast<int>(IpmsgReqInt(req, "timeout_ms", 60000));
+        if (timeoutMs < 0) timeoutMs = 0;
+        if (timeoutMs > 600000) timeoutMs = 600000;
+        return ipmsg_->Wait(IpmsgReqUint(req, "since_id", 0), IpmsgReqString(req, "agent"),
+                            IpmsgReqBool(req, "include_unaddressed", true), timeoutMs,
+                            IpmsgReqBool(req, "mark_read", true))
+            .dump();
+    }
+    if (action == "ipmsg_read") {
+        std::vector<uint64_t> ids;
+        if (req.contains("ids") && req["ids"].is_array()) {
+            for (const auto& id : req["ids"]) {
+                if (id.is_number_unsigned()) ids.push_back(id.get<uint64_t>());
+                else if (id.is_number_integer()) {
+                    int64_t v = id.get<int64_t>();
+                    if (v >= 0) ids.push_back(static_cast<uint64_t>(v));
+                } else if (id.is_string()) {
+                    try {
+                        ids.push_back(std::stoull(id.get<std::string>()));
+                    } catch (...) {
+                    }
+                }
+            }
+        }
+        return ipmsg_->MarkRead(ids, IpmsgReqBool(req, "all", false)).dump();
+    }
+    if (action == "ipmsg_download") {
+        int timeoutMs = static_cast<int>(IpmsgReqInt(req, "timeout_ms", 300000));
+        return ipmsg_->Download(IpmsgReqUint(req, "message_id", 0),
+                                IpmsgReqInt(req, "file_id", -1), IpmsgReqString(req, "dir"),
+                                IpmsgReqBool(req, "wait", false), timeoutMs)
+            .dump();
+    }
+    if (action == "ipmsg_log") {
+        return ipmsg_->Log(IpmsgReqString(req, "since", "7d"), IpmsgReqString(req, "until"),
+                           IpmsgReqString(req, "query"), IpmsgReqString(req, "peer"),
+                           IpmsgReqString(req, "agent"), IpmsgReqString(req, "event"),
+                           static_cast<size_t>(IpmsgReqUint(req, "limit", 200)))
+            .dump();
+    }
+    if (action == "ipmsg_clear") {
+        return ipmsg_->Clear().dump();
+    }
+    return "{\"ok\":false,\"error\":\"Unknown ipmsg action: " + JsonEscape(action) + "\"}";
 }
 
 std::string IpcServer::HandleRequestJson(const std::string& reqJson) {
@@ -1382,6 +1557,9 @@ std::string IpcServer::HandleRequestJson(const std::string& reqJson) {
         }
         return "{\"ok\":false,\"error\":\"Unknown memory action: " + JsonEscape(action) + "\"}";
     }
+    else if (action.rfind("ipmsg_", 0) == 0) {
+        return HandleIpmsgAction(action, reqJson);
+    }
     else if (action.rfind("config_", 0) == 0) {
         std::wstring configPath = PathJoinWide(GetEffectiveDataDirectoryWide(), L"config.json");
         if (action == "config_get") {
@@ -1411,6 +1589,23 @@ std::string IpcServer::HandleRequestJson(const std::string& reqJson) {
                 if (!w.contains("port")) w["port"] = 9138;
                 if (!w.contains("allowed_hosts")) w["allowed_hosts"] = nlohmann::json::array();
                 if (!w.contains("allowed_origins")) w["allowed_origins"] = nlohmann::json::array();
+            }
+            if (!cfg.contains("ipmsg") || !cfg["ipmsg"].is_object()) {
+                cfg["ipmsg"] = nlohmann::json::object();
+            }
+            {
+                nlohmann::json& m = cfg["ipmsg"];
+                nlohmann::json defaults = IpmsgConfig().ToJson();
+                for (auto it = defaults.begin(); it != defaults.end(); ++it) {
+                    if (!m.contains(it.key())) m[it.key()] = it.value();
+                }
+                if (!m.contains("handler") || !m["handler"].is_object()) {
+                    m["handler"] = nlohmann::json::object();
+                }
+                nlohmann::json handlerDefaults = IpmsgHandlerConfig().ToJson();
+                for (auto it = handlerDefaults.begin(); it != handlerDefaults.end(); ++it) {
+                    if (!m["handler"].contains(it.key())) m["handler"][it.key()] = it.value();
+                }
             }
             nlohmann::json out;
             out["ok"] = true;
@@ -1449,8 +1644,10 @@ std::string IpcServer::HandleRequestJson(const std::string& reqJson) {
                 SetUsageHistoryPersistence(cfg["restore_usage_graph"].get<bool>());
             }
             const bool webuiChanged = patch.contains("webui");
+            const bool ipmsgChanged = patch.contains("ipmsg");
             WriteFileAtomicWide(configPath, cfg.dump(2));
             if (webuiChanged) ScheduleWebUiRestart();
+            if (ipmsgChanged) ScheduleIpmsgRestart();
             nlohmann::json out;
             out["ok"] = true;
             out["config"] = cfg;

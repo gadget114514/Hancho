@@ -7,12 +7,15 @@
 #include <atomic>
 #include <string>
 #include <functional>
+#include <memory>
 #include <mutex>
 
 namespace pc {
 
 class BtManager;
 class WebUiServer;
+class IpmsgNode;
+class IpmsgHandler;
 
 class IpcServer {
 public:
@@ -54,12 +57,24 @@ public:
     // Runs on a short-lived helper thread so the config_set reply is sent first.
     void ScheduleWebUiRestart();
 
+    // IPMsg node. Always constructed so history and logs stay readable while
+    // the feature is disabled.
+    IpmsgNode* GetIpmsg() { return ipmsg_.get(); }
+    // Reads "ipmsg" from <data-dir>/config.json and starts the node when enabled.
+    // Failures are logged and the core keeps running.
+    void StartIpmsg();
+    void StopIpmsg();
+    // Stops and restarts the node after an "ipmsg" config change. Runs on a
+    // short-lived helper thread so the config_set reply is sent first.
+    void ScheduleIpmsgRestart();
+
     // Execute a JSON request directly against ProcessManager / TaskQueueManager / BtManager
     // and return a JSON response.
     std::string HandleRequestJson(const std::string& reqJson);
 
 private:
     void AcceptLoop();
+    std::string HandleIpmsgAction(const std::string& action, const std::string& reqJson);
     void StartRemoteListener();
     void StopRemoteListener();
     void InstallRemoteCallbacks();
@@ -84,6 +99,9 @@ private:
     std::unique_ptr<remote::RemoteListener> remoteListener_;
     std::unique_ptr<WebUiServer> webUiServer_;
     std::thread webuiRestartThread_;
+    std::unique_ptr<IpmsgNode> ipmsg_;
+    std::unique_ptr<IpmsgHandler> ipmsgHandler_;
+    std::thread ipmsgRestartThread_;
     bool remoteCallbacksInstalled_ = false;
 };
 

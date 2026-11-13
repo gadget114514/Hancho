@@ -95,3 +95,9 @@
   - **Hint ウインドウ (Pop-up Toast)**: 人間に向けて数秒で消えるガイダンスとワンクリック指示文コピーを提供。
   - **MCP レスポンス自動注入**: `taskqueue_wait` などの戻り値に `"audit"` 指導ディレクティブを直接付与。
 - 詳細は [Audit LLM 仕様書](audit-llm-ja.md) を参照。
+
+## 9. IP Messenger (IPMsg) 互換 LAN メッセージング
+- コアが古典的な IPMsg プロトコル（参加通知、メッセージ、開封通知、通常ファイル転送）を UDP/TCP ポート 2426 で話します。既定では無効です。同じ LAN 上の既存 IPMsg クライアントから Hancho がホストとして見えます。
+- `from_agent` / `to_agent` / `reply_to`、`audience`（human / agent）、ホップ数ガードによる LLM 同士のメッセージング。受信メッセージをワーカー LLM に渡し、その JSON 回答を返信として送れます。
+- `hancho-cli msg ...`、MCP の `ipmsg_*` ツール、単体ダイアログ（`Hancho.exe ipmsg [--tray]`、ダッシュボードのツールバーからも起動可）を提供。トレイ通知、検索可能なログ、設定を備えます。
+- 信頼できる LAN 専用で、暗号化はありません。プロトコル、設定、セキュリティ、例は [IP Messenger](ipmsg-ja.md) を参照。

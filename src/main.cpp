@@ -5,6 +5,7 @@
 #include "bt_manager.h"
 #include "mcp_server.h"
 #include "gui_dashboard.h"
+#include "gui_ipmsg.h"
 #include "cli.h"
 #include "ipc_client.h"
 #include "power.h"
@@ -43,6 +44,13 @@ USAGE:
   Hancho.exe mcp [--data-dir <path>]
       Run as a Model Context Protocol (MCP) stdio server for Claude.
       Automatically connects to (or launches) the Win32 GUI Dashboard.
+
+  Hancho.exe ipmsg [--data-dir <path>] [--tray]
+      Run the IPMsg compatible messenger dialog only (no main dashboard).
+      Connects to the running core, or starts the headless core first.
+      One dialog per data dir; a second launch brings the existing one forward.
+      --tray starts hidden in the notification area. Close (X) hides to tray;
+      exit from the tray menu.
 
   Hancho.exe --help
       Show this help.
@@ -141,7 +149,7 @@ MCP SERVER SETUP:
     - The dashboard auto-starts on first use and owns the Named Pipe server.
     - Logs, state and task queues live under logs/ (override: HANCHO_LOG_DIR).
 
-  MCP tools (34):
+  MCP tools (47):
     Process (6):
       start_process, list_processes, get_process_output, send_process_input,
       wait_process, kill_process
@@ -155,6 +163,11 @@ MCP SERVER SETUP:
     Behavior tree (10):
       bt_validate, bt_start, bt_get, bt_list, bt_wait, bt_resume, bt_retry,
       bt_update, bt_cancel, bt_pause
+    Power (3):
+      power_suspend, power_cancel, power_status
+    IPMsg (10):
+      ipmsg_status, ipmsg_peers, ipmsg_refresh, ipmsg_send, ipmsg_get,
+      ipmsg_inbox, ipmsg_wait, ipmsg_read, ipmsg_download, ipmsg_log
 
   HOW TO USE (decision guide):
     - One command, e.g. a build script, CLI worker or shell -> start_process
@@ -574,10 +587,12 @@ int main() {
     // Like hancho-cli, --json may come before or after the command.
     bool jsonOutput = false;
     bool noPrompt = false;
+    bool trayFlag = false;
     std::string firstCmd;
     for (size_t i = 1; i < args.size(); ++i) {
         if (args[i] == "--json" || args[i] == "-j") jsonOutput = true;
         else if (args[i] == "--no-prompt" || args[i] == "--no-start-core") noPrompt = true;
+        else if (args[i] == "--tray") trayFlag = true;
         // Starting is now the default; keep the old flag accepted so existing shortcuts still work.
         else if (args[i] == "--auto-start-core" || args[i] == "--start-core") {}
         else if (args[i] == "--webui-port" && i + 1 < args.size()) {
@@ -618,6 +633,23 @@ int main() {
 
     if (subcmd == "mcp") {
         return RunMcpServer();
+    }
+
+    if (subcmd == "ipmsg") {
+        // IPC client only: no main dashboard. Start the headless core if it is
+        // not running (same behavior as `Hancho.exe gui`).
+        std::string pingResp, pingErr;
+        if (!SendIpcRequest("{\"action\":\"ping\"}", pingResp, pingErr, false)) {
+            if (noPrompt) {
+                std::cerr << "Hancho core is not running. Please start it with: Hancho.exe --headless" << std::endl;
+                return 1;
+            }
+            if (!StartCoreHeadless()) return 1;
+        }
+        // Hide the console window of the GUI client process if present.
+        HWND hConsole = GetConsoleWindow();
+        if (hConsole) ShowWindow(hConsole, SW_HIDE);
+        return RunIpmsgDialog(trayFlag);
     }
 
     if (subcmd == "quit" || subcmd == "--quit") {

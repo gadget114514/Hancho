@@ -19,13 +19,17 @@ bool IpcServer::Start() {
     acceptThread_ = std::thread(&IpcServer::AcceptLoop, this);
     StartRemoteListener();
     StartWebUiServer();
+    StartIpmsg();
     return true;
 }
 
 void IpcServer::Stop() {
     if (stop_.exchange(true)) return;
     if (webuiRestartThread_.joinable()) webuiRestartThread_.join();
+    if (ipmsgRestartThread_.joinable()) ipmsgRestartThread_.join();
     StopWebUiServer();
+    StopIpmsg();
+    if (ipmsgHandler_) ipmsgHandler_->Stop();
     StopRemoteListener();
     if (transport_) transport_->Stop();
     if (acceptThread_.joinable()) acceptThread_.join();
