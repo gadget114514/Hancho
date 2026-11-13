@@ -31,6 +31,7 @@
 #include <ctime>
 #include <cstdio>
 #include <cmath>
+#include <cwctype>
 
 // ---------------------------------------------------------------------------
 // Globals required by src/Terminal/src/TerminalGridView.cpp
@@ -746,7 +747,7 @@ static int ListFontSizeIndex(int px) {
 }
 constexpr int kMinTerminalH        = 200;
 constexpr int kNumKpiCards         = 14;
-constexpr int kUsagePanelH         = 110;
+constexpr int kUsagePanelH         = 170;
 constexpr int kMinStreamPaneH      = 160;
 constexpr int64_t kLongStepMs      = 30000;
 
@@ -771,10 +772,15 @@ enum ControlId {
     IDC_BTN_REFRESH = 1029,
     IDC_BT_DEBUG = 1030,  // "BT" toolbar button / Ctrl+Shift+B: behavior tree view
     IDC_BTN_HINT = 1040,
-    IDC_BTN_SUPERVISOR = 1041,
     IDC_HINT_COPY = 1042,
     IDC_HINT_LAUNCH = 1043,
     IDC_HINT_CLOSE = 1044,
+    IDC_HINT_HISTORY = 1045,
+    IDC_BTN_HISTORY = 1046,
+    IDC_BTN_SEARCH_PROC = 1047,
+    IDC_BTN_SEARCH_TASK = 1048,
+    IDC_EDIT_SEARCH_PROC = 1049,
+    IDC_EDIT_SEARCH_TASK = 1050,
     IDC_SET_LANG_JA = 6001,
     IDC_SET_LANG_EN = 6002,
     IDC_SET_LANG_ES = 6003,
@@ -883,6 +889,20 @@ static SortDirection NextSortDirection(SortDirection dir) {
 
 struct LlmStreamDlgState;
 
+// One supervisor guidance hint as it was shown. Kept so the history dialog can list
+// earlier hints and re-use their prompt after the popup has gone away.
+struct SupervisorHintRecord {
+    std::wstring timestamp;
+    std::wstring category;
+    std::wstring summary;
+    std::wstring prompt;
+    std::string signature;
+};
+
+constexpr size_t kSupervisorHintHistoryMax = 200;
+constexpr int kHintWndWidth = 560;
+constexpr int kHintWndHeight = 210;
+
 struct DashboardState {
     ProcessManager* pm = nullptr;
     IpcServer* ipc = nullptr;
@@ -901,8 +921,9 @@ struct DashboardState {
     HWND hwndBtnToggleTerm = nullptr;
     HWND hwndBtnUsage = nullptr;
     HWND hwndBtnHint = nullptr;
-    HWND hwndBtnSupervisor = nullptr;
+    HWND hwndBtnHistory = nullptr;
     HWND hwndHintWnd = nullptr;
+    HWND hwndHintHistory = nullptr;
     bool showSupervisorHints = true;
     int hintAutoDismissSec = 6;
     std::string supervisorCommand = "claude";
@@ -910,13 +931,14 @@ struct DashboardState {
     // Signatures already popped up. Automatic hints skip them so a second divergence, failure or
     // contention surfaces while the first one is still in the list. Capped; see EvaluateSupervisorHint.
     std::unordered_set<std::string> shownHintSignatures;
+    std::vector<SupervisorHintRecord> hintHistory;
     std::wstring currentHintCategory;
     std::wstring currentHintSummary;
     std::wstring currentHintPrompt;
     int hintDismissCountdown = 0;
     HWND hwndUsagePanel = nullptr;
     bool showUsagePanel = true;
-    int usagePanelHeight = 110;
+    int usagePanelHeight = 170;
     int usageRangeIndex = 0; // 0: 24h (default), 1: 7d, 2: 30d, 3: 12m
     int usageGraphMode = 0; // 0: token kinds (default), 1: by provider/model
     bool restoreUsageGraph = false;
@@ -961,6 +983,15 @@ struct DashboardState {
     HWND hwndBtnStreamPane = nullptr;
     HWND hwndBtnBtView = nullptr;
     HWND hwndBtnRefresh = nullptr;
+    // Inline search bars in the process / task list captions.
+    HWND hwndSearchProcBtn = nullptr;
+    HWND hwndSearchTaskBtn = nullptr;
+    HWND hwndSearchProcEdit = nullptr;
+    HWND hwndSearchTaskEdit = nullptr;
+    bool showProcSearch = false;
+    bool showTaskSearch = false;
+    std::wstring procSearchText;
+    std::wstring taskSearchText;
     HWND hwndStreamPane = nullptr;
     LlmStreamDlgState* streamPane = nullptr; // owned by hwndStreamPane
     bool showStreamPane = true;
@@ -1256,6 +1287,8 @@ static TaskQueueCounts FetchTaskQueueCountsIpc(DashboardState* st) {
             c.failed = cnt.value("failed", 0);
             c.cancelled = cnt.value("cancelled", 0);
             c.total = cnt.value("total", 0);
+            c.minRemainingSec = cnt.value("min_remaining_sec", static_cast<int64_t>(-1));
+            c.sumRemainingSec = cnt.value("sum_remaining_sec", static_cast<int64_t>(-1));
         } else {
             c.running = resp.value("running", 0);
             c.waiting = resp.value("waiting", 0);
@@ -1265,6 +1298,8 @@ static TaskQueueCounts FetchTaskQueueCountsIpc(DashboardState* st) {
             c.failed = resp.value("failed", 0);
             c.cancelled = resp.value("cancelled", 0);
             c.total = resp.value("total", 0);
+            c.minRemainingSec = resp.value("min_remaining_sec", static_cast<int64_t>(-1));
+            c.sumRemainingSec = resp.value("sum_remaining_sec", static_cast<int64_t>(-1));
         }
         return c;
     }
@@ -1278,7 +1313,8 @@ static std::string TaskQueueListIpc(DashboardState* st, const std::string& taskq
     nlohmann::json req = {
         {"action", "taskqueue_list"},
         {"taskqueue", taskqueue},
-        {"state", state}
+        {"state", state},
+        {"include_planned", true}
     };
     if (sinceSec > 0) req["since_sec"] = sinceSec;
     if (!origin.empty()) req["origin"] = origin;
@@ -3271,6 +3307,9 @@ static std::vector<std::pair<std::string, std::string>> TaskQueueDepList(const s
 
 static std::wstring TaskQueueStateLabel(const std::string& state, const std::string& jobJson,
                                         const std::unordered_map<std::string, std::string>& stateById) {
+    if (state == "planned") {
+        return Tr(L"予定 (未登録)", L"planned", L"previsto");
+    }
     if (state != "pending") return Utf8ToWide(state);
     bool waitingForDeps = false;
     for (const auto& dep : TaskQueueDepList(jobJson)) {
@@ -3857,6 +3896,17 @@ static LRESULT CALLBACK PastRunsWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPAR
 
 static void ShowTaskQueueJobDetails(DashboardState* st, const std::string& jobId, int initialTab = 0) {
     if (!st || jobId.empty()) return;
+    if (jobId.rfind("btplan:", 0) == 0) {
+        gui_platform::GetGuiPlatform()->ShowMessageBox(
+            st->hwndMain,
+            Tr(L"予定タスク", L"Planned Task", L"Tarea prevista"),
+            Tr(L"このタスクはまだ起動していません。BT がこの分岐に進むとキューに登録されます。",
+               L"This task has not started yet. It is registered in the queue when the BT reaches this branch.",
+               L"Esta tarea aún no ha comenzado. Se registrará cuando el BT llegue a esta rama."),
+            gui_platform::MessageBoxType::Info,
+            false);
+        return;
+    }
     std::string err;
     std::string resp = TaskQueueGetIpc(st, jobId, true, 0, err);
     nlohmann::json job = nlohmann::json::parse(resp, nullptr, false);
@@ -4476,13 +4526,26 @@ static std::wstring TaskListCellText(HWND list, int row, int col) {
 
 static void ShowTaskQueueContextMenu(DashboardState* st, const std::string& jobId, POINT ptScreen, const std::wstring& cellText) {
     if (!st || jobId.empty()) return;
+    const bool virtualJob = jobId.rfind("btplan:", 0) == 0;
     std::string err;
-    std::string resp = TaskQueueGetIpc(st, jobId, false, 0, err);
+    std::string resp = virtualJob ? std::string() : TaskQueueGetIpc(st, jobId, false, 0, err);
     std::string jobState = JsonGetString(resp, "state", "");
 
     HMENU hMenu = CreatePopupMenu();
     AppendMenuW(hMenu, MF_STRING | (cellText.empty() ? MF_GRAYED : 0), 3110, Tr(L"セルをコピー", L"Copy cell", L"Copiar celda"));
     AppendMenuW(hMenu, MF_SEPARATOR, 0, nullptr);
+    if (virtualJob) {
+        // Provisional BT rows are not queue jobs yet; retry/cancel would have nothing to act on.
+        AppendMenuW(hMenu, MF_STRING, 3111, Tr(L"ビヘイビアツリーで表示", L"Show in Behavior Tree", L"Ver en el árbol de comportamiento"));
+        int cmd = TrackPopupMenu(hMenu, TPM_RETURNCMD | TPM_RIGHTBUTTON, ptScreen.x, ptScreen.y, 0, st->hwndMain, nullptr);
+        DestroyMenu(hMenu);
+        if (cmd == 3110) {
+            CopyTextToClipboard(st->hwndMain, cellText);
+        } else if (cmd == 3111) {
+            SendMessageW(st->hwndMain, WM_COMMAND, IDC_BT_DEBUG, 0);
+        }
+        return;
+    }
     if (jobState == "running") {
         AppendMenuW(hMenu, MF_STRING, 3107, Tr(L"ツリー終了 (ジョブ中断)", L"Kill Tree (Cancel Job)", L"Terminar árbol (Cancelar)"));
         AppendMenuW(hMenu, MF_SEPARATOR, 0, nullptr);
@@ -4552,6 +4615,27 @@ static void ShowTaskQueueContextMenu(DashboardState* st, const std::string& jobI
     RefreshDashboardData(st);
 }
 
+// Case-insensitive substring used by the list search bars.
+static bool WideContainsCi(const std::wstring& haystack, const std::wstring& needle) {
+    if (needle.empty()) return true;
+    auto it = std::search(haystack.begin(), haystack.end(), needle.begin(), needle.end(),
+                          [](wchar_t a, wchar_t b) {
+                              return std::towlower(a) == std::towlower(b);
+                          });
+    return it != haystack.end();
+}
+
+static bool ProcSnapshotMatchesSearch(const ProcessSnapshot& s, const std::wstring& query) {
+    if (query.empty()) return true;
+    return WideContainsCi(std::to_wstring(s.id), query) ||
+           WideContainsCi(std::to_wstring(s.rootPid), query) ||
+           WideContainsCi(Utf8ToWide(s.name), query) ||
+           WideContainsCi(Utf8ToWide(s.commandLine), query) ||
+           WideContainsCi(Utf8ToWide(s.jobKey), query) ||
+           WideContainsCi(Utf8ToWide(s.activity), query) ||
+           WideContainsCi(Utf8ToWide(s.activityTarget), query);
+}
+
 static void RefreshTaskQueueData(DashboardState* st, bool force = false) {
     if (!st || !st->hwndTaskList) return;
     if (st->listDisplayMode == ListDisplayMode::ProcessOnly) return;
@@ -4563,8 +4647,14 @@ static void RefreshTaskQueueData(DashboardState* st, bool force = false) {
         resp.find("\"state\":\"running\"") == std::string::npos) {
         return;
     }
+    const bool taskListChanged = (resp != st->lastTaskListJson);
     st->lastTaskListJson = resp;
     st->lastTaskListLang = lang;
+    // The Gantt reads lastTaskListJson; repaint it as soon as the BT state or jobs change
+    // instead of waiting for the usage panel's one-second timer.
+    if (taskListChanged && st->showUsagePanel && st->hwndUsagePanel) {
+        InvalidateRect(st->hwndUsagePanel, nullptr, FALSE);
+    }
     auto jobs = SplitJsonObjectArray(resp, "jobs");
 
     std::unordered_map<std::string, std::string> stateById;
@@ -4587,8 +4677,9 @@ static void RefreshTaskQueueData(DashboardState* st, bool force = false) {
     auto jobRank = [&](const std::string& jobJson) {
         std::string st = JsonGetString(jobJson, "state", "");
         if (st == "running") return 0;
-        if (st == "pending") return depsSatisfied(jobJson) ? 1 : 2;
-        return 3;
+        if (st == "planned") return 1;
+        if (st == "pending") return depsSatisfied(jobJson) ? 2 : 3;
+        return 4;
     };
     std::stable_sort(jobs.begin(), jobs.end(), [&](const std::string& a, const std::string& b) {
         int ra = jobRank(a);
@@ -4620,6 +4711,8 @@ static void RefreshTaskQueueData(DashboardState* st, bool force = false) {
         std::string kind = "other";
         if (state == "running") {
             kind = "running";
+        } else if (state == "planned") {
+            kind = "planned";
         } else if (state == "failed") {
             kind = (lastReason == "timed_out" || lastReason == "idle_timed_out") ? "timeout" : "failed";
         }
@@ -4705,7 +4798,7 @@ static void RefreshTaskQueueData(DashboardState* st, bool force = false) {
                     if (startEpochSec > 0) endEpochSec = startEpochSec + budgetSec;
                 }
             }
-        } else if (state == "pending") {
+        } else if (state == "pending" || state == "planned") {
             int timeoutSec = static_cast<int>(JsonGetInt(j, "timeout_sec", 0));
             int estimateSec = static_cast<int>(JsonGetInt(j, "estimate_sec", 0));
             int budgetSec = estimateSec > 0 ? estimateSec : timeoutSec;
@@ -4759,6 +4852,16 @@ static void RefreshTaskQueueData(DashboardState* st, bool force = false) {
         row.cells[7] = std::move(queueStr);
         row.cells[8] = std::move(originStr);
         row.cells[9] = std::move(resourcesStr);
+        if (!st->taskSearchText.empty()) {
+            bool matches = false;
+            for (const auto& cell : row.cells) {
+                if (WideContainsCi(cell, st->taskSearchText)) {
+                    matches = true;
+                    break;
+                }
+            }
+            if (!matches) continue;
+        }
         rows.push_back(std::move(row));
     }
 
@@ -5065,20 +5168,30 @@ static void RefreshDashboardData(DashboardState* st) {
 
     SortSnapshots(st->cachedSnapshots, st->sortColumn, st->sortDirection);
 
+    // Apply the process search here instead of dropping snapshots, so terminal tabs and
+    // the monitor keep working for processes hidden by the filter.
+    std::vector<size_t> visibleProcIdx;
+    visibleProcIdx.reserve(st->cachedSnapshots.size());
+    for (size_t i = 0; i < st->cachedSnapshots.size(); ++i) {
+        if (ProcSnapshotMatchesSearch(st->cachedSnapshots[i], st->procSearchText)) {
+            visibleProcIdx.push_back(i);
+        }
+    }
+
     auto getNewestId = [&]() -> int {
         int maxId = -1;
-        for (const auto& s : st->cachedSnapshots) {
-            if (s.id > maxId) maxId = s.id;
+        for (size_t idx : visibleProcIdx) {
+            if (st->cachedSnapshots[idx].id > maxId) maxId = st->cachedSnapshots[idx].id;
         }
         return maxId;
     };
 
-    if (st->selectedProcId <= 0 && !st->cachedSnapshots.empty()) {
+    if (st->selectedProcId <= 0 && !visibleProcIdx.empty()) {
         st->selectedProcId = getNewestId();
     } else if (st->selectedProcId > 0) {
         bool exists = false;
-        for (const auto& s : st->cachedSnapshots) {
-            if (s.id == st->selectedProcId) { exists = true; break; }
+        for (size_t idx : visibleProcIdx) {
+            if (st->cachedSnapshots[idx].id == st->selectedProcId) { exists = true; break; }
         }
         if (!exists) {
             st->selectedProcId = getNewestId();
@@ -5088,7 +5201,7 @@ static void RefreshDashboardData(DashboardState* st) {
     LayoutTerminalViews(st);
 
     int currentCount = ListView_GetItemCount(st->hwndList);
-    int targetCount = static_cast<int>(st->cachedSnapshots.size());
+    int targetCount = static_cast<int>(visibleProcIdx.size());
     if (static_cast<int>(st->procListCells.size()) != currentCount) {
         st->procListCells.assign(static_cast<size_t>(currentCount), {});
         st->procListRowBg.assign(static_cast<size_t>(currentCount), CLR_INVALID);
@@ -5106,7 +5219,7 @@ static void RefreshDashboardData(DashboardState* st) {
     st->procListRowBg.resize(static_cast<size_t>(targetCount), CLR_INVALID);
 
     for (int i = 0; i < targetCount; ++i) {
-        const auto& s = st->cachedSnapshots[i];
+        const auto& s = st->cachedSnapshots[visibleProcIdx[i]];
         std::wstring idStr = L"#" + std::to_wstring(s.id);
         std::wstring nameStr = Utf8ToWide(s.name);
         if (!s.agentType.empty()) {
@@ -5210,7 +5323,7 @@ static void RefreshDashboardData(DashboardState* st) {
 
     int selIdx = -1;
     for (int i = 0; i < targetCount; ++i) {
-        if (st->cachedSnapshots[i].id == st->selectedProcId) {
+        if (st->cachedSnapshots[visibleProcIdx[i]].id == st->selectedProcId) {
             selIdx = i;
             break;
         }
@@ -5290,6 +5403,132 @@ static void UpdateTaskListColumnWidths(DashboardState* st) {
     for (int i = 1; i < kOther; ++i) ListView_SetColumnWidth(st->hwndTaskList, i + 1, widths[i]);
 }
 
+// ---------------------------------------------------------------------------
+// Task Gantt chart. Drawn as the third column of the usage panel, and draws
+// one row per task-queue job. Provisional BT rows (state "planned") are included
+// because the dashboard's taskqueue_list request asks for include_planned.
+// ---------------------------------------------------------------------------
+struct TaskGanttSegment {
+    int64_t start = 0;
+    int64_t end = 0;
+    std::string reason;
+    bool running = false;
+};
+
+struct TaskGanttRow {
+    std::string id;
+    std::wstring label;
+    std::string state;
+    int64_t firstStart = 0;
+    int64_t lastEnd = 0;
+    bool planned = false;
+    std::vector<TaskGanttSegment> segments;
+};
+
+static std::vector<TaskGanttRow> BuildTaskGanttRows(const std::string& listJson, int64_t now) {
+    std::vector<TaskGanttRow> rows;
+    auto jobs = SplitJsonObjectArray(listJson, "jobs");
+    rows.reserve(jobs.size());
+    // Planned rows have no created_at, so give them a stable forecast: chain them in the
+    // order taskqueue_list returned (BT execution order) instead of starting each one at
+    // "now" on every repaint.
+    int64_t plannedCursor = now;
+    for (const auto& j : jobs) {
+        TaskGanttRow row;
+        row.id = JsonGetString(j, "id", "");
+        row.state = JsonGetString(j, "state", "");
+        std::string summary = JsonGetString(j, "summary", "");
+        if (summary.empty()) summary = row.id;
+        row.label = Utf8ToWide(summary);
+        if (row.state == "planned") {
+            row.label = Tr(L"[予定] ", L"[planned] ", L"[previsto] ") + row.label;
+            row.planned = true;
+        }
+
+        auto attempts = SplitJsonObjectArray(j, "attempts");
+        for (size_t ai = 0; ai < attempts.size(); ++ai) {
+            const auto& a = attempts[ai];
+            int64_t start = ParseTimestampStrToEpoch(JsonGetString(a, "start", ""));
+            if (start <= 0) continue;
+            int64_t end = ParseTimestampStrToEpoch(JsonGetString(a, "end", ""));
+            bool last = (ai + 1 == attempts.size());
+            bool running = last && end <= 0 && row.state == "running";
+            if (end <= 0) end = running ? now : start;
+            if (end < start) end = start;
+            TaskGanttSegment seg;
+            seg.start = start;
+            seg.end = end;
+            seg.reason = JsonGetString(a, "reason", "");
+            seg.running = running;
+            row.segments.push_back(seg);
+        }
+        if (row.segments.empty()) {
+            int64_t estimate = JsonGetInt(j, "estimate_sec", 0);
+            if (estimate <= 0) estimate = JsonGetInt(j, "timeout_sec", 0);
+            if (estimate <= 0) estimate = 60;
+            int64_t start = ParseTimestampStrToEpoch(JsonGetString(j, "created_at", ""));
+            if (start <= 0) start = (row.state == "planned") ? plannedCursor : now;
+            TaskGanttSegment seg;
+            seg.start = start;
+            seg.end = start + estimate;
+            seg.reason = row.state;
+            row.segments.push_back(seg);
+            if (row.state == "planned") plannedCursor = seg.end;
+            row.planned = (row.state == "planned" || row.state == "pending");
+        }
+        row.firstStart = row.segments.front().start;
+        row.lastEnd = row.segments.front().end;
+        for (const auto& s : row.segments) {
+            row.firstStart = (std::min)(row.firstStart, s.start);
+            row.lastEnd = (std::max)(row.lastEnd, s.end);
+        }
+        rows.push_back(std::move(row));
+    }
+    std::stable_sort(rows.begin(), rows.end(), [](const TaskGanttRow& a, const TaskGanttRow& b) {
+        if (a.firstStart != b.firstStart) return a.firstStart < b.firstStart;
+        return _wcsicmp(a.label.c_str(), b.label.c_str()) < 0;
+    });
+    return rows;
+}
+
+static std::wstring FormatGanttTick(int64_t epochSec, bool withDate) {
+    time_t t = static_cast<time_t>(epochSec);
+    struct tm tmLocal = {};
+    if (!LocalTimeFromSec(&t, &tmLocal)) return L"";
+    wchar_t buf[64] = {};
+    if (withDate) {
+        wcsftime(buf, 64, L"%m/%d %H:%M", &tmLocal);
+    } else {
+        wcsftime(buf, 64, L"%H:%M", &tmLocal);
+    }
+    return buf;
+}
+
+static int64_t NiceGanttStep(int64_t raw) {
+    static const int64_t steps[] = {1, 2, 5, 10, 15, 30, 60, 120, 300, 600, 900, 1800,
+                                    3600, 7200, 10800, 21600, 43200, 86400, 172800, 604800};
+    if (raw <= 1) return 1;
+    for (int64_t s : steps) {
+        if (raw <= s) return s;
+    }
+    return 604800;
+}
+
+static COLORREF GanttSegmentColor(const TaskGanttSegment& seg, const std::string& jobState) {
+    if (seg.running) return g_theme.rowRunning;
+    if (seg.reason == "ok" || seg.reason == "succeeded") return g_theme.rowCompleted;
+    if (seg.reason == "deferred" || seg.reason == "interrupted" || seg.reason == "killed") {
+        return g_theme.rowIdle;
+    }
+    if (seg.reason == "failed" || seg.reason == "checkFailed" ||
+        seg.reason == "timed_out" || seg.reason == "idle_timed_out") {
+        return g_theme.rowFailed;
+    }
+    if (jobState == "succeeded") return g_theme.rowCompleted;
+    if (jobState == "failed" || jobState == "cancelled") return g_theme.rowFailed;
+    return g_theme.rowIdle;
+}
+
 static void LayoutControls(DashboardState* st, int width, int height) {
     if (!st) return;
     int margin = 10;
@@ -5329,7 +5568,7 @@ static void LayoutControls(DashboardState* st, int width, int height) {
         {st->hwndBtnHideTray, 28},
         {st->hwndBtnRefresh, 28},
         {st->hwndBtnHint, 28},
-        {st->hwndBtnSupervisor, 28},
+        {st->hwndBtnHistory, 28},
         {st->hwndClock, 80}
     };
     const int gap = 7;
@@ -5412,6 +5651,7 @@ static void LayoutControls(DashboardState* st, int width, int height) {
                                (std::max)(0, listH - captionH), TRUE);
                 }
             } else {
+                st->lastTotalListHeight = availForRows;
                 int procH = static_cast<int>(availForRows * st->procRowRatio);
                 if (procH < kMinRowListH) procH = kMinRowListH;
                 if (procH > availForRows - kMinRowListH) procH = availForRows - kMinRowListH;
@@ -5485,6 +5725,32 @@ static void LayoutControls(DashboardState* st, int width, int height) {
 
     // Bottom Status Bar
     st->rcStatusBar = {0, height - kStatusBarH, width, height};
+
+    auto layoutCaptionSearch = [&](const RECT& cap, HWND btn, HWND edit, bool open) {
+        if (!btn || !edit) return;
+        const int capH = cap.bottom - cap.top;
+        if (capH <= 0) {
+            ShowWindow(btn, SW_HIDE);
+            ShowWindow(edit, SW_HIDE);
+            return;
+        }
+        const int h = (std::max)(18, capH - 4);
+        const int y = cap.top + 2;
+        const int bw = 24;
+        const int bx = cap.right - 8 - bw;
+        ShowWindow(btn, SW_SHOW);
+        MoveWindow(btn, bx, y, bw, h, TRUE);
+        if (open) {
+            const int ew = (std::min)(220, (std::max)(100, bx - static_cast<int>(cap.left) - 16));
+            const int ex = bx - ew - 4;
+            MoveWindow(edit, ex, y, ew, h, TRUE);
+            ShowWindow(edit, SW_SHOW);
+        } else {
+            ShowWindow(edit, SW_HIDE);
+        }
+    };
+    layoutCaptionSearch(st->rcProcCaption, st->hwndSearchProcBtn, st->hwndSearchProcEdit, st->showProcSearch);
+    layoutCaptionSearch(st->rcTaskCaption, st->hwndSearchTaskBtn, st->hwndSearchTaskEdit, st->showTaskSearch);
 
     UpdateTaskListColumnWidths(st);
     LayoutTerminalViews(st);
@@ -9070,8 +9336,8 @@ static void UpdateToolbarLabels(DashboardState* st) {
         SetWindowTextW(st->hwndBtnHideTray, L"⤓");
     if (st->hwndBtnHint)
         SetWindowTextW(st->hwndBtnHint, L"💡");
-    if (st->hwndBtnSupervisor)
-        SetWindowTextW(st->hwndBtnSupervisor, L"🤖");
+    if (st->hwndBtnHistory)
+        SetWindowTextW(st->hwndBtnHistory, L"🕘");
 
     if (st->hwndToolbarTip) {
         if (st->hwndBtnGridView)
@@ -9083,9 +9349,9 @@ static void UpdateToolbarLabels(DashboardState* st) {
         if (st->hwndBtnHint)
             UpdateControlTooltip(st->hwndToolbarTip, st->hwndMain, st->hwndBtnHint,
                 Tr(L"Supervisor ガイダンス・ヒント", L"Supervisor Guidance / Hints", L"Guía de Supervisor"));
-        if (st->hwndBtnSupervisor)
-            UpdateControlTooltip(st->hwndToolbarTip, st->hwndMain, st->hwndBtnSupervisor,
-                Tr(L"Supervisor LLM を起動", L"Launch Supervisor LLM", L"Iniciar Supervisor LLM"));
+        if (st->hwndBtnHistory)
+            UpdateControlTooltip(st->hwndToolbarTip, st->hwndMain, st->hwndBtnHistory,
+                Tr(L"ヒント履歴", L"Hint History", L"Historial de pistas"));
     }
     UpdatePanelToggleLabels(st);
     if (st->hwndBtnViewTasks) {
@@ -10825,6 +11091,145 @@ static COLORREF DesaturateColor(COLORREF c, float amount) {
     return RGB(nr, ng, nb);
 }
 
+static void DrawTaskGanttPane(HDC hdc, DashboardState* st, const RECT& plot,
+                              int64_t since, int64_t now) {
+    if (!st || plot.right - plot.left < 60 || plot.bottom - plot.top < 16) return;
+    if (now <= since) return;
+
+    RECT titleRc = {plot.left, plot.top - 14, plot.right, plot.top};
+    SetTextColor(hdc, g_theme.muted);
+    SelectObject(hdc, st->hFontUiBold ? st->hFontUiBold : GetStockObject(DEFAULT_GUI_FONT));
+    DrawTextW(hdc, Tr(L"タスク・ガント", L"TASK GANTT", L"GANTT DE TAREAS"), -1, &titleRc,
+              DT_LEFT | DT_VCENTER | DT_SINGLELINE | DT_END_ELLIPSIS);
+
+    std::vector<TaskGanttRow> rows;
+    if (!st->lastTaskListJson.empty()) rows = BuildTaskGanttRows(st->lastTaskListJson, now);
+    std::vector<const TaskGanttRow*> visible;
+    visible.reserve(rows.size());
+    for (const auto& row : rows) {
+        if (row.segments.empty() || row.lastEnd < since) continue;
+        visible.push_back(&row);
+    }
+
+    int64_t winStart = since;
+    int64_t winEnd = now;
+    if (!visible.empty()) {
+        winStart = visible.front()->firstStart;
+        winEnd = visible.front()->lastEnd;
+        for (const TaskGanttRow* row : visible) {
+            winStart = (std::min)(winStart, row->firstStart);
+            winEnd = (std::max)(winEnd, row->lastEnd);
+        }
+        int64_t span = winEnd - winStart;
+        if (span < 60) {
+            int64_t pad = (60 - span + 1) / 2;
+            winStart -= pad;
+            winEnd += pad;
+            span = winEnd - winStart;
+        }
+        int64_t pad = span / 20;
+        if (pad > 0) {
+            winStart -= pad;
+            winEnd += pad;
+        }
+    }
+
+    int x0 = plot.left;
+    int x1 = plot.right;
+    int top = plot.top;
+    int bottom = plot.bottom - 15;
+    if (bottom <= top) return;
+
+    int labelW = (x1 - x0) * 2 / 5;
+    if (labelW > 150) labelW = 150;
+    if (labelW < 52) labelW = 52;
+    int laneX0 = x0 + labelW + 4;
+    int laneX1 = x1;
+    int laneW = laneX1 - laneX0;
+    if (laneW < 20) return;
+    int64_t span = winEnd - winStart;
+    if (span <= 0) span = 1;
+
+    auto timeToX = [&](int64_t t) {
+        int x = laneX0 + static_cast<int>((static_cast<double>(t - winStart) / span) * laneW);
+        if (x < laneX0) x = laneX0;
+        if (x > laneX1) x = laneX1;
+        return x;
+    };
+
+    HPEN grid = CreatePen(PS_DOT, 1, g_theme.border);
+    HGDIOBJ oldPen = SelectObject(hdc, grid);
+    int64_t tickStep = NiceGanttStep(span / 4);
+    if (tickStep < 1) tickStep = 1;
+    int64_t tick = ((winStart + tickStep - 1) / tickStep) * tickStep;
+    for (; tick < winEnd; tick += tickStep) {
+        int tx = timeToX(tick);
+        MoveToEx(hdc, tx, top, nullptr);
+        LineTo(hdc, tx, bottom);
+    }
+    SelectObject(hdc, oldPen);
+    DeleteObject(grid);
+
+    if (visible.empty()) {
+        SetTextColor(hdc, g_theme.muted);
+        SelectObject(hdc, st->hFontUi ? st->hFontUi : GetStockObject(DEFAULT_GUI_FONT));
+        RECT emptyRc = {x0, top, x1, bottom};
+        DrawTextW(hdc, Tr(L"この期間にタスクはありません", L"No tasks in range", L"Sin tareas en el rango"),
+                  -1, &emptyRc, DT_CENTER | DT_VCENTER | DT_SINGLELINE | DT_END_ELLIPSIS);
+    } else {
+        const int rowH = 16;
+        int nFit = (bottom - top) / rowH;
+        if (nFit < 1) nFit = 1;
+        int total = static_cast<int>(visible.size());
+        int n = total;
+        bool more = false;
+        if (n > nFit) {
+            n = nFit - 1;
+            if (n < 0) n = 0;
+            more = true;
+        }
+        SelectObject(hdc, st->hFontUi ? st->hFontUi : GetStockObject(DEFAULT_GUI_FONT));
+        for (int i = 0; i < n; ++i) {
+            const TaskGanttRow& row = *visible[i];
+            int ry = top + i * rowH;
+            RECT labelRc = {x0, ry, x0 + labelW, ry + rowH};
+            SetTextColor(hdc, row.planned ? g_theme.muted : g_theme.text);
+            DrawTextW(hdc, row.label.c_str(), -1, &labelRc,
+                      DT_LEFT | DT_VCENTER | DT_SINGLELINE | DT_END_ELLIPSIS);
+
+            for (const auto& seg : row.segments) {
+                int64_t s = (std::max)(seg.start, winStart);
+                int64_t e = (std::min)(seg.end, winEnd);
+                if (e <= s) continue;
+                int sx = timeToX(s);
+                int ex = timeToX(e);
+                if (ex <= sx) ex = sx + 2;
+                RECT segRc = {sx, ry + 3, ex, ry + rowH - 3};
+                HBRUSH brush = CreateSolidBrush(GanttSegmentColor(seg, row.state));
+                FillRect(hdc, &segRc, brush);
+                DeleteObject(brush);
+            }
+        }
+        if (more) {
+            SetTextColor(hdc, g_theme.muted);
+            wchar_t moreText[32] = {};
+            swprintf_s(moreText, L"+%d", total - n);
+            RECT moreRc = {x0, top + n * rowH, x1, top + (n + 1) * rowH};
+            DrawTextW(hdc, moreText, -1, &moreRc, DT_RIGHT | DT_SINGLELINE | DT_END_ELLIPSIS);
+        }
+    }
+
+    SetTextColor(hdc, g_theme.muted);
+    SelectObject(hdc, st->hFontUi ? st->hFontUi : GetStockObject(DEFAULT_GUI_FONT));
+    bool withDate = span >= 86400;
+    std::wstring startLbl = FormatGanttTick(winStart, withDate);
+    std::wstring endLbl = FormatGanttTick(winEnd, withDate);
+    RECT startRc = {laneX0, bottom + 1, laneX0 + laneW / 2, bottom + 14};
+    RECT endRc = {laneX0 + laneW / 2, bottom + 1, laneX1, bottom + 14};
+    DrawTextW(hdc, startLbl.c_str(), -1, &startRc, DT_LEFT | DT_SINGLELINE | DT_END_ELLIPSIS);
+    DrawTextW(hdc, endLbl.c_str(), -1, &endRc, DT_RIGHT | DT_SINGLELINE | DT_END_ELLIPSIS);
+}
+
 static void DrawUsagePanel(HWND hwnd, HDC hdc, DashboardState* st) {
     RECT rc = {};
     GetClientRect(hwnd, &rc);
@@ -10961,6 +11366,8 @@ static void DrawUsagePanel(HWND hwnd, HDC hdc, DashboardState* st) {
             for (const auto& d : daily) {
                 LlmUsagePoint pt;
                 pt.epochSec = d.firstEpochSec > 0 ? d.firstEpochSec : now;
+                if (pt.epochSec < since) pt.epochSec = since;
+                if (pt.epochSec > now) pt.epochSec = now;
                 pt.inputTokens = d.inputTokens;
                 pt.outputTokens = d.outputTokens;
                 pt.thinkingTokens = d.thinkingTokens;
@@ -10990,8 +11397,10 @@ static void DrawUsagePanel(HWND hwnd, HDC hdc, DashboardState* st) {
         }
 
         int gx0_tmp = 58;
-        int splitX_tmp = gx0_tmp + (w - gx0_tmp - 12) * 33 / 100;
-        int graphW_tmp = (splitX_tmp - 6) - gx0_tmp;
+        int colW_tmp = (w - 24) / 3;
+        if (colW_tmp < 1) colW_tmp = 1;
+        int graphW_tmp = (12 + colW_tmp - 8) - gx0_tmp;
+        if (graphW_tmp < 1) graphW_tmp = 1;
         nBuckets = graphW_tmp / 7;
         if (nBuckets < 12) nBuckets = 12;
         if (nBuckets > 96) nBuckets = 96;
@@ -11007,10 +11416,15 @@ static void DrawUsagePanel(HWND hwnd, HDC hdc, DashboardState* st) {
         valCache.assign(nBuckets, std::vector<uint64_t>(keys.size(), 0));
         bucketTotal.assign(nBuckets, 0);
 
+        int64_t windowStartSec = static_cast<int64_t>(windowStartBucket * bucketSec);
         for (const auto& p : points) {
-            int64_t pb = static_cast<int64_t>(p.epochSec / bucketSec);
+            int64_t pe = p.epochSec;
+            if (pe < windowStartSec) pe = windowStartSec;
+            if (pe > now) pe = now;
+            int64_t pb = static_cast<int64_t>(pe / bucketSec);
             int bi = static_cast<int>(pb - windowStartBucket);
-            if (bi < 0 || bi >= nBuckets) continue;
+            if (bi < 0) bi = 0;
+            if (bi >= nBuckets) bi = nBuckets - 1;
             std::string name = p.agentType.empty() ? "unknown" : p.agentType;
             if (!p.model.empty()) name += " / " + p.model;
             else name += " / (default)";
@@ -11159,11 +11573,19 @@ static void DrawUsagePanel(HWND hwnd, HDC hdc, DashboardState* st) {
     RECT sumRc = {closeRc.left - 270, 6, closeRc.left - 116, 24};
     SetTextColor(hdc, g_theme.accent);
     DrawTextW(hdc, summary.c_str(), -1, &sumRc, DT_RIGHT | DT_VCENTER | DT_SINGLELINE | DT_END_ELLIPSIS);
+    // Three equal columns: token usage over time, usage by model, task Gantt.
+    int contentL = 12;
+    int contentR = w - 12;
+    int colW = (contentR - contentL) / 3;
+    if (colW < 1) colW = 1;
+    int col1 = contentL + colW;
+    int col2 = contentL + colW * 2;
     int gx0 = 58;
-    int splitX = gx0 + (w - gx0 - 12) * 33 / 100;
-    int gx1 = splitX - 6;
-    int mx0 = splitX + 6;
-    int mx1 = w - 12;
+    int gx1 = col1 - 8;
+    int mx0 = col1 + 8;
+    int mx1 = col2 - 8;
+    int tx0 = col2 + 8;
+    int tx1 = contentR;
     int gy0 = 30;
     int gy1 = h - 26;
     int graphW = gx1 - gx0;
@@ -11185,8 +11607,6 @@ static void DrawUsagePanel(HWND hwnd, HDC hdc, DashboardState* st) {
             ? Tr(L"データを取得中です...", L"Fetching data...", L"Obteniendo datos...")
             : Tr(L"まだ使用量データがありません", L"No token usage recorded yet", L"Aún no hay datos de uso");
         DrawTextW(hdc, msg, -1, &emptyRc, DT_CENTER | DT_VCENTER | DT_SINGLELINE);
-        SelectObject(hdc, oldFont);
-        return;
     }
 
     uint64_t maxBucket = 1;
@@ -11305,7 +11725,11 @@ static void DrawUsagePanel(HWND hwnd, HDC hdc, DashboardState* st) {
         int rowH = (n > 0) ? (availH / n) : availH;
         if (rowH < 30) rowH = 30;
         if (rowH > 44) rowH = 44;
-        int labelW = (std::min)(300, mx1 - mx0 - 30);
+        int labelW = (mx1 - mx0) * 45 / 100;
+        if (labelW > 220) labelW = 220;
+        if (labelW < 60) labelW = 60;
+        if (labelW > mx1 - mx0 - 30) labelW = mx1 - mx0 - 30;
+        if (labelW < 0) labelW = 0;
         int barX0 = mx0 + labelW + 4;
         int y = gy0 + 2;
         SelectObject(hdc, st->hFontUi ? st->hFontUi : GetStockObject(DEFAULT_GUI_FONT));
@@ -11383,6 +11807,11 @@ static void DrawUsagePanel(HWND hwnd, HDC hdc, DashboardState* st) {
             DrawTextW(hdc, full.c_str(), -1, &valRc, DT_LEFT | DT_VCENTER | DT_SINGLELINE | DT_END_ELLIPSIS);
             y += 16;
         }
+    }
+
+    if (tx1 - tx0 >= 60) {
+        RECT ganttPlot = {tx0, gy0, tx1, gy1};
+        DrawTaskGanttPane(hdc, st, ganttPlot, since, now);
     }
 
     SetTextColor(hdc, g_theme.muted);
@@ -11490,10 +11919,48 @@ static LRESULT CALLBACK UsagePanelWndProc(HWND hwnd, UINT msg, WPARAM wParam, LP
 // Supervisor Guidance & Audit Hint Window (Card 070)
 // ---------------------------------------------------------------------------
 
-static void LaunchSupervisorTerminal(DashboardState* st) {
+// Quote one argument for a Windows command line (CommandLineToArgvW rules).
+static std::wstring QuoteSupervisorArg(const std::wstring& arg) {
+    std::wstring out;
+    out.reserve(arg.size() + 2);
+    out.push_back(L'"');
+    size_t backslashes = 0;
+    for (wchar_t c : arg) {
+        if (c == L'\\') {
+            ++backslashes;
+            out.push_back(c);
+        } else if (c == L'"') {
+            out.append(backslashes + 1, L'\\');
+            out.push_back(L'"');
+            backslashes = 0;
+        } else {
+            backslashes = 0;
+            out.push_back(c);
+        }
+    }
+    out.append(backslashes, L'\\');
+    out.push_back(L'"');
+    return out;
+}
+
+// supervisor_command may contain {prompt}; when it does not, a non-empty prompt is
+// appended as one more argument. This is what lets the hint window hand its prompt
+// to the supervisor instead of only opening a blank terminal.
+static std::string BuildSupervisorCommand(const std::string& configured, const std::wstring& prompt) {
+    std::wstring cmd = Utf8ToWide(configured.empty() ? std::string("claude") : configured);
+    const size_t pos = cmd.find(L"{prompt}");
+    if (pos != std::wstring::npos) {
+        cmd.replace(pos, 8, prompt.empty() ? std::wstring() : QuoteSupervisorArg(prompt));
+    } else if (!prompt.empty()) {
+        if (!cmd.empty() && cmd.back() != L' ') cmd.push_back(L' ');
+        cmd += QuoteSupervisorArg(prompt);
+    }
+    return WideToUtf8(cmd);
+}
+
+static void LaunchSupervisorTerminal(DashboardState* st, const std::wstring& prompt = L"") {
     if (!st) return;
-    std::string cmd = st->supervisorCommand;
-    if (cmd.empty()) cmd = "claude";
+    std::string cmd = BuildSupervisorCommand(st->supervisorCommand, prompt);
     StartProcessRequest req;
     req.mode = ExecMode::ConPTY;
     req.name = "supervisor";
@@ -11533,13 +12000,289 @@ static void RepositionHintWindow(DashboardState* st) {
     if (!st || !st->hwndHintWnd || !IsWindow(st->hwndHintWnd)) return;
     RECT rcMain = {};
     GetWindowRect(st->hwndMain, &rcMain);
-    int hintW = 460;
-    int hintH = 210;
+    int hintW = kHintWndWidth;
+    int hintH = kHintWndHeight;
     int x = rcMain.right - hintW - 20;
     int y = rcMain.bottom - hintH - 45;
     if (x < rcMain.left + 10) x = rcMain.left + 10;
     if (y < rcMain.top + 10) y = rcMain.top + 10;
     SetWindowPos(st->hwndHintWnd, HWND_TOP, x, y, hintW, hintH, SWP_NOACTIVATE);
+}
+
+// ---------------------------------------------------------------------------
+// Supervisor hint history: a list of hints that were shown earlier, with the
+// same copy / launch actions as the popup so a dismissed hint is not lost.
+// ---------------------------------------------------------------------------
+static void DisplaySupervisorHint(DashboardState* st, const std::wstring& category,
+                                  const std::wstring& summary, const std::wstring& prompt,
+                                  int autoDismissSec);
+
+struct HintHistoryDlgState {
+    DashboardState* dash = nullptr;
+    HFONT fontUi = nullptr;
+    HWND list = nullptr;
+    HWND detail = nullptr;
+    HWND btnCopy = nullptr;
+    HWND btnLaunch = nullptr;
+    HWND btnReload = nullptr;
+    HWND btnClose = nullptr;
+    std::vector<SupervisorHintRecord> rows;
+    bool loading = false;
+};
+
+static void HintHistoryUpdateSelection(HintHistoryDlgState* ds) {
+    if (!ds || !ds->list) return;
+    int sel = ListView_GetNextItem(ds->list, -1, LVNI_SELECTED);
+    bool has = sel >= 0 && static_cast<size_t>(sel) < ds->rows.size();
+    if (ds->detail) {
+        if (has) {
+            const SupervisorHintRecord& r = ds->rows[static_cast<size_t>(sel)];
+            std::wstring text = r.timestamp + L"  " + r.category + L"\r\n\r\n" + r.summary +
+                                L"\r\n\r\n" + r.prompt;
+            SetWindowTextW(ds->detail, text.c_str());
+        } else {
+            SetWindowTextW(ds->detail, Tr(L"ヒントを選択してください。", L"Select a hint.", L"Selecciona una pista."));
+        }
+    }
+    if (ds->btnCopy) EnableWindow(ds->btnCopy, has);
+    if (ds->btnLaunch) EnableWindow(ds->btnLaunch, has);
+}
+
+static void HintHistoryReload(HintHistoryDlgState* ds) {
+    if (!ds || !ds->list || !ds->dash) return;
+    ds->loading = true;
+    ds->rows.assign(ds->dash->hintHistory.rbegin(), ds->dash->hintHistory.rend());
+
+    SendMessageW(ds->list, WM_SETREDRAW, FALSE, 0);
+    ListView_DeleteAllItems(ds->list);
+    for (size_t i = 0; i < ds->rows.size(); ++i) {
+        const SupervisorHintRecord& r = ds->rows[i];
+        std::wstring summary = r.summary;
+        for (wchar_t& c : summary) {
+            if (c == L'\r' || c == L'\n') c = L' ';
+        }
+        LVITEMW item = {};
+        item.mask = LVIF_TEXT | LVIF_PARAM;
+        item.iItem = static_cast<int>(i);
+        item.pszText = const_cast<wchar_t*>(r.timestamp.c_str());
+        item.lParam = static_cast<LPARAM>(i);
+        ListView_InsertItem(ds->list, &item);
+        ListView_SetItemText(ds->list, static_cast<int>(i), 1, const_cast<wchar_t*>(r.category.c_str()));
+        ListView_SetItemText(ds->list, static_cast<int>(i), 2, const_cast<wchar_t*>(summary.c_str()));
+    }
+    SendMessageW(ds->list, WM_SETREDRAW, TRUE, 0);
+    InvalidateRect(ds->list, nullptr, TRUE);
+    ds->loading = false;
+
+    HintHistoryUpdateSelection(ds);
+}
+
+static void HintHistoryLayout(HWND hwnd, HintHistoryDlgState* ds) {
+    if (!ds) return;
+    RECT rc = {};
+    GetClientRect(hwnd, &rc);
+    int w = rc.right - rc.left;
+    int h = rc.bottom - rc.top;
+    int pad = 12;
+    int btnH = 28;
+    int btnY = (std::max)(pad, h - pad - btnH);
+    int listY = pad;
+    int listH = (std::max)(120, (h * 30) / 100);
+    int detailY = listY + listH + 8;
+    int detailH = (std::max)(80, btnY - 8 - detailY);
+    int contentW = (std::max)(200, w - pad * 2);
+    if (ds->list) MoveWindow(ds->list, pad, listY, contentW, listH, TRUE);
+    if (ds->detail) MoveWindow(ds->detail, pad, detailY, contentW, detailH, TRUE);
+    int curX = pad;
+    if (ds->btnCopy) { MoveWindow(ds->btnCopy, curX, btnY, 150, btnH, TRUE); curX += 156; }
+    if (ds->btnLaunch) { MoveWindow(ds->btnLaunch, curX, btnY, 190, btnH, TRUE); curX += 196; }
+    if (ds->btnReload) { MoveWindow(ds->btnReload, curX, btnY, 100, btnH, TRUE); curX += 106; }
+    if (ds->btnClose) MoveWindow(ds->btnClose, (std::max)(curX + 10, w - pad - 100), btnY, 100, btnH, TRUE);
+}
+
+static LRESULT CALLBACK HintHistoryWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
+    auto* ds = reinterpret_cast<HintHistoryDlgState*>(GetWindowLongPtrW(hwnd, GWLP_USERDATA));
+    switch (msg) {
+        case WM_CREATE: {
+            auto* cs = reinterpret_cast<CREATESTRUCTW*>(lParam);
+            ds = reinterpret_cast<HintHistoryDlgState*>(cs->lpCreateParams);
+            SetWindowLongPtrW(hwnd, GWLP_USERDATA, reinterpret_cast<LONG_PTR>(ds));
+            HINSTANCE hInst = cs->hInstance;
+
+            ds->list = CreateWindowExW(WS_EX_CLIENTEDGE, WC_LISTVIEWW, L"",
+                WS_CHILD | WS_VISIBLE | LVS_REPORT | LVS_SINGLESEL | LVS_SHOWSELALWAYS,
+                12, 12, 860, 170, hwnd, (HMENU)2901, hInst, nullptr);
+            ListView_SetExtendedListViewStyle(ds->list, LVS_EX_FULLROWSELECT | LVS_EX_GRIDLINES);
+            MemoryListAddColumn(ds->list, 0, Tr(L"時刻", L"Time", L"Hora"), 130);
+            MemoryListAddColumn(ds->list, 1, Tr(L"種類", L"Category", L"Categoría"), 190);
+            MemoryListAddColumn(ds->list, 2, Tr(L"概要", L"Summary", L"Resumen"), 520);
+            ListView_SetBkColor(ds->list, g_theme.panel);
+            ListView_SetTextBkColor(ds->list, g_theme.panel);
+            ListView_SetTextColor(ds->list, g_theme.listText);
+            if (HWND header = ListView_GetHeader(ds->list)) {
+                ApplyNativeControlTheme(header, IsDarkThemeActive());
+            }
+
+            ds->detail = CreateWindowExW(WS_EX_CLIENTEDGE, L"EDIT", L"",
+                WS_CHILD | WS_VISIBLE | WS_VSCROLL | ES_MULTILINE | ES_READONLY | ES_AUTOVSCROLL,
+                12, 190, 860, 280, hwnd, (HMENU)2902, hInst, nullptr);
+
+            ds->btnCopy = CreateWindowExW(0, L"BUTTON", Tr(L"📋 プロンプトをコピー", L"📋 Copy Prompt", L"📋 Copiar Prompt"),
+                WS_CHILD | WS_VISIBLE | BS_PUSHBUTTON, 12, 484, 150, 28, hwnd, (HMENU)2903, hInst, nullptr);
+            ds->btnLaunch = CreateWindowExW(0, L"BUTTON", Tr(L"🤖 解決させる", L"🤖 Resolve", L"🤖 Resolver"),
+                WS_CHILD | WS_VISIBLE | BS_PUSHBUTTON, 168, 484, 190, 28, hwnd, (HMENU)2904, hInst, nullptr);
+            ds->btnReload = CreateWindowExW(0, L"BUTTON", Tr(L"再読み込み", L"Reload", L"Recargar"),
+                WS_CHILD | WS_VISIBLE | BS_PUSHBUTTON, 364, 484, 100, 28, hwnd, (HMENU)2905, hInst, nullptr);
+            ds->btnClose = CreateWindowExW(0, L"BUTTON", Tr(L"閉じる", L"Close", L"Cerrar"),
+                WS_CHILD | WS_VISIBLE | BS_PUSHBUTTON, 772, 484, 100, 28, hwnd, (HMENU)IDOK, hInst, nullptr);
+
+            HWND controls[] = {ds->list, ds->detail, ds->btnCopy, ds->btnLaunch, ds->btnReload, ds->btnClose};
+            for (HWND h : controls) {
+                if (h && ds->fontUi) SendMessageW(h, WM_SETFONT, reinterpret_cast<WPARAM>(ds->fontUi), TRUE);
+            }
+
+            ApplyNativeThemeToWindow(hwnd);
+            HintHistoryReload(ds);
+            return 0;
+        }
+        case WM_NOTIFY: {
+            if (!ds) break;
+            auto* nm = reinterpret_cast<NMHDR*>(lParam);
+            if (nm && nm->hwndFrom == ds->list && !ds->loading) {
+                if (nm->code == LVN_ITEMCHANGED) {
+                    auto* nv = reinterpret_cast<NMLISTVIEW*>(lParam);
+                    HintHistoryUpdateSelection(ds);
+                    if ((nv->uNewState & LVIS_SELECTED) && ds->dash) {
+                        int sel = ListView_GetNextItem(ds->list, -1, LVNI_SELECTED);
+                        if (sel >= 0 && static_cast<size_t>(sel) < ds->rows.size()) {
+                            const SupervisorHintRecord& r = ds->rows[static_cast<size_t>(sel)];
+                            DisplaySupervisorHint(ds->dash, r.category, r.summary, r.prompt, 0);
+                        }
+                    }
+                    return 0;
+                }
+                if (nm->code == LVN_ITEMACTIVATE && ds->dash) {
+                    int sel = ListView_GetNextItem(ds->list, -1, LVNI_SELECTED);
+                    if (sel >= 0 && static_cast<size_t>(sel) < ds->rows.size()) {
+                        const SupervisorHintRecord& r = ds->rows[static_cast<size_t>(sel)];
+                        DisplaySupervisorHint(ds->dash, r.category, r.summary, r.prompt, 0);
+                    }
+                    return 0;
+                }
+            }
+            break;
+        }
+        case WM_SIZE:
+            HintHistoryLayout(hwnd, ds);
+            return 0;
+        case WM_COMMAND: {
+            int id = LOWORD(wParam);
+            if (id == IDOK || id == IDCANCEL) {
+                DestroyWindow(hwnd);
+                return 0;
+            }
+            if (!ds) return 0;
+            if (id == 2905) {
+                HintHistoryReload(ds);
+                return 0;
+            }
+            int sel = ds->list ? ListView_GetNextItem(ds->list, -1, LVNI_SELECTED) : -1;
+            bool has = sel >= 0 && static_cast<size_t>(sel) < ds->rows.size();
+            if (id == 2903) {
+                if (has) {
+                    CopyTextToClipboard(hwnd, ds->rows[static_cast<size_t>(sel)].prompt);
+                    SetWindowTextW(ds->btnCopy, Tr(L"✓ コピー完了!", L"✓ Copied!", L"✓ ¡Copiado!"));
+                    SetTimer(hwnd, 1, 1500, nullptr);
+                }
+                return 0;
+            }
+            if (id == 2904) {
+                if (has && ds->dash) {
+                    LaunchSupervisorTerminal(ds->dash, ds->rows[static_cast<size_t>(sel)].prompt);
+                }
+                return 0;
+            }
+            break;
+        }
+        case WM_TIMER:
+            if (ds && wParam == 1 && ds->btnCopy) {
+                KillTimer(hwnd, 1);
+                SetWindowTextW(ds->btnCopy, Tr(L"📋 プロンプトをコピー", L"📋 Copy Prompt", L"📋 Copiar Prompt"));
+                return 0;
+            }
+            break;
+        case WM_CTLCOLORSTATIC:
+        case WM_CTLCOLOREDIT:
+        case WM_CTLCOLORLISTBOX: {
+            HDC hdc = reinterpret_cast<HDC>(wParam);
+            SetTextColor(hdc, g_theme.text);
+            SetBkColor(hdc, g_theme.panel);
+            return reinterpret_cast<LRESULT>(g_dialogBgBrush);
+        }
+        case WM_ERASEBKGND: {
+            HDC hdc = reinterpret_cast<HDC>(wParam);
+            RECT rc = {};
+            GetClientRect(hwnd, &rc);
+            FillRect(hdc, &rc, g_dialogBgBrush);
+            return 1;
+        }
+        case WM_CLOSE:
+            DestroyWindow(hwnd);
+            return 0;
+        case WM_NCDESTROY:
+            if (ds) {
+                if (ds->dash && ds->dash->hwndHintHistory == hwnd) ds->dash->hwndHintHistory = nullptr;
+                delete ds;
+            }
+            SetWindowLongPtrW(hwnd, GWLP_USERDATA, 0);
+            return 0;
+    }
+    return DefWindowProcW(hwnd, msg, wParam, lParam);
+}
+
+static void ShowHintHistoryDialog(DashboardState* st) {
+    if (!st || !st->hwndMain) return;
+    if (st->hwndHintHistory && IsWindow(st->hwndHintHistory)) {
+        ShowWindow(st->hwndHintHistory, SW_SHOW);
+        SetForegroundWindow(st->hwndHintHistory);
+        return;
+    }
+
+    auto* ds = new HintHistoryDlgState();
+    ds->dash = st;
+    ds->fontUi = st->hFontUi;
+
+    HINSTANCE hInst = GetModuleHandleW(nullptr);
+    static bool registered = false;
+    if (!registered) {
+        WNDCLASSEXW wc = {};
+        wc.cbSize = sizeof(wc);
+        wc.style = CS_HREDRAW | CS_VREDRAW;
+        wc.lpfnWndProc = HintHistoryWndProc;
+        wc.hInstance = hInst;
+        wc.hCursor = LoadCursorW(nullptr, IDC_ARROW);
+        wc.hbrBackground = g_dialogBgBrush;
+        wc.lpszClassName = L"HanchoHintHistoryWnd";
+        RegisterClassExW(&wc);
+        registered = true;
+    }
+
+    RECT parent = {};
+    GetWindowRect(st->hwndMain, &parent);
+    int dlgW = 900;
+    int dlgH = 560;
+    int x = parent.left + ((parent.right - parent.left) - dlgW) / 2;
+    int y = parent.top + ((parent.bottom - parent.top) - dlgH) / 2;
+    HWND hDlg = CreateWindowExW(WS_EX_DLGMODALFRAME, L"HanchoHintHistoryWnd",
+        Tr(L"Supervisor ヒント履歴", L"Supervisor Hint History", L"Historial de pistas del Supervisor"),
+        WS_OVERLAPPEDWINDOW | WS_VISIBLE, x, y, dlgW, dlgH, st->hwndMain, nullptr, hInst, ds);
+    if (hDlg) {
+        st->hwndHintHistory = hDlg;
+        ShowWindow(hDlg, SW_SHOW);
+        SetForegroundWindow(hDlg);
+    } else {
+        delete ds;
+    }
 }
 
 struct SupervisorHintInfo {
@@ -11769,6 +12512,7 @@ struct HintWndState {
     HWND hwndPromptEdit = nullptr;
     HWND btnCopyPrompt = nullptr;
     HWND btnLaunchSupervisor = nullptr;
+    HWND btnHistory = nullptr;
     HWND btnClose = nullptr;
     int copySuccessTicks = 0;
 };
@@ -11783,24 +12527,27 @@ static LRESULT CALLBACK HintWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM l
             HINSTANCE hInst = cs->hInstance;
 
             hs->hwndCategory = CreateWindowExW(0, L"STATIC", L"", WS_CHILD | WS_VISIBLE | SS_LEFT,
-                12, 10, 300, 20, hwnd, nullptr, hInst, nullptr);
+                12, 10, 380, 20, hwnd, nullptr, hInst, nullptr);
             hs->hwndCountdown = CreateWindowExW(0, L"STATIC", L"", WS_CHILD | WS_VISIBLE | SS_RIGHT,
-                315, 10, 130, 20, hwnd, nullptr, hInst, nullptr);
+                415, 10, 133, 20, hwnd, nullptr, hInst, nullptr);
             hs->hwndSummary = CreateWindowExW(0, L"STATIC", L"", WS_CHILD | WS_VISIBLE | SS_LEFT,
-                12, 34, 434, 36, hwnd, nullptr, hInst, nullptr);
+                12, 34, 536, 36, hwnd, nullptr, hInst, nullptr);
             hs->hwndPromptEdit = CreateWindowExW(WS_EX_CLIENTEDGE, L"EDIT", L"",
                 WS_CHILD | WS_VISIBLE | WS_VSCROLL | ES_MULTILINE | ES_READONLY | ES_AUTOVSCROLL,
-                12, 74, 434, 88, hwnd, nullptr, hInst, nullptr);
+                12, 74, 536, 88, hwnd, nullptr, hInst, nullptr);
 
             hs->btnCopyPrompt = CreateWindowExW(0, L"BUTTON", Tr(L"📋 プロンプトをコピー", L"📋 Copy Prompt", L"📋 Copiar Prompt"),
                 WS_CHILD | WS_VISIBLE | BS_PUSHBUTTON,
-                12, 170, 160, 28, hwnd, (HMENU)IDC_HINT_COPY, hInst, nullptr);
-            hs->btnLaunchSupervisor = CreateWindowExW(0, L"BUTTON", Tr(L"🤖 Supervisor 起動", L"🤖 Launch Supervisor", L"🤖 Iniciar Supervisor"),
+                12, 170, 150, 28, hwnd, (HMENU)IDC_HINT_COPY, hInst, nullptr);
+            hs->btnLaunchSupervisor = CreateWindowExW(0, L"BUTTON", Tr(L"🤖 解決させる", L"🤖 Resolve", L"🤖 Resolver"),
                 WS_CHILD | WS_VISIBLE | BS_PUSHBUTTON,
-                180, 170, 190, 28, hwnd, (HMENU)IDC_HINT_LAUNCH, hInst, nullptr);
+                168, 170, 190, 28, hwnd, (HMENU)IDC_HINT_LAUNCH, hInst, nullptr);
+            hs->btnHistory = CreateWindowExW(0, L"BUTTON", Tr(L"🕘 履歴", L"🕘 History", L"🕘 Historial"),
+                WS_CHILD | WS_VISIBLE | BS_PUSHBUTTON,
+                364, 170, 90, 28, hwnd, (HMENU)IDC_HINT_HISTORY, hInst, nullptr);
             hs->btnClose = CreateWindowExW(0, L"BUTTON", L"✕",
                 WS_CHILD | WS_VISIBLE | BS_PUSHBUTTON,
-                378, 170, 68, 28, hwnd, (HMENU)IDC_HINT_CLOSE, hInst, nullptr);
+                460, 170, 88, 28, hwnd, (HMENU)IDC_HINT_CLOSE, hInst, nullptr);
 
             if (hs && hs->dash) {
                 SendMessageW(hs->hwndCategory, WM_SETFONT, (WPARAM)hs->dash->hFontUiBold, TRUE);
@@ -11809,6 +12556,7 @@ static LRESULT CALLBACK HintWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM l
                 SendMessageW(hs->hwndPromptEdit, WM_SETFONT, (WPARAM)hs->dash->hFontUi, TRUE);
                 SendMessageW(hs->btnCopyPrompt, WM_SETFONT, (WPARAM)hs->dash->hFontUi, TRUE);
                 SendMessageW(hs->btnLaunchSupervisor, WM_SETFONT, (WPARAM)hs->dash->hFontUi, TRUE);
+                SendMessageW(hs->btnHistory, WM_SETFONT, (WPARAM)hs->dash->hFontUi, TRUE);
                 SendMessageW(hs->btnClose, WM_SETFONT, (WPARAM)hs->dash->hFontUi, TRUE);
             }
             ApplyNativeThemeToWindow(hwnd);
@@ -11826,7 +12574,15 @@ static LRESULT CALLBACK HintWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM l
             }
             if (id == IDC_HINT_LAUNCH) {
                 if (hs && hs->dash) {
-                    LaunchSupervisorTerminal(hs->dash);
+                    LaunchSupervisorTerminal(hs->dash, hs->dash->currentHintPrompt);
+                    ShowWindow(hwnd, SW_HIDE);
+                    KillTimer(hwnd, TIMER_HINT_COUNTDOWN_ID);
+                }
+                return 0;
+            }
+            if (id == IDC_HINT_HISTORY) {
+                if (hs && hs->dash) {
+                    ShowHintHistoryDialog(hs->dash);
                 }
                 return 0;
             }
@@ -11928,8 +12684,8 @@ static void EnsureHintWindow(DashboardState* st) {
 
     RECT rcMain = {};
     GetWindowRect(st->hwndMain, &rcMain);
-    int hintW = 460;
-    int hintH = 210;
+    int hintW = kHintWndWidth;
+    int hintH = kHintWndHeight;
     int x = rcMain.right - hintW - 20;
     int y = rcMain.bottom - hintH - 45;
 
@@ -11944,6 +12700,41 @@ static void EnsureHintWindow(DashboardState* st) {
         hInst,
         hs
     );
+}
+
+// Populate and show the hint popup. autoDismissSec <= 0 keeps it up until the user
+// closes it (used by the history dialog, which must not inherit the toast timeout).
+static void DisplaySupervisorHint(DashboardState* st, const std::wstring& category,
+                                  const std::wstring& summary, const std::wstring& prompt,
+                                  int autoDismissSec) {
+    if (!st || !st->hwndMain) return;
+    st->currentHintCategory = category;
+    st->currentHintSummary = summary;
+    st->currentHintPrompt = prompt;
+
+    EnsureHintWindow(st);
+    RepositionHintWindow(st);
+
+    auto* hs = reinterpret_cast<HintWndState*>(GetWindowLongPtrW(st->hwndHintWnd, GWLP_USERDATA));
+    if (hs) {
+        SetWindowTextW(hs->hwndCategory, category.c_str());
+        SetWindowTextW(hs->hwndSummary, summary.c_str());
+        SetWindowTextW(hs->hwndPromptEdit, prompt.c_str());
+        if (autoDismissSec > 0) {
+            st->hintDismissCountdown = autoDismissSec;
+            std::wstring cdStr = Tr(L"自動消去まで ", L"Auto-close in ", L"Cerrar en ") +
+                                 std::to_wstring(st->hintDismissCountdown) + L"s";
+            SetWindowTextW(hs->hwndCountdown, cdStr.c_str());
+            SetTimer(st->hwndHintWnd, TIMER_HINT_COUNTDOWN_ID, 1000, nullptr);
+        } else {
+            st->hintDismissCountdown = 0;
+            SetWindowTextW(hs->hwndCountdown, L"");
+            KillTimer(st->hwndHintWnd, TIMER_HINT_COUNTDOWN_ID);
+        }
+    }
+
+    ShowWindow(st->hwndHintWnd, SW_SHOWNOACTIVATE);
+    InvalidateRect(st->hwndHintWnd, nullptr, TRUE);
 }
 
 static void EvaluateSupervisorHint(DashboardState* st, bool forceShow = false) {
@@ -11973,32 +12764,24 @@ static void EvaluateSupervisorHint(DashboardState* st, bool forceShow = false) {
     // Bound the shown set; once full, start over so a long-running session cannot grow it forever.
     if (st->shownHintSignatures.size() >= 256) st->shownHintSignatures.clear();
     st->shownHintSignatures.insert(info.signature);
-    st->currentHintCategory = info.category;
-    st->currentHintSummary = info.summary;
-    st->currentHintPrompt = info.prompt;
 
-    EnsureHintWindow(st);
-    RepositionHintWindow(st);
-
-    auto* hs = reinterpret_cast<HintWndState*>(GetWindowLongPtrW(st->hwndHintWnd, GWLP_USERDATA));
-    if (hs) {
-        SetWindowTextW(hs->hwndCategory, info.category.c_str());
-        SetWindowTextW(hs->hwndSummary, info.summary.c_str());
-        SetWindowTextW(hs->hwndPromptEdit, info.prompt.c_str());
-        if (st->hintAutoDismissSec > 0) {
-            st->hintDismissCountdown = st->hintAutoDismissSec;
-            std::wstring cdStr = Tr(L"自動消去まで ", L"Auto-close in ", L"Cerrar en ") +
-                                 std::to_wstring(st->hintDismissCountdown) + L"s";
-            SetWindowTextW(hs->hwndCountdown, cdStr.c_str());
-            SetTimer(st->hwndHintWnd, TIMER_HINT_COUNTDOWN_ID, 1000, nullptr);
-        } else {
-            SetWindowTextW(hs->hwndCountdown, L"");
-            KillTimer(st->hwndHintWnd, TIMER_HINT_COUNTDOWN_ID);
+    if (!info.signature.empty() &&
+        (st->hintHistory.empty() || st->hintHistory.back().signature != info.signature ||
+         st->hintHistory.back().prompt != info.prompt)) {
+        SupervisorHintRecord rec;
+        rec.timestamp = Utf8ToWide(GetCurrentTimestampStr());
+        rec.category = info.category;
+        rec.summary = info.summary;
+        rec.prompt = info.prompt;
+        rec.signature = info.signature;
+        st->hintHistory.push_back(std::move(rec));
+        if (st->hintHistory.size() > kSupervisorHintHistoryMax) {
+            st->hintHistory.erase(st->hintHistory.begin(),
+                                  st->hintHistory.begin() + (st->hintHistory.size() - kSupervisorHintHistoryMax));
         }
     }
 
-    ShowWindow(st->hwndHintWnd, SW_SHOWNOACTIVATE);
-    InvalidateRect(st->hwndHintWnd, nullptr, TRUE);
+    DisplaySupervisorHint(st, info.category, info.summary, info.prompt, st->hintAutoDismissSec);
 }
 
 static LRESULT CALLBACK DashboardWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
@@ -12074,8 +12857,8 @@ static LRESULT CALLBACK DashboardWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPA
                 WS_CHILD | WS_VISIBLE | BS_OWNERDRAW, 0, 0, 28, 24, hwnd, (HMENU)IDC_BTN_REFRESH, nullptr, nullptr);
             st->hwndBtnHint = CreateWindowExW(0, L"BUTTON", L"💡",
                 WS_CHILD | WS_VISIBLE | BS_OWNERDRAW, 0, 0, 28, 24, hwnd, (HMENU)IDC_BTN_HINT, nullptr, nullptr);
-            st->hwndBtnSupervisor = CreateWindowExW(0, L"BUTTON", L"🤖",
-                WS_CHILD | WS_VISIBLE | BS_OWNERDRAW, 0, 0, 28, 24, hwnd, (HMENU)IDC_BTN_SUPERVISOR, nullptr, nullptr);
+            st->hwndBtnHistory = CreateWindowExW(0, L"BUTTON", L"🕘",
+                WS_CHILD | WS_VISIBLE | BS_OWNERDRAW, 0, 0, 28, 24, hwnd, (HMENU)IDC_BTN_HISTORY, nullptr, nullptr);
             st->hwndClock = CreateWindowExW(0, L"BUTTON", L"",
                 WS_CHILD | WS_VISIBLE | BS_OWNERDRAW, 0, 0, 80, 24, hwnd, (HMENU)IDC_CLOCK, nullptr, nullptr);
             st->hwndBtnUsage = CreateWindowExW(0, L"BUTTON", L"📊",
@@ -12084,6 +12867,18 @@ static LRESULT CALLBACK DashboardWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPA
                 WS_CHILD | WS_VISIBLE | BS_OWNERDRAW, 0, 0, 28, 24, hwnd, (HMENU)IDC_BTN_STREAM_PANE, nullptr, nullptr);
             st->hwndBtnBtView = CreateWindowExW(0, L"BUTTON", L"BT",
                 WS_CHILD | WS_VISIBLE | BS_OWNERDRAW, 0, 0, 34, 24, hwnd, (HMENU)IDC_BT_DEBUG, nullptr, nullptr);
+
+            st->hwndSearchProcBtn = CreateWindowExW(0, L"BUTTON", L"🔍",
+                WS_CHILD | BS_OWNERDRAW, 0, 0, 24, 20, hwnd, (HMENU)IDC_BTN_SEARCH_PROC, nullptr, nullptr);
+            st->hwndSearchTaskBtn = CreateWindowExW(0, L"BUTTON", L"🔍",
+                WS_CHILD | BS_OWNERDRAW, 0, 0, 24, 20, hwnd, (HMENU)IDC_BTN_SEARCH_TASK, nullptr, nullptr);
+            st->hwndSearchProcEdit = CreateWindowExW(WS_EX_CLIENTEDGE, L"EDIT", L"",
+                WS_CHILD | ES_AUTOHSCROLL, 0, 0, 160, 20, hwnd, (HMENU)IDC_EDIT_SEARCH_PROC, nullptr, nullptr);
+            st->hwndSearchTaskEdit = CreateWindowExW(WS_EX_CLIENTEDGE, L"EDIT", L"",
+                WS_CHILD | ES_AUTOHSCROLL, 0, 0, 160, 20, hwnd, (HMENU)IDC_EDIT_SEARCH_TASK, nullptr, nullptr);
+            for (HWND edit : {st->hwndSearchProcEdit, st->hwndSearchTaskEdit}) {
+                if (edit && st->hFontUi) SendMessageW(edit, WM_SETFONT, reinterpret_cast<WPARAM>(st->hFontUi), TRUE);
+            }
 
             static bool usageClassRegistered = false;
             if (!usageClassRegistered) {
@@ -12126,7 +12921,7 @@ static LRESULT CALLBACK DashboardWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPA
                 addTool(st->hwndBtnHideTray);
                 addTool(st->hwndBtnRefresh);
                 addTool(st->hwndBtnHint);
-                addTool(st->hwndBtnSupervisor);
+                addTool(st->hwndBtnHistory);
             }
 
             LoadShellConfig(st);
@@ -12206,7 +13001,7 @@ static LRESULT CALLBACK DashboardWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPA
                 st->hwndBtnStart, st->hwndBtnSettings, st->hwndBtnKillAll,
                 st->hwndBtnGridView,
                 st->hwndBtnToggleList, st->hwndBtnToggleTerm, st->hwndBtnStreamPane, st->hwndBtnBtView, st->hwndBtnHideTray, st->hwndBtnRefresh,
-                st->hwndBtnHint, st->hwndBtnSupervisor, st->hwndClock,
+                st->hwndBtnHint, st->hwndBtnHistory, st->hwndClock,
                 st->hwndBtnViewTasks, st->hwndList, st->hwndTaskList, st->hwndTab
             };
             for (HWND h : uiCtrls) {
@@ -12321,6 +13116,20 @@ static LRESULT CALLBACK DashboardWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPA
                 InvalidateRect(hwnd, nullptr, FALSE);
             }
             return 0;
+        }
+
+        case WM_CTLCOLOREDIT: {
+            HDC hdc = reinterpret_cast<HDC>(wParam);
+            SetBkColor(hdc, g_theme.windowBg);
+            SetTextColor(hdc, g_theme.text);
+            static COLORREF lastBg = CLR_INVALID;
+            static HBRUSH editBg = nullptr;
+            if (!editBg || lastBg != g_theme.windowBg) {
+                if (editBg) DeleteObject(editBg);
+                editBg = CreateSolidBrush(g_theme.windowBg);
+                lastBg = g_theme.windowBg;
+            }
+            return reinterpret_cast<INT_PTR>(editBg);
         }
 
         case WM_TIMER: {
@@ -12575,6 +13384,8 @@ static LRESULT CALLBACK DashboardWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPA
                 if (dis->hwndItem == st->hwndBtnStreamPane) latched = st->showStreamPane;
                 else if (dis->hwndItem == st->hwndBtnToggleList) latched = !st->hideProcessList;
                 else if (dis->hwndItem == st->hwndBtnToggleTerm) latched = !st->hideTerminalGrid;
+                else if (dis->hwndItem == st->hwndSearchProcBtn) latched = st->showProcSearch;
+                else if (dis->hwndItem == st->hwndSearchTaskBtn) latched = st->showTaskSearch;
             }
             bool pressed = (dis->itemState & ODS_SELECTED) != 0 || latched;
             COLORREF bg = pressed ? g_theme.border : g_theme.panel;
@@ -12719,8 +13530,48 @@ static LRESULT CALLBACK DashboardWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPA
                 } else {
                     EvaluateSupervisorHint(st, true);
                 }
-            } else if (id == IDC_BTN_SUPERVISOR) {
-                LaunchSupervisorTerminal(st);
+            } else if (id == IDC_BTN_HISTORY) {
+                ShowHintHistoryDialog(st);
+            } else if (id == IDC_BTN_SEARCH_PROC) {
+                st->showProcSearch = !st->showProcSearch;
+                SetWindowTextW(st->hwndSearchProcBtn, st->showProcSearch ? L"✕" : L"🔍");
+                if (!st->showProcSearch) {
+                    st->procSearchText.clear();
+                    SetWindowTextW(st->hwndSearchProcEdit, L"");
+                    RefreshDashboardData(st);
+                } else {
+                    SetFocus(st->hwndSearchProcEdit);
+                }
+                RECT rcClient = {};
+                GetClientRect(hwnd, &rcClient);
+                LayoutControls(st, rcClient.right, rcClient.bottom);
+                InvalidateRect(hwnd, nullptr, FALSE);
+            } else if (id == IDC_BTN_SEARCH_TASK) {
+                st->showTaskSearch = !st->showTaskSearch;
+                SetWindowTextW(st->hwndSearchTaskBtn, st->showTaskSearch ? L"✕" : L"🔍");
+                if (!st->showTaskSearch) {
+                    st->taskSearchText.clear();
+                    SetWindowTextW(st->hwndSearchTaskEdit, L"");
+                    RefreshTaskQueueData(st, true);
+                } else {
+                    SetFocus(st->hwndSearchTaskEdit);
+                }
+                RECT rcClient = {};
+                GetClientRect(hwnd, &rcClient);
+                LayoutControls(st, rcClient.right, rcClient.bottom);
+                InvalidateRect(hwnd, nullptr, FALSE);
+            } else if (id == IDC_EDIT_SEARCH_PROC && HIWORD(wParam) == EN_CHANGE) {
+                wchar_t buf[512] = {};
+                GetWindowTextW(st->hwndSearchProcEdit, buf, 512);
+                st->procSearchText = buf;
+                RefreshDashboardData(st);
+                InvalidateRect(st->hwndList, nullptr, FALSE);
+            } else if (id == IDC_EDIT_SEARCH_TASK && HIWORD(wParam) == EN_CHANGE) {
+                wchar_t buf[512] = {};
+                GetWindowTextW(st->hwndSearchTaskEdit, buf, 512);
+                st->taskSearchText = buf;
+                RefreshTaskQueueData(st, true);
+                InvalidateRect(st->hwndTaskList, nullptr, FALSE);
             }
             return 0;
         }
@@ -12842,6 +13693,8 @@ static LRESULT CALLBACK DashboardWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPA
                         } else if (kind == "running") {
                             lvcd->clrTextBk = MutedRowColor(g_theme.rowSelected);
                         } else if (kind == "timeout") {
+                            lvcd->clrTextBk = MutedRowColor(g_theme.rowIdle);
+                        } else if (kind == "planned") {
                             lvcd->clrTextBk = MutedRowColor(g_theme.rowIdle);
                         } else if (kind == "failed") {
                             lvcd->clrTextBk = MutedRowColor(g_theme.rowFailed);

@@ -484,10 +484,10 @@ int RunMcpServer() {
                 << "},"
                 << "{"
                 << "\"name\":\"taskqueue_add\","
-                << "\"description\":\"Register one or more jobs in a task queue. Hancho decides execution order, timeouts, success checks and automatic retries. Each job must have a one-line summary and its own timeoutSec. Use dependsOn to chain jobs instead of shell '&&'.\","
+                << "\"description\":\"Register one or more jobs in a task queue. Hancho decides execution order, timeouts, success checks and automatic retries. Each job must have a one-line summary and its own timeoutSec. Use dependsOn to chain jobs instead of shell '&&'. Optional suspendWhenDone/suspendDelaySec/suspendHibernate arm the PC to suspend after that job finishes and all other jobs and managed processes are idle.\","
                 << "\"inputSchema\":{\"type\":\"object\",\"properties\":{"
                 << "\"taskqueue\":{\"type\":\"string\",\"description\":\"Task queue name, e.g. 'main'\"},"
-                << "\"jobs\":{\"type\":\"array\",\"description\":\"Job objects: id, command, summary, timeoutSec (required); cwd, env, dependsOn (['id'] or [{id,on}]), idle {outputSec,cpuSec}, maxAttempts, retryDelaySec, success {exitCode,filesNewer,outputRegex,testReport (JUnit/NUnit XML path: newer than the attempt, >=1 test, none failed)}, killExclude, resources {write:[...],read:[...]} (paths/globs relative to cwd or @name locks; @name:{root} is one lock per git checkout/worktree of cwd, @name:{cwd} one per cwd; a bare file name such as Foo.cs means **/Foo.cs; jobs with overlapping write/write or write/read never run together, read/read may), defer {exitCodes,delaySec,limit} (default [75],60,60: an attempt exiting with one of exitCodes means nothing ran; the job is re-run after delaySec without using up maxAttempts; {exitCodes:[]} turns it off), priority, instructionsFile or instructionsText\",\"items\":{\"type\":\"object\"}},"
+                << "\"jobs\":{\"type\":\"array\",\"description\":\"Job objects: id, command, summary, timeoutSec (required); cwd, env, dependsOn (['id'] or [{id,on}]), idle {outputSec,cpuSec}, maxAttempts, retryDelaySec, success {exitCode,filesNewer,outputRegex,testReport (JUnit/NUnit XML path: newer than the attempt, >=1 test, none failed)}, killExclude, resources {write:[...],read:[...]} (paths/globs relative to cwd or @name locks; @name:{root} is one lock per git checkout/worktree of cwd, @name:{cwd} one per cwd; a bare file name such as Foo.cs means **/Foo.cs; jobs with overlapping write/write or write/read never run together, read/read may), defer {exitCodes,delaySec,limit} (default [75],60,60: an attempt exiting with one of exitCodes means nothing ran; the job is re-run after delaySec without using up maxAttempts; {exitCodes:[]} turns it off), priority, suspendWhenDone, suspendDelaySec, suspendHibernate, instructionsFile or instructionsText\",\"items\":{\"type\":\"object\"}},"
                 << "\"concurrency\":{\"type\":\"integer\",\"description\":\"Max jobs running at the same time for this queue (default 1)\"},"
                 << "\"notifyFile\":{\"type\":\"string\",\"description\":\"Optional file updated on jobFailed / taskqueueStalled / taskqueueDrained\"},"
                 << "\"originLabel\":{\"type\":\"string\",\"description\":\"Optional short name for the work these jobs belong to (e.g. 'release v2.9.2'), shown in the dashboard's Origin column. Your session id and working folder are recorded automatically.\"}"
@@ -495,13 +495,14 @@ int RunMcpServer() {
                 << "},"
                 << "{"
                  << "\"name\":\"taskqueue_list\","
-                 << "\"description\":\"List task queue jobs with state, attempts, last reason and blockedBy. Failed jobs carry the same top-level failure record (class, summary, suggestedAction, evidence) as taskqueue_get.\","
+                 << "\"description\":\"List task queue jobs with state, attempts, last reason and blockedBy. Failed jobs carry the same top-level failure record (class, summary, suggestedAction, evidence) as taskqueue_get. Set includePlanned=true to add provisional 'planned' rows for idle job/worker leaves of running behavior trees; they are not stored jobs.\","
                 << "\"inputSchema\":{\"type\":\"object\",\"properties\":{"
                 << "\"taskqueue\":{\"type\":\"string\",\"description\":\"Optional task queue name (all queues when omitted)\"},"
-                << "\"state\":{\"type\":\"string\",\"description\":\"Optional state filter: pending, running, succeeded, failed, blocked, cancelled\"},"
+                << "\"state\":{\"type\":\"string\",\"description\":\"Optional state filter: pending, planned, running, succeeded, failed, blocked, cancelled\"},"
                 << "\"since\":{\"type\":\"string\",\"description\":\"Optional time window: only jobs updated within this period, e.g. 30m, 6h, 2d\"},"
                 << "\"origin\":{\"type\":\"string\",\"description\":\"Optional: 'self' for only the jobs your session added, or an origin label or session id (prefix)\"},"
-                << "\"bt\":{\"type\":\"string\",\"description\":\"Optional behavior-tree id: list every job of that tree across its parallel branch queues\"}"
+                << "\"bt\":{\"type\":\"string\",\"description\":\"Optional behavior-tree id: list every job of that tree across its parallel branch queues\"},"
+                << "\"includePlanned\":{\"type\":\"boolean\",\"description\":\"Include provisional planned rows for idle job/worker leaves of running behavior trees (default false)\"}"
                 << "}}"
                 << "},"
                 << "{"
@@ -631,7 +632,7 @@ int RunMcpServer() {
                 << "},"
                 << "{"
                 << "\"name\":\"bt_get\","
-                << "\"description\":\"Get behavior tree state and variables. Set compact=true for lightweight summary.\","
+                << "\"description\":\"Get behavior tree state and variables, plus pendingEstimateSec (unstarted work on the current branch) and plannedTasks (idle job/worker leaves). Set compact=true for lightweight summary.\","
                 << "\"inputSchema\":{\"type\":\"object\",\"properties\":{"
                 << "\"id\":{\"type\":\"string\",\"description\":\"Behavior tree id\"},"
                 << "\"compact\":{\"type\":\"boolean\",\"description\":\"Return compact tree and one-line-per-node text (default false)\"}"
@@ -639,7 +640,7 @@ int RunMcpServer() {
                 << "},"
                 << "{"
                 << "\"name\":\"bt_list\","
-                << "\"description\":\"List registered behavior trees with state, version, and nodeRuns.\","
+                << "\"description\":\"List registered behavior trees with state, version, nodeRuns and pendingEstimateSec.\","
                 << "\"inputSchema\":{\"type\":\"object\",\"properties\":{}}"
                 << "},"
                 << "{"
@@ -804,6 +805,29 @@ int RunMcpServer() {
                 << "\"groupBy\":{\"type\":\"string\",\"enum\":[\"day\",\"month\",\"engine\",\"model\"],\"description\":\"Optional grouping: 'day', 'month', 'engine', or 'model'.\"},"
                 << "\"out\":{\"type\":\"string\",\"description\":\"Optional file path to write export into. If omitted, exported content is returned in the tool response.\"}"
                 << "}}"
+                << "}"
+                << ","
+                << "{"
+                << "\"name\":\"power_suspend\","
+                << "\"description\":\"Suspend the PC after a task queue job finishes and all other jobs / managed processes are idle. Pass jobId to arm an existing job (pending, running or already finished); omit jobId to suspend immediately after delaySec. The core waits for other task queue jobs (running/waiting/pending) and managed processes before the grace period starts; new work cancels the countdown. Use dryRun=true to verify without suspending. Local host only.\","
+                << "\"inputSchema\":{\"type\":\"object\",\"properties\":{"
+                << "\"jobId\":{\"type\":\"string\",\"description\":\"Task queue job id to arm. Omit to suspend immediately.\"},"
+                << "\"delaySec\":{\"type\":\"integer\",\"description\":\"Grace period in seconds (default 3 for immediate; job-triggered uses suspendDelaySec or 10).\"},"
+                << "\"hibernate\":{\"type\":\"boolean\",\"description\":\"Hibernate instead of sleep (default false).\"},"
+                << "\"dryRun\":{\"type\":\"boolean\",\"description\":\"Report what would happen without arming or suspending.\"}"
+                << "}}"
+                << "}"
+                << ","
+                << "{"
+                << "\"name\":\"power_cancel\","
+                << "\"description\":\"Clear every armed suspend-after-job flag and cancel the countdown.\","
+                << "\"inputSchema\":{\"type\":\"object\",\"properties\":{}}"
+                << "}"
+                << ","
+                << "{"
+                << "\"name\":\"power_status\","
+                << "\"description\":\"Show armed suspend jobs, the current phase (waiting_target, waiting_others, countdown), other jobs/processes still running, and seconds until suspend.\","
+                << "\"inputSchema\":{\"type\":\"object\",\"properties\":{}}"
                 << "}"
                 << "]}}";
             EmitLine(oss.str());
@@ -1057,8 +1081,11 @@ int RunMcpServer() {
                        << ",\"since\":\"" << JsonEscape(JsonGetString(argsJson, "since", "")) << "\"";
                 std::string originFilter = JsonGetString(argsJson, "origin", "");
                 if (originFilter == "self") originFilter = CallerSelfOriginFilter();
+                const bool includePlanned = JsonGetBool(argsJson, "includePlanned",
+                                                         JsonGetBool(argsJson, "include_planned", false));
                 ipcReq << ",\"origin\":\"" << JsonEscape(originFilter) << "\""
-                       << ",\"bt\":\"" << JsonEscape(JsonGetString(argsJson, "bt", "")) << "\"}";
+                       << ",\"bt\":\"" << JsonEscape(JsonGetString(argsJson, "bt", "")) << "\""
+                       << ",\"include_planned\":" << (includePlanned ? "true" : "false") << "}";
             }
             else if (toolName == "taskqueue_get") {
                 bool includeInstr = JsonGetBool(argsJson, "includeInstructions",
@@ -1129,6 +1156,20 @@ int RunMcpServer() {
                 ipcReq << "{\"action\":\"taskqueue_graph\""
                        << ",\"taskqueue\":\"" << JsonEscape(JsonGetString(argsJson, "taskqueue", "")) << "\""
                        << ",\"root\":\"" << JsonEscape(JsonGetString(argsJson, "root", "")) << "\"}";
+            }
+            else if (toolName == "power_suspend" || toolName == "power_cancel" ||
+                     toolName == "power_status") {
+                auto p = nlohmann::json::parse(argsJson, nullptr, false);
+                if (p.is_discarded() || !p.is_object()) p = nlohmann::json::object();
+                nlohmann::json req;
+                req["action"] = toolName;
+                if (toolName == "power_suspend") {
+                    req["job_id"] = p.value("jobId", p.value("job_id", std::string()));
+                    req["delay_sec"] = p.value("delaySec", p.value("delay_sec", 3));
+                    req["hibernate"] = p.value("hibernate", false);
+                    req["dry_run"] = p.value("dryRun", p.value("dry_run", false));
+                }
+                ipcReq << req.dump();
             }
             else if (toolName.rfind("bt_", 0) == 0) {
                 auto argsObj = nlohmann::json::parse(argsJson, nullptr, false);

@@ -57,6 +57,14 @@ hancho-cli.exe mcp uninstall --delete-data-dir           # データディレク
 | `taskqueue_link` / `taskqueue_unlink` | 依存を 1 本追加 / 削除（`job`, `dependsOn`, `on` = `success`\|`done`）。 |
 | `taskqueue_graph` | 依存グラフ（`ready` / `waiting_for` / `dependents`）。 |
 
+**サスペンド操作**
+
+| ツール | 説明 |
+| :--- | :--- |
+| `power_suspend` | PC をサスペンド。`jobId` を指定すると、そのジョブの終了後に他の全ジョブと管理プロセスがアイドルになるまで待ってから実行。省略すると `delaySec`（既定 3）後に即時実行。`hibernate` で休止、`dryRun` で確認のみ。ローカルホスト専用。 |
+| `power_cancel` | 武装中の `suspendWhenDone` をすべて解除し、カウントダウンを中止。 |
+| `power_status` | 武装中のジョブ、フェーズ（`waiting_target` / `waiting_others` / `countdown`）、他の実行中ジョブ・プロセス数、残り秒数を返す。 |
+
 **メモリ操作**
 
 | ツール | 説明 |

@@ -37,6 +37,12 @@ public:
         std::lock_guard<std::mutex> lock(cbMutex_);
         shutdownCb_ = std::move(cb);
     }
+    // Local suspend implementation used by `power_suspend` (MCP / CLI).
+    using PowerCallback = std::function<bool(bool hibernate, std::string& outError)>;
+    void SetPowerCallback(PowerCallback cb) {
+        std::lock_guard<std::mutex> lock(cbMutex_);
+        powerCb_ = std::move(cb);
+    }
     // True when no dashboard window is owned by this process (started with --headless).
     void SetHeadless(bool headless) { headless_ = headless; }
     bool IsHeadless() const { return headless_; }
@@ -70,6 +76,7 @@ private:
     std::atomic<HWND> notifyHwnd_{nullptr};
     std::function<void()> guiShowCb_;
     std::function<void()> shutdownCb_;
+    PowerCallback powerCb_;
     std::mutex cbMutex_;
     bool headless_ = false;
     std::atomic<bool> stop_{false};

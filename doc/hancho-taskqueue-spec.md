@@ -217,6 +217,9 @@ Job ──1:N── Attempt ──1:1── ManagedProcess (既存)
   "success": { "exitCode": 0, "filesNewer": ["reports/A.md"], "outputRegex": null },
   "killExclude": ["Unity.exe"],
   "priority": 0,
+  "suspendWhenDone": true,
+  "suspendDelaySec": 30,
+  "suspendHibernate": false,
   "state": "pending",
   "attempts": [],
   "blockedBy": null,
@@ -228,6 +231,7 @@ Job ──1:N── Attempt ──1:1── ManagedProcess (既存)
 - `dependsOn[].on`: `success` (依存元が succeeded で開始) または `done` (終われば成否に関係なく開始)。文字列だけなら `success`。
 - `idle`: **出力が `outputSec` 秒止まり、かつプロセスツリーの CPU が `cpuSec` 秒止まった**ときだけハングと判定する。0 の条件は使わない。重い処理中 (CPU 使用中・出力なし) を誤って kill しないため。既存の `lastOutputTickMs` / `lastCpuActivityTickMs` を利用する。判定間隔は粗くてよい (既存の監視ループの周期で十分)。
 - `success`: 条件はすべて AND。`filesNewer` は cwd からの相対パスで、すべて存在し mtime が attempt の開始時刻より新しいこと。`outputRegex` はログ末尾 200 行に一致すること。省略時は `exitCode: 0` だけ。
+- `suspendWhenDone` / `suspendDelaySec` / `suspendHibernate`: このジョブが終了し、他の全ジョブ (running/waiting/pending) と Hancho 管理プロセスがアイドルになった後、`suspendDelaySec` (0 = 既定 10 秒) 後に PC をサスペンドする。`suspendHibernate` は休止。`hancho-cli power suspend --after-job <id>` と MCP `power_suspend` で後から指定でき、`power status` / `power cancel` で確認・解除する。
 - `killExclude`: ツリー kill で除外するイメージ名 (共有の常駐プロセスを巻き込まないため)。
 
 ### 5.3 Attempt

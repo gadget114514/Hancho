@@ -2,6 +2,7 @@
 #include "common.h"
 #include "ipc_server.h"
 #include "mcp_server.h"
+#include "power.h"
 #include "process_manager.h"
 #include "taskqueue.h"
 
@@ -92,9 +93,22 @@ int main(int argc, char** argv) {
     });
 
     pc::BtManager btm(pm, tqm);
+    tqm.SetSuspendCallback([](const std::string& jobId, const std::string& state,
+                              bool hibernate) {
+        (void)jobId;
+        (void)state;
+        pc::SleepMs(500);
+        std::string err;
+        if (!pc::SuspendSystem(hibernate, err)) {
+            pc::WriteAuditLog("POWER_FAILED", err);
+        }
+    });
     pc::IpcServer server(pm, tqm, &btm);
     server.SetHeadless(true);
     server.SetShutdownCallback([] { g_stop = true; });
+    server.SetPowerCallback([](bool hibernate, std::string& outError) {
+        return pc::SuspendSystem(hibernate, outError);
+    });
 
     if (!server.Start()) {
         std::fprintf(stderr, "Failed to start IPC server on %s\n",
@@ -107,6 +121,7 @@ int main(int argc, char** argv) {
     while (!g_stop.load()) pc::SleepMs(200);
 
     server.Stop();
+    tqm.SetSuspendCallback(nullptr);
     btm.Shutdown();
     tqm.ShutdownTaskQueueManager();
     lock->Release();

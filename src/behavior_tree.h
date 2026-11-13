@@ -92,6 +92,19 @@ public:
     virtual void CancelJob(const std::string& jobId) = 0;
 };
 
+// A job/worker leaf that is still idle and will start later if the tree keeps its current
+// branch. The task queue treats these as provisional rows; they are re-derived from the tree
+// state on every query, so a branch change (retry, fallback, if, cancel) drops stale rows
+// without any explicit unregister step.
+struct BtPlannedTask {
+    std::string btId;
+    std::string nodeKey;
+    std::string type;       // "job" or "worker"
+    std::string summary;
+    std::string queueName;
+    int estimateSec = 0;    // estimateSec when set, otherwise timeoutSec
+};
+
 struct BtLimits {
     int maxNodeRuns = 200;
     int maxWallSec = 86400;
@@ -251,6 +264,14 @@ public:
     std::string NodeDetail(const std::string& nodeKey) const;
     int NodeRunCount(const std::string& nodeKey) const;
     std::vector<std::string> NodeJobs(const std::string& nodeKey) const;
+
+    // Estimated seconds of work left in job/worker leaves that have not started yet. Jobs that
+    // are already running are counted by the task queue, so they contribute 0 here. The value
+    // follows the current branch of the tree (retry/repeat multiply future attempts, parallel
+    // takes the longest child, sequence sums, fallback/if take the active path).
+    int64_t PendingEstimateSec() const;
+    // Job/worker leaves still idle on the current execution path, in the order they will start.
+    std::vector<BtPlannedTask> PlannedTasks() const;
 
     bool GetEscalationPacket(const std::string& nodeKey, BtEscalationPacket& out) const;
     BtEscalationPacket GetCurrentEscalationPacket() const;

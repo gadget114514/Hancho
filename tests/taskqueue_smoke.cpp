@@ -2033,6 +2033,62 @@ int main() {
         Check(retryResp.find("j_plain_") == std::string::npos, "TaskQueueRetryFailed ignores plain jobs");
     }
 
+    // --- Suspend after a job and all other work become idle --------------------------------
+    tqm.ShutdownTaskQueueManager();
+    {
+        std::wstring powerDir = dir + L"_power";
+        CreateDirectoryW(powerDir.c_str(), nullptr);
+        SetDataDirectoryOverride(powerDir);
+
+        ProcessManager powerPm;
+        TaskQueueManager powerTqm;
+        powerTqm.SetProcessManager(&powerPm);
+        powerPm.SetProcessFinishedCallback([&powerTqm](int pid, int ec, const std::string& kind) {
+            powerTqm.OnProcessFinished(pid, ec, kind);
+        });
+        std::atomic<int> fired{0};
+        powerTqm.SetSuspendCallback([&fired](const std::string&, const std::string&, bool) {
+            fired.fetch_add(1);
+        });
+
+        std::string err;
+        const std::string jobs = R"([
+          {"id":"PW1","command":"cmd /c exit 0","summary":"final job","timeoutSec":30,"suspendWhenDone":true,"suspendDelaySec":1},
+          {"id":"PW_HOLD","command":"cmd /c ping -n 4 127.0.0.1","summary":"other running","timeoutSec":30},
+          {"id":"PW_DEP","command":"cmd /c exit 0","summary":"other pending","timeoutSec":30,"dependsOn":["PW_HOLD"]}
+        ])";
+        Check(JsonGetBool(powerTqm.TaskQueueAdd("powerq", jobs, 3, "", err), "ok", false),
+              "power: jobs registered: " + err);
+        Check(WaitForState(powerTqm, "PW1", "succeeded", 10000), "power: armed job finished");
+        Sleep(1200);
+        Check(fired.load() == 0, "power: waits for other jobs");
+        Check(WaitForState(powerTqm, "PW_HOLD", "succeeded", 15000), "power: other job finished");
+        Check(WaitForState(powerTqm, "PW_DEP", "succeeded", 15000), "power: dependent job finished");
+        uint64_t powerStart = GetNowTickMs();
+        while (fired.load() == 0 && GetNowTickMs() - powerStart < 8000) Sleep(100);
+        Check(fired.load() == 1, "power: fires after all work is idle");
+        std::string getResp = powerTqm.TaskQueueGet("PW1", false, 0, err);
+        Check(!JsonGetBool(getResp, "suspend_when_done", true), "power: flag cleared after firing");
+
+        const std::string cancelJob =
+            R"([{"id":"PW2","command":"cmd /c ping -n 4 127.0.0.1","summary":"cancel me","timeoutSec":30,"suspendWhenDone":true,"suspendDelaySec":1}])";
+        Check(JsonGetBool(powerTqm.TaskQueueAdd("powerq2", cancelJob, 0, "", err), "ok", false),
+              "power: cancel job added");
+        Check(WaitForState(powerTqm, "PW2", "running", 10000), "power: cancel job running");
+        std::string cancelResp = powerTqm.ClearSuspendWhenDone(err);
+        Check(JsonGetInt(cancelResp, "cleared", 0) == 1, "power: cancel clears the armed flag");
+        Check(!JsonGetBool(powerTqm.SuspendStatusJson(), "armed", true),
+              "power: status reports not armed");
+        int firedBefore = fired.load();
+        Check(WaitForState(powerTqm, "PW2", "succeeded", 15000), "power: cancel job finished");
+        Sleep(1500);
+        Check(fired.load() == firedBefore, "power: cancel prevents suspend");
+
+        powerTqm.SetSuspendCallback(nullptr);
+        powerTqm.ShutdownTaskQueueManager();
+        SetDataDirectoryOverride(dir);
+    }
+
     std::printf("%s (%d failures)\n", g_failures == 0 ? "ALL PASSED" : "FAILURES", g_failures);
     return g_failures == 0 ? 0 : 1;
 }

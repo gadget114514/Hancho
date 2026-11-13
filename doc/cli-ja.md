@@ -99,6 +99,23 @@ hancho-cli.exe taskqueue wait main --since 0 --timeout-ms 30000
 hancho-cli.exe taskqueue retry A
 ```
 
+**サスペンド（指定タスクと他の全作業が終わったら PC をスリープ）:**
+
+```powershell
+# このジョブが終わり、他の全ジョブと管理プロセスもアイドルになってから 30 秒後にスリープ
+hancho-cli.exe power suspend --after-job final-build --delay-sec 30
+
+# 登録時にジョブへ指定することもできる
+# {"id":"final-build","command":"...","summary":"...","timeoutSec":600,
+#  "suspendWhenDone":true,"suspendDelaySec":30}
+
+hancho-cli.exe power status   # 待機中の他ジョブ数・プロセス数・残り秒数
+hancho-cli.exe power cancel   # 武装を解除
+hancho-cli.exe power suspend --dry-run   # 実際にはスリープせず確認
+```
+
+対象ジョブが `succeeded` / `failed` / `cancelled` / `blocked` になると、他のタスクキュージョブ（`running` / `waiting` / `pending`）と Hancho 管理プロセスがなくなるまで待ちます。待機中に新しい作業が始まった場合はカウントダウンをやり直します。`--hibernate` で休止、`--dry-run` で確認できます。複数のジョブにフラグを付けた場合は、すべて終了してから発動します。`power_*` はローカルホスト専用です。
+
 **メモリ（過去の実行・ノート・プロジェクト知識）:**
 
 ```powershell

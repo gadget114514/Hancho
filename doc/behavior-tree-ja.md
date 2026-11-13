@@ -397,6 +397,7 @@ Hancho のビヘイビアツリー (BT) は、条件分岐 (`if`/`fallback`)、�
 - **`bt_get` (`compact: true`)**:
   - `"compact"` フィールドに 1 ノード 1 行のインデント付きツリー文字列 (`[state] type id "summary"  job <jobId>  - <detail>`) を返します。
   - `"tree"` は返しません。定義・状態・変数をすべて見るときは `compact` なしの `bt_get` を使います。
+- **残り時間と仮タスク**: `bt_get` は `pendingEstimateSec`（現在の分岐でまだ起動していない job/worker 葉の見積もり合計）と `plannedTasks`（ノードキー・キュー・見積もり）を返します。ダッシュボードは同じ葉を仮のキュータスク行として表示します（`state: "planned"`、`id: btplan:<btId>:<node>`）。これらは問い合わせのたびにツリー状態から作り直すため、retry・fallback・`if` の分岐・キャンセルで実行されない枝に移ると、該当行は自動的に消えます。
 - **保存ファイル**:
   - 状態ファイル: `<dataDir>/behaviortrees/<id>.json`
   - イベントログ: `<dataDir>/bt-<id>.events.jsonl` (`btStarted`, `nodeStarted`, `nodeFinished`, `varSet`, `escalated`, `btSucceeded`, `btFailed`, `btCancelled`)

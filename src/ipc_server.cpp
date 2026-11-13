@@ -318,6 +318,77 @@ std::string IpcServer::HandleRequestJson(const std::string& reqJson) {
         }).detach();
         return "{\"ok\":true,\"stopping\":true}";
     }
+    else if (action == "power_suspend") {
+        const std::string jobId = JsonGetString(reqJson, "job_id", JsonGetString(reqJson, "jobId", ""));
+        const bool dryRun = JsonGetBool(reqJson, "dry_run", JsonGetBool(reqJson, "dryRun", false));
+        const bool hibernate = JsonGetBool(reqJson, "hibernate", false);
+        int delaySec = static_cast<int>(JsonGetInt(reqJson, "delay_sec", JsonGetInt(reqJson, "delaySec", 3)));
+        if (delaySec < 0) delaySec = 0;
+        if (delaySec > 86400) delaySec = 86400;
+
+        if (!jobId.empty()) {
+            if (dryRun) {
+                TaskQueueJob job;
+                if (!tqm_.GetJobSnapshot(jobId, job)) {
+                    return "{\"ok\":false,\"error\":\"job not found: " + JsonEscape(jobId) + "\"}";
+                }
+                nlohmann::json out;
+                out["ok"] = true;
+                out["dry_run"] = true;
+                out["armed"] = false;
+                out["would_arm"] = true;
+                out["id"] = job.id;
+                out["state"] = job.state;
+                out["terminal"] = (job.state == "succeeded" || job.state == "failed" ||
+                                   job.state == "cancelled" || job.state == "blocked");
+                out["delay_sec"] = delaySec;
+                out["hibernate"] = hibernate;
+                return out.dump();
+            }
+            std::string err;
+            return tqm_.SetJobSuspendWhenDone(jobId, hibernate, delaySec, err);
+        }
+
+        if (dryRun) {
+            nlohmann::json out;
+            out["ok"] = true;
+            out["dry_run"] = true;
+            out["suspending"] = false;
+            out["delay_sec"] = delaySec;
+            out["hibernate"] = hibernate;
+            return out.dump();
+        }
+
+        if (delaySec < 1) delaySec = 1;
+        PowerCallback cb;
+        {
+            std::lock_guard<std::mutex> lock(cbMutex_);
+            cb = powerCb_;
+        }
+        if (!cb) {
+            return "{\"ok\":false,\"error\":\"suspend is not available\"}";
+        }
+        WriteAuditLog("POWER_SUSPEND", std::string("immediate delay=") + std::to_string(delaySec) +
+                                           (hibernate ? " hibernate" : " sleep"));
+        std::thread([cb, delaySec, hibernate] {
+            if (delaySec > 0) SleepMs(static_cast<uint32_t>(delaySec) * 1000);
+            std::string err;
+            if (!cb(hibernate, err)) WriteAuditLog("POWER_FAILED", err);
+        }).detach();
+        nlohmann::json out;
+        out["ok"] = true;
+        out["suspending"] = true;
+        out["delay_sec"] = delaySec;
+        out["hibernate"] = hibernate;
+        return out.dump();
+    }
+    else if (action == "power_cancel") {
+        std::string err;
+        return tqm_.ClearSuspendWhenDone(err);
+    }
+    else if (action == "power_status") {
+        return tqm_.SuspendStatusJson();
+    }
     else if (action == "start") {
         StartProcessRequest req;
         req.name = JsonGetString(reqJson, "name", "");
@@ -837,10 +908,36 @@ std::string IpcServer::HandleRequestJson(const std::string& reqJson) {
             if (!sinceStr.empty() && !ParseDurationToSec(sinceStr, sinceSec)) {
                 err = "invalid since '" + sinceStr + "' (use a number followed by m, h or d, e.g. 6h)";
             } else {
-                resp = tqm_.TaskQueueList(JsonGetString(reqJson, "taskqueue", ""),
-                                          JsonGetString(reqJson, "state", ""), sinceSec, err,
-                                          JsonGetString(reqJson, "origin", ""),
-                                          JsonGetString(reqJson, "bt", ""));
+                const std::string tqFilter = JsonGetString(reqJson, "taskqueue", "");
+                const std::string stateFilter = JsonGetString(reqJson, "state", "");
+                const std::string btFilter = JsonGetString(reqJson, "bt", "");
+                resp = tqm_.TaskQueueList(tqFilter, stateFilter, sinceSec, err,
+                                          JsonGetString(reqJson, "origin", ""), btFilter);
+                // Provisional BT rows: idle job/worker leaves of the current branch. They are
+                // not stored anywhere, so a branch change on the next query drops them.
+                if (err.empty() && btm_ && JsonGetBool(reqJson, "include_planned", false) &&
+                    (stateFilter.empty() || stateFilter == "pending" || stateFilter == "planned")) {
+                    nlohmann::json doc = nlohmann::json::parse(resp, nullptr, false);
+                    if (doc.is_object() && doc.contains("jobs") && doc["jobs"].is_array()) {
+                        BtRemainingInfo info = btm_->GetRemainingInfo();
+                        for (const auto& t : info.planned) {
+                            if (!tqFilter.empty() && t.queueName != tqFilter) continue;
+                            if (!btFilter.empty() && t.btId != btFilter) continue;
+                            nlohmann::json job;
+                            job["id"] = "btplan:" + t.btId + ":" + t.nodeKey;
+                            job["summary"] = t.summary.empty() ? t.nodeKey : t.summary;
+                            job["state"] = "planned";
+                            job["virtual"] = true;
+                            job["taskqueue"] = t.queueName;
+                            job["timeout_sec"] = t.estimateSec;
+                            job["estimate_sec"] = t.estimateSec;
+                            job["created_at"] = "";
+                            job["bt"] = {{"id", t.btId}, {"node", t.nodeKey}, {"planned", true}};
+                            doc["jobs"].push_back(std::move(job));
+                        }
+                        resp = doc.dump();
+                    }
+                }
             }
         } else if (action == "taskqueue_get") {
             resp = tqm_.TaskQueueGet(JsonGetString(reqJson, "id", ""),
@@ -896,26 +993,47 @@ std::string IpcServer::HandleRequestJson(const std::string& reqJson) {
                                        JsonGetString(reqJson, "root", ""), err);
         } else if (action == "taskqueue_counts") {
             TaskQueueCounts c = tqm_.GetJobCounts();
+            int64_t btPendingSec = 0;
+            int btPlanned = 0;
+            if (btm_) {
+                BtRemainingInfo info = btm_->GetRemainingInfo();
+                btPendingSec = info.pendingSec;
+                btPlanned = static_cast<int>(info.planned.size());
+            }
+            int64_t sumRemainingSec = c.sumRemainingSec;
+            if (btPendingSec > 0) {
+                sumRemainingSec = (sumRemainingSec < 0) ? btPendingSec : sumRemainingSec + btPendingSec;
+            }
+            const int pendingWithPlanned = c.pending + btPlanned;
+            const int totalWithPlanned = c.total + btPlanned;
             nlohmann::json counts;
             counts["running"] = c.running;
             counts["waiting"] = c.waiting;
-            counts["pending"] = c.pending;
+            counts["pending"] = pendingWithPlanned;
             counts["blocked"] = c.blocked;
             counts["succeeded"] = c.succeeded;
             counts["failed"] = c.failed;
             counts["cancelled"] = c.cancelled;
-            counts["total"] = c.total;
+            counts["total"] = totalWithPlanned;
+            counts["bt_planned"] = btPlanned;
+            counts["bt_remaining_sec"] = btPendingSec;
+            counts["min_remaining_sec"] = c.minRemainingSec;
+            counts["sum_remaining_sec"] = sumRemainingSec;
             nlohmann::json out;
             out["ok"] = true;
             out["counts"] = counts;
             out["running"] = c.running;
             out["waiting"] = c.waiting;
-            out["pending"] = c.pending;
+            out["pending"] = pendingWithPlanned;
             out["blocked"] = c.blocked;
             out["succeeded"] = c.succeeded;
             out["failed"] = c.failed;
             out["cancelled"] = c.cancelled;
-            out["total"] = c.total;
+            out["total"] = totalWithPlanned;
+            out["bt_planned"] = btPlanned;
+            out["bt_remaining_sec"] = btPendingSec;
+            out["min_remaining_sec"] = c.minRemainingSec;
+            out["sum_remaining_sec"] = sumRemainingSec;
             return out.dump();
         } else if (action == "taskqueue_resource_locks") {
             if (reqJson.find("\"enabled\"") != std::string::npos) {

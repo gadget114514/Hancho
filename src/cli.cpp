@@ -8,6 +8,7 @@
 #include "remote_hosts.h"
 #include "taskqueue.h"
 #include "cli_top.h"
+#include "power.h"
 #include "nlohmann/json.hpp"
 #include <iostream>
 #include <sstream>
@@ -2285,7 +2286,8 @@ HOW TO USE HANCHO (process vs task):
   Use `start --pty` only to host an interactive TUI; treat it as a terminal,
   not as a tracked task.
 
-HANCHO-CLI CONCEPTS:
+)";
+    std::cout << R"(HANCHO-CLI CONCEPTS:
   Process IDs : Numeric IDs assigned by the dashboard (#1, #2, ...). Use them with
                 list --id, logs --id, send --id, wait --id and kill --id.
   Modes       : pipe    = anonymous pipes (default; non-interactive CLI workers)
@@ -2327,6 +2329,7 @@ EXAMPLES:
   hancho-cli.exe taskqueue add --file jobs.json --taskqueue main
   hancho-cli.exe run --file queue.json --exit-on-drain --report junit.xml
   hancho-cli.exe bt start --file tree.json
+  hancho-cli.exe power suspend --after-job final-build --delay-sec 30
   hancho-cli.exe mcp install --client opencode
 
 COMMANDS:
@@ -2522,7 +2525,19 @@ REMOTE HOSTS:
       Send this invocation's IPC request to that host instead of the local
       dashboard (for example: hancho-cli --host buildbox list).
 
-)" R"(TASK QUEUE:
+)" R"(POWER:
+  power suspend [--after-job <id>] [--delay-sec <n>] [--hibernate] [--dry-run]
+      Suspend the PC after the specified task queue job finishes and every other
+      job / managed process is idle. Without --after-job, suspend after a short
+      delay. --hibernate uses hibernation instead of sleep. --dry-run only reports
+      what would happen.
+  power cancel
+      Disarm every pending suspend.
+  power status
+      Show armed jobs, the current phase, and how many other jobs / managed
+      processes are still running.
+
+TASK QUEUE:
   run --file <jobs.json> [--taskqueue <name>] [--exit-on-drain] [--report <junit.xml>]
       CI one-shot: register the queue, wait until no job is pending or running, write a
       JUnit report, then exit 0 (all succeeded), 1 (failure/blocked) or 2 (cancelled/
@@ -2537,6 +2552,7 @@ REMOTE HOSTS:
       Each job needs id, command, summary, timeoutSec; dependsOn replaces '&&'.
       Optional: cwd, host, env, dependsOn, idle, maxAttempts, retryDelaySec, success,
       killExclude, resources {write,read}, defer, priority, estimateSec,
+      suspendWhenDone, suspendDelaySec, suspendHibernate,
       instructionsFile/instructionsText.
       estimateSec is your expected run time; Hancho compares it with the actual
       duration (see AUDIT below).
@@ -2558,6 +2574,8 @@ REMOTE HOSTS:
       job waits for a resource lock, otherwise null) and timing_feedback.
       --bt <id> lists every job of a behavior tree across its parallel branch queues.
       --origin self keeps only the jobs this session added.
+      The dashboard also shows idle BT leaves as provisional "planned" rows and
+      counts their estimates in the remaining time; they are not stored jobs.
 
   taskqueue record-plain --cmd <cmd> [--name <name>] [--exit-code <n>] [--log <path>] [--summary <text>]
       Record a plain execution outside a queue into logs/taskqueues/plain.json.
@@ -2611,6 +2629,10 @@ BEHAVIOR TREES (for LLM agents; next step depends on results):
       Long-poll until the tree finishes or waits for your decision (escalate).
   bt resume --id <id> --node <node> --answer <a> --rationale <why> [--vars <json>]
   bt get --id <id> [--compact]  |  bt list
+      bt get also reports pendingEstimateSec (unstarted work on the current
+      branch) and plannedTasks. The dashboard shows those leaves as "planned"
+      rows and includes their estimates in the task remaining time; rows for
+      branches the tree leaves disappear automatically.
   bt retry --id <id> [--from <node>] [--reset-counters]
   bt update --id <id> [--node <node>] (--file <path> | --bt <json> | --patch <json>)
   bt cancel --id <id>  |  bt pause --id <id> [--paused true|false]
@@ -2710,7 +2732,7 @@ SETUP FOR LLM AGENTS:
 "        and returns the result. The wrapper costs extra tokens; calling run_worker\n"
 "        directly is cheapest.\n"
 "\n"
-"    MCP tools (34):\n"
+"    MCP tools (37):\n"
 "      Process:    start_process, list_processes, get_process_output,\n"
 "                  send_process_input, wait_process, kill_process\n"
 "      Worker:     run_worker, wait_worker, get_worker_stream, get_worker_state,\n"
@@ -2721,6 +2743,7 @@ SETUP FOR LLM AGENTS:
 "                  taskqueue_graph\n"
 "      Behavior tree: bt_validate, bt_start, bt_get, bt_list, bt_wait, bt_resume,\n"
 "                  bt_retry, bt_update, bt_cancel, bt_pause\n"
+"      Power:      power_suspend, power_cancel, power_status\n"
 "\n"
 "NOTE:\n"
 "  The GUI dashboard is provided by Hancho.exe, which is auto-started\n"
@@ -2792,6 +2815,7 @@ void PrintCliUsageJson() {
     "hancho-cli.exe taskqueue add --file jobs.json --taskqueue main",
     "hancho-cli.exe run --file queue.json --exit-on-drain --report junit.xml",
     "hancho-cli.exe bt start --file tree.json",
+    "hancho-cli.exe power suspend --after-job final-build --delay-sec 30",
     "hancho-cli.exe mcp install --client opencode"
   ],
   "commands": [
@@ -2840,7 +2864,8 @@ void PrintCliUsageJson() {
         {"name": "--wait-ms", "value": "<ms>", "description": "With --wait: maximum wait (0 = unlimited). Without --wait: initial output wait. Default: 500."}
       ]
     },
-)" R"(    {
+)";
+    std::cout << R"(    {
       "name": "send",
       "aliases": ["write"],
       "description": "Send text input to a running process's stdin or ConPTY session.",
@@ -2938,8 +2963,8 @@ void PrintCliUsageJson() {
       "description": "Manage the persistent task queue: ordered jobs, dependencies, per-job timeouts, success checks and automatic retries.",
       "usage": "hancho-cli taskqueue <add|list|get|why|retry|cancel|pause|resume|graph|wait|purge> ...",
       "subcommands": [
-        {"name": "add", "usage": "hancho-cli taskqueue add --file <jobs.json> [--taskqueue <name>] [--concurrency <n>] [--notify-file <path>] [--origin-label <text>]", "description": "Register jobs. Each job needs id, command, summary and timeoutSec; dependsOn replaces shell chaining. The caller's session id, working folder and --origin-label are recorded as the job's origin."},
-        {"name": "list", "usage": "hancho-cli taskqueue list [<name>] [--state <state>] [--since <period>] [--origin <self|label|session>] [--bt <id>]", "description": "List jobs with state, queue, summary and blockedBy. --since keeps only jobs updated within the period (e.g. 30m, 6h, 2d). --origin self keeps only the jobs this session added. --bt <id> lists every job of a behavior tree across its parallel branch queues. Each job also carries resource_wait and, once succeeded with estimateSec, timing_feedback (see audit)."},
+        {"name": "add", "usage": "hancho-cli taskqueue add --file <jobs.json> [--taskqueue <name>] [--concurrency <n>] [--notify-file <path>] [--origin-label <text>]", "description": "Register jobs. Each job needs id, command, summary and timeoutSec; dependsOn replaces shell chaining. The caller's session id, working folder and --origin-label are recorded as the job's origin. suspendWhenDone/suspendDelaySec/suspendHibernate arm the PC to suspend after that job and all other work is idle."},
+        {"name": "list", "usage": "hancho-cli taskqueue list [<name>] [--state <state>] [--since <period>] [--origin <self|label|session>] [--bt <id>]", "description": "List jobs with state, queue, summary and blockedBy. --since keeps only jobs updated within the period (e.g. 30m, 6h, 2d). --origin self keeps only the jobs this session added. --bt <id> lists every job of a behavior tree across its parallel branch queues. Each job also carries resource_wait and, once succeeded with estimateSec, timing_feedback (see audit). The dashboard adds provisional 'planned' rows for idle BT leaves; taskqueue_list returns them only with include_planned: true."},
         {"name": "record-plain", "usage": "hancho-cli taskqueue record-plain --cmd <cmd> [--name <name>] [--exit-code <n>] [--log <path>] [--summary <text>]", "description": "Record a plain execution outside a queue into logs/taskqueues/plain.json."},
         {"name": "get", "usage": "hancho-cli taskqueue get <id> [--rev <n>] [--no-instructions]", "description": "Show one job with attempts and instructions."},
         {"name": "why", "usage": "hancho-cli taskqueue why <id>", "description": "Explain why the last attempt failed: failure class, confidence, summary, suggested action, last activity and evidence (event seq / log line), plus the class of every attempt. Reads the job without instructions."},
@@ -2952,7 +2977,8 @@ void PrintCliUsageJson() {
         {"name": "purge", "usage": "hancho-cli taskqueue purge <name> [--states succeeded,failed,cancelled]", "description": "Remove finished jobs."}
       ],
       "options": []
-    },)" R"(
+    },)";
+    std::cout << R"(
     {
       "name": "bt",
       "description": "Behavior trees: submit a whole multi-step workflow (branches, fix loops, checks, worker LLM steps, escalations) as one JSON document; Hancho runs it and each leaf becomes an ordinary task-queue job. See agent.behavior_tree and doc/behavior-tree.md.",
@@ -3021,6 +3047,22 @@ void PrintCliUsageJson() {
       ]
     },
     {
+      "name": "power",
+      "description": "Suspend the PC after a task queue job finishes and all other jobs / managed processes are idle. Arm a job by id, or suspend immediately. Use --dry-run to verify without suspending. power_* IPC actions are local-host only.",
+      "usage": "hancho-cli power <suspend|cancel|status> [options]",
+      "subcommands": [
+        {"name": "suspend", "usage": "hancho-cli power suspend [--after-job <id>] [--delay-sec <n>] [--hibernate] [--dry-run]", "description": "Suspend now (after delay-sec, default 3), or arm the given job. The job may also be armed at registration with suspendWhenDone/suspendDelaySec. The core waits until every other task queue job and managed process is idle before the delay starts; new work cancels the countdown."},
+        {"name": "cancel", "usage": "hancho-cli power cancel", "description": "Clear suspendWhenDone on every job and cancel the countdown."},
+        {"name": "status", "usage": "hancho-cli power status", "description": "Show armed jobs, the phase (waiting_target, waiting_others, countdown), other jobs/processes still running, and seconds until suspend."}
+      ],
+      "options": [
+        {"name": "--after-job", "value": "<id>", "description": "Task queue job id to arm. Works for pending, running and already finished jobs."},
+        {"name": "--delay-sec", "value": "<n>", "description": "Grace period after all work becomes idle (default 3 for immediate suspend; 10 for job-triggered when suspendDelaySec is 0)."},
+        {"name": "--hibernate", "description": "Hibernate instead of sleep."},
+        {"name": "--dry-run", "description": "Report what would be armed or suspended without changing state or suspending."}
+      ]
+    },
+    {
       "name": "memory",
       "description": "Search, read, summarize and reindex Hancho's persistent memory. L1 run records live in memory/records/*.jsonl, L2 notes in memory/notes.jsonl and L3 approved knowledge in memory/knowledge.jsonl. memory/index/ is a derivative index that can be deleted and rebuilt.",
       "usage": "hancho-cli memory <search|get|brief|stats|note|retract|approve|rebuild> [options]",
@@ -3079,7 +3121,8 @@ void PrintCliUsageJson() {
       "options": []
     }
   ],
-  "completion": {
+)";
+    std::cout << R"(  "completion": {
     "description": "Use --wait to keep hancho-cli.exe alive until the managed process exits. The .done file is written atomically on exit. Without --wait, start returns immediately.",
     "blocking_start": "hancho-cli.exe start ... --wait --wait-ms 0",
     "blocking_wait": "hancho-cli.exe wait --id <id> --wait-ms 0",
@@ -3216,14 +3259,15 @@ void PrintCliUsageJson() {
     },
     "taskqueue_job": {
       "required": ["id", "command", "summary", "timeoutSec"],
-      "optional": ["cwd", "env", "dependsOn", "idle", "maxAttempts", "retryDelaySec", "defer", "success", "killExclude", "resources", "priority", "instructionsFile", "instructionsText"],
+      "optional": ["cwd", "env", "dependsOn", "idle", "maxAttempts", "retryDelaySec", "defer", "success", "killExclude", "resources", "priority", "suspendWhenDone", "suspendDelaySec", "suspendHibernate", "instructionsFile", "instructionsText"],
       "summary": "One line, max 200 chars; exported as PC_JOB_SUMMARY and substituted for {summary}.",
       "timeoutSec": "Per job; > 0 and <= queue maxTimeoutSec (default 7200). Never summed.",
       "success": "exitCode (default 0) AND filesNewer (exist and newer than the attempt start) AND outputRegex (last 200 log lines) AND testReport (JUnit/NUnit XML: newer than the attempt start, at least one test, none failed; failed test names go into the failure detail).",
       "idle": "outputSec and cpuSec must both be set; kill only when output AND CPU are idle.",
       "defer": "{exitCodes (default [75]), delaySec (60), limit (60, 0 = no limit)}: exit codes meaning nothing ran; the job is re-run after delaySec without using up maxAttempts. {\"exitCodes\": []} turns it off."
     },
-)" R"(    "behavior_tree": {
+)";
+    std::cout << R"(    "behavior_tree": {
       "summary": "One JSON document describing the whole workflow. Hancho ticks it on job completion and timers, adds each leaf as an ordinary task-queue job, and returns to you only when a decision is needed (escalate) or the tree finishes.",
       "when": "Use instead of taskqueue_add when the next step depends on results: if/else, build -> fix -> rebuild, test -> fix -> retest, file/JSON/log checks, worker LLM steps, or a decision you must make mid-way.",
       "flow": [
@@ -3239,6 +3283,7 @@ void PrintCliUsageJson() {
         "conditions": "fileExists, fileNewer, outputMatches, exitCode, jsonValue, var, nodeState"
       },
       "variables": "${name} expands BT vars; in command it is quoted as one argument. Node variables: ${<id>.state|exitCode|logFile|jobId|runs}, ${<worker>.result} (final response), ${<worker>.output.<path>} (JSON the worker wrote to PC_BT_RESULT_FILE), ${<escalate>.answer}.",
+      "remaining": "bt_get/bt_list return pendingEstimateSec (estimated work in job/worker leaves that have not started on the current branch) and plannedTasks (node, type, summary, taskqueue, estimateSec). The dashboard lists them as provisional planned rows and adds their estimates to the task remaining time; they are re-derived on every query, so retry/fallback/if branch changes and completion drop stale rows.",
       "engines": "Workers name an engine (claude, agy, opencode, codex, or ones in <data dir>/engines.json) and optionally a model; permission flags live only in the engine definition. An engine may also set adapter (a Tier 1/3 file in <data dir>/adapters/) and capabilities (jsonStream, resume, reportsUsage, reportsSubagents, permissionModes).",
       "limits": "retry/repeat max <= 100 (required); limits.maxNodeRuns default 200; limits.maxWallSec default 86400; depth 32; 1000 nodes.",
       "rules": [
@@ -3258,6 +3303,7 @@ void PrintCliUsageJson() {
       "waiting": "Queued and ready; waiting for a free slot or the retry delay.",
       "pending": "Not in the run queue yet; dependencies are not satisfied.",
       "blocked": "A success-dependency failed/cancelled; fix and retry the dependency.",
+      "planned": "Provisional row for an idle job/worker leaf of a running behavior tree. It is not a stored queue job and disappears when the tree changes branch or finishes; taskqueue_list returns it only with include_planned: true.",
       "running": "An attempt is executing.",
       "succeeded": "Success conditions met.",
       "failed": "Attempts exhausted or launch failed.",
@@ -4696,6 +4742,167 @@ int RunHostsCommand(const std::vector<std::string>& args, bool jsonOutput) {
     return 1;
 }
 
+static int RunPowerCommand(const std::vector<std::string>& args, bool jsonOutput) {
+    std::string op = args.size() >= 3 ? args[2] : "help";
+    if (op.empty()) op = "help";
+
+    auto fail = [&](const std::string& message) {
+        if (jsonOutput) {
+            nlohmann::json out;
+            out["ok"] = false;
+            out["error"] = message;
+            std::cout << out.dump() << "\n";
+        } else {
+            std::cerr << "Error: " << message << "\n";
+        }
+        return 1;
+    };
+
+    auto send = [&](const nlohmann::json& req, std::string& respOut) {
+        std::string err;
+        if (!SendIpcRequest(req.dump(), respOut, err, false)) return fail(err);
+        nlohmann::json resp = nlohmann::json::parse(respOut, nullptr, false);
+        if (resp.is_discarded() || !resp.is_object()) return fail("invalid IPC response");
+        if (!resp.value("ok", false)) {
+            return fail(resp.value("error", std::string("request failed")));
+        }
+        return 0;
+    };
+
+    if (op == "help" || op == "--help" || op == "-h") {
+        std::cout << "Usage: hancho-cli power <suspend|cancel|status> [options]\n"
+                     "\n"
+                     "  suspend [--after-job <id>] [--delay-sec <n>] [--hibernate] [--dry-run]\n"
+                     "      Suspend now, or arm a job so the PC suspends after it and all\n"
+                     "      other jobs / managed processes become idle.\n"
+                     "  cancel\n"
+                     "      Disarm every pending suspend.\n"
+                     "  status\n"
+                     "      Show armed jobs, the current phase and how many other jobs and\n"
+                     "      managed processes are still running.\n";
+        return 0;
+    }
+
+    if (op == "suspend") {
+        std::string jobId;
+        int delaySec = 3;
+        bool hibernate = false;
+        bool dryRun = false;
+        for (size_t i = 3; i < args.size(); ++i) {
+            const std::string& a = args[i];
+            if ((a == "--after-job" || a == "--job") && i + 1 < args.size()) {
+                jobId = args[++i];
+            } else if (a == "--delay-sec" && i + 1 < args.size()) {
+                try { delaySec = std::stoi(args[++i]); } catch (...) { delaySec = 3; }
+            } else if (a == "--hibernate") {
+                hibernate = true;
+            } else if (a == "--dry-run") {
+                dryRun = true;
+            } else {
+                return fail("unknown power suspend option: " + a);
+            }
+        }
+        if (delaySec < 0) delaySec = 0;
+        if (delaySec > 86400) delaySec = 86400;
+
+        if (!jobId.empty()) {
+            nlohmann::json req;
+            req["action"] = "power_suspend";
+            req["job_id"] = jobId;
+            req["delay_sec"] = delaySec;
+            req["hibernate"] = hibernate;
+            req["dry_run"] = dryRun;
+            std::string resp;
+            if (int rc = send(req, resp)) return rc;
+            if (jsonOutput) {
+                std::cout << resp << "\n";
+            } else {
+                nlohmann::json j = nlohmann::json::parse(resp, nullptr, false);
+                if (j.value("dry_run", false)) {
+                    std::cout << "Would arm job '" << jobId << "' (state "
+                              << j.value("state", std::string("?")) << "): suspend after it and\n"
+                              << "all other jobs / managed processes become idle (delay "
+                              << delaySec << "s).\n";
+                } else {
+                    std::cout << "Armed job '" << jobId << "' (state "
+                              << j.value("state", std::string("?")) << "): suspend after it and\n"
+                              << "all other jobs / managed processes become idle (delay "
+                              << delaySec << "s).\n";
+                }
+            }
+            return 0;
+        }
+
+        if (jsonOutput) {
+            nlohmann::json out;
+            out["ok"] = true;
+            out["suspending"] = !dryRun;
+            out["dry_run"] = dryRun;
+            out["delay_sec"] = delaySec;
+            out["hibernate"] = hibernate;
+            std::cout << out.dump() << "\n";
+        } else if (dryRun) {
+            std::cout << "Dry run: would suspend"
+                      << (hibernate ? " (hibernate)" : "") << " in " << delaySec << " s.\n";
+        } else {
+            std::cout << "Suspending" << (hibernate ? " (hibernate)" : "") << " in "
+                      << delaySec << " s.\n";
+        }
+        std::cout.flush();
+        if (dryRun) return 0;
+        if (delaySec > 0) SleepMs(static_cast<uint32_t>(delaySec) * 1000);
+        std::string err;
+        if (!SuspendSystem(hibernate, err)) return fail(err);
+        return 0;
+    }
+
+    if (op == "cancel") {
+        nlohmann::json req;
+        req["action"] = "power_cancel";
+        std::string resp;
+        if (int rc = send(req, resp)) return rc;
+        if (jsonOutput) {
+            std::cout << resp << "\n";
+        } else {
+            nlohmann::json j = nlohmann::json::parse(resp, nullptr, false);
+            std::cout << "Cancelled " << j.value("cleared", 0) << " armed suspend(s).\n";
+        }
+        return 0;
+    }
+
+    if (op == "status") {
+        nlohmann::json req;
+        req["action"] = "power_status";
+        std::string resp;
+        if (int rc = send(req, resp)) return rc;
+        if (jsonOutput) {
+            std::cout << resp << "\n";
+            return 0;
+        }
+        nlohmann::json j = nlohmann::json::parse(resp, nullptr, false);
+        if (!j.value("armed", false)) {
+            std::cout << "No suspend is armed.\n";
+            return 0;
+        }
+        std::cout << "Phase: " << j.value("phase", std::string("idle")) << "\n";
+        if (j.contains("jobs") && j["jobs"].is_array()) {
+            for (const auto& job : j["jobs"]) {
+                std::cout << "  job " << job.value("id", std::string("?")) << " (state "
+                          << job.value("state", std::string("?")) << ", delay "
+                          << job.value("delay_sec", 0) << "s"
+                          << (job.value("hibernate", false) ? ", hibernate" : "") << ")\n";
+            }
+        }
+        std::cout << "Other work: " << j.value("other_jobs", 0) << " job(s), "
+                  << j.value("other_processes", 0) << " managed process(es)\n";
+        int sec = j.value("seconds_until_suspend", 0);
+        if (sec > 0) std::cout << "Suspending in " << sec << " s.\n";
+        return 0;
+    }
+
+    return fail("unknown power command: " + op + " (suspend, cancel, status)");
+}
+
 int RunCli(const std::vector<std::string>& rawArgs) {
     std::vector<std::string> args;
     args.push_back(rawArgs.empty() ? "hancho-cli" : rawArgs[0]);
@@ -4749,6 +4956,7 @@ int RunCli(const std::vector<std::string>& rawArgs) {
     if (subcmd == "web" || subcmd == "ui") return RunWebCommand(args, jsonOutput);
     if (subcmd == "hosts") return RunHostsCommand(args, jsonOutput);
     if (subcmd == "usage") return RunUsageCommand(args, 2, jsonOutput);
+    if (subcmd == "power") return RunPowerCommand(args, jsonOutput);
     if (subcmd == "memory") {
         bool compareInject = false;
         for (size_t i = 2; i < args.size(); ++i) {

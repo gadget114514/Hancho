@@ -25,8 +25,8 @@ The dashboard has an **execution monitor pane** below the process and task lists
 
 ## Express
 
-- Download and install [Hancho-v0.9.7-win64-setup.exe](https://github.com/gadget114514/Hancho/releases/download/v0.9.7/Hancho-v0.9.7-win64-setup.exe)
-  (portable: [Hancho-v0.9.7-win64.zip](https://github.com/gadget114514/Hancho/releases/download/v0.9.7/Hancho-v0.9.7-win64.zip), all versions: [Releases](https://github.com/gadget114514/Hancho/releases))
+- Download and install [Hancho-v0.9.8-win64-setup.exe](https://github.com/gadget114514/Hancho/releases/download/v0.9.8/Hancho-v0.9.8-win64-setup.exe)
+  (portable: [Hancho-v0.9.8-win64.zip](https://github.com/gadget114514/Hancho/releases/download/v0.9.8/Hancho-v0.9.8-win64.zip), all versions: [Releases](https://github.com/gadget114514/Hancho/releases))
 - In your llm, "find hancho in PATH, then read help to use it" 
 - In your llm, "create task and use (opencode|claude|agy|codex) to execute the task via hancho" 
 - That's all
@@ -66,6 +66,18 @@ The response carries `finished`, `success`, `state`, `exit_code`, `result`, `res
 - If `wait_ms` runs out, the response has `finished: false` and the worker's current activity, and the worker keeps running. Continue with `wait_worker` and the returned `id`.
 - Your harness does not see this as a native sub-agent. To have it shown as one, define a thin custom agent (Claude Code: `.claude/agents/<name>.md`, cheap model, this tool only) that calls `run_worker` and returns the result. The wrapper costs extra tokens; calling `run_worker` directly is cheapest.
 - For several steps with an order, dependencies or retries, use the [task queue](doc/taskqueue.md) instead.
+
+## Suspend the PC after a specific task finishes
+
+After an overnight build or a long agent run, Hancho can put the PC to sleep automatically. It waits until the target job has finished **and every other job and Hancho-managed process is idle**, then starts a grace period.
+
+```powershell
+hancho-cli.exe power suspend --after-job final-build --delay-sec 30
+hancho-cli.exe power status    # other work still running, seconds left
+hancho-cli.exe power cancel    # disarm
+```
+
+You can also set `"suspendWhenDone": true, "suspendDelaySec": 30` when registering the job. The MCP tools `power_suspend` / `power_cancel` / `power_status` expose the same feature. Use `--hibernate` for hibernation and `--dry-run` to verify without sleeping.
 
 ## Behavior trees: the next-step decisions run inside Hancho
 
@@ -136,6 +148,13 @@ All Hancho data is plain JSON / JSONL (task queues, behavior trees, stream event
 ---
 
 ## Release Notes
+
+### v0.9.8
+- **Suspend after a task**: arm a job with `suspendWhenDone` / `suspendDelaySec` / `suspendHibernate`, or run `hancho-cli power suspend --after-job <id>`. The PC sleeps or hibernates after that job and every other task-queue job / Hancho-managed process is idle; new work cancels and restarts the countdown. `power status` / `power cancel`, MCP `power_suspend` / `power_cancel` / `power_status`, and `--dry-run` are included. Local host only.
+- **Behavior-tree remaining time and provisional tasks**: the dashboard shows idle job/worker leaves of a running BT as `planned` rows and adds their estimates to the task remaining time. Rows are re-derived from the current tree, so retry / fallback / `if` branch changes and completion remove stale rows automatically. `bt_get` / `bt_list` expose `pendingEstimateSec` and `plannedTasks`; `taskqueue_list` accepts `include_planned`.
+- **Dashboard**: `Hancho.exe gui` starts a missing headless core automatically instead of asking (`--no-prompt` keeps the fail-instead behavior). The supervisor hint window button is labeled "Resolve".
+- **List search and Gantt**: the process and task list captions have a search button with an inline case-insensitive filter. The task Gantt lays out provisional BT rows as a forecast chain in BT order and repaints as soon as the task/BT state changes.
+- **Docs**: power/suspend, planned BT tasks and the `planned` queue state.
 
 ### v0.9.7
 - **Audit feedback fixes**: `timing_feedback` now measures only the last successful attempt (a fast-failing attempt no longer reports `diverged_under`), ignores runs under 5 seconds for `diverged_under`, and reads its thresholds from `config.json` (`audit_timing_divergence_threshold`, default 2.0; `audit_timing_under_threshold`, default 0.33).

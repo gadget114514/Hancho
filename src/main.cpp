@@ -7,6 +7,7 @@
 #include "gui_dashboard.h"
 #include "cli.h"
 #include "ipc_client.h"
+#include "power.h"
 #include "platform/platform.h"
 #include <shellapi.h>
 #include <cstdlib>
@@ -22,11 +23,13 @@ static void PrintUsage() {
 "Hancho " PC_VERSION R"( - Native Win32 Multi-LLM Process & ConPTY Manager + Live GUI Dashboard
 
 USAGE:
-  Hancho.exe [gui] [--data-dir <path>] [--auto-start-core] [--no-prompt]
+  Hancho.exe [gui] [--data-dir <path>] [--no-prompt]
       Launch the Win32 Dashboard GUI as an independent IPC client.
       Connects to the running core over Named Pipe. If the core is not running,
-      prompts to start it in headless mode. Closing the GUI leaves jobs
-      running; reopening the GUI reconnects and restores all state.
+      starts it in headless mode automatically (no confirmation prompt).
+      --no-prompt fails instead of starting the core (for scripts).
+      Closing the GUI leaves jobs running; reopening the GUI reconnects and
+      restores all state.
 
   Hancho.exe --headless [--data-dir <path>]
       Run the core (process manager, task queue, behavior trees) and the Named
@@ -362,6 +365,16 @@ static int RunCoreHost(platform::IInstanceLock* instanceLock, bool showGuiAtStar
         tqm.OnProcessFinished(pid, ec, kind);
     });
     BtManager btm(pm, tqm);
+    tqm.SetSuspendCallback([](const std::string& jobId, const std::string& state,
+                              bool hibernate) {
+        (void)jobId;
+        (void)state;
+        SleepMs(500);
+        std::string err;
+        if (!pc::SuspendSystem(hibernate, err)) {
+            WriteAuditLog("POWER_FAILED", err);
+        }
+    });
 
     WNDCLASSEXW wc = {};
     wc.cbSize = sizeof(wc);
@@ -394,6 +407,9 @@ static int RunCoreHost(platform::IInstanceLock* instanceLock, bool showGuiAtStar
     ipc.SetShutdownCallback([hwnd] {
         PostMessageW(hwnd, WM_PC_HOST_QUIT, 0, 0);
     });
+    ipc.SetPowerCallback([](bool hibernate, std::string& outError) {
+        return pc::SuspendSystem(hibernate, outError);
+    });
 
     ipc.Start();
     if (showGuiAtStart) CoreHostShowGui(&ctx);
@@ -414,8 +430,10 @@ static int RunCoreHost(platform::IInstanceLock* instanceLock, bool showGuiAtStar
 
     ipc.SetGuiShowCallback(nullptr);
     ipc.SetShutdownCallback(nullptr);
+    ipc.SetPowerCallback(nullptr);
     ipc.Stop();
     pm.SetProcessFinishedCallback(nullptr);
+    tqm.SetSuspendCallback(nullptr);
     btm.Shutdown();
     tqm.ShutdownTaskQueueManager();
 
@@ -457,29 +475,10 @@ static const wchar_t* TrMain(const wchar_t* ja, const wchar_t* en) {
     return en;
 }
 
-static bool PromptAndStartCore(bool autoStart = false, bool noPrompt = false) {
-    if (noPrompt) {
-        std::cerr << "Hancho core is not running. Please start it with: Hancho.exe --headless" << std::endl;
-        return false;
-    }
-
-    if (!autoStart) {
-        const wchar_t* promptMsg = TrMain(
-            L"Hancho コアが起動していません。\n今すぐバックグラウンド（headless モード）でコアを起動しますか？",
-            L"Hancho core is not running.\nWould you like to start the core in headless mode now?"
-        );
-        const wchar_t* title = TrMain(
-            L"Hancho コアの起動確認",
-            L"Hancho Core Not Running"
-        );
-
-        int choice = MessageBoxW(nullptr, promptMsg, title, MB_YESNO | MB_ICONQUESTION);
-        if (choice != IDYES) {
-            std::cerr << "Hancho core is not running. Please start it with: Hancho.exe --headless" << std::endl;
-            return false;
-        }
-    }
-
+// Starts the background core without asking. The dashboard cannot work without a core, so the
+// old yes/no prompt only added a click to every launch. --no-prompt keeps the script-friendly
+// "fail instead of launching" behavior.
+static bool StartCoreHeadless() {
     wchar_t exePath[MAX_PATH] = {};
     GetModuleFileNameW(nullptr, exePath, MAX_PATH);
 
@@ -574,13 +573,13 @@ int main() {
 
     // Like hancho-cli, --json may come before or after the command.
     bool jsonOutput = false;
-    bool autoStartCore = false;
     bool noPrompt = false;
     std::string firstCmd;
     for (size_t i = 1; i < args.size(); ++i) {
         if (args[i] == "--json" || args[i] == "-j") jsonOutput = true;
-        else if (args[i] == "--auto-start-core" || args[i] == "--start-core") autoStartCore = true;
         else if (args[i] == "--no-prompt" || args[i] == "--no-start-core") noPrompt = true;
+        // Starting is now the default; keep the old flag accepted so existing shortcuts still work.
+        else if (args[i] == "--auto-start-core" || args[i] == "--start-core") {}
         else if (args[i] == "--webui-port" && i + 1 < args.size()) {
             _putenv_s("HANCHO_WEBUI_PORT", args[++i].c_str());
         } else if (args[i].rfind("--webui-port=", 0) == 0) {
@@ -653,9 +652,13 @@ int main() {
         std::string pingResp, pingErr;
         bool coreRunning = SendIpcRequest("{\"action\":\"ping\"}", pingResp, pingErr, false);
 
-        // 3. If not running, prompt user to start the core in headless mode.
+        // 3. If not running, start the core in headless mode automatically.
         if (!coreRunning) {
-            if (!PromptAndStartCore(autoStartCore, noPrompt)) {
+            if (noPrompt) {
+                std::cerr << "Hancho core is not running. Please start it with: Hancho.exe --headless" << std::endl;
+                return 1;
+            }
+            if (!StartCoreHeadless()) {
                 return 1;
             }
         }

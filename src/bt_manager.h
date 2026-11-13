@@ -17,6 +17,11 @@
 
 namespace pc {
 
+struct BtRemainingInfo {
+    int64_t pendingSec = 0;
+    std::vector<BtPlannedTask> planned;  // provisional rows, derived from the current tree state
+};
+
 class BtManager : public IBtJobRunner, public IBtEngineCatalog {
 public:
     BtManager(ProcessManager& pm, TaskQueueManager& tqm);
@@ -38,6 +43,10 @@ public:
     std::string StartJob(const BtJobSpec& spec) override;
     std::string StartWorker(const BtWorkerSpec& spec) override;
     void CancelJob(const std::string& jobId) override;
+
+    // Estimated work left in active BTs plus every idle job/worker leaf. Recomputed from the
+    // tree state on each call, so rows for branches that will not run are simply absent.
+    BtRemainingInfo GetRemainingInfo() const;
 
     // JSON API (stage 2 & stage 3)
     std::string Validate(const std::string& json);

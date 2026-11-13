@@ -1,5 +1,5 @@
 cmake_minimum_required(VERSION 3.20)
-project(Hancho VERSION 0.9.7 LANGUAGES CXX)
+project(Hancho VERSION 0.9.8 LANGUAGES CXX)
 
 set(CMAKE_CXX_STANDARD 20)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
@@ -23,6 +23,7 @@ if(WIN32)
 add_executable(Hancho
     src/main.cpp
     src/common.cpp
+    src/power.cpp
     src/platform/platform_windows.cpp
     src/process_manager.cpp
     src/taskqueue.cpp
@@ -104,6 +105,7 @@ target_link_libraries(Hancho PRIVATE
     windowscodecs
     crypt32
     ws2_32
+    powrprof
     "${CMAKE_CURRENT_SOURCE_DIR}/lib/libsixel.lib"
 )
 
@@ -135,6 +137,7 @@ add_executable(hancho-cli
     src/llm_stream_codex.cpp
     src/event_schema.cpp
     src/common.cpp
+    src/power.cpp
     src/hancho-cli.rc
     src/agent_template.rc
 )
@@ -162,6 +165,7 @@ target_link_libraries(hancho-cli PRIVATE
     advapi32
     crypt32
     ws2_32
+    powrprof
 )
 
 # Headless smoke test for the task queue engine (deps, retries, chain guard, persistence).
@@ -844,6 +848,7 @@ else()
 
     set(HANCHO_CORE_SOURCES
         src/common_posix.cpp
+        src/power.cpp
         src/platform/platform_posix.cpp
         src/process_manager_posix.cpp
         src/taskqueue.cpp
@@ -904,6 +909,7 @@ else()
         src/llm_stream_codex.cpp
         src/event_schema.cpp
         src/common_posix.cpp
+        src/power.cpp
         src/platform/platform_posix.cpp
     )
     target_compile_definitions(hancho-cli PRIVATE ${PC_VERSION_DEFINITIONS})

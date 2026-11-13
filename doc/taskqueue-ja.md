@@ -37,6 +37,7 @@ hancho-cli.exe taskqueue wait main --since 0 --timeout-ms 30000
 | `defer` | `{ "exitCodes": [75], "delaySec": 60, "limit": 60 }`（既定値）。`exitCodes` のどれかで終わった試行は「何も実行していない、後で再試行」の意味（75 = EX_TEMPFAIL。例: 重なるカードを `ww-run` が拒否した）。試行は `deferred` として記録され、ジョブは pending に戻って `delaySec` 後に再び起動します。`maxAttempts` は消費しません。`limit` 回（`0` = 無制限）を超えるとその終了コードは通常の失敗になります。`{ "exitCodes": [] }` で無効。graph に `retry_in_sec` が出ます。 |
 | `success` | `exitCode`（既定 0）AND `filesNewer`（存在し、試行開始より新しい）AND `outputRegex`（ログ末尾 200 行）AND `testReport`（JUnit / NUnit の XML のパス。試行開始より新しく、テストが 1 件以上あり、失敗が 0 件。失敗したテスト名の先頭数件を失敗の詳細に入れる）。 |
 | `cwd`, `env`, `killExclude`, `priority` | 作業ディレクトリ、追加環境変数、ツリー kill 除外イメージ名、優先度。 |
+| `suspendWhenDone`, `suspendDelaySec`, `suspendHibernate` | `true` にすると、このジョブが終了（`succeeded` / `failed` / `cancelled` / `blocked`）し、他の全ジョブと Hancho 管理プロセスがアイドルになった後に PC をサスペンドする。`suspendDelaySec` は最後の作業が終わってからの猶予（0 = 既定 10 秒）。`suspendHibernate` は休止。`hancho-cli power suspend --after-job <id>` / MCP `power_suspend` で後から付けられる。`power status` / `power cancel` で確認・解除。 |
 | `resources` | `{ "write": [...], "read": [...] }`。パス/glob（`cwd` 基準。ファイル名だけの `Foo.cs` は `**/Foo.cs`）または `@name` ロック。集合が重なる（write/write、write/read）ジョブはキューをまたいでも同時に実行しない。read 同士は並列可。デフォルトはオン（設定画面のチェックボックス）。[resource-locks-ja.md](resource-locks-ja.md) を参照。 |
 | `instructionsFile` / `instructionsText` | 任意の指示書。ジョブに複製され、版ごとに実体化される。 |
 | `memory` | `{ "inject": true, "budgetChars": 1500, "scopes": ["job","file","project"] }` — 起動時に `memory_brief` を指示書へ注入する。既定はオフ。`{memory}` の位置に展開し、プレースホルダがなければ末尾に足す。ファイルスコープは `resources` と前回の `filesEdited` から決める。注入した id は試行の `memory_refs` に残る。`includeAgentNotes: false` でエージェントが書いた L2 ノートを除ける。 |
@@ -63,6 +64,7 @@ hancho-cli.exe taskqueue wait main --since 0 --timeout-ms 30000
 | `pending` | まだ実行キューに入っていない（依存が未達）。 |
 | `blocked` | success 依存が失敗/キャンセル。依存を直して `taskqueue_retry` すると blocked の後続も自動で戻る。 |
 | `running` | 試行（1 つの managed process）が実行中。 |
+| `planned` | 実行中のビヘイビアツリーが後で起動する job/worker 葉の仮行。実際にはキューに保存されていない。`taskqueue_list` は `include_planned: true` のときだけ返し（ダッシュボードは指定する）、ツリーが別の枝に進むか終了すると消える。 |
 | `succeeded` / `failed` / `cancelled` | 終了状態。failed は `maxAttempts` まで自動再実行。 |
 
 **失敗の診断と `failure-rules.json`**

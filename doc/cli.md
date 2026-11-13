@@ -145,6 +145,23 @@ hancho-cli.exe taskqueue retry --failed
 hancho-cli.exe taskqueue retry --failed main --since 6h
 ```
 
+**Suspend after a specific task and all other work (sleep the PC):**
+
+```powershell
+# After this job, and after every other job / managed process is idle, sleep in 30s
+hancho-cli.exe power suspend --after-job final-build --delay-sec 30
+
+# Or arm the job at registration time
+# {"id":"final-build","command":"...","summary":"...","timeoutSec":600,
+#  "suspendWhenDone":true,"suspendDelaySec":30}
+
+hancho-cli.exe power status   # other jobs/processes still running, seconds left
+hancho-cli.exe power cancel   # disarm
+hancho-cli.exe power suspend --dry-run   # verify without sleeping
+```
+
+The job may end as `succeeded`, `failed`, `cancelled` or `blocked`. The core then waits until no other task queue job (`running` / `waiting` / `pending`) and no Hancho-managed process is running. If new work starts during the countdown, the countdown is cancelled and restarted when the machine is idle again. Use `--hibernate` for hibernation and `--dry-run` to verify. When several jobs are armed, all of them must finish. `power_*` actions are local-host only.
+
 **Memory (previous runs, notes and project knowledge):**
 
 ```powershell

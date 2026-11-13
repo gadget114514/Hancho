@@ -168,7 +168,7 @@ int main() {
                             {"type", "job"},
                             {"id", "job_a"},
                             {"summary", "First job"},
-                            {"command", "cmd /c exit 0"},
+                            {"command", "cmd /c ping -n 3 127.0.0.1 >nul"},
                             {"timeoutSec", 30}
                         },
                         {
@@ -186,6 +186,26 @@ int main() {
             Check(rStart.value("ok", false) && rStart.value("id", "") == "ipc-two-jobs" &&
                       !rStart.contains("tree") && rStart.contains("compact") && rStart.contains("version"),
                   "bt_start registers and starts ipc-two-jobs");
+
+            // While job_a runs, job_b is an idle BT leaf: it must appear as a provisional row
+            // and its estimate must count toward the remaining time.
+            json rPlanned = h.Call({{"action", "taskqueue_list"}, {"include_planned", true}});
+            bool foundPlanned = false, plannedIsVirtual = false;
+            if (rPlanned["jobs"].is_array()) {
+                for (const auto& job : rPlanned["jobs"]) {
+                    if (job.value("id", "") == "btplan:ipc-two-jobs:job_b") {
+                        foundPlanned = true;
+                        plannedIsVirtual = job.value("virtual", false) && job.value("state", "") == "planned";
+                    }
+                }
+            }
+            Check(foundPlanned, "taskqueue_list include_planned shows the idle BT job");
+            Check(plannedIsVirtual, "planned BT row is marked virtual/planned");
+
+            json rPlanCounts = h.Call({{"action", "taskqueue_counts"}});
+            Check(rPlanCounts.value("bt_planned", 0) >= 1, "taskqueue_counts includes planned BT rows");
+            Check(rPlanCounts.value("sum_remaining_sec", -1) >= 30,
+                  "taskqueue_counts adds BT estimates to the remaining time");
 
             json rWait = h.Call({{"action", "bt_wait"}, {"id", "ipc-two-jobs"}, {"sinceVersion", 0}, {"timeoutMs", 15000}});
             Check(rWait.value("ok", false) && rWait.value("state", "") == "succeeded",
@@ -213,6 +233,10 @@ int main() {
                 }
             }
             Check(foundInList, "bt_list includes ipc-two-jobs with state=succeeded");
+
+            json rDoneCounts = h.Call({{"action", "taskqueue_counts"}});
+            Check(rDoneCounts.value("bt_planned", -1) == 0,
+                  "planned BT rows disappear when the tree finishes");
         }
 
         // 3. escalate answered with bt_resume (and missing rationale rejected)

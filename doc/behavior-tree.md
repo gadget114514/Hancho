@@ -407,6 +407,7 @@ When execution reaches an `escalate` node:
 - **`bt_get` with `compact: true`**:
   - Returns `"compact"`: a one-line-per-node indented tree showing `[state] type id "summary"  job <jobId>  - <detail>`.
   - Omits `"tree"`. Call `bt_get` without `compact` for the full state document (definitions, statuses, and variables in full).
+- **Remaining time and provisional tasks**: `bt_get` reports `pendingEstimateSec` (the estimated work in job/worker leaves on the current branch that have not started yet) and `plannedTasks` (their node keys, queues and estimates). The dashboard lists the same leaves as provisional queue rows (`state: "planned"`, `id: btplan:<btId>:<node>`). They are re-derived from the tree state on every query, so when a retry, fallback, `if` branch or cancel moves the tree on, rows that will not run disappear automatically.
 - **Files on disk**:
   - State file: `<dataDir>/behaviortrees/<id>.json`
   - Event log: `<dataDir>/bt-<id>.events.jsonl` (events: `btStarted`, `nodeStarted`, `nodeFinished`, `varSet`, `escalated`, `btSucceeded`, `btFailed`, `btCancelled`)

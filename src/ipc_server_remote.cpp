@@ -502,6 +502,10 @@ void IpcServer::StartRemoteListener() {
         if (action == "subscribe") {
             return HandleRemoteSubscribe(pm_, requestJson);
         }
+        if (action.rfind("power_", 0) == 0) {
+            return std::string("{\"ok\":false,\"error\":\"power actions are only available ")
+                   + "on the local host\"}";
+        }
         std::string resp = HandleRequestJson(requestJson);
         if (action == "start") {
             nlohmann::json r = nlohmann::json::parse(resp, nullptr, false);

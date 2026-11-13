@@ -221,6 +221,7 @@ json BuildTreeResponseJson(const BehaviorTree& tree, TreeView view) {
     out["version"] = tree.Version();
     out["nodeRuns"] = tree.NodeRuns();
     out["taskqueue"] = tree.TaskQueueName();
+    out["pendingEstimateSec"] = tree.PendingEstimateSec();
     out["compact"] = FormatCompactTreeText(stateDoc);
 
     if (tree.State() == "waitingForLlm") {
@@ -259,6 +260,18 @@ json BuildTreeResponseJson(const BehaviorTree& tree, TreeView view) {
         }
         out["tree"] = std::move(stateDoc);
     }
+
+    json planned = json::array();
+    for (const auto& task : tree.PlannedTasks()) {
+        json item;
+        item["node"] = task.nodeKey;
+        item["type"] = task.type;
+        item["summary"] = task.summary;
+        item["taskqueue"] = task.queueName;
+        item["estimateSec"] = task.estimateSec;
+        planned.push_back(std::move(item));
+    }
+    out["plannedTasks"] = std::move(planned);
     return out;
 }
 
@@ -343,6 +356,7 @@ std::string BtManager::List() {
         item["version"] = t.Version();
         item["nodeRuns"] = t.NodeRuns();
         item["taskqueue"] = t.TaskQueueName();
+        item["pendingEstimateSec"] = t.PendingEstimateSec();
         item["createdAt"] = t.CreatedAt();
         item["updatedAt"] = t.UpdatedAt();
         arr.push_back(std::move(item));

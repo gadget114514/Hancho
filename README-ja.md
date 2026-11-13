@@ -22,8 +22,8 @@
 
 ## Express
 
-- [Hancho-v0.9.7-win64-setup.exe](https://github.com/gadget114514/Hancho/releases/download/v0.9.7/Hancho-v0.9.7-win64-setup.exe) をダウンロードしてインストール
-  （ポータブル版: [Hancho-v0.9.7-win64.zip](https://github.com/gadget114514/Hancho/releases/download/v0.9.7/Hancho-v0.9.7-win64.zip)、全バージョン: [Releases](https://github.com/gadget114514/Hancho/releases)）
+- [Hancho-v0.9.8-win64-setup.exe](https://github.com/gadget114514/Hancho/releases/download/v0.9.8/Hancho-v0.9.8-win64-setup.exe) をダウンロードしてインストール
+  （ポータブル版: [Hancho-v0.9.8-win64.zip](https://github.com/gadget114514/Hancho/releases/download/v0.9.8/Hancho-v0.9.8-win64.zip)、全バージョン: [Releases](https://github.com/gadget114514/Hancho/releases)）
 - LLM に「PATH から hancho を探して、help を読んで使い方を把握して」と伝える
 - LLM に「タスクを作成して、hancho 経由で (opencode|claude|agy|codex) に実行させて」と伝える
 - 以上
@@ -64,6 +64,20 @@ MCP ツール `run_worker` は、1つのタスクをワーカーの LLM CLI に�
 - `wait_ms` が切れると、応答は `finished: false` とワーカーの現在の動作を返し、ワーカーは動き続けます。続きは、返された `id` を `wait_worker` に渡して待ちます。
 - ハーネスからはネイティブのサブエージェントには見えません。そう見せたいときは、`run_worker` を呼んで結果を返すだけの薄いカスタムエージェント（Claude Code なら `.claude/agents/<name>.md`、安価なモデル、このツールのみ）を定義します。その分のトークンがかかるため、`run_worker` を直接呼ぶのが最も安上がりです。
 - 順序・依存・リトライのある複数ステップには、[タスクキュー](doc/taskqueue-ja.md)を使ってください。
+
+---
+
+## 指定タスクの終了後に PC をサスペンドする
+
+夜間のビルドや長時間のエージェント実行が終わったあと、PC を自動でスリープさせられます。対象ジョブが終了し、**他の全ジョブと Hancho 管理プロセスもアイドル**になってから猶予時間の後にサスペンドします。
+
+```powershell
+hancho-cli.exe power suspend --after-job final-build --delay-sec 30
+hancho-cli.exe power status    # 他の実行数と残り秒数
+hancho-cli.exe power cancel    # 解除
+```
+
+ジョブ登録時に `"suspendWhenDone": true, "suspendDelaySec": 30` を付けることもできます。MCP の `power_suspend` / `power_cancel` / `power_status` も同じ機能を提供します。`--hibernate` で休止、`--dry-run` で実行前確認ができます。
 
 ---
 
@@ -140,6 +154,13 @@ Hancho のデータはすべて JSON / JSONL（タスクキュー、ビヘイビ
 （以下の help 本文は英語です）
 
 ## リリースノート
+
+### v0.9.8
+- **指定タスク終了後の PC サスペンド**: ジョブに `suspendWhenDone` / `suspendDelaySec` / `suspendHibernate` を付けるか、`hancho-cli power suspend --after-job <id>` で予約できます。対象ジョブと他の全タスクキュー・Hancho 管理プロセスがアイドルになった後、PC をスリープ（または休止）します。新しい作業が始まるとカウントダウンは取り消され、再びアイドルになってから再開します。`power status` / `power cancel`、MCP `power_suspend` / `power_cancel` / `power_status`、`--dry-run` に対応。ローカルホスト専用です。
+- **ビヘイビアツリーの残り時間と仮タスク**: 実行中の BT が後で起動する job/worker 葉を `planned` 行としてダッシュボードに表示し、その見積もりをタスクの残り時間に加算します。行は現在のツリーから毎回作り直すため、retry / fallback / `if` の分岐変更や完了時に不要な行は自動で消えます。`bt_get` / `bt_list` は `pendingEstimateSec` と `plannedTasks` を返し、`taskqueue_list` は `include_planned` を受け付けます。
+- **ダッシュボード**: `Hancho.exe gui` はコア未起動時に確認せず headless コアを自動起動します（`--no-prompt` は従来どおり起動せずエラー）。Supervisor ヒントウインドウのボタン文言を「解決させる」に変更。
+- **一覧の検索とガント**: プロセス一覧・タスク一覧のラベル右側に検索ボタンを追加し、インラインで大文字小文字を区別せず絞り込めます。タスク・ガントは BT の仮行を実行順の予測チェーンとして表示し、タスク／BT の状態変化で即座に再描画します。
+- **ドキュメント**: サスペンド、BT の仮タスク、`planned` 状態を追記。
 
 ### v0.9.7
 - **Audit フィードバックの修正**: `timing_feedback` は最後に成功した試行だけを計測するようになりました（すぐ失敗した試行で `diverged_under` と判定されなくなりました）。5 秒未満の実行は `diverged_under` にしません。閾値は `config.json` の `audit_timing_divergence_threshold`（既定 2.0）と `audit_timing_under_threshold`（既定 0.33）から読みます。

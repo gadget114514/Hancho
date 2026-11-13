@@ -41,6 +41,7 @@ struct TaskQueueCounts {
     int running = 0;
     int waiting = 0;   // Ready to run (state == "pending", dependencies satisfied)
     int pending = 0;   // Waiting for dependencies (state == "pending", dependencies not satisfied)
+    int neverRunnablePending = 0; // Pending, but a dependency can never be satisfied
     int blocked = 0;
     int succeeded = 0;
     int failed = 0;
@@ -544,6 +545,11 @@ struct TaskQueueJob {
     std::vector<std::string> killExclude;
     TaskQueueResources resources;
     int priority = 0;
+    // Armed by `hancho-cli power suspend --after-job <id>` or a job's suspendWhenDone.
+    // The core suspends after this job finishes and all other work becomes idle.
+    bool suspendWhenDone = false;
+    int suspendDelaySec = 0;       // 0 = default grace period
+    bool suspendHibernate = false; // false = sleep
     std::string state;
     std::vector<TaskQueueAttempt> attempts;
     std::string blockedBy;
@@ -755,10 +761,14 @@ public:
     using ProcessFinishedCallback = std::function<void(int processId, int exitCode, const std::string& endKind)>;
     using JobFinishedCallback = std::function<void(const TaskQueueJob& snapshot, const std::string& finalState)>;
     using BtRetryCallback = std::function<bool(const TaskQueueBtRef& ref, bool resetCounters, std::string& outError)>;
+    // Invoked on the scheduler thread when a flagged job and all other work are idle.
+    using SuspendCallback = std::function<void(const std::string& jobId, const std::string& state,
+                                               bool hibernate)>;
 
     void SetProcessFinishedCallback(ProcessFinishedCallback cb);
     void SetJobFinishedCallback(JobFinishedCallback cb);
     void SetBtRetryCallback(BtRetryCallback cb);
+    void SetSuspendCallback(SuspendCallback cb);
     void SetProcessManager(ProcessManager* pm);
     // Installed by IpcServer. Passing empty callbacks makes remote jobs fail to launch.
     void SetRemoteCallbacks(RemoteStartCallback start, RemotePollCallback poll,
@@ -819,6 +829,13 @@ public:
 
     TaskQueueCounts GetJobCounts() const;
 
+    // Suspend-after-job support (hancho-cli power suspend / MCP power_suspend).
+    // Arming a terminal job starts the countdown as soon as all other work is idle.
+    std::string SetJobSuspendWhenDone(const std::string& id, bool hibernate, int delaySec,
+                                      std::string& outError);
+    std::string ClearSuspendWhenDone(std::string& outError);
+    std::string SuspendStatusJson() const;
+
     // Plain runs outside a taskqueue (doc/design-v3.md §7, card 072-1).
     static std::string IssuePlainJobId(int processId = 0, const std::string& name = "") {
         return pc::IssuePlainJobId(processId, name);
@@ -861,6 +878,8 @@ private:
     void SchedulerLoop();
     void ProcessSchedulerTick();
     void FlushFinishedCallbacks();
+    void CheckSuspendWhenDone();
+    bool HasActiveOtherWork();
 
     TaskQueueJob* FindJob(const std::string& id, TaskQueue** outQueue);
     const TaskQueueJob* FindJobConst(const std::string& id) const;
@@ -911,6 +930,12 @@ private:
     int jobFinishedCbInFlight_ = 0;
     std::condition_variable jobFinishedCbIdleCv_;
     BtRetryCallback btRetryCb_;
+    SuspendCallback suspendCb_;
+    // Suspend monitor state, guarded by mutex_.
+    std::string suspendPhase_; // empty/idle, waiting_target, waiting_others, countdown
+    int64_t suspendDueMs_ = 0;
+    int suspendDelaySec_ = 0;
+    bool suspendHibernate_ = false;
     std::vector<std::pair<TaskQueueJob, std::string>> pendingFinished_;
     mutable std::mutex mutex_;
     std::condition_variable cv_;

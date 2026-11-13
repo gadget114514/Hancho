@@ -58,6 +58,14 @@ You can also run the server directly with `Hancho.exe mcp`. It connects to the d
 | `taskqueue_link` / `taskqueue_unlink` | Add/remove one dependency (`job`, `dependsOn`, `on` = `success`\|`done`). |
 | `taskqueue_graph` | Dependency graph with `ready` / `waiting_for` / `dependents`. |
 
+**Power tools**
+
+| Tool | Description |
+| :--- | :--- |
+| `power_suspend` | Suspend the PC. With `jobId`, wait until that job finishes and every other job / managed process is idle, then suspend. Without it, suspend after `delaySec` (default 3). `hibernate` selects hibernation; `dryRun` only reports. Local host only. |
+| `power_cancel` | Clear every armed `suspendWhenDone` and cancel the countdown. |
+| `power_status` | Return armed jobs, the phase (`waiting_target` / `waiting_others` / `countdown`), other running jobs/processes, and seconds until suspend. |
+
 **Memory tools**
 
 | Tool | Description |

@@ -310,6 +310,21 @@ std::string BtManager::StartWorker(const BtWorkerSpec& spec) {
     return jobId;
 }
 
+BtRemainingInfo BtManager::GetRemainingInfo() const {
+    BtRemainingInfo out;
+    std::lock_guard<std::mutex> lock(mutex_);
+    for (const auto& [id, entry] : trees_) {
+        (void)id;
+        if (!entry || !entry->tree) continue;
+        const std::string& state = entry->tree->State();
+        if (state != "running" && state != "waitingForLlm" && state != "paused") continue;
+        out.pendingSec += entry->tree->PendingEstimateSec();
+        std::vector<BtPlannedTask> planned = entry->tree->PlannedTasks();
+        out.planned.insert(out.planned.end(), planned.begin(), planned.end());
+    }
+    return out;
+}
+
 void BtManager::CancelJob(const std::string& jobId) {
     ScopedCancelGuard guard;
     std::string err;

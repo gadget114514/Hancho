@@ -500,6 +500,76 @@ int main() {
               "estimateSec reaches the job spec");
     }
 
+    // A sequence's not-yet-started jobs are planned rows; the running job is already in the queue.
+    {
+        std::string planBt = R"JSON({
+            "id": "plan-test",
+            "taskqueue": "main",
+            "root": {
+                "type": "sequence",
+                "children": [
+                    { "type": "job", "id": "a", "summary": "A", "command": "a", "timeoutSec": 600, "estimateSec": 100 },
+                    { "type": "job", "id": "b", "summary": "B", "command": "b", "timeoutSec": 600, "estimateSec": 200 },
+                    { "type": "job", "id": "c", "summary": "C", "command": "c", "timeoutSec": 600, "estimateSec": 300 }
+                ]
+            }
+        })JSON";
+        FakeJobRunner runner;
+        BehaviorTree bt;
+        std::string err;
+        Check(bt.LoadDefinition(planBt, &catalog, err), "load planning BT: " + err);
+        bt.SetJobRunner(&runner);
+        bt.Start(1000);
+
+        std::vector<BtPlannedTask> planned = bt.PlannedTasks();
+        Check(planned.size() == 2 && planned[0].nodeKey == "b" && planned[1].nodeKey == "c",
+              "sequence reports future jobs as planned");
+        Check(!planned.empty() && planned[0].queueName == "main" && planned[0].estimateSec == 200,
+              "planned row carries queue and estimate");
+        Check(bt.PendingEstimateSec() == 500, "pending estimate sums unstarted sequence jobs");
+
+        bt.OnJobFinished("plan-test-1", true, 0, "", "", 1100);
+        planned = bt.PlannedTasks();
+        Check(planned.size() == 1 && planned[0].nodeKey == "c", "finished job leaves the planned list");
+        Check(bt.PendingEstimateSec() == 300, "pending estimate drops the finished job");
+    }
+
+    // A branch change drops provisional rows that the tree will no longer run.
+    {
+        std::string branchBt = R"JSON({
+            "id": "branch-test",
+            "root": {
+                "type": "fallback",
+                "children": [
+                    {
+                        "type": "sequence",
+                        "children": [
+                            { "type": "job", "id": "f1", "summary": "F1", "command": "f1", "timeoutSec": 60, "estimateSec": 10 },
+                            { "type": "job", "id": "f2", "summary": "F2", "command": "f2", "timeoutSec": 60, "estimateSec": 20 }
+                        ]
+                    },
+                    { "type": "job", "id": "alt", "summary": "Alt", "command": "alt", "timeoutSec": 60, "estimateSec": 30 }
+                ]
+            }
+        })JSON";
+        FakeJobRunner runner;
+        BehaviorTree bt;
+        std::string err;
+        Check(bt.LoadDefinition(branchBt, &catalog, err), "load branch-change BT: " + err);
+        bt.SetJobRunner(&runner);
+        bt.Start(1000);
+
+        std::vector<BtPlannedTask> planned = bt.PlannedTasks();
+        Check(planned.size() == 1 && planned[0].nodeKey == "f2",
+              "fallback shows only the active branch's planned job");
+        Check(bt.PendingEstimateSec() == 20, "fallback estimate ignores inactive branches");
+
+        bt.OnJobFinished("branch-test-1", false, 1, "", "", 1100);
+        planned = bt.PlannedTasks();
+        Check(planned.empty(), "failed branch's provisional job is gone after the tree moves on");
+        Check(bt.PendingEstimateSec() == 0, "pending estimate follows the new branch");
+    }
+
     RunPart2Tests(tempDirUtf8, tempDirW);
 
     RemoveTempDirRecursive(tempDirW);

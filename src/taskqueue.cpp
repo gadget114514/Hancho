@@ -317,7 +317,10 @@ static std::string NormalizeJobJsonKeys(const std::string& in) {
         {"testReport", "test_report"},
         {"budgetChars", "budget_chars"},
         {"includeAgentNotes", "include_agent_notes"},
-        {"waitForRateLimit", "wait_for_rate_limit"}
+        {"waitForRateLimit", "wait_for_rate_limit"},
+        {"suspendWhenDone", "suspend_when_done"},
+        {"suspendDelaySec", "suspend_delay_sec"},
+        {"suspendHibernate", "suspend_hibernate"}
     };
     std::string out = in;
     for (const auto& pair : kPairs) {
@@ -1860,6 +1863,11 @@ static TaskQueueJob ParseJob(const std::string& j) {
     job.resources = ParseResources(JsonFieldObj(j, "resources"));
     job.memory = ParseMemory(JsonFieldObj(j, "memory", ""));
     job.priority = static_cast<int>(JsonFieldInt(j, "priority", 0));
+    job.suspendWhenDone = JsonFieldBool(j, "suspend_when_done", false);
+    job.suspendDelaySec = static_cast<int>(JsonFieldInt(j, "suspend_delay_sec", 0));
+    if (job.suspendDelaySec < 0) job.suspendDelaySec = 0;
+    if (job.suspendDelaySec > 86400) job.suspendDelaySec = 86400;
+    job.suspendHibernate = JsonFieldBool(j, "suspend_hibernate", false);
     job.state = JsonFieldStr(j, "state", "pending");
     for (const auto& attJson : JsonFieldObjArray(j, "attempts")) {
         job.attempts.push_back(ParseAttempt(attJson));
@@ -2029,6 +2037,11 @@ void TaskQueueManager::SetBtRetryCallback(BtRetryCallback cb) {
     btRetryCb_ = std::move(cb);
 }
 
+void TaskQueueManager::SetSuspendCallback(SuspendCallback cb) {
+    std::lock_guard<std::mutex> lock(mutex_);
+    suspendCb_ = std::move(cb);
+}
+
 void TaskQueueManager::SetRemoteCallbacks(RemoteStartCallback start, RemotePollCallback poll,
                                           RemoteKillCallback kill) {
     RemotePollCallback pollCopy;
@@ -2165,6 +2178,7 @@ TaskQueueCounts TaskQueueManager::GetJobCounts() const {
                     counts.waiting++;
                 } else {
                     counts.pending++;
+                    if (isNeverRunnable(job, 0)) counts.neverRunnablePending++;
                 }
                 // Only jobs that can still run count toward the remaining time.
                 const int64_t budget = job.estimateSec > 0 ? job.estimateSec : job.timeoutSec;
@@ -2186,6 +2200,311 @@ TaskQueueCounts TaskQueueManager::GetJobCounts() const {
     }
     if (!anyRemain) counts.sumRemainingSec = -1;
     return counts;
+}
+
+namespace {
+
+constexpr int kDefaultSuspendDelaySec = 10;
+
+bool IsTerminalJobState(const std::string& state) {
+    return state == "succeeded" || state == "failed" || state == "cancelled" ||
+           state == "blocked";
+}
+
+} // namespace
+
+bool TaskQueueManager::HasActiveOtherWork() {
+    TaskQueueCounts counts = GetJobCounts();
+    int activeJobs = counts.running + counts.waiting +
+                     (counts.pending - counts.neverRunnablePending);
+    if (activeJobs > 0) return true;
+    if (!pm_) return false;
+    for (const auto& snap : pm_->GetAllSnapshots()) {
+        if (snap.state == ProcState::Running) return true;
+    }
+    return false;
+}
+
+void TaskQueueManager::CheckSuspendWhenDone() {
+    int delaySec = kDefaultSuspendDelaySec;
+    bool hibernate = false;
+    {
+        std::lock_guard<std::mutex> lock(mutex_);
+        if (!suspendCb_) {
+            suspendPhase_.clear();
+            suspendDueMs_ = 0;
+            return;
+        }
+
+        bool any = false;
+        bool unfinished = false;
+        delaySec = 0;
+        hibernate = false;
+        for (const auto& [name, tq] : queues_) {
+            (void)name;
+            for (const auto& job : tq.jobs) {
+                if (!job.suspendWhenDone) continue;
+                any = true;
+                if (!IsTerminalJobState(job.state)) unfinished = true;
+                int d = job.suspendDelaySec > 0 ? job.suspendDelaySec : kDefaultSuspendDelaySec;
+                if (d > delaySec) delaySec = d;
+                if (job.suspendHibernate) hibernate = true;
+            }
+        }
+        if (!any) {
+            suspendPhase_.clear();
+            suspendDueMs_ = 0;
+            suspendDelaySec_ = 0;
+            suspendHibernate_ = false;
+            return;
+        }
+        suspendDelaySec_ = delaySec;
+        suspendHibernate_ = hibernate;
+        if (unfinished) {
+            if (suspendPhase_ != "waiting_target") {
+                WriteAuditLog("POWER_WAITING", "waiting for the armed job to finish");
+            }
+            suspendPhase_ = "waiting_target";
+            suspendDueMs_ = 0;
+            return;
+        }
+    }
+
+    if (HasActiveOtherWork()) {
+        std::lock_guard<std::mutex> lock(mutex_);
+        if (suspendPhase_ != "waiting_others") {
+            WriteAuditLog("POWER_WAITING", "waiting for other jobs and managed processes");
+        }
+        suspendPhase_ = "waiting_others";
+        suspendDueMs_ = 0;
+        return;
+    }
+
+    bool shouldFire = false;
+    {
+        std::lock_guard<std::mutex> lock(mutex_);
+        // Re-scan after the lock was released: flags may have changed.
+        bool any = false;
+        bool unfinished = false;
+        delaySec = 0;
+        hibernate = false;
+        for (const auto& [name, tq] : queues_) {
+            (void)name;
+            for (const auto& job : tq.jobs) {
+                if (!job.suspendWhenDone) continue;
+                any = true;
+                if (!IsTerminalJobState(job.state)) unfinished = true;
+                int d = job.suspendDelaySec > 0 ? job.suspendDelaySec : kDefaultSuspendDelaySec;
+                if (d > delaySec) delaySec = d;
+                if (job.suspendHibernate) hibernate = true;
+            }
+        }
+        if (!any) {
+            suspendPhase_.clear();
+            suspendDueMs_ = 0;
+            suspendDelaySec_ = 0;
+            suspendHibernate_ = false;
+            return;
+        }
+        if (unfinished) {
+            suspendPhase_ = "waiting_target";
+            suspendDueMs_ = 0;
+            return;
+        }
+        suspendDelaySec_ = delaySec;
+        suspendHibernate_ = hibernate;
+        if (suspendPhase_ != "countdown") {
+            suspendPhase_ = "countdown";
+            suspendDueMs_ = static_cast<int64_t>(GetNowTickMs()) +
+                            static_cast<int64_t>(delaySec) * 1000;
+            WriteAuditLog("POWER_ARMED", "all work idle; suspending in " +
+                                              std::to_string(delaySec) + "s");
+            return;
+        }
+        if (static_cast<int64_t>(GetNowTickMs()) < suspendDueMs_) return;
+        shouldFire = true;
+    }
+
+    if (!shouldFire) return;
+
+    // Final check as close to the suspend as possible.
+    if (HasActiveOtherWork()) {
+        std::lock_guard<std::mutex> lock(mutex_);
+        suspendPhase_ = "waiting_others";
+        suspendDueMs_ = 0;
+        return;
+    }
+
+    std::string fireJob;
+    std::string fireState;
+    bool fireHibernate = false;
+    SuspendCallback cb;
+    {
+        std::lock_guard<std::mutex> lock(mutex_);
+        for (const auto& [name, tq] : queues_) {
+            (void)name;
+            for (const auto& job : tq.jobs) {
+                if (!job.suspendWhenDone) continue;
+                if (!IsTerminalJobState(job.state)) {
+                    suspendPhase_ = "waiting_target";
+                    suspendDueMs_ = 0;
+                    return;
+                }
+            }
+        }
+        for (auto& [name, tq] : queues_) {
+            (void)name;
+            bool changed = false;
+            for (auto& job : tq.jobs) {
+                if (!job.suspendWhenDone) continue;
+                job.suspendWhenDone = false;
+                job.suspendDelaySec = 0;
+                job.suspendHibernate = false;
+                job.updatedAt = GetCurrentTimestampStr();
+                if (fireJob.empty()) {
+                    fireJob = job.id;
+                    fireState = job.state;
+                }
+                changed = true;
+            }
+            if (changed) SaveQueue(tq);
+        }
+        fireHibernate = suspendHibernate_;
+        suspendPhase_.clear();
+        suspendDueMs_ = 0;
+        suspendDelaySec_ = 0;
+        suspendHibernate_ = false;
+        cb = suspendCb_;
+    }
+
+    if (fireJob.empty()) return;
+    WriteAuditLog("POWER_SUSPEND", "job=" + fireJob + " state=" + fireState +
+                                       (fireHibernate ? " hibernate" : " sleep"));
+    if (cb) cb(fireJob, fireState, fireHibernate);
+}
+
+std::string TaskQueueManager::SetJobSuspendWhenDone(const std::string& id, bool hibernate,
+                                                    int delaySec, std::string& outError) {
+    outError.clear();
+    if (delaySec < 0) delaySec = 0;
+    if (delaySec > 86400) delaySec = 86400;
+    std::lock_guard<std::mutex> lock(mutex_);
+    TaskQueue* tq = nullptr;
+    TaskQueueJob* job = FindJob(id, &tq);
+    if (!job) {
+        outError = "job not found: " + id;
+        return BuildError(outError);
+    }
+    job->suspendWhenDone = true;
+    job->suspendDelaySec = delaySec;
+    job->suspendHibernate = hibernate;
+    job->updatedAt = GetCurrentTimestampStr();
+    SaveQueue(*tq);
+    suspendPhase_.clear();
+    suspendDueMs_ = 0;
+    cv_.notify_all();
+    WriteAuditLog("POWER_ARM", "job=" + id + " state=" + job->state + " delay=" +
+                                   std::to_string(delaySec) + (hibernate ? " hibernate" : " sleep"));
+    nlohmann::json out;
+    out["ok"] = true;
+    out["armed"] = true;
+    out["id"] = job->id;
+    out["state"] = job->state;
+    out["terminal"] = IsTerminalJobState(job->state);
+    out["delay_sec"] = delaySec;
+    out["hibernate"] = hibernate;
+    return out.dump();
+}
+
+std::string TaskQueueManager::ClearSuspendWhenDone(std::string& outError) {
+    outError.clear();
+    int cleared = 0;
+    {
+        std::lock_guard<std::mutex> lock(mutex_);
+        for (auto& [name, tq] : queues_) {
+            (void)name;
+            bool changed = false;
+            for (auto& job : tq.jobs) {
+                if (!job.suspendWhenDone) continue;
+                job.suspendWhenDone = false;
+                job.suspendDelaySec = 0;
+                job.suspendHibernate = false;
+                job.updatedAt = GetCurrentTimestampStr();
+                ++cleared;
+                changed = true;
+            }
+            if (changed) SaveQueue(tq);
+        }
+        suspendPhase_.clear();
+        suspendDueMs_ = 0;
+        suspendDelaySec_ = 0;
+        suspendHibernate_ = false;
+    }
+    if (cleared > 0) {
+        WriteAuditLog("POWER_CANCEL", "cleared=" + std::to_string(cleared));
+    }
+    nlohmann::json out;
+    out["ok"] = true;
+    out["cleared"] = cleared;
+    out["armed"] = false;
+    return out.dump();
+}
+
+std::string TaskQueueManager::SuspendStatusJson() const {
+    std::string phase;
+    int64_t dueMs = 0;
+    int delaySec = 0;
+    bool hibernate = false;
+    nlohmann::json jobs = nlohmann::json::array();
+    {
+        std::lock_guard<std::mutex> lock(const_cast<std::mutex&>(mutex_));
+        phase = suspendPhase_;
+        dueMs = suspendDueMs_;
+        delaySec = suspendDelaySec_;
+        hibernate = suspendHibernate_;
+        for (const auto& [name, tq] : queues_) {
+            (void)name;
+            for (const auto& job : tq.jobs) {
+                if (!job.suspendWhenDone) continue;
+                nlohmann::json item;
+                item["id"] = job.id;
+                item["state"] = job.state;
+                item["terminal"] = IsTerminalJobState(job.state);
+                item["delay_sec"] = job.suspendDelaySec;
+                item["hibernate"] = job.suspendHibernate;
+                jobs.push_back(std::move(item));
+            }
+        }
+    }
+
+    TaskQueueCounts counts = GetJobCounts();
+    int activeJobs = counts.running + counts.waiting +
+                     (counts.pending - counts.neverRunnablePending);
+    if (activeJobs < 0) activeJobs = 0;
+    int runningProcesses = 0;
+    if (pm_) {
+        for (const auto& snap : pm_->GetAllSnapshots()) {
+            if (snap.state == ProcState::Running) ++runningProcesses;
+        }
+    }
+
+    nlohmann::json out;
+    out["ok"] = true;
+    out["armed"] = !jobs.empty();
+    out["phase"] = phase.empty() ? "idle" : phase;
+    out["jobs"] = std::move(jobs);
+    out["delay_sec"] = delaySec;
+    out["hibernate"] = hibernate;
+    out["other_jobs"] = activeJobs;
+    out["other_processes"] = runningProcesses;
+    if (phase == "countdown" && dueMs > 0) {
+        int64_t now = static_cast<int64_t>(GetNowTickMs());
+        int64_t remaining = dueMs > now ? dueMs - now : 0;
+        out["seconds_until_suspend"] = (remaining + 999) / 1000;
+    } else {
+        out["seconds_until_suspend"] = 0;
+    }
+    return out.dump();
 }
 
 bool TaskQueueManager::FindUnfinishedJobByCommand(const std::string& command, std::string& outJobId) const {
@@ -2402,6 +2721,9 @@ std::string TaskQueueManager::JobToJson(const TaskQueueJob& job, bool includeIns
         << ",\"resources\":" << ResourcesToJson(job.resources)
         << ",\"memory\":" << MemoryToJson(job.memory)
         << ",\"priority\":" << job.priority
+        << ",\"suspend_when_done\":" << (job.suspendWhenDone ? "true" : "false")
+        << ",\"suspend_delay_sec\":" << job.suspendDelaySec
+        << ",\"suspend_hibernate\":" << (job.suspendHibernate ? "true" : "false")
         << ",\"state\":\"" << JsonEscape(job.state) << "\""
         << ",\"attempts\":" << AttemptsToJson(job.attempts)
         << ",\"blocked_by\":";
@@ -3174,6 +3496,17 @@ static bool ParseNewJob(const std::string& rawJson, const std::string& taskqueue
         return false;
     }
     job.priority = static_cast<int>(JsonFieldInt(j, "priority", 0));
+    job.suspendWhenDone = JsonFieldBool(j, "suspend_when_done", false);
+    job.suspendDelaySec = static_cast<int>(JsonFieldInt(j, "suspend_delay_sec", 0));
+    if (job.suspendDelaySec < 0) {
+        err = "job '" + job.id + "': suspend_delay_sec must not be negative";
+        return false;
+    }
+    if (job.suspendDelaySec > 86400) {
+        err = "job '" + job.id + "': suspend_delay_sec must be 86400 or less";
+        return false;
+    }
+    job.suspendHibernate = JsonFieldBool(j, "suspend_hibernate", false);
     job.env = ParseJsonStringMap(JsonFieldObj(j, "env"));
     {
         size_t aStart = 0;
@@ -3658,6 +3991,7 @@ std::string TaskQueueManager::TaskQueueUpdate(const std::string& id, const std::
     if (onlyNotes) {
         for (const char* k : {"summary","command","cwd","host","timeout_sec","idle","max_attempts",
                               "retry_delay_sec","retry","defer","priority","kill_exclude","resources","memory","env","success",
+                              "suspend_when_done","suspend_delay_sec","suspend_hibernate",
                               "instructions_text","instructions_file","depends_on"}) {
             if (HasJsonKey(patchJson, k)) { onlyNotes = false; break; }
         }
@@ -3763,6 +4097,20 @@ std::string TaskQueueManager::TaskQueueUpdate(const std::string& id, const std::
             return BuildError(outError);
         }
         job->defer = d;
+    }
+    if (HasJsonKey(patchJson, "suspend_when_done")) {
+        job->suspendWhenDone = JsonFieldBool(patchJson, "suspend_when_done", false);
+    }
+    if (HasJsonKey(patchJson, "suspend_delay_sec")) {
+        int d = static_cast<int>(JsonFieldInt(patchJson, "suspend_delay_sec", job->suspendDelaySec));
+        if (d < 0 || d > 86400) {
+            outError = "suspend_delay_sec must be between 0 and 86400";
+            return BuildError(outError);
+        }
+        job->suspendDelaySec = d;
+    }
+    if (HasJsonKey(patchJson, "suspend_hibernate")) {
+        job->suspendHibernate = JsonFieldBool(patchJson, "suspend_hibernate", false);
     }
     if (HasJsonKey(patchJson, "notes")) {
         job->notes = JsonFieldStr(patchJson, "notes", "");
@@ -4974,6 +5322,7 @@ void TaskQueueManager::SchedulerLoop() {
         }
         if (!schedulerRunning_.load()) break;
         ProcessSchedulerTick();
+        CheckSuspendWhenDone();
     }
 }
 
