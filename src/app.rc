@@ -1,3 +1,4 @@
 1 ICON "../images/app.ico"
+2 ICON "../images/chat512x512.ico"
 
 #include "version_info.rc2"

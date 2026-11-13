@@ -790,7 +790,7 @@ void AddTrayIcon(DialogState* st) {
     st->nid.uID = kTrayId;
     st->nid.uFlags = NIF_ICON | NIF_MESSAGE | NIF_TIP;
     st->nid.uCallbackMessage = kTrayMessage;
-    st->nid.hIcon = LoadIconW(st->inst, MAKEINTRESOURCEW(1));
+    st->nid.hIcon = LoadIconW(st->inst, MAKEINTRESOURCEW(2));
     if (!st->nid.hIcon) st->nid.hIcon = LoadIconW(nullptr, IDI_APPLICATION);
     wcsncpy_s(st->nid.szTip, L"Hancho Chat", _TRUNCATE);
     if (Shell_NotifyIconW(NIM_ADD, &st->nid)) st->trayAdded = true;
@@ -2332,7 +2332,7 @@ int RunIpmsgDialog(bool startHidden) {
     wc.style = CS_HREDRAW | CS_VREDRAW;
     wc.lpfnWndProc = IpmsgWndProc;
     wc.hInstance = st.inst;
-    wc.hIcon = LoadIconW(st.inst, MAKEINTRESOURCEW(1));
+    wc.hIcon = LoadIconW(st.inst, MAKEINTRESOURCEW(2));
     if (!wc.hIcon) wc.hIcon = LoadIconW(nullptr, IDI_APPLICATION);
     wc.hIconSm = wc.hIcon;
     wc.hCursor = LoadCursorW(nullptr, IDC_ARROW);
