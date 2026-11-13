@@ -624,6 +624,14 @@ static const wchar_t* Tr(const wchar_t* ja, const wchar_t* en, const wchar_t* es
 }
 
 // Small caption bar above each list so it is clear which list is which.
+static const wchar_t* ProcListCaptionText() {
+    return Tr(L"プロセス", L"PROCESSES", L"PROCESOS");
+}
+
+static const wchar_t* TaskListCaptionText() {
+    return Tr(L"タスクキュー", L"TASK QUEUE", L"COLA DE TAREAS");
+}
+
 static void DrawListCaption(HDC hdc, const RECT& rc, const wchar_t* text, COLORREF accent, HFONT font) {
     if (rc.bottom <= rc.top || rc.right <= rc.left) return;
     HBRUSH bg = CreateSolidBrush(g_theme.panel);
@@ -928,6 +936,7 @@ struct DashboardState {
     int hintAutoDismissSec = 7;
     std::string supervisorCommand = "claude";
     std::string lastHintSignature;
+    int unreadHintCount = 0; // hints added since the hint history was last opened (badge on its button)
     // Signatures already popped up. Automatic hints skip them so a second divergence, failure or
     // contention surfaces while the first one is still in the list. Capped; see EvaluateSupervisorHint.
     std::unordered_set<std::string> shownHintSignatures;
@@ -939,8 +948,9 @@ struct DashboardState {
     HWND hwndUsagePanel = nullptr;
     bool showUsagePanel = true;
     int usagePanelHeight = 170;
-    int usageRangeIndex = 0; // 0: 24h (default), 1: 7d, 2: 30d, 3: 12m
+    int usageRangeIndex = 1; // 0: 4h, 1: 24h (default), 2: 7d, 3: 30d, 4: 12m
     int usageGraphMode = 0; // 0: token kinds (default), 1: by provider/model
+    int ganttRangeIndex = 2; // Task Gantt window: 0: 6h, 1: 12h, 2: 24h (default), 3: All
     bool restoreUsageGraph = false;
     int64_t llmMaxEvents = kDefaultLlmMaxEvents;  // events kept per stream tracker; -1 = unlimited
     bool resourceLocks = true; // task queue resource locks (doc/resource-locks.md)
@@ -963,6 +973,7 @@ struct DashboardState {
     RECT rcRowsSplitter = {};
     RECT rcProcCaption = {};
     RECT rcTaskCaption = {};
+    int taskCaptionExtraLeft = 0; // x where the failure summary starts (after the search button/edit)
     bool rowsSplitterDragging = false;
     int lastTotalListHeight = 0;
     std::vector<std::string> taskJobIds;
@@ -2252,16 +2263,25 @@ static void DrawDashboardCanvas(DashboardState* st, HDC hdcWindow) {
     }
 
     if (st->rcProcCaption.bottom > st->rcProcCaption.top) {
-        DrawListCaption(hdc, st->rcProcCaption, Tr(L"プロセス", L"PROCESSES", L"PROCESOS"),
-                        g_theme.accent, st->hFontUiBold);
+        DrawListCaption(hdc, st->rcProcCaption, ProcListCaptionText(), g_theme.accent, st->hFontUiBold);
     }
     if (st->rcTaskCaption.bottom > st->rcTaskCaption.top) {
-        std::wstring caption = Tr(L"タスクキュー", L"TASK QUEUE", L"COLA DE TAREAS");
-        if (!st->taskFailureSummary.empty()) {
-            caption += L"    " + st->taskFailureSummary;
-        }
-        DrawListCaption(hdc, st->rcTaskCaption, caption.c_str(),
+        DrawListCaption(hdc, st->rcTaskCaption, TaskListCaptionText(),
                         IsDarkThemeActive() ? RGB(255, 190, 90) : RGB(200, 110, 0), st->hFontUiBold);
+        // The failure summary follows the search button (and its edit box when open).
+        if (!st->taskFailureSummary.empty()) {
+            RECT sumRc = st->rcTaskCaption;
+            sumRc.left = (std::max)(static_cast<LONG>(st->taskCaptionExtraLeft), sumRc.left + 12);
+            sumRc.right -= 8;
+            if (sumRc.right > sumRc.left) {
+                SetBkMode(hdc, TRANSPARENT);
+                SetTextColor(hdc, g_theme.text);
+                HGDIOBJ of = SelectObject(hdc, st->hFontUiBold);
+                DrawTextW(hdc, st->taskFailureSummary.c_str(), -1, &sumRc,
+                          DT_LEFT | DT_VCENTER | DT_SINGLELINE | DT_END_ELLIPSIS);
+                SelectObject(hdc, of);
+            }
+        }
     }
 
     SetBkMode(hdc, TRANSPARENT);
@@ -5514,19 +5534,45 @@ static int64_t NiceGanttStep(int64_t raw) {
     return 604800;
 }
 
+// Seconds to add to an epoch value to get local wall-clock seconds (local time zone offset,
+// DST included) at that moment. Used to put Gantt ticks on local hour / day boundaries.
+static int64_t LocalUtcOffsetSec(int64_t epochSec) {
+    time_t t = static_cast<time_t>(epochSec);
+    struct tm tmLocal = {};
+    if (!LocalTimeFromSec(&t, &tmLocal)) return 0;
+    int64_t asUtc = static_cast<int64_t>(_mkgmtime64(&tmLocal));
+    if (asUtc == -1) return 0;
+    return asUtc - epochSec;
+}
+
+// The list row colours (rowCompleted etc.) are faint backgrounds meant to sit behind text;
+// as thin Gantt bars they all but disappear, so the bars use a dedicated palette. Light
+// panels get deeper tones and dark panels brighter ones so the bars stand out either way.
 static COLORREF GanttSegmentColor(const TaskGanttSegment& seg, const std::string& jobState) {
-    if (seg.running) return g_theme.rowRunning;
-    if (seg.reason == "ok" || seg.reason == "succeeded") return g_theme.rowCompleted;
+    const bool dark = IsDarkThemeActive();
+    const COLORREF kRunning = dark ? RGB(0x60, 0xA5, 0xFA) : RGB(0x1D, 0x4E, 0xD8);
+    const COLORREF kOk = dark ? RGB(0x34, 0xD3, 0x99) : RGB(0x15, 0x80, 0x3D);
+    const COLORREF kFailed = dark ? RGB(0xF8, 0x71, 0x71) : RGB(0xB9, 0x1C, 0x1C);
+    const COLORREF kIdle = dark ? RGB(0xA0, 0xA8, 0xB8) : RGB(0x64, 0x74, 0x8B);
+    if (seg.running) return kRunning;
+    if (seg.reason == "ok" || seg.reason == "succeeded") return kOk;
     if (seg.reason == "deferred" || seg.reason == "interrupted" || seg.reason == "killed") {
-        return g_theme.rowIdle;
+        return kIdle;
     }
     if (seg.reason == "failed" || seg.reason == "checkFailed" ||
         seg.reason == "timed_out" || seg.reason == "idle_timed_out") {
-        return g_theme.rowFailed;
+        return kFailed;
     }
-    if (jobState == "succeeded") return g_theme.rowCompleted;
-    if (jobState == "failed" || jobState == "cancelled") return g_theme.rowFailed;
-    return g_theme.rowIdle;
+    if (jobState == "succeeded") return kOk;
+    if (jobState == "failed" || jobState == "cancelled") return kFailed;
+    if (jobState == "running") return kRunning;
+    return kIdle;
+}
+
+// 1px bar outline, a little lighter on dark panels and a little darker on light ones, so
+// adjacent or very short bars stay distinguishable from the fill and from the panel.
+static COLORREF GanttSegmentOutlineColor(COLORREF fill) {
+    return BlendColor(fill, IsDarkThemeActive() ? RGB(0xFF, 0xFF, 0xFF) : RGB(0x00, 0x00, 0x00), 0.30f);
 }
 
 static void LayoutControls(DashboardState* st, int width, int height) {
@@ -5726,31 +5772,50 @@ static void LayoutControls(DashboardState* st, int width, int height) {
     // Bottom Status Bar
     st->rcStatusBar = {0, height - kStatusBarH, width, height};
 
-    auto layoutCaptionSearch = [&](const RECT& cap, HWND btn, HWND edit, bool open) {
-        if (!btn || !edit) return;
+    // The search button sits right after the caption label, and its edit box (when open) right after
+    // the button. Returns the x where anything else drawn in the caption may start.
+    auto layoutCaptionSearch = [&](const RECT& cap, const wchar_t* label, HWND btn, HWND edit, bool open) -> int {
+        if (!btn || !edit) return cap.left + 12;
         const int capH = cap.bottom - cap.top;
         if (capH <= 0) {
             ShowWindow(btn, SW_HIDE);
             ShowWindow(edit, SW_HIDE);
-            return;
+            return cap.left + 12;
+        }
+        int labelW = 0;
+        if (HDC hdc = GetDC(st->hwndMain)) {
+            HGDIOBJ of = SelectObject(hdc, st->hFontUiBold ? static_cast<HGDIOBJ>(st->hFontUiBold)
+                                                           : GetStockObject(DEFAULT_GUI_FONT));
+            SIZE sz = {};
+            GetTextExtentPoint32W(hdc, label, static_cast<int>(wcslen(label)), &sz);
+            SelectObject(hdc, of);
+            ReleaseDC(st->hwndMain, hdc);
+            labelW = sz.cx;
         }
         const int h = (std::max)(18, capH - 4);
         const int y = cap.top + 2;
         const int bw = 24;
-        const int bx = cap.right - 8 - bw;
+        int bx = static_cast<int>(cap.left) + 12 + labelW + 8;
+        if (bx > cap.right - 8 - bw) bx = cap.right - 8 - bw;
         ShowWindow(btn, SW_SHOW);
         MoveWindow(btn, bx, y, bw, h, TRUE);
+        int end = bx + bw;
         if (open) {
-            const int ew = (std::min)(220, (std::max)(100, bx - static_cast<int>(cap.left) - 16));
-            const int ex = bx - ew - 4;
+            const int ex = bx + bw + 4;
+            int ew = (std::min)(220, static_cast<int>(cap.right) - 8 - ex);
+            if (ew < 60) ew = 60;
             MoveWindow(edit, ex, y, ew, h, TRUE);
             ShowWindow(edit, SW_SHOW);
+            end = ex + ew;
         } else {
             ShowWindow(edit, SW_HIDE);
         }
+        return end + 12;
     };
-    layoutCaptionSearch(st->rcProcCaption, st->hwndSearchProcBtn, st->hwndSearchProcEdit, st->showProcSearch);
-    layoutCaptionSearch(st->rcTaskCaption, st->hwndSearchTaskBtn, st->hwndSearchTaskEdit, st->showTaskSearch);
+    layoutCaptionSearch(st->rcProcCaption, ProcListCaptionText(), st->hwndSearchProcBtn,
+                        st->hwndSearchProcEdit, st->showProcSearch);
+    st->taskCaptionExtraLeft = layoutCaptionSearch(st->rcTaskCaption, TaskListCaptionText(), st->hwndSearchTaskBtn,
+                                                   st->hwndSearchTaskEdit, st->showTaskSearch);
 
     UpdateTaskListColumnWidths(st);
     LayoutTerminalViews(st);
@@ -11029,9 +11094,11 @@ static void ShowSettingsDialog(DashboardState* st) {
 // ---------------------------------------------------------------------------
 // Token usage panel (docked below the KPI cards)
 // ---------------------------------------------------------------------------
-static const int kUsageRangeCount = 4;
-static const int64_t kUsageRangeSec[kUsageRangeCount] = {86400, 7 * 86400, 30 * 86400, 365 * 86400};
-static const wchar_t* const kUsageRangeLabels[kUsageRangeCount] = {L"24h", L"7d", L"30d", L"12m"};
+// Index 0-1 use live per-call history (time buckets), 2-3 daily rollups, 4 monthly rollups.
+static const int kUsageRangeCount = 5;
+static const int64_t kUsageRangeSec[kUsageRangeCount] = {4 * 3600, 86400, 7 * 86400, 30 * 86400, 365 * 86400};
+static const wchar_t* const kUsageRangeLabels[kUsageRangeCount] = {L"4h", L"24h", L"7d", L"30d", L"12m"};
+static const RECT kUsageViewToggleRc = {292, 7, 324, 24};
 static const COLORREF kUsagePalette[] = {
     RGB(0x4F, 0x8C, 0xFF), RGB(0x3D, 0xD5, 0x98), RGB(0xFF, 0xB4, 0x54),
     RGB(0xFF, 0x6B, 0x6B), RGB(0xB4, 0x7A, 0xFF), RGB(0x2E, 0xC4, 0xE0),
@@ -11048,12 +11115,49 @@ static std::wstring FormatCompactTokens(uint64_t v) {
 }
 
 static void GetUsagePillRects(int width, RECT out[kUsageRangeCount], RECT& closeRc) {
-    int x = 136;
+    int x = 66;
     for (int i = 0; i < kUsageRangeCount; ++i) {
         out[i] = {x, 7, x + 40, 24};
         x += 44;
     }
     closeRc = {width - 28, 5, width - 8, 25};
+}
+
+// The usage panel is three equal columns: token usage over time, usage by model, task Gantt.
+// Returns the left edge of the model and Gantt columns and the right edge of the first one.
+static void GetUsageColumnEdges(int width, int& col1Right, int& modelLeft, int& ganttLeft) {
+    int contentL = 12;
+    int contentR = width - 12;
+    int colW = (contentR - contentL) / 3;
+    if (colW < 1) colW = 1;
+    col1Right = contentL + colW - 8;
+    modelLeft = contentL + colW + 8;
+    ganttLeft = contentL + colW * 2 + 8;
+}
+
+static const int kGanttRangeCount = 4;
+static const wchar_t* const kGanttRangeLabels[kGanttRangeCount] = {L"6h", L"12h", L"24h", L"All"};
+static const int64_t kGanttRangeSec[kGanttRangeCount] = {6 * 3600, 12 * 3600, 24 * 3600, 0};
+
+static const wchar_t* GanttTitleText() {
+    return Tr(L"タスク・ガント", L"TASK GANTT", L"GANTT DE TAREAS");
+}
+
+// Range buttons sit right after the "Task Gantt" title in the header row. The title width is
+// measured with the bold UI font, so the same rects come out when painting and hit-testing.
+static void GetGanttPillRects(HDC hdc, HFONT boldFont, int width, RECT out[kGanttRangeCount]) {
+    int col1Right = 0, modelLeft = 0, ganttLeft = 0;
+    GetUsageColumnEdges(width, col1Right, modelLeft, ganttLeft);
+    HGDIOBJ of = SelectObject(hdc, boldFont ? static_cast<HGDIOBJ>(boldFont) : GetStockObject(DEFAULT_GUI_FONT));
+    SIZE sz = {};
+    const wchar_t* title = GanttTitleText();
+    GetTextExtentPoint32W(hdc, title, static_cast<int>(wcslen(title)), &sz);
+    SelectObject(hdc, of);
+    int x = ganttLeft + sz.cx + 10;
+    for (int i = 0; i < kGanttRangeCount; ++i) {
+        out[i] = {x, 7, x + 36, 24};
+        x += 40;
+    }
 }
 
 static COLORREF ColorForUsageKey(const std::string& name) {
@@ -11100,12 +11204,7 @@ static void DrawTaskGanttPane(HDC hdc, DashboardState* st, const RECT& plot,
     if (!st || plot.right - plot.left < 60 || plot.bottom - plot.top < 16) return;
     if (now <= since) return;
 
-    RECT titleRc = {plot.left, plot.top - 14, plot.right, plot.top};
-    SetTextColor(hdc, g_theme.muted);
-    SelectObject(hdc, st->hFontUiBold ? st->hFontUiBold : GetStockObject(DEFAULT_GUI_FONT));
-    DrawTextW(hdc, Tr(L"タスク・ガント", L"TASK GANTT", L"GANTT DE TAREAS"), -1, &titleRc,
-              DT_LEFT | DT_VCENTER | DT_SINGLELINE | DT_END_ELLIPSIS);
-
+    // The title and range buttons are drawn in the panel header (DrawUsagePanel).
     std::vector<TaskGanttRow> rows;
     if (!st->lastTaskListJson.empty()) rows = BuildTaskGanttRows(st->lastTaskListJson, now);
     std::vector<const TaskGanttRow*> visible;
@@ -11115,7 +11214,31 @@ static void DrawTaskGanttPane(HDC hdc, DashboardState* st, const RECT& plot,
         visible.push_back(&row);
     }
 
-    int64_t winStart = since;
+    int x0 = plot.left;
+    int x1 = plot.right;
+    int top = plot.top;
+    int bottom = plot.bottom - 15;
+    if (bottom <= top) return;
+
+    // Rows are in start order. When they do not all fit, keep the most recent ones (the
+    // oldest are the least interesting) and say how many earlier rows were left out.
+    const int rowH = 16;
+    int nFit = (bottom - top) / rowH;
+    if (nFit < 1) nFit = 1;
+    const int total = static_cast<int>(visible.size());
+    int hiddenEarlier = 0;
+    if (total > nFit) {
+        int keep = nFit - 1;
+        if (keep < 1) keep = 1;
+        hiddenEarlier = total - keep;
+        visible.erase(visible.begin(), visible.begin() + hiddenEarlier);
+    }
+    const int rowTop = top + (hiddenEarlier > 0 ? rowH : 0);
+
+    // The time axis covers only the rows that are drawn. Fitting it to every job in the
+    // range would squeeze the drawn rows into a few pixels when the range spans hours or days.
+    // since == 0 means "All"; with nothing to draw, fall back to the last 24 hours for the axis.
+    int64_t winStart = since > 0 ? since : now - 24 * 3600;
     int64_t winEnd = now;
     if (!visible.empty()) {
         winStart = visible.front()->firstStart;
@@ -11138,12 +11261,6 @@ static void DrawTaskGanttPane(HDC hdc, DashboardState* st, const RECT& plot,
         }
     }
 
-    int x0 = plot.left;
-    int x1 = plot.right;
-    int top = plot.top;
-    int bottom = plot.bottom - 15;
-    if (bottom <= top) return;
-
     int labelW = (x1 - x0) * 2 / 5;
     if (labelW > 150) labelW = 150;
     if (labelW < 52) labelW = 52;
@@ -11161,77 +11278,124 @@ static void DrawTaskGanttPane(HDC hdc, DashboardState* st, const RECT& plot,
         return x;
     };
 
-    HPEN grid = CreatePen(PS_DOT, 1, g_theme.border);
+    SelectObject(hdc, st->hFontUi ? st->hFontUi : GetStockObject(DEFAULT_GUI_FONT));
+
+    // Ticks sit on local wall-clock boundaries (whole hours, midnight, ...) and are labelled.
+    // The step is chosen so the labels fit: "HH:MM" normally, "MM/DD HH:MM" where the day changes.
+    const bool multiDay = span >= 86400 ||
+        (winStart + LocalUtcOffsetSec(winStart)) / 86400 != (winEnd + LocalUtcOffsetSec(winEnd)) / 86400;
+    SIZE lblSize = {};
+    const wchar_t* sample = multiDay ? L"00/00 00:00" : L"00:00";
+    GetTextExtentPoint32W(hdc, sample, static_cast<int>(wcslen(sample)), &lblSize);
+    int maxTicks = laneW / (lblSize.cx + 12);
+    if (maxTicks < 1) maxTicks = 1;
+    int64_t tickStep = NiceGanttStep((span + maxTicks - 1) / maxTicks);
+    if (tickStep < 60) tickStep = 60;  // labels have minute resolution
+    const int64_t tzOff = LocalUtcOffsetSec(winStart);
+    int64_t tick = ((winStart + tzOff + tickStep - 1) / tickStep) * tickStep - tzOff;
+
+    // A dotted border alone gets lost on both white and near-black panels; nudging it
+    // toward the muted text colour keeps the grid readable in every theme.
+    HPEN grid = CreatePen(PS_DOT, 1, BlendColor(g_theme.border, g_theme.muted, 0.35f));
     HGDIOBJ oldPen = SelectObject(hdc, grid);
-    int64_t tickStep = NiceGanttStep(span / 4);
-    if (tickStep < 1) tickStep = 1;
-    int64_t tick = ((winStart + tickStep - 1) / tickStep) * tickStep;
+    SetTextColor(hdc, g_theme.muted);
+    int lastLabelRight = laneX0 - 1000;
+    int prevDay = -1;
+    int labelled = 0;
     for (; tick < winEnd; tick += tickStep) {
         int tx = timeToX(tick);
         MoveToEx(hdc, tx, top, nullptr);
         LineTo(hdc, tx, bottom);
+
+        time_t tt = static_cast<time_t>(tick);
+        struct tm tmLocal = {};
+        if (!LocalTimeFromSec(&tt, &tmLocal)) continue;
+        const bool newDay = multiDay && tmLocal.tm_yday != prevDay;
+        prevDay = tmLocal.tm_yday;
+        std::wstring lbl = FormatGanttTick(tick, newDay);
+        SIZE sz = {};
+        GetTextExtentPoint32W(hdc, lbl.c_str(), static_cast<int>(lbl.size()), &sz);
+        int lx = tx - sz.cx / 2;
+        if (lx < laneX0) lx = laneX0;
+        if (lx + sz.cx > laneX1) lx = laneX1 - sz.cx;
+        if (lx <= lastLabelRight + 6) continue;
+        RECT lrc = {lx, bottom + 1, lx + sz.cx, bottom + 14};
+        DrawTextW(hdc, lbl.c_str(), -1, &lrc, DT_LEFT | DT_SINGLELINE | DT_NOCLIP);
+        lastLabelRight = lx + sz.cx;
+        ++labelled;
     }
     SelectObject(hdc, oldPen);
     DeleteObject(grid);
 
+    if (labelled == 0) {
+        // No tick inside the window (very short span): label both ends instead.
+        std::wstring startLbl = FormatGanttTick(winStart, multiDay);
+        std::wstring endLbl = FormatGanttTick(winEnd, multiDay);
+        RECT startRc = {laneX0, bottom + 1, laneX0 + laneW / 2, bottom + 14};
+        RECT endRc = {laneX0 + laneW / 2, bottom + 1, laneX1, bottom + 14};
+        DrawTextW(hdc, startLbl.c_str(), -1, &startRc, DT_LEFT | DT_SINGLELINE | DT_END_ELLIPSIS);
+        DrawTextW(hdc, endLbl.c_str(), -1, &endRc, DT_RIGHT | DT_SINGLELINE | DT_END_ELLIPSIS);
+    }
+
     if (visible.empty()) {
         SetTextColor(hdc, g_theme.muted);
-        SelectObject(hdc, st->hFontUi ? st->hFontUi : GetStockObject(DEFAULT_GUI_FONT));
         RECT emptyRc = {x0, top, x1, bottom};
         DrawTextW(hdc, Tr(L"この期間にタスクはありません", L"No tasks in range", L"Sin tareas en el rango"),
                   -1, &emptyRc, DT_CENTER | DT_VCENTER | DT_SINGLELINE | DT_END_ELLIPSIS);
-    } else {
-        const int rowH = 16;
-        int nFit = (bottom - top) / rowH;
-        if (nFit < 1) nFit = 1;
-        int total = static_cast<int>(visible.size());
-        int n = total;
-        bool more = false;
-        if (n > nFit) {
-            n = nFit - 1;
-            if (n < 0) n = 0;
-            more = true;
-        }
-        SelectObject(hdc, st->hFontUi ? st->hFontUi : GetStockObject(DEFAULT_GUI_FONT));
-        for (int i = 0; i < n; ++i) {
-            const TaskGanttRow& row = *visible[i];
-            int ry = top + i * rowH;
-            RECT labelRc = {x0, ry, x0 + labelW, ry + rowH};
-            SetTextColor(hdc, row.planned ? g_theme.muted : g_theme.text);
-            DrawTextW(hdc, row.label.c_str(), -1, &labelRc,
-                      DT_LEFT | DT_VCENTER | DT_SINGLELINE | DT_END_ELLIPSIS);
+        return;
+    }
 
-            for (const auto& seg : row.segments) {
-                int64_t s = (std::max)(seg.start, winStart);
-                int64_t e = (std::min)(seg.end, winEnd);
-                if (e <= s) continue;
-                int sx = timeToX(s);
-                int ex = timeToX(e);
-                if (ex <= sx) ex = sx + 2;
-                RECT segRc = {sx, ry + 3, ex, ry + rowH - 3};
-                HBRUSH brush = CreateSolidBrush(GanttSegmentColor(seg, row.state));
+    if (hiddenEarlier > 0) {
+        SetTextColor(hdc, g_theme.muted);
+        wchar_t moreText[64] = {};
+        if (g_uiLanguage == UiLanguage::Japanese) {
+            swprintf_s(moreText, L"↑ 以前の %d 件", hiddenEarlier);
+        } else if (g_uiLanguage == UiLanguage::Spanish) {
+            swprintf_s(moreText, L"↑ %d anteriores", hiddenEarlier);
+        } else {
+            swprintf_s(moreText, L"↑ %d earlier", hiddenEarlier);
+        }
+        RECT moreRc = {x0, top, x0 + labelW, top + rowH};
+        DrawTextW(hdc, moreText, -1, &moreRc, DT_LEFT | DT_VCENTER | DT_SINGLELINE | DT_END_ELLIPSIS);
+    }
+
+    for (size_t i = 0; i < visible.size(); ++i) {
+        const TaskGanttRow& row = *visible[i];
+        int ry = rowTop + static_cast<int>(i) * rowH;
+        if (ry + rowH > bottom + 1) break;
+        RECT labelRc = {x0, ry, x0 + labelW, ry + rowH};
+        SetTextColor(hdc, row.planned ? g_theme.muted : g_theme.text);
+        DrawTextW(hdc, row.label.c_str(), -1, &labelRc,
+                  DT_LEFT | DT_VCENTER | DT_SINGLELINE | DT_END_ELLIPSIS);
+
+        for (const auto& seg : row.segments) {
+            int64_t s = (std::max)(seg.start, winStart);
+            int64_t e = (std::min)(seg.end, winEnd);
+            if (e < s) continue;
+            int sx = timeToX(s);
+            int ex = timeToX(e);
+            // Short attempts in a long window still get a visible mark.
+            if (ex < sx + 3) ex = sx + 3;
+            if (ex > laneX1) { ex = laneX1; sx = (std::min)(sx, ex - 3); }
+            RECT segRc = {sx, ry + 3, ex, ry + rowH - 3};
+            const COLORREF fill = GanttSegmentColor(seg, row.state);
+            const COLORREF outline = GanttSegmentOutlineColor(fill);
+            if (!row.planned) {
+                HBRUSH brush = CreateSolidBrush(fill);
                 FillRect(hdc, &segRc, brush);
                 DeleteObject(brush);
             }
-        }
-        if (more) {
-            SetTextColor(hdc, g_theme.muted);
-            wchar_t moreText[32] = {};
-            swprintf_s(moreText, L"+%d", total - n);
-            RECT moreRc = {x0, top + n * rowH, x1, top + (n + 1) * rowH};
-            DrawTextW(hdc, moreText, -1, &moreRc, DT_RIGHT | DT_SINGLELINE | DT_END_ELLIPSIS);
+            // Hollow forecast bars keep their outline-only look; real bars get the same
+            // 1px border so neighbouring segments never blend into one another.
+            HPEN pen = CreatePen(PS_SOLID, 1, outline);
+            HGDIOBJ oldBarPen = SelectObject(hdc, pen);
+            HGDIOBJ oldBarBrush = SelectObject(hdc, GetStockObject(NULL_BRUSH));
+            Rectangle(hdc, segRc.left, segRc.top, segRc.right, segRc.bottom);
+            SelectObject(hdc, oldBarBrush);
+            SelectObject(hdc, oldBarPen);
+            DeleteObject(pen);
         }
     }
-
-    SetTextColor(hdc, g_theme.muted);
-    SelectObject(hdc, st->hFontUi ? st->hFontUi : GetStockObject(DEFAULT_GUI_FONT));
-    bool withDate = span >= 86400;
-    std::wstring startLbl = FormatGanttTick(winStart, withDate);
-    std::wstring endLbl = FormatGanttTick(winEnd, withDate);
-    RECT startRc = {laneX0, bottom + 1, laneX0 + laneW / 2, bottom + 14};
-    RECT endRc = {laneX0 + laneW / 2, bottom + 1, laneX1, bottom + 14};
-    DrawTextW(hdc, startLbl.c_str(), -1, &startRc, DT_LEFT | DT_SINGLELINE | DT_END_ELLIPSIS);
-    DrawTextW(hdc, endLbl.c_str(), -1, &endRc, DT_RIGHT | DT_SINGLELINE | DT_END_ELLIPSIS);
 }
 
 static void DrawUsagePanel(HWND hwnd, HDC hdc, DashboardState* st) {
@@ -11277,8 +11441,8 @@ static void DrawUsagePanel(HWND hwnd, HDC hdc, DashboardState* st) {
     FillRect(hdc, &accentRc, accent);
     DeleteObject(accent);
     SetTextColor(hdc, g_theme.text);
-    RECT titleRc = {18, 6, 130, 24};
-    DrawTextW(hdc, Tr(L"トークン使用量", L"TOKEN USAGE", L"USO DE TOKENS"), -1, &titleRc,
+    RECT titleRc = {18, 6, 62, 24};
+    DrawTextW(hdc, Tr(L"使用量", L"Usage", L"Uso"), -1, &titleRc,
               DT_LEFT | DT_VCENTER | DT_SINGLELINE | DT_END_ELLIPSIS);
 
     SelectObject(hdc, st->hFontUi ? st->hFontUi : GetStockObject(DEFAULT_GUI_FONT));
@@ -11309,7 +11473,7 @@ static void DrawUsagePanel(HWND hwnd, HDC hdc, DashboardState* st) {
 
     // View toggle button: token kinds (T) vs by provider/model (M).
     {
-        RECT viewRc = {360, 7, 392, 24};
+        RECT viewRc = kUsageViewToggleRc;
         HBRUSH vb = CreateSolidBrush(g_theme.panel);
         HPEN vp = CreatePen(PS_SOLID, 1, g_theme.border);
         HGDIOBJ ob = SelectObject(hdc, vb);
@@ -11362,8 +11526,8 @@ static void DrawUsagePanel(HWND hwnd, HDC hdc, DashboardState* st) {
     std::vector<std::vector<uint64_t>> valCache;
     std::vector<uint64_t> bucketTotal;
 
-    if (rangeIdx == 0) {
-        // 24h: live U0 points (fallback to today's daily log if in-memory history empty)
+    if (rangeIdx <= 1) {
+        // 4h / 24h: live U0 points (fallback to today's daily log if in-memory history empty)
         std::vector<LlmUsagePoint> points = GetLlmUsageHistory(since);
         if (points.empty()) {
             auto daily = ReadDailyUsageSummary("24h", "");
@@ -11408,7 +11572,7 @@ static void DrawUsagePanel(HWND hwnd, HDC hdc, DashboardState* st) {
         nBuckets = graphW_tmp / 7;
         if (nBuckets < 12) nBuckets = 12;
         if (nBuckets > 96) nBuckets = 96;
-        bucketSec = 86400.0 / nBuckets;
+        bucketSec = static_cast<double>(kUsageRangeSec[rangeIdx]) / nBuckets;
         if (bucketSec < 1.0) bucketSec = 1.0;
         int64_t currentBucket = static_cast<int64_t>(now / bucketSec);
         windowStartBucket = currentBucket - nBuckets + 1;
@@ -11442,9 +11606,9 @@ static void DrawUsagePanel(HWND hwnd, HDC hdc, DashboardState* st) {
             valCache[bi][k] += p.cacheReadTokens + p.cacheWriteTokens;
             bucketTotal[bi] += pt;
         }
-    } else if (rangeIdx == 1 || rangeIdx == 2) {
+    } else if (rangeIdx == 2 || rangeIdx == 3) {
         // 7d or 30d: daily buckets from U1 daily rollups
-        int nDays = (rangeIdx == 1) ? 7 : 30;
+        int nDays = (rangeIdx == 2) ? 7 : 30;
         nBuckets = nDays;
         std::vector<std::string> dayKeys;
         dayKeys.reserve(nDays);
@@ -11574,22 +11738,53 @@ static void DrawUsagePanel(HWND hwnd, HDC hdc, DashboardState* st) {
         swprintf_s(cbuf, L"  \x00B7  $%.4f", rangeCost);
         summary += cbuf;
     }
-    RECT sumRc = {closeRc.left - 270, 6, closeRc.left - 116, 24};
-    SetTextColor(hdc, g_theme.accent);
-    DrawTextW(hdc, summary.c_str(), -1, &sumRc, DT_RIGHT | DT_VCENTER | DT_SINGLELINE | DT_END_ELLIPSIS);
     // Three equal columns: token usage over time, usage by model, task Gantt.
-    int contentL = 12;
-    int contentR = w - 12;
-    int colW = (contentR - contentL) / 3;
-    if (colW < 1) colW = 1;
-    int col1 = contentL + colW;
-    int col2 = contentL + colW * 2;
+    int gx1 = 0, mx0 = 0, tx0 = 0;
+    GetUsageColumnEdges(w, gx1, mx0, tx0);
     int gx0 = 58;
-    int gx1 = col1 - 8;
-    int mx0 = col1 + 8;
-    int mx1 = col2 - 8;
-    int tx0 = col2 + 8;
-    int tx1 = contentR;
+    int mx1 = tx0 - 16;
+    int tx1 = w - 12;
+
+    // Total for the range: left-aligned in the first column's header, after the view toggle.
+    RECT sumRc = {kUsageViewToggleRc.right + 8, 6, gx1, 24};
+    if (sumRc.right > sumRc.left) {
+        SetTextColor(hdc, g_theme.accent);
+        DrawTextW(hdc, summary.c_str(), -1, &sumRc, DT_LEFT | DT_VCENTER | DT_SINGLELINE | DT_END_ELLIPSIS);
+    }
+
+    // Column titles share the header row with the token-usage title.
+    SetTextColor(hdc, g_theme.muted);
+    {
+        RECT mtitle = {mx0, 6, mx1, 24};
+        DrawTextW(hdc, Tr(L"モデル別使用量", L"USAGE BY MODEL", L"USO POR MODELO"), -1, &mtitle,
+                  DT_LEFT | DT_VCENTER | DT_SINGLELINE | DT_END_ELLIPSIS);
+        RECT ttitle = {tx0, 6, closeRc.left - 4, 24};
+        DrawTextW(hdc, GanttTitleText(), -1, &ttitle, DT_LEFT | DT_VCENTER | DT_SINGLELINE | DT_END_ELLIPSIS);
+    }
+
+    int ganttIdx = st->ganttRangeIndex;
+    if (ganttIdx < 0 || ganttIdx >= kGanttRangeCount) ganttIdx = 2;
+    {
+        RECT gpills[kGanttRangeCount] = {};
+        GetGanttPillRects(hdc, st->hFontUiBold, w, gpills);
+        SelectObject(hdc, st->hFontUi ? st->hFontUi : GetStockObject(DEFAULT_GUI_FONT));
+        for (int i = 0; i < kGanttRangeCount; ++i) {
+            if (gpills[i].right > closeRc.left - 4) break;
+            bool active = (i == ganttIdx);
+            HBRUSH pb = CreateSolidBrush(active ? DesaturateColor(g_theme.accent, 0.45f) : g_theme.panel);
+            HPEN pp = CreatePen(PS_SOLID, 1, active ? g_theme.accent : g_theme.border);
+            HGDIOBJ ob = SelectObject(hdc, pb);
+            HGDIOBJ op = SelectObject(hdc, pp);
+            RoundRect(hdc, gpills[i].left, gpills[i].top, gpills[i].right, gpills[i].bottom, 10, 10);
+            SelectObject(hdc, op);
+            SelectObject(hdc, ob);
+            DeleteObject(pp);
+            DeleteObject(pb);
+            SetTextColor(hdc, active ? g_theme.windowBg : g_theme.muted);
+            DrawTextW(hdc, kGanttRangeLabels[i], -1, &gpills[i], DT_CENTER | DT_VCENTER | DT_SINGLELINE);
+        }
+    }
+    const int64_t ganttSince = kGanttRangeSec[ganttIdx] > 0 ? now - kGanttRangeSec[ganttIdx] : 0;
     int gy0 = 30;
     int gy1 = h - 26;
     int graphW = gx1 - gx0;
@@ -11620,7 +11815,7 @@ static void DrawUsagePanel(HWND hwnd, HDC hdc, DashboardState* st) {
     if (selStart > 0 && !keys.empty()) {
         int64_t ws = since;
         int64_t we = now;
-        if (rangeIdx == 0) {
+        if (rangeIdx <= 1) {
             ws = static_cast<int64_t>(windowStartBucket * bucketSec);
             we = ws + static_cast<int64_t>(nBuckets * bucketSec);
         }
@@ -11716,12 +11911,6 @@ static void DrawUsagePanel(HWND hwnd, HDC hdc, DashboardState* st) {
     }
     // Per-provider/model horizontal bar chart on the right.
     {
-        RECT mtitle = {mx0, gy0 - 14, mx1, gy0};
-        SetTextColor(hdc, g_theme.muted);
-        SelectObject(hdc, st->hFontUiBold ? st->hFontUiBold : GetStockObject(DEFAULT_GUI_FONT));
-        DrawTextW(hdc, Tr(L"モデル別使用量", L"USAGE BY MODEL", L"USO POR MODELO"), -1, &mtitle,
-                  DT_LEFT | DT_VCENTER | DT_SINGLELINE | DT_END_ELLIPSIS);
-
         uint64_t maxModel = 1;
         for (const auto& k : keys) if (k.total > maxModel) maxModel = k.total;
         int n = static_cast<int>(keys.size());
@@ -11815,7 +12004,7 @@ static void DrawUsagePanel(HWND hwnd, HDC hdc, DashboardState* st) {
 
     if (tx1 - tx0 >= 60) {
         RECT ganttPlot = {tx0, gy0, tx1, gy1};
-        DrawTaskGanttPane(hdc, st, ganttPlot, since, now);
+        DrawTaskGanttPane(hdc, st, ganttPlot, ganttSince, now);
     }
 
     SetTextColor(hdc, g_theme.muted);
@@ -11830,10 +12019,10 @@ static void DrawUsagePanel(HWND hwnd, HDC hdc, DashboardState* st) {
     struct tm nowTm = {};
     localtime_s(&nowTm, &nowT);
 
-    if (rangeIdx == 0) {
+    if (rangeIdx <= 1) {
         swprintf_s(tbuf, L"%02d:%02d", tmv.tm_hour, tmv.tm_min);
         swprintf_s(nowBuf, L"%02d:%02d", nowTm.tm_hour, nowTm.tm_min);
-    } else if (rangeIdx == 1 || rangeIdx == 2) {
+    } else if (rangeIdx == 2 || rangeIdx == 3) {
         swprintf_s(tbuf, L"%02d/%02d", tmv.tm_mon + 1, tmv.tm_mday);
         swprintf_s(nowBuf, L"%02d/%02d", nowTm.tm_mon + 1, nowTm.tm_mday);
     } else {
@@ -11888,7 +12077,7 @@ static LRESULT CALLBACK UsagePanelWndProc(HWND hwnd, UINT msg, WPARAM wParam, LP
             RECT pills[kUsageRangeCount] = {};
             RECT closeRc = {};
             GetUsagePillRects(rc.right, pills, closeRc);
-            RECT viewRc = {360, 7, 392, 24};
+            RECT viewRc = kUsageViewToggleRc;
             if (PtInRect(&viewRc, pt)) {
                 st->usageGraphMode = (st->usageGraphMode == 0) ? 1 : 0;
                 InvalidateRect(hwnd, nullptr, FALSE);
@@ -11907,6 +12096,20 @@ static LRESULT CALLBACK UsagePanelWndProc(HWND hwnd, UINT msg, WPARAM wParam, LP
                     st->usageRangeIndex = i;
                     InvalidateRect(hwnd, nullptr, FALSE);
                     return 0;
+                }
+            }
+            {
+                RECT gpills[kGanttRangeCount] = {};
+                HDC hdc = GetDC(hwnd);
+                GetGanttPillRects(hdc, st->hFontUiBold, rc.right, gpills);
+                ReleaseDC(hwnd, hdc);
+                for (int i = 0; i < kGanttRangeCount; ++i) {
+                    if (gpills[i].right > closeRc.left - 4) break;
+                    if (PtInRect(&gpills[i], pt)) {
+                        st->ganttRangeIndex = i;
+                        InvalidateRect(hwnd, nullptr, FALSE);
+                        return 0;
+                    }
                 }
             }
             return 0;
@@ -12246,6 +12449,11 @@ static LRESULT CALLBACK HintHistoryWndProc(HWND hwnd, UINT msg, WPARAM wParam, L
 
 static void ShowHintHistoryDialog(DashboardState* st) {
     if (!st || !st->hwndMain) return;
+    // Opening the history marks every hint as read.
+    if (st->unreadHintCount != 0) {
+        st->unreadHintCount = 0;
+        if (st->hwndBtnHistory) InvalidateRect(st->hwndBtnHistory, nullptr, FALSE);
+    }
     if (st->hwndHintHistory && IsWindow(st->hwndHintHistory)) {
         ShowWindow(st->hwndHintHistory, SW_SHOW);
         SetForegroundWindow(st->hwndHintHistory);
@@ -12743,6 +12951,32 @@ static void DisplaySupervisorHint(DashboardState* st, const std::wstring& catego
     InvalidateRect(st->hwndHintWnd, nullptr, TRUE);
 }
 
+// A red circle with a count in the top-right corner of a button (a notification badge).
+static void DrawCountBadge(HDC hdc, const RECT& item, int count) {
+    if (count <= 0) return;
+    static HFONT badgeFont = CreateFontW(-9, 0, 0, 0, FW_BOLD, FALSE, FALSE, FALSE, DEFAULT_CHARSET,
+                                         OUT_DEFAULT_PRECIS, CLIP_DEFAULT_PRECIS, CLEARTYPE_QUALITY,
+                                         DEFAULT_PITCH | FF_SWISS, L"Segoe UI");
+    std::wstring label = count > 9 ? L"9+" : std::to_wstring(count);
+    const int d = 13;
+    const int bw = count > 9 ? d + 5 : d;
+    RECT b = {item.right - bw, item.top, item.right, item.top + d};
+    HBRUSH brush = CreateSolidBrush(RGB(0xE8, 0x3B, 0x3B));
+    HPEN pen = CreatePen(PS_SOLID, 1, RGB(0xFF, 0xFF, 0xFF));
+    HGDIOBJ ob = SelectObject(hdc, brush);
+    HGDIOBJ op = SelectObject(hdc, pen);
+    RoundRect(hdc, b.left, b.top, b.right, b.bottom, d, d);
+    SelectObject(hdc, op);
+    SelectObject(hdc, ob);
+    DeleteObject(pen);
+    DeleteObject(brush);
+    SetBkMode(hdc, TRANSPARENT);
+    SetTextColor(hdc, RGB(0xFF, 0xFF, 0xFF));
+    HGDIOBJ of = SelectObject(hdc, badgeFont ? static_cast<HGDIOBJ>(badgeFont) : GetStockObject(DEFAULT_GUI_FONT));
+    DrawTextW(hdc, label.c_str(), -1, &b, DT_CENTER | DT_VCENTER | DT_SINGLELINE);
+    SelectObject(hdc, of);
+}
+
 static void EvaluateSupervisorHint(DashboardState* st, bool forceShow = false) {
     if (!st || !st->hwndMain) return;
     if (!forceShow && !st->showSupervisorHints) return;
@@ -12781,6 +13015,12 @@ static void EvaluateSupervisorHint(DashboardState* st, bool forceShow = false) {
         rec.prompt = info.prompt;
         rec.signature = info.signature;
         st->hintHistory.push_back(std::move(rec));
+        const bool historyOpen = st->hwndHintHistory && IsWindow(st->hwndHintHistory) &&
+                                 IsWindowVisible(st->hwndHintHistory);
+        if (!historyOpen) {
+            ++st->unreadHintCount;
+            if (st->hwndBtnHistory) InvalidateRect(st->hwndBtnHistory, nullptr, FALSE);
+        }
         if (st->hintHistory.size() > kSupervisorHintHistoryMax) {
             st->hintHistory.erase(st->hintHistory.begin(),
                                   st->hintHistory.begin() + (st->hintHistory.size() - kSupervisorHintHistoryMax));
@@ -13421,6 +13661,9 @@ static LRESULT CALLBACK DashboardWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPA
             InflateRect(&rc, -4, 0);
             DrawTextW(dis->hDC, text, -1, &rc, DT_CENTER | DT_VCENTER | DT_SINGLELINE | DT_END_ELLIPSIS);
             SelectObject(dis->hDC, oldFont);
+            if (st && dis->hwndItem == st->hwndBtnHistory && st->unreadHintCount > 0) {
+                DrawCountBadge(dis->hDC, dis->rcItem, st->unreadHintCount);
+            }
             return TRUE;
         }
 
