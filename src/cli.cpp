@@ -2539,10 +2539,10 @@ REMOTE HOSTS:
       Show armed jobs, the current phase, and how many other jobs / managed
       processes are still running.
 
-IP MESSENGER (LAN messaging between people and LLM agents; alias: ipmsg):
+CHAT (LAN messaging between people and LLM agents; alias: msg):
   msg status | on | off | peers | refresh | clear
       status   Show the node, peers, unread count and handler.
-      on/off   Enable or disable the node (writes ipmsg.enabled and restarts it).
+      on/off   Enable or disable the node (writes chat.enabled and restarts it).
       peers    List hosts seen on the LAN.
       refresh  Broadcast a presence entry; peers answer within a second.
       clear    Remove the message history (log files stay).
@@ -2565,7 +2565,7 @@ IP MESSENGER (LAN messaging between people and LLM agents; alias: ipmsg):
           [--event recv|send|local|status|file_sent|file_received|handler_*] [--limit n]
       Search the conversation log.
   msg handler [on|off] [--engine e] [--model m] [--agent a] [--auto-reply on|off]
-      Show or change ipmsg.handler, the worker LLM that answers incoming
+      Show or change chat.handler, the worker LLM that answers incoming
       messages. config.json is patched and the node restarts.
 
   LLM TO LLM:
@@ -2772,7 +2772,7 @@ SETUP FOR LLM AGENTS:
 "        and returns the result. The wrapper costs extra tokens; calling run_worker\n"
 "        directly is cheapest.\n"
 "\n"
-"    MCP tools (47):\n"
+"    MCP tools (57):\n"
 "      Process:    start_process, list_processes, get_process_output,\n"
 "                  send_process_input, wait_process, kill_process\n"
 "      Worker:     run_worker, wait_worker, get_worker_stream, get_worker_state,\n"
@@ -2784,8 +2784,11 @@ SETUP FOR LLM AGENTS:
 "      Behavior tree: bt_validate, bt_start, bt_get, bt_list, bt_wait, bt_resume,\n"
 "                  bt_retry, bt_update, bt_cancel, bt_pause\n"
 "      Power:      power_suspend, power_cancel, power_status\n"
-"      IPMsg:      ipmsg_status, ipmsg_peers, ipmsg_refresh, ipmsg_send, ipmsg_get,\n"
-"                  ipmsg_inbox, ipmsg_wait, ipmsg_read, ipmsg_download, ipmsg_log\n"
+"      Chat:       chat_status, chat_peers, chat_refresh, chat_send, chat_get,\n"
+"                  chat_inbox, chat_wait, chat_read, chat_download, chat_log, chat_handler\n"
+"      Memory:     memory_search, memory_get, memory_brief, memory_stats, memory_note,\n"
+"                  memory_retract, memory_approve\n"
+"      Usage:      usage_stats, usage_export\n"
 "\n"
 "NOTE:\n"
 "  The GUI dashboard is provided by Hancho.exe, which is auto-started\n"
@@ -3108,25 +3111,25 @@ void PrintCliUsageJson() {
     },)";
     std::cout << R"(
     {
-      "name": "msg",
-      "aliases": ["ipmsg"],
-      "description": "LAN messaging (IPMsg compatible) between people and LLM agents: enable/disable the node, list peers, send text and files, receive and long-poll messages, download files, search the conversation log and configure the answering LLM handler. LAN only and unencrypted.",
-      "usage": "hancho-cli msg <status|on|off|peers|refresh|send|inbox|get|wait|read|download|log|handler|clear> [options]",
+      "name": "chat",
+      "aliases": ["msg"],
+      "description": "LAN chat (IPMsg compatible) between people and LLM agents: enable/disable the node, list peers, send text and files, receive and long-poll messages, download files, search the conversation log and configure the answering LLM handler. LAN only and unencrypted.",
+      "usage": "hancho-cli chat <status|on|off|peers|refresh|send|inbox|get|wait|read|download|log|handler|clear> [options]",
       "subcommands": [
-        {"name": "status", "usage": "hancho-cli msg status", "description": "Show the node state, peers, unread count, last message id and handler."},
-        {"name": "on", "usage": "hancho-cli msg on", "description": "Enable the node (writes ipmsg.enabled and restarts it)."},
-        {"name": "off", "usage": "hancho-cli msg off", "description": "Disable the node."},
-        {"name": "peers", "usage": "hancho-cli msg peers", "description": "List hosts seen on the LAN."},
-        {"name": "refresh", "usage": "hancho-cli msg refresh", "description": "Broadcast a presence entry; peers answer within a second."},
-        {"name": "send", "usage": "hancho-cli msg send <to> <text...> [--from-agent a] [--to-agent a] [--reply-to id] [--audience human|agent] [--file path]... [--stdin]", "description": "Send text and/or files. <to> is a peer key (ip:port), an IP or nickname, '*' for every peer, or 'local'/'self' for agents on this node only. --stdin reads the body from stdin."},
-        {"name": "inbox", "usage": "hancho-cli msg inbox [--agent a] [--since id] [--unread] [--all] [--limit n] [--mark-read]", "description": "Show received messages; --all also includes outgoing ones."},
-        {"name": "get", "usage": "hancho-cli msg get <id>", "description": "Show one message with its files."},
-        {"name": "wait", "usage": "hancho-cli msg wait [--agent a] [--since id] [--timeout sec]", "description": "Long-poll for a new incoming message (default 60 s). Call again with the returned last_id as --since."},
-        {"name": "read", "usage": "hancho-cli msg read <id...> | --all", "description": "Mark messages as read (sends read receipts)."},
-        {"name": "download", "usage": "hancho-cli msg download <message-id> [--file-id n] [--dir d] [--wait] [--timeout sec]", "description": "Download files of an incoming message; --wait blocks until the download finishes."},
-        {"name": "log", "usage": "hancho-cli msg log [--since 7d|YYYY-MM-DD] [--until d] [--query text] [--peer p] [--agent a] [--event recv|send|local|status|file_sent|file_received|handler_*] [--limit n]", "description": "Search the conversation log."},
-        {"name": "handler", "usage": "hancho-cli msg handler [on|off] [--engine e] [--model m] [--agent a] [--auto-reply on|off]", "description": "Show or change ipmsg.handler (the worker LLM that answers messages). Without arguments prints it; config.json is patched and the node restarts."},
-        {"name": "clear", "usage": "hancho-cli msg clear", "description": "Remove the message history (log files stay)."}
+        {"name": "status", "usage": "hancho-cli chat status", "description": "Show the node state, peers, unread count, last message id and handler."},
+        {"name": "on", "usage": "hancho-cli chat on", "description": "Enable the node (writes chat.enabled and restarts it)."},
+        {"name": "off", "usage": "hancho-cli chat off", "description": "Disable the node."},
+        {"name": "peers", "usage": "hancho-cli chat peers", "description": "List hosts seen on the LAN."},
+        {"name": "refresh", "usage": "hancho-cli chat refresh", "description": "Broadcast a presence entry; peers answer within a second."},
+        {"name": "send", "usage": "hancho-cli chat send <to> <text...> [--from-agent a] [--to-agent a] [--reply-to id] [--audience human|agent] [--file path]... [--stdin]", "description": "Send text and/or files. <to> is a peer key (ip:port), an IP or nickname, '*' for every peer, or 'local'/'self' for agents on this node only. --stdin reads the body from stdin."},
+        {"name": "inbox", "usage": "hancho-cli chat inbox [--agent a] [--since id] [--unread] [--all] [--limit n] [--mark-read]", "description": "Show received messages; --all also includes outgoing ones."},
+        {"name": "get", "usage": "hancho-cli chat get <id>", "description": "Show one message with its files."},
+        {"name": "wait", "usage": "hancho-cli chat wait [--agent a] [--since id] [--timeout sec]", "description": "Long-poll for a new incoming message (default 60 s). Call again with the returned last_id as --since."},
+        {"name": "read", "usage": "hancho-cli chat read <id...> | --all", "description": "Mark messages as read (sends read receipts)."},
+        {"name": "download", "usage": "hancho-cli chat download <message-id> [--file-id n] [--dir d] [--wait] [--timeout sec]", "description": "Download files of an incoming message; --wait blocks until the download finishes."},
+        {"name": "log", "usage": "hancho-cli chat log [--since 7d|YYYY-MM-DD] [--until d] [--query text] [--peer p] [--agent a] [--event recv|send|local|status|file_sent|file_received|handler_*] [--limit n]", "description": "Search the conversation log."},
+        {"name": "handler", "usage": "hancho-cli chat handler [on|off] [--engine e] [--model m] [--agent a] [--cwd d] [--instructions s] [--taskqueue q] [--auto-reply on|off] [--skip-permissions on|off] [--timeout sec] [--max-hops n] [--concurrency n]", "description": "Show or change chat.handler (the worker LLM that answers messages) via the chat_handler IPC action. Without arguments prints the current handler; only supplied fields change and the node re-reads the config."},
+        {"name": "clear", "usage": "hancho-cli chat clear", "description": "Remove the message history (log files stay)."}
       ],
       "notes": [
         "LLM to LLM: agents name themselves with --from-agent and address others with --to-agent.",
@@ -3245,7 +3248,7 @@ void PrintCliUsageJson() {
           }
         }
       },
-      "tools": ["start_process", "list_processes", "get_process_output", "send_process_input", "wait_process", "kill_process", "run_worker", "wait_worker", "get_worker_stream", "get_worker_state", "update_worker_info", "taskqueue_add", "taskqueue_list", "taskqueue_get", "taskqueue_retry", "taskqueue_update", "taskqueue_cancel", "taskqueue_pause", "taskqueue_resume", "taskqueue_wait", "taskqueue_purge", "taskqueue_link", "taskqueue_unlink", "taskqueue_graph", "memory_search", "memory_get", "memory_brief", "memory_stats", "memory_note", "memory_retract", "bt_validate", "bt_start", "bt_get", "bt_list", "bt_wait", "bt_resume", "bt_retry", "bt_update", "bt_cancel", "bt_pause", "ipmsg_status", "ipmsg_peers", "ipmsg_refresh", "ipmsg_send", "ipmsg_get", "ipmsg_inbox", "ipmsg_wait", "ipmsg_read", "ipmsg_download", "ipmsg_log"]
+      "tools": ["start_process", "list_processes", "get_process_output", "send_process_input", "wait_process", "kill_process", "run_worker", "wait_worker", "get_worker_stream", "get_worker_state", "update_worker_info", "taskqueue_add", "taskqueue_list", "taskqueue_get", "taskqueue_retry", "taskqueue_update", "taskqueue_cancel", "taskqueue_pause", "taskqueue_resume", "taskqueue_wait", "taskqueue_purge", "taskqueue_link", "taskqueue_unlink", "taskqueue_graph", "bt_validate", "bt_start", "bt_get", "bt_list", "bt_wait", "bt_resume", "bt_retry", "bt_update", "bt_cancel", "bt_pause", "power_suspend", "power_cancel", "power_status", "chat_status", "chat_peers", "chat_refresh", "chat_send", "chat_get", "chat_inbox", "chat_wait", "chat_read", "chat_download", "chat_log", "chat_handler", "memory_search", "memory_get", "memory_brief", "memory_stats", "memory_note", "memory_retract", "memory_approve", "usage_stats", "usage_export"]
     }
   },
   "leaving": {
@@ -5000,7 +5003,7 @@ static int RunIpmsgCommand(const std::vector<std::string>& args, bool jsonOutput
         resp = nlohmann::json::parse(text, nullptr, false);
         if (resp.is_discarded() || !resp.is_object()) return fail("invalid IPC response");
         if (!resp.value("ok", false)) {
-            return fail(resp.value("error", std::string("IPMsg request failed")));
+            return fail(resp.value("error", std::string("Chat request failed")));
         }
         return 0;
     };
@@ -5062,7 +5065,7 @@ static int RunIpmsgCommand(const std::vector<std::string>& args, bool jsonOutput
     };
 
     auto printStatus = [&](const nlohmann::json& j) {
-        std::cout << "IPMsg: " << (j.value("running", false) ? "running" : "stopped") << "\n";
+        std::cout << "Chat: " << (j.value("running", false) ? "running" : "stopped") << "\n";
         if (j.contains("config") && j["config"].is_object()) {
             const auto& c = j["config"];
             std::cout << "  port: " << c.value("port", 2426) << "  bind: "
@@ -5092,11 +5095,11 @@ static int RunIpmsgCommand(const std::vector<std::string>& args, bool jsonOutput
     };
 
     const std::string helpText =
-        "Usage: hancho-cli msg <status|on|off|peers|refresh|send|inbox|get|wait|read|download|log|handler|clear>\n"
-        "       (alias: hancho-cli ipmsg ...)\n"
+        "Usage: hancho-cli chat <status|on|off|peers|refresh|send|inbox|get|wait|read|download|log|handler|clear>\n"
+        "       (alias: hancho-cli msg ...)\n"
         "\n"
         "  status                 Show the node state, peers, unread count and handler.\n"
-        "  on | off               Enable or disable the IPMsg node (writes ipmsg.enabled).\n"
+        "  on | off               Enable or disable the Chat node (writes chat.enabled).\n"
         "  peers                  List hosts seen on the LAN.\n"
         "  refresh                Broadcast a presence entry and wait for peer answers.\n"
         "  send <to> <text...> [--from-agent a] [--to-agent a] [--reply-to id]\n"
@@ -5116,7 +5119,7 @@ static int RunIpmsgCommand(const std::vector<std::string>& args, bool jsonOutput
         "      [--event recv|send|local|status|file_sent|file_received|handler_*] [--limit n]\n"
         "                         Search the conversation log.\n"
         "  handler [on|off] [--engine e] [--model m] [--agent a] [--auto-reply on|off]\n"
-        "                         Show or change ipmsg.handler (the LLM that answers messages).\n"
+        "                         Show or change chat.handler (the LLM that answers messages).\n"
         "  clear                  Remove the message history (log files are kept).\n"
         "\n"
         "LLM to LLM:\n"
@@ -5134,13 +5137,13 @@ static int RunIpmsgCommand(const std::vector<std::string>& args, bool jsonOutput
     }
 
     nlohmann::json req;
-    req["action"] = "ipmsg_" + op;
+    req["action"] = "chat_" + op;
 
     if (op == "status" || op == "peers" || op == "refresh" || op == "clear") {
-        if (op == "status") req["action"] = "ipmsg_status";
-        if (op == "peers") req["action"] = "ipmsg_peers";
-        if (op == "refresh") req["action"] = "ipmsg_refresh";
-        if (op == "clear") req["action"] = "ipmsg_clear";
+        if (op == "status") req["action"] = "chat_status";
+        if (op == "peers") req["action"] = "chat_peers";
+        if (op == "refresh") req["action"] = "chat_refresh";
+        if (op == "clear") req["action"] = "chat_clear";
         nlohmann::json resp;
         if (int rc = call(req, resp)) return rc;
         if (jsonOutput) {
@@ -5175,7 +5178,7 @@ static int RunIpmsgCommand(const std::vector<std::string>& args, bool jsonOutput
     }
 
     if (op == "on" || op == "off") {
-        req["action"] = "ipmsg_enable";
+        req["action"] = "chat_enable";
         req["enabled"] = (op == "on");
         nlohmann::json resp;
         if (int rc = call(req, resp)) return rc;
@@ -5183,7 +5186,7 @@ static int RunIpmsgCommand(const std::vector<std::string>& args, bool jsonOutput
             std::cout << resp.dump() << "\n";
             return 0;
         }
-        std::cout << "IPMsg " << (op == "on" ? "enabled" : "disabled") << ".\n";
+        std::cout << "Chat " << (op == "on" ? "enabled" : "disabled") << ".\n";
         printStatus(resp);
         return 0;
     }
@@ -5213,7 +5216,7 @@ static int RunIpmsgCommand(const std::vector<std::string>& args, bool jsonOutput
             } else if (a == "--stdin") {
                 useStdin = true;
             } else if (!a.empty() && a[0] == '-') {
-                return fail("unknown msg send option: " + a);
+                return fail("unknown chat send option: " + a);
             } else if (to.empty()) {
                 to = a;
             } else {
@@ -5284,17 +5287,17 @@ static int RunIpmsgCommand(const std::vector<std::string>& args, bool jsonOutput
             } else if (a == "--timeout" && i + 1 < args.size()) {
                 timeoutSec = intValue(args[++i], 60);
             } else {
-                return fail("unknown msg " + op + " option: " + a);
+                return fail("unknown chat " + op + " option: " + a);
             }
         }
         if (op == "wait") {
-            req["action"] = "ipmsg_wait";
+            req["action"] = "chat_wait";
             req["since_id"] = sinceId;
             req["agent"] = agent;
             req["timeout_ms"] = timeoutSec * 1000;
             req["mark_read"] = markRead;
         } else {
-            req["action"] = "ipmsg_inbox";
+            req["action"] = "chat_inbox";
             req["since_id"] = sinceId;
             req["agent"] = agent;
             req["unread_only"] = unread;
@@ -5344,7 +5347,7 @@ static int RunIpmsgCommand(const std::vector<std::string>& args, bool jsonOutput
         for (size_t i = 3; i < args.size(); ++i) {
             const std::string& a = args[i];
             if (a == "--all") all = true;
-            else if (!a.empty() && a[0] == '-') return fail("unknown msg read option: " + a);
+            else if (!a.empty() && a[0] == '-') return fail("unknown chat read option: " + a);
             else ids.push_back(uintValue(a, 0));
         }
         if (!all && ids.empty()) return fail("msg read requires <id...> or --all");
@@ -5378,10 +5381,10 @@ static int RunIpmsgCommand(const std::vector<std::string>& args, bool jsonOutput
             } else if (a == "--timeout" && i + 1 < args.size()) {
                 timeoutSec = intValue(args[++i], 300);
             } else {
-                return fail("unknown msg download option: " + a);
+                return fail("unknown chat download option: " + a);
             }
         }
-        req["action"] = "ipmsg_download";
+        req["action"] = "chat_download";
         req["message_id"] = messageId;
         req["file_id"] = fileId;
         req["dir"] = dir;
@@ -5430,7 +5433,7 @@ static int RunIpmsgCommand(const std::vector<std::string>& args, bool jsonOutput
             } else if (a == "--limit" && i + 1 < args.size()) {
                 limit = intValue(args[++i], 200);
             } else {
-                return fail("unknown msg log option: " + a);
+                return fail("unknown chat log option: " + a);
             }
         }
         req["since"] = since;
@@ -5482,49 +5485,55 @@ static int RunIpmsgCommand(const std::vector<std::string>& args, bool jsonOutput
     }
 
     if (op == "handler") {
-        std::string opFlag;
-        std::string engine;
-        std::string model;
-        std::string agent;
-        std::string autoReply;
-        bool hasEngine = false, hasModel = false, hasAgent = false, hasAutoReply = false;
+        nlohmann::json patch = {{"action", "chat_handler"}};
+        bool change = false;
         for (size_t i = 3; i < args.size(); ++i) {
             const std::string& a = args[i];
-            if (a == "--engine" && i + 1 < args.size()) {
-                engine = args[++i];
-                hasEngine = true;
+            if ((a == "on" || a == "off") && !patch.contains("enabled")) {
+                patch["enabled"] = (a == "on");
+                change = true;
+            } else if (a == "--engine" && i + 1 < args.size()) {
+                patch["engine"] = args[++i];
+                change = true;
             } else if (a == "--model" && i + 1 < args.size()) {
-                model = args[++i];
-                hasModel = true;
+                patch["model"] = args[++i];
+                change = true;
             } else if (a == "--agent" && i + 1 < args.size()) {
-                agent = args[++i];
-                hasAgent = true;
+                patch["agent"] = args[++i];
+                change = true;
+            } else if (a == "--cwd" && i + 1 < args.size()) {
+                patch["cwd"] = args[++i];
+                change = true;
+            } else if (a == "--instructions" && i + 1 < args.size()) {
+                patch["instructions"] = args[++i];
+                change = true;
+            } else if (a == "--taskqueue" && i + 1 < args.size()) {
+                patch["taskqueue"] = args[++i];
+                change = true;
             } else if (a == "--auto-reply" && i + 1 < args.size()) {
-                autoReply = args[++i];
-                hasAutoReply = true;
-            } else if ((a == "on" || a == "off") && opFlag.empty()) {
-                opFlag = a;
+                patch["auto_reply"] = boolValue(args[++i], true);
+                change = true;
+            } else if (a == "--skip-permissions" && i + 1 < args.size()) {
+                patch["skip_permissions"] = boolValue(args[++i], false);
+                change = true;
+            } else if (a == "--timeout" && i + 1 < args.size()) {
+                patch["timeout_sec"] = intValue(args[++i], 600);
+                change = true;
+            } else if (a == "--max-hops" && i + 1 < args.size()) {
+                patch["max_hops"] = intValue(args[++i], 4);
+                change = true;
+            } else if (a == "--concurrency" && i + 1 < args.size()) {
+                patch["concurrency"] = intValue(args[++i], 1);
+                change = true;
             } else if (!a.empty() && a[0] == '-') {
-                return fail("unknown msg handler option: " + a);
+                return fail("unknown chat handler option: " + a);
             } else {
-                return fail("unknown msg handler argument: " + a + " (use on or off)");
+                return fail("unknown chat handler argument: " + a + " (use on or off)");
             }
         }
 
-        nlohmann::json getResp;
-        nlohmann::json getReq;
-        getReq["action"] = "config_get";
-        if (int rc = call(getReq, getResp)) return rc;
-        if (!getResp.contains("config") || !getResp["config"].is_object())
-            return fail("config_get returned no config");
-        nlohmann::json ipmsg = getResp["config"].value("ipmsg", nlohmann::json::object());
-        if (!ipmsg.is_object()) ipmsg = nlohmann::json::object();
-        if (!ipmsg.contains("handler") || !ipmsg["handler"].is_object())
-            ipmsg["handler"] = nlohmann::json::object();
-        nlohmann::json& handler = ipmsg["handler"];
-
         auto printHandler = [&](const nlohmann::json& h) {
-            std::cout << "IPMsg handler: " << (h.value("enabled", false) ? "on" : "off") << "\n";
+            std::cout << "Chat handler: " << (h.value("enabled", false) ? "on" : "off") << "\n";
             std::cout << "  engine: " << h.value("engine", std::string())
                       << "  model: " << h.value("model", std::string())
                       << "  agent: " << h.value("agent", std::string()) << "\n";
@@ -5537,47 +5546,42 @@ static int RunIpmsgCommand(const std::vector<std::string>& args, bool jsonOutput
             if (!cwd.empty()) std::cout << "  cwd: " << cwd << "\n";
             const std::string instructions = h.value("instructions", std::string());
             if (!instructions.empty()) std::cout << "  instructions: " << instructions << "\n";
+            if (h.contains("queued")) {
+                std::cout << "  handler jobs: queued " << h.value("queued", 0) << ", running "
+                          << h.value("running", 0) << ", done " << h.value("done", 0) << ", failed "
+                          << h.value("failed", 0) << "\n";
+            }
         };
 
-        const bool change = !opFlag.empty() || hasEngine || hasModel || hasAgent || hasAutoReply;
         if (!change) {
+            nlohmann::json status;
+            if (int rc = call({{"action", "chat_status"}}, status)) return rc;
+            if (!status.contains("handler") || !status["handler"].is_object()) {
+                return fail("chat_status returned no handler");
+            }
             if (jsonOutput) {
-                std::cout << handler.dump() << "\n";
+                std::cout << status["handler"].dump() << "\n";
                 return 0;
             }
-            printHandler(handler);
+            printHandler(status["handler"]);
             return 0;
         }
 
-        if (!opFlag.empty()) handler["enabled"] = (opFlag == "on");
-        if (hasEngine) handler["engine"] = engine;
-        if (hasModel) handler["model"] = model;
-        if (hasAgent) handler["agent"] = agent;
-        if (hasAutoReply) handler["auto_reply"] = boolValue(autoReply, handler.value("auto_reply", true));
-
-        nlohmann::json setReq;
-        setReq["action"] = "config_set";
-        setReq["ipmsg"] = ipmsg;
-        nlohmann::json setResp;
-        if (int rc = call(setReq, setResp)) return rc;
-        nlohmann::json saved = handler;
-        if (setResp.contains("config") && setResp["config"].is_object()) {
-            const auto& cfg = setResp["config"];
-            if (cfg.contains("ipmsg") && cfg["ipmsg"].is_object() &&
-                cfg["ipmsg"].contains("handler") && cfg["ipmsg"]["handler"].is_object()) {
-                saved = cfg["ipmsg"]["handler"];
-            }
-        }
+        nlohmann::json resp;
+        if (int rc = call(patch, resp)) return rc;
+        nlohmann::json saved = resp.contains("handler") && resp["handler"].is_object()
+                                   ? resp["handler"]
+                                   : nlohmann::json::object();
         if (jsonOutput) {
             std::cout << saved.dump() << "\n";
             return 0;
         }
         printHandler(saved);
-        std::cout << "Saved to config.json. The IPMsg node restarts with the new settings.\n";
+        std::cout << "Saved to config.json. The Chat node restarts with the new settings.\n";
         return 0;
     }
 
-    return fail("unknown msg command: " + op +
+    return fail("unknown chat command: " + op +
                 " (status, on, off, peers, refresh, send, inbox, get, wait, read, download, log, "
                 "handler, clear)");
 }
@@ -5636,7 +5640,7 @@ int RunCli(const std::vector<std::string>& rawArgs) {
     if (subcmd == "hosts") return RunHostsCommand(args, jsonOutput);
     if (subcmd == "usage") return RunUsageCommand(args, 2, jsonOutput);
     if (subcmd == "power") return RunPowerCommand(args, jsonOutput);
-    if (subcmd == "msg" || subcmd == "ipmsg") return RunIpmsgCommand(args, jsonOutput);
+    if (subcmd == "chat" || subcmd == "msg" || subcmd == "ipmsg") return RunIpmsgCommand(args, jsonOutput);
     if (subcmd == "memory") {
         bool compareInject = false;
         for (size_t i = 2; i < args.size(); ++i) {

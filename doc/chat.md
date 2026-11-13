@@ -1,10 +1,10 @@
-# IP Messenger (IPMsg) compatible LAN messaging
+# Chat (IPMsg compatible LAN messaging)
 
-**[English](ipmsg.md) | [日本語 (Japanese)](ipmsg-ja.md)**
+**[English](chat.md) | [日本語 (Japanese)](chat-ja.md)**
 
 Hancho can speak the classic IP Messenger (IPMsg) protocol, so a stock IPMsg client on the same LAN can see Hancho as a host and exchange messages and files with it. The same channel is used for LLM-to-LLM messaging: a received message can be handed to a worker LLM, and its answer is sent back as a normal IPMsg reply.
 
-The feature is **off by default** and is meant for a **trusted LAN only**. Nothing is encrypted or authenticated.
+Chat is **off by default** and is meant for a **trusted LAN only**. Nothing is encrypted or authenticated.
 
 ## What works
 
@@ -38,7 +38,7 @@ The default port is **2426**, not IPMsg's well-known 2425 (`kIpmsgDefaultPort`).
 The block lives in `<data-dir>/config.json` (`%LOCALAPPDATA%\Programs\Hancho\logs\config.json` by default). `config_get` fills in these defaults when the block is missing or partial.
 
 ```json
-"ipmsg": {
+"chat": {
   "enabled": false,
   "port": 2426,
   "bind": "0.0.0.0",
@@ -57,7 +57,7 @@ The block lives in `<data-dir>/config.json` (`%LOCALAPPDATA%\Programs\Hancho\log
     "agent": "",
     "cwd": "",
     "instructions": "",
-    "taskqueue": "ipmsg",
+    "taskqueue": "chat",
     "auto_reply": true,
     "skip_permissions": false,
     "timeout_sec": 600,
@@ -76,7 +76,7 @@ The block lives in `<data-dir>/config.json` (`%LOCALAPPDATA%\Programs\Hancho\log
 | `group` | `"Hancho"` | IPMsg group name. |
 | `hosts` | `[]` | Extra broadcast/unicast targets (`"192.168.1.255"`, `"10.0.0.5:2426"`). |
 | `allow_from` | `[]` | Accepted source networks/hosts. Empty = every private/loopback/link-local address. |
-| `download_dir` | `""` | Where received files go. Empty = `<data-dir>/ipmsg/files`. |
+| `download_dir` | `""` | Where received files go. Empty = `<data-dir>/chat/files`. |
 | `auto_download` | `false` | Download files automatically as messages arrive. |
 | `max_file_mb` | `1024` | Size limit per file for downloads. |
 | `max_messages` | `2000` | Messages kept in the history (10-100000). |
@@ -86,14 +86,14 @@ The block lives in `<data-dir>/config.json` (`%LOCALAPPDATA%\Programs\Hancho\log
 | `handler.agent` | `""` | Also handle messages addressed to this agent. Empty = only unaddressed messages; when set, messages addressed to another agent are skipped. |
 | `handler.cwd` | `""` | Worker working directory; empty = the data directory. |
 | `handler.instructions` | `""` | Extra instructions prepended to the handler prompt. |
-| `handler.taskqueue` | `"ipmsg"` | Task queue that receives the handler jobs. |
+| `handler.taskqueue` | `"chat"` | Task queue that receives the handler jobs. |
 | `handler.auto_reply` | `true` | Send the worker's answer back automatically. |
 | `handler.skip_permissions` | `false` | Pass the engine's permission-bypass arguments (see Security). |
 | `handler.timeout_sec` | `600` | Per-message worker timeout. |
 | `handler.max_hops` | `4` | Stop replying when a reply chain reaches this many hops. |
 | `handler.concurrency` | `1` | Queue concurrency for handler jobs. |
 
-Changes made with `hancho-cli msg handler ...`, the dialog's Settings tab or `config_set` are written to `config.json`; the node and the handler reload without restarting the core.
+Changes made with `hancho-cli chat handler ...`, the dialog's Settings tab or `config_set` are written to `config.json`; the node and the handler reload without restarting the core.
 
 ## Message JSON
 
@@ -127,24 +127,24 @@ IPC, CLI, MCP and the history file use the same shape:
 
 The agent fields, `audience` and `hops` travel in a hidden Hancho extension after the text and file list; stock IPMsg clients ignore it. A plain message whose text starts with `@name ` is addressed to agent `name`.
 
-## CLI: `hancho-cli msg` (alias: `ipmsg`)
+## CLI: `hancho-cli chat` (alias: `msg`)
 
 ```powershell
-hancho-cli.exe msg status
-hancho-cli.exe msg on | off            # writes ipmsg.enabled and restarts the node
-hancho-cli.exe msg peers
-hancho-cli.exe msg refresh             # broadcast presence and collect answers
-hancho-cli.exe msg clear               # remove history; daily log files stay
+hancho-cli.exe chat status
+hancho-cli.exe chat on | off            # writes chat.enabled and restarts the node
+hancho-cli.exe chat peers
+hancho-cli.exe chat refresh             # broadcast presence and collect answers
+hancho-cli.exe chat clear               # remove history; daily log files stay
 ```
 
 Send text and/or files:
 
 ```powershell
-hancho-cli.exe msg send 192.168.1.20:2426 "build finished"
-hancho-cli.exe msg send "*" "maintenance at 22:00" --from-agent ops
-hancho-cli.exe msg send local "please review" --to-agent reviewer --audience agent
-hancho-cli.exe msg send 192.168.1.20 "here is the log" --file C:\tmp\build.log
-Get-Content C:\tmp\body.txt | hancho-cli.exe msg send 192.168.1.20 --stdin
+hancho-cli.exe chat send 192.168.1.20:2426 "build finished"
+hancho-cli.exe chat send "*" "maintenance at 22:00" --from-agent ops
+hancho-cli.exe chat send local "please review" --to-agent reviewer --audience agent
+hancho-cli.exe chat send 192.168.1.20 "here is the log" --file C:\tmp\build.log
+Get-Content C:\tmp\body.txt | hancho-cli.exe chat send 192.168.1.20 --stdin
 ```
 
 `<to>` accepts a peer key (`ip:port`), an IP, a nickname, `*` for every peer, or `local`/`self` for agents on this node only. Add `--from-agent`, `--to-agent`, `--reply-to` and `--audience human|agent` as needed.
@@ -152,26 +152,26 @@ Get-Content C:\tmp\body.txt | hancho-cli.exe msg send 192.168.1.20 --stdin
 Receive and inspect:
 
 ```powershell
-hancho-cli.exe msg inbox --since 0 --limit 50
-hancho-cli.exe msg inbox --agent reviewer --unread --mark-read
-hancho-cli.exe msg get 12
-hancho-cli.exe msg wait --agent reviewer --since 12 --timeout 120
-hancho-cli.exe msg read 12 13
-hancho-cli.exe msg read --all
-hancho-cli.exe msg download 12 --wait
-hancho-cli.exe msg download 12 --file-id 1 --dir C:\incoming
+hancho-cli.exe chat inbox --since 0 --limit 50
+hancho-cli.exe chat inbox --agent reviewer --unread --mark-read
+hancho-cli.exe chat get 12
+hancho-cli.exe chat wait --agent reviewer --since 12 --timeout 120
+hancho-cli.exe chat read 12 13
+hancho-cli.exe chat read --all
+hancho-cli.exe chat download 12 --wait
+hancho-cli.exe chat download 12 --file-id 1 --dir C:\incoming
 ```
 
-`msg wait` long-polls until a new incoming message arrives (default 60 s); pass the returned last id as the next `--since`.
+`chat wait` long-polls until a new incoming message arrives (default 60 s); pass the returned last id as the next `--since`.
 
 Log and handler:
 
 ```powershell
-hancho-cli.exe msg log --since 7d --query "build" --limit 50
-hancho-cli.exe msg log --event handler_reply
-hancho-cli.exe msg handler
-hancho-cli.exe msg handler on --engine opencode --model gpt-5.1 --agent hancho-llm
-hancho-cli.exe msg handler off
+hancho-cli.exe chat log --since 7d --query "build" --limit 50
+hancho-cli.exe chat log --event handler_reply
+hancho-cli.exe chat handler
+hancho-cli.exe chat handler on --engine opencode --model gpt-5.1 --agent hancho-llm
+hancho-cli.exe chat handler off
 ```
 
 Add `--json` (before or after the command) for the raw IPC reply.
@@ -182,16 +182,17 @@ The MCP server (`Hancho.exe mcp`) exposes ten tools. They accept camelCase (`sin
 
 | Tool | Purpose |
 | :--- | :--- |
-| `ipmsg_status` | Node state, port, nickname, peers, unread count, last id and the handler state. |
-| `ipmsg_peers` | Hosts seen on the LAN. |
-| `ipmsg_refresh` | Broadcast a presence entry; peers answer within a second. |
-| `ipmsg_send` | Send text/files (`to`, `text?`, `fromAgent?`, `toAgent?`, `replyTo?`, `audience?`, `files?`, `hops?`). |
-| `ipmsg_get` | One message with text, agent fields, audience and files (`messageId`). |
-| `ipmsg_inbox` | Received messages after `sinceId` (`agent?`, `includeUnaddressed?`, `unreadOnly?`, `includeOutgoing?`, `limit?`, `markRead?`). |
-| `ipmsg_wait` | Long-poll for a new message (`sinceId?`, `agent?`, `timeoutMs?`). Runs off the MCP read loop. |
-| `ipmsg_read` | Mark messages read and send read receipts (`ids?` or `all`). |
-| `ipmsg_download` | Download files (`messageId`, `fileId?`, `dir?`, `wait?`, `timeoutMs?`). |
-| `ipmsg_log` | Search the conversation log (`since?`, `until?`, `query?`, `peer?`, `agent?`, `event?`, `limit?`). |
+| `chat_status` | Node state, port, nickname, peers, unread count, last id and the handler state. |
+| `chat_peers` | Hosts seen on the LAN. |
+| `chat_refresh` | Broadcast a presence entry; peers answer within a second. |
+| `chat_send` | Send text/files (`to`, `text?`, `fromAgent?`, `toAgent?`, `replyTo?`, `audience?`, `files?`, `hops?`). |
+| `chat_get` | One message with text, agent fields, audience and files (`messageId`). |
+| `chat_inbox` | Received messages after `sinceId` (`agent?`, `includeUnaddressed?`, `unreadOnly?`, `includeOutgoing?`, `limit?`, `markRead?`). |
+| `chat_wait` | Long-poll for a new message (`sinceId?`, `agent?`, `timeoutMs?`). Runs off the MCP read loop. |
+| `chat_read` | Mark messages read and send read receipts (`ids?` or `all`). |
+| `chat_download` | Download files (`messageId`, `fileId?`, `dir?`, `wait?`, `timeoutMs?`). |
+| `chat_log` | Search the conversation log (`since?`, `until?`, `query?`, `peer?`, `agent?`, `event?`, `limit?`). |
+| `chat_handler` | Show or change the answering LLM (`enabled?`, `engine?`, `model?`, `agent?`, `instructions?`, `taskqueue?`, `autoReply?`, `skipPermissions?`, `timeoutSec?`, `maxHops?`, `concurrency?`). Only supplied fields change; `chat_status` shows the result. |
 
 ## LLM to LLM messaging
 
@@ -200,11 +201,11 @@ Agents identify themselves with `from_agent`, address another agent with `to_age
 ```powershell
 $since = 0
 while ($true) {
-  $reply = hancho-cli.exe msg wait --agent reviewer --since $since --timeout 120 --json | ConvertFrom-Json
+  $reply = hancho-cli.exe chat wait --agent reviewer --since $since --timeout 120 --json | ConvertFrom-Json
   if (-not $reply.ok) { continue }
   foreach ($m in $reply.messages) {
     $since = [Math]::Max($since, [int64]$m.id)
-    hancho-cli.exe msg send $m.peer.key "ack" --from-agent reviewer --to-agent $m.from_agent `
+    hancho-cli.exe chat send $m.peer.key "ack" --from-agent reviewer --to-agent $m.from_agent `
       --reply-to $m.id --audience agent
   }
 }
@@ -212,7 +213,7 @@ while ($true) {
 
 Audience rules:
 
-- `human`: the text is for a person. The LLM handler never processes it. Use it for notifications and answers meant to be read in an IPMsg window.
+- `human`: the text is for a person. The LLM handler never processes it. Use it for notifications and answers meant to be read in a Chat window.
 - `agent`: the text is for another LLM/Hancho. Covered by the handler when its filter matches.
 - Unspecified: treated like a human-written message (the handler skips it only if the text is not addressed to its agent).
 
@@ -223,7 +224,7 @@ A message with no `to_agent` is handled by any handler, whatever its `agent` val
 ### Handler flow
 
 1. An incoming (or local) message passes the filter: direction `in`/`local`, audience not `human`, `hops < max_hops`, not a local message from the handler's own agent, and `to_agent` compatible with `handler.agent`.
-2. Hancho creates a task queue job in `handler.taskqueue` (default `ipmsg`) with id `ipmsg-<message-id>` (a `-rN` suffix is added if that id already exists), summary `IPMsg from <peer>: <first line>`, one attempt and the configured engine/model/timeout. The prompt contains the message JSON and strict instructions to return one JSON object.
+2. Hancho creates a task queue job in `handler.taskqueue` (default `chat`) with id `chat-<message-id>` (a `-rN` suffix is added if that id already exists), summary `Chat from <peer>: <first line>`, one attempt and the configured engine/model/timeout. The prompt contains the message JSON and strict instructions to return one JSON object.
 3. The worker's final text is parsed as `{"audience":"human"|"agent","text":"...","to_agent":"..."}` or `{"audience":"none"}`. Unparseable text is treated as `human` with the text as the reply.
 4. If `auto_reply` is true and the answer is not `none`, Hancho sends the reply to the original peer (or `local`), with `from_agent` = `handler.agent` or `hancho-llm`, `to_agent` = the answer's `to_agent` or the original sender, `reply_to` = the original message id, `audience` from the answer, and `hops` + 1.
 5. Every step writes a `handler_*` log event.
@@ -232,9 +233,9 @@ Workers are normal Hancho jobs, so they appear in the task queue, keep their JSO
 
 ## Logs and history
 
-- **History**: `<data-dir>/ipmsg/messages.json`, capped at `max_messages`. `msg clear` removes it.
-- **Conversation log**: `<data-dir>/ipmsg/log/ipmsg-YYYY-MM-DD.jsonl`, one JSON object per line, one file per day. Log files are kept when the history is cleared.
-- **Received files**: `<data-dir>/ipmsg/files` unless `download_dir` is set.
+- **History**: `<data-dir>/chat/messages.json`, capped at `max_messages`. `chat clear` removes it.
+- **Conversation log**: `<data-dir>/chat/log/chat-YYYY-MM-DD.jsonl`, one JSON object per line, one file per day. Log files are kept when the history is cleared.
+- **Received files**: `<data-dir>/chat/files` unless `download_dir` is set.
 
 Events written to the log:
 
@@ -251,21 +252,22 @@ Events written to the log:
 | `handler_no_reply` | No reply was sent (`audience-none`, empty answer or `auto-reply-disabled`). |
 | `handler_failed` | The job could not be built/queued or the reply could not be sent. |
 
-Use `hancho-cli msg log` (or MCP `ipmsg_log`) with `--since`, `--until`, `--query`, `--peer`, `--agent`, `--event` and `--limit`. The dialog's **Log** tab provides the same filters and an **Open folder** button.
+Use `hancho-cli chat log` (or MCP `chat_log`) with `--since`, `--until`, `--query`, `--peer`, `--agent`, `--event` and `--limit`. The dialog's **Log** tab provides the same filters and an **Open folder** button.
 
 ## Standalone dialog
 
 ```powershell
-Hancho.exe ipmsg [--data-dir <path>] [--tray]
+Hancho.exe chat [--data-dir <path>] [--tray]
 ```
 
-- Runs only the IPMsg dialog as an IPC client; it does not create the main dashboard window. If the core is not running, it starts it headlessly first.
+- Runs only the Chat dialog as an IPC client; it does not create the main dashboard window. If the core is not running, it starts it headlessly first.
 - One dialog per data directory (named mutex). A second launch brings the existing window to the front.
 - Own tray icon. When a message arrives whose audience is not `agent`, the dialog shows a balloon notification and an unread count in the title/tooltip. It never opens by itself.
 - Close (`X`) hides to the tray. Tray menu: **Open**, **Exit**. `--tray` starts hidden.
-- Tabs: **Chat** (hosts, messages, message body, attachments, compose and reply), **Log** (searchable conversation log) and **Settings** (enable, port, nickname, group, extra hosts, handler on/off, engine, model, agent, auto reply). Settings are written through `config_set`, so the core reloads the node and handler.
-- The main dashboard toolbar has an IPMsg button (`💬`) that launches the dialog, and at dashboard start it launches `Hancho.exe ipmsg --tray` when `ipmsg.enabled` is true.
+- Tabs: **Chat** (hosts, messages, message body, attachments, compose and reply, plus an **Answering LLM** bar to change the handler engine/model and enable/disable it), **Log** (searchable conversation log) and **Settings** (enable, port, nickname, group, extra hosts, handler on/off, engine, model, agent, auto reply). Settings are written through `config_set`, so the core reloads the node and handler.
+- The window follows the dashboard theme (`theme` in `config.json`): window, lists, headers, edits, buttons and tabs are painted from the same palette, and a theme change is picked up while the window is open.
+- The main dashboard toolbar has a Chat button (`💬`) that launches the dialog, and at dashboard start it launches `Hancho.exe chat --tray` when `chat.enabled` is true.
 
 ## IPC actions
 
-For tool developers, the same operations are available over the Named Pipe: `ipmsg_status`, `ipmsg_enable`, `ipmsg_peers`, `ipmsg_refresh`, `ipmsg_send`, `ipmsg_get`, `ipmsg_inbox`, `ipmsg_wait`, `ipmsg_read`, `ipmsg_download`, `ipmsg_log` and `ipmsg_clear`. Fields are snake_case; `ipmsg_wait` blocks for up to 600000 ms. `config_get` returns the `ipmsg` block with defaults, and `config_set` with an `ipmsg` patch restarts the node on a helper thread.
+For tool developers, the same operations are available over the Named Pipe: `chat_status`, `chat_enable`, `chat_peers`, `chat_refresh`, `chat_send`, `chat_get`, `chat_inbox`, `chat_wait`, `chat_read`, `chat_download`, `chat_log`, `chat_handler` and `chat_clear`. Fields are snake_case; `chat_wait` blocks for up to 600000 ms. `config_get` returns the `chat` block with defaults, `config_set` with a `chat` patch restarts the node on a helper thread, and `chat_handler` patches only the answering-LLM fields.

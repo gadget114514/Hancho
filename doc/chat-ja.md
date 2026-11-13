@@ -1,6 +1,6 @@
-# IP Messenger (IPMsg) 互換 LAN メッセージング
+# Chat（IPMsg 互換 LAN メッセージング）
 
-**[English](ipmsg.md) | [日本語 (Japanese)](ipmsg-ja.md)**
+**[English](chat.md) | [日本語 (Japanese)](chat-ja.md)**
 
 Hancho は古典的な IP Messenger (IPMsg) プロトコルを話せるため、同じ LAN 上の既存の IPMsg クライアントから Hancho がホストとして見え、メッセージとファイルをやり取りできます。このチャネルは LLM 同士のメッセージングにも使います。受信メッセージをワーカー LLM に渡し、その回答を通常の IPMsg 返信として送り返せます。
 
@@ -38,7 +38,7 @@ Hancho は古典的な IP Messenger (IPMsg) プロトコルを話せるため、
 設定は `<data-dir>/config.json`（既定は `%LOCALAPPDATA%\Programs\Hancho\logs\config.json`）にあります。ブロックがない、または一部だけの場合は `config_get` が以下の既定値を補います。
 
 ```json
-"ipmsg": {
+"chat": {
   "enabled": false,
   "port": 2426,
   "bind": "0.0.0.0",
@@ -57,7 +57,7 @@ Hancho は古典的な IP Messenger (IPMsg) プロトコルを話せるため、
     "agent": "",
     "cwd": "",
     "instructions": "",
-    "taskqueue": "ipmsg",
+    "taskqueue": "chat",
     "auto_reply": true,
     "skip_permissions": false,
     "timeout_sec": 600,
@@ -76,7 +76,7 @@ Hancho は古典的な IP Messenger (IPMsg) プロトコルを話せるため、
 | `group` | `"Hancho"` | IPMsg のグループ名。 |
 | `hosts` | `[]` | 追加のブロードキャスト/ユニキャスト先（`"192.168.1.255"`, `"10.0.0.5:2426"`）。 |
 | `allow_from` | `[]` | 受け付ける送信元ネットワーク/ホスト。空 = プライベート/ループバック/リンクローカル全て。 |
-| `download_dir` | `""` | 受信ファイルの保存先。空 = `<data-dir>/ipmsg/files`。 |
+| `download_dir` | `""` | 受信ファイルの保存先。空 = `<data-dir>/chat/files`。 |
 | `auto_download` | `false` | メッセージ受信時に自動でダウンロードする。 |
 | `max_file_mb` | `1024` | ダウンロードする 1 ファイルあたりの上限サイズ。 |
 | `max_messages` | `2000` | 履歴に保持するメッセージ数（10〜100000）。 |
@@ -86,14 +86,14 @@ Hancho は古典的な IP Messenger (IPMsg) プロトコルを話せるため、
 | `handler.agent` | `""` | このエージェント宛のメッセージも処理する。空 = 宛先なしのみ。設定時は別エージェント宛を除外。 |
 | `handler.cwd` | `""` | ワーカーの作業ディレクトリ。空 = データディレクトリ。 |
 | `handler.instructions` | `""` | ハンドラのプロンプト先頭に足す追加指示。 |
-| `handler.taskqueue` | `"ipmsg"` | ハンドラのジョブを入れるタスクキュー。 |
+| `handler.taskqueue` | `"chat"` | ハンドラのジョブを入れるタスクキュー。 |
 | `handler.auto_reply` | `true` | ワーカーの回答を自動で返信する。 |
 | `handler.skip_permissions` | `false` | エンジンの権限バイパス引数を渡す（セキュリティ参照）。 |
 | `handler.timeout_sec` | `600` | 1 メッセージあたりのワーカー制限時間。 |
 | `handler.max_hops` | `4` | 返信チェーンがこのホップ数に達したら返信を止める。 |
 | `handler.concurrency` | `1` | ハンドラジョブのキュー並列度。 |
 
-`hancho-cli msg handler ...`、ダイアログの設定タブ、`config_set` での変更は `config.json` に保存され、コアを再起動せずにノードとハンドラが再読み込みされます。
+`hancho-cli chat handler ...`、ダイアログの設定タブ、`config_set` での変更は `config.json` に保存され、コアを再起動せずにノードとハンドラが再読み込みされます。
 
 ## メッセージ JSON
 
@@ -127,24 +127,24 @@ IPC、CLI、MCP、履歴ファイルは同じ形を使います。
 
 エージェント関連フィールド、`audience`、`hops` は本文とファイル一覧の後ろにある Hancho 独自の隠し拡張で運ばれ、既存の IPMsg クライアントは無視します。拡張を持たない本文が `@name ` で始まる場合は、エージェント `name` 宛として扱います。
 
-## CLI: `hancho-cli msg`（別名: `ipmsg`）
+## CLI: `hancho-cli chat`（別名: `chat`）
 
 ```powershell
-hancho-cli.exe msg status
-hancho-cli.exe msg on | off            # ipmsg.enabled を書き換えてノードを再起動
-hancho-cli.exe msg peers
-hancho-cli.exe msg refresh             # 参加通知を送り、応答を集める
-hancho-cli.exe msg clear               # 履歴を削除（日別ログファイルは残る）
+hancho-cli.exe chat status
+hancho-cli.exe chat on | off            # chat.enabled を書き換えてノードを再起動
+hancho-cli.exe chat peers
+hancho-cli.exe chat refresh             # 参加通知を送り、応答を集める
+hancho-cli.exe chat clear               # 履歴を削除（日別ログファイルは残る）
 ```
 
 本文とファイルの送信:
 
 ```powershell
-hancho-cli.exe msg send 192.168.1.20:2426 "build finished"
-hancho-cli.exe msg send "*" "maintenance at 22:00" --from-agent ops
-hancho-cli.exe msg send local "please review" --to-agent reviewer --audience agent
-hancho-cli.exe msg send 192.168.1.20 "here is the log" --file C:\tmp\build.log
-Get-Content C:\tmp\body.txt | hancho-cli.exe msg send 192.168.1.20 --stdin
+hancho-cli.exe chat send 192.168.1.20:2426 "build finished"
+hancho-cli.exe chat send "*" "maintenance at 22:00" --from-agent ops
+hancho-cli.exe chat send local "please review" --to-agent reviewer --audience agent
+hancho-cli.exe chat send 192.168.1.20 "here is the log" --file C:\tmp\build.log
+Get-Content C:\tmp\body.txt | hancho-cli.exe chat send 192.168.1.20 --stdin
 ```
 
 `<to>` にはピアキー（`ip:port`）、IP、ニックネーム、全ピアを表す `*`、同一ノードのエージェントだけを表す `local`/`self` を指定できます。必要に応じて `--from-agent`、`--to-agent`、`--reply-to`、`--audience human|agent` を付けます。
@@ -152,26 +152,26 @@ Get-Content C:\tmp\body.txt | hancho-cli.exe msg send 192.168.1.20 --stdin
 受信と確認:
 
 ```powershell
-hancho-cli.exe msg inbox --since 0 --limit 50
-hancho-cli.exe msg inbox --agent reviewer --unread --mark-read
-hancho-cli.exe msg get 12
-hancho-cli.exe msg wait --agent reviewer --since 12 --timeout 120
-hancho-cli.exe msg read 12 13
-hancho-cli.exe msg read --all
-hancho-cli.exe msg download 12 --wait
-hancho-cli.exe msg download 12 --file-id 1 --dir C:\incoming
+hancho-cli.exe chat inbox --since 0 --limit 50
+hancho-cli.exe chat inbox --agent reviewer --unread --mark-read
+hancho-cli.exe chat get 12
+hancho-cli.exe chat wait --agent reviewer --since 12 --timeout 120
+hancho-cli.exe chat read 12 13
+hancho-cli.exe chat read --all
+hancho-cli.exe chat download 12 --wait
+hancho-cli.exe chat download 12 --file-id 1 --dir C:\incoming
 ```
 
-`msg wait` は新しい受信メッセージが来るまでロングポーリングします（既定 60 秒）。返された最後の id を次の `--since` に渡してください。
+`chat wait` は新しい受信メッセージが来るまでロングポーリングします（既定 60 秒）。返された最後の id を次の `--since` に渡してください。
 
 ログとハンドラ:
 
 ```powershell
-hancho-cli.exe msg log --since 7d --query "build" --limit 50
-hancho-cli.exe msg log --event handler_reply
-hancho-cli.exe msg handler
-hancho-cli.exe msg handler on --engine opencode --model gpt-5.1 --agent hancho-llm
-hancho-cli.exe msg handler off
+hancho-cli.exe chat log --since 7d --query "build" --limit 50
+hancho-cli.exe chat log --event handler_reply
+hancho-cli.exe chat handler
+hancho-cli.exe chat handler on --engine opencode --model gpt-5.1 --agent hancho-llm
+hancho-cli.exe chat handler off
 ```
 
 生の IPC 応答が必要な場合は `--json`（コマンドの前後どちらでも可）を付けます。
@@ -182,16 +182,17 @@ MCP サーバ (`Hancho.exe mcp`) は 10 個のツールを公開します。引�
 
 | ツール | 用途 |
 | :--- | :--- |
-| `ipmsg_status` | ノード状態、ポート、ニックネーム、ピア、未読数、最後の id、ハンドラ状態。 |
-| `ipmsg_peers` | LAN 上で見えたホスト一覧。 |
-| `ipmsg_refresh` | 参加通知をブロードキャスト。ピアは 1 秒ほどで応答。 |
-| `ipmsg_send` | 本文/ファイル送信（`to`, `text?`, `fromAgent?`, `toAgent?`, `replyTo?`, `audience?`, `files?`, `hops?`）。 |
-| `ipmsg_get` | 本文、エージェント情報、audience、ファイルを含む 1 件のメッセージ（`messageId`）。 |
-| `ipmsg_inbox` | `sinceId` 以降の受信メッセージ（`agent?`, `includeUnaddressed?`, `unreadOnly?`, `includeOutgoing?`, `limit?`, `markRead?`）。 |
-| `ipmsg_wait` | 新着メッセージをロングポーリング（`sinceId?`, `agent?`, `timeoutMs?`）。MCP の読み取りループ外で動作。 |
-| `ipmsg_read` | 既読にして開封通知を送る（`ids?` または `all`）。 |
-| `ipmsg_download` | ファイルをダウンロード（`messageId`, `fileId?`, `dir?`, `wait?`, `timeoutMs?`）。 |
-| `ipmsg_log` | 会話ログを検索（`since?`, `until?`, `query?`, `peer?`, `agent?`, `event?`, `limit?`）。 |
+| `chat_status` | ノード状態、ポート、ニックネーム、ピア、未読数、最後の id、ハンドラ状態。 |
+| `chat_peers` | LAN 上で見えたホスト一覧。 |
+| `chat_refresh` | 参加通知をブロードキャスト。ピアは 1 秒ほどで応答。 |
+| `chat_send` | 本文/ファイル送信（`to`, `text?`, `fromAgent?`, `toAgent?`, `replyTo?`, `audience?`, `files?`, `hops?`）。 |
+| `chat_get` | 本文、エージェント情報、audience、ファイルを含む 1 件のメッセージ（`messageId`）。 |
+| `chat_inbox` | `sinceId` 以降の受信メッセージ（`agent?`, `includeUnaddressed?`, `unreadOnly?`, `includeOutgoing?`, `limit?`, `markRead?`）。 |
+| `chat_wait` | 新着メッセージをロングポーリング（`sinceId?`, `agent?`, `timeoutMs?`）。MCP の読み取りループ外で動作。 |
+| `chat_read` | 既読にして開封通知を送る（`ids?` または `all`）。 |
+| `chat_download` | ファイルをダウンロード（`messageId`, `fileId?`, `dir?`, `wait?`, `timeoutMs?`）。 |
+| `chat_log` | 会話ログを検索（`since?`, `until?`, `query?`, `peer?`, `agent?`, `event?`, `limit?`）。 |
+| `chat_handler` | 応答 LLM（ハンドラ）を表示・変更（`enabled?`, `engine?`, `model?`, `agent?`, `instructions?`, `taskqueue?`, `autoReply?`, `skipPermissions?`, `timeoutSec?`, `maxHops?`, `concurrency?`）。指定した項目だけを変更し、結果は `chat_status` で確認できます。 |
 
 ## LLM 同士のメッセージング
 
@@ -200,11 +201,11 @@ MCP サーバ (`Hancho.exe mcp`) は 10 個のツールを公開します。引�
 ```powershell
 $since = 0
 while ($true) {
-  $reply = hancho-cli.exe msg wait --agent reviewer --since $since --timeout 120 --json | ConvertFrom-Json
+  $reply = hancho-cli.exe chat wait --agent reviewer --since $since --timeout 120 --json | ConvertFrom-Json
   if (-not $reply.ok) { continue }
   foreach ($m in $reply.messages) {
     $since = [Math]::Max($since, [int64]$m.id)
-    hancho-cli.exe msg send $m.peer.key "ack" --from-agent reviewer --to-agent $m.from_agent `
+    hancho-cli.exe chat send $m.peer.key "ack" --from-agent reviewer --to-agent $m.from_agent `
       --reply-to $m.id --audience agent
   }
 }
@@ -212,7 +213,7 @@ while ($true) {
 
 audience の扱い:
 
-- `human`: 人間向けの本文。LLM ハンドラは処理しません。通知や、IPMsg ウィンドウで読むための回答に使います。
+- `human`: 人間向けの本文。LLM ハンドラは処理しません。通知や、Chat ウィンドウで読むための回答に使います。
 - `agent`: 別の LLM/Hancho 向け。ハンドラの条件に合えば処理されます。
 - 未指定: 人間が書いたメッセージと同様に扱います（本文がエージェント宛でなければ、ハンドラは処理しません）。
 
@@ -223,7 +224,7 @@ audience の扱い:
 ### ハンドラの流れ
 
 1. 受信（またはローカル）メッセージがフィルタを通ります: direction が `in`/`local`、audience が `human` でない、`hops < max_hops`、ハンドラ自身のエージェントからのローカルメッセージでない、`to_agent` が `handler.agent` と整合する。
-2. Hancho は `handler.taskqueue`（既定 `ipmsg`）にジョブを作ります。id は `ipmsg-<message-id>`（既に存在する場合は `-rN` を付加）、summary は `IPMsg from <peer>: <先頭行>`、試行回数 1、設定されたエンジン/モデル/制限時間を使います。プロンプトにはメッセージ JSON と、JSON オブジェクト 1 個だけを返す厳格な指示が入ります。
+2. Hancho は `handler.taskqueue`（既定 `chat`）にジョブを作ります。id は `chat-<message-id>`（既に存在する場合は `-rN` を付加）、summary は `Chat from <peer>: <先頭行>`、試行回数 1、設定されたエンジン/モデル/制限時間を使います。プロンプトにはメッセージ JSON と、JSON オブジェクト 1 個だけを返す厳格な指示が入ります。
 3. ワーカーの最終テキストを `{"audience":"human"|"agent","text":"...","to_agent":"..."}` または `{"audience":"none"}` として解析します。解析できないテキストは `human` とみなし、そのテキストを返信にします。
 4. `auto_reply` が真で回答が `none` でなければ、元のピア（または `local`）へ返信します。`from_agent` は `handler.agent` または `hancho-llm`、`to_agent` は回答の `to_agent` または元の送信者、`reply_to` は元メッセージ id、`audience` は回答の値、`hops` は +1 です。
 5. 各段階で `handler_*` ログイベントを書きます。
@@ -232,9 +233,9 @@ audience の扱い:
 
 ## ログと履歴
 
-- **履歴**: `<data-dir>/ipmsg/messages.json`。`max_messages` 件まで。`msg clear` で削除。
-- **会話ログ**: `<data-dir>/ipmsg/log/ipmsg-YYYY-MM-DD.jsonl`。1 行 1 JSON、日ごとのファイル。履歴を消してもログファイルは残ります。
-- **受信ファイル**: `download_dir` が空なら `<data-dir>/ipmsg/files`。
+- **履歴**: `<data-dir>/chat/messages.json`。`max_messages` 件まで。`chat clear` で削除。
+- **会話ログ**: `<data-dir>/chat/log/chat-YYYY-MM-DD.jsonl`。1 行 1 JSON、日ごとのファイル。履歴を消してもログファイルは残ります。
+- **受信ファイル**: `download_dir` が空なら `<data-dir>/chat/files`。
 
 ログに書かれるイベント:
 
@@ -251,21 +252,22 @@ audience の扱い:
 | `handler_no_reply` | 返信しなかった（`audience-none`、空回答、`auto-reply-disabled`）。 |
 | `handler_failed` | ジョブの構築/登録、または返信の送信に失敗。 |
 
-`hancho-cli msg log`（または MCP `ipmsg_log`）で `--since`、`--until`、`--query`、`--peer`、`--agent`、`--event`、`--limit` を指定して検索できます。ダイアログの**ログ**タブにも同じフィルタと**フォルダを開く**ボタンがあります。
+`hancho-cli chat log`（または MCP `chat_log`）で `--since`、`--until`、`--query`、`--peer`、`--agent`、`--event`、`--limit` を指定して検索できます。ダイアログの**ログ**タブにも同じフィルタと**フォルダを開く**ボタンがあります。
 
 ## 単体ダイアログ
 
 ```powershell
-Hancho.exe ipmsg [--data-dir <path>] [--tray]
+Hancho.exe chat [--data-dir <path>] [--tray]
 ```
 
-- IPMsg ダイアログだけを IPC クライアントとして起動します。メインダッシュボードのウィンドウは作りません。コアが起動していなければ、先にヘッドレスで起動します。
+- Chat ダイアログだけを IPC クライアントとして起動します。メインダッシュボードのウィンドウは作りません。コアが起動していなければ、先にヘッドレスで起動します。
 - データディレクトリごとに 1 インスタンス（名前付きミューテックス）。2 回目の起動は既存ウィンドウを前面に出します。
 - 独自のトレイアイコンを持ちます。audience が `agent` でないメッセージが届くとバルーン通知を出し、タイトル/ツールチップに未読数を表示します。勝手にウィンドウを開くことはありません。
 - 閉じる (`X`) とトレイに格納します。トレイメニューは**開く**と**終了**です。`--tray` を付けると非表示で開始します。
-- タブは**チャット**（ホスト、メッセージ、本文、添付、送信・返信）、**ログ**（検索可能な会話ログ）、**設定**（有効化、ポート、ニックネーム、グループ、追加ホスト、ハンドラの on/off、エンジン、モデル、エージェント、自動返信）です。設定は `config_set` 経由で書き込むため、コアがノードとハンドラを再読み込みします。
-- メインダッシュボードのツールバーには IPMsg ボタン（`💬`）があり、ダイアログを起動します。ダッシュボード起動時には `ipmsg.enabled` が真なら `Hancho.exe ipmsg --tray` を起動します。
+- タブは**チャット**（ホスト、メッセージ、本文、添付、送信・返信、および**応答 LLM** バーでハンドラのエンジン/モデル変更と有効/無効を切り替え）、**ログ**（検索可能な会話ログ）、**設定**（有効化、ポート、ニックネーム、グループ、追加ホスト、ハンドラの on/off、エンジン、モデル、エージェント、自動返信）です。設定は `config_set` 経由で書き込むため、コアがノードとハンドラを再読み込みします。
+- ウィンドウはダッシュボードのテーマ（`config.json` の `theme`）に追従します。ウィンドウ、一覧、ヘッダ、エディット、ボタン、タブを同じパレットで描画し、開いている間のテーマ変更も反映します。
+- メインダッシュボードのツールバーには Chat ボタン（`💬`）があり、ダイアログを起動します。ダッシュボード起動時には `chat.enabled` が真なら `Hancho.exe chat --tray` を起動します。
 
 ## IPC アクション
 
-ツール開発者向けに、同じ操作を Named Pipe でも提供します: `ipmsg_status`、`ipmsg_enable`、`ipmsg_peers`、`ipmsg_refresh`、`ipmsg_send`、`ipmsg_get`、`ipmsg_inbox`、`ipmsg_wait`、`ipmsg_read`、`ipmsg_download`、`ipmsg_log`、`ipmsg_clear`。フィールドは snake_case で、`ipmsg_wait` は最大 600000 ms ブロックします。`config_get` は既定値を補った `ipmsg` ブロックを返し、`config_set` に `ipmsg` パッチを渡すとヘルパースレッドでノードを再起動します。
+ツール開発者向けに、同じ操作を Named Pipe でも提供します: `chat_status`、`chat_enable`、`chat_peers`、`chat_refresh`、`chat_send`、`chat_get`、`chat_inbox`、`chat_wait`、`chat_read`、`chat_download`、`chat_log`、`chat_handler`、`chat_clear`。フィールドは snake_case で、`chat_wait` は最大 600000 ms ブロックします。`config_get` は既定値を補った `chat` ブロックを返し、`config_set` に `chat` パッチを渡すとヘルパースレッドでノードを再起動します。`chat_handler` は応答 LLM の項目だけを更新します。

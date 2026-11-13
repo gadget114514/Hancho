@@ -491,7 +491,7 @@ struct IpmsgNode::Impl {
     std::wstring LogDir() const { return PathJoinWide(StoreDir(), L"log"); }
 
     // Append-only conversation log: one JSON line per event in
-    // <data-dir>/ipmsg/log/ipmsg-YYYY-MM-DD.jsonl (never pruned by max_messages).
+    // <data-dir>/chat/log/chat-YYYY-MM-DD.jsonl (never pruned by max_messages).
     void LogEvent(const std::string& event, const nlohmann::json& body) {
         try {
             nlohmann::json j = body;
@@ -502,7 +502,7 @@ struct IpmsgNode::Impl {
             std::string day = FormatLocalTime(now).substr(0, 10);
             std::lock_guard<std::mutex> lk(logMu);
             EnsureDirectoryWide(LogDir());
-            AppendToLogFileWide(PathJoinWide(LogDir(), Utf8ToWide("ipmsg-" + day + ".jsonl")),
+            AppendToLogFileWide(PathJoinWide(LogDir(), Utf8ToWide("chat-" + day + ".jsonl")),
                                 j.dump() + "\n");
         } catch (...) {}
     }
@@ -519,7 +519,7 @@ struct IpmsgNode::Impl {
     }
 
     std::wstring StoreDir() const {
-        return PathJoinWide(GetEffectiveDataDirectoryWide(), L"ipmsg");
+        return PathJoinWide(GetEffectiveDataDirectoryWide(), L"chat");
     }
     std::wstring StorePath() const { return PathJoinWide(StoreDir(), L"messages.json"); }
     std::string DownloadDir() const {
@@ -1348,6 +1348,16 @@ IpmsgConfig IpmsgNode::GetConfig() const {
 bool IpmsgNode::Start(const IpmsgConfig& cfgIn, std::string* outError) {
     Stop();
     Impl& d = *impl_;
+    // Older releases stored messages and logs under "ipmsg"; move them once.
+    {
+        std::error_code ec;
+        const std::filesystem::path data = GetEffectiveDataDirectoryWide();
+        const std::filesystem::path chat = data / L"chat";
+        const std::filesystem::path old = data / L"ipmsg";
+        if (!std::filesystem::exists(chat, ec) && std::filesystem::exists(old, ec)) {
+            std::filesystem::rename(old, chat, ec);
+        }
+    }
     EnsureNetworking();
     {
         std::lock_guard<std::mutex> lk(d.mu);
@@ -1366,7 +1376,7 @@ bool IpmsgNode::Start(const IpmsgConfig& cfgIn, std::string* outError) {
         if (d.udp != kInvalidSocket) { CloseSock(d.udp); d.udp = kInvalidSocket; }
         if (d.tcp != kInvalidSocket) { CloseSock(d.tcp); d.tcp = kInvalidSocket; }
         if (outError) *outError = msg;
-        WriteAuditLog("IPMSG_START_FAILED", msg);
+        WriteAuditLog("CHAT_START_FAILED", msg);
         return false;
     };
     uint32_t bindAddr = 0;
@@ -1502,14 +1512,14 @@ nlohmann::json IpmsgNode::Peers() const {
 
 nlohmann::json IpmsgNode::Refresh() {
     Impl& d = *impl_;
-    if (!running_.load()) return {{"ok", false}, {"error", "IPMsg is disabled (set ipmsg.enabled=true)"}};
+    if (!running_.load()) return {{"ok", false}, {"error", "Chat is disabled (set chat.enabled=true)"}};
     std::string entry;
     {
         std::lock_guard<std::mutex> lk(d.mu);
         entry = d.EntryPacket(IPMSG_BR_ENTRY);
     }
     d.SendEntryTargets(entry);
-    return {{"ok", true}, {"sent", true}, {"hint", "Peers answer within a second; call ipmsg_peers."}};
+    return {{"ok", true}, {"sent", true}, {"hint", "Peers answer within a second; call chat_peers."}};
 }
 
 nlohmann::json IpmsgNode::Send(const std::string& toIn, const std::string& text,
@@ -1517,7 +1527,7 @@ nlohmann::json IpmsgNode::Send(const std::string& toIn, const std::string& text,
                                uint64_t replyTo, const std::vector<std::string>& files,
                                const std::string& audienceIn, int hops) {
     Impl& d = *impl_;
-    if (!running_.load()) return {{"ok", false}, {"error", "IPMsg is disabled (set ipmsg.enabled=true)"}};
+    if (!running_.load()) return {{"ok", false}, {"error", "Chat is disabled (set chat.enabled=true)"}};
     if (text.empty() && files.empty()) return {{"ok", false}, {"error", "text or files required"}};
     const std::string to = Trim(toIn);
     std::string audience = audienceIn;
@@ -1584,7 +1594,7 @@ nlohmann::json IpmsgNode::Send(const std::string& toIn, const std::string& text,
         std::lock_guard<std::mutex> lk(d.mu);
         if (to == "*" || to == "all") {
             for (const auto& kv : d.peers) targets.push_back(kv.second);
-            if (targets.empty()) return {{"ok", false}, {"error", "no peers known; run ipmsg_refresh first"}};
+            if (targets.empty()) return {{"ok", false}, {"error", "no peers known; run chat_refresh first"}};
         } else {
             auto lower = [](std::string s) {
                 for (char& c : s) c = static_cast<char>(std::tolower(static_cast<unsigned char>(c)));
@@ -1622,7 +1632,7 @@ nlohmann::json IpmsgNode::Send(const std::string& toIn, const std::string& text,
                     } catch (...) {}
                 }
                 uint32_t a = 0;
-                if (!ParseIpv4(addr, a)) return {{"ok", false}, {"error", "unknown peer: " + to + " (see ipmsg_peers)"}};
+                if (!ParseIpv4(addr, a)) return {{"ok", false}, {"error", "unknown peer: " + to + " (see chat_peers)"}};
                 if (!d.IsAllowed(a)) return {{"ok", false}, {"error", "address not allowed (LAN only / allow_from): " + addr}};
                 Impl::Peer p;
                 p.addr = addr;
@@ -1714,7 +1724,7 @@ nlohmann::json IpmsgNode::Send(const std::string& toIn, const std::string& text,
     out["ok"] = true;
     out["ids"] = ids;
     out["status"] = "sending";
-    out["hint"] = "Delivery is confirmed asynchronously; status becomes delivered or failed (see ipmsg_inbox include_outgoing).";
+    out["hint"] = "Delivery is confirmed asynchronously; status becomes delivered or failed (see chat_inbox include_outgoing).";
     return out;
 }
 
@@ -1792,7 +1802,7 @@ nlohmann::json IpmsgNode::Wait(uint64_t sinceId, const std::string& agent, bool 
             out["messages"] = nlohmann::json::array();
             out["last_id"] = lastId;
             out["running"] = running_.load();
-            out["hint"] = "No new message; call ipmsg_wait again with the same since_id.";
+            out["hint"] = "No new message; call chat_wait again with the same since_id.";
             return out;
         }
     }
@@ -1827,7 +1837,7 @@ nlohmann::json IpmsgNode::MarkRead(const std::vector<uint64_t>& ids, bool all) {
 nlohmann::json IpmsgNode::Download(uint64_t messageId, int64_t fileId, const std::string& dir,
                                    bool wait, int timeoutMs) {
     Impl& d = *impl_;
-    if (!running_.load()) return {{"ok", false}, {"error", "IPMsg is disabled (set ipmsg.enabled=true)"}};
+    if (!running_.load()) return {{"ok", false}, {"error", "Chat is disabled (set chat.enabled=true)"}};
     std::string target = dir.empty() ? std::string() : ResolveAbsolutePathUtf8(dir);
     nlohmann::json started = d.StartDownloads(messageId, fileId, target);
     if (!started.value("ok", false) || !wait) return started;
@@ -1890,14 +1900,18 @@ nlohmann::json IpmsgNode::Log(const std::string& since, const std::string& until
     };
     const std::string q = lower(query);
     const std::string lpeer = lower(peer);
-    std::vector<std::wstring> files = ListDirectoryWide(d.LogDir(), L"ipmsg-*.jsonl");
+    std::vector<std::wstring> files = ListDirectoryWide(d.LogDir(), L"*.jsonl");
     std::vector<std::string> names;
     for (const auto& f : files) {
         std::string n = WideToUtf8(f);
         size_t sl = n.find_last_of("/\\");
         if (sl != std::string::npos) n = n.substr(sl + 1);
-        if (n.size() < 16 || n.rfind("ipmsg-", 0) != 0) continue;
-        std::string day = n.substr(6, 10);
+        size_t prefix = 0;
+        if (n.rfind("chat-", 0) == 0) prefix = 5;
+        else if (n.rfind("ipmsg-", 0) == 0) prefix = 6;  // migrated logs
+        else continue;
+        if (n.size() < prefix + 10) continue;
+        std::string day = n.substr(prefix, 10);
         if (day < fromDay || day > toDay) continue;
         names.push_back(n);
     }

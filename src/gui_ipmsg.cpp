@@ -1,20 +1,23 @@
-// IPMsg compatible messenger dialog. Standalone Win32 window that talks to the
-// Hancho core over the Named Pipe IPC (ipmsg_* actions). It can be launched from
-// the dashboard toolbar (`Hancho.exe ipmsg`) or directly and runs without the
+// Chat dialog (IPMsg compatible protocol). Standalone Win32 window that talks to the
+// Hancho core over the Named Pipe IPC (chat_* actions). It can be launched from
+// the dashboard toolbar (`Hancho.exe chat`) or directly and runs without the
 // main dashboard window. Tray icon, balloon notifications, host/message lists,
 // file download, conversation log and settings live here.
 
 #include "gui_ipmsg.h"
+#include "gui_theme.h"
 #include "ipc_client.h"
 #include "nlohmann/json.hpp"
 
 #include <commctrl.h>
 #include <commdlg.h>
 #include <shellapi.h>
+#include <uxtheme.h>
 #include <windowsx.h>
 
 #include <algorithm>
 #include <cstdlib>
+#include <map>
 #include <set>
 #include <string>
 #include <vector>
@@ -42,6 +45,12 @@ const wchar_t* T(const wchar_t* ja, const wchar_t* en, const wchar_t* es = nullp
 
 std::string ReadConfigText() {
     return ReadFileUtf8Wide(PathJoinWide(GetEffectiveDataDirectoryWide(), L"config.json"));
+}
+
+nlohmann::json ChatBlock(const nlohmann::json& cfg) {
+    if (cfg.is_object() && cfg.contains("chat") && cfg["chat"].is_object()) return cfg["chat"];
+    if (cfg.is_object() && cfg.contains("ipmsg") && cfg["ipmsg"].is_object()) return cfg["ipmsg"];
+    return nlohmann::json::object();
 }
 
 UiLang DetectLanguage() {
@@ -263,7 +272,12 @@ enum ControlId : int {
     IDC_SET_STATUS = 2158,
     IDC_SET_WARNING = 2159,
     IDM_TRAY_OPEN = 2160,
-    IDM_TRAY_EXIT = 2161
+    IDM_TRAY_EXIT = 2161,
+    IDC_CHAT_HANDLER_LABEL = 2162,
+    IDC_CHAT_HANDLER_ENGINE = 2163,
+    IDC_CHAT_HANDLER_MODEL = 2164,
+    IDC_CHAT_HANDLER_ENABLED = 2165,
+    IDC_BTN_CHAT_HANDLER_APPLY = 2166
 };
 
 struct DialogState {
@@ -275,6 +289,11 @@ struct DialogState {
     HWND peers = nullptr;
     HWND btnRefreshPeers = nullptr;
     HWND peerCount = nullptr;
+    HWND handlerLabel = nullptr;
+    HWND handlerEngine = nullptr;
+    HWND handlerModel = nullptr;
+    HWND handlerEnabled = nullptr;
+    HWND btnHandlerApply = nullptr;
     HWND msgLabel = nullptr;
     HWND messages = nullptr;
     HWND detailLabel = nullptr;
@@ -368,6 +387,13 @@ struct DialogState {
     HFONT font = nullptr;
     HANDLE mutex = nullptr;
     ATOM dataDirAtom = 0;
+
+    DashboardPalette palette;
+    HBRUSH bgBrush = nullptr;
+    HBRUSH panelBrush = nullptr;
+    bool themeApplied = false;
+    int64_t lastThemeCheckMs = 0;
+    std::map<HWND, bool> checkState;
 };
 
 DialogState* g_state = nullptr;
@@ -376,6 +402,72 @@ UINT g_showMessage = 0;
 int S(int value) {
     const UINT dpi = g_state ? g_state->dpi : 96;
     return MulDiv(value, static_cast<int>(dpi), 96);
+}
+
+bool IsCheckboxControl(const DialogState* st, HWND h) {
+    if (!st || !h) return false;
+    return h == st->setEnabled || h == st->setHandlerEnabled || h == st->setAutoReply ||
+           h == st->handlerEnabled;
+}
+
+// Applies the dashboard palette to the dialog, its lists and its controls.
+// The dialog is a separate process, so the theme is read from config.json.
+void ApplyDialogTheme(DialogState* st, bool force = false) {
+    if (!st || !st->hwnd) return;
+    const DashboardPalette p = GetDashboardPalette();
+    if (!force && st->themeApplied && p == st->palette) return;
+    st->palette = p;
+    st->themeApplied = true;
+    if (st->bgBrush) DeleteObject(st->bgBrush);
+    if (st->panelBrush) DeleteObject(st->panelBrush);
+    st->bgBrush = CreateSolidBrush(p.windowBg);
+    st->panelBrush = CreateSolidBrush(p.panel);
+    auto styleList = [&p](HWND list) {
+        if (!list) return;
+        ListView_SetBkColor(list, p.panel);
+        ListView_SetTextBkColor(list, p.panel);
+        ListView_SetTextColor(list, p.listText);
+        InvalidateRect(list, nullptr, TRUE);
+    };
+    styleList(st->peers);
+    styleList(st->messages);
+    styleList(st->files);
+    styleList(st->attachList);
+    styleList(st->logList);
+    ApplyDashboardNativeTheme(st->hwnd);
+    if (p.dark) {
+        auto themeList = [](HWND list) {
+            if (!list) return;
+            SetWindowTheme(list, L"DarkMode_ItemsView", nullptr);
+            if (HWND header = ListView_GetHeader(list)) {
+                SetWindowTheme(header, L"DarkMode_ItemsView", nullptr);
+            }
+        };
+        themeList(st->peers);
+        themeList(st->messages);
+        themeList(st->files);
+        themeList(st->logList);
+        themeList(st->attachList);
+        // Buttons and the tab strip need an explicit dark-mode theme + change
+        // notification; otherwise they keep the light system colours.
+        for (HWND child = GetWindow(st->hwnd, GW_CHILD); child; child = GetWindow(child, GW_HWNDNEXT)) {
+            wchar_t cls[64] = {};
+            GetClassNameW(child, cls, 64);
+            if (_wcsicmp(cls, L"Button") == 0 || _wcsicmp(cls, L"SysTabControl32") == 0) {
+                SetWindowTheme(child, L"DarkMode_Explorer", nullptr);
+                SendMessageW(child, WM_THEMECHANGED, 0, 0);
+            }
+        }
+    }
+    InvalidateRect(st->hwnd, nullptr, TRUE);
+}
+
+void DestroyDialogTheme(DialogState* st) {
+    if (!st) return;
+    if (st->bgBrush) DeleteObject(st->bgBrush);
+    if (st->panelBrush) DeleteObject(st->panelBrush);
+    st->bgBrush = nullptr;
+    st->panelBrush = nullptr;
 }
 
 // ---------------------------------------------------------------------------
@@ -389,14 +481,14 @@ HWND MakeStatic(HWND parent, int id, const wchar_t* text, DWORD style = SS_LEFT)
 }
 
 HWND MakeButton(HWND parent, int id, const wchar_t* text) {
-    return CreateWindowExW(0, L"BUTTON", text, WS_CHILD | WS_VISIBLE | BS_PUSHBUTTON,
+    return CreateWindowExW(0, L"BUTTON", text, WS_CHILD | WS_VISIBLE | BS_OWNERDRAW,
                            0, 0, 10, 10, parent,
                            reinterpret_cast<HMENU>(static_cast<INT_PTR>(id)),
                            GetModuleHandleW(nullptr), nullptr);
 }
 
 HWND MakeCheck(HWND parent, int id, const wchar_t* text) {
-    return CreateWindowExW(0, L"BUTTON", text, WS_CHILD | WS_VISIBLE | BS_AUTOCHECKBOX,
+    return CreateWindowExW(0, L"BUTTON", text, WS_CHILD | WS_VISIBLE | BS_OWNERDRAW,
                            0, 0, 10, 10, parent,
                            reinterpret_cast<HMENU>(static_cast<INT_PTR>(id)),
                            GetModuleHandleW(nullptr), nullptr);
@@ -405,6 +497,13 @@ HWND MakeCheck(HWND parent, int id, const wchar_t* text) {
 HWND MakeEdit(HWND parent, int id, DWORD style, DWORD exStyle = WS_EX_CLIENTEDGE) {
     return CreateWindowExW(exStyle, L"EDIT", L"", WS_CHILD | WS_VISIBLE | style,
                            0, 0, 10, 10, parent,
+                           reinterpret_cast<HMENU>(static_cast<INT_PTR>(id)),
+                           GetModuleHandleW(nullptr), nullptr);
+}
+
+HWND MakeComboEdit(HWND parent, int id) {
+    return CreateWindowExW(0, L"COMBOBOX", L"", WS_CHILD | WS_VISIBLE | WS_VSCROLL |
+                           CBS_DROPDOWN | CBS_AUTOHSCROLL, 0, 0, 10, 10, parent,
                            reinterpret_cast<HMENU>(static_cast<INT_PTR>(id)),
                            GetModuleHandleW(nullptr), nullptr);
 }
@@ -516,12 +615,28 @@ void LayoutChat(DialogState* st, const RECT& pr) {
     const int rx = pr.left + leftW + S(8);
     const int rw = pr.right - rx;
     if (rw <= 0) return;
-    int msgH = (topBottom - pr.top - S(20)) * 45 / 100;
-    if (msgH < S(70)) msgH = S(70);
-    Place(st->msgLabel, rx, pr.top, rw, S(20));
-    Place(st->messages, rx, pr.top + S(20), rw, msgH);
+    // Answering-LLM bar: change the handler from the chat view without opening Settings.
+    int hx = rx + S(70);
+    Place(st->handlerLabel, rx, pr.top + S(3), S(66), S(20));
+    Place(st->handlerEngine, hx, pr.top, S(122), S(24));
+    hx += S(122) + S(6);
+    const int onW = S(54);
+    const int applyW = S(64);
+    int modelW = rw - static_cast<int>(hx - rx) - onW - applyW - S(18);
+    if (modelW < S(80)) modelW = S(80);
+    Place(st->handlerModel, hx, pr.top, modelW, S(24));
+    hx += modelW + S(6);
+    Place(st->handlerEnabled, hx, pr.top, onW, S(24));
+    hx += onW + S(6);
+    Place(st->btnHandlerApply, hx, pr.top, applyW, S(24));
 
-    const int dy = pr.top + S(20) + msgH + S(8);
+    const int msgTop = pr.top + S(30);
+    int msgH = (topBottom - msgTop - S(20)) * 45 / 100;
+    if (msgH < S(60)) msgH = S(60);
+    Place(st->msgLabel, rx, msgTop, rw, S(20));
+    Place(st->messages, rx, msgTop + S(20), rw, msgH);
+
+    const int dy = msgTop + S(20) + msgH + S(8);
     const int dh = topBottom - dy;
     Place(st->detailLabel, rx, dy, rw, S(18));
     int textH = (dh - S(18)) * 55 / 100;
@@ -688,7 +803,7 @@ void AddTrayIcon(DialogState* st) {
     st->nid.uCallbackMessage = kTrayMessage;
     st->nid.hIcon = LoadIconW(st->inst, MAKEINTRESOURCEW(1));
     if (!st->nid.hIcon) st->nid.hIcon = LoadIconW(nullptr, IDI_APPLICATION);
-    wcsncpy_s(st->nid.szTip, L"Hancho IPMsg", _TRUNCATE);
+    wcsncpy_s(st->nid.szTip, L"Hancho Chat", _TRUNCATE);
     if (Shell_NotifyIconW(NIM_ADD, &st->nid)) st->trayAdded = true;
 }
 
@@ -702,7 +817,7 @@ void UpdateTitleAndTray(DialogState* st) {
     if (!st || !st->hwnd) return;
     std::wstring name = Utf8ToWide(st->nickname);
     if (name.empty()) name = L"Hancho";
-    std::wstring title = L"Hancho IPMsg";
+    std::wstring title = L"Hancho Chat";
     if (st->unread > 0) {
         title += L" [";
         title += std::to_wstring(st->unread);
@@ -744,8 +859,17 @@ void ShowMainWindow(DialogState* st) {
     if (!st || !st->hwnd) return;
     if (IsIconic(st->hwnd)) ShowWindow(st->hwnd, SW_RESTORE);
     else ShowWindow(st->hwnd, SW_SHOW);
+    BringWindowToTop(st->hwnd);
+    // A background process cannot normally take the foreground: attach to the
+    // current foreground thread for the call, then detach.
+    DWORD fgThread = GetWindowThreadProcessId(GetForegroundWindow(), nullptr);
+    DWORD myThread = GetCurrentThreadId();
+    bool attached = (fgThread != 0 && fgThread != myThread &&
+                     AttachThreadInput(fgThread, myThread, TRUE) != FALSE);
     SetForegroundWindow(st->hwnd);
+    BringWindowToTop(st->hwnd);
     SetActiveWindow(st->hwnd);
+    if (attached) AttachThreadInput(fgThread, myThread, FALSE);
 }
 
 void ShowTrayMenu(DialogState* st) {
@@ -795,7 +919,7 @@ void UpdatePeerCount(DialogState* st) {
 void LoadPeers(DialogState* st) {
     if (!st) return;
     nlohmann::json resp;
-    if (!IpcCall({{"action", "ipmsg_peers"}}, resp)) return;
+    if (!IpcCall({{"action", "chat_peers"}}, resp)) return;
     if (!resp.contains("peers") || !resp["peers"].is_array()) return;
     std::set<std::string> selected = SelectedPeerKeys(st);
     st->peersJson.clear();
@@ -896,7 +1020,7 @@ void SelectMessage(DialogState* st, int idx) {
     if (msg.value("direction", std::string()) != "out" && !msg.value("read", false)) {
         uint64_t id = msg.value("id", 0ULL);
         nlohmann::json resp;
-        IpcCall({{"action", "ipmsg_read"}, {"ids", nlohmann::json::array({id})}}, resp);
+        IpcCall({{"action", "chat_read"}, {"ids", nlohmann::json::array({id})}}, resp);
         msg["read"] = true;
         st->selectedMessage = msg;
         int row = ListView_GetNextItem(st->messages, -1, LVNI_SELECTED);
@@ -908,7 +1032,7 @@ void SelectMessage(DialogState* st, int idx) {
 void LoadMessages(DialogState* st) {
     if (!st) return;
     nlohmann::json req = {
-        {"action", "ipmsg_inbox"},
+        {"action", "chat_inbox"},
         {"since_id", 0},
         {"include_outgoing", true},
         {"include_unaddressed", true},
@@ -979,7 +1103,7 @@ void LoadMessages(DialogState* st) {
 void PollStatus(DialogState* st) {
     if (!st) return;
     nlohmann::json status;
-    if (!IpcCall({{"action", "ipmsg_status"}}, status)) return;
+    if (!IpcCall({{"action", "chat_status"}}, status)) return;
     st->running = status.value("running", false);
     st->unread = static_cast<int>(status.value("unread", 0ULL));
     st->nickname = status.value("nickname", std::string());
@@ -996,9 +1120,9 @@ void PollStatus(DialogState* st) {
     if (st->composeHint) {
         if (!st->running) {
             SetWindowTextW(st->composeHint,
-                           T(L"IPMsg は無効です（設定タブで有効にしてください）",
-                             L"IPMsg is disabled (enable it in Settings)",
-                             L"IPMsg está desactivado (actívalo en Ajustes)"));
+                           T(L"チャットは無効です（設定タブで有効にしてください）",
+                             L"Chat is disabled (enable it in Settings)",
+                             L"El chat está desactivado (actívalo en Ajustes)"));
         } else {
             SetWindowTextW(st->composeHint,
                            T(L"Ctrl+Enter で送信 / 宛先は選択中のホスト、未選択ならローカルエージェント",
@@ -1102,7 +1226,7 @@ void DoSend(DialogState* st) {
     std::string firstError;
     for (const auto& to : targets) {
         nlohmann::json req = {
-            {"action", "ipmsg_send"},
+            {"action", "chat_send"},
             {"to", to},
             {"text", text},
             {"from_agent", fromAgent},
@@ -1180,7 +1304,7 @@ void DoDownload(DialogState* st) {
     }
     nlohmann::json resp;
     nlohmann::json req = {
-        {"action", "ipmsg_download"},
+        {"action", "chat_download"},
         {"message_id", id},
         {"file_id", fileId},
         {"wait", false}
@@ -1216,7 +1340,7 @@ void DoOpenDownloadFolder(DialogState* st) {
         }
     }
     if (target.empty() && !st->downloadDir.empty()) target = Utf8ToWide(st->downloadDir);
-    if (target.empty()) target = PathJoinWide(GetEffectiveDataDirectoryWide(), L"ipmsg\\files");
+    if (target.empty()) target = PathJoinWide(GetEffectiveDataDirectoryWide(), L"chat\\files");
     OpenFolder(target);
 }
 
@@ -1239,7 +1363,7 @@ void LoadLog(DialogState* st) {
         event = events[eventIdx];
     }
     nlohmann::json req = {
-        {"action", "ipmsg_log"},
+        {"action", "chat_log"},
         {"since", since},
         {"query", query},
         {"limit", 1000}
@@ -1296,38 +1420,38 @@ void LoadLog(DialogState* st) {
 // ---------------------------------------------------------------------------
 
 void SetCheck(HWND h, bool on) {
-    if (h) SendMessageW(h, BM_SETCHECK, on ? BST_CHECKED : BST_UNCHECKED, 0);
+    if (!h) return;
+    if (g_state) g_state->checkState[h] = on;
+    InvalidateRect(h, nullptr, TRUE);
 }
 
 bool GetCheck(HWND h) {
-    return h && SendMessageW(h, BM_GETCHECK, 0, 0) == BST_CHECKED;
+    if (!h || !g_state) return false;
+    auto it = g_state->checkState.find(h);
+    return it != g_state->checkState.end() && it->second;
 }
 
 void LoadSettings(DialogState* st) {
     if (!st) return;
     nlohmann::json resp;
-    nlohmann::json ipmsg = nlohmann::json::object();
+    nlohmann::json chat = nlohmann::json::object();
     if (IpcCall({{"action", "config_get"}}, resp) && resp.value("ok", false) &&
         resp.contains("config") && resp["config"].is_object()) {
-        const nlohmann::json& cfg = resp["config"];
-        if (cfg.contains("ipmsg") && cfg["ipmsg"].is_object()) ipmsg = cfg["ipmsg"];
+        chat = ChatBlock(resp["config"]);
     }
-    if (ipmsg.empty()) {
-        std::string content = ReadConfigText();
+    if (chat.empty()) {
+        const std::string content = ReadConfigText();
         if (!content.empty()) {
-            nlohmann::json parsed = nlohmann::json::parse(content, nullptr, false);
-            if (parsed.is_object() && parsed.contains("ipmsg") && parsed["ipmsg"].is_object()) {
-                ipmsg = parsed["ipmsg"];
-            }
+            chat = ChatBlock(nlohmann::json::parse(content, nullptr, false));
         }
     }
-    SetCheck(st->setEnabled, ipmsg.value("enabled", false));
-    SetTextUtf8(st->setPort, std::to_string(ipmsg.value("port", 2426)));
-    SetTextUtf8(st->setNick, ipmsg.value("nickname", std::string()));
-    SetTextUtf8(st->setGroup, ipmsg.value("group", std::string("Hancho")));
+    SetCheck(st->setEnabled, chat.value("enabled", false));
+    SetTextUtf8(st->setPort, std::to_string(chat.value("port", 2426)));
+    SetTextUtf8(st->setNick, chat.value("nickname", std::string()));
+    SetTextUtf8(st->setGroup, chat.value("group", std::string("Hancho")));
     std::string hosts;
-    if (ipmsg.contains("hosts") && ipmsg["hosts"].is_array()) {
-        for (const auto& h : ipmsg["hosts"]) {
+    if (chat.contains("hosts") && chat["hosts"].is_array()) {
+        for (const auto& h : chat["hosts"]) {
             if (!h.is_string()) continue;
             if (!hosts.empty()) hosts += ", ";
             hosts += h.get<std::string>();
@@ -1336,12 +1460,18 @@ void LoadSettings(DialogState* st) {
     SetTextUtf8(st->setHosts, hosts);
 
     nlohmann::json handler = nlohmann::json::object();
-    if (ipmsg.contains("handler") && ipmsg["handler"].is_object()) handler = ipmsg["handler"];
+    if (chat.contains("handler") && chat["handler"].is_object()) handler = chat["handler"];
     SetCheck(st->setHandlerEnabled, handler.value("enabled", false));
     SetTextUtf8(st->setEngine, handler.value("engine", std::string("agy")));
     SetTextUtf8(st->setModel, handler.value("model", std::string()));
     SetTextUtf8(st->setAgent, handler.value("agent", std::string()));
     SetCheck(st->setAutoReply, handler.value("auto_reply", true));
+    if (st->handlerEngine) {
+        const std::wstring engine = Utf8ToWide(handler.value("engine", std::string("agy")));
+        SetWindowTextW(st->handlerEngine, engine.c_str());
+    }
+    SetTextUtf8(st->handlerModel, handler.value("model", std::string()));
+    SetCheck(st->handlerEnabled, handler.value("enabled", false));
 }
 
 std::vector<std::string> SplitCsv(const std::string& text) {
@@ -1377,40 +1507,36 @@ void DoApplySettings(DialogState* st) {
     nlohmann::json base = nlohmann::json::object();
     nlohmann::json resp;
     if (IpcCall({{"action", "config_get"}}, resp) && resp.value("ok", false) &&
-        resp.contains("config") && resp["config"].is_object() &&
-        resp["config"].contains("ipmsg") && resp["config"]["ipmsg"].is_object()) {
-        base = resp["config"]["ipmsg"];
+        resp.contains("config") && resp["config"].is_object()) {
+        base = ChatBlock(resp["config"]);
     } else {
-        std::string content = ReadConfigText();
+        const std::string content = ReadConfigText();
         if (!content.empty()) {
-            nlohmann::json parsed = nlohmann::json::parse(content, nullptr, false);
-            if (parsed.is_object() && parsed.contains("ipmsg") && parsed["ipmsg"].is_object()) {
-                base = parsed["ipmsg"];
-            }
+            base = ChatBlock(nlohmann::json::parse(content, nullptr, false));
         }
     }
 
-    nlohmann::json ipmsg = base.is_object() ? base : nlohmann::json::object();
-    ipmsg["enabled"] = GetCheck(st->setEnabled);
-    ipmsg["port"] = port;
-    ipmsg["nickname"] = GetTextUtf8(st->setNick);
-    ipmsg["group"] = GetTextUtf8(st->setGroup);
-    ipmsg["hosts"] = nlohmann::json::array();
+    nlohmann::json chat = base.is_object() ? base : nlohmann::json::object();
+    chat["enabled"] = GetCheck(st->setEnabled);
+    chat["port"] = port;
+    chat["nickname"] = GetTextUtf8(st->setNick);
+    chat["group"] = GetTextUtf8(st->setGroup);
+    chat["hosts"] = nlohmann::json::array();
     for (const auto& host : SplitCsv(GetTextUtf8(st->setHosts))) {
-        ipmsg["hosts"].push_back(host);
+        chat["hosts"].push_back(host);
     }
     nlohmann::json handler = nlohmann::json::object();
-    if (ipmsg.contains("handler") && ipmsg["handler"].is_object()) handler = ipmsg["handler"];
+    if (chat.contains("handler") && chat["handler"].is_object()) handler = chat["handler"];
     handler["enabled"] = GetCheck(st->setHandlerEnabled);
     handler["engine"] = GetTextUtf8(st->setEngine);
     handler["model"] = GetTextUtf8(st->setModel);
     handler["agent"] = GetTextUtf8(st->setAgent);
     handler["auto_reply"] = GetCheck(st->setAutoReply);
-    ipmsg["handler"] = handler;
+    chat["handler"] = handler;
 
     nlohmann::json req = {
         {"action", "config_set"},
-        {"config", {{"ipmsg", ipmsg}}}
+        {"config", {{"chat", chat}}}
     };
     nlohmann::json setResp;
     if (!IpcCall(req, setResp) || !setResp.value("ok", false)) {
@@ -1425,6 +1551,33 @@ void DoApplySettings(DialogState* st) {
         SetWindowTextW(st->setStatus, T(L"適用しました", L"Applied", L"Aplicado"));
     }
     SetTimer(st->hwnd, TIMER_POLL, 300, nullptr);
+}
+
+void ApplyChatHandlerBar(DialogState* st) {
+    if (!st) return;
+    wchar_t engineBuf[128] = {};
+    if (st->handlerEngine) GetWindowTextW(st->handlerEngine, engineBuf, 128);
+    nlohmann::json req = {
+        {"action", "chat_handler"},
+        {"enabled", GetCheck(st->handlerEnabled)},
+        {"engine", Trim(WideToUtf8(engineBuf))},
+        {"model", GetTextUtf8(st->handlerModel)}
+    };
+    nlohmann::json resp;
+    if (!IpcCall(req, resp) || !resp.value("ok", false)) {
+        const std::string err = JsonError(resp, "IPC request failed");
+        MessageBoxW(st->hwnd, Utf8ToWide(err).c_str(),
+                    T(L"応答 LLM を変更できません", L"Could not change the answering LLM",
+                      L"No se pudo cambiar el LLM que responde"),
+                    MB_ICONERROR | MB_OK);
+        return;
+    }
+    if (st->handlerLabel) {
+        SetWindowTextW(st->handlerLabel,
+                       T(L"応答 LLM (適用済み)", L"Answering LLM (applied)",
+                         L"LLM que responde (aplicado)"));
+    }
+    LoadSettings(st);
 }
 
 // ---------------------------------------------------------------------------
@@ -1485,6 +1638,17 @@ LRESULT CALLBACK ComposeEditProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lPar
     return DefSubclassProc(hwnd, msg, wParam, lParam);
 }
 
+LRESULT CALLBACK TabSubclassProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam,
+                                   UINT_PTR, DWORD_PTR) {
+    if (msg == WM_ERASEBKGND && g_state && g_state->bgBrush) {
+        RECT rc = {};
+        GetClientRect(hwnd, &rc);
+        FillRect(reinterpret_cast<HDC>(wParam), &rc, g_state->bgBrush);
+        return 1;
+    }
+    return DefSubclassProc(hwnd, msg, wParam, lParam);
+}
+
 void CreateChatControls(DialogState* st) {
     HWND hwnd = st->hwnd;
     st->peersLabel = MakeStatic(hwnd, IDC_PEERS_LABEL, T(L"ホスト", L"HOSTS", L"EQUIPOS"));
@@ -1511,6 +1675,16 @@ void CreateChatControls(DialogState* st) {
     AddColumn(st->messages, 5, T(L"プレビュー", L"Preview", L"Vista previa"), S(240));
     AddColumn(st->messages, 6, T(L"ファイル", L"Files", L"Archivos"), S(120));
     AddColumn(st->messages, 7, T(L"状態", L"Status", L"Estado"), S(90));
+
+    st->handlerLabel = MakeStatic(hwnd, IDC_CHAT_HANDLER_LABEL,
+                                  T(L"応答 LLM", L"Answering LLM", L"LLM que responde"));
+    st->handlerEngine = MakeComboEdit(hwnd, IDC_CHAT_HANDLER_ENGINE);
+    for (const wchar_t* engine : {L"agy", L"claude", L"opencode", L"codex", L"antigravity", L"aider", L"ollama"}) {
+        ComboBox_AddString(st->handlerEngine, engine);
+    }
+    st->handlerModel = MakeEdit(hwnd, IDC_CHAT_HANDLER_MODEL, ES_AUTOHSCROLL);
+    st->handlerEnabled = MakeCheck(hwnd, IDC_CHAT_HANDLER_ENABLED, T(L"有効", L"On", L"Activo"));
+    st->btnHandlerApply = MakeButton(hwnd, IDC_BTN_CHAT_HANDLER_APPLY, T(L"適用", L"Apply", L"Aplicar"));
 
     st->detailLabel = MakeStatic(hwnd, IDC_DETAIL_LABEL, T(L"本文", L"MESSAGE", L"MENSAJE"));
     st->msgText = MakeEdit(hwnd, IDC_MSG_TEXT,
@@ -1567,6 +1741,8 @@ void CreateChatControls(DialogState* st) {
     st->btnReply = MakeButton(hwnd, IDC_BTN_REPLY, T(L"返信", L"Reply", L"Responder"));
 
     st->pageChat = {st->peersLabel, st->peers, st->btnRefreshPeers, st->peerCount,
+                    st->handlerLabel, st->handlerEngine, st->handlerModel,
+                    st->handlerEnabled, st->btnHandlerApply,
                     st->msgLabel, st->messages, st->detailLabel, st->msgText,
                     st->filesLabel, st->files, st->btnDownload, st->btnOpenFolder,
                     st->composeToLabel, st->composeTo, st->fromAgentLabel, st->fromAgent,
@@ -1620,7 +1796,7 @@ void CreateLogControls(DialogState* st) {
 void CreateSettingsControls(DialogState* st) {
     HWND hwnd = st->hwnd;
     st->setEnabled = MakeCheck(hwnd, IDC_SET_ENABLED,
-                               T(L"IPMsg を有効にする", L"Enable IPMsg", L"Activar IPMsg"));
+                               T(L"チャットを有効にする", L"Enable Chat", L"Activar chat"));
     st->setPortLabel = MakeStatic(hwnd, IDC_SET_PORT_LABEL, T(L"ポート", L"Port", L"Puerto"));
     st->setPort = MakeEdit(hwnd, IDC_SET_PORT, ES_AUTOHSCROLL | ES_NUMBER);
     st->setNickLabel = MakeStatic(hwnd, IDC_SET_NICK_LABEL,
@@ -1698,6 +1874,33 @@ LRESULT CALLBACK IpmsgWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam)
     }
 
     switch (msg) {
+        case WM_ERASEBKGND: {
+            if (!st) break;
+            RECT rc = {};
+            GetClientRect(hwnd, &rc);
+            FillRect(reinterpret_cast<HDC>(wParam), &rc,
+                     st->bgBrush ? st->bgBrush : reinterpret_cast<HBRUSH>(COLOR_WINDOW + 1));
+            return 1;
+        }
+        case WM_CTLCOLORSTATIC:
+        case WM_CTLCOLORBTN: {
+            if (!st) break;
+            HDC dc = reinterpret_cast<HDC>(wParam);
+            HWND control = reinterpret_cast<HWND>(lParam);
+            SetTextColor(dc, IsWindowEnabled(control) ? st->palette.text : st->palette.muted);
+            SetBkColor(dc, st->palette.windowBg);
+            return reinterpret_cast<LRESULT>(st->bgBrush ? st->bgBrush
+                                                         : reinterpret_cast<HBRUSH>(COLOR_WINDOW + 1));
+        }
+        case WM_CTLCOLOREDIT:
+        case WM_CTLCOLORLISTBOX: {
+            if (!st) break;
+            HDC dc = reinterpret_cast<HDC>(wParam);
+            SetTextColor(dc, st->palette.text);
+            SetBkColor(dc, st->palette.panel);
+            return reinterpret_cast<LRESULT>(st->panelBrush ? st->panelBrush
+                                                            : reinterpret_cast<HBRUSH>(COLOR_WINDOW + 1));
+        }
         case WM_CREATE: {
             if (!st) return -1;
             st->hwnd = hwnd;
@@ -1715,11 +1918,13 @@ LRESULT CALLBACK IpmsgWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam)
             }
 
             st->hwndTab = CreateWindowExW(0, WC_TABCONTROLW, L"",
-                                          WS_CHILD | WS_VISIBLE | TCS_TABS | TCS_SINGLELINE,
+                                          WS_CHILD | WS_VISIBLE | TCS_TABS | TCS_SINGLELINE | TCS_OWNERDRAWFIXED,
                                           0, 0, 10, 10, hwnd,
                                           reinterpret_cast<HMENU>(static_cast<INT_PTR>(IDC_TAB)),
                                           st->inst, nullptr);
             if (st->hwndTab) {
+                SetWindowTheme(st->hwndTab, L"", L"");
+                SetWindowSubclass(st->hwndTab, TabSubclassProc, 1, 0);
                 const wchar_t* labels[3] = {
                     T(L"チャット", L"Chat", L"Chat"),
                     T(L"ログ", L"Log", L"Registro"),
@@ -1737,6 +1942,7 @@ LRESULT CALLBACK IpmsgWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam)
             CreateLogControls(st);
             CreateSettingsControls(st);
             ApplyFont(st);
+            ApplyDialogTheme(st, true);
             ShowPage(st, 0);
             LoadSettings(st);
             AddTrayIcon(st);
@@ -1770,6 +1976,11 @@ LRESULT CALLBACK IpmsgWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam)
             if (!st) return 0;
             if (wParam == TIMER_POLL) {
                 PollStatus(st);
+                const int64_t now = static_cast<int64_t>(GetNowTickMs());
+                if (st->lastThemeCheckMs == 0 || now - st->lastThemeCheckMs > 5000) {
+                    st->lastThemeCheckMs = now;
+                    ApplyDialogTheme(st);
+                }
             } else if (wParam == TIMER_PEERS) {
                 KillTimer(hwnd, TIMER_PEERS);
                 LoadPeers(st);
@@ -1778,6 +1989,99 @@ LRESULT CALLBACK IpmsgWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam)
                 PollStatus(st);
             }
             return 0;
+        case WM_DRAWITEM: {
+            if (!st) break;
+            auto* dis = reinterpret_cast<DRAWITEMSTRUCT*>(lParam);
+            if (!dis || !dis->hDC) break;
+            HDC dc = dis->hDC;
+            RECT rc = dis->rcItem;
+            const bool pressed = (dis->itemState & ODS_SELECTED) != 0;
+            const bool disabled = (dis->itemState & ODS_DISABLED) != 0;
+            if (dis->CtlType == ODT_TAB) {
+                const bool selected = (dis->itemState & ODS_SELECTED) != 0;
+                const COLORREF bg = selected ? st->palette.panel : st->palette.windowBg;
+                HBRUSH brush = CreateSolidBrush(bg);
+                FillRect(dc, &rc, brush);
+                DeleteObject(brush);
+                SetBkMode(dc, TRANSPARENT);
+                SetTextColor(dc, selected ? st->palette.text : st->palette.muted);
+                HFONT font = reinterpret_cast<HFONT>(SendMessageW(dis->hwndItem, WM_GETFONT, 0, 0));
+                HGDIOBJ oldFont = font ? SelectObject(dc, font) : nullptr;
+                wchar_t label[128] = {};
+                TCITEMW item = {};
+                item.mask = TCIF_TEXT;
+                item.pszText = label;
+                item.cchTextMax = 128;
+                TabCtrl_GetItem(dis->hwndItem, dis->itemID, &item);
+                DrawTextW(dc, label, -1, &rc, DT_CENTER | DT_VCENTER | DT_SINGLELINE | DT_END_ELLIPSIS);
+                if (oldFont) SelectObject(dc, oldFont);
+                return TRUE;
+            }
+            if (dis->CtlType == ODT_BUTTON && IsCheckboxControl(st, dis->hwndItem)) {
+                HBRUSH bgBrush = CreateSolidBrush(st->palette.windowBg);
+                FillRect(dc, &rc, bgBrush);
+                DeleteObject(bgBrush);
+                const int box = S(14);
+                RECT mark = {rc.left + S(2), rc.top + (rc.bottom - rc.top - box) / 2,
+                             rc.left + S(2) + box, rc.top + (rc.bottom - rc.top - box) / 2 + box};
+                const bool checked = GetCheck(dis->hwndItem);
+                HBRUSH fill = CreateSolidBrush(checked ? st->palette.accent : st->palette.panel);
+                FillRect(dc, &mark, fill);
+                DeleteObject(fill);
+                HPEN pen = CreatePen(PS_SOLID, 1, st->palette.border);
+                HGDIOBJ oldPen = SelectObject(dc, pen);
+                HGDIOBJ oldBrush = SelectObject(dc, GetStockObject(NULL_BRUSH));
+                Rectangle(dc, mark.left, mark.top, mark.right, mark.bottom);
+                if (checked) {
+                    HPEN checkPen = CreatePen(PS_SOLID, 2, st->palette.text);
+                    HGDIOBJ oldCheck = SelectObject(dc, checkPen);
+                    MoveToEx(dc, mark.left + S(3), mark.top + S(7), nullptr);
+                    LineTo(dc, mark.left + S(6), mark.bottom - S(3));
+                    LineTo(dc, mark.right - S(2), mark.top + S(3));
+                    SelectObject(dc, oldCheck);
+                    DeleteObject(checkPen);
+                }
+                SelectObject(dc, oldBrush);
+                SelectObject(dc, oldPen);
+                DeleteObject(pen);
+                wchar_t label[256] = {};
+                GetWindowTextW(dis->hwndItem, label, 256);
+                RECT textRc = rc;
+                textRc.left = mark.right + S(6);
+                SetBkMode(dc, TRANSPARENT);
+                SetTextColor(dc, disabled ? st->palette.muted : st->palette.text);
+                HFONT font = reinterpret_cast<HFONT>(SendMessageW(dis->hwndItem, WM_GETFONT, 0, 0));
+                HGDIOBJ oldFont = font ? SelectObject(dc, font) : nullptr;
+                DrawTextW(dc, label, -1, &textRc, DT_LEFT | DT_VCENTER | DT_SINGLELINE | DT_END_ELLIPSIS);
+                if (oldFont) SelectObject(dc, oldFont);
+                return TRUE;
+            }
+            if (dis->CtlType == ODT_BUTTON) {
+                const COLORREF bg = disabled ? st->palette.windowBg
+                                             : (pressed ? st->palette.rowSelected : st->palette.panel);
+                HBRUSH brush = CreateSolidBrush(bg);
+                FillRect(dc, &rc, brush);
+                DeleteObject(brush);
+                HPEN pen = CreatePen(PS_SOLID, 1, st->palette.border);
+                HGDIOBJ oldPen = SelectObject(dc, pen);
+                HGDIOBJ oldBrush = SelectObject(dc, GetStockObject(NULL_BRUSH));
+                Rectangle(dc, rc.left, rc.top, rc.right, rc.bottom);
+                SelectObject(dc, oldBrush);
+                SelectObject(dc, oldPen);
+                DeleteObject(pen);
+                wchar_t label[256] = {};
+                GetWindowTextW(dis->hwndItem, label, 256);
+                SetBkMode(dc, TRANSPARENT);
+                SetTextColor(dc, disabled ? st->palette.muted : st->palette.text);
+                HFONT font = reinterpret_cast<HFONT>(SendMessageW(dis->hwndItem, WM_GETFONT, 0, 0));
+                HGDIOBJ oldFont = font ? SelectObject(dc, font) : nullptr;
+                if (pressed) OffsetRect(&rc, 1, 1);
+                DrawTextW(dc, label, -1, &rc, DT_CENTER | DT_VCENTER | DT_SINGLELINE | DT_END_ELLIPSIS);
+                if (oldFont) SelectObject(dc, oldFont);
+                return TRUE;
+            }
+            break;
+        }
         case WM_COMMAND: {
             if (!st) return 0;
             const int id = LOWORD(wParam);
@@ -1792,11 +2096,19 @@ LRESULT CALLBACK IpmsgWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam)
                 return 0;
             }
             if (code != BN_CLICKED) return 0;
+            if (IsCheckboxControl(st, reinterpret_cast<HWND>(lParam))) {
+                SetCheck(reinterpret_cast<HWND>(lParam), !GetCheck(reinterpret_cast<HWND>(lParam)));
+                return 0;
+            }
             switch (id) {
                 case IDC_BTN_REFRESH_PEERS: {
                     nlohmann::json resp;
-                    IpcCall({{"action", "ipmsg_refresh"}}, resp);
+                    IpcCall({{"action", "chat_refresh"}}, resp);
                     SetTimer(hwnd, TIMER_PEERS, 800, nullptr);
+                    break;
+                }
+                case IDC_BTN_CHAT_HANDLER_APPLY: {
+                    ApplyChatHandlerBar(st);
                     break;
                 }
                 case IDC_BTN_DOWNLOAD:
@@ -1822,7 +2134,7 @@ LRESULT CALLBACK IpmsgWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam)
                     break;
                 case IDC_BTN_LOG_FOLDER: {
                     std::wstring dir = st->logDir.empty()
-                        ? PathJoinWide(GetEffectiveDataDirectoryWide(), L"ipmsg\\log")
+                        ? PathJoinWide(GetEffectiveDataDirectoryWide(), L"chat\\log")
                         : Utf8ToWide(st->logDir);
                     OpenFolder(dir);
                     break;
@@ -1833,12 +2145,12 @@ LRESULT CALLBACK IpmsgWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam)
                 case IDC_SET_ENABLED: {
                     const bool on = GetCheck(st->setEnabled);
                     nlohmann::json resp;
-                    if (!IpcCall({{"action", "ipmsg_enable"}, {"enabled", on}}, resp) ||
+                    if (!IpcCall({{"action", "chat_enable"}, {"enabled", on}}, resp) ||
                         !resp.value("ok", false)) {
                         std::string err = JsonError(resp, "IPC request failed");
                         MessageBoxW(hwnd, Utf8ToWide(err).c_str(),
-                                    T(L"IPMsg を切り替えられません", L"Could not switch IPMsg",
-                                      L"No se pudo cambiar IPMsg"),
+                                    T(L"チャットを切り替えられません", L"Could not switch Chat",
+                                      L"No se pudo cambiar el chat"),
                                     MB_ICONERROR | MB_OK);
                         SetCheck(st->setEnabled, !on);
                     } else {
@@ -1947,6 +2259,7 @@ LRESULT CALLBACK IpmsgWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam)
                     DeleteObject(st->font);
                     st->font = nullptr;
                 }
+                DestroyDialogTheme(st);
             }
             PostQuitMessage(0);
             return 0;
@@ -1972,6 +2285,16 @@ HWND FindExistingDialog() {
 
 } // namespace
 
+bool ActivateIpmsgDialog() {
+    HWND h = FindExistingDialog();
+    if (!h) return false;
+    if (IsIconic(h)) ShowWindow(h, SW_RESTORE);
+    else ShowWindow(h, SW_SHOW);
+    BringWindowToTop(h);
+    SetForegroundWindow(h);
+    return true;
+}
+
 int RunIpmsgDialog(bool startHidden) {
     SetProcessDPIAware();
 
@@ -1982,6 +2305,7 @@ int RunIpmsgDialog(bool startHidden) {
     InitCommonControlsEx(&icex);
 
     g_lang = DetectLanguage();
+    InitDashboardDarkMode(GetDashboardPalette().dark);
     g_showMessage = RegisterWindowMessageW(L"HanchoIpmsgShow");
 
     std::wstring mutexName = GetGuiMutexNameWide() + L"_ipmsg";
@@ -2015,7 +2339,7 @@ int RunIpmsgDialog(bool startHidden) {
     wc.lpszClassName = kWndClass;
     RegisterClassExW(&wc);
 
-    HWND hwnd = CreateWindowExW(0, kWndClass, L"Hancho IPMsg",
+    HWND hwnd = CreateWindowExW(0, kWndClass, L"Hancho Chat",
                                 WS_OVERLAPPEDWINDOW | WS_CLIPCHILDREN,
                                 CW_USEDEFAULT, CW_USEDEFAULT, 1180, 820,
                                 nullptr, nullptr, st.inst, &st);
@@ -2036,9 +2360,9 @@ int RunIpmsgDialog(bool startHidden) {
         try {
             DispatchMessageW(&msg);
         } catch (const std::exception& e) {
-            WriteAuditLog("CRASH_GUARD", std::string("IPMsg GUI exception: ") + e.what());
+            WriteAuditLog("CRASH_GUARD", std::string("Chat GUI exception: ") + e.what());
         } catch (...) {
-            WriteAuditLog("CRASH_GUARD", "IPMsg GUI exception: unknown");
+            WriteAuditLog("CRASH_GUARD", "Chat GUI exception: unknown");
         }
     }
 

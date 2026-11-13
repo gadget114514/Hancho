@@ -1,6 +1,6 @@
 #pragma once
 
-// LLM handler for incoming IPMsg messages: each received message that matches
+// LLM handler for incoming Chat messages: each received message that matches
 // the handler's filter is passed to a worker LLM as a Hancho task queue job.
 // Implemented by the "handler" job; see ipmsg_handler.cpp.
 
@@ -23,7 +23,7 @@ class IpmsgNode;
 class ProcessManager;
 class TaskQueueManager;
 
-// config.json "ipmsg": { ..., "handler": { ... } }
+// config.json "chat": { ..., "handler": { ... } }
 struct IpmsgHandlerConfig {
     bool enabled = false;
     std::string engine = "agy";      // worker engine (WorkerEngineRegistry)
@@ -31,7 +31,7 @@ struct IpmsgHandlerConfig {
     std::string agent;               // handle messages to this agent ("" = unaddressed ones)
     std::string cwd;                 // worker working directory ("" = data dir)
     std::string instructions;        // extra system-style instructions for the worker
-    std::string taskqueue = "ipmsg"; // task queue the jobs go to
+    std::string taskqueue = "chat"; // task queue the jobs go to
     bool autoReply = true;           // core sends the worker's final text back as a reply
     bool skipPermissions = false;    // pass the engine's permissionArgs (dangerous with LAN input)
     int timeoutSec = 600;
@@ -65,7 +65,7 @@ public:
     void OnMessage(const nlohmann::json& message);
 
     // Config plus queued/running/done/failed counts and the last job ids, for
-    // ipmsg_status.
+    // chat_status.
     nlohmann::json StatusJson() const;
 
 private:

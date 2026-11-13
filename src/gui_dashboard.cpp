@@ -1,5 +1,7 @@
 #include <winsock2.h>
 #include "gui_dashboard.h"
+#include "gui_theme.h"
+#include "gui_ipmsg.h"
 #include "common.h"
 #include "llm_stream.h"
 #include "event_schema.h"
@@ -369,9 +371,8 @@ static void ApplyNativeControlTheme(HWND hwnd, bool dark) {
     SetWindowTheme(hwnd, dark ? L"DarkMode_Explorer" : L"", dark ? nullptr : L"");
 }
 
-static void ApplyNativeThemeToWindow(HWND hwnd) {
+static void ApplyNativeThemeToWindow(HWND hwnd, bool dark) {
     if (!hwnd) return;
-    bool dark = IsDarkThemeActive();
     BOOL darkFlag = dark ? TRUE : FALSE;
     DwmSetWindowAttribute(hwnd, 20, &darkFlag, sizeof(darkFlag));
     DwmSetWindowAttribute(hwnd, 19, &darkFlag, sizeof(darkFlag));
@@ -384,6 +385,10 @@ static void ApplyNativeThemeToWindow(HWND hwnd) {
             }
         }
     }
+}
+
+static void ApplyNativeThemeToWindow(HWND hwnd) {
+    ApplyNativeThemeToWindow(hwnd, IsDarkThemeActive());
 }
 
 static COLORREF BlendColor(COLORREF from, COLORREF to, float t);
@@ -9381,14 +9386,17 @@ static std::wstring GetConfigFilePathWide() {
     return GetLogsDirectoryWide() + L"\\config.json";
 }
 
-// Launches the standalone IPMsg dialog. One instance per data dir; a second
+// Launches the standalone Chat dialog. One instance per data dir; a second
 // launch activates the existing window instead of creating another one.
 static void LaunchIpmsgDialog(bool startHidden) {
+    // A toolbar click raises the window that already exists; the tray launch at
+    // dashboard start must not pull it to the foreground.
+    if (!startHidden && ActivateIpmsgDialog()) return;
     wchar_t exePath[MAX_PATH] = {};
     GetModuleFileNameW(nullptr, exePath, MAX_PATH);
     std::wstring cmd = L"\"";
     cmd += exePath;
-    cmd += L"\" ipmsg";
+    cmd += L"\" chat";
     if (startHidden) cmd += L" --tray";
     if (HasCustomDataDirectory()) {
         cmd += L" --data-dir \"";
@@ -9412,7 +9420,8 @@ static bool IpmsgEnabledInConfig() {
     if (content.empty()) return false;
     nlohmann::json j = nlohmann::json::parse(content, nullptr, false);
     if (!j.is_object()) return false;
-    auto it = j.find("ipmsg");
+    auto it = j.find("chat");
+    if (it == j.end() || !it->is_object()) it = j.find("ipmsg");
     if (it == j.end() || !it->is_object()) return false;
     return it->value("enabled", false);
 }
@@ -9707,7 +9716,7 @@ static void UpdateToolbarLabels(DashboardState* st) {
                 Tr(L"ヒント履歴", L"Hint History", L"Historial de pistas"));
         if (st->hwndBtnIpmsg)
             UpdateControlTooltip(st->hwndToolbarTip, st->hwndMain, st->hwndBtnIpmsg,
-                Tr(L"IPMsg メッセンジャー", L"IPMsg Messenger", L"Mensajero IPMsg"));
+                Tr(L"チャット", L"Chat", L"Chat"));
     }
     UpdatePanelToggleLabels(st);
     if (st->hwndBtnViewTasks) {
@@ -14737,6 +14746,39 @@ int RunGuiDashboard(ProcessManager& pm, IpcServer& ipc, TaskQueueManager& tqm) {
 
 int RunStandaloneGuiDashboard() {
     return RunGuiDashboard(nullptr, nullptr, nullptr);
+}
+
+DashboardPalette GetDashboardPalette() {
+    UiTheme theme = g_uiTheme;
+    const std::string content = ReadFileUtf8Wide(GetConfigFilePathWide());
+    if (!content.empty()) {
+        const std::string code = JsonGetString(content, "theme", "");
+        if (!code.empty()) theme = ParseTheme(code);
+    }
+    const ThemeColors c = ThemeFor(theme);
+    DashboardPalette p;
+    p.windowBg = c.windowBg;
+    p.panel = c.panel;
+    p.border = c.border;
+    p.text = c.text;
+    p.muted = c.muted;
+    p.accent = c.accent;
+    p.listText = c.listText;
+    p.rowSelected = c.rowSelected;
+    p.rowRunning = c.rowRunning;
+    p.rowIdle = c.rowIdle;
+    p.rowCompleted = c.rowCompleted;
+    p.rowFailed = c.rowFailed;
+    p.dark = IsDarkUiTheme(theme);
+    return p;
+}
+
+void InitDashboardDarkMode(bool dark) {
+    ApplyDarkModeApi(nullptr, dark);
+}
+
+void ApplyDashboardNativeTheme(HWND hwnd) {
+    ApplyNativeThemeToWindow(hwnd, GetDashboardPalette().dark);
 }
 
 } // namespace pc

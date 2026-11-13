@@ -584,7 +584,10 @@ void IpcServer::StartIpmsg() {
         ReadFileUtf8Wide(PathJoinWide(GetEffectiveDataDirectoryWide(), L"config.json"));
     if (!content.empty()) {
         nlohmann::json cfg = nlohmann::json::parse(content, nullptr, false);
-        if (cfg.is_object() && cfg.contains("ipmsg") && cfg["ipmsg"].is_object()) {
+        if (cfg.is_object() && cfg.contains("chat") && cfg["chat"].is_object()) {
+            block = cfg["chat"];
+        } else if (cfg.is_object() && cfg.contains("ipmsg") && cfg["ipmsg"].is_object()) {
+            // Old configurations keep working; the next config_set writes "chat".
             block = cfg["ipmsg"];
         }
     }
@@ -609,7 +612,7 @@ void IpcServer::StartIpmsg() {
     }
     std::string err;
     if (!ipmsg_->Start(cfg, &err)) {
-        WriteAuditLog("IPMSG_START_FAILED", err.empty() ? "cannot start IPMsg" : err);
+        WriteAuditLog("CHAT_START_FAILED", err.empty() ? "cannot start Chat" : err);
     }
 }
 

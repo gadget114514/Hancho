@@ -325,22 +325,73 @@ static uint64_t IpmsgReqUint(const nlohmann::json& req, const char* key, uint64_
     return def;
 }
 
-std::string IpcServer::HandleIpmsgAction(const std::string& action, const std::string& reqJson) {
+static nlohmann::json& EnsureChatBlock(nlohmann::json& cfg) {
+    if (!cfg.contains("chat") || !cfg["chat"].is_object()) {
+        if (cfg.contains("ipmsg") && cfg["ipmsg"].is_object()) {
+            // Migrate the pre-Chat key transparently.
+            cfg["chat"] = cfg["ipmsg"];
+        } else {
+            cfg["chat"] = nlohmann::json::object();
+        }
+    }
+    cfg.erase("ipmsg");
+    return cfg["chat"];
+}
+
+static void PatchChatHandlerConfig(nlohmann::json& handler, const nlohmann::json& req) {
+    auto str = [&](const char* snake, const char* camel) {
+        auto it = req.find(snake);
+        if (it == req.end() && camel) it = req.find(camel);
+        if (it != req.end() && it->is_string()) handler[snake] = it->get<std::string>();
+    };
+    auto boolean = [&](const char* snake, const char* camel) {
+        auto it = req.find(snake);
+        if (it == req.end() && camel) it = req.find(camel);
+        if (it != req.end() && it->is_boolean()) handler[snake] = it->get<bool>();
+    };
+    auto integer = [&](const char* snake, const char* camel) {
+        auto it = req.find(snake);
+        if (it == req.end() && camel) it = req.find(camel);
+        if (it == req.end()) return;
+        if (it->is_number_integer()) handler[snake] = it->get<int64_t>();
+        else if (it->is_number_unsigned()) handler[snake] = static_cast<int64_t>(it->get<uint64_t>());
+        else if (it->is_string()) {
+            try { handler[snake] = std::stoll(it->get<std::string>()); } catch (...) {}
+        }
+    };
+    boolean("enabled", nullptr);
+    str("engine", nullptr);
+    str("model", nullptr);
+    str("agent", nullptr);
+    str("cwd", nullptr);
+    str("instructions", nullptr);
+    str("taskqueue", "taskQueue");
+    boolean("auto_reply", "autoReply");
+    boolean("skip_permissions", "skipPermissions");
+    integer("timeout_sec", "timeoutSec");
+    integer("max_hops", "maxHops");
+    integer("concurrency", nullptr);
+}
+
+std::string IpcServer::HandleChatAction(const std::string& action, const std::string& reqJson) {
     nlohmann::json req = nlohmann::json::parse(reqJson, nullptr, false);
     if (req.is_discarded() || !req.is_object()) {
         return "{\"ok\":false,\"error\":\"invalid JSON request\"}";
     }
+    // Old ipmsg_* calls keep working without advertising the old name.
+    std::string act = action;
+    if (act.rfind("ipmsg_", 0) == 0) act = "chat_" + act.substr(6);
     if (!ipmsg_) ipmsg_ = std::make_unique<IpmsgNode>();
 
-    if (action == "ipmsg_status") {
+    if (act == "chat_status") {
         nlohmann::json status = ipmsg_->Status();
         if (ipmsgHandler_) status["handler"] = ipmsgHandler_->StatusJson();
         return status.dump();
     }
-    if (action == "ipmsg_enable") {
+    if (act == "chat_enable") {
         auto it = req.find("enabled");
         if (it == req.end() || !it->is_boolean()) {
-            return "{\"ok\":false,\"error\":\"enabled (bool) is required for ipmsg_enable\"}";
+            return "{\"ok\":false,\"error\":\"enabled (bool) is required for chat_enable\"}";
         }
         const bool enabled = it->get<bool>();
         std::wstring configPath = PathJoinWide(GetEffectiveDataDirectoryWide(), L"config.json");
@@ -350,23 +401,50 @@ std::string IpcServer::HandleIpmsgAction(const std::string& action, const std::s
             nlohmann::json parsed = nlohmann::json::parse(content, nullptr, false);
             if (parsed.is_object()) cfg = parsed;
         }
-        if (!cfg.contains("ipmsg") || !cfg["ipmsg"].is_object()) cfg["ipmsg"] = nlohmann::json::object();
-        cfg["ipmsg"]["enabled"] = enabled;
+        nlohmann::json& chat = EnsureChatBlock(cfg);
+        chat["enabled"] = enabled;
         WriteFileAtomicWide(configPath, cfg.dump(2));
-        WriteAuditLog("IPMSG_ENABLE", enabled ? "enabled" : "disabled");
+        WriteAuditLog("CHAT_ENABLE", enabled ? "enabled" : "disabled");
         // Synchronous so the reply reflects the new state (and a freed port).
         StartIpmsg();
         nlohmann::json status = ipmsg_->Status();
         if (ipmsgHandler_) status["handler"] = ipmsgHandler_->StatusJson();
         return status.dump();
     }
-    if (action == "ipmsg_peers") {
+    if (act == "chat_handler") {
+        std::wstring configPath = PathJoinWide(GetEffectiveDataDirectoryWide(), L"config.json");
+        nlohmann::json cfg = nlohmann::json::object();
+        std::string content = ReadFileUtf8Wide(configPath);
+        if (!content.empty()) {
+            nlohmann::json parsed = nlohmann::json::parse(content, nullptr, false);
+            if (parsed.is_object()) cfg = parsed;
+        }
+        nlohmann::json& chat = EnsureChatBlock(cfg);
+        if (!chat.contains("handler") || !chat["handler"].is_object()) {
+            chat["handler"] = nlohmann::json::object();
+        }
+        nlohmann::json& handler = chat["handler"];
+        PatchChatHandlerConfig(handler, req);
+        // Return (and persist) the effective values, not only the patched keys.
+        nlohmann::json handlerDefaults = IpmsgHandlerConfig().ToJson();
+        for (auto it = handlerDefaults.begin(); it != handlerDefaults.end(); ++it) {
+            if (!handler.contains(it.key())) handler[it.key()] = it.value();
+        }
+        WriteFileAtomicWide(configPath, cfg.dump(2));
+        ScheduleIpmsgRestart();
+        nlohmann::json out;
+        out["ok"] = true;
+        out["handler"] = handler;
+        out["restarting"] = true;
+        return out.dump();
+    }
+    if (act == "chat_peers") {
         return ipmsg_->Peers().dump();
     }
-    if (action == "ipmsg_refresh") {
+    if (act == "chat_refresh") {
         return ipmsg_->Refresh().dump();
     }
-    if (action == "ipmsg_send") {
+    if (act == "chat_send") {
         std::vector<std::string> files;
         if (req.contains("files") && req["files"].is_array()) {
             for (const auto& f : req["files"]) {
@@ -380,10 +458,10 @@ std::string IpcServer::HandleIpmsgAction(const std::string& action, const std::s
                             static_cast<int>(IpmsgReqInt(req, "hops", 0)))
             .dump();
     }
-    if (action == "ipmsg_get") {
+    if (act == "chat_get") {
         return ipmsg_->Get(IpmsgReqUint(req, "id", 0)).dump();
     }
-    if (action == "ipmsg_inbox") {
+    if (act == "chat_inbox") {
         return ipmsg_->Inbox(IpmsgReqUint(req, "since_id", 0), IpmsgReqString(req, "agent"),
                              IpmsgReqBool(req, "include_unaddressed", true),
                              IpmsgReqBool(req, "unread_only", false),
@@ -392,7 +470,7 @@ std::string IpcServer::HandleIpmsgAction(const std::string& action, const std::s
                              IpmsgReqBool(req, "mark_read", false))
             .dump();
     }
-    if (action == "ipmsg_wait") {
+    if (act == "chat_wait") {
         int timeoutMs = static_cast<int>(IpmsgReqInt(req, "timeout_ms", 60000));
         if (timeoutMs < 0) timeoutMs = 0;
         if (timeoutMs > 600000) timeoutMs = 600000;
@@ -401,7 +479,7 @@ std::string IpcServer::HandleIpmsgAction(const std::string& action, const std::s
                             IpmsgReqBool(req, "mark_read", true))
             .dump();
     }
-    if (action == "ipmsg_read") {
+    if (act == "chat_read") {
         std::vector<uint64_t> ids;
         if (req.contains("ids") && req["ids"].is_array()) {
             for (const auto& id : req["ids"]) {
@@ -419,24 +497,24 @@ std::string IpcServer::HandleIpmsgAction(const std::string& action, const std::s
         }
         return ipmsg_->MarkRead(ids, IpmsgReqBool(req, "all", false)).dump();
     }
-    if (action == "ipmsg_download") {
+    if (act == "chat_download") {
         int timeoutMs = static_cast<int>(IpmsgReqInt(req, "timeout_ms", 300000));
         return ipmsg_->Download(IpmsgReqUint(req, "message_id", 0),
                                 IpmsgReqInt(req, "file_id", -1), IpmsgReqString(req, "dir"),
                                 IpmsgReqBool(req, "wait", false), timeoutMs)
             .dump();
     }
-    if (action == "ipmsg_log") {
+    if (act == "chat_log") {
         return ipmsg_->Log(IpmsgReqString(req, "since", "7d"), IpmsgReqString(req, "until"),
                            IpmsgReqString(req, "query"), IpmsgReqString(req, "peer"),
                            IpmsgReqString(req, "agent"), IpmsgReqString(req, "event"),
                            static_cast<size_t>(IpmsgReqUint(req, "limit", 200)))
             .dump();
     }
-    if (action == "ipmsg_clear") {
+    if (act == "chat_clear") {
         return ipmsg_->Clear().dump();
     }
-    return "{\"ok\":false,\"error\":\"Unknown ipmsg action: " + JsonEscape(action) + "\"}";
+    return "{\"ok\":false,\"error\":\"Unknown chat action: " + JsonEscape(action) + "\"}";
 }
 
 std::string IpcServer::HandleRequestJson(const std::string& reqJson) {
@@ -1557,8 +1635,8 @@ std::string IpcServer::HandleRequestJson(const std::string& reqJson) {
         }
         return "{\"ok\":false,\"error\":\"Unknown memory action: " + JsonEscape(action) + "\"}";
     }
-    else if (action.rfind("ipmsg_", 0) == 0) {
-        return HandleIpmsgAction(action, reqJson);
+    else if (action.rfind("chat_", 0) == 0 || action.rfind("ipmsg_", 0) == 0) {
+        return HandleChatAction(action, reqJson);
     }
     else if (action.rfind("config_", 0) == 0) {
         std::wstring configPath = PathJoinWide(GetEffectiveDataDirectoryWide(), L"config.json");
@@ -1590,11 +1668,8 @@ std::string IpcServer::HandleRequestJson(const std::string& reqJson) {
                 if (!w.contains("allowed_hosts")) w["allowed_hosts"] = nlohmann::json::array();
                 if (!w.contains("allowed_origins")) w["allowed_origins"] = nlohmann::json::array();
             }
-            if (!cfg.contains("ipmsg") || !cfg["ipmsg"].is_object()) {
-                cfg["ipmsg"] = nlohmann::json::object();
-            }
             {
-                nlohmann::json& m = cfg["ipmsg"];
+                nlohmann::json& m = EnsureChatBlock(cfg);
                 nlohmann::json defaults = IpmsgConfig().ToJson();
                 for (auto it = defaults.begin(); it != defaults.end(); ++it) {
                     if (!m.contains(it.key())) m[it.key()] = it.value();
@@ -1631,9 +1706,14 @@ std::string IpcServer::HandleRequestJson(const std::string& reqJson) {
                 nlohmann::json parsed = nlohmann::json::parse(content, nullptr, false);
                 if (parsed.is_object()) cfg = parsed;
             }
+            if (patch.contains("ipmsg") && !patch.contains("chat")) {
+                patch["chat"] = patch["ipmsg"];
+            }
+            patch.erase("ipmsg");
             for (auto it = patch.begin(); it != patch.end(); ++it) {
                 cfg[it.key()] = it.value();
             }
+            EnsureChatBlock(cfg);
             if (cfg.contains("resource_locks") && cfg["resource_locks"].is_boolean()) {
                 tqm_.SetResourceLocksEnabled(cfg["resource_locks"].get<bool>());
             }
@@ -1644,10 +1724,10 @@ std::string IpcServer::HandleRequestJson(const std::string& reqJson) {
                 SetUsageHistoryPersistence(cfg["restore_usage_graph"].get<bool>());
             }
             const bool webuiChanged = patch.contains("webui");
-            const bool ipmsgChanged = patch.contains("ipmsg");
+            const bool chatChanged = patch.contains("chat");
             WriteFileAtomicWide(configPath, cfg.dump(2));
             if (webuiChanged) ScheduleWebUiRestart();
-            if (ipmsgChanged) ScheduleIpmsgRestart();
+            if (chatChanged) ScheduleIpmsgRestart();
             nlohmann::json out;
             out["ok"] = true;
             out["config"] = cfg;

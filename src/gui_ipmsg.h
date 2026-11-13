@@ -13,4 +13,8 @@ namespace pc {
 // Blocks until the dialog exits; returns the process exit code.
 int RunIpmsgDialog(bool startHidden);
 
+// Brings an already running Chat window for the current data directory to the
+// front. Returns false when no window exists.
+bool ActivateIpmsgDialog();
+
 } // namespace pc

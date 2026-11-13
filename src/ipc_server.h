@@ -74,7 +74,7 @@ public:
 
 private:
     void AcceptLoop();
-    std::string HandleIpmsgAction(const std::string& action, const std::string& reqJson);
+    std::string HandleChatAction(const std::string& action, const std::string& reqJson);
     void StartRemoteListener();
     void StopRemoteListener();
     void InstallRemoteCallbacks();

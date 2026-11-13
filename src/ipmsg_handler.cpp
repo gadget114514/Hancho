@@ -1,6 +1,6 @@
-// LLM handler for incoming IPMsg messages. Each message that passes the
+// LLM handler for incoming Chat messages. Each message that passes the
 // handler's filter becomes one Hancho task queue job whose worker answer is
-// sent back as an IPMsg reply.
+// sent back as a Chat reply.
 #include "ipmsg_handler.h"
 
 #include "common.h"
@@ -172,7 +172,7 @@ IpmsgHandlerConfig IpmsgHandlerConfig::FromJson(const nlohmann::json& j) {
     c.maxHops = j.value("max_hops", c.maxHops);
     c.concurrency = j.value("concurrency", c.concurrency);
     if (c.engine.empty()) c.engine = "agy";
-    if (c.taskqueue.empty()) c.taskqueue = "ipmsg";
+    if (c.taskqueue.empty()) c.taskqueue = "chat";
     if (c.timeoutSec < 30) c.timeoutSec = 30;
     if (c.maxHops < 1) c.maxHops = 1;
     if (c.concurrency < 1) c.concurrency = 1;
@@ -279,7 +279,7 @@ bool IpmsgHandler::ShouldProcess(const IpmsgHandlerConfig& cfg, const nlohmann::
 }
 
 std::string IpmsgHandler::MakeJobId(uint64_t messageId) const {
-    const std::string base = "ipmsg-" + std::to_string(messageId);
+    const std::string base = "chat-" + std::to_string(messageId);
     std::string candidate = base;
     for (int k = 2; k < 10000; ++k) {
         TaskQueueJob existing;
@@ -304,7 +304,7 @@ std::string IpmsgHandler::BuildPrompt(const IpmsgHandlerConfig& cfg,
 
     std::string prompt;
     prompt +=
-        "You are Hancho's IPMsg message handler. Another IPMsg peer sent your core a "
+        "You are Hancho's Chat message handler. Another Chat peer sent your core a "
         "message. Decide whether a reply is appropriate, and compose it.\n\n";
     if (!cfg.instructions.empty()) {
         prompt += "Handler instructions:\n";
@@ -325,7 +325,7 @@ std::string IpmsgHandler::BuildPrompt(const IpmsgHandlerConfig& cfg,
         "  {\"audience\":\"human\"|\"agent\",\"text\":\"...\",\"to_agent\":\"<optional>\"}\n"
         "or, when no reply should be sent:\n"
         "  {\"audience\":\"none\"}\n\n"
-        "Choose \"human\" when the reply is meant to be read by a person in an IPMsg "
+        "Choose \"human\" when the reply is meant to be read by a person in a Chat "
         "window (for example the sender is a person: no from_agent, or the audience was "
         "unspecified). Choose \"agent\" when the reply is meant for another Hancho/LLM "
         "to process. The decision belongs to you. Put plain text in \"text\"; set "
@@ -400,7 +400,7 @@ void IpmsgHandler::ProcessMessage(const nlohmann::json& message) {
     const std::string preview =
         FirstLinePreview(message.value("text", std::string()), 60);
     const std::string summary =
-        "IPMsg from " + (peerName.empty() ? std::string("?") : peerName) + ": " + preview;
+        "Chat from " + (peerName.empty() ? std::string("?") : peerName) + ": " + preview;
 
     nlohmann::json job;
     job["id"] = jobId;
@@ -414,7 +414,7 @@ void IpmsgHandler::ProcessMessage(const nlohmann::json& message) {
     if (!adapter.empty()) job["env"]["HANCHO_ADAPTER"] = adapter;
 
     nlohmann::json origin;
-    origin["label"] = "ipmsg-handler";
+    origin["label"] = "chat-handler";
     origin["cwd"] = cfg.cwd.empty() ? dataDir : cfg.cwd;
 
     std::string addError;
@@ -470,7 +470,7 @@ void IpmsgHandler::HandleJobResult(const TrackedJob& entry, const IpmsgHandlerCo
     }
     if (!node_) {
         LogEvent("handler_failed",
-                 {{"id", entry.messageId}, {"job_id", entry.jobId}, {"reason", "no-ipmsg-node"},
+                 {{"id", entry.messageId}, {"job_id", entry.jobId}, {"reason", "no-chat-node"},
                   {"peer", entry.peer}});
         return;
     }

@@ -45,8 +45,8 @@ USAGE:
       Run as a Model Context Protocol (MCP) stdio server for Claude.
       Automatically connects to (or launches) the Win32 GUI Dashboard.
 
-  Hancho.exe ipmsg [--data-dir <path>] [--tray]
-      Run the IPMsg compatible messenger dialog only (no main dashboard).
+  Hancho.exe chat [--data-dir <path>] [--tray]
+      Run the Chat dialog only (IPMsg compatible protocol; no main dashboard).
       Connects to the running core, or starts the headless core first.
       One dialog per data dir; a second launch brings the existing one forward.
       --tray starts hidden in the notification area. Close (X) hides to tray;
@@ -149,7 +149,7 @@ MCP SERVER SETUP:
     - The dashboard auto-starts on first use and owns the Named Pipe server.
     - Logs, state and task queues live under logs/ (override: HANCHO_LOG_DIR).
 
-  MCP tools (47):
+  MCP tools (57):
     Process (6):
       start_process, list_processes, get_process_output, send_process_input,
       wait_process, kill_process
@@ -165,9 +165,14 @@ MCP SERVER SETUP:
       bt_update, bt_cancel, bt_pause
     Power (3):
       power_suspend, power_cancel, power_status
-    IPMsg (10):
-      ipmsg_status, ipmsg_peers, ipmsg_refresh, ipmsg_send, ipmsg_get,
-      ipmsg_inbox, ipmsg_wait, ipmsg_read, ipmsg_download, ipmsg_log
+    Chat (11):
+      chat_status, chat_peers, chat_refresh, chat_send, chat_get, chat_inbox,
+      chat_wait, chat_read, chat_download, chat_log, chat_handler
+    Memory (7):
+      memory_search, memory_get, memory_brief, memory_stats, memory_note,
+      memory_retract, memory_approve
+    Usage (2):
+      usage_stats, usage_export
 
   HOW TO USE (decision guide):
     - One command, e.g. a build script, CLI worker or shell -> start_process
@@ -635,7 +640,7 @@ int main() {
         return RunMcpServer();
     }
 
-    if (subcmd == "ipmsg") {
+    if (subcmd == "chat" || subcmd == "ipmsg") {
         // IPC client only: no main dashboard. Start the headless core if it is
         // not running (same behavior as `Hancho.exe gui`).
         std::string pingResp, pingErr;

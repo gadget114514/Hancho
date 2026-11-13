@@ -156,7 +156,7 @@ Hancho のデータはすべて JSON / JSONL（タスクキュー、ビヘイビ
 ## リリースノート
 
 ### v0.9.10
-- **IP Messenger (IPMsg)**: コアが古典的な IPMsg プロトコル（参加通知、メッセージ、開封通知、通常ファイル転送）を UDP/TCP ポート 2426 で話します。既定では無効です。LLM 同士のメッセージング用に `from_agent` / `to_agent` / `reply_to`、`audience`（human / agent）、ホップ数ガードを追加し、ワーカー LLM のハンドラが自動返信します。`hancho-cli msg`（別名 `ipmsg`）、MCP の `ipmsg_*` ツール、単体ダイアログ（`Hancho.exe ipmsg [--tray]`、ダッシュボードのツールバーからも起動可）とトレイ通知を利用できます。詳細は `doc/ipmsg-ja.md`。
+- **Chat（IPMsg 互換）**: コアが古典的な IPMsg プロトコル（参加通知、メッセージ、開封通知、通常ファイル転送）を UDP/TCP ポート 2426 で話します。既定では無効です。LLM 同士のメッセージング用に `from_agent` / `to_agent` / `reply_to`、`audience`（human / agent）、ホップ数ガードを追加し、ワーカー LLM のハンドラが自動返信します。`hancho-cli chat`（別名 `msg`）、MCP の `chat_*` ツール（応答 LLM を変える `chat_handler` を含む）、単体ダイアログ（`Hancho.exe chat [--tray]`、ダッシュボードのツールバーからも起動可）とトレイ通知を利用できます。詳細は `doc/chat-ja.md`。
 - **ダッシュボードのホバー**: プロセス・タスク・実行モニタ・ヒント履歴の一覧と JSON ツリーで、省略表示されたセルの全文をツールチップで表示します。
 - **WebUI 設定**: 設定 → 管理タブにポート入力（1〜65535）と、LAN アドレスとセッショントークンを含む読み取り専用のアクセス URL を追加しました。
 - **ダッシュボードのガント**: 6h / 12h / 24h / All の範囲ボタンを追加し、目盛りラベルをローカル時刻の時・日の境界に配置しました。
