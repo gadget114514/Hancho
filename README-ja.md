@@ -4,7 +4,7 @@
 
 **Hancho** は、Claude Code や各種自動化スクリプトから複数のサブプロセス・対話型 CLI エージェント（`opencode`, `claude`, PowerShell, cmd, Git Bash 等）を並列起動・監視・制御し、**状況をひと目で把握できる Native Win32 + Direct2D マルチターミナルダッシュボード GUI** を備えたプロセスマネージャです。
 
-バージョンは `hancho-cli.exe --version` で確認できます（現在: 0.9.13）。
+バージョンは `hancho-cli.exe --version` で確認できます（現在: 0.9.14）。
 
 ### 対象ユーザー
 
@@ -22,8 +22,8 @@
 
 ## Express
 
-- [Hancho-v0.9.13-win64-setup.exe](https://github.com/gadget114514/Hancho/releases/download/v0.9.13/Hancho-v0.9.11-win64-setup.exe) をダウンロードしてインストール
-  （ポータブル版: [Hancho-v0.9.13-win64.zip](https://github.com/gadget114514/Hancho/releases/download/v0.9.11/Hancho-v0.9.11-win64.zip)、全バージョン: [Releases](https://github.com/gadget114514/Hancho/releases)）
+- [Hancho-v0.9.14-win64-setup.exe](https://github.com/gadget114514/Hancho/releases/download/v0.9.14/Hancho-v0.9.11-win64-setup.exe) をダウンロードしてインストール
+  （ポータブル版: [Hancho-v0.9.14-win64.zip](https://github.com/gadget114514/Hancho/releases/download/v0.9.11/Hancho-v0.9.11-win64.zip)、全バージョン: [Releases](https://github.com/gadget114514/Hancho/releases)）
 - LLM に「PATH から hancho を探して、help を読んで使い方を把握して」と伝える
 - LLM に「タスクを作成して、hancho 経由で (opencode|claude|agy|codex) に実行させて」と伝える
 - 以上
@@ -154,6 +154,16 @@ Hancho のデータはすべて JSON / JSONL（タスクキュー、ビヘイビ
 （以下の help 本文は英語です）
 
 ## リリースノート
+
+### v0.9.14
+- **Chat ハンドラのジョブを非表示**: 応答 LLM が処理するメッセージは `taskqueue list` とダッシュボードのタスク一覧に出なくなりました。実行（タイムアウト・同時実行数・使用量）は従来どおりで、`taskqueue get <id>` では確認できます。
+- **返信の修正**: ハンドラのプロンプトをファイル読み込みではなく直接渡すようにし、headless の許可判定で回答が止まらないようにしました。生のストリーム出力を返信として送ることもなくなりました。
+- **設定**: 「ツールの許可をスキップ（危険）」を追加し、`handler.skip_permissions` を設定できるようにしました。信頼できる LAN で、受信メッセージからローカルのツールを実行できます。
+- **hidden タスクの表示**: ダッシュボードの設定に「hidden タスクも表示」を追加し、Chat ハンドラのジョブも必要なら表示できます。
+- **エージェント名がニックネーム連動**: 既定の `<ニックネーム>-llm` がニックネーム変更に追従し、保存済みの `noname-llm` は自動値として再生成します。
+- **Chat の送信モード**: ホスト一覧でホストを選ぶと、下段が送信モードに戻ります。
+- **Chat ボタンのバッジ**: ダッシュボードの Chat ボタンに未読数を表示します。
+- **ダークテーマ**: Chat ウインドウのコンボボックスが白背景・黒文字にならず、テーマに従います。
 
 ### v0.9.13
 - **Chat のトレイメニュー**: 終了項目を **Hancho Chat終了** に変更し、Chat ウインドウだけが閉じてダッシュボード/コアは動き続けることを分かりやすくしました。

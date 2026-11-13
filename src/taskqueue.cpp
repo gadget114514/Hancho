@@ -1863,6 +1863,8 @@ static TaskQueueJob ParseJob(const std::string& j) {
     job.resources = ParseResources(JsonFieldObj(j, "resources"));
     job.memory = ParseMemory(JsonFieldObj(j, "memory", ""));
     job.priority = static_cast<int>(JsonFieldInt(j, "priority", 0));
+    job.hidden = JsonFieldBool(j, "hidden", false);
+    job.hidden = JsonFieldBool(j, "hidden", false);
     job.suspendWhenDone = JsonFieldBool(j, "suspend_when_done", false);
     job.suspendDelaySec = static_cast<int>(JsonFieldInt(j, "suspend_delay_sec", 0));
     if (job.suspendDelaySec < 0) job.suspendDelaySec = 0;
@@ -2721,6 +2723,7 @@ std::string TaskQueueManager::JobToJson(const TaskQueueJob& job, bool includeIns
         << ",\"resources\":" << ResourcesToJson(job.resources)
         << ",\"memory\":" << MemoryToJson(job.memory)
         << ",\"priority\":" << job.priority
+        << ",\"hidden\":" << (job.hidden ? "true" : "false")
         << ",\"suspend_when_done\":" << (job.suspendWhenDone ? "true" : "false")
         << ",\"suspend_delay_sec\":" << job.suspendDelaySec
         << ",\"suspend_hibernate\":" << (job.suspendHibernate ? "true" : "false")
@@ -3729,7 +3732,7 @@ std::string TaskQueueManager::AddBtJob(const std::string& taskqueue, const std::
 }
 
 std::string TaskQueueManager::TaskQueueList(const std::string& taskqueue, const std::string& state, int64_t sinceSec, std::string& outError,
-                                            const std::string& origin, const std::string& btId) {
+                                            const std::string& origin, const std::string& btId, bool includeHidden) {
     outError.clear();
     std::lock_guard<std::mutex> lock(mutex_);
     struct ListedJob { std::string queue; TaskQueueJob job; };
@@ -3738,6 +3741,7 @@ std::string TaskQueueManager::TaskQueueList(const std::string& taskqueue, const 
     for (const auto& [name, tq] : queues_) {
         if (!taskqueue.empty() && name != taskqueue) continue;
         for (const auto& job : tq.jobs) {
+            if (job.hidden && !includeHidden) continue;
             if (!state.empty() && job.state != state) continue;
             if (!origin.empty() && !OriginMatches(job.origin, origin)) continue;
             if (!btId.empty() && job.bt.id != btId) continue;

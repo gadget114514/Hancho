@@ -882,6 +882,7 @@ enum ControlId {
     IDC_SET_WEBUI_SCOPE = 6060,
     IDC_SET_WEBUI_ALLOWED_HOSTS = 6061,
     IDC_SET_WEBUI_PORT = 6062,
+    IDC_SET_SHOW_HIDDEN_TASKS = 6063,
     IDM_TRAY_RESTORE = 4001,
     IDM_TRAY_GRID_VIEW = 4002,
     IDM_TRAY_HIDE = 4003,
@@ -976,6 +977,8 @@ struct DashboardState {
     std::string supervisorCommand = "claude";
     std::string lastHintSignature;
     int unreadHintCount = 0; // hints added since the hint history was last opened (badge on its button)
+    int chatUnread = 0;      // unread Chat messages (badge on the Chat toolbar button)
+    uint64_t lastChatPollTickMs = 0;
     // Signatures already popped up. Automatic hints skip them so a second divergence, failure or
     // contention surfaces while the first one is still in the list. Capped; see EvaluateSupervisorHint.
     std::unordered_set<std::string> shownHintSignatures;
@@ -993,6 +996,7 @@ struct DashboardState {
     bool restoreUsageGraph = false;
     int64_t llmMaxEvents = kDefaultLlmMaxEvents;  // events kept per stream tracker; -1 = unlimited
     bool resourceLocks = true; // task queue resource locks (doc/resource-locks.md)
+    bool showHiddenTasks = false; // include internal (e.g. Chat handler) jobs in the task list
     int64_t memoryMaxBytes = 0; // memory/ capacity limit in bytes; 0 = unlimited
     uint64_t lastMemoryCheckTickMs = 0;
     bool memoryNearLimit = false;
@@ -1364,7 +1368,8 @@ static std::string TaskQueueListIpc(DashboardState* st, const std::string& taskq
         {"action", "taskqueue_list"},
         {"taskqueue", taskqueue},
         {"state", state},
-        {"include_planned", true}
+        {"include_planned", true},
+        {"include_hidden", st ? st->showHiddenTasks : false}
     };
     if (sinceSec > 0) req["since_sec"] = sinceSec;
     if (!origin.empty()) req["origin"] = origin;
@@ -1374,7 +1379,8 @@ static std::string TaskQueueListIpc(DashboardState* st, const std::string& taskq
         return resp.dump();
     }
     if (st && st->tqm) {
-        return st->tqm->TaskQueueList(taskqueue, state, sinceSec, outErr, origin, bt);
+        return st->tqm->TaskQueueList(taskqueue, state, sinceSec, outErr, origin, bt,
+                                      st->showHiddenTasks);
     }
     return "";
 }
@@ -5192,6 +5198,21 @@ static void RefreshDashboardData(DashboardState* st) {
     }
     // Hold every update while a list scrollbar is dragged; the next tick after release catches up.
     if (g_scrollDragWnd && (g_scrollDragWnd == st->hwndList || g_scrollDragWnd == st->hwndTaskList)) return;
+    {
+        const uint64_t chatNow = GetNowTickMs();
+        if (chatNow - st->lastChatPollTickMs >= 3000) {
+            st->lastChatPollTickMs = chatNow;
+            nlohmann::json chatResp;
+            int unread = 0;
+            if (GuiIpcCall(st, {{"action", "chat_status"}}, chatResp) && chatResp.value("ok", false)) {
+                unread = chatResp.value("unread", 0);
+            }
+            if (unread != st->chatUnread) {
+                st->chatUnread = unread;
+                if (st->hwndBtnIpmsg) InvalidateRect(st->hwndBtnIpmsg, nullptr, FALSE);
+            }
+        }
+    }
     st->allSnapshots = FetchProcessSnapshotsIpc(st);
 
     bool processFinished = false;
@@ -9528,6 +9549,7 @@ static void LoadShellConfig(DashboardState* st) {
     st->llmMaxEvents = ClampLlmMaxEvents(JsonGetInt(content, "llm_max_events", kDefaultLlmMaxEvents));
     SetLlmMaxEvents(st->llmMaxEvents);
     st->resourceLocks = JsonGetBool(content, "resource_locks", true);
+    st->showHiddenTasks = JsonGetBool(content, "show_hidden_tasks", false);
     SetResourceLocksEnabledIpc(st, st->resourceLocks);
     st->memoryMaxBytes = JsonGetInt(content, "memory_max_bytes", 0);
     if (st->memoryMaxBytes == 0) {
@@ -10293,6 +10315,7 @@ struct SettingsDlgState {
      HWND chkUsageGraph = nullptr;
      HWND chkRestoreUsageGraph = nullptr;
       HWND chkResourceLocks = nullptr;
+      HWND chkShowHiddenTasks = nullptr;
       HWND chkActivityStyle = nullptr;
       HWND lblEventRetention = nullptr;
       HWND editEventRetention = nullptr;
@@ -10659,6 +10682,7 @@ static void UpdateSettingsDialogTexts(HWND hwnd) {
     SetWindowTextW(ds->chkRestoreUsageGraph, Tr(L"終了後もUsageグラフを復元する", L"Restore usage graph after exit", L"Restaurar gráfico de uso tras salir"));
     SetWindowTextW(ds->chkResourceLocks, Tr(L"タスクキュー: リソースが競合するジョブを同時に実行しない", L"Task queue: never run jobs with conflicting resources together", L"Cola de tareas: no ejecutar a la vez trabajos con recursos en conflicto"));
     SetWindowTextW(ds->chkActivityStyle, Tr(L"実行状態監視ペイン: 行を色分けし、アイコンを表示", L"Execution monitor pane: colour rows and show icons", L"Panel de ejecución: colorear filas y mostrar iconos"));
+    SetWindowTextW(ds->chkShowHiddenTasks, Tr(L"hidden タスクも表示", L"Show hidden tasks", L"Mostrar tareas ocultas"));
     SetWindowTextW(ds->btnClose, Tr(L"閉じる", L"Close", L"Cerrar"));
     {
         const wchar_t* const tabNames[kSettingsTabCount] = {
@@ -10959,9 +10983,14 @@ static LRESULT CALLBACK SettingsWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPAR
                 ds->dash->resourceLocks ? BST_CHECKED : BST_UNCHECKED, 0);
 
             ds->chkActivityStyle = CreateWindowExW(0, L"BUTTON", L"", WS_CHILD | WS_VISIBLE | BS_AUTOCHECKBOX,
-                18, 266, 520, 24, hwnd, (HMENU)IDC_SET_ACTIVITY_STYLE, hInst, nullptr);
+                18, 266, 510, 24, hwnd, (HMENU)IDC_SET_ACTIVITY_STYLE, hInst, nullptr);
             SendMessageW(ds->chkActivityStyle, BM_SETCHECK,
                 g_activityStyle ? BST_CHECKED : BST_UNCHECKED, 0);
+
+            ds->chkShowHiddenTasks = CreateWindowExW(0, L"BUTTON", L"", WS_CHILD | WS_VISIBLE | WS_TABSTOP | BS_AUTOCHECKBOX,
+                536, 266, 148, 24, hwnd, (HMENU)IDC_SET_SHOW_HIDDEN_TASKS, hInst, nullptr);
+            SendMessageW(ds->chkShowHiddenTasks, BM_SETCHECK,
+                ds->dash->showHiddenTasks ? BST_CHECKED : BST_UNCHECKED, 0);
 
             ds->lblEventRetention = CreateWindowExW(0, L"STATIC", L"", WS_CHILD | WS_VISIBLE,
                 18, 296, 530, 20, hwnd, nullptr, hInst, nullptr);
@@ -11075,7 +11104,7 @@ static LRESULT CALLBACK SettingsWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPAR
                              ds->btnDeepPurple, ds->btnPastelPurple, ds->btnDeepYellow, ds->btnPastelYellow,
                              ds->btnShell, ds->btnReset, ds->btnClear, ds->btnClose, ds->chkSound, ds->editSound,
                              ds->btnBrowseSound, ds->btnTestSound, ds->chkHideEnded, ds->chkUsageGraph, ds->chkRestoreUsageGraph,
-                             ds->chkResourceLocks, ds->chkActivityStyle, ds->lblEventRetention, ds->editEventRetention,
+                             ds->chkResourceLocks, ds->chkActivityStyle, ds->chkShowHiddenTasks, ds->lblEventRetention, ds->editEventRetention,
                              ds->lblRefreshInterval, ds->editRefreshInterval, ds->btnListBgReset,
                              ds->chkEndBlink, ds->lblEndBlinkSec, ds->editEndBlinkSec,
                              ds->chkSupervisorHints, ds->lblHintAutoDismissSec, ds->editHintAutoDismissSec,
@@ -11219,6 +11248,13 @@ static LRESULT CALLBACK SettingsWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPAR
                     (SendMessageW(ds->chkResourceLocks, BM_GETCHECK, 0, 0) == BST_CHECKED);
                 SetResourceLocksEnabledIpc(ds->dash, ds->dash->resourceLocks);
                 SaveShellConfig(ds->dash);
+                return 0;
+            }
+            if (id == IDC_SET_SHOW_HIDDEN_TASKS) {
+                ds->dash->showHiddenTasks =
+                    (SendMessageW(ds->chkShowHiddenTasks, BM_GETCHECK, 0, 0) == BST_CHECKED);
+                SaveShellConfig(ds->dash);
+                RefreshDashboardData(ds->dash);
                 return 0;
             }
             if (id == IDC_SET_ACTIVITY_STYLE) {
@@ -14108,6 +14144,9 @@ static LRESULT CALLBACK DashboardWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPA
             SelectObject(dis->hDC, oldFont);
             if (st && dis->hwndItem == st->hwndBtnHistory && st->unreadHintCount > 0) {
                 DrawCountBadge(dis->hDC, dis->rcItem, st->unreadHintCount);
+            }
+            if (st && dis->hwndItem == st->hwndBtnIpmsg && st->chatUnread > 0) {
+                DrawCountBadge(dis->hDC, dis->rcItem, st->chatUnread);
             }
             return TRUE;
         }

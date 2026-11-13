@@ -1168,7 +1168,8 @@ std::string IpcServer::HandleRequestJson(const std::string& reqJson) {
                 const std::string stateFilter = JsonGetString(reqJson, "state", "");
                 const std::string btFilter = JsonGetString(reqJson, "bt", "");
                 resp = tqm_.TaskQueueList(tqFilter, stateFilter, sinceSec, err,
-                                          JsonGetString(reqJson, "origin", ""), btFilter);
+                                          JsonGetString(reqJson, "origin", ""), btFilter,
+                                          JsonGetBool(reqJson, "include_hidden", false));
                 // Provisional BT rows: idle job/worker leaves of the current branch. They are
                 // not stored anywhere, so a branch change on the next query drops them.
                 if (err.empty() && btm_ && JsonGetBool(reqJson, "include_planned", false) &&

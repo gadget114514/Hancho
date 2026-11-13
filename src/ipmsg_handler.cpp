@@ -301,6 +301,9 @@ std::string IpmsgHandler::BuildPrompt(const IpmsgHandlerConfig& cfg,
     data["audience"] = message.value("audience", std::string());
     data["hops"] = message.value("hops", 0);
     data["reply_to"] = message.value("reply_to", uint64_t(0));
+    if (data["text"].is_string() && data["text"].get<std::string>().size() > 8000) {
+        data["text"] = data["text"].get<std::string>().substr(0, 8000) + " ...[truncated]";
+    }
 
     std::string prompt;
     prompt +=
@@ -362,11 +365,7 @@ void IpmsgHandler::ProcessMessage(const nlohmann::json& message) {
     const std::string jobId = MakeJobId(messageId);
     const std::string prompt = BuildPrompt(cfg, message);
 
-    const std::string instructionPath =
-        WideToUtf8(TaskQueueManager::GetInstructionsFileWide(cfg.taskqueue, jobId, 1));
-    const std::string launchPrompt =
-        "Read the instructions file " + instructionPath +
-        " and carry them out. Reply with only the required JSON object.";
+    const std::string launchPrompt = prompt;
 
     const std::string engineName = cfg.engine.empty() ? engines->DefaultEngine() : cfg.engine;
     std::string command;
@@ -408,6 +407,7 @@ void IpmsgHandler::ProcessMessage(const nlohmann::json& message) {
     job["summary"] = TruncateText(summary, 200);
     job["command"] = command;
     job["cwd"] = cfg.cwd.empty() ? dataDir : cfg.cwd;
+    job["hidden"] = true;
     job["timeout_sec"] = cfg.timeoutSec;
     job["max_attempts"] = 1;
     job["instructions_text"] = prompt;
@@ -553,7 +553,7 @@ void IpmsgHandler::CheckJobs() {
             if (processId > 0) {
                 result = ExtractAgentResult(pm_, processId, true);
             }
-            if (!result.found && result.result.empty()) {
+            if (!result.found || result.result.empty() || result.source == "output") {
                 LogEvent("handler_failed",
                          {{"id", entry.messageId}, {"job_id", jobId},
                           {"reason", "no-result"}, {"peer", entry.peer}});

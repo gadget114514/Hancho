@@ -545,6 +545,8 @@ struct TaskQueueJob {
     std::vector<std::string> killExclude;
     TaskQueueResources resources;
     int priority = 0;
+    // Internal jobs (for example the Chat handler) stay in the queue but are hidden from lists.
+    bool hidden = false;
     // Armed by `hancho-cli power suspend --after-job <id>` or a job's suspendWhenDone.
     // The core suspends after this job finishes and all other work becomes idle.
     bool suspendWhenDone = false;
@@ -790,7 +792,8 @@ public:
     // origin (optional) keeps only jobs whose origin label, session or host session matches
     // (session ids also match by prefix); "pid:<n>" matches the origin process id.
     std::string TaskQueueList(const std::string& taskqueue, const std::string& state, int64_t sinceSec, std::string& outError,
-                              const std::string& origin = "", const std::string& btId = "");
+                              const std::string& origin = "", const std::string& btId = "",
+                              bool includeHidden = false);
     static TaskQueueOrigin ParseOriginJson(const std::string& json);
     static std::string OriginToJson(const TaskQueueOrigin& origin);
     static bool OriginMatches(const TaskQueueOrigin& origin, const std::string& filter);

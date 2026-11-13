@@ -599,7 +599,7 @@ void IpcServer::StartIpmsg() {
                 ? block["handler"]
                 : nlohmann::json::object();
         IpmsgHandlerConfig handlerCfg = IpmsgHandlerConfig::FromJson(handlerBlock);
-        if (handlerCfg.agent.empty()) {
+        if (handlerCfg.agent.empty() || handlerCfg.agent == "noname-llm") {
             const std::string nick = cfg.nickname.empty() ? std::string("noname") : cfg.nickname;
             handlerCfg.agent = nick + "-llm";
         }

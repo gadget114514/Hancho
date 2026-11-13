@@ -53,6 +53,14 @@ nlohmann::json ChatBlock(const nlohmann::json& cfg) {
     return nlohmann::json::object();
 }
 
+// Agent names default to "<nickname>-llm"; the name follows the nickname until it is
+// overridden explicitly.
+std::string AutoAgentName(const std::string& nick) {
+    std::string n = Trim(nick);
+    if (n.empty()) n = "noname";
+    return n + "-llm";
+}
+
 UiLang DetectLanguage() {
     std::string code;
     std::string content = ReadConfigText();
@@ -264,6 +272,7 @@ enum ControlId : int {
     IDC_BTN_APPLY = 2157,
     IDC_SET_STATUS = 2158,
     IDC_SET_WARNING = 2159,
+    IDC_SET_SKIP_PERMISSIONS = 2162,
     IDM_TRAY_OPEN = 2160,
     IDM_TRAY_EXIT = 2161,
 };
@@ -321,6 +330,8 @@ struct DialogState {
     HWND setModel = nullptr;
     HWND setAgentLabel = nullptr;
     HWND setAgent = nullptr;
+    HWND setSkipPermissions = nullptr;
+    std::string autoAgentAtLoad;
     HWND setAutoReply = nullptr;
     HWND btnApply = nullptr;
     HWND setStatus = nullptr;
@@ -349,6 +360,7 @@ struct DialogState {
     std::wstring currentTitle;
 
     bool replyActive = false;
+    bool peerRefreshActive = false; // suppress selection events while rebuilding the host list
     std::string replyPeerKey;
     std::wstring replyLabel;
     uint64_t replyToId = 0;
@@ -382,7 +394,8 @@ int S(int value) {
 
 bool IsCheckboxControl(const DialogState* st, HWND h) {
     if (!st || !h) return false;
-    return h == st->setEnabled || h == st->setHandlerEnabled || h == st->setAutoReply;
+    return h == st->setEnabled || h == st->setHandlerEnabled || h == st->setAutoReply ||
+           h == st->setSkipPermissions;
 }
 
 // Applies the dashboard palette to the dialog, its lists and its controls.
@@ -426,7 +439,10 @@ void ApplyDialogTheme(DialogState* st, bool force = false) {
         for (HWND child = GetWindow(st->hwnd, GW_CHILD); child; child = GetWindow(child, GW_HWNDNEXT)) {
             wchar_t cls[64] = {};
             GetClassNameW(child, cls, 64);
-            if (_wcsicmp(cls, L"Button") == 0 || _wcsicmp(cls, L"SysTabControl32") == 0) {
+            if (_wcsicmp(cls, L"ComboBox") == 0) {
+                SetWindowTheme(child, L"DarkMode_CFD", nullptr);
+                SendMessageW(child, WM_THEMECHANGED, 0, 0);
+            } else if (_wcsicmp(cls, L"Button") == 0 || _wcsicmp(cls, L"SysTabControl32") == 0) {
                 SetWindowTheme(child, L"DarkMode_Explorer", nullptr);
                 SendMessageW(child, WM_THEMECHANGED, 0, 0);
             }
@@ -444,7 +460,10 @@ void ApplyDialogTheme(DialogState* st, bool force = false) {
         for (HWND child = GetWindow(st->hwnd, GW_CHILD); child; child = GetWindow(child, GW_HWNDNEXT)) {
             wchar_t cls[64] = {};
             GetClassNameW(child, cls, 64);
-            if (_wcsicmp(cls, L"Button") == 0 || _wcsicmp(cls, L"SysTabControl32") == 0) {
+            if (_wcsicmp(cls, L"ComboBox") == 0) {
+                SetWindowTheme(child, L"", L"");
+                SendMessageW(child, WM_THEMECHANGED, 0, 0);
+            } else if (_wcsicmp(cls, L"Button") == 0 || _wcsicmp(cls, L"SysTabControl32") == 0) {
                 SetWindowTheme(child, L"", L"");
                 SendMessageW(child, WM_THEMECHANGED, 0, 0);
             }
@@ -733,6 +752,8 @@ void LayoutSettings(DialogState* st, const RECT& pr) {
     Place(st->setAgent, x + S(76), y, S(260), S(24));
     y += S(30);
     Place(st->setAutoReply, x, y, S(300), S(24));
+    y += S(30);
+    Place(st->setSkipPermissions, x, y, S(360), S(24));
     y += S(40);
 
     Place(st->btnApply, x, y, S(110), S(28));
@@ -912,6 +933,7 @@ void LoadPeers(DialogState* st) {
     if (!IpcCall({{"action", "chat_peers"}}, resp)) return;
     if (!resp.contains("peers") || !resp["peers"].is_array()) return;
     std::set<std::string> selected = SelectedPeerKeys(st);
+    st->peerRefreshActive = true;
     st->peersJson.clear();
     for (const auto& p : resp["peers"]) {
         if (p.is_object()) st->peersJson.push_back(p);
@@ -942,6 +964,7 @@ void LoadPeers(DialogState* st) {
             }
         }
     }
+    st->peerRefreshActive = false;
     UpdatePeerCount(st);
 }
 
@@ -1198,10 +1221,9 @@ void DoSend(DialogState* st) {
         if (chat.contains("handler") && chat["handler"].is_object()) {
             fromAgent = Trim(chat["handler"].value("agent", std::string()));
         }
-        if (fromAgent.empty()) {
-            std::string nick = Trim(chat.value("nickname", std::string()));
-            if (nick.empty()) nick = "noname";
-            fromAgent = nick + "-llm";
+        const std::string nick = Trim(chat.value("nickname", std::string()));
+        if (fromAgent.empty() || fromAgent == "noname-llm") {
+            fromAgent = AutoAgentName(nick);
         }
     }
     int target = st->composeTo ? ComboBox_GetCurSel(st->composeTo) : 0;
@@ -1471,14 +1493,12 @@ void LoadSettings(DialogState* st) {
     SetTextUtf8(st->setModel, handler.value("model", std::string()));
     {
         std::string agent = handler.value("agent", std::string());
-        if (agent.empty()) {
-            std::string nick = chat.value("nickname", std::string());
-            if (nick.empty()) nick = "noname";
-            agent = nick + "-llm";
-        }
+        if (agent.empty()) agent = AutoAgentName(chat.value("nickname", std::string()));
+        st->autoAgentAtLoad = agent;
         SetTextUtf8(st->setAgent, agent);
     }
     SetCheck(st->setAutoReply, handler.value("auto_reply", true));
+    SetCheck(st->setSkipPermissions, handler.value("skip_permissions", false));
 }
 
 std::vector<std::string> SplitCsv(const std::string& text) {
@@ -1537,8 +1557,15 @@ void DoApplySettings(DialogState* st) {
     handler["enabled"] = GetCheck(st->setHandlerEnabled);
     handler["engine"] = GetTextUtf8(st->setEngine);
     handler["model"] = GetTextUtf8(st->setModel);
-    handler["agent"] = GetTextUtf8(st->setAgent);
+    {
+        std::string agent = Trim(GetTextUtf8(st->setAgent));
+        const std::string autoAgent = AutoAgentName(GetTextUtf8(st->setNick));
+        handler["agent"] = (agent.empty() || agent == autoAgent || agent == st->autoAgentAtLoad)
+                               ? std::string()
+                               : agent;
+    }
     handler["auto_reply"] = GetCheck(st->setAutoReply);
+    handler["skip_permissions"] = GetCheck(st->setSkipPermissions);
     chat["handler"] = handler;
 
     nlohmann::json req = {
@@ -1592,6 +1619,7 @@ void ApplyFont(DialogState* st) {
     push(st->setHostsLabel); push(st->setHosts); push(st->setHandlerEnabled);
     push(st->setEngineLabel); push(st->setEngine); push(st->setModelLabel); push(st->setModel);
     push(st->setAgentLabel); push(st->setAgent); push(st->setAutoReply);
+    push(st->setSkipPermissions);
     push(st->btnApply); push(st->setStatus); push(st->setWarning);
     for (HWND h : all) {
         SendMessageW(h, WM_SETFONT, reinterpret_cast<WPARAM>(st->font), TRUE);
@@ -1777,6 +1805,10 @@ void CreateSettingsControls(DialogState* st) {
     st->setAgent = MakeEdit(hwnd, IDC_SET_AGENT, ES_AUTOHSCROLL);
     st->setAutoReply = MakeCheck(hwnd, IDC_SET_AUTO_REPLY,
                                  T(L"自動返信", L"Auto reply", L"Respuesta automática"));
+    st->setSkipPermissions = MakeCheck(
+        hwnd, IDC_SET_SKIP_PERMISSIONS,
+        T(L"ツールの許可をスキップ（危険）", L"Skip tool permissions (dangerous)",
+          L"Omitir permisos de herramientas (peligroso)"));
     st->btnApply = MakeButton(hwnd, IDC_BTN_APPLY, T(L"適用", L"Apply", L"Aplicar"));
     st->setStatus = MakeStatic(hwnd, IDC_SET_STATUS, L"");
     st->setWarning = MakeStatic(hwnd, IDC_SET_WARNING,
@@ -1789,6 +1821,7 @@ void CreateSettingsControls(DialogState* st) {
                         st->setHostsLabel, st->setHosts, st->setHandlerEnabled,
                         st->setEngineLabel, st->setEngine, st->setModelLabel, st->setModel,
                         st->setAgentLabel, st->setAgent, st->setAutoReply,
+                        st->setSkipPermissions,
                         st->btnApply, st->setStatus, st->setWarning};
 }
 
@@ -2050,6 +2083,14 @@ LRESULT CALLBACK IpmsgWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam)
                 DestroyWindow(hwnd);
                 return 0;
             }
+            if (id == IDC_SET_NICK && code == EN_CHANGE) {
+                std::string agent = Trim(GetTextUtf8(st->setAgent));
+                if (agent.empty() || agent == st->autoAgentAtLoad) {
+                    st->autoAgentAtLoad = AutoAgentName(GetTextUtf8(st->setNick));
+                    SetTextUtf8(st->setAgent, st->autoAgentAtLoad);
+                }
+                return 0;
+            }
             if (id == IDC_COMPOSE_TO) {
                 if (code == CBN_SELCHANGE) {
                     const int sel = ComboBox_GetCurSel(st->composeTo);
@@ -2159,10 +2200,19 @@ LRESULT CALLBACK IpmsgWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam)
             }
             if (hdr->idFrom == IDC_PEERS && hdr->code == LVN_ITEMCHANGED) {
                 auto* nv = reinterpret_cast<NMLISTVIEW*>(lParam);
-                if (nv->iItem >= 0 && (nv->uChanged & LVIF_STATE) &&
-                    (nv->uNewState & LVIS_SELECTED) && !(nv->uOldState & LVIS_SELECTED) &&
-                    GetFocus() == st->peers) {
+                if (!st->peerRefreshActive && nv->iItem >= 0 && (nv->uChanged & LVIF_STATE) &&
+                    (nv->uNewState & LVIS_SELECTED) && !(nv->uOldState & LVIS_SELECTED)) {
+                    // Choosing a host means "send a new message", not reply.
                     ResetReply(st);
+                    LayoutCurrentPage(st);
+                }
+                return 0;
+            }
+            if (hdr->idFrom == IDC_PEERS && hdr->code == NM_CLICK) {
+                auto* nm = reinterpret_cast<NMITEMACTIVATE*>(lParam);
+                if (!st->peerRefreshActive && nm && nm->iItem >= 0) {
+                    ResetReply(st);
+                    LayoutCurrentPage(st);
                 }
                 return 0;
             }

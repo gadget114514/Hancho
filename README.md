@@ -4,7 +4,7 @@
 
 **Hancho** is a native Win32 C++ Multi-Terminal ConPTY Process Manager and Dashboard designed for orchestrating, monitoring, and interacting with multiple parallel CLI agents (`claude`, `opencode`, build scripts, and interactive shells) via both **Model Context Protocol (MCP)** and **CLI commands**.
 
-Check the version with `hancho-cli.exe --version` (current: 0.9.13).
+Check the version with `hancho-cli.exe --version` (current: 0.9.14).
 
 ### Who is this for?
 
@@ -25,8 +25,8 @@ The dashboard has an **execution monitor pane** below the process and task lists
 
 ## Express
 
-- Download and install [Hancho-v0.9.13-win64-setup.exe](https://github.com/gadget114514/Hancho/releases/download/v0.9.13/Hancho-v0.9.11-win64-setup.exe)
-  (portable: [Hancho-v0.9.13-win64.zip](https://github.com/gadget114514/Hancho/releases/download/v0.9.11/Hancho-v0.9.11-win64.zip), all versions: [Releases](https://github.com/gadget114514/Hancho/releases))
+- Download and install [Hancho-v0.9.14-win64-setup.exe](https://github.com/gadget114514/Hancho/releases/download/v0.9.14/Hancho-v0.9.11-win64-setup.exe)
+  (portable: [Hancho-v0.9.14-win64.zip](https://github.com/gadget114514/Hancho/releases/download/v0.9.11/Hancho-v0.9.11-win64.zip), all versions: [Releases](https://github.com/gadget114514/Hancho/releases))
 - In your llm, "find hancho in PATH, then read help to use it" 
 - In your llm, "create task and use (opencode|claude|agy|codex) to execute the task via hancho" 
 - That's all
@@ -148,6 +148,16 @@ All Hancho data is plain JSON / JSONL (task queues, behavior trees, stream event
 ---
 
 ## Release Notes
+
+### v0.9.14
+- **Chat handler jobs are hidden**: messages handled by the answering LLM no longer appear in `taskqueue list` or the dashboard task list. They still run (with timeout/concurrency and usage accounting); `taskqueue get <id>` still shows one.
+- **Replies work again**: the handler prompt is passed inline instead of asking the worker to read a file, so headless permission checks no longer block the answer; raw stream output is never sent as a Chat reply.
+- **Settings**: a "Skip tool permissions (dangerous)" checkbox sets `handler.skip_permissions`, so a received message can run local tools on a trusted LAN.
+- **Show hidden tasks**: the dashboard Settings has a "Show hidden tasks" toggle, so the Chat handler jobs can be shown again when needed.
+- **Agent name follows the nickname**: the default `<nickname>-llm` tracks nickname changes, and a stored `noname-llm` is treated as automatic and regenerated.
+- **Chat send mode**: choosing a host in the Chat host list switches the compose back to send mode.
+- **Chat toolbar badge**: the dashboard's Chat button shows the unread Chat count.
+- **Dark theme**: combo boxes in the Chat window use the dark theme instead of white fields with dark text.
 
 ### v0.9.13
 - **Chat tray menu**: the exit item is now labelled **Hancho Chat終了** (Quit Hancho Chat) so it is clear that only the Chat window closes and the dashboard/core keeps running.
