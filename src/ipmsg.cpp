@@ -1372,7 +1372,7 @@ bool IpmsgNode::Start(const IpmsgConfig& cfgIn, std::string* outError) {
         }
         d.selfUser = LocalUserName();
         d.selfHost = LocalHostName();
-        d.selfNick = cfgIn.nickname.empty() ? ("Hancho@" + d.selfHost) : cfgIn.nickname;
+        d.selfNick = cfgIn.nickname.empty() ? std::string("noname") : cfgIn.nickname;
         d.peers.clear();
     }
     auto fail = [&](const std::string& msg) {

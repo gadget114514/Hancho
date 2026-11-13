@@ -72,7 +72,7 @@ Hancho は古典的な IP Messenger (IPMsg) プロトコルを話せるため、
 | `enabled` | `false` | UDP/TCP ノードを起動する。変更するとノードを再起動。 |
 | `port` | `2426` | 参加通知・メッセージ用 UDP とファイル転送用 TCP のポート。 |
 | `bind` | `"0.0.0.0"` | ローカルのバインドアドレス。 |
-| `nickname` | `""` | 他クライアントに表示する名前。空 = `Hancho@<host>`。 |
+| `nickname` | `""` | 他クライアントに表示する名前。空 = `noname`。 |
 | `group` | `"Hancho"` | IPMsg のグループ名。 |
 | `hosts` | `[]` | 追加のブロードキャスト/ユニキャスト先（`"192.168.1.255"`, `"10.0.0.5:2426"`）。 |
 | `allow_from` | `[]` | 受け付ける送信元ネットワーク/ホスト。空 = プライベート/ループバック/リンクローカル全て。 |
@@ -83,7 +83,7 @@ Hancho は古典的な IP Messenger (IPMsg) プロトコルを話せるため、
 | `handler.enabled` | `false` | 条件に合う受信メッセージをワーカー LLM に渡す。 |
 | `handler.engine` | `"agy"` | ワーカーエンジン名（`hancho-cli engines` 参照）。 |
 | `handler.model` | `""` | モデルの上書き。空 = エンジン既定。 |
-| `handler.agent` | `""` | このエージェント宛のメッセージも処理する。空 = 宛先なしのみ。設定時は別エージェント宛を除外。 |
+| `handler.agent` | 自動 | このノードの LLM の識別名。ダイアログから送るときの送信元名（`from_agent`）になり、別エージェント宛のメッセージは除外されます。空 = `<nickname>-llm`。 |
 | `handler.cwd` | `""` | ワーカーの作業ディレクトリ。空 = データディレクトリ。 |
 | `handler.instructions` | `""` | ハンドラのプロンプト先頭に足す追加指示。 |
 | `handler.taskqueue` | `"chat"` | ハンドラのジョブを入れるタスクキュー。 |
@@ -192,7 +192,7 @@ MCP サーバ (`Hancho.exe mcp`) は 11 個のツールを公開します。引�
 | `chat_read` | 既読にして開封通知を送る（`ids?` または `all`）。 |
 | `chat_download` | ファイルをダウンロード（`messageId`, `fileId?`, `dir?`, `wait?`, `timeoutMs?`）。 |
 | `chat_log` | 会話ログを検索（`since?`, `until?`, `query?`, `peer?`, `agent?`, `event?`, `limit?`）。 |
-| `chat_handler` | 応答 LLM（ハンドラ）を表示・変更（`enabled?`, `engine?`, `model?`, `agent?`, `instructions?`, `taskqueue?`, `autoReply?`, `timeoutSec?`, `maxHops?`, `concurrency?`）。指定した項目だけを変更し、結果は `chat_status` で確認できます。 |
+| `chat_handler` | 応答 LLM（ハンドラ）を表示・変更（`enabled?`, `engine?`, `model?`, `agent?`, `cwd?`, `instructions?`, `taskqueue?`, `autoReply?`, `timeoutSec?`, `maxHops?`, `concurrency?`）。指定した項目だけを変更し、結果は `chat_status` で確認できます。 |
 
 ## LLM 同士のメッセージング
 

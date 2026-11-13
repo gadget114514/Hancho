@@ -72,7 +72,7 @@ The block lives in `<data-dir>/config.json` (`%LOCALAPPDATA%\Programs\Hancho\log
 | `enabled` | `false` | Start the UDP/TCP node. Changing it restarts the node. |
 | `port` | `2426` | UDP port for presence/messages and TCP port for file transfer. |
 | `bind` | `"0.0.0.0"` | Local bind address. |
-| `nickname` | `""` | Shown to other clients. Empty = `Hancho@<host>`. |
+| `nickname` | `""` | Shown to other clients. Empty = `noname`. |
 | `group` | `"Hancho"` | IPMsg group name. |
 | `hosts` | `[]` | Extra broadcast/unicast targets (`"192.168.1.255"`, `"10.0.0.5:2426"`). |
 | `allow_from` | `[]` | Accepted source networks/hosts. Empty = every private/loopback/link-local address. |
@@ -83,7 +83,7 @@ The block lives in `<data-dir>/config.json` (`%LOCALAPPDATA%\Programs\Hancho\log
 | `handler.enabled` | `false` | Pass matching incoming messages to a worker LLM. |
 | `handler.engine` | `"agy"` | Worker engine name (see `hancho-cli engines`). |
 | `handler.model` | `""` | Model override; empty = engine default. |
-| `handler.agent` | `""` | Also handle messages addressed to this agent. Empty = only unaddressed messages; when set, messages addressed to another agent are skipped. |
+| `handler.agent` | auto | This node's LLM identity. It is the sender name (`from_agent`) for messages sent from the dialog, and messages addressed to another agent are skipped. Empty = `<nickname>-llm`. |
 | `handler.cwd` | `""` | Worker working directory; empty = the data directory. |
 | `handler.instructions` | `""` | Extra instructions prepended to the handler prompt. |
 | `handler.taskqueue` | `"chat"` | Task queue that receives the handler jobs. |
@@ -192,7 +192,7 @@ The MCP server (`Hancho.exe mcp`) exposes eleven tools. They accept camelCase (`
 | `chat_read` | Mark messages read and send read receipts (`ids?` or `all`). |
 | `chat_download` | Download files (`messageId`, `fileId?`, `dir?`, `wait?`, `timeoutMs?`). |
 | `chat_log` | Search the conversation log (`since?`, `until?`, `query?`, `peer?`, `agent?`, `event?`, `limit?`). |
-| `chat_handler` | Show or change the answering LLM (`enabled?`, `engine?`, `model?`, `agent?`, `instructions?`, `taskqueue?`, `autoReply?`, `timeoutSec?`, `maxHops?`, `concurrency?`). Only supplied fields change; `chat_status` shows the result. |
+| `chat_handler` | Show or change the answering LLM (`enabled?`, `engine?`, `model?`, `agent?`, `cwd?`, `instructions?`, `taskqueue?`, `autoReply?`, `timeoutSec?`, `maxHops?`, `concurrency?`). Only supplied fields change; `chat_status` shows the result. |
 
 ## LLM to LLM messaging
 

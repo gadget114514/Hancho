@@ -150,8 +150,8 @@ std::wstring PeerText(const nlohmann::json& msgOrPeer) {
     std::string nick = p.value("nickname", std::string());
     std::string key = p.value("key", std::string());
     std::string host = p.value("host", std::string());
-    std::wstring out = Utf8ToWide(!nick.empty() ? nick : key);
-    if (out.empty()) out = Utf8ToWide(host);
+    std::wstring out = Utf8ToWide(!nick.empty() ? nick : host);
+    if (out.empty()) out = Utf8ToWide(key);
     if (out.empty()) out = L"?";
     return out;
 }
@@ -228,19 +228,12 @@ enum ControlId : int {
     IDC_BTN_OPEN_FOLDER = 2112,
     IDC_COMPOSE_TO_LABEL = 2113,
     IDC_COMPOSE_TO = 2114,
-    IDC_FROM_AGENT_LABEL = 2115,
-    IDC_FROM_AGENT = 2116,
-    IDC_TO_AGENT_LABEL = 2117,
-    IDC_TO_AGENT = 2118,
-    IDC_AUDIENCE_LABEL = 2119,
-    IDC_AUDIENCE = 2120,
     IDC_BTN_ATTACH = 2121,
     IDC_BTN_REMOVE_ATTACH = 2122,
     IDC_ATTACH_LIST = 2123,
     IDC_COMPOSE_TEXT = 2124,
     IDC_COMPOSE_HINT = 2125,
     IDC_BTN_SEND = 2126,
-    IDC_BTN_REPLY = 2127,
     IDC_LOG_SINCE_LABEL = 2130,
     IDC_LOG_SINCE = 2131,
     IDC_LOG_SEARCH_LABEL = 2132,
@@ -273,11 +266,6 @@ enum ControlId : int {
     IDC_SET_WARNING = 2159,
     IDM_TRAY_OPEN = 2160,
     IDM_TRAY_EXIT = 2161,
-    IDC_CHAT_HANDLER_LABEL = 2162,
-    IDC_CHAT_HANDLER_ENGINE = 2163,
-    IDC_CHAT_HANDLER_MODEL = 2164,
-    IDC_CHAT_HANDLER_ENABLED = 2165,
-    IDC_BTN_CHAT_HANDLER_APPLY = 2166
 };
 
 struct DialogState {
@@ -289,11 +277,6 @@ struct DialogState {
     HWND peers = nullptr;
     HWND btnRefreshPeers = nullptr;
     HWND peerCount = nullptr;
-    HWND handlerLabel = nullptr;
-    HWND handlerEngine = nullptr;
-    HWND handlerModel = nullptr;
-    HWND handlerEnabled = nullptr;
-    HWND btnHandlerApply = nullptr;
     HWND msgLabel = nullptr;
     HWND messages = nullptr;
     HWND detailLabel = nullptr;
@@ -304,19 +287,12 @@ struct DialogState {
     HWND btnOpenFolder = nullptr;
     HWND composeToLabel = nullptr;
     HWND composeTo = nullptr;
-    HWND fromAgentLabel = nullptr;
-    HWND fromAgent = nullptr;
-    HWND toAgentLabel = nullptr;
-    HWND toAgent = nullptr;
-    HWND audienceLabel = nullptr;
-    HWND audience = nullptr;
     HWND btnAttach = nullptr;
     HWND btnRemoveAttach = nullptr;
     HWND attachList = nullptr;
     HWND composeText = nullptr;
     HWND composeHint = nullptr;
     HWND btnSend = nullptr;
-    HWND btnReply = nullptr;
 
     HWND logSinceLabel = nullptr;
     HWND logSince = nullptr;
@@ -406,8 +382,7 @@ int S(int value) {
 
 bool IsCheckboxControl(const DialogState* st, HWND h) {
     if (!st || !h) return false;
-    return h == st->setEnabled || h == st->setHandlerEnabled || h == st->setAutoReply ||
-           h == st->handlerEnabled;
+    return h == st->setEnabled || h == st->setHandlerEnabled || h == st->setAutoReply;
 }
 
 // Applies the dashboard palette to the dialog, its lists and its controls.
@@ -614,93 +589,90 @@ void Place(HWND h, int x, int y, int w, int hgt) {
     MoveWindow(h, x, y, w, hgt, TRUE);
 }
 
+// The received body and attachments are shown only while composing a reply.
+void UpdateReplyDetailVisibility(DialogState* st) {
+    if (!st) return;
+    const bool show = st->replyActive && st->currentPage == 0;
+    HWND controls[] = {st->detailLabel, st->msgText, st->filesLabel, st->files,
+                       st->btnDownload, st->btnOpenFolder};
+    for (HWND h : controls) {
+        if (h) ShowWindow(h, show ? SW_SHOW : SW_HIDE);
+    }
+}
+
 void LayoutChat(DialogState* st, const RECT& pr) {
     const int w = pr.right - pr.left;
     const int hgt = pr.bottom - pr.top;
     if (w < 60 || hgt < 60) return;
 
     const int composeH = S(172);
-    const int topBottom = pr.bottom - composeH - S(8);
-    const int leftW = (std::min)(S(300), w / 2);
+    const int rightW = (std::min)(S(460), w / 2);
+    const int rx = pr.right - rightW;
+    const int lw = rx - pr.left - S(8);
+    if (lw < S(120)) return;
+    const int hostBottom = pr.bottom - composeH - S(8);
 
-    Place(st->peersLabel, pr.left, pr.top, leftW - S(80), S(20));
-    Place(st->btnRefreshPeers, pr.left + leftW - S(76), pr.top, S(76), S(22));
-    Place(st->peerCount, pr.left, pr.top + S(24), leftW, S(18));
-    Place(st->peers, pr.left, pr.top + S(44), leftW, topBottom - pr.top - S(44));
+    // Right upper: hosts.
+    Place(st->peersLabel, rx, pr.top, rightW - S(80), S(20));
+    Place(st->btnRefreshPeers, rx + rightW - S(76), pr.top, S(76), S(22));
+    Place(st->peerCount, rx, pr.top + S(24), rightW, S(18));
+    Place(st->peers, rx, pr.top + S(44), rightW,
+          (std::max)(S(40), hostBottom - static_cast<int>(pr.top) - S(44)));
 
-    const int rx = pr.left + leftW + S(8);
-    const int rw = pr.right - rx;
-    if (rw <= 0) return;
-    // Answering-LLM bar: change the handler from the chat view without opening Settings.
-    int hx = rx + S(70);
-    Place(st->handlerLabel, rx, pr.top + S(3), S(66), S(20));
-    Place(st->handlerEngine, hx, pr.top, S(122), S(24));
-    hx += S(122) + S(6);
-    const int onW = S(54);
-    const int applyW = S(64);
-    int modelW = rw - static_cast<int>(hx - rx) - onW - applyW - S(18);
-    if (modelW < S(80)) modelW = S(80);
-    Place(st->handlerModel, hx, pr.top, modelW, S(24));
-    hx += modelW + S(6);
-    Place(st->handlerEnabled, hx, pr.top, onW, S(24));
-    hx += onW + S(6);
-    Place(st->btnHandlerApply, hx, pr.top, applyW, S(24));
+    // Left: the message list, plus the received body and attachments while replying.
+    const int msgTop = pr.top;
+    Place(st->msgLabel, pr.left, msgTop, lw, S(20));
+    if (st->replyActive) {
+        int msgH = (pr.bottom - msgTop - S(20) - S(8)) * 45 / 100;
+        if (msgH < S(60)) msgH = S(60);
+        Place(st->messages, pr.left, msgTop + S(20), lw, msgH);
 
-    const int msgTop = pr.top + S(30);
-    int msgH = (topBottom - msgTop - S(20)) * 45 / 100;
-    if (msgH < S(60)) msgH = S(60);
-    Place(st->msgLabel, rx, msgTop, rw, S(20));
-    Place(st->messages, rx, msgTop + S(20), rw, msgH);
+        const int dy = msgTop + S(20) + msgH + S(8);
+        const int dh = pr.bottom - dy;
+        Place(st->detailLabel, pr.left, dy, lw, S(18));
+        int textH = (dh - S(18)) * 55 / 100;
+        if (textH < S(40)) textH = S(40);
+        Place(st->msgText, pr.left, dy + S(18), lw, textH);
 
-    const int dy = msgTop + S(20) + msgH + S(8);
-    const int dh = topBottom - dy;
-    Place(st->detailLabel, rx, dy, rw, S(18));
-    int textH = (dh - S(18)) * 55 / 100;
-    if (textH < S(40)) textH = S(40);
-    Place(st->msgText, rx, dy + S(18), rw, textH);
+        const int fy = dy + S(18) + textH + S(4);
+        Place(st->filesLabel, pr.left, fy, S(200), S(18));
+        Place(st->btnDownload, pr.left + lw - S(186), fy, S(88), S(20));
+        Place(st->btnOpenFolder, pr.left + lw - S(94), fy, S(94), S(20));
+        int filesH = pr.bottom - (fy + S(24));
+        if (filesH < S(30)) filesH = S(30);
+        Place(st->files, pr.left, fy + S(24), lw, filesH);
+    } else {
+        int msgH = pr.bottom - (msgTop + S(20));
+        if (msgH < S(60)) msgH = S(60);
+        Place(st->messages, pr.left, msgTop + S(20), lw, msgH);
+    }
 
-    const int fy = dy + S(18) + textH + S(4);
-    Place(st->filesLabel, rx, fy, S(200), S(18));
-    Place(st->btnDownload, rx + rw - S(186), fy, S(88), S(20));
-    Place(st->btnOpenFolder, rx + rw - S(94), fy, S(94), S(20));
-    int filesH = topBottom - (fy + S(24));
-    if (filesH < S(30)) filesH = S(30);
-    Place(st->files, rx, fy + S(24), rw, filesH);
-
+    // Right lower: compose.
     const int cy = pr.bottom - composeH;
-    int x = pr.left;
+    int x = rx;
     int y = cy;
     const int labelH = S(22);
-    Place(st->composeToLabel, x, y + S(3), S(24), labelH);
-    x += S(26);
-    Place(st->composeTo, x, y, S(196), S(24));
-    x += S(196) + S(8);
-    Place(st->fromAgentLabel, x, y + S(3), S(38), labelH);
-    x += S(40);
-    Place(st->fromAgent, x, y, S(86), S(24));
-    x += S(86) + S(8);
-    Place(st->toAgentLabel, x, y + S(3), S(26), labelH);
-    x += S(28);
-    Place(st->toAgent, x, y, S(86), S(24));
-    x += S(86) + S(8);
-    Place(st->audienceLabel, x, y + S(3), S(66), labelH);
-    x += S(68);
-    Place(st->audience, x, y, S(104), S(24));
-    x += S(104) + S(8);
-    Place(st->btnAttach, x, y, S(90), S(24));
-    x += S(90) + S(6);
-    Place(st->btnRemoveAttach, x, y, S(78), S(24));
+    Place(st->composeToLabel, x, y + S(3), S(48), labelH);
+    x += S(50);
+    Place(st->composeTo, x, y, (std::max)(S(160), rightW - S(50)), S(24));
 
     const int row2 = y + S(30);
-    const int attachW = S(190);
-    const int textW = (std::max)(S(120), w - attachW - S(8));
-    Place(st->composeText, pr.left, row2, textW, S(84));
-    Place(st->attachList, pr.left + textW + S(8), row2, attachW, S(84));
+    int attachW = S(190);
+    int textW = rightW - attachW - S(8);
+    if (textW < S(120)) {
+        textW = S(120);
+        attachW = (std::max)(S(90), rightW - textW - S(8));
+    }
+    const int attachX = rx + textW + S(8);
+    Place(st->composeText, rx, row2, textW, S(84));
+    const int abtnW = (std::max)(S(48), (attachW - S(6)) / 2);
+    Place(st->btnAttach, attachX, row2, abtnW, S(22));
+    Place(st->btnRemoveAttach, attachX + abtnW + S(6), row2, abtnW, S(22));
+    Place(st->attachList, attachX, row2 + S(26), attachW, S(84) - S(26));
 
     const int row3 = row2 + S(88);
-    Place(st->composeHint, pr.left, row3 + S(5), (std::max)(S(80), w - S(200)), S(20));
-    Place(st->btnReply, pr.right - S(94), row3, S(94), S(28));
-    Place(st->btnSend, pr.right - S(94) - S(8) - S(96), row3, S(96), S(28));
+    Place(st->composeHint, rx, row3 + S(5), (std::max)(S(80), rightW - S(120)), S(20));
+    Place(st->btnSend, rx + rightW - S(96), row3, S(96), S(28));
 }
 
 void LayoutLog(DialogState* st, const RECT& pr) {
@@ -800,6 +772,7 @@ void ShowPage(DialogState* st, int page) {
     show(st->pageChat, page == 0);
     show(st->pageLog, page == 1);
     show(st->pageSettings, page == 2);
+    if (page == 0) UpdateReplyDetailVisibility(st);
     LayoutCurrentPage(st);
 }
 
@@ -945,13 +918,10 @@ void LoadPeers(DialogState* st) {
     if (st->peers) ListView_DeleteAllItems(st->peers);
     for (size_t i = 0; i < st->peersJson.size(); ++i) {
         const auto& p = st->peersJson[i];
-        std::wstring addr = Utf8ToWide(p.value("addr", std::string())) + L":" +
-                            std::to_wstring(p.value("port", 0));
         std::vector<std::wstring> cells = {
             Utf8ToWide(p.value("nickname", std::string())),
             Utf8ToWide(p.value("group", std::string())),
             Utf8ToWide(p.value("host", std::string())),
-            addr,
             p.value("hancho", false) ? L"Hancho" : L""
         };
         InsertRow(st->peers, cells, static_cast<LPARAM>(i));
@@ -1078,7 +1048,6 @@ void LoadMessages(DialogState* st) {
             Utf8ToWide(m.value("direction", std::string())),
             PeerText(m),
             AgentsText(m),
-            Utf8ToWide(m.value("audience", std::string())),
             PreviewOf(m.value("text", std::string())),
             FilesText(m),
             Utf8ToWide(m.value("status", std::string()))
@@ -1208,7 +1177,9 @@ void ResetReply(DialogState* st) {
         ComboBox_DeleteString(st->composeTo, 2);
         ComboBox_InsertString(st->composeTo, 2, T(L"返信", L"Reply", L"Responder"));
         ComboBox_SetCurSel(st->composeTo, 0);
+        EnableWindow(st->composeTo, TRUE);
     }
+    UpdateReplyDetailVisibility(st);
 }
 
 void DoSend(DialogState* st) {
@@ -1218,15 +1189,22 @@ void DoSend(DialogState* st) {
         MessageBeep(MB_ICONWARNING);
         return;
     }
-    std::string fromAgent = GetTextUtf8(st->fromAgent);
-    std::string toAgent = GetTextUtf8(st->toAgent);
-    int audienceIdx = st->audience ? ComboBox_GetCurSel(st->audience) : 0;
-    std::string audience;
-    if (audienceIdx == 1) audience = "agent";
-    else if (audienceIdx == 2) audience = "";
-    else audience = "human";
-
+    // The sender identity is the agent name configured in Settings (chat.handler.agent).
+    std::string fromAgent;
+    {
+        nlohmann::json cfg = nlohmann::json::parse(ReadConfigText(), nullptr, false);
+        nlohmann::json chat = ChatBlock(cfg);
+        if (chat.contains("handler") && chat["handler"].is_object()) {
+            fromAgent = Trim(chat["handler"].value("agent", std::string()));
+        }
+        if (fromAgent.empty()) {
+            std::string nick = Trim(chat.value("nickname", std::string()));
+            if (nick.empty()) nick = "noname";
+            fromAgent = nick + "-llm";
+        }
+    }
     int target = st->composeTo ? ComboBox_GetCurSel(st->composeTo) : 0;
+    if (st->replyActive && !st->replyPeerKey.empty()) target = 2;
     std::vector<std::string> targets;
     if (target == 1) {
         targets.push_back("local");
@@ -1245,9 +1223,7 @@ void DoSend(DialogState* st) {
             {"action", "chat_send"},
             {"to", to},
             {"text", text},
-            {"from_agent", fromAgent},
-            {"to_agent", toAgent},
-            {"audience", audience}
+            {"from_agent", fromAgent}
         };
         if (!st->attachFiles.empty()) req["files"] = st->attachFiles;
         if (target == 2 && st->replyToId) req["reply_to"] = st->replyToId;
@@ -1270,21 +1246,21 @@ void DoSend(DialogState* st) {
     SetTimer(st->hwnd, TIMER_RELOAD, 400, nullptr);
 }
 
-void DoReply(DialogState* st) {
-    if (!st) return;
-    int idx = SelectedMessageIndex(st);
-    if (idx < 0) return;
+// Reply mode: the message list picks the counterpart, so the destination cannot be
+// changed here. The lower pane stays in reply mode until New is pressed or a send succeeds.
+void EnterReplyMode(DialogState* st, int idx) {
+    if (!st || idx < 0 || static_cast<size_t>(idx) >= st->messagesJson.size()) return;
     const nlohmann::json& m = st->messagesJson[static_cast<size_t>(idx)];
+    if (m.value("direction", std::string()) == "out") return;
     std::string peerKey;
     if (m.contains("peer") && m["peer"].is_object()) {
         peerKey = m["peer"].value("key", std::string());
     }
-    if (peerKey.empty() || peerKey == "local") peerKey = "local";
+    if (peerKey.empty()) peerKey = "local";
     st->replyActive = true;
     st->replyPeerKey = peerKey;
     st->replyToId = m.value("id", 0ULL);
     st->replyLabel = PeerText(m);
-    SetTextUtf8(st->toAgent, m.value("from_agent", std::string()));
     if (st->composeTo) {
         std::wstring label = T(L"返信: ", L"Reply to: ", L"Responder a: ");
         label += st->replyLabel;
@@ -1292,7 +1268,24 @@ void DoReply(DialogState* st) {
         ComboBox_InsertString(st->composeTo, 2, label.c_str());
         ComboBox_SetCurSel(st->composeTo, 2);
     }
-    SetFocus(st->composeText);
+    UpdateReplyDetailVisibility(st);
+}
+
+// Reply mode without a message (nothing selected): show empty body/attachments.
+void EnterEmptyReplyMode(DialogState* st) {
+    if (!st) return;
+    st->replyActive = true;
+    st->replyPeerKey.clear();
+    st->replyToId = 0;
+    st->replyLabel.clear();
+    if (st->msgText) SetWindowTextW(st->msgText, L"");
+    if (st->files) ListView_DeleteAllItems(st->files);
+    if (st->composeTo) {
+        ComboBox_DeleteString(st->composeTo, 2);
+        ComboBox_InsertString(st->composeTo, 2, T(L"返信", L"Reply", L"Responder"));
+        ComboBox_SetCurSel(st->composeTo, 2);
+    }
+    UpdateReplyDetailVisibility(st);
 }
 
 // ---------------------------------------------------------------------------
@@ -1405,19 +1398,14 @@ void LoadLog(DialogState* st) {
             std::string error = e.value("error", std::string());
             detail = Utf8ToWide(!status.empty() ? status : (!path.empty() ? path : error));
         }
-        std::wstring agents;
-        std::string from = e.value("from_agent", std::string());
-        std::string to = e.value("to_agent", std::string());
-        if (!from.empty()) agents += Utf8ToWide(from);
-        if (!to.empty()) {
-            if (!agents.empty()) agents += L" -> ";
-            agents += Utf8ToWide(to);
-        }
+        std::wstring from = Utf8ToWide(e.value("from_agent", std::string()));
+        std::wstring to = Utf8ToWide(e.value("to_agent", std::string()));
         std::vector<std::wstring> cells = {
             Utf8ToWide(e.value("logged_at", e.value("time", std::string()))),
             Utf8ToWide(e.value("event", std::string())),
             peer,
-            agents,
+            from,
+            to,
             TruncateW(detail, 160)
         };
         InsertRow(st->logList, cells, static_cast<LPARAM>(count));
@@ -1480,14 +1468,16 @@ void LoadSettings(DialogState* st) {
     SetCheck(st->setHandlerEnabled, handler.value("enabled", false));
     SetTextUtf8(st->setEngine, handler.value("engine", std::string("agy")));
     SetTextUtf8(st->setModel, handler.value("model", std::string()));
-    SetTextUtf8(st->setAgent, handler.value("agent", std::string()));
-    SetCheck(st->setAutoReply, handler.value("auto_reply", true));
-    if (st->handlerEngine) {
-        const std::wstring engine = Utf8ToWide(handler.value("engine", std::string("agy")));
-        SetWindowTextW(st->handlerEngine, engine.c_str());
+    {
+        std::string agent = handler.value("agent", std::string());
+        if (agent.empty()) {
+            std::string nick = chat.value("nickname", std::string());
+            if (nick.empty()) nick = "noname";
+            agent = nick + "-llm";
+        }
+        SetTextUtf8(st->setAgent, agent);
     }
-    SetTextUtf8(st->handlerModel, handler.value("model", std::string()));
-    SetCheck(st->handlerEnabled, handler.value("enabled", false));
+    SetCheck(st->setAutoReply, handler.value("auto_reply", true));
 }
 
 std::vector<std::string> SplitCsv(const std::string& text) {
@@ -1569,32 +1559,6 @@ void DoApplySettings(DialogState* st) {
     SetTimer(st->hwnd, TIMER_POLL, 300, nullptr);
 }
 
-void ApplyChatHandlerBar(DialogState* st) {
-    if (!st) return;
-    wchar_t engineBuf[128] = {};
-    if (st->handlerEngine) GetWindowTextW(st->handlerEngine, engineBuf, 128);
-    nlohmann::json req = {
-        {"action", "chat_handler"},
-        {"enabled", GetCheck(st->handlerEnabled)},
-        {"engine", Trim(WideToUtf8(engineBuf))},
-        {"model", GetTextUtf8(st->handlerModel)}
-    };
-    nlohmann::json resp;
-    if (!IpcCall(req, resp) || !resp.value("ok", false)) {
-        const std::string err = JsonError(resp, "IPC request failed");
-        MessageBoxW(st->hwnd, Utf8ToWide(err).c_str(),
-                    T(L"応答 LLM を変更できません", L"Could not change the answering LLM",
-                      L"No se pudo cambiar el LLM que responde"),
-                    MB_ICONERROR | MB_OK);
-        return;
-    }
-    if (st->handlerLabel) {
-        SetWindowTextW(st->handlerLabel,
-                       T(L"応答 LLM (適用済み)", L"Answering LLM (applied)",
-                         L"LLM que responde (aplicado)"));
-    }
-    LoadSettings(st);
-}
 
 // ---------------------------------------------------------------------------
 // Fonts and control creation
@@ -1613,15 +1577,12 @@ void ApplyFont(DialogState* st) {
     auto push = [&](HWND h) { if (h) all.push_back(h); };
     push(st->hwndTab);
     push(st->peersLabel); push(st->peers); push(st->btnRefreshPeers); push(st->peerCount);
-    push(st->handlerLabel); push(st->handlerEngine); push(st->handlerModel);
-    push(st->handlerEnabled); push(st->btnHandlerApply);
     push(st->msgLabel); push(st->messages); push(st->detailLabel); push(st->msgText);
     push(st->filesLabel); push(st->files); push(st->btnDownload); push(st->btnOpenFolder);
-    push(st->composeToLabel); push(st->composeTo); push(st->fromAgentLabel);
-    push(st->fromAgent); push(st->toAgentLabel); push(st->toAgent);
-    push(st->audienceLabel); push(st->audience); push(st->btnAttach);
+    push(st->composeToLabel); push(st->composeTo);
+    push(st->btnAttach);
     push(st->btnRemoveAttach); push(st->attachList); push(st->composeText);
-    push(st->composeHint); push(st->btnSend); push(st->btnReply);
+    push(st->composeHint); push(st->btnSend);
     push(st->logSinceLabel); push(st->logSince); push(st->logSearchLabel);
     push(st->logSearch); push(st->logEventLabel); push(st->logEvent);
     push(st->btnLogRefresh); push(st->btnLogFolder); push(st->logList); push(st->logCount);
@@ -1675,8 +1636,7 @@ void CreateChatControls(DialogState* st) {
     AddColumn(st->peers, 0, T(L"ニックネーム", L"Nickname", L"Apodo"), S(110));
     AddColumn(st->peers, 1, T(L"グループ", L"Group", L"Grupo"), S(80));
     AddColumn(st->peers, 2, T(L"ホスト", L"Host", L"Host"), S(110));
-    AddColumn(st->peers, 3, T(L"アドレス:ポート", L"Address:port", L"Dirección:puerto"), S(120));
-    AddColumn(st->peers, 4, T(L"マーク", L"Mark", L"Marca"), S(60));
+    AddColumn(st->peers, 3, T(L"マーク", L"Mark", L"Marca"), S(60));
     st->btnRefreshPeers = MakeButton(hwnd, IDC_BTN_REFRESH_PEERS,
                                      T(L"更新", L"Refresh", L"Actualizar"));
     st->peerCount = MakeStatic(hwnd, IDC_PEER_COUNT, L"");
@@ -1689,26 +1649,16 @@ void CreateChatControls(DialogState* st) {
     AddColumn(st->messages, 1, T(L"方向", L"Dir", L"Dir"), S(50));
     AddColumn(st->messages, 2, T(L"ピア", L"Peer", L"Par"), S(120));
     AddColumn(st->messages, 3, T(L"エージェント", L"Agents", L"Agentes"), S(110));
-    AddColumn(st->messages, 4, T(L"宛先種別", L"Audience", L"Audiencia"), S(70));
-    AddColumn(st->messages, 5, T(L"プレビュー", L"Preview", L"Vista previa"), S(240));
-    AddColumn(st->messages, 6, T(L"ファイル", L"Files", L"Archivos"), S(120));
-    AddColumn(st->messages, 7, T(L"状態", L"Status", L"Estado"), S(90));
+    AddColumn(st->messages, 4, T(L"プレビュー", L"Preview", L"Vista previa"), S(240));
+    AddColumn(st->messages, 5, T(L"ファイル", L"Files", L"Archivos"), S(120));
+    AddColumn(st->messages, 6, T(L"状態", L"Status", L"Estado"), S(90));
 
-    st->handlerLabel = MakeStatic(hwnd, IDC_CHAT_HANDLER_LABEL,
-                                  T(L"応答 LLM", L"Answering LLM", L"LLM que responde"));
-    st->handlerEngine = MakeComboEdit(hwnd, IDC_CHAT_HANDLER_ENGINE);
-    for (const wchar_t* engine : {L"agy", L"claude", L"opencode", L"codex", L"antigravity", L"aider", L"ollama"}) {
-        ComboBox_AddString(st->handlerEngine, engine);
-    }
-    st->handlerModel = MakeEdit(hwnd, IDC_CHAT_HANDLER_MODEL, ES_AUTOHSCROLL);
-    st->handlerEnabled = MakeCheck(hwnd, IDC_CHAT_HANDLER_ENABLED, T(L"有効", L"On", L"Activo"));
-    st->btnHandlerApply = MakeButton(hwnd, IDC_BTN_CHAT_HANDLER_APPLY, T(L"適用", L"Apply", L"Aplicar"));
-
-    st->detailLabel = MakeStatic(hwnd, IDC_DETAIL_LABEL, T(L"本文", L"MESSAGE", L"MENSAJE"));
+    st->detailLabel = MakeStatic(hwnd, IDC_DETAIL_LABEL,
+                                 T(L"受信本文", L"RECEIVED MESSAGE", L"MENSAJE RECIBIDO"));
     st->msgText = MakeEdit(hwnd, IDC_MSG_TEXT,
                            ES_MULTILINE | ES_READONLY | ES_AUTOVSCROLL | WS_VSCROLL);
     st->filesLabel = MakeStatic(hwnd, IDC_FILES_LABEL,
-                                T(L"添付ファイル", L"ATTACHMENTS", L"ADJUNTOS"));
+                                T(L"受信添付ファイル", L"RECEIVED ATTACHMENTS", L"ADJUNTOS RECIBIDOS"));
     st->files = MakeList(hwnd, IDC_FILES);
     ListView_SetExtendedListViewStyle(st->files, LVS_EX_FULLROWSELECT | LVS_EX_DOUBLEBUFFER);
     AddColumn(st->files, 0, T(L"名前", L"Name", L"Nombre"), S(200));
@@ -1721,7 +1671,8 @@ void CreateChatControls(DialogState* st) {
     st->btnOpenFolder = MakeButton(hwnd, IDC_BTN_OPEN_FOLDER,
                                    T(L"フォルダを開く", L"Open folder", L"Abrir carpeta"));
 
-    st->composeToLabel = MakeStatic(hwnd, IDC_COMPOSE_TO_LABEL, T(L"宛先", L"To", L"Para"));
+    st->composeToLabel = MakeStatic(hwnd, IDC_COMPOSE_TO_LABEL,
+                                    T(L"送信先", L"Send to", L"Enviar a"));
     st->composeTo = MakeCombo(hwnd, IDC_COMPOSE_TO);
     ComboBox_AddString(st->composeTo,
                        T(L"選択中のホスト", L"Selected host(s)", L"Equipos seleccionados"));
@@ -1729,18 +1680,6 @@ void CreateChatControls(DialogState* st) {
                        T(L"ローカルエージェント", L"Local agents", L"Agentes locales"));
     ComboBox_AddString(st->composeTo, T(L"返信", L"Reply", L"Responder"));
     ComboBox_SetCurSel(st->composeTo, 0);
-    st->fromAgentLabel = MakeStatic(hwnd, IDC_FROM_AGENT_LABEL,
-                                    T(L"From", L"From", L"De"));
-    st->fromAgent = MakeEdit(hwnd, IDC_FROM_AGENT, ES_AUTOHSCROLL);
-    st->toAgentLabel = MakeStatic(hwnd, IDC_TO_AGENT_LABEL, T(L"To", L"To", L"A"));
-    st->toAgent = MakeEdit(hwnd, IDC_TO_AGENT, ES_AUTOHSCROLL);
-    st->audienceLabel = MakeStatic(hwnd, IDC_AUDIENCE_LABEL,
-                                   T(L"宛先種別", L"Audience", L"Audiencia"));
-    st->audience = MakeCombo(hwnd, IDC_AUDIENCE);
-    ComboBox_AddString(st->audience, T(L"human (人間)", L"human", L"human (persona)"));
-    ComboBox_AddString(st->audience, T(L"agent (LLM)", L"agent", L"agent (LLM)"));
-    ComboBox_AddString(st->audience, T(L"未指定", L"unspecified", L"sin especificar"));
-    ComboBox_SetCurSel(st->audience, 0);
     st->btnAttach = MakeButton(hwnd, IDC_BTN_ATTACH,
                                T(L"添付...", L"Attach...", L"Adjuntar..."));
     st->btnRemoveAttach = MakeButton(hwnd, IDC_BTN_REMOVE_ATTACH,
@@ -1756,17 +1695,13 @@ void CreateChatControls(DialogState* st) {
     SetWindowSubclass(st->composeText, ComposeEditProc, 1, 0);
     st->composeHint = MakeStatic(hwnd, IDC_COMPOSE_HINT, L"Ctrl+Enter");
     st->btnSend = MakeButton(hwnd, IDC_BTN_SEND, T(L"送信", L"Send", L"Enviar"));
-    st->btnReply = MakeButton(hwnd, IDC_BTN_REPLY, T(L"返信", L"Reply", L"Responder"));
 
     st->pageChat = {st->peersLabel, st->peers, st->btnRefreshPeers, st->peerCount,
-                    st->handlerLabel, st->handlerEngine, st->handlerModel,
-                    st->handlerEnabled, st->btnHandlerApply,
                     st->msgLabel, st->messages, st->detailLabel, st->msgText,
                     st->filesLabel, st->files, st->btnDownload, st->btnOpenFolder,
-                    st->composeToLabel, st->composeTo, st->fromAgentLabel, st->fromAgent,
-                    st->toAgentLabel, st->toAgent, st->audienceLabel, st->audience,
+                    st->composeToLabel, st->composeTo,
                     st->btnAttach, st->btnRemoveAttach, st->attachList, st->composeText,
-                    st->composeHint, st->btnSend, st->btnReply};
+                    st->composeHint, st->btnSend};
 }
 
 void CreateLogControls(DialogState* st) {
@@ -1802,8 +1737,9 @@ void CreateLogControls(DialogState* st) {
     AddColumn(st->logList, 0, T(L"時刻", L"Time", L"Hora"), S(150));
     AddColumn(st->logList, 1, T(L"イベント", L"Event", L"Evento"), S(100));
     AddColumn(st->logList, 2, T(L"ピア", L"Peer", L"Par"), S(150));
-    AddColumn(st->logList, 3, T(L"エージェント", L"Agents", L"Agentes"), S(140));
-    AddColumn(st->logList, 4, T(L"本文 / 状態", L"Text / status", L"Texto / estado"), S(420));
+    AddColumn(st->logList, 3, T(L"送信元", L"From", L"De"), S(120));
+    AddColumn(st->logList, 4, T(L"送信先", L"To", L"Para"), S(120));
+    AddColumn(st->logList, 5, T(L"本文 / 状態", L"Text / status", L"Texto / estado"), S(380));
     st->logCount = MakeStatic(hwnd, IDC_LOG_COUNT, L"");
 
     st->pageLog = {st->logSinceLabel, st->logSince, st->logSearchLabel, st->logSearch,
@@ -2113,6 +2049,35 @@ LRESULT CALLBACK IpmsgWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam)
                 DestroyWindow(hwnd);
                 return 0;
             }
+            if (id == IDC_COMPOSE_TO) {
+                if (code == CBN_SELCHANGE) {
+                    const int sel = ComboBox_GetCurSel(st->composeTo);
+                    if (sel == 2) {
+                        int idx = SelectedMessageIndex(st);
+                        if (idx < 0) {
+                            // Nothing selected: reply to the newest received message.
+                            for (int i = static_cast<int>(st->messagesJson.size()) - 1; i >= 0; --i) {
+                                if (st->messagesJson[static_cast<size_t>(i)].value(
+                                        "direction", std::string()) != "out") {
+                                    idx = i;
+                                    break;
+                                }
+                            }
+                            if (idx >= 0) {
+                                SelectRowByData(st->messages, static_cast<LPARAM>(idx));
+                                SelectMessage(st, idx);
+                            }
+                        }
+                        EnterReplyMode(st, idx);
+                        if (!st->replyActive) EnterEmptyReplyMode(st);
+                    } else if (st->replyActive) {
+                        ResetReply(st);
+                        ComboBox_SetCurSel(st->composeTo, sel);
+                    }
+                    LayoutCurrentPage(st);
+                }
+                return 0;
+            }
             if (code != BN_CLICKED) return 0;
             if (IsCheckboxControl(st, reinterpret_cast<HWND>(lParam))) {
                 SetCheck(reinterpret_cast<HWND>(lParam), !GetCheck(reinterpret_cast<HWND>(lParam)));
@@ -2124,10 +2089,6 @@ LRESULT CALLBACK IpmsgWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam)
                     nlohmann::json resp;
                     IpcCall({{"action", "chat_refresh"}}, resp);
                     SetTimer(hwnd, TIMER_PEERS, 800, nullptr);
-                    break;
-                }
-                case IDC_BTN_CHAT_HANDLER_APPLY: {
-                    ApplyChatHandlerBar(st);
                     break;
                 }
                 case IDC_BTN_DOWNLOAD:
@@ -2144,9 +2105,6 @@ LRESULT CALLBACK IpmsgWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam)
                     break;
                 case IDC_BTN_SEND:
                     DoSend(st);
-                    break;
-                case IDC_BTN_REPLY:
-                    DoReply(st);
                     break;
                 case IDC_BTN_LOG_REFRESH:
                     LoadLog(st);
@@ -2198,6 +2156,15 @@ LRESULT CALLBACK IpmsgWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam)
                 else if (page == 2) LoadSettings(st);
                 return 0;
             }
+            if (hdr->idFrom == IDC_PEERS && hdr->code == LVN_ITEMCHANGED) {
+                auto* nv = reinterpret_cast<NMLISTVIEW*>(lParam);
+                if (nv->iItem >= 0 && (nv->uChanged & LVIF_STATE) &&
+                    (nv->uNewState & LVIS_SELECTED) && !(nv->uOldState & LVIS_SELECTED) &&
+                    GetFocus() == st->peers) {
+                    ResetReply(st);
+                }
+                return 0;
+            }
             if (hdr->idFrom == IDC_MESSAGES && hdr->code == LVN_ITEMCHANGED) {
                 auto* nv = reinterpret_cast<NMLISTVIEW*>(lParam);
                 if (nv->iItem >= 0 && (nv->uChanged & LVIF_STATE) &&
@@ -2206,7 +2173,22 @@ LRESULT CALLBACK IpmsgWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam)
                     info.mask = LVIF_PARAM;
                     info.iItem = nv->iItem;
                     if (ListView_GetItem(st->messages, &info)) {
-                        SelectMessage(st, static_cast<int>(info.lParam));
+                        const int idx = static_cast<int>(info.lParam);
+                        SelectMessage(st, idx);
+                        // A selected message means reply; a selected host means a new send.
+                        if (st->replyActive || GetFocus() == st->messages) EnterReplyMode(st, idx);
+                    }
+                }
+                return 0;
+            }
+            if (hdr->idFrom == IDC_MESSAGES && hdr->code == NM_CLICK) {
+                auto* nm = reinterpret_cast<NMITEMACTIVATE*>(lParam);
+                if (nm && nm->iItem >= 0) {
+                    LVITEMW info = {};
+                    info.mask = LVIF_PARAM;
+                    info.iItem = nm->iItem;
+                    if (ListView_GetItem(st->messages, &info)) {
+                        EnterReplyMode(st, static_cast<int>(info.lParam));
                     }
                 }
                 return 0;

@@ -41,7 +41,7 @@ struct IpmsgConfig {
     bool enabled = false;
     uint16_t port = kIpmsgDefaultPort;
     std::string bind = "0.0.0.0";
-    std::string nickname;          // default: "Hancho@<host>"
+    std::string nickname;          // default: "noname"
     std::string group = "Hancho";
     // Extra entry targets: broadcast addresses or unicast hosts ("a.b.c.d" or
     // "a.b.c.d:port"). 255.255.255.255 is always used.

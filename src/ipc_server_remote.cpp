@@ -599,6 +599,10 @@ void IpcServer::StartIpmsg() {
                 ? block["handler"]
                 : nlohmann::json::object();
         IpmsgHandlerConfig handlerCfg = IpmsgHandlerConfig::FromJson(handlerBlock);
+        if (handlerCfg.agent.empty()) {
+            const std::string nick = cfg.nickname.empty() ? std::string("noname") : cfg.nickname;
+            handlerCfg.agent = nick + "-llm";
+        }
         ipmsgHandler_->Configure(handlerCfg, WideToUtf8(GetEffectiveDataDirectoryWide()),
                                  btm_ ? &btm_->Engines() : nullptr);
         ipmsg_->SetOnMessage([this](const nlohmann::json& message) {

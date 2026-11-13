@@ -4,7 +4,7 @@
 
 **Hancho** is a native Win32 C++ Multi-Terminal ConPTY Process Manager and Dashboard designed for orchestrating, monitoring, and interacting with multiple parallel CLI agents (`claude`, `opencode`, build scripts, and interactive shells) via both **Model Context Protocol (MCP)** and **CLI commands**.
 
-Check the version with `hancho-cli.exe --version` (current: 0.9.11).
+Check the version with `hancho-cli.exe --version` (current: 0.9.12).
 
 ### Who is this for?
 
@@ -25,8 +25,8 @@ The dashboard has an **execution monitor pane** below the process and task lists
 
 ## Express
 
-- Download and install [Hancho-v0.9.11-win64-setup.exe](https://github.com/gadget114514/Hancho/releases/download/v0.9.11/Hancho-v0.9.11-win64-setup.exe)
-  (portable: [Hancho-v0.9.11-win64.zip](https://github.com/gadget114514/Hancho/releases/download/v0.9.11/Hancho-v0.9.11-win64.zip), all versions: [Releases](https://github.com/gadget114514/Hancho/releases))
+- Download and install [Hancho-v0.9.12-win64-setup.exe](https://github.com/gadget114514/Hancho/releases/download/v0.9.12/Hancho-v0.9.11-win64-setup.exe)
+  (portable: [Hancho-v0.9.12-win64.zip](https://github.com/gadget114514/Hancho/releases/download/v0.9.11/Hancho-v0.9.11-win64.zip), all versions: [Releases](https://github.com/gadget114514/Hancho/releases))
 - In your llm, "find hancho in PATH, then read help to use it" 
 - In your llm, "create task and use (opencode|claude|agy|codex) to execute the task via hancho" 
 - That's all
@@ -148,6 +148,15 @@ All Hancho data is plain JSON / JSONL (task queues, behavior trees, stream event
 ---
 
 ## Release Notes
+
+### v0.9.12
+- **Chat dialog layout**: messages (list, received body and attachments) on the left, hosts in the upper right and the compose in the lower right.
+- **Simpler compose**: the send row only picks the destination (selected hosts / local agents / reply). The sender name comes from Settings; `to_agent` and the audience selector are no longer shown, so messages are handled by the destination's answering LLM.
+- **Reply mode**: selecting a message, or choosing Reply in the destination combo, shows the received body and attachments (empty when nothing is selected). Choosing another destination leaves reply mode.
+- **Log**: separate Sender and Destination columns.
+- **Hosts**: the address:port column is gone; peer names fall back to the host name before the key.
+- **Settings**: the answering-LLM controls live only in the Settings tab.
+- **Defaults**: nickname `noname`; agent name auto-generated as `<nickname>-llm` and used as the sender name.
 
 ### v0.9.11
 - **Chat**: the IPMsg-compatible feature is now named Chat everywhere: `hancho-cli chat` (alias `msg`), the MCP `chat_*` tools, the standalone `Hancho.exe chat` window and the dashboard toolbar. `doc/ipmsg.md` became `doc/chat.md`.
