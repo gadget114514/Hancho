@@ -30,6 +30,7 @@
 #include <map>
 #include <sstream>
 #include <iomanip>
+#include <climits>
 #include <algorithm>
 #include <chrono>
 #include <unordered_map>
@@ -971,6 +972,10 @@ struct DashboardState {
     DWORD guiThreadId = 0;
 
     HWND hwndMain = nullptr;
+    bool hasWindowPlacement = false;
+    WINDOWPLACEMENT windowPlacement = {sizeof(WINDOWPLACEMENT)};
+    int processListColumnWidths[14] = {52, 78, 100, 100, 120, 140, 85, 65, 72, 78, 70, 185, 175, 80};
+    int taskListColumnWidths[11] = {90, 350, 100, 150, 105, 115, 190, 110, 82, 150, 200};
     HWND hwndBtnStart = nullptr;
     HWND hwndBtnSettings = nullptr;
     HWND hwndBtnKillSel = nullptr;
@@ -10020,6 +10025,49 @@ static void LoadShellConfig(DashboardState* st) {
     }
     if (content.empty()) return;
 
+    nlohmann::json configJson = nlohmann::json::parse(content, nullptr, false);
+    if (configJson.is_object()) {
+        auto placementIt = configJson.find("window_placement");
+        if (placementIt != configJson.end() && placementIt->is_object()) {
+            const auto readPlacementInt = [&](const char* key, int fallback) {
+                auto it = placementIt->find(key);
+                if (it == placementIt->end() || !it->is_number_integer()) return fallback;
+                int64_t value = it->get<int64_t>();
+                if (value < INT_MIN || value > INT_MAX) return fallback;
+                return static_cast<int>(value);
+            };
+            WINDOWPLACEMENT& wp = st->windowPlacement;
+            wp.length = sizeof(wp);
+            wp.flags = static_cast<UINT>(readPlacementInt("flags", 0));
+            wp.showCmd = static_cast<UINT>(readPlacementInt("show_cmd", SW_SHOW));
+            wp.ptMinPosition.x = readPlacementInt("min_x", -1);
+            wp.ptMinPosition.y = readPlacementInt("min_y", -1);
+            wp.ptMaxPosition.x = readPlacementInt("max_x", -1);
+            wp.ptMaxPosition.y = readPlacementInt("max_y", -1);
+            wp.rcNormalPosition.left = readPlacementInt("left", 100);
+            wp.rcNormalPosition.top = readPlacementInt("top", 100);
+            wp.rcNormalPosition.right = readPlacementInt("right", 1560);
+            wp.rcNormalPosition.bottom = readPlacementInt("bottom", 1040);
+            if (wp.showCmd == SW_SHOWMINIMIZED || wp.showCmd == SW_MINIMIZE) {
+                wp.showCmd = SW_SHOWNORMAL;
+            }
+            st->hasWindowPlacement = true;
+        }
+
+        const auto loadColumnWidths = [&configJson](const char* key, int* widths, size_t count) {
+            auto it = configJson.find(key);
+            if (it == configJson.end() || !it->is_array()) return;
+            for (size_t i = 0; i < count && i < it->size(); ++i) {
+                const auto& value = (*it)[i];
+                if (!value.is_number_integer()) continue;
+                int64_t width = value.get<int64_t>();
+                if (width > 0 && width <= INT_MAX) widths[i] = static_cast<int>(width);
+            }
+        };
+        loadColumnWidths("process_list_column_widths", st->processListColumnWidths, 14);
+        loadColumnWidths("task_list_column_widths", st->taskListColumnWidths, kTaskListColumns);
+    }
+
     std::string defShell = JsonGetString(content, "default_shell", "powershell");
     if (defShell == "cmd") st->defaultShell = ShellType::Cmd;
     else if (defShell == "bash") st->defaultShell = ShellType::Bash;
@@ -10184,6 +10232,33 @@ static void SaveShellConfig(const DashboardState* st) {
             for (auto it = oldJson.begin(); it != oldJson.end(); ++it) {
                 if (!cfgJson.contains(it.key())) cfgJson[it.key()] = it.value();
             }
+        }
+        if (st->hwndMain && IsWindow(st->hwndMain)) {
+            WINDOWPLACEMENT wp = {sizeof(wp)};
+            if (GetWindowPlacement(st->hwndMain, &wp)) {
+                cfgJson["window_placement"] = {
+                    {"flags", wp.flags},
+                    {"show_cmd", wp.showCmd},
+                    {"min_x", wp.ptMinPosition.x},
+                    {"min_y", wp.ptMinPosition.y},
+                    {"max_x", wp.ptMaxPosition.x},
+                    {"max_y", wp.ptMaxPosition.y},
+                    {"left", wp.rcNormalPosition.left},
+                    {"top", wp.rcNormalPosition.top},
+                    {"right", wp.rcNormalPosition.right},
+                    {"bottom", wp.rcNormalPosition.bottom}
+                };
+            }
+        }
+        if (st->hwndList && IsWindow(st->hwndList)) {
+            nlohmann::json widths = nlohmann::json::array();
+            for (int i = 0; i < 14; ++i) widths.push_back(ListView_GetColumnWidth(st->hwndList, i));
+            cfgJson["process_list_column_widths"] = std::move(widths);
+        }
+        if (st->hwndTaskList && IsWindow(st->hwndTaskList)) {
+            nlohmann::json widths = nlohmann::json::array();
+            for (int i = 0; i < kTaskListColumns; ++i) widths.push_back(ListView_GetColumnWidth(st->hwndTaskList, i));
+            cfgJson["task_list_column_widths"] = std::move(widths);
         }
         serialized = cfgJson.dump(2);
         WriteFileAtomicWide(GetConfigFilePathWide(), serialized);
@@ -10687,6 +10762,7 @@ static void RemoveTrayIcon(DashboardState* st) {
 
 static void HideToTray(DashboardState* st) {
     if (!st || !st->hwndMain) return;
+    SaveShellConfig(st);
     InitTrayIcon(st);
     // Without a tray icon, hiding the window would leave no way back to it: fall back to a normal minimize.
     if (!st->trayAdded) {
@@ -15540,6 +15616,14 @@ static LRESULT CALLBACK HintWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM l
             hs->btnClose = CreateWindowExW(0, L"BUTTON", L"✕",
                 WS_CHILD | WS_VISIBLE | BS_PUSHBUTTON,
                 460, 170, 88, 28, hwnd, (HMENU)IDC_HINT_CLOSE, hInst, nullptr);
+            AddControlHelp(hwnd, hs->btnLaunchSupervisor,
+                Tr(L"このヒントに対応するトリアージカードを開きます。\n候補から処置を選んだり、LLM に相談したりできます。",
+                   L"Opens the triage card for this hint.\nChoose a candidate action or ask the LLM for advice.",
+                   L"Abre la tarjeta de triaje de este aviso.\nElige una acción candidata o consulta al LLM."));
+            AddControlHelp(hwnd, hs->btnClose,
+                Tr(L"このヒントを閉じます。\n設定で自動消去までの秒数を変更できます。",
+                   L"Closes this hint.\nSettings control how many seconds it stays visible.",
+                   L"Cierra este aviso.\nEn Ajustes puedes cambiar los segundos que permanece visible."));
 
             if (hs && hs->dash) {
                 SendMessageW(hs->hwndCategory, WM_SETFONT, (WPARAM)hs->dash->hFontUiBold, TRUE);
@@ -16015,12 +16099,12 @@ static LRESULT CALLBACK DashboardWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPA
             ListView_SetExtendedListViewStyle(st->hwndList, LVS_EX_FULLROWSELECT | LVS_EX_DOUBLEBUFFER | LVS_EX_INFOTIP);
             ApplyListTheme(st);
 
-            const int colWidths[14] = {52, 78, 100, 100, 120, 140, 85, 65, 72, 78, 70, 185, 175, 80};
+            const int procDefaultWidths[14] = {52, 78, 100, 100, 120, 140, 85, 65, 72, 78, 70, 185, 175, 80};
             for (int i = 0; i < 14; ++i) {
                 LVCOLUMNW lvc = {};
                 lvc.mask = LVCF_TEXT | LVCF_WIDTH | LVCF_SUBITEM;
                 lvc.pszText = const_cast<wchar_t*>(ColumnTitle(i));
-                lvc.cx = colWidths[i];
+                lvc.cx = st->processListColumnWidths[i] > 0 ? st->processListColumnWidths[i] : procDefaultWidths[i];
                 lvc.iSubItem = i;
                 ListView_InsertColumn(st->hwndList, i, &lvc);
             }
@@ -16048,12 +16132,12 @@ static LRESULT CALLBACK DashboardWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPA
             ListView_SetTextBkColor(st->hwndTaskList, g_theme.panel);
             ListView_SetTextColor(st->hwndTaskList, g_theme.listText);
             {
-                const int taskWidths[kTaskListColumns] = {90, 350, 100, 150, 105, 115, 190, 110, 82, 150, 200};
+                const int taskDefaultWidths[kTaskListColumns] = {90, 350, 100, 150, 105, 115, 190, 110, 82, 150, 200};
                 for (int i = 0; i < kTaskListColumns; ++i) {
                     LVCOLUMNW lvc = {};
                     lvc.mask = LVCF_TEXT | LVCF_WIDTH | LVCF_SUBITEM;
                     lvc.pszText = const_cast<wchar_t*>(TaskColumnTitle(i));
-                    lvc.cx = taskWidths[i];
+                    lvc.cx = st->taskListColumnWidths[i] > 0 ? st->taskListColumnWidths[i] : taskDefaultWidths[i];
                     lvc.iSubItem = i;
                     ListView_InsertColumn(st->hwndTaskList, i, &lvc);
                 }
@@ -17122,7 +17206,11 @@ int RunGuiDashboard(ProcessManager* pm, IpcServer* ipc, TaskQueueManager* tqm) {
     if (ipc) {
         ipc->SetNotifyHwnd(hwnd);
     }
-    ShowWindow(hwnd, SW_SHOW);
+    if (!state.hasWindowPlacement ||
+        MonitorFromRect(&state.windowPlacement.rcNormalPosition, MONITOR_DEFAULTTONULL) == nullptr ||
+        !SetWindowPlacement(hwnd, &state.windowPlacement)) {
+        ShowWindow(hwnd, SW_SHOW);
+    }
     UpdateWindow(hwnd);
     ApplyNativeThemeToWindow(hwnd);
 

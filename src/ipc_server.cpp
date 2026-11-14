@@ -1788,14 +1788,28 @@ std::string IpcServer::HandleRequestJson(const std::string& reqJson) {
                 nlohmann::json parsed = nlohmann::json::parse(content, nullptr, false);
                 if (parsed.is_object()) cfg = parsed;
             }
+            EnsureChatBlock(cfg);
             if (patch.contains("ipmsg") && !patch.contains("chat")) {
                 patch["chat"] = patch["ipmsg"];
             }
             patch.erase("ipmsg");
             for (auto it = patch.begin(); it != patch.end(); ++it) {
-                cfg[it.key()] = it.value();
+                if (it.key() == "chat" && it.value().is_object()) {
+                    nlohmann::json& chat = EnsureChatBlock(cfg);
+                    for (auto cit = it.value().begin(); cit != it.value().end(); ++cit) {
+                        if (cit.key() == "handler" && cit.value().is_object() &&
+                            chat.contains("handler") && chat["handler"].is_object()) {
+                            for (auto hit = cit.value().begin(); hit != cit.value().end(); ++hit) {
+                                chat["handler"][hit.key()] = hit.value();
+                            }
+                        } else {
+                            chat[cit.key()] = cit.value();
+                        }
+                    }
+                } else {
+                    cfg[it.key()] = it.value();
+                }
             }
-            EnsureChatBlock(cfg);
             if (cfg.contains("resource_locks") && cfg["resource_locks"].is_boolean()) {
                 tqm_.SetResourceLocksEnabled(cfg["resource_locks"].get<bool>());
             }

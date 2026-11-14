@@ -26,7 +26,10 @@ bool IpcServer::Start() {
 void IpcServer::Stop() {
     if (stop_.exchange(true)) return;
     if (webuiRestartThread_.joinable()) webuiRestartThread_.join();
-    if (ipmsgRestartThread_.joinable()) ipmsgRestartThread_.join();
+    {
+        std::lock_guard<std::mutex> lk(ipmsgRestartMutex_);
+        if (ipmsgRestartThread_.joinable()) ipmsgRestartThread_.join();
+    }
     StopWebUiServer();
     StopIpmsg();
     if (ipmsgHandler_) ipmsgHandler_->Stop();

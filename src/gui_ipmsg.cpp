@@ -16,6 +16,7 @@
 #include <windowsx.h>
 
 #include <algorithm>
+#include <climits>
 #include <cstdlib>
 #include <map>
 #include <set>
@@ -281,6 +282,8 @@ struct DialogState {
     HINSTANCE inst = nullptr;
     HWND hwnd = nullptr;
     HWND hwndTab = nullptr;
+    bool hasWindowPlacement = false;
+    WINDOWPLACEMENT windowPlacement = {sizeof(WINDOWPLACEMENT)};
 
     HWND peersLabel = nullptr;
     HWND peers = nullptr;
@@ -502,6 +505,36 @@ HWND MakeCheck(HWND parent, int id, const wchar_t* text) {
                            0, 0, 10, 10, parent,
                            reinterpret_cast<HMENU>(static_cast<INT_PTR>(id)),
                            GetModuleHandleW(nullptr), nullptr);
+}
+
+// One tooltip window per dialog, created on first use, so each button can explain itself.
+HWND EnsureControlTip(HWND parent) {
+    if (!parent) return nullptr;
+    HWND tip = reinterpret_cast<HWND>(GetPropW(parent, L"HanchoControlTip"));
+    if (tip && IsWindow(tip)) return tip;
+    tip = CreateWindowExW(WS_EX_TOPMOST, TOOLTIPS_CLASSW, nullptr,
+                          WS_POPUP | TTS_ALWAYSTIP | TTS_NOPREFIX,
+                          CW_USEDEFAULT, CW_USEDEFAULT, CW_USEDEFAULT, CW_USEDEFAULT,
+                          parent, nullptr, GetModuleHandleW(nullptr), nullptr);
+    if (!tip) return nullptr;
+    SetWindowPos(tip, HWND_TOPMOST, 0, 0, 0, 0, SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE);
+    SendMessageW(tip, TTM_SETMAXTIPWIDTH, 0, 440);
+    SendMessageW(tip, TTM_SETDELAYTIME, TTDT_INITIAL, 400);
+    SetPropW(parent, L"HanchoControlTip", tip);
+    return tip;
+}
+
+void AddControlHelp(HWND parent, HWND ctrl, const wchar_t* text) {
+    if (!parent || !ctrl || !text || !*text) return;
+    HWND tip = EnsureControlTip(parent);
+    if (!tip) return;
+    TOOLINFOW ti = {};
+    ti.cbSize = sizeof(ti);
+    ti.hwnd = parent;
+    ti.uId = reinterpret_cast<UINT_PTR>(ctrl);
+    ti.uFlags = TTF_SUBCLASS | TTF_IDISHWND;
+    ti.lpszText = const_cast<wchar_t*>(text);
+    SendMessageW(tip, TTM_ADDTOOLW, 0, reinterpret_cast<LPARAM>(&ti));
 }
 
 HWND MakeEdit(HWND parent, int id, DWORD style, DWORD exStyle = WS_EX_CLIENTEDGE) {
@@ -1472,6 +1505,29 @@ void LoadSettings(DialogState* st) {
             chat = ChatBlock(nlohmann::json::parse(content, nullptr, false));
         }
     }
+    auto placementIt = chat.find("window_placement");
+    if (placementIt != chat.end() && placementIt->is_object()) {
+        const auto readPlacementInt = [&placementIt](const char* key, int fallback) {
+            auto it = placementIt->find(key);
+            if (it == placementIt->end() || !it->is_number_integer()) return fallback;
+            int64_t value = it->get<int64_t>();
+            if (value < INT_MIN || value > INT_MAX) return fallback;
+            return static_cast<int>(value);
+        };
+        WINDOWPLACEMENT& wp = st->windowPlacement;
+        wp.length = sizeof(wp);
+        wp.flags = static_cast<UINT>(readPlacementInt("flags", 0));
+        wp.showCmd = static_cast<UINT>(readPlacementInt("show_cmd", SW_SHOW));
+        wp.ptMinPosition.x = readPlacementInt("min_x", -1);
+        wp.ptMinPosition.y = readPlacementInt("min_y", -1);
+        wp.ptMaxPosition.x = readPlacementInt("max_x", -1);
+        wp.ptMaxPosition.y = readPlacementInt("max_y", -1);
+        wp.rcNormalPosition.left = readPlacementInt("left", 100);
+        wp.rcNormalPosition.top = readPlacementInt("top", 100);
+        wp.rcNormalPosition.right = readPlacementInt("right", 1280);
+        wp.rcNormalPosition.bottom = readPlacementInt("bottom", 920);
+        st->hasWindowPlacement = true;
+    }
     SetCheck(st->setEnabled, chat.value("enabled", false));
     SetTextUtf8(st->setPort, std::to_string(chat.value("port", 2426)));
     SetTextUtf8(st->setNick, chat.value("nickname", std::string()));
@@ -1499,6 +1555,39 @@ void LoadSettings(DialogState* st) {
     }
     SetCheck(st->setAutoReply, handler.value("auto_reply", true));
     SetCheck(st->setSkipPermissions, handler.value("skip_permissions", false));
+}
+
+void SaveWindowPlacement(DialogState* st) {
+    if (!st || !st->hwnd || !IsWindow(st->hwnd)) return;
+    WINDOWPLACEMENT wp = {sizeof(wp)};
+    if (!GetWindowPlacement(st->hwnd, &wp)) return;
+
+    nlohmann::json chat = nlohmann::json::object();
+    nlohmann::json resp;
+    if (IpcCall({{"action", "config_get"}}, resp) && resp.value("ok", false) &&
+        resp.contains("config") && resp["config"].is_object()) {
+        chat = ChatBlock(resp["config"]);
+    } else {
+        const std::string content = ReadConfigText();
+        if (!content.empty()) {
+            chat = ChatBlock(nlohmann::json::parse(content, nullptr, false));
+        }
+    }
+    if (!chat.is_object()) chat = nlohmann::json::object();
+    chat["window_placement"] = {
+        {"flags", wp.flags},
+        {"show_cmd", wp.showCmd},
+        {"min_x", wp.ptMinPosition.x},
+        {"min_y", wp.ptMinPosition.y},
+        {"max_x", wp.ptMaxPosition.x},
+        {"max_y", wp.ptMaxPosition.y},
+        {"left", wp.rcNormalPosition.left},
+        {"top", wp.rcNormalPosition.top},
+        {"right", wp.rcNormalPosition.right},
+        {"bottom", wp.rcNormalPosition.bottom}
+    };
+    nlohmann::json setResp;
+    IpcCall({{"action", "config_set"}, {"config", {{"chat", chat}}}}, setResp);
 }
 
 std::vector<std::string> SplitCsv(const std::string& text) {
@@ -1668,6 +1757,10 @@ void CreateChatControls(DialogState* st) {
     AddColumn(st->peers, 3, T(L"マーク", L"Mark", L"Marca"), S(60));
     st->btnRefreshPeers = MakeButton(hwnd, IDC_BTN_REFRESH_PEERS,
                                      T(L"更新", L"Refresh", L"Actualizar"));
+    AddControlHelp(hwnd, st->btnRefreshPeers,
+        T(L"LAN 上のピア一覧を再検索します。\nピアの追加・離脱を反映したいときに使います。",
+          L"Rescans for peers on the LAN.\nUse it to pick up peers that joined or left.",
+          L"Vuelve a buscar equipos en la LAN.\nÚtil para detectar equipos que entran o salen."));
     st->peerCount = MakeStatic(hwnd, IDC_PEER_COUNT, L"");
 
     st->msgLabel = MakeStatic(hwnd, IDC_MSG_LABEL, T(L"メッセージ", L"MESSAGES", L"MENSAJES"));
@@ -1697,8 +1790,16 @@ void CreateChatControls(DialogState* st) {
     AddColumn(st->files, 4, T(L"パス", L"Path", L"Ruta"), S(240));
     st->btnDownload = MakeButton(hwnd, IDC_BTN_DOWNLOAD,
                                  T(L"ダウンロード", L"Download", L"Descargar"));
+    AddControlHelp(hwnd, st->btnDownload,
+        T(L"選択した受信添付ファイルを保存します。\n進捗は添付一覧の「進捗」列に表示されます。",
+          L"Downloads the selected received attachment.\nProgress is shown in the Progress column.",
+          L"Descarga el adjunto recibido seleccionado.\nEl progreso aparece en la columna Progreso."));
     st->btnOpenFolder = MakeButton(hwnd, IDC_BTN_OPEN_FOLDER,
                                    T(L"フォルダを開く", L"Open folder", L"Abrir carpeta"));
+    AddControlHelp(hwnd, st->btnOpenFolder,
+        T(L"受信した添付ファイルの保存フォルダーを開きます。\n保存済みファイルをすぐに確認できます。",
+          L"Opens the folder where received attachments are saved.\nCheck downloaded files right away.",
+          L"Abre la carpeta donde se guardan los adjuntos recibidos.\nConsulta los archivos descargados."));
 
     st->composeToLabel = MakeStatic(hwnd, IDC_COMPOSE_TO_LABEL,
                                     T(L"送信先", L"Send to", L"Enviar a"));
@@ -1711,8 +1812,16 @@ void CreateChatControls(DialogState* st) {
     ComboBox_SetCurSel(st->composeTo, 0);
     st->btnAttach = MakeButton(hwnd, IDC_BTN_ATTACH,
                                T(L"添付...", L"Attach...", L"Adjuntar..."));
+    AddControlHelp(hwnd, st->btnAttach,
+        T(L"送信メッセージに添付するファイルを選びます。\n選択したファイルは下の添付一覧に追加されます。",
+          L"Chooses files to attach to the outgoing message.\nThey are added to the attachment list below.",
+          L"Elige archivos para adjuntar al mensaje.\nSe añaden a la lista de adjuntos inferior."));
     st->btnRemoveAttach = MakeButton(hwnd, IDC_BTN_REMOVE_ATTACH,
                                      T(L"削除", L"Remove", L"Quitar"));
+    AddControlHelp(hwnd, st->btnRemoveAttach,
+        T(L"選択した添付ファイルを送信リストから外します。\nディスク上の元ファイルは削除されません。",
+          L"Removes the selected attachment from the outgoing list.\nThe original file on disk is not deleted.",
+          L"Quita el adjunto seleccionado de la lista de envío.\nNo borra el archivo original del disco."));
     st->attachList = CreateWindowExW(WS_EX_CLIENTEDGE, L"LISTBOX", L"",
                                      WS_CHILD | WS_VISIBLE | WS_VSCROLL |
                                      LBS_NOINTEGRALHEIGHT | LBS_HASSTRINGS,
@@ -1724,6 +1833,10 @@ void CreateChatControls(DialogState* st) {
     SetWindowSubclass(st->composeText, ComposeEditProc, 1, 0);
     st->composeHint = MakeStatic(hwnd, IDC_COMPOSE_HINT, L"Ctrl+Enter");
     st->btnSend = MakeButton(hwnd, IDC_BTN_SEND, T(L"送信", L"Send", L"Enviar"));
+    AddControlHelp(hwnd, st->btnSend,
+        T(L"入力中のメッセージを選択した宛先へ送信します。\nCtrl+Enter でも送信できます。",
+          L"Sends the message to the selected recipients.\nCtrl+Enter also sends it.",
+          L"Envía el mensaje a los destinatarios seleccionados.\nCtrl+Intro también lo envía."));
 
     st->pageChat = {st->peersLabel, st->peers, st->btnRefreshPeers, st->peerCount,
                     st->msgLabel, st->messages, st->detailLabel, st->msgText,
@@ -1758,8 +1871,16 @@ void CreateLogControls(DialogState* st) {
     ComboBox_SetCurSel(st->logEvent, 0);
     st->btnLogRefresh = MakeButton(hwnd, IDC_BTN_LOG_REFRESH,
                                    T(L"更新", L"Refresh", L"Actualizar"));
+    AddControlHelp(hwnd, st->btnLogRefresh,
+        T(L"チャットログを最新の状態に更新します。\n期間・検索語・イベント種別の条件で絞り込みます。",
+          L"Refreshes the chat log.\nFilters by period, search text and event type.",
+          L"Actualiza el registro del chat.\nFiltra por periodo, texto y tipo de evento."));
     st->btnLogFolder = MakeButton(hwnd, IDC_BTN_LOG_FOLDER,
                                   T(L"ログを開く", L"Open log folder", L"Abrir carpeta de registro"));
+    AddControlHelp(hwnd, st->btnLogFolder,
+        T(L"チャットログの保存フォルダーを開きます。\nログをエディタで直接確認できます。",
+          L"Opens the folder where chat logs are saved.\nInspect them directly in an editor.",
+          L"Abre la carpeta donde se guardan los registros del chat.\nPuedes abrirlos en un editor."));
     st->logList = MakeList(hwnd, IDC_LOG_LIST);
     ListView_SetExtendedListViewStyle(st->logList,
                                       LVS_EX_FULLROWSELECT | LVS_EX_DOUBLEBUFFER);
@@ -1810,6 +1931,26 @@ void CreateSettingsControls(DialogState* st) {
         T(L"ツールの許可をスキップ（危険）", L"Skip tool permissions (dangerous)",
           L"Omitir permisos de herramientas (peligroso)"));
     st->btnApply = MakeButton(hwnd, IDC_BTN_APPLY, T(L"適用", L"Apply", L"Aplicar"));
+    AddControlHelp(hwnd, st->setEnabled,
+        T(L"チャット機能全体を有効または無効にします。\n無効にするとピアからの受信も止まります。",
+          L"Enables or disables chat as a whole.\nTurning it off also stops receiving from peers.",
+          L"Activa o desactiva el chat por completo.\nAl desactivarlo también deja de recibir de otros equipos."));
+    AddControlHelp(hwnd, st->setHandlerEnabled,
+        T(L"受信メッセージを LLM ハンドラで自動処理するかどうかを切り替えます。\n使用するエンジンとモデルは下の欄で指定します。",
+          L"Lets the LLM handler process incoming messages automatically.\nChoose the engine and model in the boxes below.",
+          L"Permite que el manejador LLM procese los mensajes entrantes.\nElige el motor y el modelo en los cuadros inferiores."));
+    AddControlHelp(hwnd, st->setAutoReply,
+        T(L"受信メッセージへ自動で返信するかどうかを切り替えます。\nLLM ハンドラが有効なときだけ意味があります。",
+          L"Toggles automatic replies to incoming messages.\nOnly meaningful while the LLM handler is enabled.",
+          L"Activa las respuestas automáticas a los mensajes entrantes.\nSolo tiene efecto con el manejador LLM activo."));
+    AddControlHelp(hwnd, st->setSkipPermissions,
+        T(L"LLM ハンドラがツールの許可確認をせずに実行できるようにします。\n信頼できるメッセージだけを扱う場合に限って有効にしてください（危険）。",
+          L"Lets the LLM handler run tools without asking for permission.\nEnable only when handling trusted messages (dangerous).",
+          L"Permite que el manejador LLM use herramientas sin pedir permiso.\nActívalo solo con mensajes de confianza (peligroso)."));
+    AddControlHelp(hwnd, st->btnApply,
+        T(L"設定を保存して反映します。\nポートやニックネームの変更は接続の再初期化を伴う場合があります。",
+          L"Saves and applies the settings.\nChanging the port or nickname may reinitialise the connection.",
+          L"Guarda y aplica los ajustes.\nCambiar el puerto o el apodo puede reiniciar la conexión."));
     st->setStatus = MakeStatic(hwnd, IDC_SET_STATUS, L"");
     st->setWarning = MakeStatic(hwnd, IDC_SET_WARNING,
                                 T(L"LAN 内のみ - 暗号化なし。受信メッセージは LLM で処理される場合があります。",
@@ -2286,6 +2427,7 @@ LRESULT CALLBACK IpmsgWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam)
         }
         case WM_CLOSE:
             if (st && !st->exiting) {
+                SaveWindowPlacement(st);
                 ShowWindow(hwnd, SW_HIDE);
                 return 0;
             }
@@ -2301,6 +2443,7 @@ LRESULT CALLBACK IpmsgWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam)
             KillTimer(hwnd, TIMER_PEERS);
             KillTimer(hwnd, TIMER_RELOAD);
             if (st) {
+                SaveWindowPlacement(st);
                 RemoveTrayIcon(st);
                 RemovePropW(hwnd, kPropDataDir);
                 if (st->dataDirAtom) {
@@ -2401,6 +2544,11 @@ int RunIpmsgDialog(bool startHidden) {
         return 1;
     }
 
+    const bool validPlacement = st.hasWindowPlacement &&
+        st.windowPlacement.showCmd != SW_SHOWMINIMIZED &&
+        st.windowPlacement.showCmd != SW_MINIMIZE &&
+        MonitorFromRect(&st.windowPlacement.rcNormalPosition, MONITOR_DEFAULTTONULL) != nullptr;
+    if (validPlacement) SetWindowPlacement(hwnd, &st.windowPlacement);
     if (!startHidden) {
         ShowWindow(hwnd, SW_SHOW);
         UpdateWindow(hwnd);
@@ -2424,4 +2572,3 @@ int RunIpmsgDialog(bool startHidden) {
 }
 
 } // namespace pc
-
