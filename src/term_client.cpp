@@ -40,23 +40,6 @@ constexpr wchar_t kConnectDlgClass[] = L"HanchoTermConnectDlg";
 constexpr wchar_t kAttachDlgClass[] = L"HanchoTermAttachDlg";
 constexpr wchar_t kSessionsDlgClass[] = L"HanchoTermSessionsDlg";
 
-// One client window per data directory, so two Hancho instances with different
-// --data-dir values do not focus each other's terminal client.
-const std::wstring& ClientWindowClass() {
-    static const std::wstring name = [] {
-        uint64_t hash = 1469598103934665603ULL;
-        for (wchar_t c : GetEffectiveDataDirectoryWide()) {
-            hash ^= static_cast<uint64_t>(c);
-            hash *= 1099511628211ULL;
-        }
-        wchar_t buf[64] = {};
-        std::swprintf(buf, 64, L"HanchoTerminalClientWnd_%016llx",
-                      static_cast<unsigned long long>(hash));
-        return std::wstring(buf);
-    }();
-    return name;
-}
-
 constexpr UINT WM_CLIENT_SESSION_EXIT = WM_APP + 21;
 constexpr UINT WM_CLIENT_SESSION_ERROR = WM_APP + 22;
 
@@ -2220,7 +2203,7 @@ void RegisterWindowClasses(HINSTANCE hInst) {
     wc.hInstance = hInst;
     wc.hCursor = LoadCursorW(nullptr, IDC_ARROW);
     wc.hbrBackground = reinterpret_cast<HBRUSH>(COLOR_BTNFACE + 1);
-    wc.lpszClassName = ClientWindowClass().c_str();
+    wc.lpszClassName = TerminalClientWindowClass().c_str();
     RegisterClassExW(&wc);
 
     WNDCLASSEXW dlg = {};
@@ -2254,44 +2237,6 @@ void CreateUiFont() {
 
 } // namespace
 
-bool LaunchTerminalClientWindow() {
-    HWND existing = FindWindowW(ClientWindowClass().c_str(), nullptr);
-    if (existing) {
-        if (IsIconic(existing)) ShowWindow(existing, SW_RESTORE);
-        else ShowWindow(existing, SW_SHOW);
-        SetForegroundWindow(existing);
-        return true;
-    }
-
-    wchar_t exePath[MAX_PATH] = {};
-    DWORD len = GetModuleFileNameW(nullptr, exePath, MAX_PATH);
-    if (len == 0 || len >= MAX_PATH) return false;
-
-    std::wstring command;
-    command.reserve(len + 64);
-    command += L'"';
-    command += exePath;
-    command += L"\" terminal";
-    const std::wstring dataDir = GetDataDirectoryOverride();
-    if (!dataDir.empty()) {
-        command += L" --data-dir \"";
-        command += dataDir;
-        command += L'"';
-    }
-
-    STARTUPINFOW si = {};
-    si.cb = sizeof(si);
-    si.dwFlags = STARTF_USESHOWWINDOW;
-    si.wShowWindow = SW_SHOWNORMAL;
-    PROCESS_INFORMATION pi = {};
-    BOOL ok = CreateProcessW(nullptr, command.data(), nullptr, nullptr, FALSE,
-                             CREATE_NO_WINDOW, nullptr, nullptr, &si, &pi);
-    if (!ok) return false;
-    CloseHandle(pi.hThread);
-    CloseHandle(pi.hProcess);
-    return true;
-}
-
 int RunTerminalClient(const TermClientOptions& options) {
     SetProcessDPIAware();
 
@@ -2317,14 +2262,18 @@ int RunTerminalClient(const TermClientOptions& options) {
 
     HMENU menu = BuildMenu(&state);
     HWND hwnd = CreateWindowExW(
-        0, ClientWindowClass().c_str(),
+        0, TerminalClientWindowClass().c_str(),
         T(L"Hancho ターミナル - WinConsoleServer",
           L"Hancho Terminal - WinConsoleServer",
           L"Hancho Terminal - WinConsoleServer"),
         WS_OVERLAPPEDWINDOW | WS_CLIPCHILDREN,
         CW_USEDEFAULT, CW_USEDEFAULT, 1100, 720,
         nullptr, menu, hInst, &state);
-    if (!hwnd) return 1;
+    if (!hwnd) {
+        WriteAuditLog("TERM_CLIENT_CREATE_FAILED",
+                      std::string("GetLastError=") + std::to_string(GetLastError()));
+        return 1;
+    }
 
     if (state.rememberWindow && state.hasSavedRect) {
         RECT rc = state.savedRect;

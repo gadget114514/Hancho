@@ -1,5 +1,5 @@
 cmake_minimum_required(VERSION 3.20)
-project(Hancho VERSION 0.9.19 LANGUAGES CXX)
+project(Hancho VERSION 0.9.20 LANGUAGES CXX)
 
 set(CMAKE_CXX_STANDARD 20)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
@@ -75,7 +75,9 @@ add_executable(Hancho
     src/bt_manager_api.cpp
     src/gui_dashboard.cpp
     src/gui_ipmsg.cpp
-    src/term_client.cpp
+    src/gui_theme.cpp
+    src/term_launch.cpp
+    src/term_window.cpp
     src/app.rc
     src/agent_template.rc
     src/Terminal/src/ConPtySession.cpp
@@ -224,6 +226,77 @@ target_link_libraries(wct PRIVATE
     crypt32
     ws2_32
     powrprof
+)
+
+# HanchoTerm: standalone GUI terminal client for the WCSP terminal server.
+# This used to be `Hancho.exe terminal`; it is now its own executable so the
+# terminal client does not have to be shipped inside Hancho.exe.
+add_executable(HanchoTerm
+    src/term_main.cpp
+    src/term_client.cpp
+    src/term_window.cpp
+    src/gui_theme.cpp
+    src/common.cpp
+    src/ipc_client.cpp
+    src/Terminal/src/ConPtySession.cpp
+    src/Terminal/src/ImageManager.cpp
+    src/Terminal/src/TerminalBuffer.cpp
+    src/Terminal/src/TerminalEmulator.cpp
+    src/Terminal/src/TerminalView.cpp
+    src/hancho-term.rc
+    ${WCSP_SOURCES}
+)
+
+set_target_properties(HanchoTerm PROPERTIES WIN32_EXECUTABLE TRUE)
+
+target_compile_definitions(HanchoTerm PRIVATE ${PC_VERSION_DEFINITIONS} PC_TERM)
+
+target_include_directories(HanchoTerm PRIVATE
+    src
+    include
+    src/Terminal/include
+    src/Terminal/src
+    src/wcsp
+)
+
+if(MSVC)
+    target_compile_options(HanchoTerm PRIVATE /W4 /utf-8 /EHsc)
+    target_link_options(HanchoTerm PRIVATE /ENTRY:mainCRTStartup
+        "/MANIFESTDEPENDENCY:type='win32' name='Microsoft.Windows.Common-Controls' version='6.0.0.0' processorArchitecture='*' publicKeyToken='6595b64144ccf1df' language='*'")
+endif()
+
+target_link_libraries(HanchoTerm PRIVATE
+    user32
+    gdi32
+    comctl32
+    comdlg32
+    uxtheme
+    shell32
+    advapi32
+    psapi
+    ole32
+    shlwapi
+    imm32
+    winmm
+    d2d1
+    dwrite
+    dwmapi
+    windowscodecs
+    crypt32
+    ws2_32
+    iphlpapi
+    powrprof
+    "${CMAKE_CURRENT_SOURCE_DIR}/lib/libsixel.lib"
+)
+
+add_custom_command(TARGET HanchoTerm POST_BUILD
+    COMMAND ${CMAKE_COMMAND} -E copy_if_different
+        "${CMAKE_CURRENT_SOURCE_DIR}/lib/conpty.dll"
+        "$<TARGET_FILE_DIR:HanchoTerm>/conpty.dll"
+    COMMAND ${CMAKE_COMMAND} -E copy_if_different
+        "${CMAKE_CURRENT_SOURCE_DIR}/lib/OpenConsole.exe"
+        "$<TARGET_FILE_DIR:HanchoTerm>/OpenConsole.exe"
+    COMMENT "Copying lib/conpty.dll and lib/OpenConsole.exe to output directory"
 )
 
 # End-to-end smoke test for wct: runs wct inside a local ConPTY against an

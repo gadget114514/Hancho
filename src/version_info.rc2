@@ -1,14 +1,20 @@
-// VERSIONINFO shared by Hancho.exe and hancho-cli.exe.
+// VERSIONINFO shared by Hancho.exe, hancho-cli.exe and HanchoTerm.exe.
 // CMake passes PC_VERSION and PC_VERSION_MAJOR/MINOR/PATCH from PROJECT_VERSION;
-// define PC_CLI before including this file for hancho-cli.exe.
+// define PC_CLI before including this file for hancho-cli.exe, and PC_TERM for
+// HanchoTerm.exe.
 #include <winver.h>
 
 #ifdef PC_CLI
 #define PC_FILE_DESCRIPTION "Hancho console client"
 #define PC_ORIGINAL_FILENAME "hancho-cli.exe"
 #else
+#ifdef PC_TERM
+#define PC_FILE_DESCRIPTION "Hancho Terminal"
+#define PC_ORIGINAL_FILENAME "HanchoTerm.exe"
+#else
 #define PC_FILE_DESCRIPTION "Hancho"
 #define PC_ORIGINAL_FILENAME "Hancho.exe"
+#endif
 #endif
 
 VS_VERSION_INFO VERSIONINFO

@@ -1,12 +1,48 @@
 #pragma once
 
-// Colours and native theming shared by the dashboard and the standalone Chat
-// window. The palette is read from <data-dir>/config.json ("theme") so a
-// separate Chat process follows the same theme as the dashboard.
+// Colours and native theming shared by the dashboard, the standalone Chat
+// window and the standalone terminal client (HanchoTerm.exe). The palette is
+// read from <data-dir>/config.json ("theme") so separate processes follow the
+// same theme as the dashboard.
 
 #include <windows.h>
 
+#include <string>
+
 namespace pc {
+
+enum class UiTheme { System, Dark, Light, Pastel, HighContrast, Midnight, Ember, Berry, Crimson, Forest, Mist,
+    PastelBlue, PastelOrange, PastelPink, PastelRed, PastelGreen, PastelPurple, PastelYellow,
+    DeepPurple, DeepYellow };
+
+struct ThemeColors {
+    COLORREF windowBg;
+    COLORREF panel;
+    COLORREF border;
+    COLORREF text;
+    COLORREF muted;
+    COLORREF accent;
+    COLORREF terminalBg;
+    COLORREF emptyBg;
+    COLORREF listText;
+    COLORREF rowSelected;
+    COLORREF rowRunning;
+    COLORREF rowIdle;
+    COLORREF rowCompleted;
+    COLORREF rowFailed;
+};
+
+bool IsSystemDarkMode();
+ThemeColors ThemeFor(UiTheme theme);
+bool IsPastelTheme(UiTheme theme);
+bool IsDarkUiTheme(UiTheme theme);
+const char* ThemeCode(UiTheme theme);
+UiTheme ParseTheme(const std::string& code);
+
+// Dark-mode opt-in and native (title bar / controls) theming helpers.
+void ApplyDarkModeApi(HWND hwnd, bool dark);
+void ApplyNativeControlTheme(HWND hwnd, bool dark);
+void ApplyNativeThemeToWindow(HWND hwnd, bool dark);
 
 struct DashboardPalette {
     COLORREF windowBg = RGB(10, 10, 12);

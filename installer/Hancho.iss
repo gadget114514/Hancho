@@ -3,7 +3,7 @@
 ; Prerequisites:
 ;   1. Build the Release binaries and assemble the payload into
 ;      dist\Hancho-v<version>-win64\ :
-;        Hancho.exe, hancho-cli.exe, wct.exe, conpty.dll, OpenConsole.exe,
+;        Hancho.exe, HanchoTerm.exe, hancho-cli.exe, wct.exe, conpty.dll, OpenConsole.exe,
 ;        LICENSE, README.md, README-ja.md, doc\* (topic documents and doc\images)
 ;      tools\ (the ww task-card runner template) and skills\* (agent skills such as
 ;      skills\hancho) are taken from the repository directly.
@@ -69,6 +69,7 @@ Name: "autostartgui"; Description: "Start the Hancho dashboard at sign-in (tray)
 
 [Files]
 Source: "{#PayloadDir}\Hancho.exe"; DestDir: "{app}"; Flags: ignoreversion
+Source: "{#PayloadDir}\HanchoTerm.exe"; DestDir: "{app}"; Flags: ignoreversion
 Source: "{#PayloadDir}\hancho-cli.exe"; DestDir: "{app}"; Flags: ignoreversion
 Source: "{#PayloadDir}\wct.exe"; DestDir: "{app}"; Flags: ignoreversion
 Source: "{#PayloadDir}\conpty.dll"; DestDir: "{app}"; Flags: ignoreversion
@@ -85,6 +86,7 @@ Source: "..\tools\*"; DestDir: "{app}\tools"; Flags: ignoreversion recursesubdir
 
 [Icons]
 Name: "{group}\{#MyAppName}"; Filename: "{app}\{#MyAppExeName}"; WorkingDir: "{app}"
+Name: "{group}\{#MyAppName} Terminal"; Filename: "{app}\HanchoTerm.exe"; WorkingDir: "{app}"
 Name: "{group}\README (English)"; Filename: "{app}\README.md"
 Name: "{group}\README (日本語)"; Filename: "{app}\README-ja.md"
 Name: "{group}\{cm:UninstallProgram,{#MyAppName}}"; Filename: "{uninstallexe}"

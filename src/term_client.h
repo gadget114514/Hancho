@@ -20,12 +20,16 @@ struct TermClientOptions {
     bool autoAttach = true;
 };
 
-// Runs the tabbed WCSP terminal client (Hancho.exe terminal). Each tab is an
+// Runs the tabbed WCSP terminal client (HanchoTerm.exe). Each tab is an
 // independent WCSP session, so several consoles can be connected at once.
 int RunTerminalClient(const TermClientOptions& options);
 
-// Brings an existing client window to the front, or starts a new client
-// process (Hancho.exe terminal). Safe to call from the dashboard.
+// Window class of the terminal client window. It is derived from the data
+// directory so two Hancho instances do not focus each other's client.
+const std::wstring& TerminalClientWindowClass();
+
+// Brings an existing client window to the front, or starts HanchoTerm.exe.
+// Safe to call from the dashboard.
 bool LaunchTerminalClientWindow();
 
 } // namespace pc

@@ -172,7 +172,9 @@ bool TerminalView::StartRemote(const std::wstring& target, std::wstring* error) 
     int rows = 25;
     if (hwnd_) {
         RECT rc; GetClientRect(hwnd_, &rc);
-        GridSizeFor(rc.right - rc.left, rc.bottom - rc.top, cols, rows);
+        if (rc.right - rc.left > 120 && rc.bottom - rc.top > 100) {
+            GridSizeFor(rc.right - rc.left, rc.bottom - rc.top, cols, rows);
+        }
     }
     opt.cols = cols;
     opt.rows = rows;
@@ -219,7 +221,9 @@ bool TerminalView::StartSession(const std::wstring& shell,
     int rows = 25;
     if (hwnd_) {
         RECT rc; GetClientRect(hwnd_, &rc);
-        GridSizeFor(rc.right - rc.left, rc.bottom - rc.top, cols, rows);
+        if (rc.right - rc.left > 120 && rc.bottom - rc.top > 100) {
+            GridSizeFor(rc.right - rc.left, rc.bottom - rc.top, cols, rows);
+        }
     }
     {
         std::lock_guard<std::mutex> lock(bufferMutex_);
@@ -776,6 +780,10 @@ void TerminalView::UpdateMetrics() {
 // ---------------------------------------------------------------------------
 void TerminalView::OnSize(int w, int h) {
     ReleaseRenderTarget(); // recreate at new size
+    // The 100x100 size used while the child window is created (and 0x0 while
+    // hidden) is not a real layout. Leave the buffer at its initial size; the
+    // real WM_SIZE or StartRemote() will size it.
+    if (w <= 120 || h <= 100) return;
     int cols = 0;
     int rows = 0;
     if (!GridSizeFor(w, h, cols, rows)) return;

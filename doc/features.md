@@ -17,8 +17,8 @@
   - Click **any column header** (`ID`, `Windows PID`, `Agent / Name`, `Status`, `Start Time`, `End Time`, `Uptime`, `Tree Procs`, `Memory`, `CPU Time`, `Idle`, `Latest Output Preview`, `Command Line`, `Job`) to toggle **Ascending (`▲`) / Descending (`▼`)** sort order.
   - `ID` is Hancho's internal number; `Windows PID` is the root process's OS PID, so you can find it immediately in Task Manager.
   - **CPU-Aware Idle Detection**: While a process's CPU time keeps increasing, it stays `RUNNING` instead of being shown as `IDLE / WAITING`, and it is not killed by `--idle-timeout`. CPU time includes all processes in the Win32 Job Object tree.
-- **Standalone Tabbed Terminal Client (`Hancho.exe terminal`, `[>_]`)**:
-  - The WCSP terminal client runs in its own window, separate from the dashboard. Open it from the **`[>_]`** toolbar button or with `Hancho.exe terminal`.
+- **Standalone Tabbed Terminal Client (`HanchoTerm.exe`, `[>_]`)**:
+  - The WCSP terminal client runs in its own window, separate from the dashboard. Open it from the **`[>_]`** toolbar button or with `HanchoTerm.exe`.
   - Each tab is an independent WCSP session, so several local or remote consoles can be connected at the same time. Tabs keep running while you switch between them; close a tab with `Ctrl+W`.
   - `File` > **New local shell** (PowerShell / cmd / bash), **Attach to local job...** (`attach:<id>`) or **Connect to remote...** (host, port, token, target).
   - A right-click (or the **Edit** menu) offers **Copy** / **Paste**; a right-click on a tab also offers **Reconnect** and **Close**. New local ConPTY jobs started from the dashboard (`+ Launch`) are attached automatically.
@@ -60,7 +60,7 @@
 
 ## 4. System Tray Integration
 - Click **`[⤓]`** (Tray icon button), minimize the window, or press the window close button (`[X]`) to hide Hancho into the **Windows System Tray** while keeping all background ConPTY processes and IPC/MCP services running.
-- Left-click or double-click the tray icon (or right-click to open the tray menu) to restore and expand the dashboard at any time. The tray menu separates **Close Dashboard** (keeps the core and jobs running) from **Quit Hancho (stop core and jobs)** (stops the core and all running jobs after confirmation).
+- Left-click or double-click the tray icon (or right-click to open the tray menu) to restore and expand the dashboard at any time. The tray menu separates **Close Dashboard** (keeps the core and jobs running) from **Quit Hancho (stop core and jobs)** (stops the core and all running jobs after confirmation; the dashboard stays open until the core has stopped).
 
 ## 5. Persistent Logs, State Recovery & `.done` Completion Marker Files
 - **Real-Time Per-Process Logs**: Every process's stdout/ConPTY stream is continuously written to `logs/proc_<id>_<name>_<YYYYMMDD_HHMMSS>.log` (or a custom `--log-file <path>`).
@@ -106,7 +106,7 @@
 - Trusted LAN only; nothing is encrypted. See [Chat](chat.md) for the protocol, configuration, security notes and examples.
 
 ## 11. Terminal sessions (WCSP)
-- The core exposes every ConPTY job over the WinConsoleServer protocol (WCSP v1). The terminal client (`Hancho.exe terminal`, or the `[>_]` toolbar button) runs in its own window, separate from the dashboard. Each tab is an independent WCSP session, so several local or remote consoles can be connected at the same time; closing a tab or the client does not stop an attached job.
+- The core exposes every ConPTY job over the WinConsoleServer protocol (WCSP v1). The terminal client (`HanchoTerm.exe`, or the `[>_]` toolbar button) runs in its own window, separate from the dashboard. Each tab is an independent WCSP session, so several local or remote consoles can be connected at the same time; closing a tab or the client does not stop an attached job.
 - In the client, `File` > **New local shell** opens a PowerShell / cmd / bash job on the core, **Attach to local job...** lists the running ConPTY jobs (`attach:<id>`), and **Connect to remote...** connects to another Hancho core by host, port and token. New local jobs started from the dashboard (`+ Launch`) are attached automatically. Right-click a tab for **Reconnect** or **Close**.
 - The client reports its viewport size in cells. With WCSP `FeatureSizeSync`, when several clients attach to the same job the PTY follows the most recently active client: the others receive `RESIZED` reason `PEER` and re-assert their own size on the next focus or keystroke, like tmux. Display scaling (DPI) is handled locally and never leaks into the protocol.
 - Closing a tab or the client asks whether to **terminate** or **detach**. **Terminate** sends a WCSP `CLOSE` and closes the server-side ConPTY (whether it was started by the client or attached from the dashboard). **Detach** keeps the session open so `File` > **Reconnect to session...** can list and reopen it later. The same picker's **Connect all** button, and `File` > **Connect to all retained sessions**, open a tab for every running session at once (sessions already open are skipped).
@@ -118,7 +118,7 @@
 
   With `local: true` (the default) it binds `127.0.0.1` on an ephemeral port. The client learns the address and token through the local named pipe (`term_endpoint`); when `token` is empty, a random token is generated on first start and written back to the config file.
 - History depth is byte-based. `terminal.history_bytes` (default 32 MiB) caps the raw ConPTY history kept by the core and the replay sent when a client attaches. The client trims its own scrollback to Settings → **Scrollback** (64–2048 MB per tab, default 1024 MB), so a long-running console can be scrolled back thousands of lines without unbounded memory use.
-- Set `remote: true` to bind `host:port` so WinConsoleTerminal (`Hancho.exe terminal --host <pc> --port 9139 --shell powershell --token <token>`) or another client on the LAN can connect past the local core.
+- Set `remote: true` to bind `host:port` so WinConsoleTerminal (`HanchoTerm.exe --host <pc> --port 9139 --shell powershell --token <token>`) or another client on the LAN can connect past the local core.
 - Settings → **WinConsoleServer** has **local** and **remote** switches (`terminal.local` / `terminal.remote`). Turning both off stops the listener, so neither the local dashboard nor a remote client can attach.
 - WCSP is plain TCP without encryption. Enable `remote` only on a trusted LAN and keep the token private.
 - The wire protocol (frames, TLVs, handshake, sessions and limits) is documented in [WCSP](wcsp.md).

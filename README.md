@@ -99,6 +99,12 @@ The skill starts with `hancho-cli.exe help --json`, so the commands it shows alw
 
 
 
+### v0.9.20
+- **Standalone HanchoTerm.exe**: the WCSP terminal client is now its own executable (`HanchoTerm.exe`) instead of `Hancho.exe terminal`. The dashboard `[>_]` button launches it, the installer adds it with a Start Menu shortcut, and local core discovery (`term_endpoint` / `attach:<id>`) still works. `Hancho.exe terminal` now points to the new program.
+- **Terminal robustness**: the terminal ignores the temporary 100x100 size used while a view is hidden or being created, and the buffer bounds-checks cursor writes during resize, avoiding a wrong grid or a crash on some jobs.
+- **Quit Hancho**: the tray action now keeps the dashboard open until the core has actually stopped, and reports when the core is still running after 10 seconds instead of closing silently.
+- **Shared theme**: the terminal client and dashboard now read the same theme implementation, so palette changes match exactly.
+
 ### v0.9.19
 - **Terminal sizing**: cells are measured in physical pixels again, so WCSP `HELLO` / `RESIZE` sizes match the visible console at 150%/200% scaling. The 80x25 minimum is gone and the scroll bar no longer counts as a column.
 - **WCSP 1.2 size sync**: when one client resizes a shared job, other clients that advertise `FeatureSizeSync` follow the new size and re-assert their own on focus or input.
@@ -120,7 +126,7 @@ The skill starts with `hancho-cli.exe help --json`, so the commands it shows alw
 - **Settings**: the WinConsoleServer tab shows WCSP connections and can refresh the token or disconnect a session.
 
 ### v0.9.16
-- **Tabbed terminal client window**: the WCSP client moved out of the dashboard into its own window (`Hancho.exe terminal`). Each tab is an independent session, so several local or remote consoles can be connected at once; `+ Launch` and `[>_]` open the client.
+- **Tabbed terminal client window**: the WCSP client moved out of the dashboard into its own executable and window (`HanchoTerm.exe`). Each tab is an independent session, so several local or remote consoles can be connected at once; `+ Launch` and `[>_]` open the client.
 - **Terminal client controls**: follows the dashboard theme, Copy/Paste in the Edit and right-click menus, always-on-top, window-position memory, and a byte-based scrollback budget (64-2048 MB per tab, default 1024 MB). `terminal.history_bytes` (default 32 MiB) controls the server-side replay budget; replays are split into frames, so a 6 MB (~100k-line) history attaches correctly.
 - **Dashboard**: remembers the window layout and shows status-aware tooltips; the standalone dashboard no longer draws embedded terminal tabs.
 - **Performance**: the usage graph and monitor pane have configurable refresh intervals, task-queue lookups use a job index, and idle polling does less work.

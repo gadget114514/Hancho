@@ -33,7 +33,7 @@ The core's listener is configured in `<data-dir>/config.json`:
 | `token` | `""` | Shared secret. When empty, the core generates 16 random bytes and writes the 32 lowercase hex characters back to the file. |
 | `history_bytes` | `32 MiB` | Raw ConPTY output kept per job and the maximum replay sent to a new subscriber. Accepted range is 64 KiB to 64 MiB. |
 
-When both `local` and `remote` are false, the listener is not started. A local IPC `term_endpoint` request returns `{"ok":true,"host":"127.0.0.1","port":<ephemeral>,"token":"<token>"}` while the server is running; otherwise it returns an error. The standalone terminal client (`Hancho.exe terminal`) discovers the local endpoint this way and usually attaches with a target of `attach:<jobId>`.
+When both `local` and `remote` are false, the listener is not started. A local IPC `term_endpoint` request returns `{"ok":true,"host":"127.0.0.1","port":<ephemeral>,"token":"<token>"}` while the server is running; otherwise it returns an error. The standalone terminal client (`HanchoTerm.exe`) discovers the local endpoint this way and usually attaches with a target of `attach:<jobId>`.
 
 Settings → **WinConsoleServer** toggles `local` and `remote`.
 
@@ -335,10 +335,11 @@ Hancho's client:
 | Wire protocol, frame/TLV codecs | `src/wcsp/protocol.h`, `src/wcsp/protocol.cpp` |
 | Incremental frame reader | `src/wcsp/frame_reader.h`, `src/wcsp/frame_reader.cpp` |
 | Client backend (`ITerminalIo`) | `src/wcsp/remote_session.h`, `src/wcsp/remote_session.cpp` |
+| GUI terminal client (`HanchoTerm.exe`) | `src/term_main.cpp`, `src/term_client.cpp` |
 | Console client (`wct.exe`) | `src/wct_main.cpp`, `src/wct_client.cpp` |
 | Server and job attachment | `src/term_server.h`, `src/term_server.cpp` |
 
-The server implementation is Windows-only. It does not spawn a command shell for `attach:<id>`; it subscribes to the existing headless ConPTY job. The standalone terminal client (`Hancho.exe terminal`, `src/term_client.cpp`) uses `RemoteSession`; the dashboard opens that client window instead of embedding terminal tabs. `wct.exe` is a console client for the same protocol: it runs in the current console, forwards raw input/output, detaches with a single `Ctrl+]`, and sends `CLOSE` when `Ctrl+]` is pressed twice in quick succession.
+The server implementation is Windows-only. It does not spawn a command shell for `attach:<id>`; it subscribes to the existing headless ConPTY job. The standalone terminal client (`HanchoTerm.exe`, `src/term_client.cpp`) uses `RemoteSession`; the dashboard opens that client window instead of embedding terminal tabs. `wct.exe` is a console client for the same protocol: it runs in the current console, forwards raw input/output, detaches with a single `Ctrl+]`, and sends `CLOSE` when `Ctrl+]` is pressed twice in quick succession.
 
 The server splits an attachment replay into `OUTPUT` frames of at most **256 KiB**, so `history_bytes` (default 32 MiB) can be replayed without exceeding the 1 MiB frame limit. The server retains sessions after a disconnect; only a `CLOSE` frame ends them. The terminal client asks **Terminate / Detach / Cancel** when closing a tab or the window.
 

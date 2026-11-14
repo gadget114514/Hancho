@@ -9,7 +9,6 @@
 #include "mcp_server.h"
 #include "gui_dashboard.h"
 #include "gui_ipmsg.h"
-#include "term_client.h"
 #include "cli.h"
 #include "ipc_client.h"
 #include "power.h"
@@ -56,17 +55,6 @@ USAGE:
       One dialog per data dir; a second launch brings the existing one forward.
       --tray starts hidden in the notification area. Close (X) hides to tray;
       exit from the tray menu.
-
-  Hancho.exe terminal [options]
-      Run the standalone WinConsoleServer (WCSP) terminal client in its own
-      tabbed window. Each tab is an independent session, so several consoles
-      can be connected at once. Without options it opens an empty window.
-      --host <host> --port <port> --token <token>   connect to a remote core
-      --shell <shell>    powershell / cmd / bash (default powershell)
-      --target <target>  "attach:<job id>" to view an existing job
-      --local            force a local core connection
-      --no-auto-attach   do not attach to new local ConPTY jobs automatically
-      --no-connect       do not open a tab (and disable auto-attach)
 
   Hancho.exe --help
       Show this help.
@@ -760,74 +748,9 @@ int main() {
     }
 
     if (subcmd == "terminal" || subcmd == "--terminal" || subcmd == "term-client") {
-        TermClientOptions opt;
-        bool sawRemote = false;
-        bool forceLocal = false;
-        bool anyConnectOption = false;
-        for (size_t i = 2; i < args.size(); ++i) {
-            const std::string& a = args[i];
-            auto next = [&](std::string& out) {
-                if (i + 1 < args.size()) {
-                    out = args[++i];
-                    return true;
-                }
-                return false;
-            };
-            if (a == "--host") {
-                std::string v;
-                if (next(v)) { opt.host = v; sawRemote = true; anyConnectOption = true; }
-            } else if (a.rfind("--host=", 0) == 0) {
-                opt.host = a.substr(7);
-                sawRemote = true;
-                anyConnectOption = true;
-            } else if (a == "--port") {
-                std::string v;
-                if (next(v)) { opt.port = std::atoi(v.c_str()); sawRemote = true; anyConnectOption = true; }
-            } else if (a.rfind("--port=", 0) == 0) {
-                opt.port = std::atoi(a.substr(7).c_str());
-                sawRemote = true;
-                anyConnectOption = true;
-            } else if (a == "--token") {
-                std::string v;
-                if (next(v)) opt.token = v;
-            } else if (a.rfind("--token=", 0) == 0) {
-                opt.token = a.substr(8);
-            } else if (a == "--shell") {
-                std::string v;
-                if (next(v)) { opt.target = v; anyConnectOption = true; }
-            } else if (a.rfind("--shell=", 0) == 0) {
-                opt.target = a.substr(8);
-                anyConnectOption = true;
-            } else if (a == "--target") {
-                std::string v;
-                if (next(v)) { opt.target = v; anyConnectOption = true; }
-            } else if (a.rfind("--target=", 0) == 0) {
-                opt.target = a.substr(9);
-                anyConnectOption = true;
-            } else if (a == "--attach") {
-                std::string v;
-                if (next(v)) { opt.target = "attach:" + v; anyConnectOption = true; }
-            } else if (a.rfind("--attach=", 0) == 0) {
-                opt.target = "attach:" + a.substr(9);
-                anyConnectOption = true;
-            } else if (a == "--local") {
-                forceLocal = true;
-                anyConnectOption = true;
-            }
-        }
-        opt.local = forceLocal || !sawRemote;
-        opt.autoConnect = anyConnectOption;
-        for (size_t i = 2; i < args.size(); ++i) {
-            if (args[i] == "--no-connect") {
-                opt.autoConnect = false;
-                opt.autoAttach = false;
-            } else if (args[i] == "--no-auto-attach") {
-                opt.autoAttach = false;
-            }
-        }
-        if (opt.autoConnect && opt.target.empty()) opt.target = "powershell";
-        if (opt.port > 0 && opt.host.empty()) opt.host = "127.0.0.1";
-        return RunTerminalClient(opt);
+        std::cerr << "The WCSP terminal client is now HanchoTerm.exe (next to Hancho.exe)."
+                  << std::endl;
+        return 1;
     }
 
     const bool headlessRequested = (subcmd == "headless" || subcmd == "--headless");

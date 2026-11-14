@@ -14,6 +14,6 @@
 ## ビルドとリリース
 
 - [ ] `CMakeLists.txt` のバージョンを更新する。
-- [ ] Release で `Hancho` と `hancho-cli` をビルドする。
+- [ ] Release で `Hancho`、`HanchoTerm`、`hancho-cli` をビルドする。
 - [ ] `hancho-cli.exe --version` が一致することを確認する。
 - [ ] zip とインストーラーを作り、GitHub リリースを公開してインストールする。

@@ -14,6 +14,6 @@ Run this checklist for every release. It keeps the graduation guidance in `desig
 ## Build and release
 
 - [ ] Update the version in `CMakeLists.txt`.
-- [ ] Build `Hancho` and `hancho-cli` in Release.
+- [ ] Build `Hancho`, `HanchoTerm` and `hancho-cli` in Release.
 - [ ] Confirm `hancho-cli.exe --version` matches.
 - [ ] Package the zip and installer, publish the GitHub release, and install it.

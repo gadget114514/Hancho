@@ -90,6 +90,7 @@ static int ClampPerformanceIntervalMs(int ms) {
 constexpr UINT_PTR TIMER_KPI_ANIM_ID  = 2;
 constexpr UINT_PTR TIMER_END_BLINK_ID = 3;     // list rows blinking after a process/task ends
 constexpr UINT_PTR TIMER_HINT_COUNTDOWN_ID = 4; // countdown for supervisor guidance hint popup
+constexpr UINT_PTR TIMER_QUIT_WAIT_ID = 5;     // waits for the core to exit after "Quit Hancho"
 constexpr UINT kEndBlinkTimerMs = 200;         // repaint period while a blink is running
 constexpr ULONGLONG kEndBlinkHalfPeriodMs = 400;  // on/off toggle period of the blink
 constexpr int kDefaultEndBlinkSec = 5;
@@ -112,27 +113,6 @@ static HICON LoadAppSmallIcon() {
 }
 
 enum class UiLanguage { Japanese, English, Spanish };
-enum class UiTheme { System, Dark, Light, Pastel, HighContrast, Midnight, Ember, Berry, Crimson, Forest, Mist,
-    PastelBlue, PastelOrange, PastelPink, PastelRed, PastelGreen, PastelPurple, PastelYellow,
-    DeepPurple, DeepYellow };
-
-struct ThemeColors {
-    COLORREF windowBg;
-    COLORREF panel;
-    COLORREF border;
-    COLORREF text;
-    COLORREF muted;
-    COLORREF accent;
-    COLORREF terminalBg;
-    COLORREF emptyBg;
-    COLORREF listText;
-    COLORREF rowSelected;
-    COLORREF rowRunning;
-    COLORREF rowIdle;
-    COLORREF rowCompleted;
-    COLORREF rowFailed;
-};
-
 static UiLanguage g_uiLanguage = UiLanguage::English;
 static UiTheme g_uiTheme = UiTheme::System;
 static float g_kpiSaturation = 1.0f;
@@ -157,196 +137,6 @@ static UiLanguage DetectDefaultLanguage() {
     }
 }
 
-static bool IsSystemDarkMode() {
-    DWORD value = 1;
-    DWORD size = sizeof(value);
-    HKEY key = nullptr;
-    if (RegOpenKeyExW(HKEY_CURRENT_USER,
-            L"Software\\Microsoft\\Windows\\CurrentVersion\\Themes\\Personalize",
-            0, KEY_READ, &key) == ERROR_SUCCESS) {
-        RegQueryValueExW(key, L"AppsUseLightTheme", nullptr, nullptr,
-                         reinterpret_cast<LPBYTE>(&value), &size);
-        RegCloseKey(key);
-    }
-    return value == 0;
-}
-
-static COLORREF GetSystemAccentColor() {
-    DWORD color = 0;
-    BOOL opaque = FALSE;
-    if (SUCCEEDED(DwmGetColorizationColor(&color, &opaque))) {
-        return RGB((color >> 16) & 0xFF, (color >> 8) & 0xFF, color & 0xFF);
-    }
-    return GetSysColor(COLOR_HIGHLIGHT);
-}
-
-static ThemeColors ThemeFor(UiTheme theme) {
-    switch (theme) {
-        case UiTheme::System: {
-            ThemeColors base = ThemeFor(IsSystemDarkMode() ? UiTheme::Dark : UiTheme::Light);
-            base.accent = GetSystemAccentColor();
-            return base;
-        }
-        case UiTheme::Light:
-            return {
-                RGB(241, 245, 249), RGB(255, 255, 255), RGB(203, 213, 225),
-                RGB(15, 23, 42), RGB(71, 85, 105), RGB(2, 132, 199),
-                RGB(15, 23, 42), RGB(226, 232, 240), RGB(15, 23, 42), RGB(229, 231, 235),
-                RGB(220, 252, 231), RGB(254, 243, 199), RGB(219, 234, 254), RGB(254, 226, 226)
-            };
-        case UiTheme::Pastel:
-            return {
-                RGB(243, 235, 220), RGB(250, 246, 236), RGB(214, 204, 224),
-                RGB(74, 66, 84), RGB(130, 118, 140), RGB(178, 148, 210),
-                RGB(34, 30, 40), RGB(243, 236, 248), RGB(74, 66, 84), RGB(232, 230, 235),
-                RGB(220, 244, 226), RGB(252, 238, 210), RGB(220, 235, 250), RGB(250, 220, 224)
-            };
-        case UiTheme::HighContrast:
-            return {
-                RGB(0, 0, 0), RGB(20, 20, 20), RGB(255, 255, 255),
-                RGB(255, 255, 255), RGB(220, 220, 220), RGB(255, 255, 0),
-                RGB(0, 0, 0), RGB(0, 0, 0), RGB(255, 255, 255), RGB(60, 60, 60),
-                RGB(0, 40, 0), RGB(50, 40, 0), RGB(0, 20, 50), RGB(50, 0, 0)
-            };
-        case UiTheme::Midnight:
-            return {
-                RGB(12, 22, 44), RGB(20, 34, 64), RGB(48, 68, 104),
-                RGB(220, 228, 240), RGB(140, 156, 184), RGB(96, 165, 250),
-                RGB(8, 15, 32), RGB(16, 28, 54), RGB(220, 228, 240), RGB(38, 62, 104),
-                RGB(20, 52, 58), RGB(40, 44, 64), RGB(24, 40, 80), RGB(60, 30, 46)
-            };
-        case UiTheme::Ember:
-            return {
-                RGB(38, 20, 8), RGB(60, 32, 14), RGB(104, 62, 32),
-                RGB(250, 232, 214), RGB(190, 150, 120), RGB(249, 115, 22),
-                RGB(26, 13, 4), RGB(46, 24, 10), RGB(250, 232, 214), RGB(110, 58, 20),
-                RGB(40, 62, 30), RGB(70, 50, 20), RGB(40, 40, 70), RGB(80, 28, 24)
-            };
-        case UiTheme::Berry:
-            return {
-                RGB(38, 14, 30), RGB(60, 22, 46), RGB(104, 46, 80),
-                RGB(250, 226, 240), RGB(196, 150, 176), RGB(236, 72, 153),
-                RGB(26, 8, 20), RGB(46, 18, 38), RGB(250, 226, 240), RGB(110, 36, 80),
-                RGB(34, 60, 50), RGB(70, 50, 30), RGB(40, 36, 80), RGB(84, 26, 44)
-            };
-        case UiTheme::Crimson:
-            return {
-                RGB(36, 10, 12), RGB(60, 18, 22), RGB(108, 40, 46),
-                RGB(250, 226, 226), RGB(196, 140, 144), RGB(239, 68, 68),
-                RGB(24, 6, 8), RGB(44, 14, 16), RGB(250, 226, 226), RGB(110, 30, 36),
-                RGB(34, 58, 44), RGB(70, 52, 24), RGB(36, 40, 72), RGB(96, 24, 28)
-            };
-        case UiTheme::Forest:
-            return {
-                RGB(10, 30, 20), RGB(18, 50, 34), RGB(46, 96, 70),
-                RGB(220, 244, 232), RGB(140, 186, 162), RGB(34, 197, 94),
-                RGB(6, 20, 13), RGB(14, 40, 27), RGB(220, 244, 232), RGB(36, 96, 64),
-                RGB(26, 80, 50), RGB(60, 64, 28), RGB(24, 52, 70), RGB(70, 36, 30)
-            };
-        case UiTheme::Mist:
-            return {
-                RGB(226, 228, 231), RGB(240, 241, 243), RGB(190, 194, 200),
-                RGB(31, 36, 44), RGB(92, 99, 112), RGB(70, 100, 140),
-                RGB(28, 31, 38), RGB(222, 225, 230), RGB(31, 36, 44), RGB(206, 212, 222),
-                RGB(220, 242, 228), RGB(246, 236, 212), RGB(220, 230, 246), RGB(248, 222, 222)
-            };
-        case UiTheme::PastelBlue:
-            return {
-                RGB(220, 235, 250), RGB(238, 246, 253), RGB(188, 208, 232),
-                RGB(40, 58, 84), RGB(92, 112, 140), RGB(86, 140, 200),
-                RGB(24, 32, 44), RGB(230, 240, 251), RGB(40, 58, 84), RGB(204, 222, 242),
-                RGB(220, 244, 226), RGB(252, 238, 210), RGB(220, 235, 250), RGB(250, 220, 224)
-            };
-        case UiTheme::PastelOrange:
-            return {
-                RGB(253, 232, 212), RGB(254, 244, 234), RGB(232, 204, 176),
-                RGB(84, 58, 36), RGB(140, 108, 80), RGB(222, 136, 72),
-                RGB(40, 30, 22), RGB(253, 238, 224), RGB(84, 58, 36), RGB(245, 218, 192),
-                RGB(220, 244, 226), RGB(252, 238, 210), RGB(220, 235, 250), RGB(250, 220, 224)
-            };
-        case UiTheme::PastelPink:
-            return {
-                RGB(252, 226, 238), RGB(254, 242, 248), RGB(232, 192, 212),
-                RGB(84, 44, 66), RGB(140, 96, 120), RGB(216, 104, 160),
-                RGB(40, 26, 34), RGB(253, 234, 243), RGB(84, 44, 66), RGB(244, 210, 226),
-                RGB(220, 244, 226), RGB(252, 238, 210), RGB(220, 235, 250), RGB(250, 220, 224)
-            };
-        case UiTheme::PastelRed:
-            return {
-                RGB(250, 218, 218), RGB(253, 238, 238), RGB(228, 184, 184),
-                RGB(84, 40, 42), RGB(140, 92, 94), RGB(208, 88, 92),
-                RGB(40, 24, 24), RGB(251, 228, 228), RGB(84, 40, 42), RGB(240, 202, 202),
-                RGB(220, 244, 226), RGB(252, 238, 210), RGB(220, 235, 250), RGB(250, 220, 224)
-            };
-        case UiTheme::PastelGreen:
-            return {
-                RGB(220, 242, 222), RGB(238, 249, 239), RGB(186, 218, 190),
-                RGB(36, 68, 44), RGB(88, 124, 96), RGB(84, 164, 104),
-                RGB(22, 36, 26), RGB(230, 246, 232), RGB(36, 68, 44), RGB(204, 232, 208),
-                RGB(220, 244, 226), RGB(252, 238, 210), RGB(220, 235, 250), RGB(250, 220, 224)
-            };
-        case UiTheme::PastelPurple:
-            return {
-                RGB(232, 224, 250), RGB(245, 241, 253), RGB(206, 194, 232),
-                RGB(58, 44, 92), RGB(112, 98, 146), RGB(140, 108, 210),
-                RGB(30, 24, 46), RGB(239, 233, 251), RGB(58, 44, 92), RGB(220, 208, 244),
-                RGB(220, 244, 226), RGB(252, 238, 210), RGB(220, 235, 250), RGB(250, 220, 224)
-            };
-        case UiTheme::PastelYellow:
-            return {
-                RGB(252, 245, 200), RGB(254, 251, 228), RGB(228, 216, 150),
-                RGB(78, 66, 20), RGB(130, 116, 64), RGB(204, 164, 30),
-                RGB(38, 34, 18), RGB(253, 248, 214), RGB(78, 66, 20), RGB(244, 232, 170),
-                RGB(220, 244, 226), RGB(252, 238, 210), RGB(220, 235, 250), RGB(250, 220, 224)
-            };
-        case UiTheme::DeepPurple:
-            return {
-                RGB(36, 18, 64), RGB(54, 30, 92), RGB(96, 68, 146),
-                RGB(236, 226, 252), RGB(170, 150, 204), RGB(168, 120, 250),
-                RGB(22, 10, 42), RGB(44, 24, 78), RGB(236, 226, 252), RGB(90, 54, 150),
-                RGB(30, 66, 62), RGB(72, 52, 54), RGB(40, 44, 96), RGB(90, 30, 62)
-            };
-        case UiTheme::DeepYellow:
-            return {
-                RGB(84, 66, 4), RGB(108, 86, 10), RGB(168, 138, 40),
-                RGB(255, 247, 208), RGB(216, 196, 130), RGB(250, 204, 21),
-                RGB(34, 26, 0), RGB(72, 56, 2), RGB(255, 247, 208), RGB(150, 118, 14),
-                RGB(52, 92, 40), RGB(128, 92, 12), RGB(46, 74, 96), RGB(124, 46, 26)
-            };
-        case UiTheme::Dark:
-        default:
-            return {
-                RGB(10, 10, 12), RGB(18, 18, 20), RGB(50, 50, 54),
-                RGB(202, 202, 208), RGB(145, 145, 150), RGB(95, 125, 145),
-                RGB(0, 0, 0), RGB(12, 12, 14), RGB(202, 202, 208), RGB(55, 55, 60),
-                RGB(18, 30, 24), RGB(34, 30, 20), RGB(20, 28, 36), RGB(36, 22, 24)
-            };
-    }
-}
-
-static bool IsPastelTheme(UiTheme theme) {
-    return theme == UiTheme::Pastel || (theme >= UiTheme::PastelBlue && theme <= UiTheme::PastelYellow);
-}
-
-static bool IsDarkUiTheme(UiTheme theme) {
-    switch (theme) {
-        case UiTheme::Dark:
-        case UiTheme::HighContrast:
-        case UiTheme::Midnight:
-        case UiTheme::Ember:
-        case UiTheme::Berry:
-        case UiTheme::Crimson:
-        case UiTheme::Forest:
-        case UiTheme::DeepPurple:
-        case UiTheme::DeepYellow:
-            return true;
-        case UiTheme::System:
-            return IsSystemDarkMode();
-        default:
-            return false;
-    }
-}
-
 static void ApplyTheme() {
     g_theme = ThemeFor(g_uiTheme);
     g_darkThemeActive = IsDarkUiTheme(g_uiTheme);
@@ -359,51 +149,8 @@ static bool IsDarkThemeActive() {
     return IsDarkUiTheme(g_uiTheme);
 }
 
-using SetPreferredAppModeFn = int(WINAPI*)(int);
-using AllowDarkModeForWindowFn = BOOL(WINAPI*)(HWND, BOOL);
-
-static void ApplyDarkModeApi(HWND hwnd, bool dark) {
-    static bool initialized = false;
-    static SetPreferredAppModeFn setPreferredAppMode = nullptr;
-    static AllowDarkModeForWindowFn allowDarkModeForWindow = nullptr;
-    if (!initialized) {
-        HMODULE ux = LoadLibraryW(L"uxtheme.dll");
-        if (ux) {
-            setPreferredAppMode = reinterpret_cast<SetPreferredAppModeFn>(
-                GetProcAddress(ux, MAKEINTRESOURCEA(135)));
-            allowDarkModeForWindow = reinterpret_cast<AllowDarkModeForWindowFn>(
-                GetProcAddress(ux, MAKEINTRESOURCEA(133)));
-        }
-        initialized = true;
-    }
-    if (setPreferredAppMode) setPreferredAppMode(dark ? 2 : 3);
-    if (allowDarkModeForWindow && hwnd) allowDarkModeForWindow(hwnd, dark ? TRUE : FALSE);
-}
-
-static void ApplyNativeControlTheme(HWND hwnd, bool dark) {
-    if (!hwnd) return;
-    ApplyDarkModeApi(hwnd, dark);
-    SetWindowTheme(hwnd, dark ? L"DarkMode_Explorer" : L"", dark ? nullptr : L"");
-}
-
-static void ApplyNativeThemeToWindow(HWND hwnd, bool dark) {
-    if (!hwnd) return;
-    BOOL darkFlag = dark ? TRUE : FALSE;
-    DwmSetWindowAttribute(hwnd, 20, &darkFlag, sizeof(darkFlag));
-    DwmSetWindowAttribute(hwnd, 19, &darkFlag, sizeof(darkFlag));
-    ApplyNativeControlTheme(hwnd, dark);
-    for (HWND child = GetWindow(hwnd, GW_CHILD); child; child = GetWindow(child, GW_HWNDNEXT)) {
-        ApplyNativeControlTheme(child, dark);
-        if (GetWindow(child, GW_CHILD)) {
-            for (HWND grand = GetWindow(child, GW_CHILD); grand; grand = GetWindow(grand, GW_HWNDNEXT)) {
-                ApplyNativeControlTheme(grand, dark);
-            }
-        }
-    }
-}
-
 static void ApplyNativeThemeToWindow(HWND hwnd) {
-    ApplyNativeThemeToWindow(hwnd, IsDarkThemeActive());
+    pc::ApplyNativeThemeToWindow(hwnd, IsDarkThemeActive());
 }
 
 static COLORREF BlendColor(COLORREF from, COLORREF to, float t);
@@ -767,53 +514,6 @@ static UiLanguage ParseLanguage(const std::string& code) {
     if (code == "es") return UiLanguage::Spanish;
     if (code == "en") return UiLanguage::English;
     return DetectDefaultLanguage();
-}
-
-static const char* ThemeCode(UiTheme theme) {
-    switch (theme) {
-        case UiTheme::Dark:         return "dark";
-        case UiTheme::Light:        return "light";
-        case UiTheme::Pastel:       return "pastel";
-        case UiTheme::HighContrast: return "high_contrast";
-        case UiTheme::Midnight:     return "midnight";
-        case UiTheme::Ember:        return "ember";
-        case UiTheme::Berry:        return "berry";
-        case UiTheme::Crimson:      return "crimson";
-        case UiTheme::Forest:       return "forest";
-        case UiTheme::Mist:         return "mist";
-        case UiTheme::PastelBlue: return "pastel_blue";
-        case UiTheme::PastelOrange: return "pastel_orange";
-        case UiTheme::PastelPink: return "pastel_pink";
-        case UiTheme::PastelRed: return "pastel_red";
-        case UiTheme::PastelGreen: return "pastel_green";
-        case UiTheme::PastelPurple: return "pastel_purple";
-        case UiTheme::PastelYellow: return "pastel_yellow";
-        case UiTheme::DeepPurple: return "deep_purple";
-        case UiTheme::DeepYellow: return "deep_yellow";
-        default:                    return "system";
-    }
-}
-static UiTheme ParseTheme(const std::string& code) {
-    if (code == "dark") return UiTheme::Dark;
-    if (code == "light") return UiTheme::Light;
-    if (code == "pastel") return UiTheme::Pastel;
-    if (code == "high_contrast") return UiTheme::HighContrast;
-    if (code == "midnight") return UiTheme::Midnight;
-    if (code == "ember") return UiTheme::Ember;
-    if (code == "berry") return UiTheme::Berry;
-    if (code == "crimson") return UiTheme::Crimson;
-    if (code == "forest") return UiTheme::Forest;
-    if (code == "mist") return UiTheme::Mist;
-    if (code == "pastel_blue") return UiTheme::PastelBlue;
-    if (code == "pastel_orange") return UiTheme::PastelOrange;
-    if (code == "pastel_pink") return UiTheme::PastelPink;
-    if (code == "pastel_red") return UiTheme::PastelRed;
-    if (code == "pastel_green") return UiTheme::PastelGreen;
-    if (code == "pastel_purple") return UiTheme::PastelPurple;
-    if (code == "pastel_yellow") return UiTheme::PastelYellow;
-    if (code == "deep_purple") return UiTheme::DeepPurple;
-    if (code == "deep_yellow") return UiTheme::DeepYellow;
-    return UiTheme::System;
 }
 
 // Compact dashboard header / splitter layout constants
@@ -1200,6 +900,10 @@ struct DashboardState {
     int selectedProcId = -1;
     std::string selectedJobKey;
     bool allowExit = false;
+    // Set by the tray "Quit Hancho": the dashboard stays visible until the
+    // core has actually stopped (see TIMER_QUIT_WAIT_ID).
+    bool waitingForCoreExit = false;
+    DWORD64 coreExitWaitStartMs = 0;
     NOTIFYICONDATAW nid = {};
     bool trayAdded = false;
 
@@ -11059,9 +10763,29 @@ static void ShowTrayContextMenu(DashboardState* st) {
         }
         nlohmann::json response;
         std::string error;
-        GuiIpcCall(st, {{"action", "quit"}}, response, &error);
-        st->allowExit = true;
-        DestroyWindow(st->hwndMain);
+        const bool sent = GuiIpcCall(st, {{"action", "quit"}}, response, &error);
+        if (!sent && IsHanchoRunningForDataDirWide()) {
+            // The core did not accept the request (or did not answer), so it may
+            // still be running. Keep the dashboard open instead of hiding it.
+            const std::wstring failed = Tr(
+                L"Hancho コアを停止できませんでした。\n\n",
+                L"Could not stop the Hancho core.\n\n",
+                L"No se pudo detener el núcleo de Hancho.\n\n") +
+                Utf8ToWide(error);
+            MessageBoxW(st->hwndMain, failed.c_str(), title.c_str(), MB_OK | MB_ICONERROR);
+            return;
+        }
+        if (!IsHanchoRunningForDataDirWide()) {
+            st->allowExit = true;
+            DestroyWindow(st->hwndMain);
+            return;
+        }
+        // The core answers before it starts its shutdown sequence, so wait for
+        // its instance lock to be released before closing the dashboard.
+        st->waitingForCoreExit = true;
+        st->coreExitWaitStartMs = GetTickCount64();
+        SetTimer(st->hwndMain, TIMER_QUIT_WAIT_ID, 100, nullptr);
+        return;
     }
 }
 
@@ -17001,8 +16725,12 @@ static LRESULT CALLBACK DashboardWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPA
         case WM_TIMER: {
             if (wParam == TIMER_REFRESH_ID && st) {
                 UpdateClock(st);
-                RefreshDashboardData(st);
-                ApplyDashboardRefreshTimer(st);
+                // The core is shutting down after "Quit Hancho"; polling it
+                // now would only produce failed IPC calls.
+                if (!st->waitingForCoreExit) {
+                    RefreshDashboardData(st);
+                    ApplyDashboardRefreshTimer(st);
+                }
             } else if (wParam == TIMER_END_BLINK_ID && st) {
                 if (!TickEndBlink(st)) KillTimer(hwnd, TIMER_END_BLINK_ID);
             } else if (wParam == TIMER_KPI_ANIM_ID && st) {
@@ -17011,6 +16739,27 @@ static LRESULT CALLBACK DashboardWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPA
                 if (g_kpiBarPhase >= 1.0f) g_kpiBarPhase -= 1.0f;
                 InvalidateRect(hwnd, &st->kpiCardRects[1], FALSE);
                 InvalidateRect(hwnd, &st->kpiCardRects[9], FALSE);
+                }
+            } else if (wParam == TIMER_QUIT_WAIT_ID && st) {
+                if (!st->waitingForCoreExit) {
+                    KillTimer(hwnd, TIMER_QUIT_WAIT_ID);
+                } else if (!IsHanchoRunningForDataDirWide()) {
+                    st->waitingForCoreExit = false;
+                    KillTimer(hwnd, TIMER_QUIT_WAIT_ID);
+                    st->allowExit = true;
+                    DestroyWindow(hwnd);
+                } else if (GetTickCount64() - st->coreExitWaitStartMs > 10000) {
+                    st->waitingForCoreExit = false;
+                    KillTimer(hwnd, TIMER_QUIT_WAIT_ID);
+                    MessageBoxW(hwnd,
+                        Tr(L"Hancho コアが 10 秒以内に終了しませんでした。\n\n"
+                           L"`Hancho.exe quit` でもう一度試してください。",
+                           L"The Hancho core did not exit within 10 seconds.\n\n"
+                           L"Try again with `Hancho.exe quit`.",
+                           L"El núcleo de Hancho no se detuvo en 10 segundos.\n\n"
+                           L"Vuelve a intentarlo con `Hancho.exe quit`."),
+                        Tr(L"Hancho を完全終了", L"Quit Hancho", L"Salir de Hancho"),
+                        MB_OK | MB_ICONWARNING);
                 }
             }
             return 0;
@@ -17507,35 +17256,6 @@ static LRESULT CALLBACK DashboardWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPA
                         }
                     }
                 }
-            } else if (nmhdr->idFrom == IDC_LIST_PROCS) {
-                if (nmhdr->code == LVN_GETINFOTIPW) {
-                    // The preview cell shortens the agent activity; rebuild it in full for the tip.
-                    auto* tip = reinterpret_cast<NMLVGETINFOTIPW*>(lParam);
-                    if (tip->iItem >= 0) {
-                        std::wstring text = ListViewFullCellText(st->hwndList, tip->iItem, tip->iSubItem);
-                        if (tip->iSubItem == 11) {
-                            LVITEMW lvi = {};
-                            lvi.mask = LVIF_PARAM;
-                            lvi.iItem = tip->iItem;
-                            int procId = 0;
-                            if (ListView_GetItem(st->hwndList, &lvi)) {
-                                procId = static_cast<int>(lvi.lParam);
-                            }
-                            for (const auto& s : st->cachedSnapshots) {
-                                if (s.id != procId) continue;
-                                if ((s.jsonStream || s.streamEventCount > 0) && !s.activity.empty()) {
-                                    text = ActivityLine(s.activity, s.activityTarget, s.activitySinceEpochMs,
-                                                        s.state == ProcState::Running, 100000);
-                                } else {
-                                    text = Utf8ToWide(s.lastLinePreview);
-                                }
-                                break;
-                            }
-                        }
-                        SetListInfoTip(tip, text);
-                    }
-                    return 0;
-                }
             } else if (nmhdr->idFrom == IDC_LIST_TASKS) {
                 if (nmhdr->code == LVN_COLUMNCLICK) {
                     // Clicking a header sorts by that column; the same column cycles
@@ -17646,6 +17366,34 @@ static LRESULT CALLBACK DashboardWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPA
                     }
                 }
             } else if (nmhdr->idFrom == IDC_LIST_PROCS) {
+                if (nmhdr->code == LVN_GETINFOTIPW) {
+                    // The preview cell shortens the agent activity; rebuild it in full for the tip.
+                    auto* tip = reinterpret_cast<NMLVGETINFOTIPW*>(lParam);
+                    if (tip->iItem >= 0) {
+                        std::wstring text = ListViewFullCellText(st->hwndList, tip->iItem, tip->iSubItem);
+                        if (tip->iSubItem == 11) {
+                            LVITEMW lvi = {};
+                            lvi.mask = LVIF_PARAM;
+                            lvi.iItem = tip->iItem;
+                            int procId = 0;
+                            if (ListView_GetItem(st->hwndList, &lvi)) {
+                                procId = static_cast<int>(lvi.lParam);
+                            }
+                            for (const auto& s : st->cachedSnapshots) {
+                                if (s.id != procId) continue;
+                                if ((s.jsonStream || s.streamEventCount > 0) && !s.activity.empty()) {
+                                    text = ActivityLine(s.activity, s.activityTarget, s.activitySinceEpochMs,
+                                                        s.state == ProcState::Running, 100000);
+                                } else {
+                                    text = Utf8ToWide(s.lastLinePreview);
+                                }
+                                break;
+                            }
+                        }
+                        SetListInfoTip(tip, text);
+                    }
+                    return 0;
+                }
                 if (nmhdr->code == LVN_COLUMNCLICK) {
                     // Clicking a header sorts by that column; the same column cycles
                     // ascending -> descending -> unsorted.
@@ -17823,7 +17571,9 @@ static LRESULT CALLBACK DashboardWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPA
         case WM_DESTROY: {
             KillTimer(hwnd, TIMER_REFRESH_ID);
             KillTimer(hwnd, TIMER_KPI_ANIM_ID);
+            KillTimer(hwnd, TIMER_QUIT_WAIT_ID);
             if (st) {
+                if (st->waitingForCoreExit) st->waitingForCoreExit = false;
                 if (st->hwndHintWnd) {
                     DestroyWindow(st->hwndHintWnd);
                     st->hwndHintWnd = nullptr;
@@ -17958,39 +17708,6 @@ int RunGuiDashboard(ProcessManager& pm, IpcServer& ipc, TaskQueueManager& tqm) {
 
 int RunStandaloneGuiDashboard() {
     return RunGuiDashboard(nullptr, nullptr, nullptr);
-}
-
-DashboardPalette GetDashboardPalette() {
-    UiTheme theme = g_uiTheme;
-    const std::string content = ReadFileUtf8Wide(GetConfigFilePathWide());
-    if (!content.empty()) {
-        const std::string code = JsonGetString(content, "theme", "");
-        if (!code.empty()) theme = ParseTheme(code);
-    }
-    const ThemeColors c = ThemeFor(theme);
-    DashboardPalette p;
-    p.windowBg = c.windowBg;
-    p.panel = c.panel;
-    p.border = c.border;
-    p.text = c.text;
-    p.muted = c.muted;
-    p.accent = c.accent;
-    p.listText = c.listText;
-    p.rowSelected = c.rowSelected;
-    p.rowRunning = c.rowRunning;
-    p.rowIdle = c.rowIdle;
-    p.rowCompleted = c.rowCompleted;
-    p.rowFailed = c.rowFailed;
-    p.dark = IsDarkUiTheme(theme);
-    return p;
-}
-
-void InitDashboardDarkMode(bool dark) {
-    ApplyDarkModeApi(nullptr, dark);
-}
-
-void ApplyDashboardNativeTheme(HWND hwnd) {
-    ApplyNativeThemeToWindow(hwnd, GetDashboardPalette().dark);
 }
 
 } // namespace pc
