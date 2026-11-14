@@ -206,7 +206,7 @@ Handshake validation failures send `ERROR` and close the connection; transport f
 - Several clients may attach to the same job. Each has its own `SESSION_ID` and receives its own replay. When clients negotiate `SIZE_SYNC`, a resize from one is forwarded to the others as `RESIZED` with reason `PEER`; otherwise they must not assume the PTY keeps their requested size.
 - An **attached** job keeps running when the client detaches or closes the connection without `CLOSE`.
 - A **shell started by this session** is now retained too. A lost connection, a client crash or a plain socket close only detaches; the shell keeps running and appears in the session list. Send `CLOSE` to terminate it explicitly.
-- Any retained ConPTY job can be reattached with `attach:<id>`. The client lists the retained sessions with `LIST_SESSIONS` and lets the user choose one or more.
+- Any retained ConPTY job can be reattached with `attach:<id>`. The client lists the retained sessions with `LIST_SESSIONS` and lets the user choose one or more; its **Connect all** action attaches every running session, one connection (tab) each.
 - If the attached job has already exited, the server still sends `HELLO_ACK`, the replay, and then `EXIT`.
 
 ### 6.1 SESSION_LIST encoding

@@ -85,6 +85,7 @@ constexpr int IDM_SCROLLBACK_1024 = 5124;
 constexpr int IDM_SCROLLBACK_2048 = 5125;
 constexpr int IDM_RECONNECT_SESSION = 5117;
 constexpr int IDM_TERMINATE_SESSION = 5118;
+constexpr int IDM_RECONNECT_ALL = 5119;
 
 constexpr int kStatusHeight = 26;
 
@@ -776,6 +777,8 @@ LRESULT CALLBACK SessionsDlgProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lPar
             SendMessageW(state->list, LB_SETSEL, TRUE, 0);
             SendMessageW(state->list, LB_SETCURSEL, 0, 0);
         }
+        AddDialogButton(hwnd, T(L"すべて接続", L"Connect all", L"Conectar todo"),
+                        1003, 372, 338, 108, 28, false);
         AddDialogButton(hwnd, T(L"再接続", L"Reconnect", L"Reconectar"),
                         IDOK, 488, 338, 86, 28, true);
         AddDialogButton(hwnd, T(L"キャンセル", L"Cancel", L"Cancelar"),
@@ -807,6 +810,11 @@ LRESULT CALLBACK SessionsDlgProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lPar
             }
             state->ok = true;
             DestroyWindow(hwnd);
+        } else if (id == 1003) {
+            // Select every retained session and accept, so one click opens a tab per session.
+            if (!state || !state->list) return 0;
+            SendMessageW(state->list, LB_SETSEL, TRUE, static_cast<LPARAM>(-1));
+            SendMessageW(hwnd, WM_COMMAND, IDOK, 0);
         } else if (id == IDCANCEL) {
             DestroyWindow(hwnd);
         } else if (id == 1002 && HIWORD(wParam) == LBN_DBLCLK) {
@@ -1336,9 +1344,12 @@ void ShowRemoteConnect(ClientState* st) {
     }
 }
 
-void ShowReconnectDialog(ClientState* st, bool startup) {
+// Shows the retained-session picker, or with connectAll attaches to every running
+// session without asking. Each session gets its own tab, so they connect in parallel.
+void ShowReconnectDialog(ClientState* st, bool startup, bool connectAll = false) {
     if (!st) return;
-    WriteAuditLog("TERM_CLIENT_RECONNECT", startup ? "startup" : "manual");
+    WriteAuditLog("TERM_CLIENT_RECONNECT",
+                  startup ? "startup" : (connectAll ? "all" : "manual"));
     struct SuppressAutoAttach {
         ClientState* st;
         explicit SuppressAutoAttach(ClientState* s) : st(s) { st->suppressAutoAttach = true; }
@@ -1406,7 +1417,28 @@ void ShowReconnectDialog(ClientState* st, bool startup) {
 
     SessionsDlgState dlg;
     dlg.sessions = running;
-    if (!RunSessionsDialog(st->hwndMain, dlg)) return;
+    if (connectAll) {
+        auto alreadyOpen = [st, &settings](uint32_t id) {
+            for (const auto& tab : st->tabs) {
+                if (!tab || tab->localJobId != static_cast<int>(id)) continue;
+                if (tab->settings.host == settings.host && tab->settings.port == settings.port) return true;
+            }
+            return false;
+        };
+        for (const auto& session : running) {
+            if (!alreadyOpen(session.id)) dlg.selectedIds.push_back(session.id);
+        }
+        if (dlg.selectedIds.empty()) {
+            MessageBoxW(st->hwndMain,
+                T(L"保持中のセッションはすべて開いています。",
+                  L"All retained sessions are already open.",
+                  L"Todas las sesiones conservadas ya están abiertas."),
+                T(L"再接続", L"Reconnect", L"Reconectar"), MB_OK | MB_ICONINFORMATION);
+            return;
+        }
+    } else {
+        if (!RunSessionsDialog(st->hwndMain, dlg)) return;
+    }
 
     for (uint32_t id : dlg.selectedIds) {
         std::wstring label = L"#" + std::to_wstring(id);
@@ -1607,6 +1639,9 @@ HMENU BuildMenu(ClientState* st) {
     AppendMenuW(file, MF_STRING, IDM_RECONNECT_SESSION,
                 T(L"セッションに再接続...", L"Reconnect to session...",
                   L"Reconectar a una sesión..."));
+    AppendMenuW(file, MF_STRING, IDM_RECONNECT_ALL,
+                T(L"すべての保持セッションに接続", L"Connect to all retained sessions",
+                  L"Conectar a todas las sesiones conservadas"));
     AppendMenuW(file, MF_SEPARATOR, 0, nullptr);
     AppendMenuW(file, MF_STRING, IDM_RECONNECT,
                 T(L"現在のタブを再接続", L"Reconnect current tab",
@@ -1803,6 +1838,9 @@ void ShowClientContextMenu(ClientState* st, POINT pt) {
     AppendMenuW(menu, MF_STRING, IDM_RECONNECT_SESSION,
                 T(L"セッションに再接続...", L"Reconnect to session...",
                   L"Reconectar a una sesión..."));
+    AppendMenuW(menu, MF_STRING, IDM_RECONNECT_ALL,
+                T(L"すべての保持セッションに接続", L"Connect to all retained sessions",
+                  L"Conectar a todas las sesiones conservadas"));
     AppendMenuW(menu, MF_SEPARATOR, 0, nullptr);
     AppendMenuW(menu, MF_STRING | (tab ? 0 : MF_GRAYED), IDM_RECONNECT,
                 T(L"現在のタブを再接続", L"Reconnect current tab",
@@ -1973,6 +2011,9 @@ LRESULT CALLBACK ClientWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam
             return 0;
         case IDM_RECONNECT_SESSION:
             ShowReconnectDialog(st, false);
+            return 0;
+        case IDM_RECONNECT_ALL:
+            ShowReconnectDialog(st, false, true);
             return 0;
         case IDM_TERMINATE_SESSION:
             TerminateActiveSession(st);

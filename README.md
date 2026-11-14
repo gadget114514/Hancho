@@ -99,6 +99,13 @@ The skill starts with `hancho-cli.exe help --json`, so the commands it shows alw
 
 
 
+### v0.9.19
+- **Terminal sizing**: cells are measured in physical pixels again, so WCSP `HELLO` / `RESIZE` sizes match the visible console at 150%/200% scaling. The 80x25 minimum is gone and the scroll bar no longer counts as a column.
+- **WCSP 1.2 size sync**: when one client resizes a shared job, other clients that advertise `FeatureSizeSync` follow the new size and re-assert their own on focus or input.
+- **Retained sessions**: the reconnect picker has a **Connect all** button, and **File** > **Connect to all retained sessions** attaches every running session at once, one tab each (sessions already open are skipped).
+- **Settings**: closing the Settings dialog no longer blocks the dashboard. Saves send only dashboard-owned keys, and the core restarts WebUI / Chat / terminal only when that block actually changed.
+- **WinConsoleServer tab**: the active-session list refreshes while the tab is open and keeps the selected session selected.
+
 ### v0.9.18
 - **wct keys**: `Ctrl+]` detaches after a short timeout; press `Ctrl+]` twice quickly to close the session (WCSP `CLOSE`). `Ctrl+\` is no longer used.
 - **Tray**: the existing item is now **Close Dashboard** (the core and jobs keep running); **Quit Hancho (stop core and jobs)** stops the core and all jobs after confirmation.
