@@ -9,6 +9,7 @@
 #include "taskqueue.h"
 #include "cli_top.h"
 #include "power.h"
+#include "triage_text.h"
 #include "nlohmann/json.hpp"
 #include <iostream>
 #include <sstream>
@@ -2539,6 +2540,23 @@ REMOTE HOSTS:
       Show armed jobs, the current phase, and how many other jobs / managed
       processes are still running.
 
+TRIAGE:
+  triage list [--all | --state <pending|acted|ignored|resolved|open|follow_up>]
+      List pending cards (or the selected state) and lifecycle / KPI counts.
+  triage show <id>
+      Show card information, advice, candidates, decision and lifecycle outcome.
+  triage advise <id>
+      Ask an LLM worker for advice on this card.
+  triage decide <id> <candidateId> [--reason <text>] [--multiplier <n>] [--answer <text>]
+      Execute a candidate and record the decision.
+  triage ack <id> | --all-auto
+      Mark one or all automatic decisions as reviewed.
+  triage handoff <id>... | --all
+      Hand pending cards to a batch (non-interactive) supervisor run as a hidden job in queue
+      _supervisor. The cards stay pending, marked "with supervisor", until it records decisions.
+  triage manual <id>
+      Mark a pending card as being handled manually and print an interactive prompt.
+
 CHAT (LAN messaging between people and LLM agents; alias: msg):
   chat status | on | off | peers | refresh | clear
       status   Show the node, peers, unread count and handler.
@@ -3026,6 +3044,22 @@ void PrintCliUsageJson() {
         {"name": "purge", "usage": "hancho-cli taskqueue purge <name> [--states succeeded,failed,cancelled]", "description": "Remove finished jobs."}
       ],
       "options": []
+    },)";
+    std::cout << R"(
+    {
+      "name": "triage",
+      "description": "Review failed jobs and managed processes with deterministic information, advice, and explicit candidate actions.",
+      "usage": "hancho-cli triage <list|show|advise|decide|ack|handoff|manual> ...",
+      "subcommands": [
+        {"name": "list", "usage": "hancho-cli triage list [--all|--state <pending|acted|ignored|resolved|open|follow_up>]", "description": "List triage cards by lifecycle and task/process KPI counts."},
+        {"name": "show", "usage": "hancho-cli triage show <id>", "description": "Show card information, recommendations, outcome, branches, LLM advice, candidates and decision."},
+        {"name": "advise", "usage": "hancho-cli triage advise <id>", "description": "Request LLM advice as a hidden task-queue job."},
+        {"name": "decide", "usage": "hancho-cli triage decide <id> <candidateId> [--reason <text>] [--multiplier <n>] [--answer <text>]", "description": "Run a listed candidate and record the decision."},
+        {"name": "ack", "usage": "hancho-cli triage ack <id> | hancho-cli triage ack --all-auto", "description": "Mark automatic decisions as reviewed."},
+        {"name": "handoff", "usage": "hancho-cli triage handoff <id>... | hancho-cli triage handoff --all", "description": "Hand pending cards to a batch supervisor (hidden job in queue _supervisor, with a timeout). Cards stay pending until it records decisions."},
+        {"name": "manual", "usage": "hancho-cli triage manual <id>", "description": "Mark a pending card as being handled manually and print an interactive prompt."}
+      ],
+      "options": [{"name": "--json", "description": "Print the raw IPC response."}]
     },)";
     std::cout << R"(
     {
@@ -3793,6 +3827,14 @@ int PrintTaskQueueWhy(const std::string& respJson, bool jsonOutput, const std::s
     return 0;
 }
 
+static std::string ReadTriageDisplayLanguage() {
+    const std::string content = ReadFileUtf8Wide(PathJoinWide(GetEffectiveDataDirectoryWide(), L"config.json"));
+    const nlohmann::json config = nlohmann::json::parse(content, nullptr, false);
+    if (!config.is_object()) return "en";
+    const std::string language = config.value("language", std::string("en"));
+    return language == "ja" || language == "es" ? language : "en";
+}
+
 int PrintResponse(const std::string& action, const std::string& respJson, bool jsonOutput,
                   int requestedId = 0, bool waitForCompletion = false) {
     if (action == "taskqueue_why") {
@@ -3817,6 +3859,217 @@ int PrintResponse(const std::string& action, const std::string& respJson, bool j
     if (!JsonGetBool(respJson, "ok", false)) {
         std::cerr << "Error: " << JsonGetString(respJson, "error", "Unknown error.") << "\n";
         return 1;
+    }
+
+    if (action.rfind("triage_", 0) == 0) {
+        using json = nlohmann::json;
+        json response = json::parse(respJson, nullptr, false);
+        if (response.is_discarded() || !response.is_object()) {
+            std::cerr << "Error: invalid triage response.\n";
+            return 1;
+        }
+        if (action == "triage_list") {
+            const std::string language = ReadTriageDisplayLanguage();
+            const json counts = response.value("counts", json::object());
+            std::cout << "language: " << language << "\n"
+                      << (language == "ja" ? "トリアージ" : language == "es" ? "Triaje" : "Triage")
+                      << ": " << (language == "ja" ? "タスク " : language == "es" ? "tareas " : "tasks ")
+                      << counts.value("pendingTask", 0) << ", "
+                      << (language == "ja" ? "プロセス " : language == "es" ? "procesos " : "processes ")
+                      << counts.value("pendingProcess", 0) << ", "
+                      << (language == "ja" ? "その他 " : language == "es" ? "otros " : "other ")
+                      << counts.value("pendingOther", 0) << " "
+                      << TriageLabel(language, "cardState", "pending") << ", "
+                      << counts.value("autoUnreviewed", 0) << " "
+                      << (language == "ja" ? "自動・未確認" : language == "es" ? "automáticos sin revisar" : "automatic unreviewed")
+                      << "; " << TriageLabel(language, "lifecycle", "handling") << " " << counts.value("handling", 0)
+                      << ", " << TriageLabel(language, "lifecycle", "running") << " " << counts.value("running", 0)
+                      << ", " << TriageLabel(language, "lifecycle", "waiting_branch") << " " << counts.value("waitingBranch", 0)
+                      << ", " << TriageLabel(language, "lifecycle", "waiting_next") << " " << counts.value("waitingNext", 0)
+                      << ", " << TriageLabel(language, "lifecycle", "follow_up") << " " << counts.value("followUp", 0)
+                      << ", " << TriageLabel(language, "lifecycle", "done") << " " << counts.value("done", 0) << "\n";
+            const json cards = response.value("cards", json::array());
+            if (cards.empty()) {
+                std::cout << (language == "ja" ? "カードはありません。\n" : language == "es" ? "No hay tarjetas.\n" : "No triage cards.\n");
+                return 0;
+            }
+            auto pad = [](std::string text, size_t width) {
+                if (text.size() > width) text = text.substr(0, width - 1) + "~";
+                return text + std::string(width - text.size() + 2, ' ');
+            };
+            std::cout << pad(language == "ja" ? "ライフサイクル" : language == "es" ? "CICLO" : "LIFECYCLE", 16)
+                      << pad("ID", 10) << pad(language == "ja" ? "状態" : language == "es" ? "ESTADO" : "STATE", 8)
+                      << pad(language == "ja" ? "種別" : language == "es" ? "TIPO" : "KIND", 21)
+                      << pad(language == "ja" ? "対象" : language == "es" ? "OBJETIVO" : "TARGET", 22)
+                      << pad(language == "ja" ? "推奨 / 判断" : language == "es" ? "RECOMENDACIÓN / DECISIÓN" : "RECOMMENDATION / DECISION", 40)
+                      << (language == "ja" ? "経過時間\n" : language == "es" ? "EDAD\n" : "AGE\n");
+            for (const auto& card : cards) {
+                const json target = card.value("target", json::object());
+                const json recommendation = card.value("recommendation", json::object());
+                const json advice = card.value("advice", json::object());
+                const json decision = card.value("decision", json::object());
+                const std::string cardState = card.value("state", std::string());
+                const std::string lifecycle = card.value("lifecycle", std::string("pending"));
+                std::string choice;
+                if (decision.is_object() && !decision.value("candidateId", std::string()).empty()) {
+                    // A decided card shows what was chosen and by whom, so nothing looks unhandled.
+                    choice = (language == "ja" ? "選択: " : language == "es" ? "eligió: " : "chose ") +
+                             TriageCandidateLabel(language, decision.value("candidateId", std::string())) + " (" +
+                             decision.value("by", std::string()) +
+                             (decision.contains("reviewed") && decision["reviewed"].is_boolean() &&
+                              !decision["reviewed"].get<bool>() ? (language == "ja" ? ", 未確認" : language == "es" ? ", sin revisar" : ", unreviewed") : "") + ")";
+                } else if (cardState == "resolved") {
+                    choice = language == "ja" ? "自然解消" : language == "es" ? "resuelto" : "resolved by itself";
+                } else if (card.contains("manual") && card["manual"].is_object()) {
+                    choice = "manual " + card["manual"].value("state", std::string());
+                } else if (card.contains("handoff") && card["handoff"].is_object() &&
+                           !card["handoff"].value("state", std::string()).empty()) {
+                    // Handed to a batch supervisor: show that it is being handled, not untouched.
+                    choice = "supervisor " + card["handoff"].value("state", std::string()) + " (" +
+                             card["handoff"].value("jobId", std::string()) + ")";
+                } else if (advice.is_object() && !advice.value("candidateId", std::string()).empty()) {
+                    choice = "LLM: " + TriageCandidateLabel(language, advice.value("candidateId", std::string())) + " (" +
+                             TriageLabel(language, "confidence", advice.value("confidence", std::string())) + ")";
+                } else if (!recommendation.value("candidateId", std::string()).empty()) {
+                    choice = "Hancho: " + TriageCandidateLabel(language, recommendation.value("candidateId", std::string())) + " (" +
+                             TriageLabel(language, "confidence", recommendation.value("confidence", std::string())) + ")";
+                } else {
+                    choice = language == "ja" ? "— (人の判断が必要)" : language == "es" ? "— (requiere decisión humana)" : "- (needs a human decision)";
+                }
+                std::string targetText = target.value("jobId", target.value("processId", target.value("btId", std::string(""))));
+                if (targetText.empty()) targetText = target.value("name", std::string());
+                const int64_t created = ParseTimestampStrToEpoch(card.value("createdAt", std::string()));
+                const int64_t now = ParseTimestampStrToEpoch(GetCurrentTimestampStr());
+                const std::string age = created > 0 && now >= created
+                    ? TriageFormatDuration(language, now - created) : TriageLabel(language, "noneLocal", "none");
+                std::cout << pad(TriageLabel(language, "lifecycle", lifecycle), 16) << pad(card.value("id", std::string()), 10)
+                          << pad(TriageLabel(language, "cardState", cardState), 8)
+                          << pad(TriageLabel(language, "kind", card.value("kind", std::string())), 21) << pad(targetText, 22)
+                          << pad(choice, 40) << age << "\n";
+            }
+            return 0;
+        }
+        if (action == "triage_handoff") {
+            std::cout << "Handed " << response.value("cards", json::array()).size()
+                      << " card(s) to supervisor job " << response.value("jobId", std::string())
+                      << " (batch, queue _supervisor). The cards stay pending until it records decisions.\n";
+            return 0;
+        }
+        if (action == "triage_manual") {
+            const std::string prompt = response.value("prompt", std::string());
+            if (prompt.empty()) {
+                std::cerr << "Error: manual triage response did not include a prompt.\n";
+                return 1;
+            }
+            std::cout << prompt;
+            return 0;
+        }
+        if (action == "triage_ack") {
+            if (response.contains("acknowledged"))
+                std::cout << "Acknowledged " << response.value("acknowledged", 0) << " automatic decision(s).\n";
+            else std::cout << "Automatic decision marked reviewed.\n";
+            return 0;
+        }
+        if (response.contains("result")) std::cout << response.value("result", std::string()) << "\n";
+        if (!response.contains("card") || !response["card"].is_object()) return 0;
+        const json card = response["card"];
+        if (action == "triage_get" || action == "triage_advise") {
+            const std::string language = ReadTriageDisplayLanguage();
+            std::cout << "language: " << language << "\n"
+                      << (language == "ja" ? "トリアージカード " : language == "es" ? "Tarjeta de triaje " : "Triage card ")
+                      << card.value("id", std::string()) << " ["
+                      << TriageLabel(language, "cardState", card.value("state", std::string())) << "] "
+                      << TriageLabel(language, "kind", card.value("kind", std::string()))
+                      << " — " << TriageLabel(language, "lifecycle", card.value("lifecycle", std::string("pending"))) << "\n";
+            const json info = card.value("info", json::object());
+            for (const auto& section : {"cause", "background", "environment", "conditions", "reason"}) {
+                std::cout << "\n" << TriageLabel(language, "section", section) << ":\n";
+                const json lines = info.value(section, json::array());
+                for (const auto& line : lines) {
+                    for (const auto& text : TriageFormatInfoRows(language, line))
+                        if (!text.empty()) std::cout << "  " << text << "\n";
+                }
+            }
+            const json recommendation = card.value("recommendation", json::object());
+            std::cout << "\n" << (language == "ja" ? "助言" : language == "es" ? "Consejo" : "Advice")
+                      << ":\n  Hancho: " << TriageCandidateLabel(language, recommendation.value("candidateId", std::string()),
+                          TriageLabel(language, "noneLocal", "none"))
+                      << " (" << TriageLabel(language, "confidence", recommendation.value("confidence", std::string("low"))) << ") — "
+                      << TriageFormatRationale(language, recommendation.value("rationaleKey", std::string()),
+                          recommendation.value("rationaleParams", json::object()), recommendation.value("rationale", std::string())) << "\n";
+            const json advice = card.value("advice", json::object());
+            if (advice.is_object()) {
+                if (advice.contains("error")) std::cout << "  LLM error: " << advice.value("error", std::string()) << "\n";
+                else if (advice.contains("candidateId")) {
+                    std::cout << "  LLM: " << TriageCandidateLabel(language, advice.value("candidateId", std::string())) << " ("
+                              << TriageLabel(language, "confidence", advice.value("confidence", std::string())) << ") — "
+                              << advice.value("rationale", std::string()) << "\n";
+                    if (!advice.value("caution", std::string()).empty()) std::cout << "  Caution: " << advice["caution"] << "\n";
+                    if (!advice.value("infoNeeded", std::string()).empty()) std::cout << "  Information needed: " << advice["infoNeeded"] << "\n";
+                }
+            } else std::cout << "  LLM advice: " << card.value("adviceState", std::string("none")) << "\n";
+            const std::string recommended = advice.is_object() && advice.contains("candidateId")
+                ? advice.value("candidateId", std::string()) : recommendation.value("candidateId", std::string());
+            std::cout << "\nCandidates:\n";
+            for (const auto& candidate : card.value("candidates", json::array())) {
+                const std::string candidateId = candidate.value("id", std::string());
+                std::cout << "  " << (candidateId == recommended ? "★ " : "  ")
+                          << TriageCandidateLabel(language, candidateId, candidate.value("label", candidateId))
+                          << ": " << TriageCandidateEffect(language, candidateId, candidate.value("effect", std::string()))
+                          << " [safe=" << (candidate.value("safe", false) ? "yes" : "no") << "]\n";
+            }
+            const json decision = card.value("decision", json());
+            if (decision.is_object()) std::cout << "\nDecision: " << decision.value("by", std::string())
+                << " chose " << decision.value("candidateId", std::string()) << ": "
+                << decision.value("reason", std::string()) << "\n";
+            const json manual = card.value("manual", json::object());
+            if (manual.is_object() && !manual.empty())
+                std::cout << "Manual route: " << manual.value("state", std::string())
+                          << " (started " << manual.value("at", std::string())
+                          << (manual.value("endedAt", std::string()).empty() ? "" : ", ended " + manual.value("endedAt", std::string()))
+                          << ")\n";
+            if (decision.is_object() && decision.value("route", std::string()) == "manual")
+                std::cout << "Decision route: manual\n";
+            const json outcome = card.value("outcome", json::object());
+            if (outcome.is_object() && !outcome.empty()) {
+                std::cout << "\n■ " << (language == "ja" ? "結果" : language == "es" ? "Resultado" : "Outcome") << ": "
+                          << TriageLabel(language, "outcome", outcome.value("state", std::string("unknown")))
+                          << " — " << outcome.value("detail", std::string())
+                          << (outcome.value("complete", false) ? " [complete]" : " [open]") << "\n";
+                const json branch = outcome.value("branch", json::object());
+                if (branch.is_object()) {
+                    std::cout << "  Branch: " << branch.value("succeeded", 0) << "/" << branch.value("total", 0)
+                              << " succeeded, " << branch.value("running", 0) << " running, "
+                              << branch.value("blocked", 0) << " blocked, " << branch.value("failed", 0) << " failed\n";
+                    for (const auto& job : branch.value("jobs", json::array())) {
+                        std::cout << "    " << job.value("id", std::string()) << " ["
+                                  << TriageLabel(language, "jobState", job.value("state", std::string())) << "]";
+                        if (!job.value("key", std::string()).empty()) std::cout << " key=" << job["key"].get<std::string>();
+                        if (!job.value("cardId", std::string()).empty()) std::cout << " card=" << job["cardId"].get<std::string>();
+                        std::cout << "\n";
+                    }
+                }
+                const json bt = outcome.value("bt", json::object());
+                if (bt.is_object() && !bt.empty())
+                    std::cout << "  BT: " << bt.value("id", std::string()) << " ["
+                              << TriageLabel(language, "jobState", bt.value("state", std::string())) << "]\n";
+            }
+            if (!card.value("previousCardId", std::string()).empty())
+                std::cout << "Previous card: " << card["previousCardId"].get<std::string>() << "\n";
+            if (outcome.is_object() && !outcome.value("nextCardId", std::string()).empty())
+                std::cout << "Next card: " << outcome["nextCardId"].get<std::string>() << "\n";
+            const json handoff = card.value("handoff", json());
+            if (handoff.is_object() && !handoff.value("jobId", std::string()).empty()) {
+                std::cout << "\nSupervisor (batch): " << handoff.value("state", std::string()) << " — "
+                          << handoff.value("jobId", std::string()) << " at " << handoff.value("at", std::string()) << "\n";
+                if (!handoff.value("note", std::string()).empty())
+                    std::cout << "  note: " << handoff.value("note", std::string()) << "\n";
+            }
+            return 0;
+        }
+        std::cout << "Updated triage card " << card.value("id", std::string()) << " ["
+                  << card.value("state", std::string()) << "].\n";
+        return 0;
     }
 
     if (action.rfind("taskqueue_", 0) == 0) {
@@ -5963,6 +6216,85 @@ if (subcmd == "start" || subcmd == "run") {
             }
         }
         return 0;
+    }
+    else if (subcmd == "triage") {
+        const std::string op = args.size() > 2 ? args[2] : "";
+        auto failWith = [&](const std::string& message) {
+            if (jsonOutput) std::cout << nlohmann::json{{"ok", false}, {"error", message}}.dump() << "\n";
+            else std::cerr << "Error: " << message << "\n";
+            return 1;
+        };
+        if (op.empty() || op == "help" || op == "--help" || op == "-h") {
+            std::cout << "TRIAGE\n"
+                      << "  list [--all|--state <pending|acted|ignored|resolved|open|follow_up>]\n"
+                      << "  show <id> | advise <id>\n"
+                      << "  decide <id> <candidateId> [--reason <text>] [--multiplier <n>] [--answer <text>]\n"
+                      << "  ack <id> | ack --all-auto\n"
+                      << "  handoff <id>... | handoff --all\n"
+                      << "  manual <id>\n";
+            return 0;
+        }
+        nlohmann::json request;
+        std::string action;
+        if (op == "list") {
+            std::string state = "pending";
+            for (size_t i = 3; i < args.size(); ++i) {
+                if (args[i] == "--all") state = "all";
+                else if (args[i] == "--state" && i + 1 < args.size()) state = args[++i];
+                else return failWith("unknown triage list option: " + args[i]);
+            }
+            request = {{"action", "triage_list"}, {"state", state}};
+            action = "triage_list";
+        } else if (op == "show" || op == "advise") {
+            if (args.size() < 4) return failWith("triage " + op + " requires <id>");
+            request = {{"action", op == "show" ? "triage_get" : "triage_advise"}, {"id", args[3]}};
+            action = op == "show" ? "triage_get" : "triage_advise";
+        } else if (op == "decide") {
+            if (args.size() < 5) return failWith("triage decide requires <id> <candidateId>");
+            std::string reason;
+            nlohmann::json params = nlohmann::json::object();
+            for (size_t i = 5; i < args.size(); ++i) {
+                if (args[i] == "--reason" && i + 1 < args.size()) reason = args[++i];
+                else if (args[i] == "--multiplier" && i + 1 < args.size()) {
+                    try { params["multiplier"] = std::stod(args[++i]); }
+                    catch (...) { return failWith("--multiplier must be numeric"); }
+                } else if (args[i] == "--answer" && i + 1 < args.size()) params["answer"] = args[++i];
+                else return failWith("unknown triage decide option: " + args[i]);
+            }
+            request = {{"action", "triage_decide"}, {"id", args[3]}, {"candidateId", args[4]},
+                       {"reason", reason}, {"params", params}, {"by", "human"}};
+            action = "triage_decide";
+        } else if (op == "handoff") {
+            bool all = false;
+            nlohmann::json ids = nlohmann::json::array();
+            for (size_t i = 3; i < args.size(); ++i) {
+                if (args[i] == "--all") all = true;
+                else ids.push_back(args[i]);
+            }
+            if (all == !ids.empty()) return failWith("triage handoff requires <id>... or --all");
+            request = {{"action", "triage_handoff"}, {"ids", ids}, {"all", all}};
+            action = "triage_handoff";
+        } else if (op == "manual") {
+            if (args.size() < 4) return failWith("triage manual requires <id>");
+            request = {{"action", "triage_manual"}, {"id", args[3]}};
+            action = "triage_manual";
+        } else if (op == "ack") {
+            bool all = false;
+            std::string id;
+            for (size_t i = 3; i < args.size(); ++i) {
+                if (args[i] == "--all-auto") all = true;
+                else if (id.empty()) id = args[i];
+                else return failWith("triage ack accepts one id or --all-auto");
+            }
+            if (all == !id.empty()) return failWith("triage ack requires <id> or --all-auto");
+            request = {{"action", "triage_ack"}, {"id", id}, {"all_auto", all}};
+            action = "triage_ack";
+        } else {
+            return failWith("unknown triage command: " + op + " (list, show, advise, decide, ack, handoff, manual)");
+        }
+        reqJson << request.dump();
+        // PrintResponse picks the human-readable formatter from subcmd (as taskqueue_why does).
+        subcmd = action;
     }
     else if (subcmd == "taskqueue") {
         std::string op = (args.size() >= 3) ? args[2] : "";

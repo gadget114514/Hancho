@@ -29,6 +29,7 @@
   - **`[>_]`** Hide/Show Terminal Panel toggle
   - **`[⤓]`** Minimize to System Tray
   - All toolbar icon buttons provide instant status-aware hover tooltips.
+- **Triage**: Review one persistent card per failed job or other condition, with Hancho-collected information, candidate actions and a deterministic recommendation; choose and record a decision, request LLM advice, and track pending, acted, ignored or naturally resolved cards. See [Triage](triage.md).
 
 ## 2. Multi-Shell Launcher & `[Config]` Dialog (`cmd` / `powershell` / `bash`)
 - Click **`[+ Launch (...)]`** on the toolbar to immediately spawn a new interactive ConPTY terminal tab.
@@ -102,3 +103,20 @@
 - LLM-to-LLM messaging with `from_agent` / `to_agent` / `reply_to`, an `audience` (human or agent) and a hop guard. Incoming messages can be handed to a worker LLM whose JSON answer is sent back as a reply.
 - `hancho-cli chat ...`, the MCP `chat_*` tools, and a standalone dialog (`Hancho.exe chat [--tray]`, also openable from the dashboard toolbar) with tray notifications, a searchable log and settings.
 - Trusted LAN only; nothing is encrypted. See [Chat](chat.md) for the protocol, configuration, security notes and examples.
+
+## 11. Terminal sessions (WCSP)
+- The core exposes every ConPTY job over the WinConsoleServer protocol (WCSP v1). The standalone dashboard (`Hancho.exe gui`) attaches to those jobs through a local TCP listener and shows the live screen and keyboard input in the existing terminal tabs. Closing the dashboard, switching tabs or detaching does not stop the job.
+- The listener is configured in `<data-dir>/config.json`:
+
+  ```json
+  "terminal": { "local": true, "remote": false, "host": "0.0.0.0", "port": 9139, "token": "" }
+  ```
+
+  With `local: true` (the default) it binds `127.0.0.1` on an ephemeral port. The dashboard learns the address and token through the local named pipe (`term_endpoint`); when `token` is empty, a random token is generated on first start and written back to the config file.
+- Set `remote: true` to bind `host:port` so WinConsoleTerminal on another PC can connect:
+
+  `WinConsoleTerminal --host <pc> --port 9139 --shell powershell --token <token>`
+
+  Use `attach:<id>` as the shell/target to view an existing Hancho job instead of starting a new one.
+- Settings → **WinConsoleServer** has **local** and **remote** switches (`terminal.local` / `terminal.remote`). Turning both off stops the listener, so neither the dashboard nor WinConsoleTerminal can attach.
+- WCSP is plain TCP without encryption. Enable `remote` only on a trusted LAN and keep the token private.

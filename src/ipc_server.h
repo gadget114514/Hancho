@@ -13,7 +13,9 @@
 namespace pc {
 
 class BtManager;
+class TriageManager;
 class WebUiServer;
+class TermServer;
 class IpmsgNode;
 class IpmsgHandler;
 
@@ -57,6 +59,13 @@ public:
     // Runs on a short-lived helper thread so the config_set reply is sent first.
     void ScheduleWebUiRestart();
 
+    // WCSP terminal server (ConPTY jobs exposed to the dashboard and, when
+    // "terminal.remote" is enabled, to WinConsoleTerminal on another PC).
+    void StartTermServer();
+    void StopTermServer();
+    // Stops and restarts the terminal server after a "terminal" config change.
+    void ScheduleTermServerRestart();
+
     // IPMsg node. Always constructed so history and logs stay readable while
     // the feature is disabled.
     IpmsgNode* GetIpmsg() { return ipmsg_.get(); }
@@ -88,6 +97,7 @@ private:
     ProcessManager& pm_;
     TaskQueueManager& tqm_;
     BtManager* btm_ = nullptr;
+    std::unique_ptr<TriageManager> triageManager_;
     std::atomic<HWND> notifyHwnd_{nullptr};
     std::function<void()> guiShowCb_;
     std::function<void()> shutdownCb_;
@@ -99,6 +109,8 @@ private:
     std::unique_ptr<remote::RemoteListener> remoteListener_;
     std::unique_ptr<WebUiServer> webUiServer_;
     std::thread webuiRestartThread_;
+    std::unique_ptr<TermServer> termServer_;
+    std::thread termRestartThread_;
     std::unique_ptr<IpmsgNode> ipmsg_;
     std::unique_ptr<IpmsgHandler> ipmsgHandler_;
     std::thread ipmsgRestartThread_;

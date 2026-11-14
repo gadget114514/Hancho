@@ -9,7 +9,9 @@
 #include "memory_record.h"
 #include "memory_search.h"
 #include "remote_hosts.h"
+#include "triage_manager.h"
 #include "webui_server.h"
+#include "term_server.h"
 #include "nlohmann/json.hpp"
 #include <ctime>
 #include <fstream>
@@ -113,6 +115,7 @@ static std::string ExtractRawJsonValue(const std::string& json, const std::strin
 
 IpcServer::IpcServer(ProcessManager& pm, TaskQueueManager& tqm, HWND notifyHwnd)
     : pm_(pm), tqm_(tqm), btm_(nullptr), notifyHwnd_(notifyHwnd) {
+    triageManager_ = std::make_unique<TriageManager>(pm_, tqm_, btm_);
     ipmsg_ = std::make_unique<IpmsgNode>();
     ipmsgHandler_ = std::make_unique<IpmsgHandler>(tqm_, pm_, ipmsg_.get());
     InstallRemoteCallbacks();
@@ -120,6 +123,7 @@ IpcServer::IpcServer(ProcessManager& pm, TaskQueueManager& tqm, HWND notifyHwnd)
 
 IpcServer::IpcServer(ProcessManager& pm, TaskQueueManager& tqm, BtManager* btm, HWND notifyHwnd)
     : pm_(pm), tqm_(tqm), btm_(btm), notifyHwnd_(notifyHwnd) {
+    triageManager_ = std::make_unique<TriageManager>(pm_, tqm_, btm_);
     ipmsg_ = std::make_unique<IpmsgNode>();
     ipmsgHandler_ = std::make_unique<IpmsgHandler>(tqm_, pm_, ipmsg_.get());
     InstallRemoteCallbacks();
@@ -132,21 +136,26 @@ IpcServer::~IpcServer() {
 #ifdef _WIN32
 bool IpcServer::Start() {
     stop_ = false;
+    if (triageManager_) triageManager_->Start();
     acceptThread_ = std::thread(&IpcServer::AcceptLoop, this);
     StartRemoteListener();
     StartWebUiServer();
+    StartTermServer();
     StartIpmsg();
     return true;
 }
 
 void IpcServer::Stop() {
     if (stop_.exchange(true)) return;
+    if (triageManager_) triageManager_->Stop();
     if (webuiRestartThread_.joinable()) webuiRestartThread_.join();
+    if (termRestartThread_.joinable()) termRestartThread_.join();
     {
         std::lock_guard<std::mutex> lk(ipmsgRestartMutex_);
         if (ipmsgRestartThread_.joinable()) ipmsgRestartThread_.join();
     }
     StopWebUiServer();
+    StopTermServer();
     StopIpmsg();
     if (ipmsgHandler_) ipmsgHandler_->Stop();
     StopRemoteListener();
@@ -530,6 +539,64 @@ std::string IpcServer::HandleRequestJson(const std::string& reqJson) {
     if (action == "ping") {
         return "{\"ok\":true,\"status\":\"running\",\"headless\":"
                + std::string(headless_ ? "true" : "false") + "}";
+    }
+    else if (action == "term_endpoint") {
+        if (!termServer_ || !termServer_->IsRunning() || termServer_->Port() == 0) {
+            return "{\"ok\":false,\"error\":\"terminal server is not running\"}";
+        }
+        nlohmann::json out;
+        out["ok"] = true;
+        out["host"] = "127.0.0.1";
+        out["port"] = termServer_->Port();
+        out["token"] = termServer_->Token();
+        return out.dump();
+    }
+    else if (action == "triage_list") {
+        return triageManager_ ? triageManager_->List(JsonGetString(reqJson, "state", "pending"))
+                              : "{\"ok\":false,\"error\":\"triage manager is unavailable\"}";
+    }
+    else if (action == "triage_get") {
+        return triageManager_ ? triageManager_->Get(JsonGetString(reqJson, "id", ""))
+                              : "{\"ok\":false,\"error\":\"triage manager is unavailable\"}";
+    }
+    else if (action == "triage_advise") {
+        return triageManager_ ? triageManager_->RequestAdvice(JsonGetString(reqJson, "id", ""))
+                              : "{\"ok\":false,\"error\":\"triage manager is unavailable\"}";
+    }
+    else if (action == "triage_decide") {
+        if (!triageManager_) return "{\"ok\":false,\"error\":\"triage manager is unavailable\"}";
+        nlohmann::json request = nlohmann::json::parse(reqJson, nullptr, false);
+        if (!request.is_object()) return "{\"ok\":false,\"error\":\"invalid JSON request\"}";
+        nlohmann::json params = request.value("params", nlohmann::json::object());
+        if (!params.is_object()) return "{\"ok\":false,\"error\":\"params must be an object\"}";
+        return triageManager_->Decide(JsonGetString(reqJson, "id", ""),
+                                      JsonGetString(reqJson, "candidateId", JsonGetString(reqJson, "candidate_id", "")),
+                                      JsonGetString(reqJson, "reason", ""), params,
+                                      JsonGetString(reqJson, "by", "human"));
+    }
+    else if (action == "triage_handoff") {
+        if (!triageManager_) return "{\"ok\":false,\"error\":\"triage manager is unavailable\"}";
+        nlohmann::json request = nlohmann::json::parse(reqJson, nullptr, false);
+        if (!request.is_object()) return "{\"ok\":false,\"error\":\"invalid JSON request\"}";
+        std::vector<std::string> ids;
+        auto idsIt = request.find("ids");
+        if (idsIt != request.end() && idsIt->is_array()) {
+            for (const auto& v : *idsIt) if (v.is_string()) ids.push_back(v.get<std::string>());
+        }
+        const std::string single = request.value("id", std::string());
+        if (!single.empty()) ids.push_back(single);
+        const bool all = request.value("all", false);
+        if (!all && ids.empty()) return "{\"ok\":false,\"error\":\"triage_handoff needs ids or all\"}";
+        return triageManager_->Handoff(ids, all);
+    }
+    else if (action == "triage_manual") {
+        return triageManager_ ? triageManager_->MarkManual(JsonGetString(reqJson, "id", ""))
+                              : "{\"ok\":false,\"error\":\"triage manager is unavailable\"}";
+    }
+    else if (action == "triage_ack") {
+        return triageManager_ ? triageManager_->Acknowledge(JsonGetString(reqJson, "id", ""),
+                                  JsonGetBool(reqJson, "all_auto", JsonGetBool(reqJson, "allAuto", false)))
+                              : "{\"ok\":false,\"error\":\"triage manager is unavailable\"}";
     }
     else if (action == "gui_status") {
         // A GUI client can ask whether a dashboard is available without starting one.
@@ -1672,6 +1739,17 @@ std::string IpcServer::HandleRequestJson(const std::string& reqJson) {
                 if (!w.contains("allowed_hosts")) w["allowed_hosts"] = nlohmann::json::array();
                 if (!w.contains("allowed_origins")) w["allowed_origins"] = nlohmann::json::array();
             }
+            if (!cfg.contains("terminal") || !cfg["terminal"].is_object()) {
+                cfg["terminal"] = nlohmann::json::object();
+            }
+            {
+                nlohmann::json& t = cfg["terminal"];
+                if (!t.contains("local")) t["local"] = true;
+                if (!t.contains("remote")) t["remote"] = false;
+                if (!t.contains("host")) t["host"] = "0.0.0.0";
+                if (!t.contains("port")) t["port"] = 9139;
+                if (!t.contains("token")) t["token"] = "";
+            }
             {
                 nlohmann::json& m = EnsureChatBlock(cfg);
                 nlohmann::json defaults = IpmsgConfig().ToJson();
@@ -1729,9 +1807,11 @@ std::string IpcServer::HandleRequestJson(const std::string& reqJson) {
             }
             const bool webuiChanged = patch.contains("webui");
             const bool chatChanged = patch.contains("chat");
+            const bool terminalChanged = patch.contains("terminal");
             WriteFileAtomicWide(configPath, cfg.dump(2));
             if (webuiChanged) ScheduleWebUiRestart();
             if (chatChanged) ScheduleIpmsgRestart();
+            if (terminalChanged) ScheduleTermServerRestart();
             nlohmann::json out;
             out["ok"] = true;
             out["config"] = cfg;

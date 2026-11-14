@@ -14,6 +14,7 @@
 #include "TerminalEmulator.h"
 #include "ConPtySession.h"
 #include "ImageManager.h"
+#include "wcsp/iterminal_io.h"
 
 #include <functional>
 #include <memory>
@@ -47,17 +48,29 @@ public:
     // Create the child HWND (hidden by default).  Returns nullptr on failure.
     HWND Create(HWND parent);
 
+    // Install a remote I/O backend (WCSP RemoteSession). Must be called before
+    // StartRemote(). The default backend is the in-process ConPTY session.
+    void SetRemoteIo(std::unique_ptr<ITerminalIo> io);
+
     // Lazy-start the ConPTY session.  Safe to call multiple times.
     bool StartSession(
         const std::wstring& shell = L"powershell.exe",
         UINT codePage = CP_UTF8,
         const std::vector<std::pair<std::wstring,std::wstring>>& extraEnv = {});
 
-    bool IsStarted() const { return session_.IsRunning(); }
+    // Lazy-start the remote session. `target` is the WCSP shell field, e.g.
+    // L"attach:42" or L"powershell".
+    bool StartRemote(const std::wstring& target, std::wstring* error = nullptr);
+
+    bool IsStarted() const {
+        return remoteIo_ ? remoteIo_->IsRunning() : session_.IsRunning();
+    }
     HWND Hwnd()      const { return hwnd_; }
-    HANDLE GetProcessHandle() const { return session_.GetProcessHandle(); }
-    DWORD ProcessId() const { return session_.ProcessId(); }
-    std::wstring LastError()  const { return session_.LastError(); }
+    HANDLE GetProcessHandle() const { return remoteIo_ ? nullptr : session_.GetProcessHandle(); }
+    DWORD ProcessId() const { return remoteIo_ ? 0 : session_.ProcessId(); }
+    std::wstring LastError()  const {
+        return remoteIo_ ? remoteIo_->LastError() : session_.LastError();
+    }
     std::wstring Title()      const { return title_; }
 
     void SetWorkingDirectory(const std::wstring& cwd) { session_.SetWorkingDirectory(cwd); }
@@ -98,6 +111,12 @@ private:
     void    OnChar(wchar_t ch);
     void    OnMouseWheel(int delta);
     void    OnTerminalOutput(const char* data, size_t len);
+
+    // Backend-agnostic PTY operations (local ConPtySession or remote WCSP).
+    void PtyWrite(const void* data, size_t len);
+    void PtyWriteFront(const void* data, size_t len);
+    void PtyResize(int cols, int rows);
+    bool PtyIsRunning() const;
 
     // Rendering
     bool EnsureRenderTarget();
@@ -160,6 +179,7 @@ private:
     TerminalBuffer  buffer_;
     TerminalEmulator emulator_;
     ConPtySession   session_;
+    std::unique_ptr<ITerminalIo> remoteIo_;
 
     // D2D / DWrite
     ID2D1Factory*          d2dFactory_  = nullptr;

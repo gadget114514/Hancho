@@ -107,11 +107,17 @@ The Audit LLM audits five critical dimensions from Hancho's telemetry:
 
 Audit findings are delivered through two complementary channels:
 
-### Loop A: Human-in-the-Loop (Hint Window)
-A non-intrusive floating hint window appears at the bottom-right of the Hancho GUI Dashboard:
-- Summarizes the current audit finding in plain language.
-- Includes a **"Copy Prompt" button** allowing the user to paste the exact corrective instruction directly into the Supervisor's chat prompt.
-- Automatically dismisses after a few seconds (configurable).
+### Loop A: Human-in-the-Loop (Triage)
+Triage presents one card per item that needs attention. Hancho prepares the card with information grouped as cause, background, environment, conditions and reason, then provides candidate actions and a deterministic recommendation. The flow is **information → advice → candidates → choose**: Hancho's recommendation is deterministic, while optional LLM advice only chooses among the candidates and explains why; it does not invent or execute actions.
+
+The `triage_mode` setting controls decisions:
+- `manual`: a person chooses every action; LLM advice follows `triage_llm_mode`.
+- `semi` (default): Hancho may execute a high-confidence, safe recommendation when its guards pass; other cards await a person. LLM advice follows `triage_llm_mode`.
+- `auto`: every pending card is sent for LLM advice; Hancho executes only a safe candidate with high/medium confidence and passing guards, otherwise it waits for a person.
+
+In manual/semi mode, `triage_llm_mode` is `uncertain` (default: recommendation confidence is low, a timeout is repeated/unknown, or the previous attempt had the same failure class), `manual` (request advice explicitly), or `always`. Deterministic guards allow only candidates on the card, prohibit automatic unsafe actions, limit automatic retry to once per job and failure class, cap timeout increases at 4× the original timeout and the queue's `maxTimeoutSec`, and block automation for `needsHuman`, low-confidence advice or advice errors. A pending card becomes `resolved` when its condition naturally goes away. Decisions are recorded on the card and appended to a target job's notes so the Supervisor can read them with `taskqueue_get`.
+
+LLM advice runs as a hidden job in the `_triage` task queue, with one advice job running at a time. The card information, available candidates and Hancho recommendation are included in the advice request. See the [Triage design](triage.md) for card fields, candidates, settings and behavior.
 
 ### Loop B: Fully Autonomous (Direct Machine Injection)
 When the Supervisor LLM calls `taskqueue_wait`, `taskqueue_get`, or `bt_wait`, Hancho attaches an `"audit"` object to the JSON response.

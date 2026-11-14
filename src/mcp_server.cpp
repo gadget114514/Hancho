@@ -843,6 +843,34 @@ int RunMcpServer() {
                 << "}"
                 << ","
                 << "{"
+                << "\"name\":\"triage_list\","
+                << "\"description\":\"List Hancho-prepared triage cards. Hancho supplies the information, candidate actions and deterministic recommendation; read each card before deciding. A supervisor must choose exactly one candidate id and give a reason; ignore and cancel are allowed only with a reason.\","
+                << "\"inputSchema\":{\"type\":\"object\",\"properties\":{"
+                << "\"state\":{\"type\":\"string\",\"enum\":[\"pending\",\"all\",\"acted\",\"ignored\",\"resolved\"],\"description\":\"Card state filter (default pending; use all for every card)\"}"
+                << "}}"
+                << "}"
+                << ","
+                << "{"
+                << "\"name\":\"triage_get\","
+                << "\"description\":\"Read one complete Hancho-prepared triage card, including its information, candidates and recommendation. The supervisor must read the card, choose exactly one candidate id and give a reason; ignore and cancel are allowed only with a reason.\","
+                << "\"inputSchema\":{\"type\":\"object\",\"properties\":{"
+                << "\"id\":{\"type\":\"string\",\"description\":\"Triage card id returned by triage_list\"}"
+                << "},\"required\":[\"id\"]}"
+                << "}"
+                << ","
+                << "{"
+                << "\"name\":\"triage_decide\","
+                << "\"description\":\"Record a supervisor decision on a Hancho-prepared triage card. Read the card first, choose exactly one candidate id from that card and provide a reason. ignore and cancel are allowed only with a reason. Optional multiplier is for retry_raise_timeout; answer is for candidates that require an answer.\","
+                << "\"inputSchema\":{\"type\":\"object\",\"properties\":{"
+                << "\"id\":{\"type\":\"string\",\"description\":\"Triage card id\"},"
+                << "\"candidateId\":{\"type\":\"string\",\"description\":\"Exactly one candidate id listed on this card\"},"
+                << "\"reason\":{\"type\":\"string\",\"description\":\"Required explanation for the decision\"},"
+                << "\"multiplier\":{\"type\":\"number\",\"description\":\"Optional timeout multiplier for retry_raise_timeout (1.5 to 4; default 2)\"},"
+                << "\"answer\":{\"type\":\"string\",\"description\":\"Optional answer for a candidate that needs one, such as bt_resume\"}"
+                << "},\"required\":[\"id\",\"candidateId\",\"reason\"]}"
+                << "}"
+                << ","
+                << "{"
                 << "\"name\":\"power_suspend\","
                 << "\"description\":\"Suspend the PC after a task queue job finishes and all other jobs / managed processes are idle. Pass jobId to arm an existing job (pending, running or already finished); omit jobId to suspend immediately after delaySec. The core waits for other task queue jobs (running/waiting/pending) and managed processes before the grace period starts; new work cancels the countdown. Use dryRun=true to verify without suspending. Local host only.\","
                 << "\"inputSchema\":{\"type\":\"object\",\"properties\":{"
@@ -1270,6 +1298,37 @@ int RunMcpServer() {
                 ipcReq << "{\"action\":\"taskqueue_update\""
                        << ",\"id\":\"" << JsonEscape(JsonGetString(argsJson, "id", "")) << "\""
                        << ",\"patch\":" << argsJson << "}";
+            }
+            else if (toolName == "triage_list" || toolName == "triage_get" || toolName == "triage_decide") {
+                nlohmann::json args = nlohmann::json::parse(argsJson, nullptr, false);
+                if (args.is_discarded() || !args.is_object()) args = nlohmann::json::object();
+                nlohmann::json triageReq = nlohmann::json::object();
+                triageReq["action"] = toolName;
+                if (toolName == "triage_list") {
+                    if (args.contains("state") && args["state"].is_string())
+                        triageReq["state"] = args["state"];
+                } else if (toolName == "triage_get") {
+                    triageReq["id"] = JsonGetString(argsJson, "id", "");
+                } else {
+                    const std::string id = JsonGetString(argsJson, "id", "");
+                    const std::string candidateId = JsonGetString(argsJson, "candidateId", "");
+                    const std::string reason = JsonGetString(argsJson, "reason", "");
+                    if (id.empty() || candidateId.empty() || reason.empty()) {
+                        EmitLine(BuildMcpToolResult(rpcId,
+                            "triage_decide requires id, candidateId, and a non-empty reason", true));
+                        continue;
+                    }
+                    triageReq["id"] = id;
+                    triageReq["candidateId"] = candidateId;
+                    triageReq["reason"] = reason;
+                    triageReq["by"] = "supervisor";
+                    triageReq["params"] = nlohmann::json::object();
+                    if (args.contains("multiplier") && args["multiplier"].is_number())
+                        triageReq["params"]["multiplier"] = args["multiplier"];
+                    if (args.contains("answer") && args["answer"].is_string())
+                        triageReq["params"]["answer"] = args["answer"];
+                }
+                ipcReq << triageReq.dump();
             }
             else if (toolName == "taskqueue_cancel") {
                 ipcReq << "{\"action\":\"taskqueue_cancel\",\"id\":\""

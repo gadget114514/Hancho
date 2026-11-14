@@ -283,6 +283,11 @@ int ProcessManager::StartProcess(const StartProcessRequest& req, std::string& ou
                 if (sp->cleanOutput.size() > kMaxRawBytes) {
                     sp->cleanOutput.erase(0, sp->cleanOutput.size() - kMaxRawBytes);
                 }
+                // WCSP terminal subscribers are invoked while outputMutex is held so
+                // a subscriber's replay snapshot and live stream stay contiguous.
+                for (auto& kv : sp->terminalSubscribers) {
+                    if (kv.second) kv.second(data, len);
+                }
             }
             if (!logPathW.empty() && !cleanChunk.empty()) {
                 AppendToLogFileWide(logPathW, cleanChunk);
@@ -1142,6 +1147,127 @@ TerminalView* ProcessManager::GetTerminalView(int id) {
         if (p->id == id) return p->terminalView;
     }
     return nullptr;
+}
+
+int ProcessManager::AddTerminalSubscriber(int id, std::function<void(const char*, size_t)> sink,
+                                          std::string& replay, std::string& err) {
+    std::shared_ptr<ManagedProcess> proc;
+    {
+        std::lock_guard<std::mutex> lock(mutex_);
+        for (auto& p : processes_) {
+            if (p->id == id) {
+                proc = p;
+                break;
+            }
+        }
+    }
+    if (!proc) {
+        err = "Process ID " + std::to_string(id) + " not found.";
+        return -1;
+    }
+    if (proc->mode != ExecMode::ConPTY) {
+        err = "Process ID " + std::to_string(id) + " is not a ConPTY job.";
+        return -1;
+    }
+    if (!proc->headlessPty) {
+        err = "Process ID " + std::to_string(id) +
+              " has no headless ConPTY session to attach to.";
+        return -1;
+    }
+
+    constexpr size_t kMaxReplayBytes = 512 * 1024;
+    std::lock_guard<std::mutex> outLock(proc->outputMutex);
+    if (proc->rawOutput.size() > kMaxReplayBytes) {
+        replay.assign(proc->rawOutput,
+                      proc->rawOutput.size() - kMaxReplayBytes,
+                      kMaxReplayBytes);
+    } else {
+        replay = proc->rawOutput;
+    }
+    int subId = ++proc->nextTerminalSubId;
+    proc->terminalSubscribers[subId] = std::move(sink);
+    return subId;
+}
+
+void ProcessManager::RemoveTerminalSubscriber(int id, int subId) {
+    std::shared_ptr<ManagedProcess> proc;
+    {
+        std::lock_guard<std::mutex> lock(mutex_);
+        for (auto& p : processes_) {
+            if (p->id == id) {
+                proc = p;
+                break;
+            }
+        }
+    }
+    if (!proc) return;
+    std::lock_guard<std::mutex> outLock(proc->outputMutex);
+    proc->terminalSubscribers.erase(subId);
+}
+
+bool ProcessManager::WriteTerminalRaw(int id, const void* data, size_t len, bool front,
+                                      std::string& err) {
+    std::shared_ptr<ManagedProcess> proc;
+    {
+        std::lock_guard<std::mutex> lock(mutex_);
+        for (auto& p : processes_) {
+            if (p->id == id) {
+                proc = p;
+                break;
+            }
+        }
+    }
+    if (!proc) {
+        err = "Process ID " + std::to_string(id) + " not found.";
+        return false;
+    }
+    if (proc->mode != ExecMode::ConPTY) {
+        err = "Process ID " + std::to_string(id) + " is not a ConPTY job.";
+        return false;
+    }
+    bool ok = false;
+    if (proc->terminalView) {
+        proc->terminalView->SendInput(std::string(static_cast<const char*>(data), len));
+        ok = true;
+    } else if (proc->headlessPty) {
+        ok = front ? proc->headlessPty->WriteFront(data, len)
+                   : proc->headlessPty->Write(data, len);
+    }
+    if (!ok) err = "ConPTY session is not active.";
+    return ok;
+}
+
+bool ProcessManager::ResizeTerminal(int id, int cols, int rows, std::string& err) {
+    std::shared_ptr<ManagedProcess> proc;
+    {
+        std::lock_guard<std::mutex> lock(mutex_);
+        for (auto& p : processes_) {
+            if (p->id == id) {
+                proc = p;
+                break;
+            }
+        }
+    }
+    if (!proc) {
+        err = "Process ID " + std::to_string(id) + " not found.";
+        return false;
+    }
+    if (proc->mode != ExecMode::ConPTY) {
+        err = "Process ID " + std::to_string(id) + " is not a ConPTY job.";
+        return false;
+    }
+    if (cols < 2) cols = 2;
+    if (rows < 1) rows = 1;
+    if (cols > 1000) cols = 1000;
+    if (rows > 1000) rows = 1000;
+    std::lock_guard<std::mutex> outLock(proc->outputMutex);
+    if (proc->headlessPty) {
+        proc->headlessPty->Resize(cols, rows);
+        if (proc->headlessBuffer) proc->headlessBuffer->resize(cols, rows);
+        return true;
+    }
+    err = "No headless ConPTY session to resize.";
+    return false;
 }
 
 ProcessSnapshot ProcessManager::BuildSnapshot(ProcessManager::ManagedProcess& p, uint64_t now) {

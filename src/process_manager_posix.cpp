@@ -1058,6 +1058,25 @@ AgentExtractedResult ExtractAgentResult(ProcessManager& pm, int id, bool finishe
     return out;
 }
 
+int ProcessManager::AddTerminalSubscriber(int, std::function<void(const char*, size_t)>,
+                                          std::string& replay, std::string& err) {
+    replay.clear();
+    err = "Terminal attachment is only supported on Windows.";
+    return -1;
+}
+
+void ProcessManager::RemoveTerminalSubscriber(int, int) {}
+
+bool ProcessManager::WriteTerminalRaw(int, const void*, size_t, bool, std::string& err) {
+    err = "Terminal attachment is only supported on Windows.";
+    return false;
+}
+
+bool ProcessManager::ResizeTerminal(int, int, int, std::string& err) {
+    err = "Terminal attachment is only supported on Windows.";
+    return false;
+}
+
 } // namespace pc
 
 #endif // !_WIN32

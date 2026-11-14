@@ -6,6 +6,7 @@
 #include "ipmsg.h"
 #include "ipmsg_handler.h"
 #include "remote_hosts.h"
+#include "term_server.h"
 #include "webui_server.h"
 #include "nlohmann/json.hpp"
 
@@ -505,6 +506,10 @@ void IpcServer::StartRemoteListener() {
         if (action == "subscribe") {
             return HandleRemoteSubscribe(pm_, requestJson);
         }
+        if (action == "term_endpoint") {
+            return std::string("{\"ok\":false,\"error\":\"term_endpoint is only available ")
+                   + "on the local host\"}";
+        }
         if (action.rfind("power_", 0) == 0) {
             return std::string("{\"ok\":false,\"error\":\"power actions are only available ")
                    + "on the local host\"}";
@@ -543,6 +548,10 @@ void IpcServer::StopRemoteListener() {
 
 void IpcServer::StartWebUiServer(const std::string& token) {
     auto webui = std::make_unique<WebUiServer>([this](const std::string& reqJson) {
+        if (JsonGetString(reqJson, "action", "") == "term_endpoint") {
+            return std::string("{\"ok\":false,\"error\":\"term_endpoint is only available ")
+                   + "on the local host\"}";
+        }
         return HandleRequestJson(reqJson);
     });
     std::string err;
@@ -574,6 +583,38 @@ void IpcServer::ScheduleWebUiRestart() {
         StopWebUiServer();
         if (stop_.load()) return;
         StartWebUiServer(token);
+    });
+}
+
+void IpcServer::StartTermServer() {
+    auto server = std::make_unique<TermServer>(pm_);
+    std::string err;
+    if (!server->Start(err)) {
+        WriteAuditLog("TERM_SERVER_START_FAILED",
+                      err.empty() ? "cannot start WCSP terminal server" : err);
+        return;
+    }
+    termServer_ = std::move(server);
+}
+
+void IpcServer::StopTermServer() {
+    if (termServer_) {
+        termServer_->Stop();
+        termServer_.reset();
+    }
+}
+
+void IpcServer::ScheduleTermServerRestart() {
+    if (termRestartThread_.joinable()) {
+        termRestartThread_.join();
+    }
+    termRestartThread_ = std::thread([this]() {
+        // Let the config_set reply reach the caller before dropping sessions.
+        SleepMs(250);
+        if (stop_.load()) return;
+        StopTermServer();
+        if (stop_.load()) return;
+        StartTermServer();
     });
 }
 

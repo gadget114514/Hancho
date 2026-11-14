@@ -163,6 +163,16 @@ public:
     // Get TerminalView* for a process ID (returns nullptr if not a ConPTY process)
     TerminalView* GetTerminalView(int id);
 
+    // Terminal attachment (WCSP). Subscribers receive raw ConPTY bytes; only the
+    // headless ConPTY path is supported for the server-side sessions.
+    // AddTerminalSubscriber returns a subscription id (>0) or -1; `replay` receives
+    // the tail of the raw output captured up to the moment the subscriber was added.
+    int AddTerminalSubscriber(int id, std::function<void(const char*, size_t)> sink,
+                              std::string& replay, std::string& err);
+    void RemoveTerminalSubscriber(int id, int subId);
+    bool WriteTerminalRaw(int id, const void* data, size_t len, bool front, std::string& err);
+    bool ResizeTerminal(int id, int cols, int rows, std::string& err);
+
     // Get snapshot of a single process
     bool GetSnapshot(int id, ProcessSnapshot& outSnap);
 
@@ -249,6 +259,8 @@ private:
         std::atomic<uint64_t> treeMemoryBytes{0};
 
         std::mutex outputMutex;
+        std::map<int, std::function<void(const char*, size_t)>> terminalSubscribers;
+        int nextTerminalSubId = 0;
         std::string rawOutput;
         std::string cleanOutput;
         std::string lastLinePreview;

@@ -496,7 +496,39 @@ static const wchar_t* TrMain(const wchar_t* ja, const wchar_t* en) {
 // Starts the background core without asking. The dashboard cannot work without a core, so the
 // old yes/no prompt only added a click to every launch. --no-prompt keeps the script-friendly
 // "fail instead of launching" behavior.
+static bool WaitForCorePing(HANDLE coreProcess, int timeoutMs) {
+    const ULONGLONG deadline = GetTickCount64() + static_cast<ULONGLONG>(timeoutMs);
+    while (GetTickCount64() < deadline) {
+        Sleep(100);
+        std::string resp, err;
+        if (SendIpcRequest("{\"action\":\"ping\"}", resp, err, false)) return true;
+        // The core we launched exited (crash, or it lost the instance lock to another
+        // core) and nobody holds the lock now: waiting longer cannot succeed.
+        if (coreProcess && WaitForSingleObject(coreProcess, 0) == WAIT_OBJECT_0 &&
+            !IsHanchoRunningForDataDirWide()) {
+            return false;
+        }
+    }
+    return false;
+}
+
 static bool StartCoreHeadless() {
+    // Restoring many jobs can make the core slow to open its pipe; the old 5 seconds
+    // made callers give up and start yet another core.
+    const int kCoreStartWaitMs = 30000;
+
+    // A core is already starting (it holds the instance lock): wait for it instead of
+    // launching another one.
+    if (IsHanchoRunningForDataDirWide()) {
+        if (WaitForCorePing(nullptr, kCoreStartWaitMs)) return true;
+        const wchar_t* waitErrText = TrMain(
+            L"Hancho コアは起動していますが、応答がありません。",
+            L"Hancho core is running but does not respond."
+        );
+        MessageBoxW(nullptr, waitErrText, TrMain(L"エラー", L"Error"), MB_ICONERROR);
+        return false;
+    }
+
     wchar_t exePath[MAX_PATH] = {};
     GetModuleFileNameW(nullptr, exePath, MAX_PATH);
 
@@ -529,15 +561,9 @@ static bool StartCoreHeadless() {
         return false;
     }
     CloseHandle(pi.hThread);
+    const bool ready = WaitForCorePing(pi.hProcess, kCoreStartWaitMs);
     CloseHandle(pi.hProcess);
-
-    for (int i = 0; i < 50; ++i) {
-        Sleep(100);
-        std::string resp, err;
-        if (SendIpcRequest("{\"action\":\"ping\"}", resp, err, false)) {
-            return true;
-        }
-    }
+    if (ready) return true;
 
     const wchar_t* waitErrText = TrMain(
         L"Hancho コアの起動待機中にタイムアウトしました。",

@@ -84,8 +84,9 @@ bool SendIpcRequest(const std::string& reqJson, std::string& outRespJson, std::s
     std::string err;
     auto conn = platform::ConnectIpc(endpoint, 0, err);
     if (!conn && autoStartGui) {
-        SpawnCore();
-        for (int attempt = 0; attempt < 40 && !conn; ++attempt) {
+        // A core holding the instance lock is still starting: wait, don't spawn another.
+        if (!IsHanchoRunningForDataDirWide()) SpawnCore();
+        for (int attempt = 0; attempt < 300 && !conn; ++attempt) {
             SleepMs(100);
             conn = platform::ConnectIpc(endpoint, 0, err);
         }

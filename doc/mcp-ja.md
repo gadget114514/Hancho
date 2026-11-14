@@ -57,6 +57,18 @@ hancho-cli.exe mcp uninstall --delete-data-dir           # データディレク
 | `taskqueue_link` / `taskqueue_unlink` | 依存を 1 本追加 / 削除（`job`, `dependsOn`, `on` = `success`\|`done`）。 |
 | `taskqueue_graph` | 依存グラフ（`ready` / `waiting_for` / `dependents`）。 |
 
+**トリアージ操作**
+
+各カードの情報・処置候補・決定論的な推奨は Hancho が用意します。判断前にカードを読み、Supervisor はカードにある候補 id を 1 つ選び、理由を付けてください。`ignore` と `cancel` は理由がある場合のみ選べます。
+
+| ツール | 説明 |
+| :--- | :--- |
+| `triage_list` | カード一覧（`state?`: 既定 `pending`、`all`、`acted`、`ignored`、`resolved`）。 |
+| `triage_get` | 1 枚のカードと情報・推奨・助言・候補・判断記録を取得（`id`）。 |
+| `triage_decide` | 候補を選択して記録（`id`, `candidateId`, 必須 `reason`, `retry_raise_timeout` 用の任意 `multiplier?`, 回答が必要な候補用の任意 `answer?`）。判断の `by` は `"supervisor"` になります。 |
+
+自動処置の確認には IPC と `hancho-cli triage ack` の `triage_ack` アクションを使います。MCP ツールは上記の 3 つです。全体の流れと候補は[トリアージ設計](triage.md)を参照してください。
+
 **サスペンド操作**
 
 | ツール | 説明 |

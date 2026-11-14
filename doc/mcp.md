@@ -58,6 +58,18 @@ You can also run the server directly with `Hancho.exe mcp`. It connects to the d
 | `taskqueue_link` / `taskqueue_unlink` | Add/remove one dependency (`job`, `dependsOn`, `on` = `success`\|`done`). |
 | `taskqueue_graph` | Dependency graph with `ready` / `waiting_for` / `dependents`. |
 
+**Triage tools**
+
+Hancho prepares each card with its information, candidate actions and deterministic recommendation. Read the card before deciding; the supervisor chooses exactly one candidate id from it and provides a reason. `ignore` and `cancel` are allowed only with a reason.
+
+| Tool | Description |
+| :--- | :--- |
+| `triage_list` | List cards (`state?`: `pending` by default, `all`, `acted`, `ignored`, or `resolved`). |
+| `triage_get` | Read one complete card and its information, recommendation, advice, candidates and decision (`id`). |
+| `triage_decide` | Choose and record a candidate (`id`, `candidateId`, required `reason`, optional `multiplier?` for `retry_raise_timeout`, optional `answer?` for candidates that need an answer). The decision is recorded with `by: "supervisor"`. |
+
+The `triage_ack` action is available through IPC and `hancho-cli triage ack` to confirm automatic decisions; MCP provides the three tools above. See the [Triage design](triage.md) for the full workflow and candidate actions.
+
 **Power tools**
 
 | Tool | Description |

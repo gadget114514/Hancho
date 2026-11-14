@@ -29,6 +29,7 @@
   - **`[>_]`** ターミナルパネルの表示/非表示切り替え
   - **`[⤓]`** タスクトレイに格納
   - ツールバーの各アイコンボタンに状態対応のホバーツールチップが設定されています。
+- **トリアージ**: 失敗ジョブなどの対象ごとに永続カードを作成し、Hancho が集めた情報・処置候補・決定論的な推奨を表示します。人が判断を選んで記録し、LLM に助言を依頼できます。判断待ち・処置済み・無視・自然解消を追跡できます。詳細は[トリアージ](triage.md)を参照してください。
 
 ![Terminal Grid View](images/grid_view.png)
 
@@ -101,3 +102,20 @@
 - `from_agent` / `to_agent` / `reply_to`、`audience`（human / agent）、ホップ数ガードによる LLM 同士のメッセージング。受信メッセージをワーカー LLM に渡し、その JSON 回答を返信として送れます。
 - `hancho-cli chat ...`、MCP の `chat_*` ツール、単体ダイアログ（`Hancho.exe chat [--tray]`、ダッシュボードのツールバーからも起動可）を提供。トレイ通知、検索可能なログ、設定を備えます。
 - 信頼できる LAN 専用で、暗号化はありません。プロトコル、設定、セキュリティ、例は [Chat](chat-ja.md) を参照。
+
+## 10. ターミナルセッション（WCSP）
+- コアはすべての ConPTY ジョブを WinConsoleServer プロトコル（WCSP v1）で公開します。スタンドアロンのダッシュボード（`Hancho.exe gui`）はローカル TCP リスナー経由でジョブに接続し、既存のターミナルタブに画面とキー入力を表示します。ダッシュボードを閉じたり、タブを切り替えたり、切断してもジョブは停止しません。
+- リスナーは `<data-dir>/config.json` で設定します。
+
+  ```json
+  "terminal": { "local": true, "remote": false, "host": "0.0.0.0", "port": 9139, "token": "" }
+  ```
+
+  `local: true`（既定）では `127.0.0.1` の一時ポートにバインドします。ダッシュボードはローカル名前付きパイプ（`term_endpoint`）からアドレスとトークンを取得します。`token` が空の場合は初回起動時にランダムなトークンを生成し、設定ファイルへ書き戻します。
+- `remote: true` にすると `host:port` にバインドし、別 PC の WinConsoleTerminal から接続できます。
+
+  `WinConsoleTerminal --host <pc> --port 9139 --shell powershell --token <token>`
+
+  シェル（ターゲット）に `attach:<id>` を指定すると、新しいシェルを起動せず既存の Hancho ジョブを表示できます。
+- 設定の **WinConsoleServer** タブに **ローカル接続** と **リモート接続** のスイッチ（`terminal.local` / `terminal.remote`）があります。両方オフにするとリスナーを停止し、ダッシュボードからも WinConsoleTerminal からも接続できません。
+- WCSP は暗号化なしのプレーン TCP です。`remote` は信頼できる LAN でのみ有効にし、トークンは公開しないでください。

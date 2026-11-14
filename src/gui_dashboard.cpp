@@ -9,8 +9,10 @@
 #include "bt_debug_view.h"
 #include "memory_record.h"
 #include "memory_search.h"
+#include "triage_text.h"
 #include "TerminalView.h"
 #include "TerminalGridView.h"
+#include "wcsp/remote_session.h"
 #include "SettingsManager.h"
 #include "remote_hosts.h"
 #include "ipc_client.h"
@@ -790,7 +792,7 @@ static int ListFontSizeIndex(int px) {
     return idx;
 }
 constexpr int kMinTerminalH        = 200;
-constexpr int kNumKpiCards         = 14;
+constexpr int kNumKpiCards         = 16;
 constexpr int kUsagePanelH         = 170;
 constexpr int kMinStreamPaneH      = 160;
 constexpr int64_t kLongStepMs      = 30000;
@@ -883,6 +885,11 @@ enum ControlId {
     IDC_SET_WEBUI_ALLOWED_HOSTS = 6061,
     IDC_SET_WEBUI_PORT = 6062,
     IDC_SET_SHOW_HIDDEN_TASKS = 6063,
+    IDC_SET_TRIAGE_MODE = 6064,
+    IDC_SET_TRIAGE_LLM_MODE = 6065,
+    IDC_SET_TRIAGE_KIND_BASE = 6066, // 6066..6070
+    IDC_SET_TERM_LOCAL = 6071,
+    IDC_SET_TERM_REMOTE = 6072,
     IDM_TRAY_RESTORE = 4001,
     IDM_TRAY_GRID_VIEW = 4002,
     IDM_TRAY_HIDE = 4003,
@@ -944,11 +951,18 @@ struct SupervisorHintRecord {
     std::wstring summary;
     std::wstring prompt;
     std::string signature;
+    bool resolved = false; // Resolve was pressed for this hint
 };
 
 constexpr size_t kSupervisorHintHistoryMax = 200;
 constexpr int kHintWndWidth = 560;
 constexpr int kHintWndHeight = 210;
+
+struct RemoteTerm {
+    std::unique_ptr<TerminalView> view;
+    bool failed = false;
+    uint64_t retryAt = 0;
+};
 
 struct DashboardState {
     ProcessManager* pm = nullptr;
@@ -974,9 +988,22 @@ struct DashboardState {
     HWND hwndHintHistory = nullptr;
     bool showSupervisorHints = true;
     int hintAutoDismissSec = 7;
-    std::string supervisorCommand = "claude";
+    std::string supervisorCommand;  // batch supervisor engine name (triage_supervisor_engine); "" = default
     std::string lastHintSignature;
     int unreadHintCount = 0; // hints added since the hint history was last opened (badge on its button)
+    int pendingTriageTask = 0;
+    int pendingTriageProcess = 0;
+    int pendingTriageOther = 0;
+    int autoTriageUnreviewed = 0;
+    int triageFollowUp = 0;
+    nlohmann::json triageResponse = nlohmann::json::object();
+    std::unordered_set<std::string> seenTriageCards;
+    std::unordered_set<std::string> seenAutoTriageCards;
+    std::unordered_set<std::string> hiddenTriageCards;
+    std::unordered_map<std::string, nlohmann::json> triageJobs;
+    std::string triageMode = "semi";
+    std::string triageLlmMode = "uncertain";
+    std::string currentTriageCardId;
     int chatUnread = 0;      // unread Chat messages (badge on the Chat toolbar button)
     uint64_t lastChatPollTickMs = 0;
     // Signatures already popped up. Automatic hints skip them so a second divergence, failure or
@@ -1073,6 +1100,7 @@ struct DashboardState {
     int sortColumn = 0;        // Default: Column 0 (ID)
     SortDirection sortDirection = SortDirection::Descending; // Default: Descending (newest processes at the top)
 
+    int taskFitColW[4] = {};   // content widths of the task list's ID, State, Start and End columns (0: not measured)
     int taskSortColumn = -1;   // -1: the task list keeps its natural order
     SortDirection taskSortDirection = SortDirection::None;
 
@@ -1109,6 +1137,14 @@ struct DashboardState {
 
     std::vector<ProcessSnapshot> allSnapshots;
     std::vector<ProcessSnapshot> cachedSnapshots;
+
+    // WCSP terminal views (standalone dashboard: st->pm == nullptr).
+    std::unordered_map<int, RemoteTerm> remoteTerms;
+    bool termEndpointKnown = false;
+    uint64_t termEndpointRetryAt = 0;
+    std::string termHost = "127.0.0.1";
+    uint16_t termPort = 0;
+    std::string termToken;
     RECT rcKpiArea = {};
     RECT rcTerminalArea = {10, 300, 1380, 810};
     RECT rcStatusBar = {0, 814, 1400, 840};
@@ -1121,6 +1157,15 @@ struct DashboardState {
 
 static DashboardState* GetState(HWND hwnd) {
     return reinterpret_cast<DashboardState*>(GetWindowLongPtrW(hwnd, GWLP_USERDATA));
+}
+
+// Returns the TerminalView for a process: the in-process one when the dashboard
+// owns the core, or the WCSP remote view in the standalone dashboard.
+static TerminalView* GetTerminalViewForProcess(DashboardState* st, int id) {
+    if (!st || id <= 0) return nullptr;
+    if (st->pm) return st->pm->GetTerminalView(id);
+    auto it = st->remoteTerms.find(id);
+    return (it != st->remoteTerms.end()) ? it->second.view.get() : nullptr;
 }
 
 // ---------------------------------------------------------------------------
@@ -1583,6 +1628,23 @@ static std::wstring FormatRemainingTime(int64_t remainingSec) {
     return buf;
 }
 
+// A duration in few characters for the task list: "1時間05分", "5分12秒", "42秒" (en: "1h05m", "5m12s", "42s").
+static std::wstring FormatCompactDuration(int64_t sec) {
+    if (sec < 0) sec = 0;
+    const int64_t hrs = sec / 3600;
+    const int64_t mins = (sec % 3600) / 60;
+    const int64_t secs = sec % 60;
+    wchar_t buf[64] = {};
+    if (hrs > 0) {
+        swprintf_s(buf, Tr(L"%lld時間%02lld分", L"%lldh%02lldm", L"%lldh%02lldm"), hrs, mins);
+    } else if (mins > 0) {
+        swprintf_s(buf, Tr(L"%lld分%02lld秒", L"%lldm%02llds", L"%lldm%02llds"), mins, secs);
+    } else {
+        swprintf_s(buf, Tr(L"%lld秒", L"%llds", L"%llds"), secs);
+    }
+    return buf;
+}
+
 static std::wstring FormatRemainingTimeShort(int64_t remainingSec) {
     if (remainingSec <= 0) {
         return L"0s";
@@ -1888,7 +1950,7 @@ static void UpdateKpiTooltips(DashboardState* st, uint32_t totalTreeProcs,
                               int64_t procMinRemainSec = -1, int64_t taskMinRemainSec = -1) {
     if (!st || !st->hwndKpiTip) return;
 
-    // Row 0: Processes (Cards 0..6)
+    // Row 0: Processes (Cards 0..7)
     st->kpiTipText[0] = Tr(
         L"管理対象のターミナル/プロセスの総数。",
         L"Total number of managed terminals/processes.",
@@ -1929,14 +1991,18 @@ static void UpdateKpiTooltips(DashboardState* st, uint32_t totalTreeProcs,
     if (procMinRemainSec >= 0) {
         st->kpiTipText[6] += std::wstring(L"\n") + Tr(L"残り時間: ", L"Remaining: ", L"Restante: ") + FormatRemainingTime(procMinRemainSec);
     }
-
-    // Row 1: Tasks (Cards 7..13)
     st->kpiTipText[7] = Tr(
+        L"失敗・タイムアウト・強制終了したプロセスの判断待ちカード。",
+        L"Process failure, timeout, or forced-stop cards awaiting a decision.",
+        L"Tarjetas de procesos fallidos, agotados o terminados que esperan una decisión.");
+
+    // Row 1: Tasks (Cards 8..15)
+    st->kpiTipText[8] = Tr(
         L"タスクキューに登録されている全ジョブの総数。",
         L"Total number of jobs in the task queue.",
         L"Total de tareas en la cola de tareas.");
 
-    st->kpiTipText[8] = Tr(
+    st->kpiTipText[9] = Tr(
         L"現在実行中のタスク数。",
         L"Number of tasks currently running.",
         L"Número de tareas en ejecución actualmente.");
@@ -1946,35 +2012,43 @@ static void UpdateKpiTooltips(DashboardState* st, uint32_t totalTreeProcs,
         tqWaitTip += std::wstring(L" (+") + std::to_wstring(tqCounts.pending) +
             Tr(L" 依存関係保留)", L" pending for deps)", L" pendientes por dependencias)");
     }
-    st->kpiTipText[9] = std::wstring(Tr(
+    st->kpiTipText[10] = std::wstring(Tr(
         L"依存関係が満たされ実行準備が整っているタスク。",
         L"Tasks ready to run with all dependencies satisfied.",
         L"Tareas listas para ejecutarse con dependencias cumplidas.")) + L" (" + tqWaitTip + L")";
 
-    st->kpiTipText[10] = Tr(
+    st->kpiTipText[11] = Tr(
         L"正常に成功・完了したタスク。",
         L"Tasks that finished successfully.",
         L"Tareas finalizadas con éxito.");
 
-    st->kpiTipText[11] = Tr(
+    st->kpiTipText[12] = Tr(
         L"試行回数上限またはタイムアウト等で失敗したタスク、またはキャンセルされたタスク。",
         L"Tasks that failed after max attempts/timeout, or were cancelled.",
         L"Tareas fallidas tras agotar intentos/tiempo límite o canceladas.");
 
-    st->kpiTipText[12] = Tr(
+    st->kpiTipText[13] = Tr(
         L"未完了の先行タスク待ち (依存保留)、または先行タスク失敗によりブロックされたタスク。",
         L"Tasks waiting for unfinished dependencies, or blocked by upstream failure.",
         L"Tareas en espera de dependencias o bloqueadas por fallo aguas arriba.");
 
-    st->kpiTipText[13] = Tr(
+    st->kpiTipText[14] = Tr(
         L"未完了タスク（実行中・待機・保留のうち実行されうるもの）の残り時間の合計。見積もり時間があればそれを使い、なければタイムアウト値で見積もります。ブロックされて実行されないタスクは含みません。",
         L"Total remaining time across unfinished tasks that can still run (running, waiting, pending). Uses the job's estimate when present, otherwise its timeout. Blocked tasks that will never run are not included.",
         L"Tiempo restante total de las tareas sin terminar que aún pueden ejecutarse (en ejecución, en espera, pendientes). Usa la estimación del trabajo si existe; si no, su tiempo límite. Las tareas bloqueadas que nunca se ejecutarán no se incluyen.");
     if (tqCounts.sumRemainingSec >= 0) {
-        st->kpiTipText[13] += std::wstring(L"\n") + Tr(L"合計残り時間: ", L"Total remaining: ", L"Restante total: ") + FormatRemainingTime(tqCounts.sumRemainingSec);
+        st->kpiTipText[14] += std::wstring(L"\n") + Tr(L"合計残り時間: ", L"Total remaining: ", L"Restante total: ") + FormatRemainingTime(tqCounts.sumRemainingSec);
     }
     if (taskMinRemainSec >= 0) {
-        st->kpiTipText[13] += std::wstring(L"\n") + Tr(L"最短: ", L"Shortest: ", L"Más corto: ") + FormatRemainingTime(taskMinRemainSec);
+        st->kpiTipText[14] += std::wstring(L"\n") + Tr(L"最短: ", L"Shortest: ", L"Más corto: ") + FormatRemainingTime(taskMinRemainSec);
+    }
+    st->kpiTipText[15] = Tr(
+        L"失敗・タイムアウトしたタスクのうち判断待ちの件数。自動処置が未確認の場合は併記します。",
+        L"Task failures and timeouts awaiting a decision; includes the count of unreviewed automatic actions.",
+        L"Fallos y tiempos agotados que esperan decisión; incluye acciones automáticas sin revisar.");
+    if (st->autoTriageUnreviewed > 0) {
+        st->kpiTipText[15] += L"\n" + std::to_wstring(st->autoTriageUnreviewed) +
+            Tr(L" 件の自動処置が未確認", L" automatic action(s) unreviewed", L" acción(es) automáticas sin revisar");
     }
 
     for (int i = 0; i < kNumKpiCards; ++i) {
@@ -2168,7 +2242,7 @@ static void DrawDashboardCanvas(DashboardState* st, HDC hdcWindow) {
     // 1. Top KPI Cards (2 rows: Row 0 = Processes, Row 1 = Tasks)
     int kpiMargin = 10;
     int kpiGap = 7;
-    int numCols = 7;
+    int numCols = 8;
     int availW = width - kpiMargin * 2 - kpiGap * (numCols - 1);
     int cardW = (std::max)(90, availW / numCols);
 
@@ -2214,6 +2288,11 @@ static void DrawDashboardCanvas(DashboardState* st, HDC hdcWindow) {
                     std::wstring val = (minRemainingSec >= 0) ? FormatRemainingTimeShort(minRemainingSec) : Tr(L"なし", L"None", L"Ninguno");
                     DrawKpiCard(hdc, rcCard, Tr(L"残り時間", L"PROC TIMEOUT", L"TIEMPO RESTANTE"),
                                 val, KpiAccent(6), st->hFontUiBold, st->hFontKpiVal);
+                } else if (col == 7) {
+                    DrawKpiCard(hdc, rcCard, Tr(L"プロセス判断待ち", L"PROC TRIAGE", L"TRIAJE PROC"),
+                                std::to_wstring(st->pendingTriageProcess),
+                                st->pendingTriageProcess > 0 ? KpiAccent(4) : KpiAccent(0),
+                                st->hFontUiBold, st->hFontKpiVal);
                 }
             } else {
                 // Bottom Row: Tasks
@@ -2246,6 +2325,19 @@ static void DrawDashboardCanvas(DashboardState* st, HDC hdcWindow) {
                     std::wstring val = (tqCounts.sumRemainingSec >= 0) ? FormatRemainingTimeShort(tqCounts.sumRemainingSec) : Tr(L"なし", L"None", L"Ninguno");
                     DrawKpiCard(hdc, rcCard, Tr(L"残り時間", L"TASK REMAINING", L"RESTANTE TOTAL"),
                                 val, KpiAccent(6), st->hFontUiBold, st->hFontKpiVal);
+                } else if (col == 7) {
+                    std::wstring sub;
+                    if (st->autoTriageUnreviewed > 0)
+                        sub = Tr(L"自動 ", L"Auto ", L"Auto ") + std::to_wstring(st->autoTriageUnreviewed) +
+                            Tr(L" 未確認", L" unreviewed", L" sin revisar");
+                    if (st->triageFollowUp > 0) {
+                        if (!sub.empty()) sub += L" / ";
+                        sub += Tr(L"要フォロー ", L"Follow-up ", L"Seguimiento ") + std::to_wstring(st->triageFollowUp);
+                    }
+                    DrawKpiCard(hdc, rcCard, Tr(L"タスク判断待ち", L"TASK TRIAGE", L"TRIAJE TAREAS"),
+                                std::to_wstring(st->pendingTriageTask),
+                                st->pendingTriageTask > 0 ? KpiAccent(4) : KpiAccent(0),
+                                st->hFontUiBold, st->hFontKpiVal, -1.0f, sub);
                 }
             }
         }
@@ -2414,8 +2506,8 @@ static void DrawDashboardCanvas(DashboardState* st, HDC hdcWindow) {
             HBRUSH tvBrush = CreateSolidBrush(g_theme.terminalBg);
             FillRect(hdc, &rcTv, tvBrush);
             DeleteObject(tvBrush);
-            if (st->pm) {
-                TerminalView* tv = st->pm->GetTerminalView(snap->id);
+            if (st->pm || !st->remoteTerms.empty()) {
+                TerminalView* tv = GetTerminalViewForProcess(st, snap->id);
                 if (tv) {
                     std::wstring termText = tv->ExtractScreenText(0);
                     if (!termText.empty()) {
@@ -2466,11 +2558,9 @@ static void DrawDashboardCanvas(DashboardState* st, HDC hdcWindow) {
         if (!selSnap->logFilePath.empty()) {
             sbLeft << L"  |  " << Tr(L"ログ: ", L"Log: ", L"Registro: ") << Utf8ToWide(selSnap->logFilePath);
         }
-        if (st->pm) {
-            TerminalView* tv = st->pm->GetTerminalView(selSnap->id);
-            if (tv && !tv->Title().empty()) {
-                sbLeft << L"  |  " << Tr(L"タイトル: ", L"Title: ", L"Título: ") << tv->Title();
-            }
+        TerminalView* tv = GetTerminalViewForProcess(st, selSnap->id);
+        if (tv && !tv->Title().empty()) {
+            sbLeft << L"  |  " << Tr(L"タイトル: ", L"Title: ", L"Título: ") << tv->Title();
         }
         if (st->termProgressState > 0) {
             sbLeft << L"  |  " << Tr(L"進捗: ", L"Progress: ", L"Progreso: ") << st->termProgressValue << L"%";
@@ -2569,18 +2659,18 @@ static void UpdateListHeaderSortIndicator(DashboardState* st) {
     }
 }
 
-// Task list columns: ID, Summary, State, Start, End, Running, Depends, Queue, Origin, Resources.
-static constexpr int kTaskListColumns = 10;
+// Task list columns: ID, Summary, State, Triage, Start, End, Running, Depends, Queue, Origin, Resources.
+static constexpr int kTaskListColumns = 11;
 
 static const wchar_t* TaskColumnTitle(int index) {
     static const wchar_t* const ja[kTaskListColumns] = {
-        L"ID", L"サマリ", L"状態", L"開始時刻", L"終了 / 残り時間", L"実行中", L"依存 / 理由", L"キュー", L"発行元", L"リソース"
+        L"ID", L"サマリ", L"状態", L"判断", L"開始時刻", L"終了 / 残り時間", L"実行中", L"依存 / 理由", L"キュー", L"発行元", L"リソース"
     };
     static const wchar_t* const en[kTaskListColumns] = {
-        L"ID", L"Summary", L"State", L"Start", L"End / Left", L"Running", L"Depends / Reason", L"Queue", L"Origin", L"Resources"
+        L"ID", L"Summary", L"State", L"Triage", L"Start", L"End / Left", L"Running", L"Depends / Reason", L"Queue", L"Origin", L"Resources"
     };
     static const wchar_t* const es[kTaskListColumns] = {
-        L"ID", L"Resumen", L"Estado", L"Inicio", L"Fin / Restante", L"En curso", L"Dependencias", L"Cola", L"Origen", L"Recursos"
+        L"ID", L"Resumen", L"Estado", L"Triaje", L"Inicio", L"Fin / Restante", L"En curso", L"Dependencias", L"Cola", L"Origen", L"Recursos"
     };
     if (g_uiLanguage == UiLanguage::Spanish) return es[index];
     if (g_uiLanguage == UiLanguage::English) return en[index];
@@ -2618,6 +2708,9 @@ static void UpdateTaskListHeaders(DashboardState* st) {
 // One row of the task list: the cells to show plus the values a sort compares.
 // The two time columns keep the full date and time, because the column itself
 // only shows the time of day.
+static bool MeasureTaskFitColumns(DashboardState* st);
+static void UpdateTaskListColumnWidths(DashboardState* st);
+
 struct TaskListRow {
     std::wstring cells[kTaskListColumns];
     std::string id;
@@ -2672,18 +2765,19 @@ static int CompareTaskRows(const TaskListRow& a, const TaskListRow& b, int col) 
             break;
         case 1:  // Summary
         case 2:  // State
-        case 5:  // Running
-        case 6:  // Depends / Reason
-        case 7:  // Queue
-        case 8:  // Origin
-        case 9:  // Resources
+        case 3:  // Triage
+        case 6:  // Running
+        case 7:  // Depends / Reason
+        case 8:  // Queue
+        case 9:  // Origin
+        case 10: // Resources
             cmp = CompareCellText(a.cells[col], b.cells[col]);
             break;
-        case 3:  // Start: the full date and time of the last attempt
-        case 4:  // End: the full date and time of the end, or of the estimated end
+        case 4:  // Start: the full date and time of the last attempt
+        case 5:  // End: the full date and time of the end, or of the estimated end
         {
-            const int64_t ka = (col == 3) ? a.startKey : a.endKey;
-            const int64_t kb = (col == 3) ? b.startKey : b.endKey;
+            const int64_t ka = (col == 4) ? a.startKey : a.endKey;
+            const int64_t kb = (col == 4) ? b.startKey : b.endKey;
             if (ka == 0 && kb == 0) cmp = 0;
             else if (ka == 0) cmp = 1;
             else if (kb == 0) cmp = -1;
@@ -2719,6 +2813,38 @@ static void UpdateControlTooltip(HWND hwndTip, HWND hwndParent, HWND hwndCtrl, c
     SendMessageW(hwndTip, TTM_UPDATETIPTEXTW, 0, reinterpret_cast<LPARAM>(&ti));
 }
 
+// One tooltip window per top-level dialog, created the first time a control asks for help.
+// The tooltip is owned by the dialog, so Windows destroys it together with the dialog.
+static HWND EnsureControlTip(HWND hwndParent) {
+    if (!hwndParent) return nullptr;
+    HWND tip = reinterpret_cast<HWND>(GetPropW(hwndParent, L"HanchoControlTip"));
+    if (tip && IsWindow(tip)) return tip;
+    tip = CreateWindowExW(WS_EX_TOPMOST, TOOLTIPS_CLASSW, nullptr,
+        WS_POPUP | TTS_ALWAYSTIP | TTS_NOPREFIX,
+        CW_USEDEFAULT, CW_USEDEFAULT, CW_USEDEFAULT, CW_USEDEFAULT,
+        hwndParent, nullptr, GetModuleHandleW(nullptr), nullptr);
+    if (!tip) return nullptr;
+    SetWindowPos(tip, HWND_TOPMOST, 0, 0, 0, 0, SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE);
+    SendMessageW(tip, TTM_SETMAXTIPWIDTH, 0, 460);
+    SendMessageW(tip, TTM_SETDELAYTIME, TTDT_INITIAL, 400);
+    SetPropW(hwndParent, L"HanchoControlTip", tip);
+    return tip;
+}
+
+// Adds detailed hover help to one control. "\n" starts a new tooltip line.
+static void AddControlHelp(HWND hwndParent, HWND hwndCtrl, const wchar_t* text) {
+    if (!hwndParent || !hwndCtrl || !text || !*text) return;
+    HWND tip = EnsureControlTip(hwndParent);
+    if (!tip) return;
+    TOOLINFOW ti = {};
+    ti.cbSize = sizeof(ti);
+    ti.hwnd = hwndParent;
+    ti.uId = reinterpret_cast<UINT_PTR>(hwndCtrl);
+    ti.uFlags = TTF_SUBCLASS | TTF_IDISHWND;
+    ti.lpszText = const_cast<wchar_t*>(text);
+    SendMessageW(tip, TTM_ADDTOOLW, 0, reinterpret_cast<LPARAM>(&ti));
+}
+
 static void UpdatePanelToggleLabels(DashboardState* st) {
     if (!st) return;
     if (st->hwndBtnToggleList) {
@@ -2730,27 +2856,91 @@ static void UpdatePanelToggleLabels(DashboardState* st) {
     if (st->hwndToolbarTip) {
         if (st->hwndBtnToggleList) {
             UpdateControlTooltip(st->hwndToolbarTip, st->hwndMain, st->hwndBtnToggleList,
-                st->hideProcessList ? Tr(L"リストを表示", L"Show List", L"Mostrar lista")
-                                    : Tr(L"リストを非表示", L"Hide List", L"Ocultar lista"));
+                st->hideProcessList
+                    ? Tr(L"プロセス一覧とタスクキューを再表示します。\nターミナル領域を元の広さに戻します。",
+                         L"Shows the process and task lists again.\nThe terminal area returns to its normal size.",
+                         L"Vuelve a mostrar las listas de procesos y tareas.\nEl área de terminal recupera su tamaño normal.")
+                    : Tr(L"プロセス一覧とタスクキューを非表示にします。\nターミナル領域を広く使えます。",
+                         L"Hides the process and task lists.\nGives the terminal area more room.",
+                         L"Oculta las listas de procesos y tareas.\nDeja más espacio para la terminal."));
         }
         if (st->hwndBtnToggleTerm) {
             UpdateControlTooltip(st->hwndToolbarTip, st->hwndMain, st->hwndBtnToggleTerm,
-                st->hideTerminalGrid ? Tr(L"ターミナルを表示", L"Show Terminal", L"Mostrar terminal")
-                                     : Tr(L"ターミナルを非表示", L"Hide Terminal", L"Ocultar terminal"));
+                st->hideTerminalGrid
+                    ? Tr(L"ターミナルのグリッド表示を再表示します。\n各プロセスの出力を並べて確認できます。",
+                         L"Shows the terminal grid again.\nWatch the output of several processes side by side.",
+                         L"Vuelve a mostrar la cuadrícula de terminales.\nObserva la salida de varios procesos a la vez.")
+                    : Tr(L"ターミナルのグリッド表示を隠します。\n一覧と監視ペインを広く使えます。",
+                         L"Hides the terminal grid.\nGives the lists and monitor pane more room.",
+                         L"Oculta la cuadrícula de terminales.\nDeja más espacio a las listas y al panel de monitor."));
         }
         if (st->hwndBtnStreamPane) {
             UpdateControlTooltip(st->hwndToolbarTip, st->hwndMain, st->hwndBtnStreamPane,
-                st->showStreamPane ? Tr(L"タスク監視ペインを非表示", L"Hide Monitor Pane", L"Ocultar panel de monitor")
-                                   : Tr(L"タスク監視ペインを表示", L"Show Monitor Pane", L"Mostrar panel de monitor"));
+                st->showStreamPane
+                    ? Tr(L"選択中プロセスの LLM イベント（ツール呼び出し・トークン使用量）を隠します。\nもう一度押すと再表示します。",
+                         L"Hides the LLM event pane for the selected process (tool calls, token usage).\nPress again to show it.",
+                         L"Oculta el panel de eventos LLM del proceso seleccionado (llamadas y uso de tokens).\nPulsa de nuevo para mostrarlo.")
+                    : Tr(L"選択中プロセスの LLM イベント（ツール呼び出し・トークン使用量）を下段に表示します。",
+                         L"Shows LLM events for the selected process (tool calls, token usage) below the lists.",
+                         L"Muestra los eventos LLM del proceso seleccionado (llamadas y uso de tokens) bajo las listas."));
         }
         if (st->hwndBtnBtView) {
             UpdateControlTooltip(st->hwndToolbarTip, st->hwndMain, st->hwndBtnBtView,
-                Tr(L"ビヘイビアツリーを表示 (Ctrl+Shift+B)", L"Show Behavior Trees (Ctrl+Shift+B)",
-                   L"Mostrar árboles de comportamiento (Ctrl+Shift+B)"));
+                Tr(L"ビヘイビアツリーのデバッグ表示を開きます。\n各タスクを起動したノードと、ツリーの実行の進み具合を確認できます。\nショートカット: Ctrl+Shift+B",
+                   L"Opens the behavior tree debug view.\nSee which node started each task and how far each tree has run.\nShortcut: Ctrl+Shift+B",
+                   L"Abre la vista de depuración de árboles de comportamiento.\nMuestra qué nodo inició cada tarea y el progreso del árbol.\nAtajo: Ctrl+Shift+B"));
         }
         if (st->hwndBtnRefresh) {
             UpdateControlTooltip(st->hwndToolbarTip, st->hwndMain, st->hwndBtnRefresh,
-                Tr(L"すべてのリストを最新の情報に更新", L"Refresh All Lists", L"Actualizar todas las listas"));
+                Tr(L"プロセス一覧・タスクキュー・ターミナル・監視ペインを今すぐ更新します。\n通常は設定した更新間隔で自動更新されます。",
+                   L"Refreshes the process list, task queue, terminals and monitor pane now.\nThey otherwise update automatically at the configured interval.",
+                   L"Actualiza ahora las listas, las terminales y el panel de monitor.\nNormalmente se actualizan solos según el intervalo configurado."));
+        }
+        if (st->hwndBtnStart) {
+            UpdateControlTooltip(st->hwndToolbarTip, st->hwndMain, st->hwndBtnStart,
+                Tr(L"新しいターミナルを開き、既定のシェルでプロセスを起動します。\n使用するシェルは「設定 → 表示 → シェル構成」で変更できます。",
+                   L"Opens a new terminal and starts a process with the configured default shell.\nChange it in Settings > Appearance > Shell Config.",
+                   L"Abre una terminal nueva e inicia un proceso con el shell predeterminado.\nCámbialo en Ajustes > Apariencia > Configurar shell."));
+        }
+        if (st->hwndBtnSettings) {
+            UpdateControlTooltip(st->hwndToolbarTip, st->hwndMain, st->hwndBtnSettings,
+                Tr(L"表示・動作・通知・トリアージ・Web UI などの設定を開きます。\n変更はダイアログを閉じると保存され、次回起動時にも引き継がれます。",
+                   L"Opens settings for appearance, behavior, alerts, triage and the Web UI.\nChanges are saved when you close the dialog and persist across restarts.",
+                   L"Abre los ajustes de apariencia, comportamiento, avisos, triaje y Web UI.\nLos cambios se guardan al cerrar y se conservan tras reiniciar."));
+        }
+        if (st->hwndBtnKillAll) {
+            UpdateControlTooltip(st->hwndToolbarTip, st->hwndMain, st->hwndBtnKillAll,
+                Tr(L"実行中・待機中のすべてのプロセスを強制終了します。\n確認ダイアログが表示され、実行中のジョブも停止します。",
+                   L"Force-stops every running or waiting process.\nA confirmation appears first; running jobs are stopped too.",
+                   L"Fuerza el cierre de todos los procesos en ejecución o en espera.\nAparece una confirmación; también se detienen los trabajos en curso."));
+        }
+        if (st->hwndBtnViewTasks) {
+            UpdateControlTooltip(st->hwndToolbarTip, st->hwndMain, st->hwndBtnViewTasks,
+                Tr(L"一覧を「プロセス＋タスク」→「プロセスのみ」→「タスクのみ」の順に切り替えます。\nショートカット: Ctrl+T",
+                   L"Cycles the lists through processes + tasks, processes only, and tasks only.\nShortcut: Ctrl+T",
+                   L"Alterna las listas entre procesos + tareas, solo procesos y solo tareas.\nAtajo: Ctrl+T"));
+        }
+        if (st->hwndBtnUsage) {
+            UpdateControlTooltip(st->hwndToolbarTip, st->hwndMain, st->hwndBtnUsage,
+                Tr(L"LLM のトークン使用量グラフを表示または非表示にします。\n設定で provider/model 別の積み上げ表示にも切り替えられます。",
+                   L"Shows or hides the LLM token usage graph.\nSettings can stack the graph by provider/model instead of token kind.",
+                   L"Muestra u oculta el gráfico de uso de tokens LLM.\nEn Ajustes puedes apilarlo por proveedor/modelo en vez de por tipo."));
+        }
+        if (st->hwndClock) {
+            UpdateControlTooltip(st->hwndToolbarTip, st->hwndMain, st->hwndClock,
+                Tr(L"現在のローカル時刻です。", L"Current local time.", L"Hora local actual."));
+        }
+        if (st->hwndSearchProcBtn) {
+            UpdateControlTooltip(st->hwndToolbarTip, st->hwndMain, st->hwndSearchProcBtn,
+                Tr(L"プロセス一覧の検索欄を開きます。ID・名前・コマンドラインなどで絞り込めます。\nもう一度押すと検索条件を解除して閉じます。",
+                   L"Opens the process list search box.\nFilter by ID, name, command line and more; press again to clear and close it.",
+                   L"Abre la búsqueda de la lista de procesos.\nFiltra por ID, nombre, línea de comandos, etc.; pulsa otra vez para limpiar y cerrar."));
+        }
+        if (st->hwndSearchTaskBtn) {
+            UpdateControlTooltip(st->hwndToolbarTip, st->hwndMain, st->hwndSearchTaskBtn,
+                Tr(L"タスクキューの検索欄を開きます。ジョブ名・状態・結果などで絞り込めます。\nもう一度押すと検索条件を解除して閉じます。",
+                   L"Opens the task queue search box.\nFilter by job name, state, outcome and more; press again to clear and close it.",
+                   L"Abre la búsqueda de la cola de tareas.\nFiltra por nombre, estado, resultado, etc.; pulsa otra vez para limpiar y cerrar."));
         }
     }
     // Repaint the toggles so their latched (pressed) look follows the state.
@@ -3873,6 +4063,9 @@ static LRESULT CALLBACK PastRunsWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPAR
 
             ds->btnClose = CreateWindowExW(0, L"BUTTON", Tr(L"閉じる", L"Close", L"Cerrar"),
                 WS_CHILD | WS_VISIBLE | BS_PUSHBUTTON, 700, 500, 100, 28, hwnd, (HMENU)IDOK, nullptr, nullptr);
+            AddControlHelp(hwnd, ds->btnClose,
+                Tr(L"タスク詳細ダイアログを閉じます。", L"Closes the task details dialog.",
+                   L"Cierra el diálogo de detalles de la tarea."));
 
             HWND controls[] = {ds->tab, ds->jobEdit, ds->summaryEdit, ds->list, ds->detailEdit,
                                ds->whyEdit, ds->whyList, ds->whyDetail, ds->btnClose};
@@ -4375,6 +4568,28 @@ static LRESULT CALLBACK MemoryListWndProc(HWND hwnd, UINT msg, WPARAM wParam, LP
                 WS_CHILD | WS_VISIBLE | BS_PUSHBUTTON, 390, 456, 170, 28, hwnd, (HMENU)2810, nullptr, nullptr);
             ds->btnClose = CreateWindowExW(0, L"BUTTON", Tr(L"閉じる", L"Close", L"Cerrar"),
                 WS_CHILD | WS_VISIBLE | BS_PUSHBUTTON, 740, 456, 100, 28, hwnd, (HMENU)IDOK, nullptr, nullptr);
+            AddControlHelp(hwnd, ds->btnSearch,
+                Tr(L"上の欄に入力した語句でメモリ（L1/L2/L3）を検索します。\nEnter でも検索できます。",
+                   L"Searches memory (L1/L2/L3) for the text in the box above.\nEnter also runs the search.",
+                   L"Busca en la memoria (L1/L2/L3) el texto del cuadro superior.\nIntro también inicia la búsqueda."));
+            AddControlHelp(hwnd, ds->btnRetract,
+                Tr(L"選択中の L2 note を取り消します。\n取り消した note は今後のタスクに注入されなくなります。",
+                   L"Retracts the selected L2 note.\nA retracted note is no longer injected into future tasks.",
+                   L"Retira la nota L2 seleccionada.\nDeja de inyectarse en las tareas futuras."));
+            AddControlHelp(hwnd, ds->btnPromote,
+                Tr(L"選択した L2 note を L3 knowledge に昇格させます。\n昇格後は長期的な知識として再利用されます。",
+                   L"Promotes the selected L2 note to L3 knowledge.\nIt is then reused as long-term knowledge.",
+                   L"Promociona la nota L2 seleccionada a conocimiento L3.\nDespués se reutiliza como conocimiento a largo plazo."));
+            AddControlHelp(hwnd, ds->btnRefresh,
+                Tr(L"メモリ一覧をディスクから再読み込みします。\n他のプロセスが追加した note も反映されます。",
+                   L"Reloads the memory list from disk.\nNotes added by other processes are picked up too.",
+                   L"Recarga la lista de memoria desde el disco.\nTambién recoge notas añadidas por otros procesos."));
+            AddControlHelp(hwnd, ds->btnCompare,
+                Tr(L"選択した note を注入した場合としない場合の効果を比較します。\n今後のタスクに役立つかどうかの判断に使います。",
+                   L"Compares the effect of injecting the selected note versus not injecting it.\nUse it to judge whether the note helps future tasks.",
+                   L"Compara el efecto de inyectar la nota seleccionada frente a no hacerlo.\nAyuda a decidir si mejora las tareas futuras."));
+            AddControlHelp(hwnd, ds->btnClose,
+                Tr(L"メモリ一覧を閉じます。", L"Closes the memory list.", L"Cierra la lista de memoria."));
 
             HWND controls[] = {ds->search, ds->btnSearch, ds->layer, ds->layerInfo, ds->author, ds->list, ds->detail,
                                ds->btnRetract, ds->btnPromote, ds->btnRefresh, ds->btnCompare, ds->btnClose};
@@ -4576,7 +4791,7 @@ static void ShowMemoryListDialog(DashboardState* st) {
     RECT parent = {};
     GetWindowRect(st->hwndMain, &parent);
     int dlgW = 900;
-    int dlgH = 560;
+    int dlgH = 1000;
     int x = parent.left + ((parent.right - parent.left) - dlgW) / 2;
     int y = parent.top + ((parent.bottom - parent.top) - dlgH) / 2;
     HWND hDlg = CreateWindowExW(WS_EX_DLGMODALFRAME, L"HanchoMemoryListWnd",
@@ -4591,9 +4806,11 @@ static void ShowMemoryListDialog(DashboardState* st) {
 }
 
 static void CopyTextToClipboard(HWND hwnd, const std::wstring& text);
+static void ShowTriageDialog(DashboardState* st, const std::wstring& filter = L"pendingTask",
+                             const std::string& selectId = std::string());
 
 // Column index of "Origin" in the task list (see UpdateTaskListColumnWidths).
-static const int kTaskListOriginCol = 8;
+static const int kTaskListOriginCol = 9;
 
 // Full text of one task-list cell. The control keeps the whole string even when the column is
 // too narrow to draw it, so this is the text that hover and "copy cell" should use.
@@ -4640,6 +4857,9 @@ static void ShowTaskQueueContextMenu(DashboardState* st, const std::string& jobI
     AppendMenuW(hMenu, MF_STRING, 3114, Tr(L"なぜ失敗したか", L"Why failed", L"Por qué falló"));
     AppendMenuW(hMenu, MF_STRING, 3112, Tr(L"過去の実行を表示", L"Show past runs", L"Ver ejecuciones anteriores"));
     AppendMenuW(hMenu, MF_STRING, 3113, Tr(L"メモリ一覧...", L"Memory list...", L"Lista de memoria..."));
+    auto triageIt = st->triageJobs.find(jobId);
+    if (triageIt != st->triageJobs.end() && !triageIt->second.value("cardId", std::string()).empty())
+        AppendMenuW(hMenu, MF_STRING, 3115, Tr(L"トリアージで開く", L"Open in Triage", L"Abrir en Triaje"));
     if (resp.find("\"bt\":{") != std::string::npos) {
         AppendMenuW(hMenu, MF_STRING, 3111, Tr(L"ビヘイビアツリーで表示", L"Show in Behavior Tree", L"Ver en el árbol de comportamiento"));
     }
@@ -4690,6 +4910,10 @@ static void ShowTaskQueueContextMenu(DashboardState* st, const std::string& jobI
         ShowTaskQueueJobDetails(st, jobId, 2);
     } else if (cmd == 3113) {
         ShowMemoryListDialog(st);
+    } else if (cmd == 3115) {
+        auto it = st->triageJobs.find(jobId);
+        if (it != st->triageJobs.end())
+            ShowTriageDialog(st, L"all", it->second.value("cardId", std::string()));
     }
     RefreshDashboardData(st);
 }
@@ -4714,6 +4938,9 @@ static bool ProcSnapshotMatchesSearch(const ProcessSnapshot& s, const std::wstri
            WideContainsCi(Utf8ToWide(s.activity), query) ||
            WideContainsCi(Utf8ToWide(s.activityTarget), query);
 }
+
+static std::wstring TriageHandoffLabel(const std::string& handoffState);
+static std::wstring TriageLifecycleLabel(const std::string& lifecycle);
 
 static void RefreshTaskQueueData(DashboardState* st, bool force = false) {
     if (!st || !st->hwndTaskList) return;
@@ -4840,49 +5067,49 @@ static void RefreshTaskQueueData(DashboardState* st, bool force = false) {
         if (!attemptStart.empty()) {
             startStr = Utf8ToWide(TimeOfDayText(attemptStart));
             if (!attemptEnd.empty()) {
+                // Ended: the time it ended, and how long the attempt took.
                 endStr = Utf8ToWide(TimeOfDayText(attemptEnd));
+                if (startEpochSec > 0 && endEpochSec >= startEpochSec) {
+                    endStr += L" (" + FormatCompactDuration(endEpochSec - startEpochSec) + L")";
+                }
             } else if (state == "running") {
                 int timeoutSec = static_cast<int>(JsonGetInt(j, "timeout_sec", 0));
                 int estimateSec = static_cast<int>(JsonGetInt(j, "estimate_sec", 0));
                 int budgetSec = estimateSec > 0 ? estimateSec : timeoutSec;
-                if (budgetSec > 0) {
-                    std::string est = AddSecondsToTimestamp(attemptStart, budgetSec);
-                    int y = 0, mo = 0, d = 0, h = 0, mi = 0, sec = 0;
-                    if (sscanf_s(attemptStart.c_str(), "%d-%d-%d %d:%d:%d", &y, &mo, &d, &h, &mi, &sec) == 6) {
-                        struct tm t = {};
-                        t.tm_year = y - 1900;
-                        t.tm_mon = mo - 1;
-                        t.tm_mday = d;
-                        t.tm_hour = h;
-                        t.tm_min = mi;
-                        t.tm_sec = sec;
-                        t.tm_isdst = -1;
-                        time_t startEpoch = mktime(&t);
-                        if (startEpoch != static_cast<time_t>(-1)) {
-                            time_t nowEpoch = time(nullptr);
-                            int64_t elapsed = static_cast<int64_t>(nowEpoch - startEpoch);
-                            int64_t remSec = static_cast<int64_t>(budgetSec) - elapsed;
-                            if (remSec < 0) remSec = 0;
-                            if (!est.empty()) {
-                                endStr = L"~" + Utf8ToWide(TimeOfDayText(est)) + L" (" + FormatRemainingTime(remSec) + L")";
-                            } else {
-                                endStr = FormatRemainingTime(remSec);
-                            }
-                        }
+                const int64_t elapsed = startEpochSec > 0
+                    ? (std::max)(static_cast<int64_t>(0), static_cast<int64_t>(time(nullptr) - startEpochSec)) : -1;
+                const std::string est = budgetSec > 0 ? AddSecondsToTimestamp(attemptStart, budgetSec) : std::string();
+                // The remaining time comes first, so it stays visible even when the column is narrow.
+                if (budgetSec > 0 && elapsed >= 0) {
+                    const int64_t remSec = static_cast<int64_t>(budgetSec) - elapsed;
+                    if (remSec > 0) {
+                        endStr = Tr(L"残り ", L"", L"Quedan ") + FormatCompactDuration(remSec) +
+                                 Tr(L"", L" left", L"");
+                    } else {
+                        // Past its budget: an estimate is only a guess, a timeout means it is about to be stopped.
+                        endStr = (estimateSec > 0 ? Tr(L"見込み超過 ", L"over by ", L"Excedido ")
+                                                  : Tr(L"時間切れ ", L"timed out +", L"Agotado +")) +
+                                 FormatCompactDuration(-remSec);
                     }
-                    if (endStr.empty() && !est.empty()) {
-                        endStr = L"~" + Utf8ToWide(TimeOfDayText(est));
-                    }
-                    // The estimated end of the running attempt, with its date.
-                    if (startEpochSec > 0) endEpochSec = startEpochSec + budgetSec;
+                    if (!est.empty()) endStr += L" (~" + Utf8ToWide(TimeOfDayText(est)) + L")";
+                } else if (!est.empty()) {
+                    endStr = L"~" + Utf8ToWide(TimeOfDayText(est));
+                } else if (elapsed >= 0) {
+                    // No estimate or timeout: say how long it has been running instead of a bare "-".
+                    endStr = Tr(L"経過 ", L"", L"Lleva ") + FormatCompactDuration(elapsed) +
+                             Tr(L" (終了未定)", L" elapsed (no end set)", L" (sin fin previsto)");
                 }
+                // The estimated end of the running attempt, with its date.
+                if (budgetSec > 0 && startEpochSec > 0) endEpochSec = startEpochSec + budgetSec;
             }
         } else if (state == "pending" || state == "planned") {
             int timeoutSec = static_cast<int>(JsonGetInt(j, "timeout_sec", 0));
             int estimateSec = static_cast<int>(JsonGetInt(j, "estimate_sec", 0));
             int budgetSec = estimateSec > 0 ? estimateSec : timeoutSec;
             if (budgetSec > 0) {
-                endStr = FormatRemainingTime(budgetSec);
+                // Not started yet, so this is how long it is expected to take, not a countdown.
+                endStr = (estimateSec > 0 ? Tr(L"見込み ", L"est. ", L"Estimado ")
+                                          : Tr(L"上限 ", L"max ", L"Máx. ")) + FormatCompactDuration(budgetSec);
                 // A job that has not started yet ends this long after it was queued.
                 const int64_t createdEpoch = ParseTimestampStrToEpoch(JsonGetString(j, "created_at", ""));
                 if (createdEpoch > 0) endEpochSec = createdEpoch + budgetSec;
@@ -4921,16 +5148,69 @@ static void RefreshTaskQueueData(DashboardState* st, bool force = false) {
         row.originTip = std::move(originTip);
         std::wstring resourcesStr = TaskQueueResourcesDisplay(j);
 
+        std::wstring triageStr = L"—";
+        auto triageIt = st->triageJobs.find(jobId);
+        if (triageIt != st->triageJobs.end()) {
+            const nlohmann::json& triage = triageIt->second;
+            const std::string triageState = triage.value("state", std::string());
+            const std::string lifecycle = triage.value("lifecycle", std::string());
+            const std::string cardId = triage.value("cardId", std::string());
+            if (!cardId.empty()) row.id = jobId;
+            if (!lifecycle.empty()) {
+                triageStr = TriageLifecycleLabel(lifecycle);
+            } else if (triageState == "pending") {
+                triageStr = Tr(L"判断待ち", L"Awaiting decision", L"Pendiente de decisión");
+                const std::wstring mark = TriageHandoffLabel(triage.value("handoff", std::string()));
+                if (!mark.empty()) triageStr += L" " + mark;
+            } else if (triageState == "acted") {
+                const std::string candidateId = triage.value("candidateId", std::string());
+                std::wstring label = Utf8ToWide(candidateId);
+                const nlohmann::json& cards = st->triageResponse.value("cards", nlohmann::json::array());
+                if (cards.is_array()) {
+                    for (const auto& card : cards) {
+                        if (card.value("id", std::string()) != cardId || !card.contains("candidates") ||
+                            !card["candidates"].is_array()) continue;
+                        for (const auto& candidate : card["candidates"]) {
+                            if (candidate.value("id", std::string()) == candidateId) {
+                                label = Utf8ToWide(candidate.value("label", candidateId));
+                                break;
+                            }
+                        }
+                        break;
+                    }
+                }
+                triageStr = label;
+                const std::string by = triage.value("by", std::string());
+                if (by == "hancho-auto" || by == "llm-auto") {
+                    triageStr += Tr(L" (自動)", L" (auto)", L" (auto)");
+                    const bool reviewed = cards.empty() ? false : [&]() {
+                        for (const auto& card : cards) {
+                            if (card.value("id", std::string()) != cardId || !card.contains("decision") ||
+                                !card["decision"].is_object()) continue;
+                            return card["decision"].value("reviewed", false);
+                        }
+                        return false;
+                    }();
+                    if (!reviewed) triageStr += Tr(L" 未確認", L" unreviewed", L" sin revisar");
+                }
+            } else if (triageState == "ignored") {
+                triageStr = Tr(L"無視: ", L"Ignored: ", L"Ignorado: ") + Utf8ToWide(triage.value("reason", std::string()));
+            } else if (triageState == "resolved") {
+                triageStr = Tr(L"自然解消", L"Naturally resolved", L"Resuelto naturalmente");
+            }
+        }
+
         row.cells[0] = std::move(idStr);
         row.cells[1] = std::move(summaryStr);
         row.cells[2] = std::move(stateStr);
-        row.cells[3] = std::move(startStr);
-        row.cells[4] = std::move(endStr);
-        row.cells[5] = std::move(taskDoingStr);
-        row.cells[6] = std::move(depsStr);
-        row.cells[7] = std::move(queueStr);
-        row.cells[8] = std::move(originStr);
-        row.cells[9] = std::move(resourcesStr);
+        row.cells[3] = std::move(triageStr);
+        row.cells[4] = std::move(startStr);
+        row.cells[5] = std::move(endStr);
+        row.cells[6] = std::move(taskDoingStr);
+        row.cells[7] = std::move(depsStr);
+        row.cells[8] = std::move(queueStr);
+        row.cells[9] = std::move(originStr);
+        row.cells[10] = std::move(resourcesStr);
         if (!st->taskSearchText.empty()) {
             bool matches = false;
             for (const auto& cell : row.cells) {
@@ -5022,6 +5302,9 @@ static void RefreshTaskQueueData(DashboardState* st, bool force = false) {
     ListView_Scroll(st->hwndTaskList, keepScrollX - GetScrollPos(st->hwndTaskList, SB_HORZ),
                     (keepTopIndex - ListView_GetTopIndex(st->hwndTaskList)) * rowHeight);
     SendMessageW(st->hwndTaskList, WM_SETREDRAW, TRUE, 0);
+    // Widen the time columns when their text grew (or shrank by a lot). Done after redraw is back on,
+    // so the client width already leaves out a vertical scroll bar the new rows brought.
+    if (MeasureTaskFitColumns(st)) UpdateTaskListColumnWidths(st);
     InvalidateRect(st->hwndTaskList, nullptr, FALSE);
 }
 
@@ -5154,7 +5437,127 @@ static std::wstring KpiSignature(DashboardState* st) {
                static_cast<long long>(minRemainingSec), tq.running, tq.waiting, tq.pending, tq.blocked,
                tq.succeeded, tq.failed, tq.cancelled, tq.total,
                static_cast<long long>(tq.minRemainingSec), static_cast<long long>(tq.sumRemainingSec));
-    return buf + Utf8ToWide(FormatBytes(memBytes));
+    return std::wstring(buf) + Utf8ToWide(FormatBytes(memBytes)) + L"|" +
+        std::to_wstring(st->pendingTriageTask) + L"|" + std::to_wstring(st->pendingTriageProcess) + L"|" +
+        std::to_wstring(st->autoTriageUnreviewed) + L"|" + std::to_wstring(st->triageFollowUp);
+}
+
+static void UpdateTriageFromCore(DashboardState* st);
+
+// ---------------------------------------------------------------------------
+// Standalone dashboard: WCSP remote terminal views
+// ---------------------------------------------------------------------------
+static bool EnsureTermEndpoint(DashboardState* st) {
+    if (!st || st->pm) return false;
+    if (st->termEndpointKnown && st->termPort != 0) return true;
+
+    const uint64_t now = GetNowTickMs();
+    if (st->termEndpointRetryAt != 0 && now < st->termEndpointRetryAt) return false;
+
+    nlohmann::json resp;
+    if (GuiIpcCall(st, {{"action", "term_endpoint"}}, resp) && resp.value("ok", false)) {
+        st->termHost = resp.value("host", std::string("127.0.0.1"));
+        const int port = resp.value("port", 0);
+        st->termPort = (port > 0 && port <= 65535) ? static_cast<uint16_t>(port) : 0;
+        st->termToken = resp.value("token", std::string());
+        if (st->termPort != 0) {
+            st->termEndpointKnown = true;
+            st->termEndpointRetryAt = 0;
+            return true;
+        }
+    }
+    st->termEndpointKnown = false;
+    st->termEndpointRetryAt = now + 5000;
+    return false;
+}
+
+static void DestroyRemoteTerm(RemoteTerm& rt) {
+    if (rt.view) {
+        // Stop the WCSP receiver before the window goes away so no new chunks
+        // are posted to a destroyed HWND.
+        rt.view->SetRemoteIo(nullptr);
+        if (rt.view->Hwnd() && IsWindow(rt.view->Hwnd())) {
+            DestroyWindow(rt.view->Hwnd());
+        }
+        rt.view.reset();
+    }
+}
+
+static void SyncRemoteTerminals(DashboardState* st) {
+    if (!st || st->pm) return;
+    if (!EnsureTermEndpoint(st)) return;
+
+    const uint64_t now = GetNowTickMs();
+
+    std::unordered_set<int> keep;
+    for (const auto& s : st->cachedSnapshots) {
+        if (s.mode != ExecMode::ConPTY) continue;
+        const bool ended = s.state != ProcState::Running;
+        if (!ended || s.id == st->selectedProcId) keep.insert(s.id);
+    }
+    for (auto it = st->remoteTerms.begin(); it != st->remoteTerms.end();) {
+        if (keep.find(it->first) == keep.end()) {
+            DestroyRemoteTerm(it->second);
+            it = st->remoteTerms.erase(it);
+        } else {
+            ++it;
+        }
+    }
+
+    for (auto& s : st->cachedSnapshots) {
+        if (s.mode != ExecMode::ConPTY) continue;
+        const bool ended = s.state != ProcState::Running;
+        if (ended && s.id != st->selectedProcId) continue;
+
+        auto it = st->remoteTerms.find(s.id);
+        if (it == st->remoteTerms.end()) {
+            it = st->remoteTerms.emplace(s.id, RemoteTerm{}).first;
+        }
+        RemoteTerm& rt = it->second;
+        if (rt.view && rt.view->Hwnd() && IsWindow(rt.view->Hwnd())) {
+            s.terminalHwnd = rt.view->Hwnd();
+            continue;
+        }
+        if (rt.failed && now < rt.retryAt) continue;
+
+        RemoteConfig cfg;
+        cfg.host = st->termHost.empty() ? "127.0.0.1" : st->termHost;
+        cfg.port = st->termPort;
+        cfg.token = st->termToken;
+
+        auto view = std::make_unique<TerminalView>();
+        HWND hTv = view->Create(st->hwndMain);
+        if (!hTv) {
+            rt.failed = true;
+            rt.retryAt = now + 5000;
+            continue;
+        }
+        ShowWindow(hTv, SW_HIDE);
+        view->SetRemoteIo(std::make_unique<RemoteSession>(cfg));
+
+        std::wstring werr;
+        if (!view->StartRemote(L"attach:" + std::to_wstring(s.id), &werr)) {
+            DestroyWindow(hTv);
+            rt.failed = true;
+            if (ended) {
+                // An ended job (e.g. one restored after a core restart) has no
+                // ConPTY left to attach to; retrying would only repeat the error.
+                rt.retryAt = UINT64_MAX;
+            } else {
+                rt.retryAt = now + 5000;
+                // The core may have restarted on a new ephemeral port.
+                st->termEndpointKnown = false;
+                st->termPort = 0;
+            }
+            WriteAuditLog("TERM_REMOTE_ATTACH_FAILED", WideToUtf8(werr));
+            continue;
+        }
+
+        rt.failed = false;
+        rt.retryAt = 0;
+        rt.view = std::move(view);
+        s.terminalHwnd = hTv;
+    }
 }
 
 static void RefreshDashboardData(DashboardState* st) {
@@ -5294,6 +5697,7 @@ static void RefreshDashboardData(DashboardState* st) {
         }
     }
 
+    if (!st->pm) SyncRemoteTerminals(st);
     LayoutTerminalViews(st);
 
     int currentCount = ListView_GetItemCount(st->hwndList);
@@ -5439,6 +5843,8 @@ static void RefreshDashboardData(DashboardState* st) {
         for (int row : changedRows) ListView_RedrawItems(st->hwndList, row, row);
     }
     RefreshTaskQueueData(st);
+    UpdateTriageFromCore(st);
+    RefreshTaskQueueData(st, true);
     std::wstring kpiSig = KpiSignature(st);
     if (kpiSig != st->lastKpiSignature) {
         st->lastKpiSignature = std::move(kpiSig);
@@ -5455,48 +5861,76 @@ static void RefreshDashboardData(DashboardState* st) {
     }
 }
 
+// Columns of the task list sized to their text: ID, State, Start, End.
+static constexpr int kTaskFitCols[4] = {0, 2, 4, 5};
+static constexpr int kTaskFitColMax[4] = {220, 200, 110, 280};
+
+// Measures the widest text (header included) of each fit column. Returns true when a width
+// changed enough to lay the columns out again; small shrinks are ignored so the columns do
+// not wobble as the remaining time ticks down.
+static bool MeasureTaskFitColumns(DashboardState* st) {
+    if (!st || !st->hwndTaskList) return false;
+    constexpr int kPad = 18;  // the list view's cell margins
+    const size_t rowCount = st->lastTaskRows.size() / kTaskListColumns;
+    bool changed = false;
+    for (int k = 0; k < 4; ++k) {
+        const int col = kTaskFitCols[k];
+        // The header can carry a sort mark, so leave room for it.
+        int need = ListView_GetStringWidth(st->hwndTaskList, (std::wstring(TaskColumnTitle(col)) + L" ▲").c_str());
+        for (size_t r = 0; r < rowCount; ++r) {
+            const std::wstring& cell = st->lastTaskRows[r * kTaskListColumns + col];
+            if (!cell.empty()) need = (std::max)(need, ListView_GetStringWidth(st->hwndTaskList, cell.c_str()));
+        }
+        need = (std::min)(need + kPad, kTaskFitColMax[k]);
+        int& cur = st->taskFitColW[k];
+        if (need > cur || need < cur - 24) {
+            cur = need;
+            changed = true;
+        }
+    }
+    return changed;
+}
+
 static void UpdateTaskListColumnWidths(DashboardState* st) {
     if (!st || !st->hwndTaskList) return;
     RECT rc = {};
     GetClientRect(st->hwndTaskList, &rc);
     int total = rc.right - rc.left;
     if (total < 400) return;
+    if (st->taskFitColW[0] == 0) MeasureTaskFitColumns(st);
 
-    // Summary takes ~half of the visible list width; the other columns share the rest.
-    int summaryW = total / 2;
-    // Columns other than Summary: ID, State, Start, End, Running, Depends, Queue, Origin, Resources.
-    constexpr int kOther = kTaskListColumns - 1;
-    const int base[kOther] = {135, 100, 105, 115, 190, 110, 82, 150, 200};
-    int baseSum = 0;
-    for (int i = 0; i < kOther; ++i) baseSum += base[i];
-
-    // Shares are proportional with no per-column minimum, so the widths always add up to the list width.
-    // A minimum here would push the sum past the list and cut off the last column (Resources).
-    // The last column takes whatever remains.
-    int remaining = total - summaryW;
-    // ID is shown at 1.5x its proportional share and Queue at 3/4x. The other columns (State, Start,
-    // End, Running, Depends) absorb the difference so the total still fits the list.
-    constexpr int kIdIdx = 0, kQueueIdx = 6, kLastIdx = kOther - 1;
-    const double idW = base[kIdIdx] * static_cast<double>(remaining) / baseSum * 1.5;
-    const double queueW = base[kQueueIdx] * static_cast<double>(remaining) / baseSum * 0.75;
-    const double otherBase = baseSum - base[kIdIdx] - base[kQueueIdx] - base[kLastIdx];
-    // Resources (the last column) takes the rounding remainder.
-    const double freeW = remaining - idW - queueW - (base[kLastIdx] * static_cast<double>(remaining) / baseSum);
-    int widths[kOther] = {};
-    int assigned = 0;
-    for (int i = 0; i < kLastIdx; ++i) {
-        double w;
-        if (i == kIdIdx) w = idW;
-        else if (i == kQueueIdx) w = queueW;
-        else w = freeW * base[i] / otherBase;
-        widths[i] = static_cast<int>(w);
-        assigned += widths[i];
+    int widths[kTaskListColumns] = {};
+    // ID, State, Start and End get the width their text needs, so the times and the remaining
+    // time are never cut off. They give up room only when the list is very narrow.
+    int fitSum = 0;
+    for (int k = 0; k < 4; ++k) fitSum += st->taskFitColW[k];
+    const int fitLimit = total * 45 / 100;
+    for (int k = 0; k < 4; ++k) {
+        int w = st->taskFitColW[k];
+        if (fitSum > fitLimit) w = static_cast<int>(static_cast<int64_t>(w) * fitLimit / fitSum);
+        widths[kTaskFitCols[k]] = w;
     }
-    widths[kLastIdx] = remaining - assigned;
+    int rest = total;
+    for (int k = 0; k < 4; ++k) rest -= widths[kTaskFitCols[k]];
 
-    ListView_SetColumnWidth(st->hwndTaskList, 0, widths[0]);
-    ListView_SetColumnWidth(st->hwndTaskList, 1, summaryW);
-    for (int i = 1; i < kOther; ++i) ListView_SetColumnWidth(st->hwndTaskList, i + 1, widths[i]);
+    // Summary takes ~45% of what is left; the remaining columns share the rest in proportion.
+    // Shares have no minimum, so the widths always add up to the list width; the last column
+    // (Resources) takes the rounding remainder.
+    widths[1] = rest * 45 / 100;
+    int other = rest - widths[1];
+    // Triage, Running, Depends, Queue, Origin, Resources.
+    constexpr int kFlex[6] = {3, 6, 7, 8, 9, 10};
+    const int base[6] = {150, 190, 110, 62, 150, 200};
+    int baseSum = 0;
+    for (int b : base) baseSum += b;
+    int assigned = 0;
+    for (int k = 0; k < 5; ++k) {
+        widths[kFlex[k]] = static_cast<int>(static_cast<int64_t>(other) * base[k] / baseSum);
+        assigned += widths[kFlex[k]];
+    }
+    widths[kFlex[5]] = other - assigned;
+
+    for (int i = 0; i < kTaskListColumns; ++i) ListView_SetColumnWidth(st->hwndTaskList, i, widths[i]);
 }
 
 // ---------------------------------------------------------------------------
@@ -5525,10 +5959,23 @@ static std::vector<TaskGanttRow> BuildTaskGanttRows(const std::string& listJson,
     std::vector<TaskGanttRow> rows;
     auto jobs = SplitJsonObjectArray(listJson, "jobs");
     rows.reserve(jobs.size());
-    // Planned rows have no created_at, so give them a stable forecast: chain them in the
-    // order taskqueue_list returned (BT execution order) instead of starting each one at
-    // "now" on every repaint.
+
+    // Planned and pending rows have a stable forecast: chain them sequentially in the
+    // order returned, starting from "now" (or when any currently running job is estimated to finish).
     int64_t plannedCursor = now;
+    for (const auto& j : jobs) {
+        if (JsonGetString(j, "state", "") == "running") {
+            auto attempts = SplitJsonObjectArray(j, "attempts");
+            if (!attempts.empty()) {
+                int64_t aStart = ParseTimestampStrToEpoch(JsonGetString(attempts.back(), "start", ""));
+                int64_t est = JsonGetInt(j, "estimate_sec", 0);
+                if (aStart > 0 && est > 0 && aStart + est > plannedCursor) {
+                    plannedCursor = aStart + est;
+                }
+            }
+        }
+    }
+
     for (const auto& j : jobs) {
         TaskGanttRow row;
         row.id = JsonGetString(j, "id", "");
@@ -5538,6 +5985,8 @@ static std::vector<TaskGanttRow> BuildTaskGanttRows(const std::string& listJson,
         row.label = Utf8ToWide(summary);
         if (row.state == "planned") {
             row.label = Tr(L"[予定] ", L"[planned] ", L"[previsto] ") + row.label;
+            row.planned = true;
+        } else if (row.state == "pending") {
             row.planned = true;
         }
 
@@ -5559,19 +6008,37 @@ static std::vector<TaskGanttRow> BuildTaskGanttRows(const std::string& listJson,
             row.segments.push_back(seg);
         }
         if (row.segments.empty()) {
-            int64_t estimate = JsonGetInt(j, "estimate_sec", 0);
-            if (estimate <= 0) estimate = JsonGetInt(j, "timeout_sec", 0);
-            if (estimate <= 0) estimate = 60;
-            int64_t start = ParseTimestampStrToEpoch(JsonGetString(j, "created_at", ""));
-            if (start <= 0) start = (row.state == "planned") ? plannedCursor : now;
-            TaskGanttSegment seg;
-            seg.start = start;
-            seg.end = start + estimate;
-            seg.reason = row.state;
-            row.segments.push_back(seg);
-            if (row.state == "planned") plannedCursor = seg.end;
-            row.planned = (row.state == "planned" || row.state == "pending");
+            if (row.state == "planned" || row.state == "pending") {
+                int64_t estimate = JsonGetInt(j, "estimate_sec", 0);
+                if (estimate <= 0) estimate = JsonGetInt(j, "timeout_sec", 0);
+                if (estimate <= 0) estimate = 60;
+                TaskGanttSegment seg;
+                seg.start = plannedCursor;
+                seg.end = plannedCursor + estimate;
+                seg.reason = row.state;
+                row.segments.push_back(seg);
+                plannedCursor = seg.end;
+                row.planned = true;
+            } else if (row.state == "cancelled") {
+                int64_t ts = ParseTimestampStrToEpoch(JsonGetString(j, "updated_at", ""));
+                if (ts <= 0) ts = ParseTimestampStrToEpoch(JsonGetString(j, "created_at", ""));
+                if (ts <= 0) ts = now;
+                TaskGanttSegment seg;
+                seg.start = ts;
+                seg.end = ts;
+                seg.reason = "cancelled";
+                row.segments.push_back(seg);
+            } else {
+                int64_t ts = ParseTimestampStrToEpoch(JsonGetString(j, "created_at", ""));
+                if (ts <= 0) ts = now;
+                TaskGanttSegment seg;
+                seg.start = ts;
+                seg.end = ts;
+                seg.reason = row.state;
+                row.segments.push_back(seg);
+            }
         }
+        if (row.segments.empty()) continue;
         row.firstStart = row.segments.front().start;
         row.lastEnd = row.segments.front().end;
         for (const auto& s : row.segments) {
@@ -5636,7 +6103,8 @@ static COLORREF GanttSegmentColor(const TaskGanttSegment& seg, const std::string
         return kIdle;
     }
     if (seg.reason == "failed" || seg.reason == "checkFailed" ||
-        seg.reason == "timed_out" || seg.reason == "idle_timed_out") {
+        seg.reason == "timed_out" || seg.reason == "idle_timed_out" ||
+        seg.reason == "launchFailed") {
         return kFailed;
     }
     if (jobState == "succeeded") return kOk;
@@ -6120,6 +6588,29 @@ static LRESULT CALLBACK TaskDetailsWndProc(HWND hwnd, UINT msg, WPARAM wParam, L
                 WS_CHILD | (!ds->snap.streamFilePath.empty() ? WS_VISIBLE : 0) | BS_OWNERDRAW, 691, 600, 160, 30, hwnd, (HMENU)2007, nullptr, nullptr);
             ds->hwndBtnClose = CreateWindowExW(0, L"BUTTON", Tr(L"閉じる", L"Close", L"Cerrar"),
                 WS_CHILD | WS_VISIBLE | BS_OWNERDRAW, 860, 600, 95, 30, hwnd, (HMENU)IDOK, nullptr, nullptr);
+            AddControlHelp(hwnd, ds->hwndBtnCopyCmd,
+                Tr(L"選択中プロセスのコマンドライン全体をクリップボードにコピーします。\n同じコマンドを再実行したいときに使います。",
+                   L"Copies the full command line of the selected process.\nUse it to run the same command again.",
+                   L"Copia la línea de comandos completa del proceso seleccionado.\nÚtil para volver a ejecutar el mismo comando."));
+            AddControlHelp(hwnd, ds->hwndBtnCopyJson,
+                Tr(L"プロセス情報を JSON 形式でクリップボードにコピーします。\nJSON モードでのみ表示されます。",
+                   L"Copies the process information as JSON.\nOnly shown in JSON mode.",
+                   L"Copia la información del proceso en formato JSON.\nSolo se muestra en modo JSON."));
+            AddControlHelp(hwnd, ds->hwndBtnToggleMode,
+                Tr(L"JSON の表示をツリー形式と生テキスト形式で切り替えます。\nJSON を返したプロセスの詳細を調べるときに使います。",
+                   L"Switches JSON output between tree and raw text.\nUse it when inspecting a process that returned JSON.",
+                   L"Alterna la salida JSON entre árbol y texto sin formato.\nÚtil al inspeccionar procesos que devuelven JSON."));
+            AddControlHelp(hwnd, ds->hwndBtnOpenLog,
+                Tr(L"このプロセスのログファイルを既定のエディタで開きます。\n実行中の出力も随時書き込まれます。",
+                   L"Opens this process's log file in the default editor.\nOutput from a running process is appended as it arrives.",
+                   L"Abre el archivo de registro de este proceso en el editor predeterminado.\nLa salida de un proceso en curso se añade sobre la marcha."));
+            AddControlHelp(hwnd, ds->hwndBtnOpenStream,
+                Tr(L"このプロセスの LLM ストリーム (jsonl) を既定のエディタで開きます。\nツール呼び出しやトークン使用量の生データを確認できます。",
+                   L"Opens this process's LLM stream (jsonl) in the default editor.\nInspect the raw tool calls and token usage.",
+                   L"Abre el flujo LLM (jsonl) de este proceso en el editor predeterminado.\nConsulta las llamadas a herramientas y el uso de tokens en bruto."));
+            AddControlHelp(hwnd, ds->hwndBtnClose,
+                Tr(L"プロセス詳細ダイアログを閉じます。", L"Closes the process details dialog.",
+                   L"Cierra el diálogo de detalles del proceso."));
 
             SendMessageW(hLblCmd, WM_SETFONT, (WPARAM)ds->hFontBold, TRUE);
             SendMessageW(ds->hwndLblInfo, WM_SETFONT, (WPARAM)ds->hFontBold, TRUE);
@@ -6848,6 +7339,25 @@ static LRESULT CALLBACK BtDebugWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARA
                 WS_CHILD | WS_VISIBLE | BS_OWNERDRAW, 0, 0, 10, 10, hwnd, (HMENU)IDC_BTDBG_SHOWALL, nullptr, nullptr);
             ds->hwndBtnClose = CreateWindowExW(0, L"BUTTON", Tr(L"閉じる", L"Close", L"Cerrar"),
                 WS_CHILD | WS_VISIBLE | BS_OWNERDRAW, 0, 0, 10, 10, hwnd, (HMENU)IDOK, nullptr, nullptr);
+            AddControlHelp(hwnd, ds->hwndBtnRefresh,
+                Tr(L"ビヘイビアツリーの状態を今すぐ再読み込みします。\n通常は数秒ごとに自動更新されます。",
+                   L"Reloads the behavior tree state now.\nIt otherwise refreshes automatically every few seconds.",
+                   L"Recarga ahora el estado de los árboles de comportamiento.\nNormalmente se actualiza solo cada pocos segundos."));
+            AddControlHelp(hwnd, ds->hwndBtnCopy,
+                Tr(L"選択中ノードの詳細をクリップボードにコピーします。\n右側の詳細欄の内容をそのまま共有できます。",
+                   L"Copies the selected node's details to the clipboard.\nShare the detail pane as-is.",
+                   L"Copia los detalles del nodo seleccionado.\nComparte el contenido del panel de detalles tal cual."));
+            AddControlHelp(hwnd, ds->hwndBtnFolder,
+                Tr(L"ビヘイビアツリーの定義ファイルがあるフォルダーを開きます。\nツリーを編集して再読み込みできます。",
+                   L"Opens the folder containing the behavior tree definitions.\nEdit a tree there and reload it.",
+                   L"Abre la carpeta con las definiciones de los árboles.\nEdita un árbol y recárgalo."));
+            AddControlHelp(hwnd, ds->hwndBtnShowAll,
+                Tr(L"実行中のツリーだけでなく、終了・失敗したツリーも表示します。\nもう一度押すと実行中のものだけに戻します。",
+                   L"Also shows finished and failed trees, not just running ones.\nPress again to show running trees only.",
+                   L"Muestra también árboles terminados y fallidos, no solo los activos.\nPulsa otra vez para ver solo los activos."));
+            AddControlHelp(hwnd, ds->hwndBtnClose,
+                Tr(L"ビヘイビアツリービューを閉じます。", L"Closes the behavior tree view.",
+                   L"Cierra la vista de árboles de comportamiento."));
 
             SendMessageW(ds->hwndLabel, WM_SETFONT, (WPARAM)(ds->dash ? ds->dash->hFontUiBold : nullptr), TRUE);
             HWND uiCtrls[] = {ds->hwndTree, ds->hwndStatus, ds->hwndBtnRefresh, ds->hwndBtnCopy, ds->hwndBtnFolder,
@@ -8680,6 +9190,13 @@ static LRESULT CALLBACK MonitorDetailWndProc(HWND hwnd, UINT msg, WPARAM wParam,
                 WS_CHILD | WS_VISIBLE | BS_PUSHBUTTON, 0, 0, 100, 28, hwnd, (HMENU)2, hInst, nullptr);
             ds->btnClose = CreateWindowExW(0, L"BUTTON", Tr(L"閉じる", L"Close", L"Cerrar"),
                 WS_CHILD | WS_VISIBLE | BS_PUSHBUTTON, 0, 0, 100, 28, hwnd, (HMENU)IDCANCEL, hInst, nullptr);
+            AddControlHelp(hwnd, ds->btnCopy,
+                Tr(L"表示中のイベント全文をクリップボードにコピーします。\n選択範囲がある場合は選択部分だけがコピーされます。",
+                   L"Copies the full event text to the clipboard.\nIf part of the text is selected, only the selection is copied.",
+                   L"Copia el texto completo del evento al portapapeles.\nSi hay texto seleccionado, solo se copia la selección."));
+            AddControlHelp(hwnd, ds->btnClose,
+                Tr(L"イベント詳細ウィンドウを閉じます。", L"Closes the event details window.",
+                   L"Cierra la ventana de detalles del evento."));
             if (ds->fontUi) {
                 SendMessageW(ds->edit, WM_SETFONT, reinterpret_cast<WPARAM>(ds->fontUi), TRUE);
                 SendMessageW(ds->btnCopy, WM_SETFONT, reinterpret_cast<WPARAM>(ds->fontUi), TRUE);
@@ -9338,7 +9855,7 @@ static void ShowTaskContextMenu(DashboardState* st, int procId, POINT ptScreen) 
     }
     AppendMenuW(hMenu, MF_SEPARATOR, 0, nullptr);
     if (snap.state == ProcState::Running) {
-        AppendMenuW(hMenu, MF_STRING, 3004, Tr(L"ツリー終了", L"Kill Tree", L"Terminar árbol"));
+        AppendMenuW(hMenu, MF_STRING, 3004, Tr(L"プロセスを終了 (子プロセスごと)", L"Kill Process (with child processes)", L"Terminar proceso (con procesos hijos)"));
     } else {
         AppendMenuW(hMenu, MF_STRING, 3005, Tr(L"この履歴を削除", L"Remove This Entry", L"Eliminar esta entrada"));
         AppendMenuW(hMenu, MF_STRING, 3006, Tr(L"終了履歴をすべて消去", L"Clear All Ended History", L"Borrar todo el historial finalizado"));
@@ -9375,10 +9892,10 @@ static void ShowTaskContextMenu(DashboardState* st, int procId, POINT ptScreen) 
     } else if (cmd == 3004) {
         if (gui_platform::GetGuiPlatform()->ShowMessageBox(
                 st->hwndMain,
-                Tr(L"ツリー終了の確認", L"Confirm Kill Tree", L"Confirmar cierre"),
-                Tr(L"このプロセスツリーを強制終了しますか？",
-                   L"Are you sure you want to kill this process tree?",
-                   L"¿Seguro que desea terminar este árbol de procesos?"),
+                Tr(L"プロセス終了の確認", L"Confirm Kill Process", L"Confirmar cierre"),
+                Tr(L"このプロセスを子プロセスごと強制終了しますか？",
+                   L"Are you sure you want to kill this process and its child processes?",
+                   L"¿Seguro que desea terminar este proceso y sus procesos hijos?"),
                 gui_platform::MessageBoxType::QuestionYesNo,
                 true) == gui_platform::MessageBoxResult::Yes) {
             std::string err;
@@ -9568,7 +10085,23 @@ static void LoadShellConfig(DashboardState* st) {
     SettingsManager::Instance().SetTabGridRefreshIntervalMs(st->refreshIntervalMs);
     st->showSupervisorHints = JsonGetBool(content, "show_supervisor_hints", true);
     st->hintAutoDismissSec = static_cast<int>(JsonGetInt(content, "hint_auto_dismiss_sec", 7));
-    st->supervisorCommand = JsonGetString(content, "supervisor_command", "claude");
+    // The supervisor runs only in batch; this is the engine name ("" = the default engine).
+    // The old interactive "supervisor_command" key is no longer used.
+    st->supervisorCommand = JsonGetString(content, "triage_supervisor_engine", "");
+    st->triageMode = JsonGetString(content, "triage_mode", "semi");
+    if (st->triageMode != "manual" && st->triageMode != "semi" && st->triageMode != "auto") st->triageMode = "semi";
+    st->triageLlmMode = JsonGetString(content, "triage_llm_mode", "uncertain");
+    if (st->triageLlmMode != "uncertain" && st->triageLlmMode != "manual" && st->triageLlmMode != "always")
+        st->triageLlmMode = "uncertain";
+    {
+        nlohmann::json cfg = nlohmann::json::parse(content, nullptr, false);
+        if (cfg.is_object() && cfg.contains("triage_hidden_cards") && cfg["triage_hidden_cards"].is_array()) {
+            for (const auto& id : cfg["triage_hidden_cards"]) {
+                if (id.is_string() && st->hiddenTriageCards.size() < 500)
+                    st->hiddenTriageCards.insert(id.get<std::string>());
+            }
+        }
+    }
     for (int m = 0; m < kListRowModeCount; ++m) {
         for (int k = 0; k < kListRowKeyCount; ++k) {
             COLORREF c = 0;
@@ -9622,9 +10155,20 @@ static void SaveShellConfig(const DashboardState* st) {
         << "  \"memory_max_bytes\": " << st->memoryMaxBytes << ",\n"
         << "  \"process_list_font_px\": " << st->processListFontPx << ",\n"
         << "  \"task_list_font_px\": " << st->taskListFontPx << ",\n"
-        << "  \"show_supervisor_hints\": " << (st->showSupervisorHints ? "true" : "false") << ",\n"
-        << "  \"hint_auto_dismiss_sec\": " << st->hintAutoDismissSec << ",\n"
-        << "  \"supervisor_command\": \"" << JsonEscape(st->supervisorCommand) << "\",\n"
+       << "  \"show_supervisor_hints\": " << (st->showSupervisorHints ? "true" : "false") << ",\n"
+       << "  \"hint_auto_dismiss_sec\": " << st->hintAutoDismissSec << ",\n"
+       << "  \"triage_mode\": \"" << JsonEscape(st->triageMode) << "\",\n"
+       << "  \"triage_llm_mode\": \"" << JsonEscape(st->triageLlmMode) << "\",\n"
+       << "  \"triage_hidden_cards\": [";
+    {
+        size_t n = 0;
+        for (const auto& id : st->hiddenTriageCards) {
+            if (n++) ss << ", ";
+            ss << "\"" << JsonEscape(id) << "\"";
+        }
+    }
+    ss << "],\n"
+       << "  \"triage_supervisor_engine\": \"" << JsonEscape(st->supervisorCommand) << "\",\n"
         << listBg.str()
         << "  \"refresh_interval_ms\": " << st->refreshIntervalMs << "\n"
         << "}\n";
@@ -9719,26 +10263,36 @@ static void UpdateToolbarLabels(DashboardState* st) {
     if (st->hwndBtnHint)
         SetWindowTextW(st->hwndBtnHint, L"💡");
     if (st->hwndBtnHistory)
-        SetWindowTextW(st->hwndBtnHistory, L"🕘");
+        SetWindowTextW(st->hwndBtnHistory, L"🩺");
     if (st->hwndBtnIpmsg)
         SetWindowTextW(st->hwndBtnIpmsg, L"💬");
 
     if (st->hwndToolbarTip) {
         if (st->hwndBtnGridView)
             UpdateControlTooltip(st->hwndToolbarTip, st->hwndMain, st->hwndBtnGridView,
-                Tr(L"グリッド表示", L"Grid View", L"Vista de cuadrícula"));
+                Tr(L"ターミナルを格子状に並べるグリッド表示と通常表示を切り替えます。\n複数プロセスの出力を同時に確認したいときに使います。",
+                   L"Toggles the tiled terminal grid on and off.\nUse it to watch several process outputs at the same time.",
+                   L"Alterna la cuadrícula de terminales.\nÚsala para ver la salida de varios procesos a la vez."));
         if (st->hwndBtnHideTray)
             UpdateControlTooltip(st->hwndToolbarTip, st->hwndMain, st->hwndBtnHideTray,
-                Tr(L"トレイに格納", L"Tray", L"Bandeja"));
+                Tr(L"ウィンドウをタスクトレイに格納します。\nトレイアイコンをダブルクリックすると元に戻ります。",
+                   L"Minimizes the window to the notification area.\nDouble-click the tray icon to restore it.",
+                   L"Minimiza la ventana al área de notificación.\nHaz doble clic en el icono para restaurarla."));
         if (st->hwndBtnHint)
             UpdateControlTooltip(st->hwndToolbarTip, st->hwndMain, st->hwndBtnHint,
-                Tr(L"Supervisor ガイダンス・ヒント", L"Supervisor Guidance / Hints", L"Guía de Supervisor"));
+                Tr(L"Supervisor のガイダンスを今すぐ評価して表示します。\n状態に応じた助言、見積もり乖離、リソース競合などを知らせます。\n表示中に押すと閉じます。",
+                   L"Evaluates and shows Supervisor guidance now.\nIt reports state-dependent advice, timing divergence and resource contention; press while visible to close it.",
+                   L"Evalúa y muestra ahora la guía del Supervisor.\nAvisa de consejos según el estado, desviaciones de tiempo y conflictos de recursos; pulsa de nuevo para cerrarla."));
         if (st->hwndBtnHistory)
             UpdateControlTooltip(st->hwndToolbarTip, st->hwndMain, st->hwndBtnHistory,
-                Tr(L"ヒント履歴", L"Hint History", L"Historial de pistas"));
+                Tr(L"トリアージ画面を開きます。\n失敗したジョブ・プロセスの原因、対処候補、LLM の助言を確認して処置できます。\nバッジの数字は未処理の判断待ち件数です。",
+                   L"Opens triage.\nReview the cause, candidate actions and LLM advice for failed jobs and processes, then act.\nThe badge counts pending decisions.",
+                   L"Abre el triaje.\nRevisa la causa, las acciones candidatas y el consejo del LLM para tareas y procesos fallidos.\nLa insignia cuenta las decisiones pendientes."));
         if (st->hwndBtnIpmsg)
             UpdateControlTooltip(st->hwndToolbarTip, st->hwndMain, st->hwndBtnIpmsg,
-                Tr(L"チャット", L"Chat", L"Chat"));
+                Tr(L"同じ LAN のホストやローカルエージェントとチャットします。\nバッジの数字は未読メッセージ数です。",
+                   L"Chat with hosts on the same LAN and with local agents.\nThe badge counts unread messages.",
+                   L"Chatea con equipos de la misma LAN y con agentes locales.\nLa insignia cuenta los mensajes sin leer."));
     }
     UpdatePanelToggleLabels(st);
     if (st->hwndBtnViewTasks) {
@@ -9813,7 +10367,7 @@ static void LaunchShellByType(DashboardState* st, ShellType type) {
     } else {
         st->selectedProcId = id;
         RefreshDashboardData(st);
-        TerminalView* tv = st->pm ? st->pm->GetTerminalView(id) : nullptr;
+        TerminalView* tv = GetTerminalViewForProcess(st, id);
         if (tv && tv->Hwnd()) {
             SetFocus(tv->Hwnd());
         }
@@ -9900,6 +10454,38 @@ static LRESULT CALLBACK ShellConfigWndProc(HWND hwnd, UINT msg, WPARAM wParam, L
                 WS_CHILD | WS_VISIBLE | BS_OWNERDRAW, 330, 170, 140, 30, hwnd, (HMENU)IDOK, nullptr, nullptr);
             HWND hBtnCancel = CreateWindowExW(0, L"BUTTON", Tr(L"キャンセル", L"Cancel", L"Cancelar"),
                 WS_CHILD | WS_VISIBLE | BS_OWNERDRAW, 480, 170, 140, 30, hwnd, (HMENU)IDCANCEL, nullptr, nullptr);
+            AddControlHelp(hwnd, cs->hwndRadCmd,
+                Tr(L"ツールバーの Launch ボタンで使う既定シェルを cmd にします。",
+                   L"Makes cmd the default shell used by the toolbar Launch button.",
+                   L"Hace que cmd sea el shell predeterminado del botón Iniciar."));
+            AddControlHelp(hwnd, cs->hwndRadPs,
+                Tr(L"ツールバーの Launch ボタンで使う既定シェルを PowerShell にします。",
+                   L"Makes PowerShell the default shell used by the toolbar Launch button.",
+                   L"Hace que PowerShell sea el shell predeterminado del botón Iniciar."));
+            AddControlHelp(hwnd, cs->hwndRadBash,
+                Tr(L"ツールバーの Launch ボタンで使う既定シェルを bash（Git Bash / WSL）にします。",
+                   L"Makes bash (Git Bash / WSL) the default shell used by the toolbar Launch button.",
+                   L"Hace que bash (Git Bash / WSL) sea el shell predeterminado del botón Iniciar."));
+            AddControlHelp(hwnd, hBtnRunCmd,
+                Tr(L"右の入力欄にあるコマンドで cmd ターミナルを今すぐ起動します。\n既定シェルの設定には影響しません。",
+                   L"Starts a cmd terminal now with the command in the box to the right.\nThis does not change the default shell.",
+                   L"Inicia ahora una terminal cmd con el comando del cuadro derecho.\nNo cambia el shell predeterminado."));
+            AddControlHelp(hwnd, hBtnRunPs,
+                Tr(L"右の入力欄にあるコマンドで PowerShell ターミナルを今すぐ起動します。\n既定シェルの設定には影響しません。",
+                   L"Starts a PowerShell terminal now with the command in the box to the right.\nThis does not change the default shell.",
+                   L"Inicia ahora una terminal PowerShell con el comando del cuadro derecho.\nNo cambia el shell predeterminado."));
+            AddControlHelp(hwnd, hBtnRunBash,
+                Tr(L"右の入力欄にあるコマンドで bash ターミナルを今すぐ起動します。\n既定シェルの設定には影響しません。",
+                   L"Starts a bash terminal now with the command in the box to the right.\nThis does not change the default shell.",
+                   L"Inicia ahora una terminal bash con el comando del cuadro derecho.\nNo cambia el shell predeterminado."));
+            AddControlHelp(hwnd, hBtnSave,
+                Tr(L"選択した既定シェルと 3 つの起動コマンドを保存して閉じます。\n次の Launch から新しい設定が使われます。",
+                   L"Saves the selected default shell and the three launch commands, then closes.\nThe next Launch uses the new settings.",
+                   L"Guarda el shell predeterminado y los tres comandos, y cierra.\nLa próxima ejecución usa los nuevos ajustes."));
+            AddControlHelp(hwnd, hBtnCancel,
+                Tr(L"変更を保存せずにシェル構成を閉じます。",
+                   L"Closes the shell settings without saving changes.",
+                   L"Cierra la configuración del shell sin guardar cambios."));
 
             SendMessageW(hTitle, WM_SETFONT, (WPARAM)st->hFontUiBold, TRUE);
             HWND ctrls[] = {
@@ -10121,8 +10707,8 @@ static void RestoreFromTray(DashboardState* st) {
     }
     SetForegroundWindow(st->hwndMain);
     RefreshDashboardData(st);
-    if (st->selectedProcId > 0 && st->pm) {
-        TerminalView* tv = st->pm->GetTerminalView(st->selectedProcId);
+    if (st->selectedProcId > 0) {
+        TerminalView* tv = GetTerminalViewForProcess(st, st->selectedProcId);
         if (tv && tv->Hwnd()) {
             SetFocus(tv->Hwnd());
         }
@@ -10269,7 +10855,7 @@ static int ThemeButtonId(UiTheme theme) {
     }
 }
 
-static constexpr int kSettingsTabCount = 5;
+static constexpr int kSettingsTabCount = 7;
 
 struct SettingsDlgState {
     DashboardState* dash = nullptr;
@@ -10327,9 +10913,21 @@ struct SettingsDlgState {
       HWND chkEndBlink = nullptr;
       HWND lblEndBlinkSec = nullptr;
       HWND editEndBlinkSec = nullptr;
-      HWND chkSupervisorHints = nullptr;
-      HWND lblHintAutoDismissSec = nullptr;
-      HWND editHintAutoDismissSec = nullptr;
+       HWND chkSupervisorHints = nullptr;
+       HWND lblHintAutoDismissSec = nullptr;
+       HWND editHintAutoDismissSec = nullptr;
+       HWND lblTriageMode = nullptr;
+       HWND cmbTriageMode = nullptr;
+       HWND lblTriageLlmMode = nullptr;
+        HWND cmbTriageLlmMode = nullptr;
+        HWND lblTriageKinds = nullptr;
+        HWND chkTriageKinds[5] = {};
+        nlohmann::json triageKinds = nlohmann::json::object();
+      HWND lblTermTitle = nullptr;
+      HWND chkTermLocal = nullptr;
+      HWND chkTermRemote = nullptr;
+      HWND lblTermHint = nullptr;
+      nlohmann::json terminalConfig = nlohmann::json::object();
       HWND lblSupervisorCommand = nullptr;
       HWND editSupervisorCommand = nullptr;
       HWND lblWebUiTitle = nullptr;
@@ -10351,7 +10949,8 @@ struct SettingsDlgState {
        HWND hwndAboutVersion = nullptr;
        HWND hwndAboutDesc = nullptr;
        HWND tabCtrl = nullptr;
-       // controls shown under each tab: 0 appearance, 1 behavior, 2 maintenance, 3 colors, 4 about
+       // controls shown under each tab: 0 appearance, 1 behavior, 2 WinConsoleServer,
+       // 3 triage, 4 maintenance, 5 colors, 6 about
        std::vector<HWND> tabPages[kSettingsTabCount];
 };
 
@@ -10447,10 +11046,36 @@ static void CommitSupervisorSettings(SettingsDlgState* ds) {
     if (ds->editSupervisorCommand) {
         wchar_t text[512] = {};
         GetWindowTextW(ds->editSupervisorCommand, text, 512);
-        std::string cmd = WideToUtf8(text);
-        if (!cmd.empty()) ds->dash->supervisorCommand = cmd;
+        // An engine name from engines.json (claude, opencode, ...); the supervisor always runs in batch.
+        ds->dash->supervisorCommand = WideToUtf8(text);
+    }
+    if (ds->cmbTriageMode) {
+        const int sel = static_cast<int>(SendMessageW(ds->cmbTriageMode, CB_GETCURSEL, 0, 0));
+        if (sel >= 0 && sel < 3) {
+            static const char* values[] = {"manual", "semi", "auto"};
+            ds->dash->triageMode = values[sel];
+        }
+    }
+    if (ds->cmbTriageLlmMode) {
+        const int sel = static_cast<int>(SendMessageW(ds->cmbTriageLlmMode, CB_GETCURSEL, 0, 0));
+        if (sel >= 0 && sel < 3) {
+            static const char* values[] = {"uncertain", "manual", "always"};
+            ds->dash->triageLlmMode = values[sel];
+        }
+    }
+    const char* kindKeys[] = {"job_failure", "bt_escalation_failure", "process_failure", "timing_divergence", "resource_wait"};
+    for (int i = 0; i < 5; ++i) {
+        if (ds->chkTriageKinds[i])
+            ds->triageKinds[kindKeys[i]] = SendMessageW(ds->chkTriageKinds[i], BM_GETCHECK, 0, 0) == BST_CHECKED;
     }
     SaveShellConfig(ds->dash);
+    nlohmann::json req = {{"action", "config_set"},
+                          {"patch", {{"triage_mode", ds->dash->triageMode},
+                                     {"triage_llm_mode", ds->dash->triageLlmMode},
+                                     {"triage_supervisor_engine", ds->dash->supervisorCommand},
+                                     {"triage_kinds", ds->triageKinds}}}};
+    nlohmann::json resp;
+    GuiIpcCall(ds->dash, req, resp);
 }
 
 // Shows the controls of one tab page and hides the rest.
@@ -10647,6 +11272,39 @@ static void ApplyWebUiDialogConfig(SettingsDlgState* ds) {
     UpdateWebUiAccessUrl(ds);
 }
 
+static void LoadTerminalDialogConfig(SettingsDlgState* ds) {
+    if (!ds) return;
+    ds->terminalConfig = nlohmann::json::object();
+    nlohmann::json cfg = nlohmann::json::parse(ReadFileUtf8Wide(GetConfigFilePathWide()), nullptr, false);
+    if (cfg.is_object() && cfg.contains("terminal") && cfg["terminal"].is_object()) {
+        ds->terminalConfig = cfg["terminal"];
+    }
+    const bool local = ds->terminalConfig.value("local", true);
+    const bool remote = ds->terminalConfig.value("remote", false);
+    if (ds->chkTermLocal) {
+        SendMessageW(ds->chkTermLocal, BM_SETCHECK, local ? BST_CHECKED : BST_UNCHECKED, 0);
+    }
+    if (ds->chkTermRemote) {
+        SendMessageW(ds->chkTermRemote, BM_SETCHECK, remote ? BST_CHECKED : BST_UNCHECKED, 0);
+    }
+}
+
+static void ApplyTerminalDialogConfig(SettingsDlgState* ds) {
+    if (!ds || !ds->dash) return;
+    nlohmann::json terminal =
+        ds->terminalConfig.is_object() ? ds->terminalConfig : nlohmann::json::object();
+    const bool local = ds->chkTermLocal &&
+        SendMessageW(ds->chkTermLocal, BM_GETCHECK, 0, 0) == BST_CHECKED;
+    const bool remote = ds->chkTermRemote &&
+        SendMessageW(ds->chkTermRemote, BM_GETCHECK, 0, 0) == BST_CHECKED;
+    terminal["local"] = local;
+    terminal["remote"] = remote;
+    ds->terminalConfig = terminal;
+    nlohmann::json req = {{"action", "config_set"}, {"patch", {{"terminal", terminal}}}};
+    nlohmann::json resp;
+    GuiIpcCall(ds->dash, req, resp);
+}
+
 static void UpdateSettingsDialogTexts(HWND hwnd) {
     auto* ds = reinterpret_cast<SettingsDlgState*>(GetWindowLongPtrW(hwnd, GWLP_USERDATA));
     if (!ds) return;
@@ -10688,6 +11346,8 @@ static void UpdateSettingsDialogTexts(HWND hwnd) {
         const wchar_t* const tabNames[kSettingsTabCount] = {
             Tr(L"表示", L"Appearance", L"Apariencia"),
             Tr(L"動作・通知", L"Behavior & alerts", L"Comportamiento y avisos"),
+            Tr(L"WinConsoleServer", L"WinConsoleServer", L"WinConsoleServer"),
+            Tr(L"トリアージ", L"Triage", L"Triaje"),
             Tr(L"管理", L"Maintenance", L"Mantenimiento"),
             Tr(L"色", L"Colors", L"Colores"),
             Tr(L"バージョン情報", L"About", L"Acerca de"),
@@ -10727,9 +11387,68 @@ static void UpdateSettingsDialogTexts(HWND hwnd) {
     }
     if (ds->lblSupervisorCommand) {
         SetWindowTextW(ds->lblSupervisorCommand, Tr(
-            L"Supervisor 起動コマンド (既定 claude):",
-            L"Supervisor launch command (default claude):",
-            L"Comando de lanzamiento de Supervisor (predeterminado claude):"));
+            L"Supervisor エンジン（バッチ実行。空欄 = 既定）:",
+            L"Supervisor engine (batch run; empty = default):",
+            L"Motor del Supervisor (por lotes; vacío = predeterminado):"));
+    }
+    if (ds->lblTriageMode) SetWindowTextW(ds->lblTriageMode,
+        Tr(L"処置モード Triage mode:", L"Triage mode:", L"Modo de triaje:"));
+    if (ds->lblTriageLlmMode) SetWindowTextW(ds->lblTriageLlmMode,
+        Tr(L"LLM 相談 Ask the LLM:", L"Ask the LLM:", L"Consultar al LLM:"));
+    if (ds->lblTriageKinds) SetWindowTextW(ds->lblTriageKinds,
+        Tr(L"トリアージで扱う種別", L"Kinds handled by triage", L"Tipos gestionados por triaje"));
+    {
+        const wchar_t* labels[] = {
+            Tr(L"ジョブの失敗", L"Job failure", L"Fallo de tarea"),
+            Tr(L"BT エスカレーションの失敗", L"BT escalation failure", L"Fallo de escalación BT"),
+            Tr(L"プロセスの失敗", L"Process failure", L"Fallo de proceso"),
+            Tr(L"見積もりの乖離", L"Timing divergence", L"Desviación de tiempo"),
+            Tr(L"リソース待ち", L"Resource wait", L"Espera de recurso")};
+        for (int i = 0; i < 5; ++i) if (ds->chkTriageKinds[i]) SetWindowTextW(ds->chkTriageKinds[i], labels[i]);
+    }
+    if (ds->lblTermTitle) {
+        SetWindowTextW(ds->lblTermTitle, Tr(
+            L"ターミナル接続 (WinConsoleServer / WCSP)",
+            L"Terminal connections (WinConsoleServer / WCSP)",
+            L"Conexiones de terminal (WinConsoleServer / WCSP)"));
+    }
+    if (ds->chkTermLocal) {
+        SetWindowTextW(ds->chkTermLocal, Tr(
+            L"ローカル接続を有効にする（この PC のダッシュボード）",
+            L"Enable local connections (dashboard on this PC)",
+            L"Activar conexiones locales (panel de este PC)"));
+    }
+    if (ds->chkTermRemote) {
+        SetWindowTextW(ds->chkTermRemote, Tr(
+            L"リモート接続を有効にする（LAN の WinConsoleTerminal）",
+            L"Enable remote connections (WinConsoleTerminal on the LAN)",
+            L"Activar conexiones remotas (WinConsoleTerminal en la LAN)"));
+    }
+    if (ds->lblTermHint) {
+        SetWindowTextW(ds->lblTermHint, Tr(
+            L"ローカル接続は、この PC のダッシュボードが ConPTY ジョブに接続するために使います。"
+            L"リモート接続は config.json の terminal.host:port にバインドし、別 PC の WinConsoleTerminal から "
+            L"attach:<id> で接続できるようにします。暗号化はないため、信頼できる LAN でのみ有効にしてください。",
+            L"Local connections let the dashboard on this PC attach to ConPTY jobs. Remote connections bind "
+            L"terminal.host:port from config.json so WinConsoleTerminal on another PC can attach with "
+            L"attach:<id>. There is no encryption, so enable remote only on a trusted LAN.",
+            L"Las conexiones locales permiten que el panel de este PC se conecte a los trabajos ConPTY. Las "
+            L"conexiones remotas usan terminal.host:port de config.json para que WinConsoleTerminal de otro PC "
+            L"se conecte con attach:<id>. No hay cifrado; actívalas solo en una LAN de confianza."));
+    }
+    if (ds->cmbTriageMode && ds->cmbTriageLlmMode) {
+        int mode = static_cast<int>(SendMessageW(ds->cmbTriageMode, CB_GETCURSEL, 0, 0));
+        int llm = static_cast<int>(SendMessageW(ds->cmbTriageLlmMode, CB_GETCURSEL, 0, 0));
+        SendMessageW(ds->cmbTriageMode, CB_RESETCONTENT, 0, 0);
+        SendMessageW(ds->cmbTriageMode, CB_ADDSTRING, 0, (LPARAM)Tr(L"手動 (manual)", L"Manual", L"Manual"));
+        SendMessageW(ds->cmbTriageMode, CB_ADDSTRING, 0, (LPARAM)Tr(L"半自動 (semi)", L"Semi-automatic", L"Semiautomático"));
+        SendMessageW(ds->cmbTriageMode, CB_ADDSTRING, 0, (LPARAM)Tr(L"自動 (auto)", L"Automatic", L"Automático"));
+        SendMessageW(ds->cmbTriageMode, CB_SETCURSEL, mode < 0 ? 1 : mode, 0);
+        SendMessageW(ds->cmbTriageLlmMode, CB_RESETCONTENT, 0, 0);
+        SendMessageW(ds->cmbTriageLlmMode, CB_ADDSTRING, 0, (LPARAM)Tr(L"迷うときだけ (uncertain)", L"When uncertain", L"Cuando haya dudas"));
+        SendMessageW(ds->cmbTriageLlmMode, CB_ADDSTRING, 0, (LPARAM)Tr(L"ボタンのときだけ (manual)", L"On button only", L"Solo al pulsar"));
+        SendMessageW(ds->cmbTriageLlmMode, CB_ADDSTRING, 0, (LPARAM)Tr(L"毎回 (always)", L"Every card", L"Cada tarjeta"));
+        SendMessageW(ds->cmbTriageLlmMode, CB_SETCURSEL, llm < 0 ? 0 : llm, 0);
     }
     if (ds->lblWebUiTitle) {
         SetWindowTextW(ds->lblWebUiTitle, Tr(L"ブラウザ UI (WebUI)", L"Browser UI (WebUI)", L"Interfaz web (WebUI)"));
@@ -10852,7 +11571,7 @@ static LRESULT CALLBACK SettingsWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPAR
 
             ds->tabCtrl = CreateWindowExW(0, WC_TABCONTROLW, L"",
                 WS_CHILD | WS_VISIBLE | WS_TABSTOP | WS_CLIPSIBLINGS | TCS_TABS | TCS_SINGLELINE | TCS_OWNERDRAWFIXED,
-                8, 8, 684, 760, hwnd, (HMENU)IDC_SET_TAB, hInst, nullptr);
+                8, 8, 744, 760, hwnd, (HMENU)IDC_SET_TAB, hInst, nullptr);
             SendMessageW(ds->tabCtrl, WM_SETFONT, (WPARAM)ds->dash->hFontUi, TRUE);
             SetWindowSubclass(ds->tabCtrl, SettingsTabSubclassProc, 1, 0);
             for (int t = 0; t < kSettingsTabCount; ++t) {
@@ -11046,6 +11765,59 @@ static LRESULT CALLBACK SettingsWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPAR
                 WS_CHILD | WS_VISIBLE | WS_TABSTOP | ES_AUTOHSCROLL,
                 360, 499, 310, 24, hwnd, (HMENU)IDC_SET_SUPERVISOR_COMMAND, hInst, nullptr);
             SetWindowTextW(ds->editSupervisorCommand, Utf8ToWide(ds->dash->supervisorCommand).c_str());
+            ds->lblTriageMode = CreateWindowExW(0, L"STATIC", L"",
+                WS_CHILD | WS_VISIBLE, 18, 48, 300, 20, hwnd, nullptr, hInst, nullptr);
+            ds->cmbTriageMode = CreateWindowExW(WS_EX_CLIENTEDGE, L"COMBOBOX", L"",
+                WS_CHILD | WS_VISIBLE | WS_TABSTOP | CBS_DROPDOWNLIST | WS_VSCROLL,
+                320, 44, 350, 160, hwnd, (HMENU)IDC_SET_TRIAGE_MODE, hInst, nullptr);
+            SendMessageW(ds->cmbTriageMode, CB_ADDSTRING, 0, (LPARAM)Tr(L"手動 (manual)", L"Manual", L"Manual"));
+            SendMessageW(ds->cmbTriageMode, CB_ADDSTRING, 0, (LPARAM)Tr(L"半自動 (semi)", L"Semi-automatic", L"Semiautomático"));
+            SendMessageW(ds->cmbTriageMode, CB_ADDSTRING, 0, (LPARAM)Tr(L"自動 (auto)", L"Automatic", L"Automático"));
+            SendMessageW(ds->cmbTriageMode, CB_SETCURSEL,
+                ds->dash->triageMode == "manual" ? 0 : ds->dash->triageMode == "auto" ? 2 : 1, 0);
+            ds->lblTriageLlmMode = CreateWindowExW(0, L"STATIC", L"",
+                WS_CHILD | WS_VISIBLE, 18, 84, 300, 20, hwnd, nullptr, hInst, nullptr);
+            ds->cmbTriageLlmMode = CreateWindowExW(WS_EX_CLIENTEDGE, L"COMBOBOX", L"",
+                WS_CHILD | WS_VISIBLE | WS_TABSTOP | CBS_DROPDOWNLIST | WS_VSCROLL,
+                320, 80, 350, 160, hwnd, (HMENU)IDC_SET_TRIAGE_LLM_MODE, hInst, nullptr);
+            SendMessageW(ds->cmbTriageLlmMode, CB_ADDSTRING, 0, (LPARAM)Tr(L"迷うときだけ (uncertain)", L"When uncertain", L"Cuando haya dudas"));
+            SendMessageW(ds->cmbTriageLlmMode, CB_ADDSTRING, 0, (LPARAM)Tr(L"ボタンのときだけ (manual)", L"On button only", L"Solo al pulsar"));
+            SendMessageW(ds->cmbTriageLlmMode, CB_ADDSTRING, 0, (LPARAM)Tr(L"毎回 (always)", L"Every card", L"Cada tarjeta"));
+            SendMessageW(ds->cmbTriageLlmMode, CB_SETCURSEL,
+                ds->dash->triageLlmMode == "manual" ? 1 : ds->dash->triageLlmMode == "always" ? 2 : 0, 0);
+
+            {
+                const char* kindKeys[] = {"job_failure", "bt_escalation_failure", "process_failure", "timing_divergence", "resource_wait"};
+                nlohmann::json config = nlohmann::json::parse(ReadFileUtf8Wide(GetConfigFilePathWide()), nullptr, false);
+                if (config.is_object() && config.contains("triage_kinds") && config["triage_kinds"].is_object())
+                    ds->triageKinds = config["triage_kinds"];
+                ds->lblTriageKinds = CreateWindowExW(0, L"STATIC", L"", WS_CHILD | WS_VISIBLE,
+                    18, 120, 640, 20, hwnd, nullptr, hInst, nullptr);
+                const wchar_t* kindLabels[] = {
+                    Tr(L"ジョブの失敗", L"Job failure", L"Fallo de tarea"),
+                    Tr(L"BT エスカレーションの失敗", L"BT escalation failure", L"Fallo de escalación BT"),
+                    Tr(L"プロセスの失敗", L"Process failure", L"Fallo de proceso"),
+                    Tr(L"見積もりの乖離", L"Timing divergence", L"Desviación de tiempo"),
+                    Tr(L"リソース待ち", L"Resource wait", L"Espera de recurso")};
+                for (int i = 0; i < 5; ++i) {
+                    ds->chkTriageKinds[i] = CreateWindowExW(0, L"BUTTON", kindLabels[i],
+                        WS_CHILD | WS_VISIBLE | WS_TABSTOP | BS_AUTOCHECKBOX,
+                        18, 144 + i * 26, 640, 24, hwnd,
+                        reinterpret_cast<HMENU>(static_cast<INT_PTR>(IDC_SET_TRIAGE_KIND_BASE + i)), hInst, nullptr);
+                    const bool enabled = ds->triageKinds.contains(kindKeys[i]) && ds->triageKinds[kindKeys[i]].is_boolean()
+                        ? ds->triageKinds[kindKeys[i]].get<bool>() : i != 4;
+                    SendMessageW(ds->chkTriageKinds[i], BM_SETCHECK, enabled ? BST_CHECKED : BST_UNCHECKED, 0);
+                }
+            }
+
+            ds->lblTermTitle = CreateWindowExW(0, L"STATIC", L"", WS_CHILD | WS_VISIBLE,
+                18, 48, 640, 20, hwnd, nullptr, hInst, nullptr);
+            ds->chkTermLocal = CreateWindowExW(0, L"BUTTON", L"", WS_CHILD | WS_VISIBLE | WS_TABSTOP | BS_AUTOCHECKBOX,
+                18, 84, 640, 24, hwnd, (HMENU)IDC_SET_TERM_LOCAL, hInst, nullptr);
+            ds->chkTermRemote = CreateWindowExW(0, L"BUTTON", L"", WS_CHILD | WS_VISIBLE | WS_TABSTOP | BS_AUTOCHECKBOX,
+                18, 114, 640, 24, hwnd, (HMENU)IDC_SET_TERM_REMOTE, hInst, nullptr);
+            ds->lblTermHint = CreateWindowExW(0, L"STATIC", L"", WS_CHILD | WS_VISIBLE,
+                18, 152, 700, 80, hwnd, nullptr, hInst, nullptr);
 
             ds->lblWebUiTitle = CreateWindowExW(0, L"STATIC", L"", WS_CHILD | WS_VISIBLE,
                 18, 100, 640, 20, hwnd, nullptr, hInst, nullptr);
@@ -11098,6 +11870,192 @@ static LRESULT CALLBACK SettingsWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPAR
             ds->hwndAboutDesc = CreateWindowExW(0, L"STATIC", L"", WS_CHILD | SS_LEFT,
                 18, 124, 620, 24, hwnd, nullptr, hInst, nullptr);
 
+            // Detailed hover help for every button on every settings page. The pages are
+            // created up front, so registering the tips here covers all of them.
+            auto helpId = [&](int id, const wchar_t* text) {
+                AddControlHelp(hwnd, GetDlgItem(hwnd, id), text);
+            };
+            helpId(IDC_SET_LANG_JA,
+                Tr(L"UI の言語を日本語に切り替えます。\nメニューやボタンの表記がすぐに変わります。",
+                   L"Switches the UI language to Japanese.\nLabels change immediately.",
+                   L"Cambia la interfaz al japonés.\nLas etiquetas cambian al instante."));
+            helpId(IDC_SET_LANG_EN,
+                Tr(L"UI の言語を英語に切り替えます。\nメニューやボタンの表記がすぐに変わります。",
+                   L"Switches the UI language to English.\nLabels change immediately.",
+                   L"Cambia la interfaz al inglés.\nLas etiquetas cambian al instante."));
+            helpId(IDC_SET_LANG_ES,
+                Tr(L"UI の言語をスペイン語に切り替えます。\nメニューやボタンの表記がすぐに変わります。",
+                   L"Switches the UI language to Spanish.\nLabels change immediately.",
+                   L"Cambia la interfaz al español.\nLas etiquetas cambian al instante."));
+            helpId(IDC_SET_THEME_SYSTEM,
+                Tr(L"Windows のライト/ダーク設定に追従するテーマに切り替えます。\n色の変更はすぐに全画面へ反映されます。",
+                   L"Uses the theme that follows the Windows light/dark setting.\nColors apply to the whole app immediately.",
+                   L"Usa el tema que sigue el ajuste claro/oscuro de Windows.\nLos colores se aplican al instante."));
+            helpId(IDC_SET_THEME_DARK,
+                Tr(L"暗い背景の「ダーク」テーマに切り替えます。\n夜間や長時間の監視に向きます。",
+                   L"Switches to the dark theme.\nSuited to night work and long monitoring sessions.",
+                   L"Cambia al tema oscuro.\nAdecuado para trabajar de noche y en sesiones largas."));
+            helpId(IDC_SET_THEME_LIGHT,
+                Tr(L"明るい背景の「ライト」テーマに切り替えます。\n明るい環境での視認性を優先します。",
+                   L"Switches to the light theme.\nPrioritizes readability in bright rooms.",
+                   L"Cambia al tema claro.\nPrioriza la legibilidad en entornos luminosos."));
+            helpId(IDC_SET_THEME_PASTEL,
+                Tr(L"淡い色合いの「パステル」テーマに切り替えます。\n色のコントラストを抑えたいときに使います。",
+                   L"Switches to the soft pastel theme.\nUse it when you want lower contrast.",
+                   L"Cambia al tema pastel.\nÚtil para reducir el contraste."));
+            helpId(IDC_SET_THEME_HC,
+                Tr(L"「ハイコントラスト」テーマに切り替えます。\n文字と背景の差を大きくして見やすくします。",
+                   L"Switches to the high-contrast theme.\nIncreases the difference between text and background.",
+                   L"Cambia al tema de alto contraste.\nAumenta la diferencia entre texto y fondo."));
+            helpId(IDC_SET_THEME_MIDNIGHT,
+                Tr(L"濃紺の「深夜」テーマに切り替えます。\n暗い部屋でもまぶしくない配色です。",
+                   L"Switches to the deep-blue Midnight theme.\nEasy on the eyes in a dark room.",
+                   L"Cambia al tema Medianoche.\nCómodo para habitaciones oscuras."));
+            helpId(IDC_SET_THEME_EMBER,
+                Tr(L"暖色系の「残り火」テーマに切り替えます。\nオレンジ系のアクセントが入ります。",
+                   L"Switches to the warm Ember theme.\nUses orange accents.",
+                   L"Cambia al tema Brasa.\nUsa acentos naranjas."));
+            helpId(IDC_SET_THEME_BERRY,
+                Tr(L"紫がかった「ベリー」テーマに切り替えます。\n落ち着いた赤紫のアクセントが入ります。",
+                   L"Switches to the Berry theme.\nUses muted magenta accents.",
+                   L"Cambia al tema Baya.\nUsa acentos magenta suaves."));
+            helpId(IDC_SET_THEME_CRIMSON,
+                Tr(L"深紅の「クリムゾン」テーマに切り替えます。\n赤系のアクセントが入ります。",
+                   L"Switches to the Crimson theme.\nUses deep red accents.",
+                   L"Cambia al tema Carmesí.\nUsa acentos rojo profundo."));
+            helpId(IDC_SET_THEME_FOREST,
+                Tr(L"緑系の「深緑」テーマに切り替えます。\n緑を基調にした落ち着いた配色です。",
+                   L"Switches to the Forest theme.\nA calm green-based palette.",
+                   L"Cambia al tema Bosque.\nUna paleta calmada basada en verdes."));
+            helpId(IDC_SET_THEME_MIST,
+                Tr(L"灰色がかった「ミスト」テーマに切り替えます。\n彩度を抑えた配色です。",
+                   L"Switches to the Mist theme.\nA low-saturation grey palette.",
+                   L"Cambia al tema Niebla.\nUna paleta gris de baja saturación."));
+            helpId(IDC_SET_THEME_PASTEL_BLUE,
+                Tr(L"淡い青のテーマに切り替えます。\n色の変更はすぐに全画面へ反映されます。",
+                   L"Switches to the pastel blue theme.\nColors apply to the whole app immediately.",
+                   L"Cambia al tema azul pastel.\nLos colores se aplican al instante."));
+            helpId(IDC_SET_THEME_PASTEL_ORANGE,
+                Tr(L"淡いオレンジのテーマに切り替えます。\n色の変更はすぐに全画面へ反映されます。",
+                   L"Switches to the pastel orange theme.\nColors apply to the whole app immediately.",
+                   L"Cambia al tema naranja pastel.\nLos colores se aplican al instante."));
+            helpId(IDC_SET_THEME_PASTEL_PINK,
+                Tr(L"淡いピンクのテーマに切り替えます。\n色の変更はすぐに全画面へ反映されます。",
+                   L"Switches to the pastel pink theme.\nColors apply to the whole app immediately.",
+                   L"Cambia al tema rosa pastel.\nLos colores se aplican al instante."));
+            helpId(IDC_SET_THEME_PASTEL_RED,
+                Tr(L"淡い赤のテーマに切り替えます。\n色の変更はすぐに全画面へ反映されます。",
+                   L"Switches to the pastel red theme.\nColors apply to the whole app immediately.",
+                   L"Cambia al tema rojo pastel.\nLos colores se aplican al instante."));
+            helpId(IDC_SET_THEME_PASTEL_GREEN,
+                Tr(L"淡い緑のテーマに切り替えます。\n色の変更はすぐに全画面へ反映されます。",
+                   L"Switches to the pastel green theme.\nColors apply to the whole app immediately.",
+                   L"Cambia al tema verde pastel.\nLos colores se aplican al instante."));
+            helpId(IDC_SET_THEME_DEEP_PURPLE,
+                Tr(L"濃い紫のテーマに切り替えます。\n色の変更はすぐに全画面へ反映されます。",
+                   L"Switches to the deep purple theme.\nColors apply to the whole app immediately.",
+                   L"Cambia al tema púrpura oscuro.\nLos colores se aplican al instante."));
+            helpId(IDC_SET_THEME_PASTEL_PURPLE,
+                Tr(L"薄い紫のテーマに切り替えます。\n色の変更はすぐに全画面へ反映されます。",
+                   L"Switches to the pale purple theme.\nColors apply to the whole app immediately.",
+                   L"Cambia al tema púrpura claro.\nLos colores se aplican al instante."));
+            helpId(IDC_SET_THEME_DEEP_YELLOW,
+                Tr(L"濃い黄色のテーマに切り替えます。\n色の変更はすぐに全画面へ反映されます。",
+                   L"Switches to the deep yellow theme.\nColors apply to the whole app immediately.",
+                   L"Cambia al tema amarillo oscuro.\nLos colores se aplican al instante."));
+            helpId(IDC_SET_THEME_PASTEL_YELLOW,
+                Tr(L"薄い黄色のテーマに切り替えます。\n色の変更はすぐに全画面へ反映されます。",
+                   L"Switches to the pale yellow theme.\nColors apply to the whole app immediately.",
+                   L"Cambia al tema amarillo claro.\nLos colores se aplican al instante."));
+            helpId(IDC_SET_SHELL_CONFIG,
+                Tr(L"Launch ボタンで使う既定シェルと起動コマンドを設定します。\ncmd / PowerShell / bash ごとに個別に指定できます。",
+                   L"Sets the default shell and launch commands for the Launch button.\ncmd, PowerShell and bash can each have their own command.",
+                   L"Configura el shell y los comandos del botón Iniciar.\ncmd, PowerShell y bash pueden tener su propio comando."));
+            helpId(IDC_SET_RESET_IDS,
+                Tr(L"プロセス ID の採番を 1 に戻します。\n実行中のプロセスや既存のログには影響しません。",
+                   L"Restarts process ID numbering at 1.\nRunning processes and existing logs are not affected.",
+                   L"Reinicia la numeración de procesos en 1.\nNo afecta a procesos activos ni a los registros existentes."));
+            helpId(IDC_SET_CLEAR_ENDED,
+                Tr(L"終了済みプロセスの履歴を一覧から消去します。\n確認ダイアログが表示され、実行中のプロセスは残ります。",
+                   L"Clears finished processes from the list.\nA confirmation appears; running processes stay.",
+                   L"Borra del historial los procesos terminados.\nAparece una confirmación; los procesos activos permanecen."));
+            helpId(IDCANCEL,
+                Tr(L"設定を保存してダイアログを閉じます。\n変更内容は次回起動時にも引き継がれます。",
+                   L"Saves the settings and closes the dialog.\nChanges persist across restarts.",
+                   L"Guarda los ajustes y cierra el diálogo.\nLos cambios se conservan tras reiniciar."));
+            helpId(IDC_SET_SOUND_ENABLED,
+                Tr(L"プロセスやタスクが終了したときに通知音を鳴らすかどうかを切り替えます。",
+                   L"Toggles the notification sound played when a process or task finishes.",
+                   L"Activa o desactiva el sonido al terminar un proceso o tarea."));
+            helpId(IDC_SET_SOUND_BROWSE,
+                Tr(L"通知音に使う WAV ファイルを選択します。\n空欄のままなら Windows の既定音を使います。",
+                   L"Chooses the WAV file used for the notification sound.\nLeave it empty to use the Windows default.",
+                   L"Elige el archivo WAV del sonido de notificación.\nDéjalo vacío para usar el sonido predeterminado de Windows."));
+            helpId(IDC_SET_SOUND_TEST,
+                Tr(L"選択中の通知音をその場で再生して確認します。\n音量や長さを先に確かめられます。",
+                   L"Plays the selected notification sound so you can check it.\nConfirm the volume and length first.",
+                   L"Reproduce el sonido seleccionado para comprobarlo.\nComprueba antes el volumen y la duración."));
+            helpId(IDC_SET_HIDE_ENDED,
+                Tr(L"終了済みのプロセスを一覧から隠します。\n履歴は残るため、設定を戻せば再表示できます。",
+                   L"Hides finished processes from the list.\nTheir history remains, so they return if you turn this off.",
+                   L"Oculta los procesos terminados de la lista.\nSu historial permanece y vuelven al desactivarlo."));
+            helpId(IDC_SET_USAGE_GRAPH_MODE,
+                Tr(L"Usage グラフをトークン種別ではなく provider/model ごとの積み上げ表示にします。\nどのモデルが多く使われているか分かりやすくなります。",
+                   L"Stacks the usage graph by provider/model instead of token kind.\nMakes it easier to see which model is used most.",
+                   L"Apila el gráfico de uso por proveedor/modelo en vez de por tipo de token.\nFacilita ver qué modelo se usa más."));
+            helpId(IDC_SET_RESTORE_USAGE_GRAPH,
+                Tr(L"ダッシュボードを再起動したとき、Usage グラフの表示状態を復元します。",
+                   L"Restores whether the usage graph was shown when the dashboard restarts.",
+                   L"Restaura la visibilidad del gráfico de uso al reiniciar el panel."));
+            helpId(IDC_SET_RESOURCE_LOCKS,
+                Tr(L"同じリソース（ファイルやデバイス）を使うジョブを同時に実行しないようにします。\n競合による失敗を防ぎます。",
+                   L"Prevents jobs that use the same resource (file or device) from running at once.\nAvoids failures caused by contention.",
+                   L"Evita ejecutar a la vez trabajos que usan el mismo recurso (archivo o dispositivo).\nPreviene fallos por conflicto."));
+            helpId(IDC_SET_ACTIVITY_STYLE,
+                Tr(L"実行状態監視ペインの行を状態別に色分けし、アイコンを表示します。\n失敗や待機がひと目で分かります。",
+                   L"Colors rows in the execution monitor pane by state and shows icons.\nFailures and waits stand out at a glance.",
+                   L"Colorea las filas del panel de ejecución según el estado y muestra iconos.\nLos fallos y esperas se ven de un vistazo."));
+            helpId(IDC_SET_SHOW_HIDDEN_TASKS,
+                Tr(L"内部用の hidden タスク（チャット処理など）もタスクキューに表示します。",
+                   L"Also shows internal hidden tasks (such as chat handling) in the task queue.",
+                   L"Muestra también las tareas internas ocultas (como el chat) en la cola."));
+            helpId(IDC_SET_END_BLINK_ENABLED,
+                Tr(L"プロセスやタスクが終了したとき、一覧の行をしばらく点滅させます。\n終了を見落としにくくなります。",
+                   L"Blinks the list row for a while when a process or task finishes.\nMakes endings harder to miss.",
+                   L"Hace parpadear la fila al terminar un proceso o tarea.\nEvita pasar por alto los finales."));
+            helpId(IDC_SET_SHOW_SUPERVISOR_HINTS,
+                Tr(L"Supervisor LLM のガイダンスをポップアップ表示します。\n状態に応じた助言や見積もり乖離を知らせます。",
+                   L"Shows Supervisor LLM guidance popups.\nIt reports state-dependent advice and timing divergence.",
+                   L"Muestra avisos del Supervisor LLM.\nInforma de consejos según el estado y desviaciones de tiempo."));
+            helpId(IDC_SET_TERM_LOCAL,
+                Tr(L"この PC のダッシュボードから ConPTY ジョブへローカル接続できるようにします。",
+                   L"Lets the dashboard on this PC attach to ConPTY jobs locally.",
+                   L"Permite que el panel de este PC se conecte localmente a trabajos ConPTY."));
+            helpId(IDC_SET_TERM_REMOTE,
+                Tr(L"LAN 上の WinConsoleTerminal からのリモート接続を許可します。\n暗号化はないため、信頼できる LAN でのみ有効にしてください。",
+                   L"Allows remote connections from WinConsoleTerminal on the LAN.\nThere is no encryption, so enable it only on a trusted LAN.",
+                   L"Permite conexiones remotas desde WinConsoleTerminal en la LAN.\nNo hay cifrado; actívalo solo en una LAN de confianza."));
+            helpId(IDC_SET_WEBUI_ENABLED,
+                Tr(L"ブラウザから操作できる Web UI を有効にします。\nアクセス URL は下の欄に表示されます。",
+                   L"Enables the browser UI.\nThe access URL is shown in the box below.",
+                   L"Activa la interfaz web.\nLa URL de acceso aparece en el cuadro inferior."));
+            for (int h = 0; h < 5; ++h) {
+                helpId(IDC_SET_TRIAGE_KIND_BASE + h,
+                    Tr(L"この種別の失敗をトリアージの対象に含めます。\n外すと、その失敗は自動でカード化されません。",
+                       L"Includes this failure kind in triage.\nWhen unchecked, these failures are not turned into cards automatically.",
+                       L"Incluye este tipo de fallo en el triaje.\nSi se desactiva, no se crean tarjetas automáticamente."));
+            }
+            for (int k = 0; k < kListRowKeyCount; ++k) {
+                helpId(IDC_SET_LIST_BG_RUNNING + k,
+                    Tr(L"クリックして、この状態の行の背景色を選択します。\nダーク/ライトテーマごとに個別に保存されます。",
+                       L"Click to choose the row background colour for this state.\nDark and light themes store separate colours.",
+                       L"Haz clic para elegir el color de fondo de este estado.\nLos temas claro y oscuro guardan colores distintos."));
+            }
+            helpId(IDC_SET_LIST_BG_RESET,
+                Tr(L"リスト行の背景色を、テーマ既定の色に戻します。",
+                   L"Returns all list row background colours to the theme defaults.",
+                   L"Restablece los colores de fondo de las filas a los del tema."));
+
             HWND ctrls[] = { ds->btnJa, ds->btnEn, ds->btnEs, ds->btnSystem, ds->btnDark, ds->btnLight, ds->btnPastel, ds->btnHc,
                              ds->btnMidnight, ds->btnEmber, ds->btnBerry, ds->btnCrimson, ds->btnForest, ds->btnMist,
                              ds->btnPastelBlue, ds->btnPastelOrange, ds->btnPastelPink, ds->btnPastelRed, ds->btnPastelGreen,
@@ -11106,16 +12064,21 @@ static LRESULT CALLBACK SettingsWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPAR
                              ds->btnBrowseSound, ds->btnTestSound, ds->chkHideEnded, ds->chkUsageGraph, ds->chkRestoreUsageGraph,
                              ds->chkResourceLocks, ds->chkActivityStyle, ds->chkShowHiddenTasks, ds->lblEventRetention, ds->editEventRetention,
                              ds->lblRefreshInterval, ds->editRefreshInterval, ds->btnListBgReset,
-                             ds->chkEndBlink, ds->lblEndBlinkSec, ds->editEndBlinkSec,
-                             ds->chkSupervisorHints, ds->lblHintAutoDismissSec, ds->editHintAutoDismissSec,
-                             ds->lblSupervisorCommand, ds->editSupervisorCommand,
+                              ds->chkEndBlink, ds->lblEndBlinkSec, ds->editEndBlinkSec,
+                              ds->chkSupervisorHints, ds->lblHintAutoDismissSec, ds->editHintAutoDismissSec,
+                               ds->lblSupervisorCommand, ds->editSupervisorCommand,
+                               ds->lblTriageMode, ds->cmbTriageMode, ds->lblTriageLlmMode, ds->cmbTriageLlmMode,
+                               ds->lblTriageKinds,
+                               ds->lblTermTitle, ds->chkTermLocal, ds->chkTermRemote, ds->lblTermHint,
                              ds->lblWebUiTitle, ds->chkWebUi, ds->lblWebUiScope, ds->cmbWebUiScope,
                              ds->lblWebUiAllowedHosts, ds->editWebUiAllowedHosts,
                              ds->lblWebUiPort, ds->editWebUiPort, ds->lblWebUiUrl, ds->editWebUiUrl,
                              ds->lblProcFont, ds->cmbProcFont, ds->lblTaskFont, ds->cmbTaskFont };
-            for (HWND h : ctrls) SendMessageW(h, WM_SETFONT, (WPARAM)ds->dash->hFontUi, TRUE);
+             for (HWND h : ctrls) SendMessageW(h, WM_SETFONT, (WPARAM)ds->dash->hFontUi, TRUE);
+             for (HWND h : ds->chkTriageKinds) if (h) SendMessageW(h, WM_SETFONT, (WPARAM)ds->dash->hFontUi, TRUE);
             for (HWND h : ds->btnListBg) SendMessageW(h, WM_SETFONT, (WPARAM)ds->dash->hFontUi, TRUE);
             SendMessageW(ds->lblListBg, WM_SETFONT, (WPARAM)ds->dash->hFontUiBold, TRUE);
+            SendMessageW(ds->lblTermTitle, WM_SETFONT, (WPARAM)ds->dash->hFontUiBold, TRUE);
             SendMessageW(ds->hwndAboutTitle, WM_SETFONT, (WPARAM)ds->dash->hFontUiBold, TRUE);
             SendMessageW(ds->hwndAboutVersion, WM_SETFONT, (WPARAM)ds->dash->hFontUi, TRUE);
             SendMessageW(ds->hwndAboutDesc, WM_SETFONT, (WPARAM)ds->dash->hFontUi, TRUE);
@@ -11124,7 +12087,9 @@ static LRESULT CALLBACK SettingsWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPAR
             {
                 auto& appearance = ds->tabPages[0];
                 auto& behavior = ds->tabPages[1];
-                auto& maintenance = ds->tabPages[2];
+                auto& terminal = ds->tabPages[2];
+                auto& triage = ds->tabPages[3];
+                auto& maintenance = ds->tabPages[4];
                 appearance.insert(appearance.end(), {
                     ds->hwndLangLabel, ds->btnJa, ds->btnEn, ds->btnEs,
                     ds->hwndThemeLabel, ds->btnSystem, ds->btnDark, ds->btnLight, ds->btnPastel, ds->btnHc,
@@ -11133,7 +12098,7 @@ static LRESULT CALLBACK SettingsWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPAR
                     ds->btnDeepPurple, ds->btnPastelPurple, ds->btnDeepYellow, ds->btnPastelYellow,
                     ds->hwndSatLabel, ds->hwndSatCombo,
                     ds->lblProcFont, ds->cmbProcFont, ds->lblTaskFont, ds->cmbTaskFont });
-                auto& colors = ds->tabPages[3];
+                auto& colors = ds->tabPages[5];
                 colors.insert(colors.end(), { ds->lblListBg, ds->btnListBgReset });
                 colors.insert(colors.end(), ds->btnListBg, ds->btnListBg + kListRowKeyCount);
                 behavior.insert(behavior.end(), {
@@ -11145,17 +12110,24 @@ static LRESULT CALLBACK SettingsWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPAR
                     ds->chkEndBlink, ds->lblEndBlinkSec, ds->editEndBlinkSec,
                     ds->chkSupervisorHints, ds->lblHintAutoDismissSec, ds->editHintAutoDismissSec,
                     ds->lblSupervisorCommand, ds->editSupervisorCommand });
+                terminal.insert(terminal.end(), {
+                    ds->lblTermTitle, ds->chkTermLocal, ds->chkTermRemote, ds->lblTermHint });
+                triage.insert(triage.end(), {
+                    ds->lblTriageMode, ds->cmbTriageMode, ds->lblTriageLlmMode, ds->cmbTriageLlmMode,
+                    ds->lblTriageKinds });
+                triage.insert(triage.end(), ds->chkTriageKinds, ds->chkTriageKinds + 5);
                 maintenance.insert(maintenance.end(), { ds->btnShell, ds->btnReset, ds->btnClear });
                 maintenance.insert(maintenance.end(), {
                     ds->lblWebUiTitle, ds->chkWebUi, ds->lblWebUiScope, ds->cmbWebUiScope,
                     ds->lblWebUiAllowedHosts, ds->editWebUiAllowedHosts,
                     ds->lblWebUiPort, ds->editWebUiPort, ds->lblWebUiUrl, ds->editWebUiUrl });
-                auto& about = ds->tabPages[4];
+                auto& about = ds->tabPages[6];
                 about.insert(about.end(), { ds->hwndAboutTitle, ds->hwndAboutVersion, ds->hwndAboutDesc });
             }
             SelectSettingsTab(ds, 0);
             UpdateSettingsDialogTexts(hwnd);
             LoadWebUiDialogConfig(ds);
+            LoadTerminalDialogConfig(ds);
             ApplyNativeThemeToWindow(hwnd);
             // The tab pages are fully owner-painted with the dialog colours; theming the tab
             // control would repaint its body with the system (white) background.
@@ -11186,8 +12158,17 @@ static LRESULT CALLBACK SettingsWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPAR
                 CommitSupervisorSettings(ds);
                 return 0;
             }
+            if (id >= IDC_SET_TRIAGE_KIND_BASE && id < IDC_SET_TRIAGE_KIND_BASE + 5) {
+                CommitSupervisorSettings(ds);
+                return 0;
+            }
             if (id == IDC_SET_HINT_AUTO_DISMISS_SEC || id == IDC_SET_SUPERVISOR_COMMAND) {
                 if (HIWORD(wParam) == EN_KILLFOCUS) CommitSupervisorSettings(ds);
+                return 0;
+            }
+            if ((id == IDC_SET_TRIAGE_MODE || id == IDC_SET_TRIAGE_LLM_MODE) &&
+                HIWORD(wParam) == CBN_SELCHANGE) {
+                CommitSupervisorSettings(ds);
                 return 0;
             }
             if (id == IDC_SET_END_BLINK_ENABLED) {
@@ -11225,6 +12206,10 @@ static LRESULT CALLBACK SettingsWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPAR
                     (SendMessageW(ds->chkRestoreUsageGraph, BM_GETCHECK, 0, 0) == BST_CHECKED);
                 SetUsageHistoryPersistence(ds->dash->restoreUsageGraph);
                 SaveShellConfig(ds->dash);
+                return 0;
+            }
+            if (id == IDC_SET_TERM_LOCAL || id == IDC_SET_TERM_REMOTE) {
+                ApplyTerminalDialogConfig(ds);
                 return 0;
             }
             if (id == IDC_SET_WEBUI_ENABLED) {
@@ -11542,7 +12527,7 @@ static void ShowSettingsDialog(DashboardState* st) {
     ds->dash = st;
     RECT rcParent = {};
     GetWindowRect(st->hwndMain, &rcParent);
-    int dlgW = 700;
+    int dlgW = 760;
     int dlgH = 870;
     int x = rcParent.left + ((rcParent.right - rcParent.left) - dlgW) / 2;
     int y = rcParent.top + ((rcParent.bottom - rcParent.top) - dlgH) / 2;
@@ -11754,7 +12739,7 @@ static void DrawTaskGanttPane(HDC hdc, DashboardState* st, const RECT& plot,
     int laneX1 = x1;
     int laneW = laneX1 - laneX0;
     if (laneW < 20) return;
-    int64_t span = winEnd - winStart;
+    span = winEnd - winStart;
     if (span <= 0) span = 1;
 
     auto timeToX = [&](int64_t t) {
@@ -11821,6 +12806,21 @@ static void DrawTaskGanttPane(HDC hdc, DashboardState* st, const RECT& plot,
         RECT endRc = {laneX0 + laneW / 2, bottom + 1, laneX1, bottom + 14};
         DrawTextW(hdc, startLbl.c_str(), -1, &startRc, DT_LEFT | DT_SINGLELINE | DT_END_ELLIPSIS);
         DrawTextW(hdc, endLbl.c_str(), -1, &endRc, DT_RIGHT | DT_SINGLELINE | DT_END_ELLIPSIS);
+    }
+
+    // Current time (NOW) marker line and label
+    if (now >= winStart && now <= winEnd) {
+        int nx = timeToX(now);
+        HPEN nowPen = CreatePen(PS_SOLID, 1, g_theme.accent);
+        HGDIOBJ oldNowPen = SelectObject(hdc, nowPen);
+        MoveToEx(hdc, nx, top, nullptr);
+        LineTo(hdc, nx, bottom);
+        SelectObject(hdc, oldNowPen);
+        DeleteObject(nowPen);
+
+        RECT nowRc = {nx - 18, bottom + 1, nx + 18, bottom + 14};
+        SetTextColor(hdc, g_theme.accent);
+        DrawTextW(hdc, L"NOW", -1, &nowRc, DT_CENTER | DT_SINGLELINE | DT_NOCLIP);
     }
 
     if (visible.empty()) {
@@ -12612,83 +13612,6 @@ static LRESULT CALLBACK UsagePanelWndProc(HWND hwnd, UINT msg, WPARAM wParam, LP
 // Supervisor Guidance & Audit Hint Window (Card 070)
 // ---------------------------------------------------------------------------
 
-// Quote one argument for a Windows command line (CommandLineToArgvW rules).
-static std::wstring QuoteSupervisorArg(const std::wstring& arg) {
-    std::wstring out;
-    out.reserve(arg.size() + 2);
-    out.push_back(L'"');
-    size_t backslashes = 0;
-    for (wchar_t c : arg) {
-        if (c == L'\\') {
-            ++backslashes;
-            out.push_back(c);
-        } else if (c == L'"') {
-            out.append(backslashes + 1, L'\\');
-            out.push_back(L'"');
-            backslashes = 0;
-        } else {
-            backslashes = 0;
-            out.push_back(c);
-        }
-    }
-    out.append(backslashes, L'\\');
-    out.push_back(L'"');
-    return out;
-}
-
-// supervisor_command may contain {prompt}; when it does not, a non-empty prompt is
-// appended as one more argument. This is what lets the hint window hand its prompt
-// to the supervisor instead of only opening a blank terminal.
-static std::string BuildSupervisorCommand(const std::string& configured, const std::wstring& prompt) {
-    std::wstring cmd = Utf8ToWide(configured.empty() ? std::string("claude") : configured);
-    const size_t pos = cmd.find(L"{prompt}");
-    if (pos != std::wstring::npos) {
-        cmd.replace(pos, 8, prompt.empty() ? std::wstring() : QuoteSupervisorArg(prompt));
-    } else if (!prompt.empty()) {
-        if (!cmd.empty() && cmd.back() != L' ') cmd.push_back(L' ');
-        cmd += QuoteSupervisorArg(prompt);
-    }
-    return WideToUtf8(cmd);
-}
-
-static void LaunchSupervisorTerminal(DashboardState* st, const std::wstring& prompt = L"") {
-    if (!st) return;
-    std::string cmd = BuildSupervisorCommand(st->supervisorCommand, prompt);
-    StartProcessRequest req;
-    req.mode = ExecMode::ConPTY;
-    req.name = "supervisor";
-    req.commandLine = cmd;
-
-    std::string err;
-    int id = -1;
-    if (st->pm) {
-        id = st->pm->StartProcess(req, err);
-    } else {
-        nlohmann::json startReq = {
-            {"action", "start"},
-            {"cmd", req.commandLine},
-            {"name", req.name},
-            {"mode", ExecModeToString(req.mode)},
-            {"wait", false}
-        };
-        nlohmann::json startResp;
-        if (GuiIpcCall(st, startReq, startResp, &err) && startResp.value("ok", false)) {
-            id = startResp.value("id", -1);
-        }
-    }
-    if (id < 0) {
-        std::wstring werr = Utf8ToWide(err);
-        gui_platform::GetGuiPlatform()->ShowMessageBox(st->hwndMain, L"Failed to Launch Supervisor", werr, gui_platform::MessageBoxType::Error);
-    } else {
-        st->selectedProcId = id;
-        RefreshDashboardData(st);
-        TerminalView* tv = st->pm ? st->pm->GetTerminalView(id) : nullptr;
-        if (tv && tv->Hwnd()) {
-            SetFocus(tv->Hwnd());
-        }
-    }
-}
-
 static void RepositionHintWindow(DashboardState* st) {
     if (!st || !st->hwndHintWnd || !IsWindow(st->hwndHintWnd)) return;
     RECT rcMain = {};
@@ -12702,290 +13625,1543 @@ static void RepositionHintWindow(DashboardState* st) {
     SetWindowPos(st->hwndHintWnd, HWND_TOP, x, y, hintW, hintH, SWP_NOACTIVATE);
 }
 
-// ---------------------------------------------------------------------------
-// Supervisor hint history: a list of hints that were shown earlier, with the
-// same copy / launch actions as the popup so a dismissed hint is not lost.
-// ---------------------------------------------------------------------------
 static void DisplaySupervisorHint(DashboardState* st, const std::wstring& category,
                                   const std::wstring& summary, const std::wstring& prompt,
                                   int autoDismissSec);
 
-struct HintHistoryDlgState {
+// ---------------------------------------------------------------------------
+// Triage cards: all core data and decisions are exchanged through IPC.
+// ---------------------------------------------------------------------------
+constexpr UINT WM_PC_TRIAGE_REFRESH = WM_APP + 108;
+
+struct TriageDlgState {
     DashboardState* dash = nullptr;
     HFONT fontUi = nullptr;
+    HWND filter = nullptr;
+    HWND search = nullptr;
+    HWND modeLabel = nullptr;
+    HWND emptyState = nullptr;
     HWND list = nullptr;
-    HWND detail = nullptr;
-    HWND btnCopy = nullptr;
-    HWND btnLaunch = nullptr;
+    // Lower half: the information table (cause / background / environment / conditions / reason) on
+    // the left, and the action pane (advice, decision, candidates, reason) on the right.
+    HWND infoLabel = nullptr;
+    HWND infoTable = nullptr;
+    HWND actionLabel = nullptr;
+    HWND detail = nullptr;   // action text: advice, decision, supervisor hand-off
+    HWND reasonLabel = nullptr;
+    HWND multiplier = nullptr;
+    HWND reason = nullptr;
+    HWND btnRun = nullptr;
+    HWND btnAdvise = nullptr;
+    HWND btnManual = nullptr;
+    HWND btnLog = nullptr;
+    HWND btnSupervisor = nullptr;
+    HWND btnAllSupervisor = nullptr;
+    HWND btnAck = nullptr;
+    HWND btnAckAll = nullptr;
+    HWND btnClear = nullptr;
+    HWND btnShowPending = nullptr;
+    HWND btnMarkAll = nullptr;
     HWND btnReload = nullptr;
-    HWND btnClose = nullptr;
-    std::vector<SupervisorHintRecord> rows;
+    HWND listWideLabel = nullptr;
+    std::vector<HWND> radios;
+    std::vector<nlohmann::json> rows;
+    std::vector<nlohmann::json> allCards;
+    nlohmann::json selectedCard;
     bool loading = false;
+    int listPaneH = 0;
+    bool splitterDrag = false;
+    RECT splitterRc = {};
+    int splitContentTop = 0;
+    int splitMaxList = 0;
+    int infoPaneW = 0;          // width of the information table (0 = 55% of the lower half)
+    bool vsplitDrag = false;
+    RECT vsplitRc = {};
+    int vsplitLeft = 0;
+    int vsplitMaxW = 0;
+    std::wstring filterKey = L"pendingTask";  // default filter: task triage awaiting decision
+    std::wstring searchText;
+    std::string selectedId;
+    int sortColumn = -1;
+    bool sortDescending = true;
+    nlohmann::json counts = nlohmann::json::object();
+    RECT tileRowRc = {};
+    RECT tileRects[8] = {};
+    int tileValues[8] = {};
+    std::wstring tileSubtexts[8];
+    int activeTile = -1;
+    int searchMatches = 0;
+    // What is on screen now. The dashboard asks for a reload on every refresh (about once a second);
+    // rebuilding unchanged rows, text and radios each time made the window flicker and reset scrolling.
+    std::string shownListSignature;
+    std::string shownCardDump = "\x01";  // never equal to a real dump, so the first update always draws
 };
 
-static void HintHistoryUpdateSelection(HintHistoryDlgState* ds) {
-    if (!ds || !ds->list) return;
-    int sel = ListView_GetNextItem(ds->list, -1, LVNI_SELECTED);
-    bool has = sel >= 0 && static_cast<size_t>(sel) < ds->rows.size();
-    if (ds->detail) {
-        if (has) {
-            const SupervisorHintRecord& r = ds->rows[static_cast<size_t>(sel)];
-            std::wstring text = r.timestamp + L"  " + r.category + L"\r\n\r\n" + r.summary +
-                                L"\r\n\r\n" + r.prompt;
-            SetWindowTextW(ds->detail, text.c_str());
-        } else {
-            SetWindowTextW(ds->detail, Tr(L"ヒントを選択してください。", L"Select a hint.", L"Selecciona una pista."));
+static LRESULT CALLBACK TriageChildSubclassProc(HWND child, UINT msg, WPARAM wParam, LPARAM lParam,
+                                                UINT_PTR, DWORD_PTR) {
+    if (msg == WM_KEYDOWN) {
+        HWND parent = GetParent(child);
+        auto* ds = parent ? reinterpret_cast<TriageDlgState*>(GetWindowLongPtrW(parent, GWLP_USERDATA)) : nullptr;
+        if (wParam == VK_ESCAPE && ds) {
+            if (child == ds->search) {
+                SetWindowTextW(ds->search, L"");
+                SetFocus(ds->search);
+                return 0;
+            }
+            SendMessageW(parent, WM_COMMAND, IDCANCEL, 0);
+            return 0;
+        }
+        if (wParam == 'F' && (GetKeyState(VK_CONTROL) & 0x8000) && ds && ds->search) {
+            SetFocus(ds->search);
+            return 0;
         }
     }
-    if (ds->btnCopy) EnableWindow(ds->btnCopy, has);
-    if (ds->btnLaunch) EnableWindow(ds->btnLaunch, has);
+    return DefSubclassProc(child, msg, wParam, lParam);
 }
 
-static void HintHistoryReload(HintHistoryDlgState* ds) {
-    if (!ds || !ds->list || !ds->dash) return;
-    ds->loading = true;
-    ds->rows.assign(ds->dash->hintHistory.rbegin(), ds->dash->hintHistory.rend());
+static int TriageTileForFilter(const std::wstring& key) {
+    if (key == L"pendingTask") return 0;
+    if (key == L"pendingProcess") return 1;
+    if (key == L"handling") return 2;
+    if (key == L"running") return 3;
+    if (key == L"waiting") return 4;
+    if (key == L"follow_up") return 5;
+    if (key == L"autoUnreviewed") return 6;
+    if (key == L"done") return 7;
+    return -1;
+}
 
+static void TriageLayout(HWND hwnd, TriageDlgState* ds);
+
+static std::string TriageDisplayLanguage() {
+    return LanguageCode(g_uiLanguage);
+}
+
+static std::wstring TriageKindLabel(const nlohmann::json& card) {
+    const std::string kind = card.value("kind", std::string());
+    const std::string pattern = card.contains("flags") && card["flags"].is_object()
+        ? card["flags"].value("timeoutPattern", std::string()) : std::string();
+    if (kind == "job_failure") {
+        const auto& info = card.value("info", nlohmann::json::object());
+        std::string cause;
+        if (info.is_object() && info.contains("cause") && info["cause"].is_array()) {
+            for (const auto& item : info["cause"]) {
+                if (item.is_object() && item.value("k", std::string()) == "failureClass") {
+                    cause = item.value("v", nlohmann::json::object()).value("class", std::string());
+                    break;
+                }
+                if (item.is_string()) { cause = item.get<std::string>(); break; }
+            }
+        }
+        std::string lower = cause;
+        std::transform(lower.begin(), lower.end(), lower.begin(), [](unsigned char c) { return static_cast<char>(std::tolower(c)); });
+        if (pattern == "stalled" || lower.find("idle_stall") != std::string::npos || lower.find("hang") != std::string::npos)
+            return Tr(L"ハング", L"Hang", L"Bloqueo");
+        if (lower.find("timeout") != std::string::npos || lower.find("timed_out") != std::string::npos ||
+            pattern == "progressing" || pattern == "repeated")
+            return Tr(L"タイムアウト", L"Timeout", L"Tiempo agotado");
+        return Tr(L"失敗", L"Failure", L"Fallo");
+    }
+    if (kind == "bt_escalation_failure" || kind == "process_failure" || kind == "timing_divergence" || kind == "resource_wait")
+        return Utf8ToWide(TriageLabel(TriageDisplayLanguage(), "kind", kind));
+    return Utf8ToWide(kind);
+}
+
+static std::wstring TriageCandidateLabel(const nlohmann::json& card, const std::string& candidateId) {
+    if (card.contains("candidates") && card["candidates"].is_array()) {
+        for (const auto& candidate : card["candidates"]) {
+            if (candidate.is_object() && candidate.value("id", std::string()) == candidateId)
+                return Utf8ToWide(pc::TriageCandidateLabel(TriageDisplayLanguage(), candidateId,
+                    candidate.value("label", candidateId)));
+        }
+    }
+    return Utf8ToWide(candidateId);
+}
+
+static std::wstring TriageConfidence(const std::string& confidence) {
+    return Utf8ToWide(TriageLabel(TriageDisplayLanguage(), "confidence", confidence));
+}
+
+static std::wstring TriageRecommendation(const nlohmann::json& card) {
+    nlohmann::json advice = card.value("advice", nlohmann::json());
+    const bool hasLlm = card.value("adviceState", std::string()) == "done" && advice.is_object();
+    nlohmann::json recommendation = hasLlm ? advice : card.value("recommendation", nlohmann::json::object());
+    const std::string candidateId = recommendation.value("candidateId", std::string());
+    if (candidateId.empty()) return L"—";
+    std::wstring prefix = hasLlm ? L"LLM: " : L"Hancho: ";
+    return prefix + TriageCandidateLabel(card, candidateId) + L" (" +
+        TriageConfidence(recommendation.value("confidence", std::string())) + L")";
+}
+
+static std::wstring TriageTargetText(const nlohmann::json& card) {
+    const auto target = card.value("target", nlohmann::json::object());
+    std::wstring text;
+    for (const char* key : {"jobId", "processId", "btId", "nodeId", "name", "queue"}) {
+        if (!target.contains(key) || target[key].is_null()) continue;
+        std::string value;
+        if (target[key].is_string()) value = target[key].get<std::string>();
+        else value = target[key].dump();
+        if (value.empty()) continue;
+        if (!text.empty()) text += L" / ";
+        text += Utf8ToWide(value);
+    }
+    return text.empty() ? Utf8ToWide(card.value("key", std::string())) : text;
+}
+
+// The batch supervisor hand-off of a card, as a short label ("" when it was never handed off).
+static std::wstring TriageHandoffLabel(const std::string& handoffState) {
+    if (handoffState == "queued" || handoffState == "running")
+        return Tr(L"🤖 Supervisor 対応中", L"🤖 With supervisor", L"🤖 Con el supervisor");
+    if (handoffState == "done_undecided")
+        return Tr(L"🤖 Supervisor 完了・判断なし", L"🤖 Supervisor done, undecided", L"🤖 Supervisor terminó sin decidir");
+    if (handoffState == "done") return Tr(L"🤖 Supervisor 完了", L"🤖 Supervisor done", L"🤖 Supervisor terminó");
+    if (handoffState == "failed") return Tr(L"🤖 Supervisor 失敗", L"🤖 Supervisor failed", L"🤖 Supervisor falló");
+    return L"";
+}
+
+static std::wstring TriageLifecycleLabel(const std::string& lifecycle) {
+    return lifecycle.empty() ? L"—" : Utf8ToWide(TriageLabel(TriageDisplayLanguage(), "lifecycle", lifecycle));
+}
+
+static int TriageLifecycleRank(const std::string& lifecycle) {
+    if (lifecycle == "pending") return 0;
+    if (lifecycle == "follow_up") return 1;
+    if (lifecycle == "handling") return 2;
+    if (lifecycle == "waiting_branch") return 3;
+    if (lifecycle == "waiting_next") return 4;
+    if (lifecycle == "running") return 5;
+    if (lifecycle == "done") return 6;
+    return 7;
+}
+
+static std::wstring TriageAdviceStatus(const nlohmann::json& card);
+static std::wstring TriageDecisionText(const nlohmann::json& card);
+static std::wstring TriageReviewStatus(const nlohmann::json& card);
+
+static std::wstring TriageRouteLabel(const nlohmann::json& card) {
+    const auto handoff = card.value("handoff", nlohmann::json::object());
+    const std::string handoffState = handoff.is_object() ? handoff.value("state", std::string()) : std::string();
+    if (handoffState == "queued" || handoffState == "running") return Tr(L"🤖 バッチ: 対応中", L"🤖 Batch: working", L"🤖 Lote: en curso");
+    if (handoffState == "done") return Tr(L"🤖 バッチ: 完了", L"🤖 Batch: done", L"🤖 Lote: completado");
+    if (handoffState == "done_undecided") return Tr(L"🤖 バッチ: 完了・判断なし", L"🤖 Batch: done, undecided", L"🤖 Lote: completado sin decidir");
+    if (handoffState == "failed") return Tr(L"🤖 バッチ: 失敗", L"🤖 Batch: failed", L"🤖 Lote: fallido");
+    const auto manual = card.value("manual", nlohmann::json::object());
+    if (manual.is_object() && manual.value("state", std::string()) == "working")
+        return Tr(L"✋ 手動: 対応中", L"✋ Manual: working", L"✋ Manual: en curso");
+    const auto decision = card.value("decision", nlohmann::json::object());
+    if (!decision.is_object()) return L"—";
+    const std::string by = decision.value("by", std::string());
+    if (decision.value("route", std::string()) == "manual")
+        return Tr(L"✋ 手動: 処置済み", L"✋ Manual: handled", L"✋ Manual: tratado");
+    if (by == "human") return Tr(L"👤 人", L"👤 Human", L"👤 Persona");
+    if (by == "supervisor") return Tr(L"🤖 Supervisor", L"🤖 Supervisor", L"🤖 Supervisor");
+    if (by == "hancho-auto") return Tr(L"⚙ 自動 (Hancho)", L"⚙ Automatic (Hancho)", L"⚙ Automático (Hancho)");
+    if (by == "llm-auto") return Tr(L"⚙ 自動 (LLM)", L"⚙ Automatic (LLM)", L"⚙ Automático (LLM)");
+    return by.empty() ? L"—" : Utf8ToWide(by);
+}
+
+static std::wstring TriageOutcomeText(const nlohmann::json& card) {
+    if (card.value("resolvedReason", std::string()) == "kind_disabled")
+        return Tr(L"設定で対象外", L"Disabled in settings", L"Desactivado en ajustes");
+    const auto outcome = card.value("outcome", nlohmann::json::object());
+    if (!outcome.is_object() || outcome.empty()) {
+        const std::string previous = card.value("previousCardId", std::string());
+        return previous.empty() ? L"—" : Tr(L"前のカード: ", L"Previous card: ", L"Tarjeta anterior: ") + Utf8ToWide(previous);
+    }
+    const std::string state = outcome.value("state", std::string());
+    std::wstring text = Utf8ToWide(TriageLabel(TriageDisplayLanguage(), "outcome", state));
+    const std::string detail = outcome.value("detail", std::string());
+    if (!detail.empty()) text += L": " + Utf8ToWide(detail);
+    const auto branch = outcome.value("branch", nlohmann::json::object());
+    if (branch.is_object() && !branch.empty()) {
+        text += Tr(L"（後続 ", L" (branch ", L" (rama ") +
+            std::to_wstring(branch.value("succeeded", 0)) + L"/" +
+            std::to_wstring(branch.value("total", 0)) +
+            Tr(L" 完了）", L" done)", L" completada)");
+        if (branch.contains("jobs") && branch["jobs"].is_array()) {
+            for (const auto& job : branch["jobs"]) {
+                if (!job.is_object()) continue;
+                text += L"\r\n  " + Utf8ToWide(job.value("id", std::string())) + L" — " +
+                    Utf8ToWide(TriageLabel(TriageDisplayLanguage(), "jobState", job.value("state", std::string())));
+                if (!job.value("key", std::string()).empty()) text += L" [" + Utf8ToWide(job.value("key", std::string())) + L"]";
+            }
+        }
+    }
+    const auto bt = outcome.value("bt", nlohmann::json::object());
+    if (bt.is_object() && !bt.empty()) text += L"\r\nBT: " + Utf8ToWide(bt.value("id", std::string())) + L" [" +
+        Utf8ToWide(TriageLabel(TriageDisplayLanguage(), "jobState", bt.value("state", std::string()))) + L"]";
+    const std::string next = outcome.value("nextCardId", std::string());
+    if (!next.empty()) text += Tr(L"\r\n次のカード: ", L"\r\nNext card: ", L"\r\nSiguiente tarjeta: ") + Utf8ToWide(next);
+    const std::string previous = card.value("previousCardId", std::string());
+    if (!previous.empty()) text += Tr(L"\r\n前のカード: ", L"\r\nPrevious card: ", L"\r\nTarjeta anterior: ") + Utf8ToWide(previous);
+    return text;
+}
+
+static std::wstring TriageColumnText(const nlohmann::json& card, int column) {
+    switch (column) {
+    case 0: return TriageLifecycleLabel(card.value("lifecycle", std::string()));
+    case 1: return TriageKindLabel(card);
+    case 2: return TriageTargetText(card);
+    case 3: return TriageRecommendation(card);
+    case 4: return TriageAdviceStatus(card);
+    case 5: return TriageRouteLabel(card);
+    case 6: return TriageDecisionText(card);
+    case 7: return TriageOutcomeText(card);
+    case 8: return TriageReviewStatus(card);
+    case 9: return Utf8ToWide(card.value("createdAt", std::string()));
+    case 10: return Utf8ToWide(card.value("updatedAt", card.value("createdAt", std::string())));
+    default: return L"";
+    }
+}
+
+static std::wstring TriageLower(std::wstring text) {
+    std::transform(text.begin(), text.end(), text.begin(), [](wchar_t c) { return static_cast<wchar_t>(std::towlower(c)); });
+    return text;
+}
+
+static bool TriageSearchMatches(const nlohmann::json& card, const std::wstring& query) {
+    std::wstring searchable = Utf8ToWide(card.value("id", std::string())) + L" " + Utf8ToWide(card.dump());
+    for (int col = 0; col < 11; ++col) searchable += L" " + TriageColumnText(card, col);
+    searchable = TriageLower(std::move(searchable));
+    size_t pos = 0;
+    while (pos < query.size()) {
+        while (pos < query.size() && std::iswspace(query[pos])) ++pos;
+        if (pos == query.size()) break;
+        size_t end = pos;
+        while (end < query.size() && !std::iswspace(query[end])) ++end;
+        if (searchable.find(TriageLower(query.substr(pos, end - pos))) == std::wstring::npos) return false;
+        pos = end;
+    }
+    return true;
+}
+
+static std::wstring TriageAdviceStatus(const nlohmann::json& card) {
+    const std::string adviceState = card.value("adviceState", std::string("none"));
+    const auto advice = card.value("advice", nlohmann::json());
+    if (adviceState == "requested") return Tr(L"依頼中", L"Requested", L"Solicitado");
+    if (adviceState == "running") return Tr(L"相談中", L"Running", L"En curso");
+    if (adviceState == "failed") return Tr(L"失敗", L"Failed", L"Falló");
+    if (adviceState == "done" && advice.is_object()) {
+        return std::wstring(Tr(L"済: ", L"Done: ", L"Hecho: ")) +
+            TriageCandidateLabel(card, advice.value("candidateId", std::string()));
+    }
+    return Tr(L"未相談", L"Not asked", L"Sin consultar");
+}
+
+static std::wstring TriageDecisionText(const nlohmann::json& card) {
+    const auto decision = card.value("decision", nlohmann::json());
+    if (!decision.is_object() || decision.value("candidateId", std::string()).empty()) return L"—";
+    const std::string by = decision.value("by", std::string());
+    std::wstring who = by == "human" ? Tr(L"人", L"Human", L"Persona") :
+        by == "supervisor" ? std::wstring(L"Supervisor") :
+        by == "hancho-auto" ? Tr(L"自動 (Hancho)", L"Auto (Hancho)", L"Auto (Hancho)") :
+        by == "llm-auto" ? Tr(L"自動 (LLM)", L"Auto (LLM)", L"Auto (LLM)") : Utf8ToWide(by);
+    return who + L": " + TriageCandidateLabel(card, decision.value("candidateId", std::string()));
+}
+
+static std::wstring TriageReviewStatus(const nlohmann::json& card) {
+    const auto decision = card.value("decision", nlohmann::json());
+    if (!decision.is_object()) return L"—";
+    const std::string by = decision.value("by", std::string());
+    if (by != "hancho-auto" && by != "llm-auto") return L"—";
+    return decision.value("reviewed", false) ? Tr(L"確認済み", L"Reviewed", L"Revisado")
+                                              : Tr(L"未確認", L"Unreviewed", L"Sin revisar");
+}
+
+static void SaveTriageHiddenCards(DashboardState* st) {
+    if (!st) return;
+    nlohmann::json ids = nlohmann::json::array();
+    for (const auto& id : st->hiddenTriageCards) {
+        if (ids.size() >= 500) break;
+        ids.push_back(id);
+    }
+    nlohmann::json req = {{"action", "config_set"}, {"patch", {{"triage_hidden_cards", ids}}}};
+    nlohmann::json resp;
+    GuiIpcCall(st, req, resp);
+}
+
+static bool TriageIsAutoUnreviewed(const nlohmann::json& card) {
+    if (card.value("state", std::string()) != "acted") return false;
+    auto decision = card.value("decision", nlohmann::json::object());
+    if (!decision.is_object()) return false;
+    const std::string by = decision.value("by", std::string());
+    return (by == "hancho-auto" || by == "llm-auto") && !decision.value("reviewed", false);
+}
+
+static void TriageUpdateTitle(HWND hwnd, TriageDlgState* ds) {
+    if (!hwnd || !ds || !ds->dash) return;
+    const int pending = ds->dash->pendingTriageTask + ds->dash->pendingTriageProcess;
+    int hiddenPending = 0;
+    for (const auto& card : ds->allCards) {
+        if (card.value("state", std::string()) == "pending" &&
+            ds->dash->hiddenTriageCards.count(card.value("id", std::string()))) ++hiddenPending;
+    }
+    std::wstring title = Tr(L"Hancho トリアージ — 判断待ち ", L"Hancho Triage — ", L"Hancho Triaje — ") + std::to_wstring(pending);
+    title += Tr(L" 件", L" awaiting decision", L" pendientes");
+    if (hiddenPending > 0) title += Tr(L"（非表示 ", L" (hidden ", L" (ocultas ") + std::to_wstring(hiddenPending) + L")";
+    SetWindowTextW(hwnd, title.c_str());
+}
+
+static void TriageUpdateSelection(TriageDlgState* ds) {
+    if (!ds || !ds->list) return;
+    const int selected = ListView_GetNextItem(ds->list, -1, LVNI_SELECTED);
+    ds->selectedCard = nlohmann::json();
+    ds->selectedId.clear();
+    const bool has = selected >= 0 && static_cast<size_t>(selected) < ds->rows.size();
+    if (has) {
+        ds->selectedCard = ds->rows[static_cast<size_t>(selected)];
+        ds->selectedId = ds->selectedCard.value("id", std::string());
+    }
+    // Same card, same content: keep the information table, the action text (and its scroll position)
+    // and the candidate radios (and the person's choice) exactly as they are.
+    const std::string cardDump = has ? ds->selectedCard.dump() : std::string();
+    if (cardDump == ds->shownCardDump) return;
+    ds->shownCardDump = cardDump;
+    // Left pane: the information table, one row per line, the section name on its first row.
+    if (ds->infoTable) {
+        SendMessageW(ds->infoTable, WM_SETREDRAW, FALSE, 0);
+        ListView_DeleteAllItems(ds->infoTable);
+        if (has) {
+            const auto info = ds->selectedCard.value("info", nlohmann::json::object());
+            const char* sectionKeys[] = {"cause", "background", "environment", "conditions", "reason"};
+            // Lines that carry no information ("cwd: ", "...: null", "...: []") only push the useful ones down.
+            auto empty = [](const std::string& line) {
+                auto endsWith = [&](const char* suffix) {
+                    const size_t n = std::strlen(suffix);
+                    return line.size() >= n && line.compare(line.size() - n, n, suffix) == 0;
+                };
+                return line.empty() || endsWith(": ") || endsWith(":") || endsWith(": null") || endsWith(": []");
+            };
+            int row = 0;
+            for (int i = 0; i < 5; ++i) {
+                std::vector<std::wstring> lines;
+                if (info.is_object() && info.contains(sectionKeys[i]) && info[sectionKeys[i]].is_array()) {
+                    for (const auto& line : info[sectionKeys[i]]) {
+                        std::string value;
+                        if (line.is_string()) value = line.get<std::string>();
+                        else if (line.is_object()) {
+                            const auto formatted = TriageFormatInfoRows(TriageDisplayLanguage(), line);
+                            for (const auto& entry : formatted)
+                                if (!empty(entry)) lines.push_back(Utf8ToWide(entry));
+                            continue;
+                        }
+                        if (!empty(value)) lines.push_back(Utf8ToWide(value));
+                    }
+                }
+                if (lines.empty()) lines.push_back(L"—");
+                for (size_t j = 0; j < lines.size(); ++j) {
+                    LVITEMW item = {}; item.mask = LVIF_TEXT; item.iItem = row;
+                    std::wstring section = j == 0
+                        ? Utf8ToWide(TriageLabel(TriageDisplayLanguage(), "section", sectionKeys[i]))
+                        : std::wstring();
+                    item.pszText = const_cast<wchar_t*>(section.c_str());
+                    ListView_InsertItem(ds->infoTable, &item);
+                    ListView_SetItemText(ds->infoTable, row, 1, const_cast<wchar_t*>(lines[j].c_str()));
+                    ++row;
+                }
+            }
+        }
+        SendMessageW(ds->infoTable, WM_SETREDRAW, TRUE, 0);
+        InvalidateRect(ds->infoTable, nullptr, TRUE);
+    }
+
+    // Right pane: advice, decision, lifecycle outcome and follow-up links.
+    std::wstring text;
+    if (has) {
+        const auto& card = ds->selectedCard;
+        text += L"■ " + std::wstring(Tr(L"助言", L"Advice", L"Consejo")) + L"\r\n";
+        const auto recommendation = card.value("recommendation", nlohmann::json::object());
+        const std::string recId = recommendation.value("candidateId", std::string());
+        if (!recId.empty()) {
+            text += L"  Hancho: " + TriageCandidateLabel(card, recId) + L" (" +
+                TriageConfidence(recommendation.value("confidence", std::string())) + L") — " +
+                Utf8ToWide(TriageFormatRationale(TriageDisplayLanguage(),
+                    recommendation.value("rationaleKey", std::string()),
+                    recommendation.value("rationaleParams", nlohmann::json::object()),
+                    recommendation.value("rationale", std::string()))) + L"\r\n";
+        }
+        const std::string adviceState = card.value("adviceState", std::string("none"));
+        const auto advice = card.value("advice", nlohmann::json());
+        if (adviceState == "requested" || adviceState == "running") {
+            text += Tr(L"  LLM 相談中…\r\n", L"  LLM advice in progress…\r\n", L"  Consulta LLM en curso…\r\n");
+        } else if (adviceState == "none") {
+            text += Tr(L"  LLM 未相談\r\n", L"  LLM not asked\r\n", L"  LLM no consultado\r\n");
+        } else if (adviceState == "failed" || (advice.is_object() && advice.contains("error"))) {
+            std::string error = advice.is_object() ? advice.value("error", std::string()) : std::string();
+            text += Tr(L"  LLM エラー: ", L"  LLM error: ", L"  Error de LLM: ") + Utf8ToWide(error) + L"\r\n";
+        } else if (advice.is_object()) {
+            const std::string adviceId = advice.value("candidateId", std::string());
+            text += L"  LLM: " + TriageCandidateLabel(card, adviceId) + L" (" +
+                TriageConfidence(advice.value("confidence", std::string())) + L") — " +
+                Utf8ToWide(advice.value("rationale", std::string())) + L"\r\n";
+            if (!advice.value("caution", std::string()).empty())
+                text += Tr(L"  注意: ", L"  Caution: ", L"  Precaución: ") + Utf8ToWide(advice.value("caution", std::string())) + L"\r\n";
+            if (!advice.value("infoNeeded", std::string()).empty())
+                text += Tr(L"  追加で必要な情報: ", L"  Additional information needed: ", L"  Información adicional necesaria: ") +
+                    Utf8ToWide(advice.value("infoNeeded", std::string())) + L"\r\n";
+        }
+        text += L"\r\n■ " + std::wstring(Tr(L"判断", L"Decision", L"Decisión")) + L"\r\n";
+        const auto decision = card.value("decision", nlohmann::json());
+        if (decision.is_object()) {
+            const std::string candidateId = decision.value("candidateId", std::string());
+            text += L"  " + Utf8ToWide(decision.value("by", std::string())) + L" — " +
+                TriageCandidateLabel(card, candidateId) + L"\r\n  " +
+                Utf8ToWide(decision.value("reason", std::string())) + L"\r\n  " +
+                Utf8ToWide(decision.value("at", std::string())) + L"\r\n  " +
+                Utf8ToWide(decision.value("result", std::string()));
+        } else {
+            text += Tr(L"  未判断", L"  No decision yet", L"  Sin decisión");
+            const auto handoff = card.value("handoff", nlohmann::json::object());
+            if (handoff.is_object() && !handoff.value("jobId", std::string()).empty()) {
+                // Handed to the batch supervisor: say so, so the card does not look untouched.
+                text += L"\r\n  " + TriageHandoffLabel(handoff.value("state", std::string())) + L" — " +
+                    Utf8ToWide(handoff.value("jobId", std::string())) + L" (" +
+                    Utf8ToWide(handoff.value("at", std::string())) + L")";
+                if (!handoff.value("note", std::string()).empty())
+                    text += L"\r\n  " + std::wstring(Tr(L"Supervisor のメモ: ", L"Supervisor note: ", L"Nota del Supervisor: ")) +
+                        Utf8ToWide(handoff.value("note", std::string()));
+            }
+        }
+        text += L"\r\n\r\n■ " + std::wstring(Tr(L"ライフサイクル", L"Lifecycle", L"Ciclo de vida")) +
+            L"\r\n  " + TriageLifecycleLabel(card.value("lifecycle", std::string("pending")));
+        text += L"\r\n\r\n■ " + std::wstring(Tr(L"結果", L"Outcome", L"Resultado")) + L"\r\n  " + TriageOutcomeText(card);
+    } else {
+        text = Tr(L"カードを選択してください。", L"Select a card.", L"Selecciona una tarjeta.");
+    }
+    if (ds->detail) SetWindowTextW(ds->detail, text.c_str());
+
+    for (HWND radio : ds->radios) if (radio) DestroyWindow(radio);
+    ds->radios.clear();
+    const bool pending = has && ds->selectedCard.value("state", std::string()) == "pending";
+    std::string preferred;
+    const auto advice = has ? ds->selectedCard.value("advice", nlohmann::json()) : nlohmann::json();
+    if (has && ds->selectedCard.value("adviceState", std::string()) == "done" && advice.is_object())
+        preferred = advice.value("candidateId", std::string());
+    if (preferred.empty() && has) {
+        auto rec = ds->selectedCard.value("recommendation", nlohmann::json::object());
+        preferred = rec.value("candidateId", std::string());
+    }
+    if (has && ds->selectedCard.contains("candidates") && ds->selectedCard["candidates"].is_array()) {
+        int i = 0;
+        for (const auto& candidate : ds->selectedCard["candidates"]) {
+            if (!candidate.is_object()) continue;
+            const std::string id = candidate.value("id", std::string());
+            std::wstring label = TriageCandidateLabel(ds->selectedCard, id) + L" — " +
+                Utf8ToWide(pc::TriageCandidateEffect(TriageDisplayLanguage(), id,
+                    candidate.value("effect", std::string())));
+            if (id == preferred) label = L"★ " + std::wstring(Tr(L"推奨: ", L"Recommended: ", L"Recomendado: ")) + label;
+            // Candidates are only offered while the card awaits a decision.
+            HWND radio = CreateWindowExW(0, L"BUTTON", label.c_str(),
+                WS_CHILD | WS_VISIBLE | WS_TABSTOP | BS_AUTORADIOBUTTON | (i == 0 ? WS_GROUP : 0) | (pending ? 0 : WS_DISABLED),
+                10, 10, 900, 22, GetParent(ds->detail), reinterpret_cast<HMENU>(static_cast<INT_PTR>(3000 + i)),
+                GetModuleHandleW(nullptr), nullptr);
+            if (radio && ds->fontUi) SendMessageW(radio, WM_SETFONT, reinterpret_cast<WPARAM>(ds->fontUi), TRUE);
+            if (radio) SetWindowSubclass(radio, TriageChildSubclassProc, 1, 0);
+            ds->radios.push_back(radio);
+            if (id == preferred) SendMessageW(radio, BM_SETCHECK, BST_CHECKED, 0);
+            ++i;
+        }
+        if (!ds->radios.empty() && preferred.empty()) SendMessageW(ds->radios.front(), BM_SETCHECK, BST_CHECKED, 0);
+    }
+    bool hasTimeoutChoice = false;
+    if (has && ds->selectedCard.contains("candidates") && ds->selectedCard["candidates"].is_array()) {
+        for (const auto& candidate : ds->selectedCard["candidates"])
+            if (candidate.is_object() && candidate.value("id", std::string()) == "retry_raise_timeout") hasTimeoutChoice = true;
+    }
+    if (ds->multiplier) ShowWindow(ds->multiplier, pending && hasTimeoutChoice ? SW_SHOW : SW_HIDE);
+    if (ds->btnRun) EnableWindow(ds->btnRun, pending && !ds->radios.empty());
+    if (ds->btnAdvise) EnableWindow(ds->btnAdvise, pending);
+    if (ds->btnManual) EnableWindow(ds->btnManual, pending);
+    if (ds->btnSupervisor) EnableWindow(ds->btnSupervisor, pending);
+    if (ds->btnLog) EnableWindow(ds->btnLog, has &&
+        ds->selectedCard.value("kind", std::string()) != "process_failure");
+    const bool autoUnreviewed = has && TriageIsAutoUnreviewed(ds->selectedCard);
+    if (ds->btnAck) ShowWindow(ds->btnAck, autoUnreviewed ? SW_SHOW : SW_HIDE);
+    if (ds->btnRun) {
+        std::string chosen;
+        for (size_t i = 0; i < ds->radios.size() && i < ds->selectedCard.value("candidates", nlohmann::json::array()).size(); ++i) {
+            if (SendMessageW(ds->radios[i], BM_GETCHECK, 0, 0) == BST_CHECKED) {
+                chosen = ds->selectedCard["candidates"][i].value("id", std::string()); break;
+            }
+        }
+        const std::wstring caption = chosen.empty()
+            ? Tr(L"▶ 選んだ処置を実行", L"▶ Run selected action", L"▶ Ejecutar acción seleccionada")
+            : Tr(L"▶ 実行: ", L"▶ Run: ", L"▶ Ejecutar: ") + TriageCandidateLabel(ds->selectedCard, chosen);
+        SetWindowTextW(ds->btnRun, caption.c_str());
+    }
+    TriageLayout(GetParent(ds->list), ds);
+}
+
+static void TriagePersistSort(TriageDlgState* ds) {
+    if (!ds || !ds->dash) return;
+    nlohmann::json req = {{"action", "config_set"},
+        {"patch", {{"triage_sort", {{"column", ds->sortColumn}, {"descending", ds->sortDescending}}}}}};
+    nlohmann::json response;
+    GuiIpcCall(ds->dash, req, response);
+}
+
+static void TriageUpdateHeaders(TriageDlgState* ds) {
+    if (!ds || !ds->list) return;
+    const wchar_t* headers[] = {
+        Tr(L"ライフサイクル", L"Lifecycle", L"Ciclo de vida"), Tr(L"種別", L"Kind", L"Tipo"),
+        Tr(L"対象", L"Target", L"Objetivo"), Tr(L"推奨", L"Recommendation", L"Recomendación"),
+        Tr(L"LLM 相談", L"LLM advice", L"Consulta LLM"), Tr(L"対応", L"Route", L"Atención"),
+        Tr(L"判断", L"Decision", L"Decisión"), Tr(L"結果", L"Outcome", L"Resultado"),
+        Tr(L"確認", L"Review", L"Revisión"), Tr(L"発生", L"Created", L"Creado"), Tr(L"更新", L"Updated", L"Actualizado")};
+    for (int i = 0; i < 11; ++i) {
+        std::wstring label = headers[i];
+        if (ds->sortColumn == i) label += ds->sortDescending ? L" ▼" : L" ▲";
+        LVCOLUMNW col = {}; col.mask = LVCF_TEXT; col.pszText = label.data();
+        ListView_SetColumn(ds->list, i, &col);
+    }
+}
+
+static void TriageUpdateKpis(TriageDlgState* ds, const nlohmann::json& counts) {
+    if (!ds) return;
+    const std::string oldSignature = ds->counts.dump();
+    const std::string newSignature = counts.dump();
+    if (oldSignature == newSignature) return;
+    ds->counts = counts.is_object() ? counts : nlohmann::json::object();
+    auto value = [&](const char* key) { return ds->counts.value(key, 0); };
+    ds->tileValues[0] = value("pendingTask");
+    ds->tileValues[1] = value("pendingProcess");
+    ds->tileValues[2] = value("handling");
+    ds->tileValues[3] = value("running");
+    ds->tileValues[4] = value("waitingBranch") + value("waitingNext");
+    ds->tileValues[5] = value("followUp");
+    ds->tileValues[6] = value("autoUnreviewed");
+    ds->tileValues[7] = value("done");
+    ds->tileSubtexts[0] = Tr(L"その他 ", L"Other ", L"Otros ") + std::to_wstring(value("pendingOther"));
+    ds->tileSubtexts[4] = Tr(L"分岐 ", L"Branch ", L"Rama ") + std::to_wstring(value("waitingBranch")) +
+        Tr(L" / 次 ", L" / next ", L" / siguiente ") + std::to_wstring(value("waitingNext"));
+    for (int i : {1, 2, 3, 5, 6, 7}) ds->tileSubtexts[i].clear();
+    if (ds->tileRowRc.bottom > ds->tileRowRc.top)
+        InvalidateRect(GetParent(ds->list), &ds->tileRowRc, FALSE);
+}
+
+static void TriageReload(TriageDlgState* ds, const nlohmann::json* response = nullptr) {
+    if (!ds || !ds->dash || !ds->list) return;
+    nlohmann::json listed;
+    if (response && response->is_object()) listed = *response;
+    else {
+        nlohmann::json req = {{"action", "triage_list"}, {"state", "all"}};
+        if (!GuiIpcCall(ds->dash, req, listed) || !listed.value("ok", false)) return;
+    }
+    if (!listed.value("ok", false)) return;
+    ds->allCards.clear();
+    std::unordered_set<std::string> present;
+    if (listed.contains("cards") && listed["cards"].is_array()) {
+        for (const auto& card : listed["cards"]) {
+            if (!card.is_object()) continue;
+            ds->allCards.push_back(card);
+            present.insert(card.value("id", std::string()));
+        }
+    }
+    bool hiddenChanged = false;
+    for (auto it = ds->dash->hiddenTriageCards.begin(); it != ds->dash->hiddenTriageCards.end();) {
+        if (!present.count(*it)) { it = ds->dash->hiddenTriageCards.erase(it); hiddenChanged = true; }
+        else ++it;
+    }
+    if (hiddenChanged) SaveTriageHiddenCards(ds->dash);
+    ds->rows.clear();
+    const std::wstring filter = ds->filterKey;
+    int filterTotal = 0;
+    for (const auto& card : ds->allCards) {
+        const std::string state = card.value("state", std::string());
+        const std::string kind = card.value("kind", std::string());
+        const std::string lifecycle = card.value("lifecycle", state == "pending" ? "pending" : "done");
+        bool match = false;
+        if (filter == L"pending") match = state == "pending" && lifecycle == "pending";
+        else if (filter == L"pendingProcess") match = state == "pending" && kind == "process_failure";
+        else if (filter == L"pendingTask") match = state == "pending" &&
+            (kind == "job_failure" || kind == "bt_escalation_failure");
+        else if (filter == L"autoUnreviewed") match = TriageIsAutoUnreviewed(card);
+        else if (filter == L"all" || filter == L"open") match = filter == L"all" || lifecycle != "done";
+        else if (filter == L"handling") match = lifecycle == "handling";
+        else if (filter == L"running") match = lifecycle == "running";
+        else if (filter == L"waiting") match = lifecycle == "waiting_branch" || lifecycle == "waiting_next";
+        else if (filter == L"follow_up") match = lifecycle == "follow_up";
+        else if (filter == L"done") match = lifecycle == "done";
+        else match = state == WideToUtf8(filter);
+        if (!match || ds->dash->hiddenTriageCards.count(card.value("id", std::string()))) continue;
+        ++filterTotal;
+        if (!TriageSearchMatches(card, ds->searchText)) continue;
+        ds->rows.push_back(card);
+    }
+    ds->searchMatches = static_cast<int>(ds->rows.size());
+    const auto counts = listed.value("counts", nlohmann::json::object());
+    TriageUpdateKpis(ds, counts);
+    auto compareText = [](const std::wstring& a, const std::wstring& b) {
+        const auto la = TriageLower(a), lb = TriageLower(b);
+        return la < lb ? -1 : la > lb ? 1 : 0;
+    };
+    std::stable_sort(ds->rows.begin(), ds->rows.end(), [&](const nlohmann::json& a, const nlohmann::json& b) {
+        int cmp = 0;
+        if (ds->sortColumn < 0) {
+            const int ra = TriageLifecycleRank(a.value("lifecycle", std::string()));
+            const int rb = TriageLifecycleRank(b.value("lifecycle", std::string()));
+            if (ra != rb) return ra < rb;
+            const auto ta = a.value("updatedAt", a.value("createdAt", std::string()));
+            const auto tb = b.value("updatedAt", b.value("createdAt", std::string()));
+            return ta > tb;
+        }
+        if (ds->sortColumn == 0) {
+            const int ra = TriageLifecycleRank(a.value("lifecycle", std::string()));
+            const int rb = TriageLifecycleRank(b.value("lifecycle", std::string()));
+            cmp = ra < rb ? -1 : ra > rb ? 1 : 0;
+        } else if (ds->sortColumn == 9 || ds->sortColumn == 10) {
+            const char* key = ds->sortColumn == 9 ? "createdAt" : "updatedAt";
+            const auto ta = a.value(key, std::string());
+            const auto tb = b.value(key, std::string());
+            const int64_t ea = ParseTimestampStrToEpoch(ta), eb = ParseTimestampStrToEpoch(tb);
+            cmp = ea < eb ? -1 : ea > eb ? 1 : 0;
+        } else {
+            cmp = compareText(TriageColumnText(a, ds->sortColumn), TriageColumnText(b, ds->sortColumn));
+        }
+        return ds->sortDescending ? cmp > 0 : cmp < 0;
+    });
+    // Nothing changed since the last reload: leave the list, selection and scroll position alone.
+    std::string signature = WideToUtf8(filter) + "|" + WideToUtf8(ds->searchText) + "|" +
+        std::to_string(ds->sortColumn) + (ds->sortDescending ? "d|" : "a|") +
+        listed.value("mode", std::string()) + "|" + listed.value("llmMode", std::string()) + "|";
+    for (const auto& card : ds->rows) signature += card.dump();
+    signature += "|" + counts.dump() + "|" + std::to_string(filterTotal);
+    if (signature == ds->shownListSignature) return;
+    ds->shownListSignature = signature;
+    ds->loading = true;
     SendMessageW(ds->list, WM_SETREDRAW, FALSE, 0);
+    // Keep the scroll position across a rebuild.
+    const int topIndex = ListView_GetTopIndex(ds->list);
     ListView_DeleteAllItems(ds->list);
     for (size_t i = 0; i < ds->rows.size(); ++i) {
-        const SupervisorHintRecord& r = ds->rows[i];
-        std::wstring summary = r.summary;
-        for (wchar_t& c : summary) {
-            if (c == L'\r' || c == L'\n') c = L' ';
-        }
+        const auto& card = ds->rows[i];
+        std::wstring state = TriageLifecycleLabel(card.value("lifecycle", std::string()));
         LVITEMW item = {};
         item.mask = LVIF_TEXT | LVIF_PARAM;
         item.iItem = static_cast<int>(i);
-        item.pszText = const_cast<wchar_t*>(r.timestamp.c_str());
         item.lParam = static_cast<LPARAM>(i);
+        item.pszText = state.data();
         ListView_InsertItem(ds->list, &item);
-        ListView_SetItemText(ds->list, static_cast<int>(i), 1, const_cast<wchar_t*>(r.category.c_str()));
-        ListView_SetItemText(ds->list, static_cast<int>(i), 2, const_cast<wchar_t*>(summary.c_str()));
+        std::wstring cells[] = {
+            TriageKindLabel(card), TriageTargetText(card), TriageRecommendation(card),
+            TriageAdviceStatus(card), TriageRouteLabel(card), TriageDecisionText(card),
+            TriageOutcomeText(card), TriageReviewStatus(card),
+            Utf8ToWide(card.value("createdAt", std::string())),
+            Utf8ToWide(card.value("updatedAt", card.value("createdAt", std::string())))};
+        for (int c = 0; c < static_cast<int>(std::size(cells)); ++c)
+            ListView_SetItemText(ds->list, static_cast<int>(i), c + 1, cells[c].data());
+        if (card.value("id", std::string()) == ds->selectedId)
+            ListView_SetItemState(ds->list, static_cast<int>(i), LVIS_SELECTED | LVIS_FOCUSED, LVIS_SELECTED | LVIS_FOCUSED);
+    }
+    if (topIndex > 0 && topIndex < static_cast<int>(ds->rows.size())) {
+        RECT itemRc = {};
+        if (ListView_GetItemRect(ds->list, 0, &itemRc, LVIR_BOUNDS))
+            ListView_Scroll(ds->list, 0, topIndex * (itemRc.bottom - itemRc.top));
     }
     SendMessageW(ds->list, WM_SETREDRAW, TRUE, 0);
-    InvalidateRect(ds->list, nullptr, TRUE);
+    InvalidateRect(ds->list, nullptr, FALSE);
     ds->loading = false;
-
-    HintHistoryUpdateSelection(ds);
+    TriageUpdateTitle(GetParent(ds->list), ds);
+    TriageUpdateSelection(ds);
+    if (ds->btnShowPending) EnableWindow(ds->btnShowPending, !ds->dash->hiddenTriageCards.empty());
+    if (ds->btnAckAll) ShowWindow(ds->btnAckAll, filter == L"autoUnreviewed" ? SW_SHOW : SW_HIDE);
+    bool anyPendingShown = false;
+    for (const auto& card : ds->rows) if (card.value("state", std::string()) == "pending") anyPendingShown = true;
+    if (ds->btnMarkAll) EnableWindow(ds->btnMarkAll, anyPendingShown);
+    if (ds->btnClear) EnableWindow(ds->btnClear, !ds->rows.empty());
+    if (ds->btnAllSupervisor) EnableWindow(ds->btnAllSupervisor, ds->dash->pendingTriageTask +
+        ds->dash->pendingTriageProcess + ds->dash->pendingTriageOther > 0);
+    TriageLayout(GetParent(ds->list), ds);
+    std::wstring mode = Tr(L"処置モード: ", L"Triage mode: ", L"Modo: ");
+    const std::string modeValue = listed.value("mode", ds->dash->triageMode);
+    mode += modeValue == "manual" ? Tr(L"手動", L"manual", L"manual") :
+            modeValue == "auto" ? Tr(L"自動", L"auto", L"automático") : Tr(L"半自動", L"semi", L"semiautomático");
+    mode += Tr(L" / LLM 相談: ", L" / Ask LLM: ", L" / Consulta LLM: ");
+    const std::string llmMode = listed.value("llmMode", ds->dash->triageLlmMode);
+    mode += llmMode == "manual" ? Tr(L"ボタンのときだけ", L"on button", L"al pulsar") :
+            llmMode == "always" ? Tr(L"毎回", L"always", L"siempre") : Tr(L"迷うときだけ", L"when uncertain", L"si hay dudas");
+    if (filterTotal > ds->searchMatches) {
+        mode += L"   ｜   " + std::wstring(Tr(L"検索: ", L"Search: ", L"Buscar: ")) +
+            std::to_wstring(ds->searchMatches) + L" / " + std::to_wstring(filterTotal) + Tr(L" 件", L" cards", L" tarjetas");
+    }
+    if (ds->modeLabel) SetWindowTextW(ds->modeLabel, mode.c_str());
+    const bool taskOnly = filter == L"pendingTask";
+    int hiddenPending = 0;
+    for (const auto& card : ds->allCards) {
+        if (card.value("state", std::string()) != "pending") continue;
+        const std::string kind = card.value("kind", std::string());
+        if (taskOnly && kind != "job_failure" && kind != "bt_escalation_failure") continue;
+        if (ds->dash->hiddenTriageCards.count(card.value("id", std::string()))) ++hiddenPending;
+    }
+    if (ds->emptyState) {
+        const bool allHiddenPending = (filter == L"pending" || taskOnly) && ds->searchText.empty() &&
+            ds->rows.empty() && hiddenPending > 0;
+        std::wstring emptyText;
+        if (allHiddenPending) {
+            emptyText = std::wstring(Tr(L"判断待ち ", L"", L"")) +
+                std::to_wstring(taskOnly ? ds->dash->pendingTriageTask
+                                         : ds->dash->pendingTriageTask + ds->dash->pendingTriageProcess) +
+                Tr(L" 件を非表示にしています。「判断待ちを再表示」で戻せます。",
+                   L" pending cards are hidden. Use ‘Show pending again’ to restore them.",
+                   L" tarjetas pendientes están ocultas. Usa ‘Mostrar pendientes’ para restaurarlas.");
+        }
+        SetWindowTextW(ds->emptyState, emptyText.c_str());
+        ShowWindow(ds->emptyState, allHiddenPending ? SW_SHOW : SW_HIDE);
+    }
 }
 
-static void HintHistoryLayout(HWND hwnd, HintHistoryDlgState* ds) {
-    if (!ds) return;
-    RECT rc = {};
-    GetClientRect(hwnd, &rc);
-    int w = rc.right - rc.left;
-    int h = rc.bottom - rc.top;
-    int pad = 12;
-    int btnH = 28;
-    int btnY = (std::max)(pad, h - pad - btnH);
-    int listY = pad;
-    int listH = (std::max)(120, (h * 30) / 100);
-    int detailY = listY + listH + 8;
-    int detailH = (std::max)(80, btnY - 8 - detailY);
-    int contentW = (std::max)(200, w - pad * 2);
-    if (ds->list) MoveWindow(ds->list, pad, listY, contentW, listH, TRUE);
-    if (ds->detail) MoveWindow(ds->detail, pad, detailY, contentW, detailH, TRUE);
-    int curX = pad;
-    if (ds->btnCopy) { MoveWindow(ds->btnCopy, curX, btnY, 150, btnH, TRUE); curX += 156; }
-    if (ds->btnLaunch) { MoveWindow(ds->btnLaunch, curX, btnY, 190, btnH, TRUE); curX += 196; }
-    if (ds->btnReload) { MoveWindow(ds->btnReload, curX, btnY, 100, btnH, TRUE); curX += 106; }
-    if (ds->btnClose) MoveWindow(ds->btnClose, (std::max)(curX + 10, w - pad - 100), btnY, 100, btnH, TRUE);
-}
-
-static LRESULT CALLBACK HintHistoryWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
-    auto* ds = reinterpret_cast<HintHistoryDlgState*>(GetWindowLongPtrW(hwnd, GWLP_USERDATA));
-    switch (msg) {
-        case WM_CREATE: {
-            auto* cs = reinterpret_cast<CREATESTRUCTW*>(lParam);
-            ds = reinterpret_cast<HintHistoryDlgState*>(cs->lpCreateParams);
-            SetWindowLongPtrW(hwnd, GWLP_USERDATA, reinterpret_cast<LONG_PTR>(ds));
-            HINSTANCE hInst = cs->hInstance;
-
-            ds->list = CreateWindowExW(WS_EX_CLIENTEDGE, WC_LISTVIEWW, L"",
-                WS_CHILD | WS_VISIBLE | LVS_REPORT | LVS_SINGLESEL | LVS_SHOWSELALWAYS,
-                12, 12, 860, 170, hwnd, (HMENU)2901, hInst, nullptr);
-            ListView_SetExtendedListViewStyle(ds->list, LVS_EX_FULLROWSELECT | LVS_EX_GRIDLINES | LVS_EX_INFOTIP);
-            MemoryListAddColumn(ds->list, 0, Tr(L"時刻", L"Time", L"Hora"), 130);
-            MemoryListAddColumn(ds->list, 1, Tr(L"種類", L"Category", L"Categoría"), 190);
-            MemoryListAddColumn(ds->list, 2, Tr(L"概要", L"Summary", L"Resumen"), 520);
-            ListView_SetBkColor(ds->list, g_theme.panel);
-            ListView_SetTextBkColor(ds->list, g_theme.panel);
-            ListView_SetTextColor(ds->list, g_theme.listText);
-            if (HWND header = ListView_GetHeader(ds->list)) {
-                ApplyNativeControlTheme(header, IsDarkThemeActive());
-            }
-
-            ds->detail = CreateWindowExW(WS_EX_CLIENTEDGE, L"EDIT", L"",
-                WS_CHILD | WS_VISIBLE | WS_VSCROLL | ES_MULTILINE | ES_READONLY | ES_AUTOVSCROLL,
-                12, 190, 860, 280, hwnd, (HMENU)2902, hInst, nullptr);
-
-            ds->btnCopy = CreateWindowExW(0, L"BUTTON", Tr(L"📋 プロンプトをコピー", L"📋 Copy Prompt", L"📋 Copiar Prompt"),
-                WS_CHILD | WS_VISIBLE | BS_PUSHBUTTON, 12, 484, 150, 28, hwnd, (HMENU)2903, hInst, nullptr);
-            ds->btnLaunch = CreateWindowExW(0, L"BUTTON", Tr(L"🤖 解決させる", L"🤖 Resolve", L"🤖 Resolver"),
-                WS_CHILD | WS_VISIBLE | BS_PUSHBUTTON, 168, 484, 190, 28, hwnd, (HMENU)2904, hInst, nullptr);
-            ds->btnReload = CreateWindowExW(0, L"BUTTON", Tr(L"再読み込み", L"Reload", L"Recargar"),
-                WS_CHILD | WS_VISIBLE | BS_PUSHBUTTON, 364, 484, 100, 28, hwnd, (HMENU)2905, hInst, nullptr);
-            ds->btnClose = CreateWindowExW(0, L"BUTTON", Tr(L"閉じる", L"Close", L"Cerrar"),
-                WS_CHILD | WS_VISIBLE | BS_PUSHBUTTON, 772, 484, 100, 28, hwnd, (HMENU)IDOK, hInst, nullptr);
-
-            HWND controls[] = {ds->list, ds->detail, ds->btnCopy, ds->btnLaunch, ds->btnReload, ds->btnClose};
-            for (HWND h : controls) {
-                if (h && ds->fontUi) SendMessageW(h, WM_SETFONT, reinterpret_cast<WPARAM>(ds->fontUi), TRUE);
-            }
-
-            ApplyNativeThemeToWindow(hwnd);
-            HintHistoryReload(ds);
-            return 0;
-        }
-        case WM_NOTIFY: {
-            if (!ds) break;
-            auto* nm = reinterpret_cast<NMHDR*>(lParam);
-            if (nm && nm->hwndFrom == ds->list && nm->code == LVN_GETINFOTIPW) {
-                auto* tip = reinterpret_cast<NMLVGETINFOTIPW*>(lParam);
-                SetListInfoTip(tip, ListViewFullCellText(ds->list, tip->iItem, tip->iSubItem));
-                return 0;
-            }
-            if (nm && nm->hwndFrom == ds->list && !ds->loading) {
-                if (nm->code == LVN_ITEMCHANGED) {
-                    auto* nv = reinterpret_cast<NMLISTVIEW*>(lParam);
-                    HintHistoryUpdateSelection(ds);
-                    if ((nv->uNewState & LVIS_SELECTED) && ds->dash) {
-                        int sel = ListView_GetNextItem(ds->list, -1, LVNI_SELECTED);
-                        if (sel >= 0 && static_cast<size_t>(sel) < ds->rows.size()) {
-                            const SupervisorHintRecord& r = ds->rows[static_cast<size_t>(sel)];
-                            DisplaySupervisorHint(ds->dash, r.category, r.summary, r.prompt, 0);
-                        }
-                    }
+struct TriageConfirmState { HWND edit = nullptr; bool done = false; bool accepted = false; std::wstring reason; };
+static LRESULT CALLBACK TriageConfirmWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
+    auto* state = reinterpret_cast<TriageConfirmState*>(GetWindowLongPtrW(hwnd, GWLP_USERDATA));
+    if (msg == WM_CREATE) {
+        auto* cs = reinterpret_cast<CREATESTRUCTW*>(lParam);
+        state = static_cast<TriageConfirmState*>(cs->lpCreateParams);
+        SetWindowLongPtrW(hwnd, GWLP_USERDATA, reinterpret_cast<LONG_PTR>(state));
+        CreateWindowExW(0, L"STATIC", L"", WS_CHILD | WS_VISIBLE, 16, 14, 660, 104, hwnd, nullptr, cs->hInstance, nullptr);
+        state->edit = CreateWindowExW(WS_EX_CLIENTEDGE, L"EDIT", L"", WS_CHILD | WS_VISIBLE | WS_TABSTOP | ES_AUTOHSCROLL,
+            16, 126, 660, 26, hwnd, reinterpret_cast<HMENU>(4103), cs->hInstance, nullptr);
+        CreateWindowExW(0, L"BUTTON", Tr(L"判断済みにする", L"Mark judged", L"Marcar como decidido"),
+            WS_CHILD | WS_VISIBLE | WS_TABSTOP | BS_PUSHBUTTON, 410, 166, 128, 30, hwnd, reinterpret_cast<HMENU>(4101), cs->hInstance, nullptr);
+        // Cancel is the default button: Enter in the reason box must not record a bulk decision.
+        CreateWindowExW(0, L"BUTTON", Tr(L"キャンセル", L"Cancel", L"Cancelar"),
+            WS_CHILD | WS_VISIBLE | WS_TABSTOP | BS_DEFPUSHBUTTON, 548, 166, 128, 30, hwnd, reinterpret_cast<HMENU>(4102), cs->hInstance, nullptr);
+        SendMessageW(hwnd, DM_SETDEFID, 4102, 0);
+        AddControlHelp(hwnd, GetDlgItem(hwnd, 4101),
+            Tr(L"上に入力した理由を記録して、この判断待ちカードを判断済みにします。\n理由は空にできません。",
+               L"Records the reason above and marks this pending card as judged.\nThe reason cannot be empty.",
+               L"Registra el motivo de arriba y marca la tarjeta pendiente como decidida.\nEl motivo no puede estar vacío."));
+        AddControlHelp(hwnd, GetDlgItem(hwnd, 4102),
+            Tr(L"判断を記録せずにこのダイアログを閉じます。\nEnter でも閉じます。",
+               L"Closes this dialog without recording a decision.\nEnter also closes it.",
+               L"Cierra el diálogo sin registrar una decisión.\nIntro también lo cierra."));
+        return 0;
+    }
+    if (msg == WM_COMMAND && state) {
+        int id = LOWORD(wParam);
+        if (id == IDCANCEL || id == IDOK) id = 4102;  // Esc, or Enter routed by IsDialogMessage
+        if (id == 4101 || id == 4102) {
+            if (id == 4101) {
+                wchar_t buf[2048] = {};
+                GetWindowTextW(state->edit, buf, static_cast<int>(std::size(buf)));
+                state->reason = buf;
+                if (state->reason.empty()) {
+                    gui_platform::GetGuiPlatform()->ShowMessageBox(hwnd,
+                        Tr(L"理由が必要です", L"A reason is required", L"Se requiere un motivo"),
+                        Tr(L"理由を入力してください。", L"Enter a reason.", L"Escribe un motivo."),
+                        gui_platform::MessageBoxType::Warning);
                     return 0;
                 }
-                if (nm->code == LVN_ITEMACTIVATE && ds->dash) {
-                    int sel = ListView_GetNextItem(ds->list, -1, LVNI_SELECTED);
-                    if (sel >= 0 && static_cast<size_t>(sel) < ds->rows.size()) {
-                        const SupervisorHintRecord& r = ds->rows[static_cast<size_t>(sel)];
-                        DisplaySupervisorHint(ds->dash, r.category, r.summary, r.prompt, 0);
-                    }
-                    return 0;
-                }
+                state->accepted = true;
             }
-            break;
-        }
-        case WM_SIZE:
-            HintHistoryLayout(hwnd, ds);
-            return 0;
-        case WM_COMMAND: {
-            int id = LOWORD(wParam);
-            if (id == IDOK || id == IDCANCEL) {
-                DestroyWindow(hwnd);
-                return 0;
-            }
-            if (!ds) return 0;
-            if (id == 2905) {
-                HintHistoryReload(ds);
-                return 0;
-            }
-            int sel = ds->list ? ListView_GetNextItem(ds->list, -1, LVNI_SELECTED) : -1;
-            bool has = sel >= 0 && static_cast<size_t>(sel) < ds->rows.size();
-            if (id == 2903) {
-                if (has) {
-                    CopyTextToClipboard(hwnd, ds->rows[static_cast<size_t>(sel)].prompt);
-                    SetWindowTextW(ds->btnCopy, Tr(L"✓ コピー完了!", L"✓ Copied!", L"✓ ¡Copiado!"));
-                    SetTimer(hwnd, 1, 1500, nullptr);
-                }
-                return 0;
-            }
-            if (id == 2904) {
-                if (has && ds->dash) {
-                    LaunchSupervisorTerminal(ds->dash, ds->rows[static_cast<size_t>(sel)].prompt);
-                }
-                return 0;
-            }
-            break;
-        }
-        case WM_TIMER:
-            if (ds && wParam == 1 && ds->btnCopy) {
-                KillTimer(hwnd, 1);
-                SetWindowTextW(ds->btnCopy, Tr(L"📋 プロンプトをコピー", L"📋 Copy Prompt", L"📋 Copiar Prompt"));
-                return 0;
-            }
-            break;
-        case WM_CTLCOLORSTATIC:
-        case WM_CTLCOLOREDIT:
-        case WM_CTLCOLORLISTBOX: {
-            HDC hdc = reinterpret_cast<HDC>(wParam);
-            SetTextColor(hdc, g_theme.text);
-            SetBkColor(hdc, g_theme.panel);
-            return reinterpret_cast<LRESULT>(g_dialogBgBrush);
-        }
-        case WM_ERASEBKGND: {
-            HDC hdc = reinterpret_cast<HDC>(wParam);
-            RECT rc = {};
-            GetClientRect(hwnd, &rc);
-            FillRect(hdc, &rc, g_dialogBgBrush);
-            return 1;
-        }
-        case WM_CLOSE:
+            state->done = true;
             DestroyWindow(hwnd);
             return 0;
-        case WM_NCDESTROY:
-            if (ds) {
-                if (ds->dash && ds->dash->hwndHintHistory == hwnd) ds->dash->hwndHintHistory = nullptr;
-                delete ds;
-            }
-            SetWindowLongPtrW(hwnd, GWLP_USERDATA, 0);
-            return 0;
+        }
+    }
+    if (msg == WM_CLOSE && state) { state->done = true; DestroyWindow(hwnd); return 0; }
+    if (msg == WM_CTLCOLORSTATIC) {
+        HDC hdc = reinterpret_cast<HDC>(wParam);
+        SetTextColor(hdc, g_theme.text); SetBkColor(hdc, g_theme.panel);
+        return reinterpret_cast<LRESULT>(g_dialogBgBrush);
+    }
+    if (msg == WM_ERASEBKGND) {
+        HDC hdc = reinterpret_cast<HDC>(wParam); RECT rc = {}; GetClientRect(hwnd, &rc);
+        FillRect(hdc, &rc, g_dialogBgBrush); return 1;
     }
     return DefWindowProcW(hwnd, msg, wParam, lParam);
 }
 
-static void ShowHintHistoryDialog(DashboardState* st) {
-    if (!st || !st->hwndMain) return;
-    // Opening the history marks every hint as read.
-    if (st->unreadHintCount != 0) {
-        st->unreadHintCount = 0;
-        if (st->hwndBtnHistory) InvalidateRect(st->hwndBtnHistory, nullptr, FALSE);
-    }
-    if (st->hwndHintHistory && IsWindow(st->hwndHintHistory)) {
-        ShowWindow(st->hwndHintHistory, SW_SHOW);
-        SetForegroundWindow(st->hwndHintHistory);
-        return;
-    }
-
-    auto* ds = new HintHistoryDlgState();
-    ds->dash = st;
-    ds->fontUi = st->hFontUi;
-
-    HINSTANCE hInst = GetModuleHandleW(nullptr);
+static bool ShowTriageBulkConfirm(HWND parent, int count, const std::wstring& breakdown, std::wstring& reason) {
     static bool registered = false;
+    HINSTANCE instance = GetModuleHandleW(nullptr);
     if (!registered) {
         WNDCLASSEXW wc = {};
-        wc.cbSize = sizeof(wc);
-        wc.style = CS_HREDRAW | CS_VREDRAW;
-        wc.lpfnWndProc = HintHistoryWndProc;
-        wc.hInstance = hInst;
-        wc.hCursor = LoadCursorW(nullptr, IDC_ARROW);
-        wc.hbrBackground = g_dialogBgBrush;
-        wc.lpszClassName = L"HanchoHintHistoryWnd";
-        RegisterClassExW(&wc);
-        registered = true;
+        wc.cbSize = sizeof(wc); wc.lpfnWndProc = TriageConfirmWndProc; wc.hInstance = instance;
+        wc.hCursor = LoadCursorW(nullptr, IDC_ARROW); wc.hbrBackground = g_dialogBgBrush;
+        wc.lpszClassName = L"HanchoTriageConfirmWnd";
+        RegisterClassExW(&wc); registered = true;
+    }
+    TriageConfirmState state;
+    RECT owner = {}; GetWindowRect(parent, &owner);
+    HWND dialog = CreateWindowExW(WS_EX_DLGMODALFRAME, L"HanchoTriageConfirmWnd",
+        Tr(L"一括で判断済みにする", L"Mark all judged", L"Marcar todo como decidido"),
+        WS_CAPTION | WS_SYSMENU | WS_POPUP, owner.left + 120, owner.top + 100, 710, 250,
+        parent, nullptr, instance, &state);
+    if (!dialog) return false;
+    std::wstring message = Tr(L"表示中の判断待ち ", L"Mark ", L"Marcar ") + std::to_wstring(count) +
+        Tr(L" 件を「無視（判断済み）」として記録します。KPI の判断待ちから外れ、ジョブのメモに記録が残ります。\r\n元に戻すには各カードで処置をやり直してください。\r\n\r\n",
+           L" visible pending card(s) as ignored (judged). This lowers the KPI and records a note on jobs.\r\nTo undo, handle each card again.\r\n\r\n",
+           L" tarjeta(s) pendiente(s) visible(s) como ignorada(s). Esto reduce el KPI y deja una nota en los trabajos.\r\nPara deshacerlo, vuelve a tratar cada tarjeta.\r\n\r\n") + breakdown;
+    HWND label = FindWindowExW(dialog, nullptr, L"STATIC", nullptr);
+    if (label) SetWindowTextW(label, message.c_str());
+    if (state.edit) SetWindowTextW(state.edit,
+        Tr(L"一括で判断済み（確認のうえ対応不要）", L"Marked judged in bulk after review; no action needed", L"Marcado como decidido tras revisar; no requiere acción"));
+    ApplyNativeThemeToWindow(dialog);
+    EnableWindow(parent, FALSE);
+    ShowWindow(dialog, SW_SHOW); SetForegroundWindow(dialog);
+    // The cancel button is the initial focus, as a bulk decision is destructive.
+    HWND cancel = GetDlgItem(dialog, 4102); if (cancel) SetFocus(cancel);
+    MSG msg;
+    while (!state.done && GetMessageW(&msg, nullptr, 0, 0) > 0) {
+        if (!IsDialogMessageW(dialog, &msg)) { TranslateMessage(&msg); DispatchMessageW(&msg); }
+    }
+    EnableWindow(parent, TRUE); SetForegroundWindow(parent);
+    if (state.accepted) reason = state.reason;
+    return state.accepted;
+}
+
+static void TriageLayout(HWND hwnd, TriageDlgState* ds) {
+    if (!ds) return;
+    RECT rc = {}; GetClientRect(hwnd, &rc);
+    const int w = rc.right - rc.left, h = rc.bottom - rc.top, pad = 10;
+    if (ds->filter) MoveWindow(ds->filter, pad, pad, 205, 260, TRUE);
+    if (ds->search) MoveWindow(ds->search, pad + 213, pad, 260, 24, TRUE);
+    if (ds->modeLabel) MoveWindow(ds->modeLabel, pad + 482, pad + 3, w - pad - (pad + 482), 24, TRUE);
+    const RECT oldSplitter = ds->splitterRc;
+    const RECT oldVsplit = ds->vsplitRc;
+    const int tileTop = 40, tileH = 64, tileGap = 6, top = 110, splitterH = 6;
+    ds->tileRowRc = {pad, tileTop, w - pad, tileTop + tileH};
+    const int listWideH = 34;
+    const int lowerBottom = h - pad;
+    const int minLower = 220;
+    const int maxList = (std::max)(90, lowerBottom - top - splitterH - listWideH - minLower);
+    int listH = ds->listPaneH > 0 ? ds->listPaneH : (lowerBottom - top - listWideH) * 44 / 100;
+    listH = (std::clamp)(listH, 100, maxList);
+    ds->splitterRc = {pad, top + listH, w - pad, top + listH + splitterH};
+    ds->splitContentTop = top;
+    ds->splitMaxList = maxList;
+    if (ds->list) MoveWindow(ds->list, pad, top, w - pad * 2, listH, TRUE);
+    if (ds->emptyState) {
+        MoveWindow(ds->emptyState, pad + 30, top + listH / 2 - 18, w - pad * 2 - 60, 36, TRUE);
+        SetWindowPos(ds->emptyState, HWND_TOP, 0, 0, 0, 0,
+                     SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE);
     }
 
-    RECT parent = {};
-    GetWindowRect(st->hwndMain, &parent);
-    int dlgW = 900;
-    int dlgH = 560;
-    int x = parent.left + ((parent.right - parent.left) - dlgW) / 2;
-    int y = parent.top + ((parent.bottom - parent.top) - dlgH) / 2;
-    HWND hDlg = CreateWindowExW(WS_EX_DLGMODALFRAME, L"HanchoHintHistoryWnd",
-        Tr(L"Supervisor ヒント履歴", L"Supervisor Hint History", L"Historial de pistas del Supervisor"),
-        WS_OVERLAPPEDWINDOW | WS_VISIBLE, x, y, dlgW, dlgH, st->hwndMain, nullptr, hInst, ds);
-    if (hDlg) {
-        st->hwndHintHistory = hDlg;
-        ShowWindow(hDlg, SW_SHOW);
-        SetForegroundWindow(hDlg);
-    } else {
-        delete ds;
+    const int bulkTop = top + listH + splitterH + 2;
+    int bx = pad;
+    if (ds->listWideLabel) MoveWindow(ds->listWideLabel, bx, bulkTop + 6, 82, 22, TRUE);
+    bx += 86;
+    auto bulkPlace = [&](HWND control, int width) {
+        if (control && IsWindowVisible(control)) { MoveWindow(control, bx, bulkTop, width, 30, TRUE); bx += width + 5; }
+    };
+    bulkPlace(ds->btnAllSupervisor, 175); bulkPlace(ds->btnAckAll, 230); bulkPlace(ds->btnMarkAll, 175);
+    bulkPlace(ds->btnClear, 84); bulkPlace(ds->btnShowPending, 170); bulkPlace(ds->btnReload, 105);
+
+    // Lower half, split left (information) / right (action).
+    const int lowerTop = bulkTop + listWideH + 2;
+    const int contentBottom = lowerBottom;
+    const int labelH = 22;
+    const int paneTop = lowerTop + labelH;
+    const int paneH = (std::max)(80, contentBottom - paneTop);
+    const int lowerW = w - pad * 2;
+    const int minPaneW = 260;
+    const int maxInfoW = (std::max)(minPaneW, lowerW - splitterH - minPaneW);
+    int infoW = ds->infoPaneW > 0 ? ds->infoPaneW : lowerW * 55 / 100;
+    infoW = (std::clamp)(infoW, minPaneW, maxInfoW);
+    ds->vsplitRc = {pad + infoW, lowerTop, pad + infoW + splitterH, contentBottom};
+    ds->vsplitLeft = pad;
+    ds->vsplitMaxW = maxInfoW;
+    if (ds->infoLabel) MoveWindow(ds->infoLabel, pad, lowerTop, infoW, labelH - 2, TRUE);
+    if (ds->infoTable) {
+        MoveWindow(ds->infoTable, pad, paneTop, infoW, paneH, TRUE);
+        // Section column fixed, content column takes the rest of the pane.
+        ListView_SetColumnWidth(ds->infoTable, 0, 90);
+        ListView_SetColumnWidth(ds->infoTable, 1, (std::max)(120, infoW - 90 - GetSystemMetrics(SM_CXVSCROLL) - 6));
     }
+
+    const int rx = pad + infoW + splitterH;
+    const int rw = (std::max)(minPaneW, w - pad - rx);
+    if (ds->actionLabel) MoveWindow(ds->actionLabel, rx, lowerTop, rw, labelH - 2, TRUE);
+    const int reasonH = 24, actionButtonH = 27, actionGap = 4;
+    const int actionRows = 3;
+    const int actionsTop = contentBottom - actionRows * actionButtonH - (actionRows - 1) * actionGap;
+    const int reasonY = actionsTop - reasonH - 5;
+    const int candidateRows = static_cast<int>(ds->radios.size());
+    const int maxCandidateH = (std::max)(0, (reasonY - paneTop - 80) / 2);
+    const int radioH = candidateRows > 0 ? (std::clamp)(maxCandidateH / candidateRows, 18, 22) : 0;
+    const int candidateH = radioH * candidateRows;
+    const int candidateTop = reasonY - 6 - candidateH;
+    if (ds->detail) MoveWindow(ds->detail, rx, paneTop, rw, (std::max)(70, candidateTop - 6 - paneTop), TRUE);
+    for (size_t i = 0; i < ds->radios.size(); ++i)
+        MoveWindow(ds->radios[i], rx + 2, candidateTop + static_cast<int>(i) * radioH, rw - 4, radioH, TRUE);
+    const bool multiplierVisible = ds->multiplier && IsWindowVisible(ds->multiplier);
+    const int reasonLabelW = 50;
+    if (ds->reasonLabel) MoveWindow(ds->reasonLabel, rx, reasonY + 3, reasonLabelW, reasonH - 3, TRUE);
+    if (ds->multiplier) MoveWindow(ds->multiplier, rx + rw - 90, reasonY, 90, 200, TRUE);
+    if (ds->reason) MoveWindow(ds->reason, rx + reasonLabelW, reasonY,
+                               rw - reasonLabelW - (multiplierVisible ? 96 : 0), reasonH, TRUE);
+
+    const int buttonW = (rw - 6) / 2;
+    HWND actionButtons[] = {ds->btnRun, ds->btnAdvise, ds->btnSupervisor, ds->btnManual, ds->btnLog, ds->btnAck};
+    int visibleIndex = 0;
+    for (HWND button : actionButtons) {
+        if (!button || !IsWindowVisible(button)) continue;
+        const int col = visibleIndex % 2, row = visibleIndex / 2;
+        MoveWindow(button, rx + col * (buttonW + 6), actionsTop + row * (actionButtonH + actionGap), buttonW, actionButtonH, TRUE);
+        ++visibleIndex;
+    }
+    const int tileW = (w - 2 * pad - 7 * tileGap) / 8;
+    for (int i = 0; i < 8; ++i) {
+        ds->tileRects[i] = {pad + i * (tileW + tileGap), tileTop,
+            i == 7 ? w - pad : pad + i * (tileW + tileGap) + tileW, tileTop + tileH};
+    }
+    // Repaint only where the divider bars were and are now, not the whole window (that flickered).
+    const RECT* splitterRects[] = {&oldSplitter, &oldVsplit, &ds->splitterRc, &ds->vsplitRc};
+    for (const RECT* rect : splitterRects)
+        if (rect->right > rect->left && rect->bottom > rect->top) InvalidateRect(hwnd, rect, TRUE);
+}
+
+static void TriageRunIpc(TriageDlgState* ds, const nlohmann::json& request, bool reload = true) {
+    if (!ds || !ds->dash) return;
+    nlohmann::json response;
+    if (!GuiIpcCall(ds->dash, request, response) || !response.value("ok", false)) {
+        gui_platform::GetGuiPlatform()->ShowMessageBox(GetParent(ds->list),
+            Tr(L"トリアージに失敗しました", L"Triage action failed", L"Falló la acción de triaje"),
+            Utf8ToWide(response.value("error", std::string("IPC request failed"))), gui_platform::MessageBoxType::Error);
+        return;
+    }
+    ds->dash->triageResponse = response.contains("cards") ? response : ds->dash->triageResponse;
+    if (reload) TriageReload(ds);
+    RefreshDashboardData(ds->dash);
+}
+
+static LRESULT CALLBACK TriageWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
+    auto* ds = reinterpret_cast<TriageDlgState*>(GetWindowLongPtrW(hwnd, GWLP_USERDATA));
+    switch (msg) {
+    case WM_CREATE: {
+        auto* cs = reinterpret_cast<CREATESTRUCTW*>(lParam);
+        ds = static_cast<TriageDlgState*>(cs->lpCreateParams);
+        SetWindowLongPtrW(hwnd, GWLP_USERDATA, reinterpret_cast<LONG_PTR>(ds));
+        const HINSTANCE instance = cs->hInstance;
+        ds->filter = CreateWindowExW(WS_EX_CLIENTEDGE, L"COMBOBOX", L"", WS_CHILD | WS_VISIBLE | WS_TABSTOP | CBS_DROPDOWNLIST,
+            10, 10, 230, 260, hwnd, reinterpret_cast<HMENU>(2907), instance, nullptr);
+        const std::pair<const wchar_t*, const wchar_t*> filters[] = {
+            {L"pending", Tr(L"判断待ち", L"Pending", L"Pendientes")},
+            {L"pendingProcess", Tr(L"プロセス判断待ち", L"Process pending", L"Procesos pendientes")},
+            {L"pendingTask", Tr(L"タスク判断待ち", L"Task pending", L"Tareas pendientes")},
+            {L"autoUnreviewed", Tr(L"自動処置・未確認", L"Auto, unreviewed", L"Auto sin revisar")},
+            {L"handling", Tr(L"対応中", L"Handling", L"En curso")},
+            {L"running", Tr(L"再実行中", L"Rerunning", L"Reintentando")},
+            {L"waiting", Tr(L"完了待ち", L"Waiting for completion", L"Esperando finalización")},
+            {L"follow_up", Tr(L"要フォロー", L"Follow-up", L"Seguimiento")},
+            {L"done", Tr(L"完了", L"Done", L"Completado")},
+            {L"open", Tr(L"未完了", L"Open", L"Abierto")},
+            {L"all", Tr(L"すべて", L"All", L"Todos")},
+            {L"acted", Tr(L"処置済み", L"Acted", L"Tratados")},
+            {L"ignored", Tr(L"無視", L"Ignored", L"Ignorados")},
+            {L"resolved", Tr(L"自然解消", L"Resolved", L"Resueltos")}
+        };
+        int selected = 0;
+        for (size_t i = 0; i < std::size(filters); ++i) {
+            SendMessageW(ds->filter, CB_ADDSTRING, 0, reinterpret_cast<LPARAM>(filters[i].second));
+            if (ds->filterKey == filters[i].first) selected = static_cast<int>(i);
+        }
+        SendMessageW(ds->filter, CB_SETCURSEL, selected, 0);
+        ds->search = CreateWindowExW(WS_EX_CLIENTEDGE, L"EDIT", L"", WS_CHILD | WS_VISIBLE | WS_TABSTOP | ES_AUTOHSCROLL,
+            0, 0, 260, 24, hwnd, reinterpret_cast<HMENU>(2930), instance, nullptr);
+        ds->modeLabel = CreateWindowExW(0, L"STATIC", L"", WS_CHILD | WS_VISIBLE, 0, 0, 900, 24, hwnd, nullptr, instance, nullptr);
+        ds->emptyState = CreateWindowExW(0, L"STATIC", L"", WS_CHILD | SS_CENTER | SS_CENTERIMAGE,
+            40, 120, 1000, 36, hwnd, nullptr, instance, nullptr);
+        ds->list = CreateWindowExW(WS_EX_CLIENTEDGE, WC_LISTVIEWW, L"", WS_CHILD | WS_VISIBLE | LVS_REPORT | LVS_SINGLESEL | LVS_SHOWSELALWAYS,
+            10, 42, 1100, 250, hwnd, reinterpret_cast<HMENU>(2901), instance, nullptr);
+        ListView_SetExtendedListViewStyle(ds->list, LVS_EX_FULLROWSELECT | LVS_EX_GRIDLINES | LVS_EX_INFOTIP | LVS_EX_DOUBLEBUFFER);
+        MemoryListAddColumn(ds->list, 0, Tr(L"ライフサイクル", L"Lifecycle", L"Ciclo de vida"), 145);
+        MemoryListAddColumn(ds->list, 1, Tr(L"種別", L"Kind", L"Tipo"), 120);
+        MemoryListAddColumn(ds->list, 2, Tr(L"対象", L"Target", L"Objetivo"), 170);
+        MemoryListAddColumn(ds->list, 3, Tr(L"推奨", L"Recommendation", L"Recomendación"), 230);
+        MemoryListAddColumn(ds->list, 4, Tr(L"LLM 相談", L"LLM advice", L"Consulta LLM"), 130);
+        MemoryListAddColumn(ds->list, 5, Tr(L"対応", L"Route", L"Atención"), 155);
+        MemoryListAddColumn(ds->list, 6, Tr(L"判断", L"Decision", L"Decisión"), 210);
+        MemoryListAddColumn(ds->list, 7, Tr(L"結果", L"Outcome", L"Resultado"), 260);
+        MemoryListAddColumn(ds->list, 8, Tr(L"確認", L"Review", L"Revisión"), 85);
+        MemoryListAddColumn(ds->list, 9, Tr(L"発生", L"Created", L"Creado"), 140);
+        MemoryListAddColumn(ds->list, 10, Tr(L"更新", L"Updated", L"Actualizado"), 140);
+        ListView_SetBkColor(ds->list, g_theme.panel); ListView_SetTextBkColor(ds->list, g_theme.panel); ListView_SetTextColor(ds->list, g_theme.listText);
+        ds->infoLabel = CreateWindowExW(0, L"STATIC",
+            Tr(L"■ 情報（原因・背景・環境・条件・理由）", L"■ Information (cause, background, environment, conditions, reason)",
+               L"■ Información (causa, contexto, entorno, condiciones, motivo)"),
+            WS_CHILD | WS_VISIBLE, 10, 300, 500, 20, hwnd, nullptr, instance, nullptr);
+        ds->infoTable = CreateWindowExW(WS_EX_CLIENTEDGE, WC_LISTVIEWW, L"",
+            WS_CHILD | WS_VISIBLE | LVS_REPORT | LVS_SINGLESEL | LVS_SHOWSELALWAYS | LVS_NOSORTHEADER,
+            10, 322, 600, 300, hwnd, reinterpret_cast<HMENU>(2921), instance, nullptr);
+        ListView_SetExtendedListViewStyle(ds->infoTable, LVS_EX_FULLROWSELECT | LVS_EX_GRIDLINES | LVS_EX_INFOTIP | LVS_EX_DOUBLEBUFFER);
+        MemoryListAddColumn(ds->infoTable, 0, Tr(L"区分", L"Section", L"Sección"), 90);
+        MemoryListAddColumn(ds->infoTable, 1, Tr(L"内容", L"Detail", L"Detalle"), 500);
+        ListView_SetBkColor(ds->infoTable, g_theme.panel); ListView_SetTextBkColor(ds->infoTable, g_theme.panel);
+        ListView_SetTextColor(ds->infoTable, g_theme.listText);
+        if (HWND header = ListView_GetHeader(ds->infoTable)) ApplyNativeControlTheme(header, IsDarkThemeActive());
+        ds->actionLabel = CreateWindowExW(0, L"STATIC",
+            Tr(L"■ 処置（助言・判断・候補）", L"■ Action (advice, decision, candidates)", L"■ Acción (consejo, decisión, opciones)"),
+            WS_CHILD | WS_VISIBLE, 620, 300, 500, 20, hwnd, nullptr, instance, nullptr);
+        ds->detail = CreateWindowExW(WS_EX_CLIENTEDGE, L"EDIT", L"", WS_CHILD | WS_VISIBLE | WS_VSCROLL | ES_MULTILINE | ES_READONLY | ES_AUTOVSCROLL,
+            620, 322, 500, 180, hwnd, reinterpret_cast<HMENU>(2902), instance, nullptr);
+        ds->multiplier = CreateWindowExW(WS_EX_CLIENTEDGE, L"COMBOBOX", L"", WS_CHILD | WS_VISIBLE | WS_TABSTOP | CBS_DROPDOWNLIST,
+            10, 0, 110, 120, hwnd, reinterpret_cast<HMENU>(2908), instance, nullptr);
+        for (const wchar_t* value : {L"×1.5", L"×2", L"×3", L"×4"}) SendMessageW(ds->multiplier, CB_ADDSTRING, 0, reinterpret_cast<LPARAM>(value));
+        SendMessageW(ds->multiplier, CB_SETCURSEL, 1, 0);
+        ds->reasonLabel = CreateWindowExW(0, L"STATIC", Tr(L"理由", L"Reason", L"Motivo"), WS_CHILD | WS_VISIBLE, 10, 0, 50, 22, hwnd, nullptr, instance, nullptr);
+        ds->reason = CreateWindowExW(WS_EX_CLIENTEDGE, L"EDIT", L"", WS_CHILD | WS_VISIBLE | WS_TABSTOP | ES_AUTOHSCROLL,
+            100, 0, 700, 24, hwnd, reinterpret_cast<HMENU>(2909), instance, nullptr);
+        auto button = [&](const wchar_t* text, int id) {
+            return CreateWindowExW(0, L"BUTTON", text, WS_CHILD | WS_VISIBLE | WS_TABSTOP | BS_PUSHBUTTON,
+                0, 0, 100, 28, hwnd, reinterpret_cast<HMENU>(static_cast<INT_PTR>(id)), instance, nullptr);
+        };
+        ds->btnRun = button(Tr(L"実行", L"Run", L"Ejecutar"), 2910);
+        ds->btnAdvise = button(Tr(L"🤖 LLM に相談", L"🤖 Ask LLM", L"🤖 Consultar LLM"), 2911);
+        ds->btnLog = button(Tr(L"📄 ログを開く", L"📄 Open log", L"📄 Abrir registro"), 2912);
+        ds->btnSupervisor = button(Tr(L"🤖 解決させる（バッチ）", L"🤖 Resolve (batch)", L"🤖 Resolver (lote)"), 2913);
+        ds->btnManual = button(Tr(L"📋 プロンプトをコピー（手動で処置）", L"📋 Copy prompt (manual handling)", L"📋 Copiar prompt (gestión manual)"), 2922);
+        ds->btnAllSupervisor = button(Tr(L"🤖 全部解決させる（バッチ）", L"🤖 Resolve all (batch)", L"🤖 Resolver todo (lote)"), 2914);
+        ds->btnAck = button(Tr(L"✓ 確認した", L"✓ Mark reviewed", L"✓ Revisado"), 2915);
+        ds->btnAckAll = button(Tr(L"自動処置をすべて確認済みにする", L"Mark all auto reviewed", L"Revisar todas las acciones auto"), 2916);
+        ds->btnClear = button(Tr(L"🧹 クリア", L"🧹 Clear", L"🧹 Limpiar"), 2917);
+        ds->btnShowPending = button(Tr(L"👁 判断待ちを再表示", L"👁 Show pending again", L"👁 Mostrar pendientes"), 2918);
+        ds->btnMarkAll = button(Tr(L"✔ 判断済みにして全部消す", L"✔ Mark all judged", L"✔ Marcar todo decidido"), 2919);
+        ds->btnReload = button(Tr(L"再読み込み", L"Reload", L"Recargar"), 2920);
+        AddControlHelp(hwnd, ds->btnRun,
+            Tr(L"選択した候補（処置）をこのカードに適用します。\n右の助言と理由を確認してから実行してください。",
+               L"Applies the selected candidate action to this card.\nReview the advice and reason on the right before running it.",
+               L"Aplica la acción candidata seleccionada a esta tarjeta.\nRevisa antes el consejo y el motivo de la derecha."));
+        AddControlHelp(hwnd, ds->btnAdvise,
+            Tr(L"LLM に原因と処置候補を相談し、助言を表示します。\n処置モードが「手動」でも実行できます。",
+               L"Asks the LLM for a cause and candidate actions, then shows its advice.\nWorks even in manual triage mode.",
+               L"Pide al LLM la causa y acciones candidatas y muestra su consejo.\nFunciona incluso en modo manual."));
+        AddControlHelp(hwnd, ds->btnLog,
+            Tr(L"このカードに関連するログを開きます。\nプロセス失敗のカードでは使用できません。",
+               L"Opens the logs related to this card.\nNot available for process-failure cards.",
+               L"Abre los registros relacionados con esta tarjeta.\nNo disponible para tarjetas de fallo de proceso."));
+        AddControlHelp(hwnd, ds->btnSupervisor,
+            Tr(L"このカードをバッチ Supervisor に渡し、自動で解決させます。\n結果はカードのライフサイクルに記録されます。",
+               L"Hands this card to the batch Supervisor to resolve automatically.\nThe result is recorded in the card's lifecycle.",
+               L"Entrega esta tarjeta al Supervisor por lotes para resolverla automáticamente.\nEl resultado se registra en el ciclo de vida de la tarjeta."));
+        AddControlHelp(hwnd, ds->btnManual,
+            Tr(L"解決用プロンプトをクリップボードにコピーします。\n手元の LLM に貼り付けて手動で処置するときに使います。",
+               L"Copies a resolution prompt to the clipboard.\nPaste it into your own LLM to handle the card manually.",
+               L"Copia un prompt de resolución al portapapeles.\nPégalo en tu LLM para gestionar la tarjeta manualmente."));
+        AddControlHelp(hwnd, ds->btnAllSupervisor,
+            Tr(L"判断待ちのカードをまとめてバッチ Supervisor に渡します。\n各カードの解決結果は個別に記録されます。",
+               L"Hands all pending cards to the batch Supervisor.\nEach card's result is recorded separately.",
+               L"Entrega todas las tarjetas pendientes al Supervisor por lotes.\nEl resultado de cada tarjeta se registra por separado."));
+        AddControlHelp(hwnd, ds->btnAck,
+            Tr(L"この自動処置カードを確認済みにします。\n一覧からは消えません。",
+               L"Marks this automatic-action card as reviewed.\nIt stays in the list.",
+               L"Marca esta tarjeta de acción automática como revisada.\nSigue en la lista."));
+        AddControlHelp(hwnd, ds->btnAckAll,
+            Tr(L"自動処置のカードをすべて確認済みにします。\n未確認の自動処置がまとめて消えます。",
+               L"Marks every automatic-action card as reviewed.\nAll unreviewed automatic actions are cleared at once.",
+               L"Marca todas las tarjetas de acción automática como revisadas.\nSe descartan todas las acciones sin revisar."));
+        AddControlHelp(hwnd, ds->btnClear,
+            Tr(L"確認済み・判断済みのカードを一覧から消します。\n判断待ちのカードは残ります。",
+               L"Removes reviewed and judged cards from the list.\nPending cards stay.",
+               L"Quita de la lista las tarjetas revisadas y decididas.\nLas pendientes permanecen."));
+        AddControlHelp(hwnd, ds->btnShowPending,
+            Tr(L"非表示にした判断待ちカードを再表示します。\n「全部消す」の後に取り戻したいときに使います。",
+               L"Shows hidden pending cards again.\nUse it to undo a bulk hide or clear.",
+               L"Vuelve a mostrar las tarjetas pendientes ocultas.\nÚtil para deshacer un ocultado o borrado masivo."));
+        AddControlHelp(hwnd, ds->btnMarkAll,
+            Tr(L"すべての判断待ちカードを理由付きで判断済みにします。\n一覧からも消えます。実行前に内容を確認してください。",
+               L"Marks every pending card as judged with a reason.\nThey also leave the list; review them before running this.",
+               L"Marca todas las tarjetas pendientes como decididas con un motivo.\nTambién salen de la lista; revísalas antes."));
+        AddControlHelp(hwnd, ds->btnReload,
+            Tr(L"トリアージ一覧を最新の状態に更新します。\n新しい失敗や処置の結果を反映します。",
+               L"Refreshes the triage list.\nPicks up new failures and action results.",
+               L"Actualiza la lista de triaje.\nIncluye nuevos fallos y resultados de acciones."));
+        ds->listWideLabel = CreateWindowExW(0, L"STATIC", Tr(L"一覧全体:", L"List-wide:", L"Toda la lista:"),
+            WS_CHILD | WS_VISIBLE, 0, 0, 82, 24, hwnd, nullptr, instance, nullptr);
+        HWND controls[] = {ds->filter, ds->search, ds->modeLabel, ds->emptyState, ds->list, ds->infoLabel, ds->infoTable,
+            ds->actionLabel, ds->detail, ds->reasonLabel, ds->multiplier, ds->reason,
+            ds->btnRun, ds->btnAdvise, ds->btnLog, ds->btnSupervisor, ds->btnManual, ds->btnAllSupervisor, ds->btnAck,
+            ds->btnAckAll, ds->btnClear, ds->btnShowPending, ds->btnMarkAll, ds->btnReload, ds->listWideLabel};
+        for (HWND control : controls) if (control && ds->fontUi) SendMessageW(control, WM_SETFONT, reinterpret_cast<WPARAM>(ds->fontUi), TRUE);
+        if (ds->dash && ds->dash->hFontUiBold) {
+            for (HWND label : {ds->infoLabel, ds->actionLabel})
+                if (label) SendMessageW(label, WM_SETFONT, reinterpret_cast<WPARAM>(ds->dash->hFontUiBold), TRUE);
+        }
+        ApplyNativeThemeToWindow(hwnd);
+        RegisterHotKey(hwnd, 1, MOD_CONTROL, 'F');
+        nlohmann::json config = nlohmann::json::parse(ReadFileUtf8Wide(GetConfigFilePathWide()), nullptr, false);
+        if (config.is_object() && config.contains("triage_sort") && config["triage_sort"].is_object()) {
+            const auto sort = config["triage_sort"];
+            ds->sortColumn = sort.value("column", -1);
+            if (ds->sortColumn < -1 || ds->sortColumn > 10) ds->sortColumn = -1;
+            ds->sortDescending = sort.value("descending", true);
+        }
+        TriageUpdateHeaders(ds);
+        for (HWND child : {ds->filter, ds->search, ds->list, ds->infoTable, ds->detail, ds->reason,
+                           ds->btnRun, ds->btnAdvise, ds->btnLog, ds->btnSupervisor, ds->btnManual,
+                           ds->btnAllSupervisor, ds->btnAck, ds->btnAckAll, ds->btnClear, ds->btnShowPending,
+                           ds->btnMarkAll, ds->btnReload}) {
+            if (child) SetWindowSubclass(child, TriageChildSubclassProc, 1, 0);
+        }
+        TriageReload(ds);
+        return 0;
+    }
+    case WM_SIZE: TriageLayout(hwnd, ds); return 0;
+    case WM_PC_TRIAGE_REFRESH:
+        if (ds && ds->dash) TriageReload(ds, &ds->dash->triageResponse);
+        return 0;
+    case WM_HOTKEY:
+        if (ds && wParam == 1 && ds->search) { SetFocus(ds->search); return 0; }
+        break;
+    case WM_NOTIFY: {
+        if (!ds) break;
+        auto* nm = reinterpret_cast<NMHDR*>(lParam);
+        if (nm && nm->hwndFrom == ds->list && nm->code == LVN_COLUMNCLICK) {
+            const int column = reinterpret_cast<NMLISTVIEW*>(lParam)->iSubItem;
+            if (column >= 0 && column < 11) {
+                if (ds->sortColumn == column) ds->sortDescending = !ds->sortDescending;
+                else { ds->sortColumn = column; ds->sortDescending = false; }
+                TriageUpdateHeaders(ds);
+                TriagePersistSort(ds);
+                TriageReload(ds);
+            }
+            return 0;
+        }
+        if (nm && nm->hwndFrom == ds->list && nm->code == LVN_ITEMCHANGED) {
+            if (!ds->loading) { TriageUpdateSelection(ds); TriageLayout(hwnd, ds); }
+            return 0;
+        }
+        if (nm && nm->hwndFrom == ds->list && nm->code == LVN_GETINFOTIPW) {
+            auto* tip = reinterpret_cast<NMLVGETINFOTIPW*>(lParam);
+            SetListInfoTip(tip, ListViewFullCellText(ds->list, tip->iItem, tip->iSubItem));
+            return 0;
+        }
+        if (nm && nm->hwndFrom == ds->infoTable && nm->code == LVN_GETINFOTIPW) {
+            // Long information lines are cut off by the column; hovering shows the whole line.
+            auto* tip = reinterpret_cast<NMLVGETINFOTIPW*>(lParam);
+            SetListInfoTip(tip, ListViewFullCellText(ds->infoTable, tip->iItem, 1));
+            return 0;
+        }
+        if (nm && nm->hwndFrom == ds->list && nm->code == NM_CUSTOMDRAW) {
+            auto* cd = reinterpret_cast<NMLVCUSTOMDRAW*>(lParam);
+            if (cd->nmcd.dwDrawStage == CDDS_PREPAINT) return CDRF_NOTIFYITEMDRAW;
+            if (cd->nmcd.dwDrawStage == CDDS_ITEMPREPAINT) {
+                const size_t i = static_cast<size_t>(cd->nmcd.dwItemSpec);
+                if (i < ds->rows.size()) {
+                    const auto& card = ds->rows[i];
+                    const std::string lifecycle = card.value("lifecycle", std::string());
+                    if (lifecycle == "done") {
+                        cd->clrText = g_theme.muted; cd->clrTextBk = MutedRowColor(g_theme.panel);
+                    } else if (lifecycle == "pending" || lifecycle == "follow_up") {
+                        COLORREF custom = 0;
+                        if (GetListRowBgOverride(ListRowKey::Failed, custom)) cd->clrTextBk = custom;
+                        else cd->clrTextBk = MutedRowColor(g_theme.rowFailed);
+                    } else if (lifecycle == "handling" || lifecycle == "running" ||
+                               lifecycle == "waiting_branch" || lifecycle == "waiting_next") {
+                        COLORREF custom = 0;
+                        if (GetListRowBgOverride(ListRowKey::Running, custom)) cd->clrTextBk = custom;
+                        else cd->clrTextBk = MutedRowColor(g_theme.rowRunning);
+                    } else {
+                        const std::wstring kind = TriageKindLabel(card);
+                        if (kind == Tr(L"タイムアウト", L"Timeout", L"Tiempo agotado") ||
+                            kind == Tr(L"ハング", L"Hang", L"Bloqueo")) {
+                            COLORREF custom = 0;
+                            if (GetListRowBgOverride(ListRowKey::Timeout, custom)) cd->clrTextBk = custom;
+                            else cd->clrTextBk = MutedRowColor(g_theme.rowIdle);
+                        } else if (kind == Tr(L"失敗", L"Failure", L"Fallo") ||
+                                   kind == Tr(L"エスカレーション失敗", L"Escalation failure", L"Fallo de escalación")) {
+                            COLORREF custom = 0;
+                            if (GetListRowBgOverride(ListRowKey::Failed, custom)) cd->clrTextBk = custom;
+                            else cd->clrTextBk = MutedRowColor(g_theme.rowFailed);
+                        }
+                    }
+                }
+                return CDRF_NEWFONT;
+            }
+        }
+        break;
+    }
+    case WM_COMMAND: {
+        if (!ds) break;
+        const int id = LOWORD(wParam);
+        if (id == 2907 && HIWORD(wParam) == CBN_SELCHANGE) {
+            static const wchar_t* filters[] = {L"pending", L"pendingProcess", L"pendingTask", L"autoUnreviewed",
+                L"handling", L"running", L"waiting", L"follow_up", L"done", L"open", L"all", L"acted", L"ignored", L"resolved"};
+            int sel = static_cast<int>(SendMessageW(ds->filter, CB_GETCURSEL, 0, 0));
+            if (sel >= 0 && sel < static_cast<int>(std::size(filters))) ds->filterKey = filters[sel];
+            ds->activeTile = TriageTileForFilter(ds->filterKey);
+            TriageReload(ds); TriageLayout(hwnd, ds); return 0;
+        }
+        if (id == 2930 && HIWORD(wParam) == EN_CHANGE) {
+            wchar_t text[2048] = {};
+            GetWindowTextW(ds->search, text, static_cast<int>(std::size(text)));
+            ds->searchText = text;
+            TriageReload(ds); TriageLayout(hwnd, ds); return 0;
+        }
+        if (id >= 3000 && id < 3000 + static_cast<int>(ds->radios.size())) {
+            const size_t index = static_cast<size_t>(id - 3000);
+            bool showMultiplier = false;
+            if (ds->selectedCard.contains("candidates") && ds->selectedCard["candidates"].is_array() &&
+                index < ds->selectedCard["candidates"].size())
+                showMultiplier = ds->selectedCard["candidates"][index].value("id", std::string()) == "retry_raise_timeout";
+            if (ds->multiplier) ShowWindow(ds->multiplier, showMultiplier ? SW_SHOW : SW_HIDE);
+            if (ds->btnRun && ds->selectedCard.contains("candidates") && ds->selectedCard["candidates"].is_array() &&
+                index < ds->selectedCard["candidates"].size()) {
+                const std::string candidateId = ds->selectedCard["candidates"][index].value("id", std::string());
+                const std::wstring caption = Tr(L"▶ 実行: ", L"▶ Run: ", L"▶ Ejecutar: ") + TriageCandidateLabel(ds->selectedCard, candidateId);
+                SetWindowTextW(ds->btnRun, caption.c_str());
+            }
+            TriageLayout(hwnd, ds); return 0;
+        }
+        const int selected = ds->list ? ListView_GetNextItem(ds->list, -1, LVNI_SELECTED) : -1;
+        const bool has = selected >= 0 && static_cast<size_t>(selected) < ds->rows.size();
+        if (id == 2910 && has) {
+            std::string candidateId;
+            if (ds->selectedCard.contains("candidates") && ds->selectedCard["candidates"].is_array()) {
+                for (size_t i = 0; i < ds->radios.size() && i < ds->selectedCard["candidates"].size(); ++i) {
+                    if (SendMessageW(ds->radios[i], BM_GETCHECK, 0, 0) == BST_CHECKED) {
+                        candidateId = ds->selectedCard["candidates"][i].value("id", std::string()); break;
+                    }
+                }
+            }
+            wchar_t reasonBuf[2048] = {}; GetWindowTextW(ds->reason, reasonBuf, static_cast<int>(std::size(reasonBuf)));
+            std::wstring reasonW = reasonBuf; std::string reason = WideToUtf8(reasonW);
+            if (candidateId == "ignore" && reasonW.empty()) {
+                gui_platform::GetGuiPlatform()->ShowMessageBox(hwnd,
+                    Tr(L"理由が必要です", L"A reason is required", L"Se requiere un motivo"),
+                    Tr(L"無視する理由を入力してください。", L"Enter a reason before ignoring this card.", L"Escribe un motivo antes de ignorar esta tarjeta."),
+                    gui_platform::MessageBoxType::Warning); return 0;
+            }
+            // fix_spec is handed to a batch supervisor by the core (triage_decide routes it); nothing
+            // is started interactively here.
+            nlohmann::json params = nlohmann::json::object();
+            if (candidateId == "retry_raise_timeout") {
+                const int mult = static_cast<int>(SendMessageW(ds->multiplier, CB_GETCURSEL, 0, 0));
+                const double values[] = {1.5, 2.0, 3.0, 4.0};
+                params["multiplier"] = values[(std::clamp)(mult, 0, 3)];
+            }
+            TriageRunIpc(ds, {{"action", "triage_decide"}, {"id", ds->selectedId},
+                {"candidateId", candidateId}, {"reason", reason}, {"params", params}, {"by", "human"}});
+            return 0;
+        }
+        if (id == 2911 && has) { TriageRunIpc(ds, {{"action", "triage_advise"}, {"id", ds->selectedId}}); return 0; }
+        if (id == 2922 && has) {
+            nlohmann::json response;
+            if (!GuiIpcCall(ds->dash, {{"action", "triage_manual"}, {"id", ds->selectedId}}, response) ||
+                !response.value("ok", false)) {
+                gui_platform::GetGuiPlatform()->ShowMessageBox(hwnd,
+                    Tr(L"手動処置を開始できません", L"Could not start manual handling", L"No se pudo iniciar la gestión manual"),
+                    Utf8ToWide(response.value("error", std::string("IPC request failed"))), gui_platform::MessageBoxType::Error);
+                return 0;
+            }
+            const std::wstring prompt = Utf8ToWide(response.value("prompt", std::string()));
+            if (!prompt.empty()) CopyTextToClipboard(hwnd, prompt);
+            TriageReload(ds);
+            RefreshDashboardData(ds->dash);
+            return 0;
+        }
+        if (id == 2912 && has) {
+            const auto target = ds->selectedCard.value("target", nlohmann::json::object());
+            const std::string jobId = target.value("jobId", std::string());
+            if (!jobId.empty()) {
+                std::string err; const std::string raw = TaskQueueGetIpc(ds->dash, jobId, false, 0, err);
+                nlohmann::json job = nlohmann::json::parse(raw, nullptr, false);
+                std::wstring path;
+                if (job.is_object() && job.contains("attempts") && job["attempts"].is_array() && !job["attempts"].empty()) {
+                    const auto& attempt = job["attempts"].back();
+                    for (const char* key : {"log_file", "logFile", "tail_file", "tailFile"}) {
+                        if (attempt.contains(key) && attempt[key].is_string()) { path = Utf8ToWide(attempt[key].get<std::string>()); break; }
+                    }
+                }
+                if (!path.empty()) ShellExecuteW(hwnd, L"open", path.c_str(), nullptr, nullptr, SW_SHOWNORMAL);
+                else ShowTaskQueueJobDetails(ds->dash, jobId, 2);
+            }
+            return 0;
+        }
+        // The supervisor always runs in batch (a hidden job in queue _supervisor with a timeout); an
+        // interactive conversation belongs in the Claude desktop app, not here.
+        if (id == 2913 && has) {
+            TriageRunIpc(ds, {{"action", "triage_handoff"}, {"ids", nlohmann::json::array({ds->selectedId})}});
+            return 0;
+        }
+        if (id == 2914) {
+            TriageRunIpc(ds, {{"action", "triage_handoff"}, {"all", true}});
+            return 0;
+        }
+        if (id == 2915 && has) { TriageRunIpc(ds, {{"action", "triage_ack"}, {"id", ds->selectedId}}); return 0; }
+        if (id == 2916) { TriageRunIpc(ds, {{"action", "triage_ack"}, {"all_auto", true}}); return 0; }
+        if (id == 2917) {
+            for (const auto& card : ds->rows) ds->dash->hiddenTriageCards.insert(card.value("id", std::string()));
+            while (ds->dash->hiddenTriageCards.size() > 500) ds->dash->hiddenTriageCards.erase(ds->dash->hiddenTriageCards.begin());
+            SaveTriageHiddenCards(ds->dash); TriageReload(ds); return 0;
+        }
+        if (id == 2918) {
+            ds->dash->hiddenTriageCards.clear(); SaveTriageHiddenCards(ds->dash); TriageReload(ds); return 0;
+        }
+        if (id == 2919) {
+            std::vector<nlohmann::json> targets;
+            std::map<std::wstring, int> kinds;
+            for (const auto& card : ds->rows) if (card.value("state", std::string()) == "pending") {
+                targets.push_back(card); ++kinds[TriageKindLabel(card)];
+            }
+            if (targets.empty()) return 0;
+            std::wstring breakdown;
+            for (const auto& entry : kinds) {
+                if (!breakdown.empty()) breakdown += L", ";
+                breakdown += entry.first + L" " + std::to_wstring(entry.second);
+            }
+            std::wstring reason;
+            if (!ShowTriageBulkConfirm(hwnd, static_cast<int>(targets.size()), breakdown, reason)) return 0;
+            int success = 0; std::wstring errors;
+            for (const auto& card : targets) {
+                const std::string idCard = card.value("id", std::string());
+                const bool process = card.value("kind", std::string()) == "process_failure";
+                nlohmann::json response;
+                bool ok = GuiIpcCall(ds->dash, {{"action", "triage_decide"}, {"id", idCard},
+                    {"candidateId", process ? "ack" : "ignore"}, {"reason", WideToUtf8(reason)}, {"by", "human"}}, response) &&
+                    response.value("ok", false);
+                if (ok) ++success;
+                else errors += (errors.empty() ? L"" : L"\r\n") + Utf8ToWide(idCard) + L": " + Utf8ToWide(response.value("error", std::string("IPC request failed")));
+            }
+            std::wstring summary = std::to_wstring(success) + Tr(L" 件成功、", L" succeeded, ", L" correctas, ") +
+                std::to_wstring(targets.size() - static_cast<size_t>(success)) + Tr(L" 件失敗", L" failed", L" fallidas");
+            if (!errors.empty()) summary += L":\r\n" + errors;
+            gui_platform::GetGuiPlatform()->ShowMessageBox(hwnd, Tr(L"一括処理結果", L"Bulk result", L"Resultado"), summary,
+                errors.empty() ? gui_platform::MessageBoxType::Info : gui_platform::MessageBoxType::Warning);
+            RefreshDashboardData(ds->dash); TriageReload(ds); return 0;
+        }
+        if (id == 2920) { TriageReload(ds); return 0; }
+        if (id == IDOK || id == IDCANCEL) { DestroyWindow(hwnd); return 0; }
+        break;
+    }
+    case WM_LBUTTONDOWN:
+        if (ds) {
+            POINT pt = {GET_X_LPARAM(lParam), GET_Y_LPARAM(lParam)};
+            if (PtInRect(&ds->splitterRc, pt)) { ds->splitterDrag = true; SetCapture(hwnd); return 0; }
+            if (PtInRect(&ds->vsplitRc, pt)) { ds->vsplitDrag = true; SetCapture(hwnd); return 0; }
+            for (int i = 0; i < 8; ++i) if (PtInRect(&ds->tileRects[i], pt)) {
+                const int clicked = i;
+                if (ds->activeTile == clicked) {
+                    // Toggle back to the default (task awaiting decision); if that tile was the
+                    // active one, widen to every card awaiting decision.
+                    ds->filterKey = clicked == 0 ? L"pending" : L"pendingTask";
+                    ds->activeTile = TriageTileForFilter(ds->filterKey);
+                } else {
+                    static const wchar_t* tileFilters[] = {L"pendingTask", L"pendingProcess", L"handling", L"running",
+                        L"waiting", L"follow_up", L"autoUnreviewed", L"done"};
+                    ds->filterKey = tileFilters[i]; ds->activeTile = i;
+                }
+                static const wchar_t* filterKeys[] = {L"pending", L"pendingProcess", L"pendingTask", L"autoUnreviewed",
+                    L"handling", L"running", L"waiting", L"follow_up", L"done", L"open", L"all", L"acted", L"ignored", L"resolved"};
+                for (int f = 0; f < static_cast<int>(std::size(filterKeys)); ++f)
+                    if (ds->filterKey == filterKeys[f]) SendMessageW(ds->filter, CB_SETCURSEL, f, 0);
+                TriageReload(ds); TriageLayout(hwnd, ds); return 0;
+            }
+        }
+        break;
+    case WM_MOUSEMOVE:
+        if (ds && ds->splitterDrag) {
+            ds->listPaneH = (std::clamp)(GET_Y_LPARAM(lParam) - ds->splitContentTop, 100, ds->splitMaxList);
+            TriageLayout(hwnd, ds); return 0;
+        }
+        if (ds && ds->vsplitDrag) {
+            ds->infoPaneW = (std::clamp)(GET_X_LPARAM(lParam) - ds->vsplitLeft, 260, ds->vsplitMaxW);
+            TriageLayout(hwnd, ds); return 0;
+        }
+        break;
+    case WM_SETCURSOR:
+        if (ds && LOWORD(lParam) == HTCLIENT) {
+            POINT pt = {}; GetCursorPos(&pt); ScreenToClient(hwnd, &pt);
+            if (PtInRect(&ds->splitterRc, pt)) { SetCursor(LoadCursorW(nullptr, IDC_SIZENS)); return TRUE; }
+            if (PtInRect(&ds->vsplitRc, pt)) { SetCursor(LoadCursorW(nullptr, IDC_SIZEWE)); return TRUE; }
+        }
+        break;
+    case WM_LBUTTONUP:
+        if (ds && (ds->splitterDrag || ds->vsplitDrag)) {
+            ds->splitterDrag = false; ds->vsplitDrag = false; ReleaseCapture(); return 0;
+        }
+        break;
+    case WM_CTLCOLORSTATIC:
+    case WM_CTLCOLOREDIT:
+    case WM_CTLCOLORBTN: {
+        // Labels, the read-only action text and the candidate radios follow the dashboard theme.
+        HDC hdc = reinterpret_cast<HDC>(wParam);
+        SetTextColor(hdc, g_theme.text);
+        SetBkColor(hdc, g_theme.panel);
+        return reinterpret_cast<LRESULT>(g_dialogBgBrush);
+    }
+    case WM_ERASEBKGND: {
+        HDC hdc = reinterpret_cast<HDC>(wParam);
+        RECT rc = {}; GetClientRect(hwnd, &rc);
+        FillRect(hdc, &rc, g_dialogBgBrush);
+        return 1;
+    }
+    case WM_PAINT: {
+        PAINTSTRUCT ps = {}; HDC hdc = BeginPaint(hwnd, &ps);
+        if (ds) {
+            const wchar_t* titles[] = {
+                Tr(L"タスク判断待ち", L"TASK PENDING", L"TAREA PENDIENTE"),
+                Tr(L"プロセス判断待ち", L"PROCESS PENDING", L"PROCESO PENDIENTE"),
+                Tr(L"対応中", L"HANDLING", L"EN CURSO"),
+                Tr(L"再実行中", L"RERUNNING", L"REINTENTANDO"),
+                Tr(L"完了待ち", L"WAITING", L"EN ESPERA"),
+                Tr(L"要フォロー", L"FOLLOW-UP", L"SEGUIMIENTO"),
+                Tr(L"自動・未確認", L"AUTO UNREVIEWED", L"AUTO SIN REVISAR"),
+                Tr(L"完了", L"DONE", L"COMPLETADO")};
+            for (int i = 0; i < 8; ++i) {
+                const bool urgent = (i == 0 || i == 1 || i == 5 || i == 6) && ds->tileValues[i] > 0;
+                COLORREF accent = i == 7 ? g_theme.muted : urgent ? KpiAccent(4) : KpiAccent(i == 2 ? 1 : i == 3 ? 3 : 2);
+                DrawKpiCard(hdc, ds->tileRects[i], titles[i], std::to_wstring(ds->tileValues[i]), accent,
+                    ds->dash ? ds->dash->hFontUiBold : ds->fontUi,
+                    ds->dash ? ds->dash->hFontKpiVal : nullptr, -1.0f, ds->tileSubtexts[i]);
+                if (ds->activeTile == i) {
+                    HBRUSH active = CreateSolidBrush(g_theme.accent);
+                    FrameRect(hdc, &ds->tileRects[i], active);
+                    DeleteObject(active);
+                }
+            }
+            HBRUSH brush = CreateSolidBrush(g_theme.border);
+            if (ds->splitterRc.bottom > ds->splitterRc.top) FillRect(hdc, &ds->splitterRc, brush);
+            if (ds->vsplitRc.right > ds->vsplitRc.left) FillRect(hdc, &ds->vsplitRc, brush);
+            DeleteObject(brush);
+        }
+        EndPaint(hwnd, &ps); return 0;
+    }
+    case WM_CLOSE: DestroyWindow(hwnd); return 0;
+    case WM_NCDESTROY:
+        if (ds) {
+            UnregisterHotKey(hwnd, 1);
+            for (HWND radio : ds->radios) if (radio && IsWindow(radio)) DestroyWindow(radio);
+            if (ds->dash && ds->dash->hwndHintHistory == hwnd) ds->dash->hwndHintHistory = nullptr;
+            delete ds;
+        }
+        SetWindowLongPtrW(hwnd, GWLP_USERDATA, 0); return 0;
+    }
+    return DefWindowProcW(hwnd, msg, wParam, lParam);
+}
+
+static void ShowTriageDialog(DashboardState* st, const std::wstring& filter, const std::string& selectId) {
+    if (!st || !st->hwndMain) return;
+    if (st->hwndHintHistory && IsWindow(st->hwndHintHistory)) {
+        auto* ds = reinterpret_cast<TriageDlgState*>(GetWindowLongPtrW(st->hwndHintHistory, GWLP_USERDATA));
+        if (ds) {
+            ds->filterKey = filter; ds->selectedId = selectId;
+            static const std::wstring filters[] = {L"pending", L"pendingProcess", L"pendingTask", L"autoUnreviewed",
+                L"handling", L"running", L"waiting", L"follow_up", L"done", L"open", L"all", L"acted", L"ignored", L"resolved"};
+            for (size_t i = 0; i < std::size(filters); ++i) if (filters[i] == filter) SendMessageW(ds->filter, CB_SETCURSEL, i, 0);
+            ds->activeTile = TriageTileForFilter(filter);
+            TriageReload(ds);
+        }
+        ShowWindow(st->hwndHintHistory, SW_SHOW); SetForegroundWindow(st->hwndHintHistory); return;
+    }
+    auto* ds = new TriageDlgState(); ds->dash = st; ds->fontUi = st->hFontUi;
+    ds->filterKey = filter; ds->selectedId = selectId;
+    ds->activeTile = TriageTileForFilter(filter);
+    static bool registered = false; const HINSTANCE instance = GetModuleHandleW(nullptr);
+    if (!registered) {
+        WNDCLASSEXW wc = {}; wc.cbSize = sizeof(wc); wc.style = CS_HREDRAW | CS_VREDRAW;
+        wc.lpfnWndProc = TriageWndProc; wc.hInstance = instance; wc.hCursor = LoadCursorW(nullptr, IDC_ARROW);
+        wc.hbrBackground = g_dialogBgBrush; wc.lpszClassName = L"HanchoTriageWnd";
+        RegisterClassExW(&wc); registered = true;
+    }
+    RECT parent = {}; GetWindowRect(st->hwndMain, &parent);
+    const int width = 1480, height = 980;
+    HWND dialog = CreateWindowExW(WS_EX_DLGMODALFRAME, L"HanchoTriageWnd", Tr(L"Hancho トリアージ", L"Hancho Triage", L"Hancho Triaje"),
+        WS_OVERLAPPEDWINDOW | WS_VISIBLE | WS_CLIPCHILDREN, parent.left + ((parent.right - parent.left) - width) / 2,
+        parent.top + ((parent.bottom - parent.top) - height) / 2, width, height, st->hwndMain, nullptr, instance, ds);
+    if (dialog) {
+        st->hwndHintHistory = dialog; ShowWindow(dialog, SW_SHOW); SetForegroundWindow(dialog);
+    } else delete ds;
 }
 
 struct SupervisorHintInfo {
@@ -13002,7 +15178,15 @@ static SupervisorHintInfo AnalyzeStateForHint(DashboardState* st, bool skipShown
                                               std::unordered_set<std::string>* activeOut) {
     SupervisorHintInfo info;
     if (!st) return info;
+    (void)skipShown;
+    (void)activeOut;
+    auto makePrompt = [](const std::wstring& ja, const std::wstring& en, const std::wstring& es) -> std::wstring {
+        if (g_uiLanguage == UiLanguage::Japanese) return ja;
+        if (g_uiLanguage == UiLanguage::Spanish) return es;
+        return en;
+    };
 
+#if 0 // Failure, timing, escalation, and resource cards now come exclusively from triage_list IPC.
     auto isSkipped = [&](const std::string& sig) {
         return skipShown && st->shownHintSignatures.count(sig) > 0;
     };
@@ -13021,153 +15205,264 @@ static SupervisorHintInfo AnalyzeStateForHint(DashboardState* st, bool skipShown
         return en;
     };
 
-    // 1. Check for Timing Divergence in lastTaskListJson
+    // 1. Timing divergence: one hint for the whole diverged set, not one per job.
     if (!st->lastTaskListJson.empty()) {
+        std::vector<std::string> ids;
+        std::vector<std::wstring> lines;
         auto jobs = SplitJsonObjectArray(st->lastTaskListJson, "jobs");
         for (const auto& j : jobs) {
-            std::string tfKey = "\"timing_feedback\"";
-            size_t tfPos = j.find(tfKey);
-            if (tfPos != std::string::npos) {
-                std::string acc = JsonGetString(j, "accuracy", "");
-                if (acc == "diverged_over" || acc == "diverged_under") {
-                    std::string jid = JsonGetString(j, "id", "");
-                    std::string jname = JsonGetString(j, "name", jid);
-                    int64_t dur = JsonGetInt(j, "duration_sec", 0);
-                    int64_t est = JsonGetInt(j, "estimate_sec", 0);
-                    std::string advice = JsonGetString(j, "advice", "");
-
-                    std::string sig = "timing:" + jid + ":" + acc;
-                    if (!claim(sig)) continue;
-                    info.category = Tr(L"⏱ 見積もり乖離検知 (Audit LLM)",
-                                       L"⏱ Timing Divergence (Audit LLM)",
-                                       L"⏱ Desviación de estimación (Audit LLM)");
-                    if (!advice.empty()) {
-                        info.summary = Utf8ToWide(advice);
-                    } else if (dur > est) {
-                        info.summary = Tr(L"ジョブ '", L"Job '", L"Trabajo '") + Utf8ToWide(jname) +
-                                       Tr(L"' の実所要時間が事前見積もりを大幅に超過しました。",
-                                          L"' actual duration greatly exceeded estimate.",
-                                          L"' la duración real superó ampliamente la estimación.");
-                    } else {
-                        info.summary = Tr(L"ジョブ '", L"Job '", L"Trabajo '") + Utf8ToWide(jname) +
-                                       Tr(L"' の実所要時間は事前見積もりより大幅に短時間でした。",
-                                          L"' actual duration was far below estimate.",
-                                          L"' la duración real fue muy inferior a la estimación.");
-                    }
-                    std::wstring jidW = Utf8ToWide(jid);
-                    info.prompt = makePrompt(
-                        L"hancho-cli taskqueue list を確認してください。ジョブ '" + jidW +
-                        L"' の実所要時間 (" + std::to_wstring(dur) + L"s / 見積もり " + std::to_wstring(est) +
-                        L"s) に基づき、後続ジョブの estimate_sec を再調整し、必要に応じてタスクを分割してください。",
-                        L"Check hancho-cli taskqueue list. Based on job '" + jidW +
-                        L"' actual duration (" + std::to_wstring(dur) + L"s vs estimate " + std::to_wstring(est) +
-                        L"s), recalibrate subsequent estimate_sec and consider task partitioning.",
-                        L"Revise hancho-cli taskqueue list. Según la duración de '" + jidW +
-                        L"' (" + std::to_wstring(dur) + L"s vs " + std::to_wstring(est) +
-                        L"s), recalibre estimate_sec para tareas posteriores.");
+            if (j.find("\"timing_feedback\"") == std::string::npos) continue;
+            std::string acc = JsonGetString(j, "accuracy", "");
+            if (acc != "diverged_over" && acc != "diverged_under") continue;
+            std::string jid = JsonGetString(j, "id", "");
+            int64_t dur = JsonGetInt(j, "duration_sec", 0);
+            int64_t est = JsonGetInt(j, "estimate_sec", 0);
+            ids.push_back(jid);
+            lines.push_back(Utf8ToWide(jid) + L" (" + std::to_wstring(dur) + L"s / " +
+                            std::to_wstring(est) + L"s)");
+        }
+        if (!ids.empty()) {
+            std::sort(ids.begin(), ids.end());
+            std::string sig = "timing:";
+            for (const auto& id : ids) sig += id + ";";
+            if (claim(sig)) {
+                info.category = Tr(L"\u23f1 \u898b\u7a4d\u3082\u308a\u4e56\u96e2\u691c\u77e5 (Audit LLM)",
+                                   L"Timing Divergence (Audit LLM)",
+                                   L"Desviacion de estimacion (Audit LLM)");
+                std::wstring listed;
+                for (size_t i = 0; i < lines.size() && i < 5; ++i) {
+                    if (!listed.empty()) listed += L", ";
+                    listed += lines[i];
                 }
+                info.summary = std::to_wstring(ids.size()) +
+                               Tr(L" \u4ef6\u306e\u30b8\u30e7\u30d6\u304c\u898b\u7a4d\u3082\u308a\u304b\u3089\u5916\u308c\u307e\u3057\u305f: ",
+                                  L" jobs diverged from their estimates: ",
+                                  L" trabajos se desviaron de su estimacion: ") + listed;
+                std::wstring idList;
+                for (size_t i = 0; i < ids.size() && i < 10; ++i) {
+                    if (!idList.empty()) idList += L" ";
+                    idList += Utf8ToWide(ids[i]);
+                }
+                info.prompt = makePrompt(
+                    L"hancho-cli taskqueue list \u3067\u5bfe\u8c61\u30b8\u30e7\u30d6\u3092\u78ba\u8a8d\u3057\u3066\u304f\u3060\u3055\u3044\u3002\u4e56\u96e2\u3057\u305f\u30b8\u30e7\u30d6: " + idList +
+                    L"\u3002\u4e00\u62ec\u3067 estimate_sec \u3092\u898b\u76f4\u3057\u3001\u5fc5\u8981\u306a\u3089\u30bf\u30b9\u30af\u3092\u5206\u5272\u3057\u3066\u304f\u3060\u3055\u3044\u3002",
+                    L"Review the diverged jobs with hancho-cli taskqueue list: " + idList +
+                    L". Recalibrate estimate_sec for the set and split tasks where needed.",
+                    L"Revise los trabajos desviados con hancho-cli taskqueue list: " + idList +
+                    L". Recalibre estimate_sec en conjunto y divida tareas si es necesario.");
             }
         }
     }
 
-    // 2. Check for Behavior Tree Escalation (waiting_for_llm)
+    // 2. Behavior Tree escalations. Waiting decisions and escalation failures are kept
+    // separate from ordinary job failures.
+    std::vector<BtDebugNode> btTrees;
+    std::unordered_map<std::string, std::string> btStates;
+    std::unordered_set<std::string> escalationJobIds;
+    std::vector<const BtDebugNode*> escalationFailures;
     try {
         std::vector<std::string> btErrors;
-        std::vector<BtDebugNode> trees = LoadBtDebugTrees(GetBehaviorTreesDirWide(), btErrors);
-        // Collect every waiting node (pre-order) so that all of them count as active, not only the first.
-        std::vector<const BtDebugNode*> waitingNodes;
-        std::function<void(const BtDebugNode&)> collectWaiting = [&](const BtDebugNode& n) {
-            // An escalate node waiting for an answer keeps node state "running" (behavior_tree_escalate.cpp);
-            // the tree root carries "waitingForLlm", so match escalate nodes by type, not the root's state.
-            // Snake_case names from earlier builds are kept in case persisted states still use them.
-            const bool waiting =
-                (n.type == "escalate" && (n.state == "running" || n.state == "waitingForLlm")) ||
-                n.state == "waiting_for_llm" || n.state == "waiting_for_decision" || n.state == "escalated";
-            if (waiting) waitingNodes.push_back(&n);
-            for (const auto& ch : n.children) collectWaiting(ch);
-        };
-        for (const auto& root : trees) collectWaiting(root);
-        for (const BtDebugNode* waiting : waitingNodes) {
-            if (claim("bt:" + waiting->btId + ":" + waiting->nodeId)) {
-                info.category = Tr(L"🧠 LLM判断要請 (BT Escalation)",
-                                   L"🧠 LLM Decision Required (BT)",
-                                   L"🧠 Decisión LLM Requerida (BT)");
-                std::wstring nodeName = waiting->label.empty() ? Utf8ToWide(waiting->nodeId) : Utf8ToWide(waiting->label);
-                info.summary = Tr(L"ビヘイビアツリー '", L"Behavior tree '", L"Árbol '") +
-                               Utf8ToWide(waiting->btId) + Tr(L"' のノード '", L"' node '", L"' nodo '") +
-                               nodeName +
-                               Tr(L"' が Supervisor LLM の判断を求めて待機しています。",
-                                  L"' is waiting for Supervisor LLM decision.",
-                                  L"' espera decisión del Supervisor LLM.");
-                std::wstring btIdW = Utf8ToWide(waiting->btId);
-                std::wstring nodeW = Utf8ToWide(waiting->nodeId);
-                info.prompt = makePrompt(
-                    L"hancho-cli bt get --id " + btIdW +
-                    L" でエスカレーションパケットを確認し、hancho-cli bt resume --id " + btIdW +
-                    L" --node " + nodeW + L" --answer <answer> --rationale <why> で応答してください。",
-                    L"Check escalation details with hancho-cli bt get --id " + btIdW +
-                    L" and answer with hancho-cli bt resume --id " + btIdW +
-                    L" --node " + nodeW + L" --answer <answer> --rationale <why>",
-                    L"Revise la escalación con hancho-cli bt get --id " + btIdW +
-                    L" y responda con hancho-cli bt resume --id " + btIdW +
-                    L" --node " + nodeW + L" --answer <answer> --rationale <why>");
+        btTrees = LoadBtDebugTrees(GetBehaviorTreesDirWide(), btErrors);
+        std::function<void(const BtDebugNode&)> collect = [&](const BtDebugNode& n) {
+            if (n.type == "escalate") {
+                if (n.state == "failed") escalationFailures.push_back(&n);
+                std::function<void(const BtDebugNode&)> collectJobs = [&](const BtDebugNode& x) {
+                    for (const auto& id : x.jobIds) escalationJobIds.insert(id);
+                    for (const auto& ch : x.children) collectJobs(ch);
+                };
+                collectJobs(n);
             }
+            for (const auto& ch : n.children) collect(ch);
+        };
+        for (const auto& root : btTrees) {
+            btStates[root.btId] = root.state;
+            collect(root);
         }
     } catch (...) {}
 
-    // 3. Check for Failed jobs
+    // 2b. Escalation failures are reported separately from ordinary job failures, with the
+    // reason (timeout, fallback failure, ...) when the tree state carries one.
+    if (!escalationFailures.empty()) {
+        struct EscFailure {
+            std::string key;
+            std::wstring reason;
+        };
+        auto clipEsc = [](std::wstring text, size_t maxLen) {
+            if (text.size() <= maxLen) return text;
+            text.resize(maxLen);
+            text += L"...";
+            return text;
+        };
+        std::vector<EscFailure> failures;
+        for (const BtDebugNode* n : escalationFailures) {
+            failures.push_back({n->btId + "/" + n->nodeId,
+                                Utf8ToWide(JsonGetString(n->detailJson, "detail", ""))});
+        }
+        std::sort(failures.begin(), failures.end(),
+                  [](const EscFailure& a, const EscFailure& b) { return a.key < b.key; });
+        std::string sig = "escfail:";
+        for (const auto& f : failures) sig += f.key + ";";
+        if (claim(sig)) {
+            info.category = Tr(L"\U0001f6a8 \u5224\u65ad\u8981\u8acb\u306e\u5931\u6557 (BT \u30a8\u30b9\u30ab\u30ec\u30fc\u30b7\u30e7\u30f3)",
+                               L"Decision Request Failed (BT escalation)",
+                               L"Solicitud de decision fallida (BT)");
+            std::wstring listed;
+            for (size_t i = 0; i < failures.size() && i < 5; ++i) {
+                if (!listed.empty()) listed += L", ";
+                listed += Utf8ToWide(failures[i].key);
+                if (!failures[i].reason.empty()) {
+                    listed += L" (" + clipEsc(failures[i].reason, 80) + L")";
+                }
+            }
+            info.summary = std::to_wstring(failures.size()) +
+                           Tr(L" \u4ef6\u306e\u30a8\u30b9\u30ab\u30ec\u30fc\u30b7\u30e7\u30f3\u304c\u5931\u6557\u3057\u307e\u3057\u305f: ",
+                              L" escalations failed: ",
+                              L" escalaciones fallaron: ") + listed;
+            std::wstring idList;
+            std::wstring reasons;
+            for (size_t i = 0; i < failures.size() && i < 10; ++i) {
+                if (!idList.empty()) idList += L" ";
+                idList += Utf8ToWide(failures[i].key);
+                if (i < 5 && !failures[i].reason.empty()) {
+                    reasons += L"\n- " + Utf8ToWide(failures[i].key) + L": " +
+                               clipEsc(failures[i].reason, 160);
+                }
+            }
+            info.prompt = makePrompt(
+                L"hancho-cli bt list \u3068 hancho-cli bt get --id <btId> \u3067\u30a8\u30b9\u30ab\u30ec\u30fc\u30b7\u30e7\u30f3\u306e\u5931\u6557\u7406\u7531\u3092\u78ba\u8a8d\u3057\u3001"
+                L"\u5fc5\u8981\u306a\u3089 hancho-cli bt retry \u307e\u305f\u306f bt resume \u3067\u518d\u958b\u3057\u3066\u304f\u3060\u3055\u3044\u3002\u5bfe\u8c61: " + idList + reasons,
+                L"Check why the escalations failed with hancho-cli bt list and hancho-cli bt get --id <btId>, then retry or resume them with hancho-cli bt retry / bt resume. Targets: " + idList + reasons,
+                L"Revise por que fallaron las escalaciones con hancho-cli bt list y hancho-cli bt get --id <btId>, y reintente con hancho-cli bt retry / bt resume. Objetivos: " + idList + reasons);
+        }
+    }
+
+    // 3. Failed jobs: aggregate every real failure into one hint so the supervisor can
+    // handle them together. Failures a behavior tree absorbed (fallback/retry succeeded, or
+    // the tree is still running) and provisional "planned" rows are not real failures.
     if (!st->lastTaskListJson.empty()) {
+        auto jobBtId = [](const std::string& jobJson) {
+            size_t pos = jobJson.find("\"bt\":{");
+            if (pos == std::string::npos) return std::string();
+            return JsonGetString(jobJson.substr(pos), "id", "");
+        };
+        struct FailedJob {
+            std::string id;
+            std::string name;
+            std::wstring reason;
+        };
+        // Use the diagnosis written by the task queue (last attempt) when it is available.
+        auto failureReason = [](const std::string& jobJson) -> std::wstring {
+            size_t pos = jobJson.rfind("\"failure\":{");
+            if (pos != std::string::npos) {
+                std::string f = jobJson.substr(pos);
+                std::string summary = JsonGetString(f, "summary", "");
+                if (!summary.empty()) return Utf8ToWide(summary);
+                std::string cls = JsonGetString(f, "class", "");
+                if (!cls.empty()) return Utf8ToWide(cls);
+            }
+            std::string check = JsonGetString(jobJson, "check_detail", "");
+            if (!check.empty()) return Utf8ToWide(check);
+            return std::wstring();
+        };
+        auto clip = [](std::wstring text, size_t maxLen) {
+            if (text.size() <= maxLen) return text;
+            text.resize(maxLen);
+            text += L"...";
+            return text;
+        };
+        std::vector<FailedJob> failed;
         auto jobs = SplitJsonObjectArray(st->lastTaskListJson, "jobs");
         for (const auto& j : jobs) {
-            std::string state = JsonGetString(j, "state", "");
-            if (state == "failed") {
-                std::string jid = JsonGetString(j, "id", "");
-                std::string jname = JsonGetString(j, "name", jid);
-                std::string sig = "failed:" + jid;
-                if (!claim(sig)) continue;
-                info.category = Tr(L"⚠️ ジョブ失敗検知", L"⚠️ Job Failure Detected", L"⚠️ Fallo de trabajo detectado");
-                info.summary = Tr(L"ジョブ '", L"Job '", L"Trabajo '") + Utf8ToWide(jname) +
-                               Tr(L"' が失敗状態で停止しています。", L"' is in failed state.", L"' está en estado fallido.");
-                std::wstring jidW = Utf8ToWide(jid);
+            if (JsonGetString(j, "state", "") != "failed") continue;
+            if (JsonGetBool(j, "virtual", false)) continue;
+            const std::string btId = jobBtId(j);
+            if (!btId.empty()) {
+                auto it = btStates.find(btId);
+                if (it != btStates.end() && it->second != "failed") continue;
+            }
+            std::string jid = JsonGetString(j, "id", "");
+            if (escalationJobIds.count(jid)) continue; // escalation failures are not hinted
+            failed.push_back({jid, JsonGetString(j, "name", jid), failureReason(j)});
+        }
+        if (!failed.empty()) {
+            std::sort(failed.begin(), failed.end(), [](const FailedJob& a, const FailedJob& b) {
+                return a.id < b.id;
+            });
+            std::string sig = "failed:";
+            for (const auto& f : failed) sig += f.id + ";";
+            if (claim(sig)) {
+                info.category = Tr(L"\u26a0\ufe0f \u30b8\u30e7\u30d6\u5931\u6557\u691c\u77e5",
+                                   L"Job Failures Detected",
+                                   L"Fallos de trabajo detectados");
+                std::wstring names;
+                for (size_t i = 0; i < failed.size() && i < 5; ++i) {
+                    if (!names.empty()) names += L", ";
+                    names += Utf8ToWide(failed[i].name);
+                    if (!failed[i].reason.empty()) {
+                        names += L" (" + clip(failed[i].reason, 80) + L")";
+                    }
+                }
+                if (failed.size() > 5) names += L" ...";
+                info.summary = std::to_wstring(failed.size()) +
+                               Tr(L" \u4ef6\u306e\u30b8\u30e7\u30d6\u304c\u5931\u6557\u3057\u3066\u3044\u307e\u3059: ",
+                                  L" jobs failed: ",
+                                  L" trabajos fallaron: ") + names;
+                std::wstring idList;
+                std::wstring reasons;
+                for (size_t i = 0; i < failed.size() && i < 10; ++i) {
+                    if (!idList.empty()) idList += L" ";
+                    idList += Utf8ToWide(failed[i].id);
+                    if (i < 5 && !failed[i].reason.empty()) {
+                        reasons += L"\n- " + Utf8ToWide(failed[i].id) + L": " +
+                                   clip(failed[i].reason, 160);
+                    }
+                }
                 info.prompt = makePrompt(
-                    L"hancho-cli taskqueue why " + jidW +
-                    L" で失敗診断を確認し、修復後に hancho-cli taskqueue retry " + jidW +
-                    L" を実行してください。",
-                    L"Inspect failure diagnostics via hancho-cli taskqueue why " + jidW +
-                    L", resolve the issue, and rerun via hancho-cli taskqueue retry " + jidW,
-                    L"Inspeccione el fallo con hancho-cli taskqueue why " + jidW +
-                    L", solucione el problema y reintente con hancho-cli taskqueue retry " + jidW);
+                    L"hancho-cli taskqueue list --state failed \u3068 hancho-cli taskqueue why <id> \u3067\u5931\u6557\u3092\u307e\u3068\u3081\u3066\u78ba\u8a8d\u3057\u3001\u4fee\u5fa9\u5f8c\u306b hancho-cli taskqueue retry --failed \u3067\u4e00\u62ec\u518d\u5b9f\u884c\u3057\u3066\u304f\u3060\u3055\u3044\u3002\u5bfe\u8c61: " + idList,
+                    L"Inspect the failures together with hancho-cli taskqueue list --state failed and hancho-cli taskqueue why <id>, then rerun them with hancho-cli taskqueue retry --failed. Jobs: " + idList,
+                    L"Revise los fallos con hancho-cli taskqueue list --state failed y hancho-cli taskqueue why <id>, y reintente con hancho-cli taskqueue retry --failed. Trabajos: " + idList +
+                    reasons);
             }
         }
     }
 
-    // 4. Check for Resource Contention
+    // 4. Resource contention: one hint for every waiting job and its holder.
     if (!st->lastTaskListJson.empty()) {
+        std::vector<std::pair<std::string, std::string>> waits; // job id, "holder: resource"
         auto jobs = SplitJsonObjectArray(st->lastTaskListJson, "jobs");
         for (const auto& j : jobs) {
             std::string resWait = JsonGetString(j, "resource_wait", "");
-            if (!resWait.empty() && resWait != "null") {
-                std::string jid = JsonGetString(j, "id", "");
-                std::string sig = "res:" + resWait + ":" + jid;
-                if (!claim(sig)) continue;
-                info.category = Tr(L"🔒 リソース排他待機", L"🔒 Resource Contention", L"🔒 Conflicto de recursos");
-                info.summary = Tr(L"ジョブ '", L"Job '", L"Trabajo '") + Utf8ToWide(jid) +
-                               Tr(L"' がリソース '", L"' is waiting for resource '", L"' espera el recurso '") +
-                               Utf8ToWide(resWait) + Tr(L"' のロック解放を待機しています。", L"'.", L"'.");
-                std::wstring resW = Utf8ToWide(resWait);
+            if (resWait.empty() || resWait == "null") continue;
+            waits.emplace_back(JsonGetString(j, "id", ""), resWait);
+        }
+        if (!waits.empty()) {
+            std::sort(waits.begin(), waits.end());
+            std::string sig = "res:";
+            for (const auto& w : waits) sig += w.first + "=" + w.second + ";";
+            if (claim(sig)) {
+                info.category = Tr(L"\U0001f512 \u30ea\u30bd\u30fc\u30b9\u6392\u4ed6\u5f85\u6a5f",
+                                   L"Resource Contention",
+                                   L"Conflicto de recursos");
+                std::wstring listed;
+                for (size_t i = 0; i < waits.size() && i < 5; ++i) {
+                    if (!listed.empty()) listed += L", ";
+                    listed += Utf8ToWide(waits[i].first) + L" (" + Utf8ToWide(waits[i].second) + L")";
+                }
+                info.summary = std::to_wstring(waits.size()) +
+                               Tr(L" \u4ef6\u306e\u30b8\u30e7\u30d6\u304c\u30ea\u30bd\u30fc\u30b9\u89e3\u653e\u3092\u5f85\u3063\u3066\u3044\u307e\u3059: ",
+                                  L" jobs are waiting for resource locks: ",
+                                  L" trabajos esperan bloqueos de recursos: ") + listed;
                 info.prompt = makePrompt(
-                    L"リソース '" + resW +
-                    L"' の排他競合が発生しています。タスクキュー定義のロック種別 (read/write) または依存順序を見直してください。",
-                    L"Resource lock contention on '" + resW +
-                    L"'. Review lock mode (read/write) or job dependencies in taskqueue definitions.",
-                    L"Conflicto de bloqueo en '" + resW +
-                    L"'. Revise modo de bloqueo (read/write) o dependencias.");
+                    L"hancho-cli taskqueue list \u3068 hancho-cli taskqueue graph \u3067\u7af6\u5408\u3092\u307e\u3068\u3081\u3066\u78ba\u8a8d\u3057\u3066\u304f\u3060\u3055\u3044\u3002\u30bf\u30b9\u30af\u30ad\u30e5\u30fc\u5b9a\u7fa9\u306e\u30ed\u30c3\u30af\u7a2e\u5225 (read/write) \u307e\u305f\u306f\u4f9d\u5b58\u9806\u5e8f\u3092\u898b\u76f4\u3057\u3001\u5f85\u6a5f\u4e2d\u306e\u30b8\u30e7\u30d6\u3092\u89e3\u6d88\u3057\u3066\u304f\u3060\u3055\u3044\u3002",
+                    L"Review the contention together with hancho-cli taskqueue list and hancho-cli taskqueue graph. Adjust lock modes (read/write) or dependencies in the taskqueue definitions so the waiting jobs can run.",
+                    L"Revise la contencion con hancho-cli taskqueue list y hancho-cli taskqueue graph. Ajuste los modos de bloqueo (read/write) o las dependencias para liberar los trabajos.");
             }
         }
     }
 
-    // A candidate was claimed above (all candidates are collected even after one is claimed);
-    // the fallbacks below only apply when none was.
+#endif
+
+    // Keep the established all-succeeded / idle toast notices; actionable failure cards come from the core.
     if (!info.signature.empty()) return info;
 
     // 5. Check if all tasks succeeded
@@ -13239,15 +15534,9 @@ static LRESULT CALLBACK HintWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM l
                 WS_CHILD | WS_VISIBLE | WS_VSCROLL | ES_MULTILINE | ES_READONLY | ES_AUTOVSCROLL,
                 12, 74, 536, 88, hwnd, nullptr, hInst, nullptr);
 
-            hs->btnCopyPrompt = CreateWindowExW(0, L"BUTTON", Tr(L"📋 プロンプトをコピー", L"📋 Copy Prompt", L"📋 Copiar Prompt"),
+            hs->btnLaunchSupervisor = CreateWindowExW(0, L"BUTTON", Tr(L"🩺 カードを開く", L"🩺 Open card", L"🩺 Abrir tarjeta"),
                 WS_CHILD | WS_VISIBLE | BS_PUSHBUTTON,
-                12, 170, 150, 28, hwnd, (HMENU)IDC_HINT_COPY, hInst, nullptr);
-            hs->btnLaunchSupervisor = CreateWindowExW(0, L"BUTTON", Tr(L"🤖 解決させる", L"🤖 Resolve", L"🤖 Resolver"),
-                WS_CHILD | WS_VISIBLE | BS_PUSHBUTTON,
-                168, 170, 190, 28, hwnd, (HMENU)IDC_HINT_LAUNCH, hInst, nullptr);
-            hs->btnHistory = CreateWindowExW(0, L"BUTTON", Tr(L"🕘 履歴", L"🕘 History", L"🕘 Historial"),
-                WS_CHILD | WS_VISIBLE | BS_PUSHBUTTON,
-                364, 170, 90, 28, hwnd, (HMENU)IDC_HINT_HISTORY, hInst, nullptr);
+                12, 170, 370, 28, hwnd, (HMENU)IDC_HINT_LAUNCH, hInst, nullptr);
             hs->btnClose = CreateWindowExW(0, L"BUTTON", L"✕",
                 WS_CHILD | WS_VISIBLE | BS_PUSHBUTTON,
                 460, 170, 88, 28, hwnd, (HMENU)IDC_HINT_CLOSE, hInst, nullptr);
@@ -13257,9 +15546,7 @@ static LRESULT CALLBACK HintWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM l
                 SendMessageW(hs->hwndCountdown, WM_SETFONT, (WPARAM)hs->dash->hFontUi, TRUE);
                 SendMessageW(hs->hwndSummary, WM_SETFONT, (WPARAM)hs->dash->hFontUi, TRUE);
                 SendMessageW(hs->hwndPromptEdit, WM_SETFONT, (WPARAM)hs->dash->hFontUi, TRUE);
-                SendMessageW(hs->btnCopyPrompt, WM_SETFONT, (WPARAM)hs->dash->hFontUi, TRUE);
                 SendMessageW(hs->btnLaunchSupervisor, WM_SETFONT, (WPARAM)hs->dash->hFontUi, TRUE);
-                SendMessageW(hs->btnHistory, WM_SETFONT, (WPARAM)hs->dash->hFontUi, TRUE);
                 SendMessageW(hs->btnClose, WM_SETFONT, (WPARAM)hs->dash->hFontUi, TRUE);
             }
             ApplyNativeThemeToWindow(hwnd);
@@ -13267,17 +15554,9 @@ static LRESULT CALLBACK HintWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM l
         }
         case WM_COMMAND: {
             int id = LOWORD(wParam);
-            if (id == IDC_HINT_COPY) {
-                if (hs && hs->dash) {
-                    CopyTextToClipboard(hwnd, hs->dash->currentHintPrompt);
-                    SetWindowTextW(hs->btnCopyPrompt, Tr(L"✓ コピー完了!", L"✓ Copied!", L"✓ ¡Copiado!"));
-                    hs->copySuccessTicks = 2;
-                }
-                return 0;
-            }
             if (id == IDC_HINT_LAUNCH) {
                 if (hs && hs->dash) {
-                    LaunchSupervisorTerminal(hs->dash, hs->dash->currentHintPrompt);
+                    ShowTriageDialog(hs->dash, L"pending", hs->dash->currentTriageCardId);
                     ShowWindow(hwnd, SW_HIDE);
                     KillTimer(hwnd, TIMER_HINT_COUNTDOWN_ID);
                 }
@@ -13285,7 +15564,7 @@ static LRESULT CALLBACK HintWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM l
             }
             if (id == IDC_HINT_HISTORY) {
                 if (hs && hs->dash) {
-                    ShowHintHistoryDialog(hs->dash);
+                    ShowTriageDialog(hs->dash);
                 }
                 return 0;
             }
@@ -13298,12 +15577,6 @@ static LRESULT CALLBACK HintWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM l
         }
         case WM_TIMER: {
             if (wParam == TIMER_HINT_COUNTDOWN_ID && hs && hs->dash) {
-                if (hs->copySuccessTicks > 0) {
-                    hs->copySuccessTicks--;
-                    if (hs->copySuccessTicks == 0) {
-                        SetWindowTextW(hs->btnCopyPrompt, Tr(L"📋 プロンプトをコピー", L"📋 Copy Prompt", L"📋 Copiar Prompt"));
-                    }
-                }
                 POINT pt = {};
                 GetCursorPos(&pt);
                 RECT rc = {};
@@ -13422,6 +15695,11 @@ static void DisplaySupervisorHint(DashboardState* st, const std::wstring& catego
 
     auto* hs = reinterpret_cast<HintWndState*>(GetWindowLongPtrW(st->hwndHintWnd, GWLP_USERDATA));
     if (hs) {
+        if (hs->btnLaunchSupervisor) {
+            SetWindowTextW(hs->btnLaunchSupervisor,
+                           Tr(L"🩺 カードを開く", L"🩺 Open card", L"🩺 Abrir tarjeta"));
+            EnableWindow(hs->btnLaunchSupervisor, TRUE);
+        }
         SetWindowTextW(hs->hwndCategory, category.c_str());
         SetWindowTextW(hs->hwndSummary, summary.c_str());
         SetWindowTextW(hs->hwndPromptEdit, prompt.c_str());
@@ -13468,57 +15746,111 @@ static void DrawCountBadge(HDC hdc, const RECT& item, int count) {
     SelectObject(hdc, of);
 }
 
-static void EvaluateSupervisorHint(DashboardState* st, bool forceShow = false) {
-    if (!st || !st->hwndMain) return;
-    if (!forceShow && !st->showSupervisorHints) return;
+static std::wstring TriageFirstCause(const nlohmann::json& card) {
+    const auto info = card.value("info", nlohmann::json::object());
+    if (info.is_object() && info.contains("cause") && info["cause"].is_array() && !info["cause"].empty()) {
+        const auto& first = info["cause"][0];
+        if (first.is_string()) return Utf8ToWide(first.get<std::string>());
+        if (first.is_object() && first.contains("text") && first["text"].is_string())
+            return Utf8ToWide(first["text"].get<std::string>());
+    }
+    return L"";
+}
 
-    std::unordered_set<std::string> activeSignatures;
-    SupervisorHintInfo info = AnalyzeStateForHint(st, !forceShow, &activeSignatures);
-    // A recurring condition that has gone away is forgotten, so it can surface again if it comes back.
-    for (auto it = st->shownHintSignatures.begin(); it != st->shownHintSignatures.end();) {
-        const std::string& s = *it;
-        const bool recurring = s.rfind("timing:", 0) == 0 || s.rfind("bt:", 0) == 0 ||
-                               s.rfind("failed:", 0) == 0 || s.rfind("res:", 0) == 0;
-        if (recurring && activeSignatures.count(s) == 0) {
-            it = st->shownHintSignatures.erase(it);
-        } else {
-            ++it;
+static std::wstring TriageToastSummary(const nlohmann::json& card) {
+    std::wstring summary = TriageTargetText(card);
+    std::wstring cause = TriageFirstCause(card);
+    if (!cause.empty()) summary += L" — " + cause;
+    return summary;
+}
+
+static void UpdateTriageFromCore(DashboardState* st) {
+    if (!st) return;
+    nlohmann::json response;
+    if (!GuiIpcCall(st, {{"action", "triage_list"}, {"state", "all"}}, response) ||
+        !response.is_object() || !response.value("ok", false)) return;
+    st->triageResponse = response;
+    const auto counts = response.value("counts", nlohmann::json::object());
+    st->pendingTriageTask = counts.value("pendingTask", 0);
+    st->pendingTriageProcess = counts.value("pendingProcess", 0);
+    st->pendingTriageOther = counts.value("pendingOther", 0);
+    st->autoTriageUnreviewed = counts.value("autoUnreviewed", 0);
+    st->triageFollowUp = counts.value("followUp", 0);
+    st->triageMode = response.value("mode", st->triageMode);
+    st->triageLlmMode = response.value("llmMode", st->triageLlmMode);
+    st->triageJobs.clear();
+    if (response.contains("jobs") && response["jobs"].is_object()) {
+        for (auto it = response["jobs"].begin(); it != response["jobs"].end(); ++it)
+            if (it.value().is_object()) st->triageJobs[it.key()] = it.value();
+    }
+    bool removedHidden = false;
+    if (response.contains("cards") && response["cards"].is_array()) {
+        std::unordered_set<std::string> existing;
+        for (const auto& card : response["cards"])
+            if (card.is_object()) existing.insert(card.value("id", std::string()));
+        for (auto it = st->hiddenTriageCards.begin(); it != st->hiddenTriageCards.end();) {
+            if (!existing.count(*it)) { it = st->hiddenTriageCards.erase(it); removedHidden = true; }
+            else ++it;
         }
     }
-    // While the hint window is up, an automatic evaluation leaves it alone; the next item appears after it is hidden.
-    if (!forceShow && st->hwndHintWnd && IsWindow(st->hwndHintWnd) && IsWindowVisible(st->hwndHintWnd)) return;
-    if (!forceShow) {
-        if (info.signature == st->lastHintSignature) return;
-        if (info.signature == "idle") return; // Don't pop up spontaneously when idle
-    }
-    st->lastHintSignature = info.signature;
-    // Bound the shown set; once full, start over so a long-running session cannot grow it forever.
-    if (st->shownHintSignatures.size() >= 256) st->shownHintSignatures.clear();
-    st->shownHintSignatures.insert(info.signature);
+    if (removedHidden) SaveTriageHiddenCards(st);
+    if (st->hwndBtnHistory) InvalidateRect(st->hwndBtnHistory, nullptr, FALSE);
+    if (st->hwndMain) InvalidateRect(st->hwndMain, &st->rcKpiArea, FALSE);
+    if (st->hwndHintHistory && IsWindow(st->hwndHintHistory) && IsWindowVisible(st->hwndHintHistory))
+        PostMessageW(st->hwndHintHistory, WM_PC_TRIAGE_REFRESH, 0, 0);
 
-    if (!info.signature.empty() &&
-        (st->hintHistory.empty() || st->hintHistory.back().signature != info.signature ||
-         st->hintHistory.back().prompt != info.prompt)) {
-        SupervisorHintRecord rec;
-        rec.timestamp = Utf8ToWide(GetCurrentTimestampStr());
-        rec.category = info.category;
-        rec.summary = info.summary;
-        rec.prompt = info.prompt;
-        rec.signature = info.signature;
-        st->hintHistory.push_back(std::move(rec));
-        const bool historyOpen = st->hwndHintHistory && IsWindow(st->hwndHintHistory) &&
-                                 IsWindowVisible(st->hwndHintHistory);
-        if (!historyOpen) {
-            ++st->unreadHintCount;
-            if (st->hwndBtnHistory) InvalidateRect(st->hwndBtnHistory, nullptr, FALSE);
+    if (!st->showSupervisorHints || !response.contains("cards") || !response["cards"].is_array()) return;
+    for (const auto& card : response["cards"]) {
+        if (!card.is_object()) continue;
+        const std::string id = card.value("id", std::string());
+        if (id.empty()) continue;
+        const bool hidden = st->hiddenTriageCards.count(id) != 0;
+        const auto decision = card.value("decision", nlohmann::json());
+        const std::string by = decision.is_object() ? decision.value("by", std::string()) : std::string();
+        const bool autoDecision = by == "hancho-auto" || by == "llm-auto";
+        if (autoDecision && !st->seenAutoTriageCards.count(id)) {
+            st->seenAutoTriageCards.insert(id);
+            if (!hidden) {
+                const std::string candidateId = decision.value("candidateId", std::string());
+                std::wstring summary = Tr(L"自動で処置しました: ", L"Automatically acted: ", L"Tratado automáticamente: ") +
+                    TriageCandidateLabel(card, candidateId);
+                DisplaySupervisorHint(st, TriageKindLabel(card), TriageToastSummary(card) + L"\r\n" + summary,
+                    TriageRecommendation(card), st->hintAutoDismissSec);
+                st->currentTriageCardId = id;
+                return;
+            }
         }
-        if (st->hintHistory.size() > kSupervisorHintHistoryMax) {
-            st->hintHistory.erase(st->hintHistory.begin(),
-                                  st->hintHistory.begin() + (st->hintHistory.size() - kSupervisorHintHistoryMax));
+        if (card.value("state", std::string()) != "pending") continue;
+        if (!st->seenTriageCards.insert(id).second) continue;
+        if (hidden) continue;
+        DisplaySupervisorHint(st, TriageKindLabel(card), TriageToastSummary(card),
+            TriageRecommendation(card), st->hintAutoDismissSec);
+        st->currentTriageCardId = id;
+        return;
+    }
+}
+
+static void EvaluateSupervisorHint(DashboardState* st, bool forceShow) {
+    if (!st || !st->hwndMain || !st->showSupervisorHints) return;
+    if (forceShow && st->triageResponse.contains("cards") && st->triageResponse["cards"].is_array()) {
+        for (const auto& card : st->triageResponse["cards"]) {
+            if (!card.is_object() || card.value("state", std::string()) != "pending") continue;
+            st->currentTriageCardId = card.value("id", std::string());
+            DisplaySupervisorHint(st, TriageKindLabel(card), TriageToastSummary(card),
+                TriageRecommendation(card), st->hintAutoDismissSec);
+            return;
         }
     }
-
-    DisplaySupervisorHint(st, info.category, info.summary, info.prompt, st->hintAutoDismissSec);
+    SupervisorHintInfo info = AnalyzeStateForHint(st, false, nullptr);
+    if (info.signature != "idle" && info.signature.rfind("all_succeeded:", 0) == 0 &&
+        (forceShow || info.signature != st->lastHintSignature)) {
+        st->lastHintSignature = info.signature;
+        st->currentTriageCardId.clear();
+        DisplaySupervisorHint(st, info.category, info.summary, info.prompt, st->hintAutoDismissSec);
+    } else if (forceShow && info.signature == "idle") {
+        st->currentTriageCardId.clear();
+        DisplaySupervisorHint(st, info.category, info.summary, info.prompt, st->hintAutoDismissSec);
+    }
 }
 
 static LRESULT CALLBACK DashboardWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
@@ -13662,6 +15994,14 @@ static LRESULT CALLBACK DashboardWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPA
                 addTool(st->hwndBtnHint);
                 addTool(st->hwndBtnHistory);
                 addTool(st->hwndBtnIpmsg);
+                addTool(st->hwndBtnStart);
+                addTool(st->hwndBtnSettings);
+                addTool(st->hwndBtnKillAll);
+                addTool(st->hwndBtnViewTasks);
+                addTool(st->hwndBtnUsage);
+                addTool(st->hwndClock);
+                addTool(st->hwndSearchProcBtn);
+                addTool(st->hwndSearchTaskBtn);
             }
 
             LoadShellConfig(st);
@@ -13708,7 +16048,7 @@ static LRESULT CALLBACK DashboardWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPA
             ListView_SetTextBkColor(st->hwndTaskList, g_theme.panel);
             ListView_SetTextColor(st->hwndTaskList, g_theme.listText);
             {
-                const int taskWidths[kTaskListColumns] = {90, 350, 100, 105, 115, 190, 110, 110, 150, 200};
+                const int taskWidths[kTaskListColumns] = {90, 350, 100, 150, 105, 115, 190, 110, 82, 150, 200};
                 for (int i = 0; i < kTaskListColumns; ++i) {
                     LVCOLUMNW lvc = {};
                     lvc.mask = LVCF_TEXT | LVCF_WIDTH | LVCF_SUBITEM;
@@ -13881,11 +16221,11 @@ static LRESULT CALLBACK DashboardWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPA
             } else if (wParam == TIMER_END_BLINK_ID && st) {
                 if (!TickEndBlink(st)) KillTimer(hwnd, TIMER_END_BLINK_ID);
             } else if (wParam == TIMER_KPI_ANIM_ID && st) {
-                if (st->activeRunningCount > 0) {
-                    g_kpiBarPhase += 0.05f;
-                    if (g_kpiBarPhase >= 1.0f) g_kpiBarPhase -= 1.0f;
-                    InvalidateRect(hwnd, &st->kpiCardRects[1], FALSE);
-                    InvalidateRect(hwnd, &st->kpiCardRects[8], FALSE);
+            if (st->activeRunningCount > 0) {
+                g_kpiBarPhase += 0.05f;
+                if (g_kpiBarPhase >= 1.0f) g_kpiBarPhase -= 1.0f;
+                InvalidateRect(hwnd, &st->kpiCardRects[1], FALSE);
+                InvalidateRect(hwnd, &st->kpiCardRects[9], FALSE);
                 }
             }
             return 0;
@@ -13921,6 +16261,22 @@ static LRESULT CALLBACK DashboardWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPA
         case WM_LBUTTONDOWN: {
             if (st) {
                 POINT pt = {GET_X_LPARAM(lParam), GET_Y_LPARAM(lParam)};
+                RECT subRc = st->kpiCardRects[15];
+                subRc.top = subRc.bottom - 22;
+                if (PtInRect(&subRc, pt)) {
+                    if (st->triageFollowUp > 0 && pt.x >= (subRc.left + subRc.right) / 2)
+                        ShowTriageDialog(st, L"follow_up");
+                    else if (st->autoTriageUnreviewed > 0)
+                        ShowTriageDialog(st, L"autoUnreviewed");
+                    else if (st->triageFollowUp > 0)
+                        ShowTriageDialog(st, L"follow_up");
+                    return 0;
+                }
+                for (int i : {7, 15}) {
+                    if (!PtInRect(&st->kpiCardRects[i], pt)) continue;
+                    ShowTriageDialog(st, i == 7 ? L"pendingProcess" : L"pendingTask");
+                    return 0;
+                }
                 if (st->rcRowsSplitter.bottom > st->rcRowsSplitter.top && PtInRect(&st->rcRowsSplitter, pt)) {
                     st->rowsSplitterDragging = true;
                     SetCapture(hwnd);
@@ -13949,7 +16305,7 @@ static LRESULT CALLBACK DashboardWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPA
                     if (PtInRect(&tb.rcBorder, pt)) {
                         st->selectedProcId = tb.procId;
                         RefreshDashboardData(st);
-                        TerminalView* tv = st->pm ? st->pm->GetTerminalView(tb.procId) : nullptr;
+                        TerminalView* tv = GetTerminalViewForProcess(st, tb.procId);
                         if (tv && tv->Hwnd()) {
                             SetFocus(tv->Hwnd());
                         }
@@ -14156,8 +16512,10 @@ static LRESULT CALLBACK DashboardWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPA
             InflateRect(&rc, -4, 0);
             DrawTextW(dis->hDC, text, -1, &rc, DT_CENTER | DT_VCENTER | DT_SINGLELINE | DT_END_ELLIPSIS);
             SelectObject(dis->hDC, oldFont);
-            if (st && dis->hwndItem == st->hwndBtnHistory && st->unreadHintCount > 0) {
-                DrawCountBadge(dis->hDC, dis->rcItem, st->unreadHintCount);
+            if (st && dis->hwndItem == st->hwndBtnHistory &&
+                st->pendingTriageTask + st->pendingTriageProcess + st->pendingTriageOther > 0) {
+                DrawCountBadge(dis->hDC, dis->rcItem,
+                    st->pendingTriageTask + st->pendingTriageProcess + st->pendingTriageOther);
             }
             if (st && dis->hwndItem == st->hwndBtnIpmsg && st->chatUnread > 0) {
                 DrawCountBadge(dis->hDC, dis->rcItem, st->chatUnread);
@@ -14278,7 +16636,7 @@ static LRESULT CALLBACK DashboardWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPA
                     EvaluateSupervisorHint(st, true);
                 }
             } else if (id == IDC_BTN_HISTORY) {
-                ShowHintHistoryDialog(st);
+                ShowTriageDialog(st);
             } else if (id == IDC_BTN_IPMSG) {
                 LaunchIpmsgDialog(false);
             } else if (id == IDC_BTN_SEARCH_PROC) {
@@ -14429,7 +16787,13 @@ static LRESULT CALLBACK DashboardWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPA
                     auto* nmia = reinterpret_cast<NMITEMACTIVATE*>(lParam);
                     int idx = nmia->iItem;
                     if (idx >= 0 && idx < static_cast<int>(st->taskJobIds.size())) {
-                        ShowTaskQueueJobDetails(st, st->taskJobIds[idx]);
+                        if (nmia->iSubItem == 3) {
+                            auto triage = st->triageJobs.find(st->taskJobIds[idx]);
+                            if (triage != st->triageJobs.end())
+                                ShowTriageDialog(st, L"all", triage->second.value("cardId", std::string()));
+                        } else {
+                            ShowTaskQueueJobDetails(st, st->taskJobIds[idx]);
+                        }
                     }
                 } else if (nmhdr->code == LVN_GETINFOTIPW) {
                     // Hover over any cell whose column cut its text: show the whole text.
@@ -14514,7 +16878,7 @@ static LRESULT CALLBACK DashboardWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPA
                             st->selectedProcId = procId;
                             st->selectedJobKey.clear();
                             RefreshDashboardData(st);
-                            TerminalView* tv = st->pm ? st->pm->GetTerminalView(procId) : nullptr;
+                            TerminalView* tv = GetTerminalViewForProcess(st, procId);
                             if (tv && tv->Hwnd()) {
                                 SetFocus(tv->Hwnd());
                             }

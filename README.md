@@ -150,6 +150,14 @@ All Hancho data is plain JSON / JSONL (task queues, behavior trees, stream event
 
 ## Release Notes
 
+### v0.9.15
+- **Triage**: every failed task-queue job, BT escalation, standalone process failure, timing divergence or resource wait now gets one persistent card. Hancho collects the information (cause, background, environment, conditions, reason), candidate actions and a deterministic recommendation; a person chooses and records a decision from the dashboard, `hancho-cli triage`, or the MCP `triage_list` / `triage_get` / `triage_decide` tools. `triage_mode` selects manual, semi (default; safe high-confidence recommendations run automatically) or auto, optional LLM advice runs as a hidden `_triage` job, and `triage handoff` gives pending cards to a batch supervisor in the hidden `_supervisor` queue. Cards resolve naturally, support follow-up and acknowledgement of automatic decisions, and each kind can be turned on or off. See `doc/triage.md`.
+- **Terminal sessions (WCSP)**: the core exposes every ConPTY job over the WinConsoleServer protocol (WCSP v1), and the standalone dashboard attaches through a local TCP listener (`terminal` in `config.json`), so closing the dashboard, switching tabs or detaching no longer stops the job. Enable `terminal.remote` to attach from WinConsoleTerminal on another PC with `attach:<id>`. Plain TCP without encryption; trusted LAN only. See `doc/features.md`.
+- **Dashboard**: a Triage KPI shows pending task/process cards and unreviewed automatic decisions, and the task list has a Triage column. The Settings dialog gains dedicated **WinConsoleServer** (local/remote connection switches) and **Triage** (mode, LLM mode and per-kind switches) tabs.
+- **Gantt**: the range buttons now pick the latest 3 / 5 / 10 jobs (default 10) instead of a time range, so the chart changes even when there are few jobs.
+- **Core startup**: callers wait up to 30 seconds for a starting core, refuse further auto-starts for 60 seconds after a failure, and launch the dashboard outside the caller's process tree, preventing duplicate cores and spawn storms.
+- **Fix**: the hidden-tasks toggle is on the Settings Behavior tab.
+
 ### v0.9.14
 - **Chat handler jobs are hidden**: messages handled by the answering LLM no longer appear in `taskqueue list` or the dashboard task list. They still run (with timeout/concurrency and usage accounting); `taskqueue get <id>` still shows one.
 - **Replies work again**: the handler prompt is passed inline instead of asking the worker to read a file, so headless permission checks no longer block the answer; raw stream output is never sent as a Chat reply.

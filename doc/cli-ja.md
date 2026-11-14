@@ -99,6 +99,26 @@ hancho-cli.exe taskqueue wait main --since 0 --timeout-ms 30000
 hancho-cli.exe taskqueue retry A
 ```
 
+**トリアージ（失敗など、対応が必要なカードの確認）:**
+
+```powershell
+hancho-cli.exe triage list
+hancho-cli.exe triage list --all
+hancho-cli.exe triage list --state open
+hancho-cli.exe triage list --state follow_up
+hancho-cli.exe triage show c1a2b3c4d
+hancho-cli.exe triage manual c1a2b3c4d
+hancho-cli.exe triage advise c1a2b3c4d
+hancho-cli.exe triage decide c1a2b3c4d retry --reason "進行が確認できた状態でタイムアウトしたため再実行します。"
+hancho-cli.exe triage decide c1a2b3c4d retry_raise_timeout --reason "進行状況に合わせて時間を延長します。" --multiplier 2
+hancho-cli.exe triage ack c1a2b3c4d
+hancho-cli.exe triage ack --all-auto
+hancho-cli.exe triage handoff c1a2b3c4d
+hancho-cli.exe triage handoff --all
+```
+
+`triage list [--all | --state <pending|acted|ignored|resolved|open|follow_up>]` はカード一覧を返します（既定は判断待ち）。先頭列はライフサイクル（`pending`、`handling`、`running`、`waiting_branch`、`waiting_next`、`follow_up`、`done`）です。`open` は完了以外、`follow_up` は処置後に再実行されていないカードを表示します。`show <id>` は情報、Hancho の推奨、LLM 助言、候補、結果・後続ジョブ・BT の状態、判断記録を表示します。`manual <id>` は手動対応中として記録し、対話に貼り付けるプロンプトを出力します。候補を実行するには `triage decide` を使います。`advise <id>` は非表示の `_triage` タスクキュージョブとして LLM に助言を依頼します。`decide <id> <candidateId> [--reason <text>] [--multiplier <n>] [--answer <text>]` はカードにある候補を選び、判断を記録します。すべての判断に理由を指定してください。特に `ignore` と `cancel` では理由が必要です。`retry_raise_timeout` には `--multiplier`、回答が必要な候補には `--answer` を指定します。`ack <id>` または `ack --all-auto` は自動処置を確認済みにします。この操作は IPC の `triage_ack` アクションを使います。`handoff <id>...` または `handoff --all` は判断待ちのカードをバッチ（非対話）の Supervisor に渡します。Hancho はそれをキュー `_supervisor` の非表示ジョブとしてタイムアウトつきで実行します（`triage_supervisor_engine`、`triage_supervisor_model`、`triage_supervisor_timeout_sec` は既定 1800 秒）。カードは「Supervisor 対応中」の印が付いた判断待ちのまま残り、Supervisor が `triage decide` で判断を記録します。各カードには Supervisor のメモ（何をしたか、判断待ちに残した理由）が付きます。Supervisor を対話モードで起動することはありません。対話は Claude デスクトップアプリで行ってください。`--json` で IPC の応答をそのまま出力できます。カードの流れや候補の意味は[トリアージ設計](triage.md)を参照してください。
+
 **サスペンド（指定タスクと他の全作業が終わったら PC をスリープ）:**
 
 ```powershell

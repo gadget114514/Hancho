@@ -1,5 +1,5 @@
 cmake_minimum_required(VERSION 3.20)
-project(Hancho VERSION 0.9.14 LANGUAGES CXX)
+project(Hancho VERSION 0.9.15 LANGUAGES CXX)
 
 set(CMAKE_CXX_STANDARD 20)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
@@ -20,6 +20,14 @@ set(PC_VERSION_DEFINITIONS
 
 if(WIN32)
 
+# WCSP (WinConsoleServer protocol) client/server sources. Copied from
+# WinConsoleServer; see src/wcsp/README.md.
+set(WCSP_SOURCES
+    src/wcsp/protocol.cpp
+    src/wcsp/frame_reader.cpp
+    src/wcsp/remote_session.cpp
+)
+
 add_executable(Hancho
     src/main.cpp
     src/common.cpp
@@ -27,6 +35,9 @@ add_executable(Hancho
     src/platform/platform_windows.cpp
     src/process_manager.cpp
     src/taskqueue.cpp
+    src/triage.cpp
+    src/triage_manager.cpp
+    src/triage_text.cpp
     src/chain_guard.cpp
     src/ipc_server.cpp
     src/ipc_server_remote.cpp
@@ -72,6 +83,8 @@ add_executable(Hancho
     src/Terminal/src/TerminalEmulator.cpp
     src/Terminal/src/TerminalView.cpp
     src/Terminal/src/TerminalGridView.cpp
+    src/term_server.cpp
+    ${WCSP_SOURCES}
 )
 
 target_compile_definitions(Hancho PRIVATE ${PC_VERSION_DEFINITIONS})
@@ -81,6 +94,7 @@ target_include_directories(Hancho PRIVATE
     include
     src/Terminal/include
     src/Terminal/src
+    src/wcsp
 )
 
 if(MSVC)
@@ -127,6 +141,7 @@ add_custom_command(TARGET Hancho POST_BUILD
 add_executable(hancho-cli
     src/cli_main.cpp
     src/cli.cpp
+    src/triage_text.cpp
     src/ipc_client.cpp
     src/remote_client.cpp
     src/remote_hosts.cpp
@@ -194,6 +209,7 @@ add_executable(taskqueue_smoke
     src/Terminal/src/TerminalBuffer.cpp
     src/Terminal/src/TerminalEmulator.cpp
     src/Terminal/src/TerminalView.cpp
+    ${WCSP_SOURCES}
 )
 
 target_include_directories(taskqueue_smoke PRIVATE
@@ -201,6 +217,7 @@ target_include_directories(taskqueue_smoke PRIVATE
     include
     src/Terminal/include
     src/Terminal/src
+    src/wcsp
 )
 
 if(MSVC)
@@ -222,6 +239,7 @@ target_link_libraries(taskqueue_smoke PRIVATE
     dwrite
     dwmapi
     windowscodecs
+    ws2_32
     "${CMAKE_CURRENT_SOURCE_DIR}/lib/libsixel.lib"
 )
 
@@ -378,6 +396,7 @@ add_executable(event_pipe_smoke
     src/Terminal/src/TerminalBuffer.cpp
     src/Terminal/src/TerminalEmulator.cpp
     src/Terminal/src/TerminalView.cpp
+    ${WCSP_SOURCES}
 )
 
 target_include_directories(event_pipe_smoke PRIVATE
@@ -385,6 +404,7 @@ target_include_directories(event_pipe_smoke PRIVATE
     include
     src/Terminal/include
     src/Terminal/src
+    src/wcsp
 )
 
 if(MSVC)
@@ -406,6 +426,7 @@ target_link_libraries(event_pipe_smoke PRIVATE
     dwrite
     dwmapi
     windowscodecs
+    ws2_32
     "${CMAKE_CURRENT_SOURCE_DIR}/lib/libsixel.lib"
 )
 
@@ -492,6 +513,33 @@ target_link_libraries(worker_engines_smoke PRIVATE
     crypt32
 )
 
+# Headless test for the pure triage card logic and LLM advice validation (src/triage.cpp).
+add_executable(triage_smoke
+    tests/triage_smoke.cpp
+    src/triage.cpp
+    src/triage_text.cpp
+    src/worker_engines.cpp
+    src/platform/platform_windows.cpp
+    src/common.cpp
+)
+
+target_include_directories(triage_smoke PRIVATE
+    src
+    include
+)
+
+if(MSVC)
+    target_compile_options(triage_smoke PRIVATE /W4 /utf-8 /EHsc)
+endif()
+
+target_link_libraries(triage_smoke PRIVATE
+    user32
+    shell32
+    advapi32
+    psapi
+    crypt32
+)
+
 # Headless test for the behavior tree core engine (src/behavior_tree*.cpp).
 add_executable(behavior_tree_smoke
     tests/behavior_tree_smoke.cpp
@@ -546,6 +594,7 @@ add_executable(bt_integration_smoke
     src/worker_engines.cpp
     src/platform/platform_windows.cpp
     src/taskqueue.cpp
+    src/triage.cpp
     src/memory_record.cpp
     src/memory_search.cpp
     src/chain_guard.cpp
@@ -563,6 +612,7 @@ add_executable(bt_integration_smoke
     src/Terminal/src/TerminalBuffer.cpp
     src/Terminal/src/TerminalEmulator.cpp
     src/Terminal/src/TerminalView.cpp
+    ${WCSP_SOURCES}
 )
 
 target_include_directories(bt_integration_smoke PRIVATE
@@ -570,6 +620,7 @@ target_include_directories(bt_integration_smoke PRIVATE
     include
     src/Terminal/include
     src/Terminal/src
+    src/wcsp
 )
 
 if(MSVC)
@@ -620,6 +671,8 @@ add_executable(bt_ipc_smoke
     src/worker_engines.cpp
     src/platform/platform_windows.cpp
     src/taskqueue.cpp
+    src/triage.cpp
+    src/triage_manager.cpp
     src/memory_record.cpp
     src/memory_search.cpp
     src/chain_guard.cpp
@@ -637,6 +690,8 @@ add_executable(bt_ipc_smoke
     src/Terminal/src/TerminalBuffer.cpp
     src/Terminal/src/TerminalEmulator.cpp
     src/Terminal/src/TerminalView.cpp
+    src/term_server.cpp
+    ${WCSP_SOURCES}
 )
 
 target_include_directories(bt_ipc_smoke PRIVATE
@@ -644,6 +699,7 @@ target_include_directories(bt_ipc_smoke PRIVATE
     include
     src/Terminal/include
     src/Terminal/src
+    src/wcsp
 )
 
 if(MSVC)
@@ -846,6 +902,34 @@ target_link_libraries(webui_smoke PRIVATE
     user32
 )
 
+# Functional test for the WCSP terminal server: attaches to a running ConPTY job
+# through the core's IPC endpoint and verifies replay, input and detach.
+add_executable(term_server_smoke
+    tests/term_server_smoke.cpp
+    src/common.cpp
+    src/ipc_client.cpp
+    ${WCSP_SOURCES}
+)
+
+target_include_directories(term_server_smoke PRIVATE
+    src
+    include
+    src/wcsp
+    tests
+)
+
+if(MSVC)
+    target_compile_options(term_server_smoke PRIVATE /W4 /utf-8 /EHsc)
+endif()
+
+target_link_libraries(term_server_smoke PRIVATE
+    ws2_32
+    crypt32
+    advapi32
+    shell32
+    user32
+)
+
 
 else()
     # POSIX headless core and CLI (doc/design-v3.md 2.4). There is no GUI here:
@@ -858,6 +942,8 @@ else()
         src/platform/platform_posix.cpp
         src/process_manager_posix.cpp
         src/taskqueue.cpp
+        src/triage.cpp
+        src/triage_manager.cpp
         src/chain_guard_posix.cpp
         src/ipc_server.cpp
         src/ipc_server_posix.cpp

@@ -5775,6 +5775,19 @@ void TaskQueueManager::OnProcessFinished(int processId, int exitCode, const std:
                             fin.lastActivitySinceSec = nowMs > snap.activitySinceEpochMs
                                 ? (nowMs - snap.activitySinceEpochMs) / 1000 : 0;
                         }
+                    } else {
+                        // Plain commands have no activity events. The gap between the last output
+                        // and the end of the attempt still tells a timeout that cut off a job still
+                        // printing apart from one that had gone quiet (triage uses it).
+                        const uint64_t endTick = snap.endTickMs > 0 ? snap.endTickMs : 0;
+                        const uint64_t lastTick = snap.lastOutputTickMs > 0 ? snap.lastOutputTickMs : snap.startTickMs;
+                        if (snap.state == ProcState::Running) {
+                            fin.lastActivity = "output";
+                            fin.lastActivitySinceSec = static_cast<int64_t>(snap.idleMs / 1000);
+                        } else if (endTick > 0 && lastTick > 0 && endTick >= lastTick) {
+                            fin.lastActivity = "output";
+                            fin.lastActivitySinceSec = static_cast<int64_t>((endTick - lastTick) / 1000);
+                        }
                     }
                     fin.eventsFile = HanchoEventsFilePathForStream(snap.streamFilePath);
                     if (!fin.eventsFile.empty()) {

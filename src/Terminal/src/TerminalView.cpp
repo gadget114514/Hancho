@@ -61,7 +61,9 @@ TerminalView::TerminalView()
     // Response callback: PTY → emulator response → PTY (front-of-queue priority
     // so DSR/CPR/DA responses reach the shell before any pending keystrokes).
     emulator_.setResponseCallback([this](const std::wstring& resp) {
-        session_.WriteFront(resp);
+        // In remote mode the core's headless emulator already answers DA/CPR/DSR;
+        // answering again would duplicate responses in the child's input stream.
+        if (!remoteIo_) session_.WriteFront(resp);
     });
     // Title callback
     emulator_.setTitleCallback([this](const std::wstring& title) {
@@ -119,6 +121,7 @@ TerminalView::TerminalView()
 
 TerminalView::~TerminalView() {
     StopCursorTimer();
+    if (remoteIo_) remoteIo_->Close();
     session_.Close();
     delete imageManager_;
     imageManager_ = nullptr;
@@ -142,12 +145,64 @@ HWND TerminalView::Create(HWND parent) {
 }
 
 // ---------------------------------------------------------------------------
+// Remote I/O backend (WCSP)
+// ---------------------------------------------------------------------------
+void TerminalView::SetRemoteIo(std::unique_ptr<ITerminalIo> io) {
+    if (remoteIo_) remoteIo_->Close();
+    remoteIo_ = std::move(io);
+}
+
+bool TerminalView::StartRemote(const std::wstring& target, std::wstring* error) {
+    if (remoteIo_ && remoteIo_->IsRunning()) return true;
+    if (!remoteIo_) {
+        if (error) *error = L"remote I/O backend is not installed";
+        return false;
+    }
+
+    TerminalStartOptions opt;
+    opt.shell = target;
+    opt.codePage = CP_UTF8;
+
+    int cols = static_cast<int>(buffer_.columns());
+    int rows = static_cast<int>(buffer_.rows());
+    if (hwnd_) {
+        RECT rc; GetClientRect(hwnd_, &rc);
+        if (rc.right - rc.left > 120 && rc.bottom - rc.top > 100) {
+            if (cellWidth_ > 0)
+                cols = std::max(80, static_cast<int>((rc.right - rc.left) / cellWidth_));
+            if (cellHeight_ > 0)
+                rows = std::max(25, static_cast<int>((rc.bottom - rc.top) / cellHeight_));
+        } else {
+            cols = 80;
+            rows = 25;
+        }
+    }
+    opt.cols = cols;
+    opt.rows = rows;
+
+    {
+        std::lock_guard<std::mutex> lock(bufferMutex_);
+        buffer_.resize(cols, rows);
+    }
+
+    remoteIo_->SetOutputSink([this](const char* data, size_t len) {
+        if (!data || len == 0) return;
+        if (onOutputObserver_) onOutputObserver_(data, len);
+        char* copy = new char[len];
+        memcpy(copy, data, len);
+        PostMessage(hwnd_, WM_TERMINAL_OUTPUT, (WPARAM)copy, (LPARAM)len);
+    });
+
+    return remoteIo_->Start(opt, error);
+}
+
+// ---------------------------------------------------------------------------
 // StartSession
 // ---------------------------------------------------------------------------
 bool TerminalView::StartSession(const std::wstring& shell,
                                 UINT codePage,
                                 const std::vector<std::pair<std::wstring,std::wstring>>& extraEnv) {
-    if (session_.IsRunning()) return true;
+    if (PtyIsRunning()) return true;
 
     // Command-line --codepage overrides settings.ini value
     if (codePage != CP_UTF8 || codePage_ == CP_UTF8)
@@ -198,11 +253,51 @@ void TerminalView::MoveAndResize(int x, int y, int w, int h) {
 // SendInput
 // ---------------------------------------------------------------------------
 void TerminalView::SendInput(const std::string& utf8) {
-    session_.Write(utf8.data(), utf8.size());
+    PtyWrite(utf8.data(), utf8.size());
 }
 
 void TerminalView::SendInput(const std::wstring& text) {
-    session_.Write(text);
+    if (!remoteIo_) {
+        session_.Write(text);
+        return;
+    }
+    if (text.empty()) return;
+    int need = WideCharToMultiByte(codePage_, 0, text.c_str(),
+                                   static_cast<int>(text.size()),
+                                   nullptr, 0, nullptr, nullptr);
+    if (need <= 0) return;
+    std::string encoded(static_cast<size_t>(need), '\0');
+    WideCharToMultiByte(codePage_, 0, text.c_str(), static_cast<int>(text.size()),
+                        encoded.data(), need, nullptr, nullptr);
+    PtyWrite(encoded.data(), encoded.size());
+}
+
+void TerminalView::PtyWrite(const void* data, size_t len) {
+    if (remoteIo_) {
+        remoteIo_->Write(data, len);
+    } else {
+        session_.Write(data, len);
+    }
+}
+
+void TerminalView::PtyWriteFront(const void* data, size_t len) {
+    if (remoteIo_) {
+        remoteIo_->WriteFront(data, len);
+    } else {
+        session_.WriteFront(data, len);
+    }
+}
+
+void TerminalView::PtyResize(int cols, int rows) {
+    if (remoteIo_) {
+        remoteIo_->Resize(cols, rows);
+    } else {
+        session_.Resize(cols, rows);
+    }
+}
+
+bool TerminalView::PtyIsRunning() const {
+    return remoteIo_ ? remoteIo_->IsRunning() : session_.IsRunning();
 }
 
 // ---------------------------------------------------------------------------
@@ -333,7 +428,7 @@ LRESULT TerminalView::WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
                             result.c_str(), (int)result.size(),
                             encoded.data(), need, nullptr, nullptr);
                         if (scrollOffset_ > 0) ScrollToBottom();
-                        session_.Write(encoded.data(), encoded.size());
+                        PtyWrite(encoded.data(), encoded.size());
                     }
                 }
             }
@@ -427,14 +522,14 @@ LRESULT TerminalView::WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
     case WM_SETFOCUS:
         // Notify PTY of focus (if focus events enabled)
         if (buffer_.focusEventReportingEnabled())
-            session_.Write("\x1b[I", 3);
+            PtyWrite("\x1b[I", 3);
         cursorBlink_ = true;   // フォーカス取得時にカーソルを即座に表示する
         StartCursorTimer();
         InvalidateRect(hwnd, nullptr, FALSE);
         return 0;
     case WM_KILLFOCUS:
         if (buffer_.focusEventReportingEnabled() && !imeActive_)
-            session_.Write("\x1b[O", 3);
+            PtyWrite("\x1b[O", 3);
         StopCursorTimer();
         cursorBlink_ = true;
         return 0;
@@ -631,8 +726,8 @@ void TerminalView::OnSize(int w, int h) {
             std::lock_guard<std::mutex> lock(bufferMutex_);
             buffer_.resize(cols, rows);
         }
-        if (session_.IsRunning())
-            session_.Resize(cols, rows);
+        if (PtyIsRunning())
+            PtyResize(cols, rows);
     }
     // Clamp scroll offset to new history size after resize
     const int maxScroll = std::max(0, buffer_.historyLineCount());
@@ -1513,7 +1608,7 @@ void TerminalView::SendMouseWheelToPty(int direction, int px, int py) {
     if (buffer_.sgrMouseEnabled()) {
         // SGR エンコード: ESC [ < btn ; col ; row M
         snprintf(seq, sizeof(seq), "\x1b[<%d;%d;%dM", button, col, row);
-        session_.Write(seq, strlen(seq));
+        PtyWrite(seq, strlen(seq));
     } else {
         // X10 エンコード: ESC [ M btn+32 col+32 row+32
         // 座標が 223 を超えると範囲外になるため上限チェック
@@ -1522,7 +1617,7 @@ void TerminalView::SendMouseWheelToPty(int direction, int px, int py) {
             seq[3] = (char)(button + 32);
             seq[4] = (char)(col    + 32);
             seq[5] = (char)(row    + 32);
-            session_.Write(seq, 6);
+            PtyWrite(seq, 6);
         }
     }
 }
@@ -1535,7 +1630,7 @@ void TerminalView::SendMouseClickToPty(int button, int px, int py, bool release)
     if (buffer_.sgrMouseEnabled()) {
         // SGR: press → ESC [ < btn ; col ; row M, release → ESC [ < btn ; col ; row m
         snprintf(seq, sizeof(seq), "\x1b[<%d;%d;%d%c", button, col, row, release ? 'm' : 'M');
-        session_.Write(seq, strlen(seq));
+        PtyWrite(seq, strlen(seq));
     } else {
         // X10: press = btn+32, release = btn+32+64
         if (col + 32 <= 255 && row + 32 <= 255) {
@@ -1544,7 +1639,7 @@ void TerminalView::SendMouseClickToPty(int button, int px, int py, bool release)
             seq[3] = (char)b;
             seq[4] = (char)(col + 32);
             seq[5] = (char)(row + 32);
-            session_.Write(seq, 6);
+            PtyWrite(seq, 6);
         }
     }
 }
@@ -1685,11 +1780,11 @@ void TerminalView::PasteFromClipboard() {
                 }
                 scrollOffset_ = 0;
                 if (buffer_.bracketedPasteEnabled()) {
-                    session_.Write("\x1b[200~", 6);
-                    session_.Write(out.data(), out.size());
-                    session_.Write("\x1b[201~", 6);
+                    PtyWrite("\x1b[200~", 6);
+                    PtyWrite(out.data(), out.size());
+                    PtyWrite("\x1b[201~", 6);
                 } else {
-                    session_.Write(out.data(), out.size());
+                    PtyWrite(out.data(), out.size());
                 }
             }
             GlobalUnlock(hData);
@@ -1784,7 +1879,7 @@ void TerminalView::OnKeyDown(WPARAM vk, LPARAM /*lParam*/) {
         }
         // Snap to bottom on keystroke if user was scrolling back
         if (scrollOffset_ > 0) ScrollToBottom();
-        session_.Write(seq.data(), seq.size());
+        PtyWrite(seq.data(), seq.size());
     }
 }
 
@@ -1810,7 +1905,7 @@ void TerminalView::OnChar(wchar_t ch) {
     if (need > 0) {
         std::string encoded(need, '\0');
         WideCharToMultiByte(codePage_, 0, ws, 1, encoded.data(), need, nullptr, nullptr);
-        session_.Write(encoded.data(), encoded.size());
+        PtyWrite(encoded.data(), encoded.size());
     }
 }
 

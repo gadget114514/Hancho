@@ -145,6 +145,26 @@ hancho-cli.exe taskqueue retry --failed
 hancho-cli.exe taskqueue retry --failed main --since 6h
 ```
 
+**Triage (reviewing failures and other attention cards):**
+
+```powershell
+hancho-cli.exe triage list
+hancho-cli.exe triage list --all
+hancho-cli.exe triage list --state open
+hancho-cli.exe triage list --state follow_up
+hancho-cli.exe triage show c1a2b3c4d
+hancho-cli.exe triage manual c1a2b3c4d
+hancho-cli.exe triage advise c1a2b3c4d
+hancho-cli.exe triage decide c1a2b3c4d retry --reason "The timeout interrupted visible progress."
+hancho-cli.exe triage decide c1a2b3c4d retry_raise_timeout --reason "Allow more time for the observed progress." --multiplier 2
+hancho-cli.exe triage ack c1a2b3c4d
+hancho-cli.exe triage ack --all-auto
+hancho-cli.exe triage handoff c1a2b3c4d
+hancho-cli.exe triage handoff --all
+```
+
+`triage list [--all | --state <pending|acted|ignored|resolved|open|follow_up>]` lists cards (pending by default); the first column is the lifecycle (`pending`, `handling`, `running`, `waiting_branch`, `waiting_next`, `follow_up`, or `done`). `open` filters out completed cards and `follow_up` shows acted cards that have not been rerun. `show <id>` prints information, Hancho's recommendation, any LLM advice, candidates, the outcome and dependent-job/BT details, and the recorded decision. `manual <id>` marks the card as being handled manually and prints an interactive prompt to paste into a conversation; record the chosen candidate with `triage decide`. `advise <id>` requests LLM advice as a hidden `_triage` task-queue job. `decide <id> <candidateId> [--reason <text>] [--multiplier <n>] [--answer <text>]` chooses a candidate from that card and records the decision; supply a reason for every decision, and especially for `ignore` or `cancel`. Use `--multiplier` for `retry_raise_timeout` and `--answer` when the selected candidate needs an answer. `ack <id>` or `ack --all-auto` confirms automatic decisions; this uses the `triage_ack` IPC action. `handoff <id>...` or `handoff --all` hands pending cards to a batch (non-interactive) supervisor that Hancho runs as a hidden job in queue `_supervisor` with a timeout (`triage_supervisor_engine`, `triage_supervisor_model`, `triage_supervisor_timeout_sec` = 1800 by default). The cards stay pending, marked as with the supervisor, until it records decisions with `triage decide`; its note on each card says what it did or why it left the card pending. The supervisor is never started interactively; hold conversations in the Claude desktop app. `--json` prints the raw IPC response. See the [Triage design](triage.md) for the card workflow and candidate meanings.
+
 **Suspend after a specific task and all other work (sleep the PC):**
 
 ```powershell
