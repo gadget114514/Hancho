@@ -24,8 +24,7 @@
 
 ## Express
 
-- [Hancho-v0.9.14-win64-setup.exe](https://github.com/gadget114514/Hancho/releases/download/v0.9.14/Hancho-v0.9.11-win64-setup.exe) をダウンロードしてインストール
-  （ポータブル版: [Hancho-v0.9.14-win64.zip](https://github.com/gadget114514/Hancho/releases/download/v0.9.11/Hancho-v0.9.11-win64.zip)、全バージョン: [Releases](https://github.com/gadget114514/Hancho/releases)）
+- [Releases](https://github.com/gadget114514/Hancho/releases) ページを開き、最新の `Hancho-vx.y.z-win64-setup.exe` をダウンロードしてインストール（ポータブル版: `Hancho-vx.y.z-win64.zip`）
 - LLM に「PATH から hancho を探して、help を読んで使い方を把握して」と伝える
 - LLM に「タスクを作成して、hancho 経由で (opencode|claude|agy|codex) に実行させて」と伝える
 - 以上

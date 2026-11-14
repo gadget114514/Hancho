@@ -22,7 +22,7 @@
 1. **事前確認**: `git fetch` して `main` が `origin/main` より遅れていないこと、タグ `vx.y.z` がまだないことを確認する。未コミットの変更はリリースに含める。ただし内容を確認し、無関係なファイルや一時ファイルは含めない（`git add -A` は使わない）。
 2. **バージョンとノート**:
    - `CMakeLists.txt` の `project(... VERSION x.y.z)` を更新する。
-   - `README.md` と `README-ja.md` の「リリースノート」の先頭に `### vx.y.z` を追加し、ダウンロードリンクのバージョンを更新する。
+   - `README.md` と `README-ja.md` の「リリースノート」の先頭に `### vx.y.z` を追加する。ダウンロードは Releases ページへのリンクだけにしているので、個別リリースへのリンクは追加しない。
    - 前回のタグ以降の変更から `dist/release-notes-vx.y.z.md` を書く（形式は `dist` にある前回のファイルに合わせ、英語と日本語の両方を入れる）。
    - これらのファイルは改行コードを保って編集する（`sed -i` は全行の改行を変えることがあるので使わない）。
 3. **ビルド**: `cmake --build build --config Release --target Hancho hancho-cli` を実行し、`build\Release\hancho-cli.exe --version` が `x.y.z` を返すことを確認する。

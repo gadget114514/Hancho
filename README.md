@@ -27,8 +27,7 @@ The dashboard has an **execution monitor pane** below the process and task lists
 
 ## Express
 
-- Download and install [Hancho-v0.9.14-win64-setup.exe](https://github.com/gadget114514/Hancho/releases/download/v0.9.14/Hancho-v0.9.11-win64-setup.exe)
-  (portable: [Hancho-v0.9.14-win64.zip](https://github.com/gadget114514/Hancho/releases/download/v0.9.11/Hancho-v0.9.11-win64.zip), all versions: [Releases](https://github.com/gadget114514/Hancho/releases))
+- Open the [Releases](https://github.com/gadget114514/Hancho/releases) page, then download and install the latest `Hancho-vx.y.z-win64-setup.exe` (portable: `Hancho-vx.y.z-win64.zip`)
 - In your llm, "find hancho in PATH, then read help to use it" 
 - In your llm, "create task and use (opencode|claude|agy|codex) to execute the task via hancho" 
 - That's all
