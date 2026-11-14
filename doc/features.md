@@ -108,6 +108,7 @@
 ## 11. Terminal sessions (WCSP)
 - The core exposes every ConPTY job over the WinConsoleServer protocol (WCSP v1). The terminal client (`Hancho.exe terminal`, or the `[>_]` toolbar button) runs in its own window, separate from the dashboard. Each tab is an independent WCSP session, so several local or remote consoles can be connected at the same time; closing a tab or the client does not stop an attached job.
 - In the client, `File` > **New local shell** opens a PowerShell / cmd / bash job on the core, **Attach to local job...** lists the running ConPTY jobs (`attach:<id>`), and **Connect to remote...** connects to another Hancho core by host, port and token. New local jobs started from the dashboard (`+ Launch`) are attached automatically. Right-click a tab for **Reconnect** or **Close**.
+- Closing a tab or the client asks whether to **terminate** or **detach**. **Terminate** sends a WCSP `CLOSE` and closes the server-side ConPTY (whether it was started by the client or attached from the dashboard). **Detach** keeps the session open so `File` > **Reconnect to session...** can list and reopen it later.
 - The listener is configured in `<data-dir>/config.json`:
 
   ```json
@@ -120,3 +121,4 @@
 - Settings → **WinConsoleServer** has **local** and **remote** switches (`terminal.local` / `terminal.remote`). Turning both off stops the listener, so neither the local dashboard nor a remote client can attach.
 - WCSP is plain TCP without encryption. Enable `remote` only on a trusted LAN and keep the token private.
 - The wire protocol (frames, TLVs, handshake, sessions and limits) is documented in [WCSP](wcsp.md).
+- **`wct` console client**: `wct.exe` connects to the same WCSP endpoint from a normal console. `wct` opens a local PowerShell, `wct <job-id>` reattaches a retained job, and `--host/--port/--token/--shell` connect to a remote core. `Ctrl+]` detaches and `Ctrl+\` terminates. The installer puts `wct.exe` next to `hancho-cli.exe` and on the user PATH.

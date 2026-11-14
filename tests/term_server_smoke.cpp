@@ -15,6 +15,8 @@
 
 #include <windows.h>
 
+#include <chrono>
+#include <condition_variable>
 #include <cstdio>
 #include <cstdlib>
 #include <mutex>
@@ -209,6 +211,77 @@ int main(int argc, char** argv) {
     Check(stillThere, "job is still listed after the client disconnects");
     Check(stillThere && process.value("state", "") == "running",
           "disconnecting an attach session does not kill the job");
+
+    // Retained sessions and the LIST_SESSIONS control session.
+    std::mutex listMutex;
+    std::condition_variable listCv;
+    bool listDone = false;
+    std::vector<wcs::SessionInfo> sessions;
+    RemoteSession control(cfg);
+    control.onSessionList = [&](const std::vector<wcs::SessionInfo>& list) {
+        std::lock_guard<std::mutex> lock(listMutex);
+        sessions = list;
+        listDone = true;
+        listCv.notify_all();
+    };
+    TerminalStartOptions controlOpt;
+    controlOpt.shell = L"list";
+    controlOpt.cols = 80;
+    controlOpt.rows = 25;
+    Check(control.Start(controlOpt, &error), "control session starts");
+    control.RequestSessionList();
+    {
+        std::unique_lock<std::mutex> lock(listMutex);
+        listDone = listCv.wait_for(lock, std::chrono::seconds(3), [&] { return listDone; });
+    }
+    Check(listDone, "SESSION_LIST is received");
+    bool listedJob = false;
+    for (const auto& info : sessions) {
+        if (info.id == static_cast<uint32_t>(jobId)) listedJob = true;
+    }
+    Check(listedJob, "SESSION_LIST contains the attached job");
+    control.Close();
+
+    // A server-spawned shell survives a disconnect, is listed, can be
+    // reattached, and CLOSE terminates it.
+    RemoteSession spawned(cfg);
+    TerminalStartOptions spawnOpt;
+    spawnOpt.shell = L"cmd";
+    spawnOpt.cols = 80;
+    spawnOpt.rows = 25;
+    Check(spawned.Start(spawnOpt, &error), "spawned cmd session starts");
+    Sleep(1000);
+    int spawnedId = 0;
+    {
+        json list;
+        if (IpcCall({{"action", "list"}}, list) && list.value("ok", false)) {
+            for (const auto& p : list["processes"]) {
+                if (p.value("name", "") == "wcsp-cmd" && p.value("state", "") == "running") {
+                    int id = p.value("id", 0);
+                    if (id > spawnedId) spawnedId = id;
+                }
+            }
+        }
+    }
+    Check(spawnedId > 0, "spawned session is listed by IPC");
+    spawned.Close();
+    Sleep(700);
+    json spawnedProcess;
+    bool stillRunning = FindProcess(spawnedId, spawnedProcess) &&
+                        spawnedProcess.value("state", "") == "running";
+    Check(stillRunning, "spawned session is retained after disconnect");
+
+    RemoteSession reattached(cfg);
+    TerminalStartOptions reattachOpt;
+    reattachOpt.shell = L"attach:" + std::to_wstring(spawnedId);
+    reattachOpt.cols = 80;
+    reattachOpt.rows = 25;
+    Check(reattached.Start(reattachOpt, &error), "retained spawned session can be reattached");
+    reattached.TerminateSession();
+    Sleep(700);
+    bool gone = !FindProcess(spawnedId, spawnedProcess) ||
+                spawnedProcess.value("state", "") != "running";
+    Check(gone, "CLOSE terminates a retained spawned session");
 
     std::printf("\n%d passed, %d failed\n", g_passes, g_failures);
     return g_failures == 0 ? 0 : 1;

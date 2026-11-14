@@ -62,6 +62,10 @@ public:
     // L"attach:42" or L"powershell".
     bool StartRemote(const std::wstring& target, std::wstring* error = nullptr);
 
+    // Sends a WCSP CLOSE frame so the server ends a spawned session. A plain
+    // close only detaches and keeps the session for reconnect.
+    void TerminateRemoteSession();
+
     bool IsStarted() const {
         return remoteIo_ ? remoteIo_->IsRunning() : session_.IsRunning();
     }

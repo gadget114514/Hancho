@@ -120,7 +120,21 @@ class TermConnection;
 class TermConnection {
 public:
     TermConnection(SOCKET socket, std::shared_ptr<TermShared> shared, uint32_t id)
-        : socket_(socket), shared_(std::move(shared)), id_(id) {}
+        : socket_(socket), shared_(std::move(shared)), id_(id) {
+        connectTime_ = std::chrono::steady_clock::now();
+        sockaddr_storage ss{};
+        int len = sizeof(ss);
+        if (getpeername(socket_, reinterpret_cast<sockaddr*>(&ss), &len) == 0) {
+            char host[NI_MAXHOST] = {};
+            char port[NI_MAXSERV] = {};
+            if (getnameinfo(reinterpret_cast<sockaddr*>(&ss), len,
+                            host, sizeof(host), port, sizeof(port),
+                            NI_NUMERICHOST | NI_NUMERICSERV) == 0) {
+                remoteAddr_ = std::string(host) + ":" + port;
+            }
+        }
+        if (remoteAddr_.empty()) remoteAddr_ = "unknown";
+    }
 
     ~TermConnection() {
         JoinWriter();
@@ -141,6 +155,16 @@ public:
         queueCv_.notify_all();
     }
 
+    TermSessionInfo GetInfo() const {
+        TermSessionInfo info;
+        info.id = id_;
+        info.remoteAddr = remoteAddr_;
+        info.target = target_;
+        auto now = std::chrono::steady_clock::now();
+        info.connectedSec = std::chrono::duration_cast<std::chrono::seconds>(now - connectTime_).count();
+        return info;
+    }
+
 private:
     bool ReadFrame(wcs::Frame& frame, int timeoutMs, std::string* error);
     bool SendFrame(const wcs::Frame& frame);
@@ -154,6 +178,7 @@ private:
     bool HandleFrame(const wcs::Frame& frame, wcs::ExitReason& exitReason);
     void OnJobOutput(const char* data, size_t len);
     void Finish(wcs::ExitReason reason, int exitCode, bool ended);
+    void RunControlSession();
 
     SOCKET socket_ = INVALID_SOCKET;
     std::shared_ptr<TermShared> shared_;
@@ -164,6 +189,7 @@ private:
     int jobId_ = 0;
     int subId_ = 0;
     bool spawned_ = false;
+    bool terminateRequested_ = false;
 
     std::mutex queueMutex_;
     std::condition_variable queueCv_;
@@ -178,6 +204,9 @@ private:
     bool writerStarted_ = false;
 
     std::atomic<bool> stopping_{false};
+    std::string remoteAddr_;
+    std::string target_ = "(connecting)";
+    std::chrono::steady_clock::time_point connectTime_;
 };
 
 void TermConnection::ShutdownSocket() {
@@ -419,6 +448,7 @@ bool TermConnection::HandleFrame(const wcs::Frame& frame, wcs::ExitReason& exitR
     }
 
     case wcs::FrameType::Close:
+        terminateRequested_ = true;
         exitReason = wcs::ExitReason::ClientClose;
         return true;
 
@@ -430,7 +460,11 @@ bool TermConnection::HandleFrame(const wcs::Frame& frame, wcs::ExitReason& exitR
 void TermConnection::Finish(wcs::ExitReason reason, int exitCode, bool ended) {
     ProcessManager& pm = *shared_->pm;
 
-    if (spawned_ && !ended && jobId_ > 0) {
+    // A dropped connection is a detach: the ConPTY stays alive so a later
+    // client can list it and reconnect. An explicit CLOSE frame terminates the
+    // underlying ConPTY job, whether it was spawned by WCSP or attached from
+    // the dashboard.
+    if (!ended && jobId_ > 0 && terminateRequested_) {
         std::string err;
         pm.KillProcess(jobId_, err);
     }
@@ -499,6 +533,26 @@ void TermConnection::Run() {
         std::clamp<int>(hello.rows, wcs::kMinRows, wcs::kMaxDimension));
 
     std::string shellName = hello.shell;
+    const std::string lowerShell = ToLower(shellName);
+    target_ = shellName.empty() ? "powershell" : shellName;
+    if (lowerShell == "list" || lowerShell == "sessions") {
+        // Control session: no PTY. The client asks for SESSION_LIST and leaves.
+        wcs::HelloAck ack;
+        ack.major = wcs::kProtocolMajor;
+        ack.minor = wcs::kProtocolMinor;
+        ack.features = hello.features & wcs::kDefaultFeatures;
+        ack.cols = cols;
+        ack.rows = rows;
+        ack.session_id = id_;
+        ack.shell = "sessions";
+        wcs::Frame ackFrame;
+        ackFrame.type = wcs::FrameType::HelloAck;
+        ackFrame.payload = wcs::EncodeHelloAck(ack);
+        if (!SendFrame(ackFrame)) return;
+        RunControlSession();
+        return;
+    }
+
     int attachId = 0;
     bool attach = ParseAttachId(shellName, attachId);
     std::string displayName;
@@ -680,7 +734,71 @@ void TermConnection::Run() {
     Finish(exitReason, exitCode, jobEnded);
 }
 
+void TermConnection::RunControlSession() {
+    DWORD timeout = kPollTimeoutMs;
+    setsockopt(socket_, SOL_SOCKET, SO_RCVTIMEO,
+               reinterpret_cast<const char*>(&timeout), sizeof(timeout));
+    DWORD sendTimeout = 5000;
+    setsockopt(socket_, SOL_SOCKET, SO_SNDTIMEO,
+               reinterpret_cast<const char*>(&sendTimeout), sizeof(sendTimeout));
+
+    while (!stopping_) {
+        char buf[16384];
+        int n = recv(socket_, buf, static_cast<int>(sizeof(buf)), 0);
+        if (n > 0) {
+            reader_.Append(reinterpret_cast<const uint8_t*>(buf), static_cast<size_t>(n));
+            for (;;) {
+                wcs::Frame frame;
+                std::string parseError;
+                wcs::ReadResult rr = reader_.Next(frame, &parseError);
+                if (rr == wcs::ReadResult::NeedMore) break;
+                if (rr == wcs::ReadResult::Error) return;
+
+                if (frame.type == wcs::FrameType::ListSessions) {
+                    std::vector<wcs::SessionInfo> sessions;
+                    for (const auto& snap : shared_->pm->GetAllSnapshots()) {
+                        if (snap.mode != ExecMode::ConPTY) continue;
+                        wcs::SessionInfo info;
+                        info.id = static_cast<uint32_t>(snap.id);
+                        info.state = static_cast<uint8_t>(snap.state);
+                        info.name = snap.name;
+                        info.command = snap.commandLine;
+                        sessions.push_back(std::move(info));
+                    }
+                    std::stable_sort(sessions.begin(), sessions.end(),
+                                     [](const wcs::SessionInfo& a, const wcs::SessionInfo& b) {
+                                         const bool ar = a.state == 0;
+                                         const bool br = b.state == 0;
+                                         if (ar != br) return ar;
+                                         return a.id < b.id;
+                                     });
+                    wcs::Frame out;
+                    out.type = wcs::FrameType::SessionList;
+                    out.payload = wcs::EncodeSessionList(sessions);
+                    if (!SendFrame(out)) return;
+                } else if (frame.type == wcs::FrameType::Ping) {
+                    wcs::Frame pong;
+                    pong.type = wcs::FrameType::Pong;
+                    pong.payload = frame.payload;
+                    if (!SendFrame(pong)) return;
+                } else if (frame.type == wcs::FrameType::Close) {
+                    return;
+                }
+            }
+        } else if (n == 0) {
+            return;
+        } else {
+            int err = WSAGetLastError();
+            if (err != WSAETIMEDOUT) return;
+        }
+    }
+}
+
 } // namespace
+
+std::string GenerateTermToken() {
+    return GenerateToken();
+}
 
 struct TermServer::Impl {
     explicit Impl(ProcessManager& processManager) : pm(processManager) {}
@@ -726,8 +844,12 @@ void TermServer::Impl::AcceptLoop() {
         }
 
         auto sharedState = shared;
-        std::thread([conn, sharedState, id]() {
+        std::thread([this, conn, sharedState, id]() {
             conn->Run();
+            {
+                std::lock_guard<std::mutex> lock(sessionsMutex);
+                sessions.erase(id);
+            }
             {
                 std::lock_guard<std::mutex> lock(sharedState->mutex);
                 sharedState->activeSessions--;
@@ -946,6 +1068,45 @@ std::string TermServer::Token() const {
     if (!impl_) return {};
     std::lock_guard<std::mutex> lock(impl_->shared->mutex);
     return impl_->shared->token;
+}
+
+void TermServer::SetToken(const std::string& token) {
+    if (!impl_) return;
+    std::lock_guard<std::mutex> lock(impl_->shared->mutex);
+    impl_->shared->token = token;
+}
+
+std::vector<TermSessionInfo> TermServer::ListSessions() const {
+    if (!impl_) return {};
+    std::lock_guard<std::mutex> lock(impl_->sessionsMutex);
+    std::vector<TermSessionInfo> result;
+    result.reserve(impl_->sessions.size());
+    for (const auto& kv : impl_->sessions) {
+        if (kv.second) {
+            result.push_back(kv.second->GetInfo());
+        }
+    }
+    std::stable_sort(result.begin(), result.end(), [](const TermSessionInfo& a, const TermSessionInfo& b) {
+        return a.id < b.id;
+    });
+    return result;
+}
+
+bool TermServer::KillSession(uint32_t id) {
+    if (!impl_) return false;
+    std::shared_ptr<TermConnection> targetConn;
+    {
+        std::lock_guard<std::mutex> lock(impl_->sessionsMutex);
+        auto it = impl_->sessions.find(id);
+        if (it != impl_->sessions.end()) {
+            targetConn = it->second;
+        }
+    }
+    if (targetConn) {
+        targetConn->RequestStop();
+        return true;
+    }
+    return false;
 }
 
 } // namespace pc

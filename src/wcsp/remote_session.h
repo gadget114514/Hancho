@@ -46,12 +46,18 @@ public:
 
     bool IsRunning() const override;
     void Close() override;
+    void TerminateSession() override;
     std::wstring LastError() const override;
+
+    // Requests the server's retained-session list. The answer arrives on
+    // onSessionList from the receiver thread.
+    void RequestSessionList();
 
     // UI notifications (called from worker threads; post to the UI thread).
     std::function<void(const wcs::ExitInfo&)> onExit;
     std::function<void(const wcs::ErrorInfo&)> onError;
     std::function<void(const wcs::ResizedInfo&)> onResized;
+    std::function<void(const std::vector<wcs::SessionInfo>&)> onSessionList;
 
 private:
     bool Connect(std::wstring* error);
@@ -79,6 +85,7 @@ private:
     std::wstring last_error_;
 
     std::mutex close_mutex_;
+    std::mutex send_mutex_;
     std::mutex queue_mutex_;
     std::condition_variable queue_cv_;
     std::deque<wcs::Frame> normal_queue_;

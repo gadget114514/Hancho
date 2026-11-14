@@ -1,5 +1,6 @@
 #include "protocol.h"
 
+#include <algorithm>
 #include <cstring>
 #include <limits>
 
@@ -416,6 +417,59 @@ std::vector<uint8_t> EncodePing(uint64_t nonce) {
 bool DecodePing(const uint8_t* data, size_t len, uint64_t& nonce) {
     size_t off = 0;
     return ReadU64(data, len, off, nonce);
+}
+
+std::vector<uint8_t> EncodeSessionList(const std::vector<SessionInfo>& sessions) {
+    std::vector<uint8_t> out;
+    // Keep the whole list comfortably below the 1 MiB frame limit.
+    const uint32_t count = static_cast<uint32_t>(
+        (std::min)(sessions.size(), static_cast<size_t>(1024)));
+    AppendU32(out, count);
+    for (uint32_t i = 0; i < count; ++i) {
+        const SessionInfo& s = sessions[i];
+        const uint16_t nameLen = static_cast<uint16_t>(
+            (std::min)(s.name.size(), static_cast<size_t>(256)));
+        const uint16_t commandLen = static_cast<uint16_t>(
+            (std::min)(s.command.size(), static_cast<size_t>(512)));
+        AppendU32(out, s.id);
+        AppendU8(out, s.state);
+        AppendU16(out, nameLen);
+        AppendStringBytes(out, s.name.substr(0, nameLen));
+        AppendU16(out, commandLen);
+        AppendStringBytes(out, s.command.substr(0, commandLen));
+    }
+    return out;
+}
+
+bool DecodeSessionList(const uint8_t* data, size_t len,
+                       std::vector<SessionInfo>& out, std::string* error) {
+    size_t off = 0;
+    uint32_t count = 0;
+    if (!ReadU32(data, len, off, count)) return Fail(error, "truncated session count");
+    if (count > 4096) return Fail(error, "too many sessions");
+    out.clear();
+    out.reserve(count);
+    for (uint32_t i = 0; i < count; ++i) {
+        SessionInfo s;
+        uint16_t nameLen = 0;
+        uint16_t commandLen = 0;
+        if (!ReadU32(data, len, off, s.id) ||
+            !ReadU8(data, len, off, s.state) ||
+            !ReadU16(data, len, off, nameLen)) {
+            return Fail(error, "truncated session entry");
+        }
+        if (off + nameLen > len) return Fail(error, "truncated session name");
+        s.name.assign(reinterpret_cast<const char*>(data + off), nameLen);
+        off += nameLen;
+        if (!ReadU16(data, len, off, commandLen)) {
+            return Fail(error, "truncated session command length");
+        }
+        if (off + commandLen > len) return Fail(error, "truncated session command");
+        s.command.assign(reinterpret_cast<const char*>(data + off), commandLen);
+        off += commandLen;
+        out.push_back(std::move(s));
+    }
+    return true;
 }
 
 } // namespace wcs

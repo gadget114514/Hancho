@@ -2,7 +2,7 @@
 
 WCSP is the binary protocol Hancho uses to expose ConPTY terminal jobs over TCP. It was imported from WinConsoleServer and is implemented by the core's terminal server (`src/term_server.cpp`) and by the client in `src/wcsp/` (`RemoteSession`).
 
-This document describes protocol version **1.0**. The reference implementation is `src/wcsp/protocol.h` / `protocol.cpp`.
+This document describes protocol version **1.1**. Version 1.1 adds the retained-session list (`LIST_SESSIONS` / `SESSION_LIST`) and persistent sessions. The reference implementation is `src/wcsp/protocol.h` / `protocol.cpp`.
 
 ## 1. Transport and endpoint
 
@@ -31,7 +31,7 @@ The core's listener is configured in `<data-dir>/config.json`:
 | `host` | `0.0.0.0` | Interface used when `remote` is true. |
 | `port` | `9139` | Port used when `remote` is true. |
 | `token` | `""` | Shared secret. When empty, the core generates 16 random bytes and writes the 32 lowercase hex characters back to the file. |
-| `history_bytes` | `32 MiB` | Raw ConPTY output kept per job and the maximum replay sent to a new subscriber. Accepted range is 64 KiB to 2 GiB. |
+| `history_bytes` | `32 MiB` | Raw ConPTY output kept per job and the maximum replay sent to a new subscriber. Accepted range is 64 KiB to 64 MiB. |
 
 When both `local` and `remote` are false, the listener is not started. A local IPC `term_endpoint` request returns `{"ok":true,"host":"127.0.0.1","port":<ephemeral>,"token":"<token>"}` while the server is running; otherwise it returns an error. The standalone terminal client (`Hancho.exe terminal`) discovers the local endpoint this way and usually attaches with a target of `attach:<jobId>`.
 
@@ -101,7 +101,7 @@ Strings are UTF-8 without a NUL terminator. `ENV` may appear more than once. Unk
 | `0x10` | `INPUT` | client → server | Implemented. Raw terminal input. |
 | `0x11` | `RESIZE` | client → server | Implemented. |
 | `0x12` | `RESIZED` | server → client | Implemented. Reports the applied (possibly clamped) size. |
-| `0x13` | `CLOSE` | client → server | Implemented. Detach/close request, no payload. |
+| `0x13` | `CLOSE` | client → server | Implemented. Terminates the session: the underlying ConPTY job is closed. No payload. |
 | `0x14` | `PING` | both | Implemented. Payload is a `uint64` nonce. |
 | `0x15` | `PONG` | both | Implemented. Echoes the nonce. |
 | `0x16` | `WINDOW_UPDATE` | both | Reserved (flow credit is not implemented). |
@@ -109,6 +109,8 @@ Strings are UTF-8 without a NUL terminator. `ENV` may appear more than once. Unk
 | `0x22` | `EXIT` | server → client | Implemented. Sent before the server closes the connection. |
 | `0x23` | `ERROR` | server → client | Implemented. Used during the handshake and on request errors. |
 | `0x24` | `TITLE` | server → client | Reserved. The window title is carried as terminal escape sequences in `OUTPUT`. |
+| `0x30` | `LIST_SESSIONS` | client → server | Implemented. Requests the retained-session list; empty payload. |
+| `0x31` | `SESSION_LIST` | server → client | Implemented. Retained sessions (section 6.1). |
 | `0x7F` | `NOOP` | both | Reserved. |
 
 ## 5. HELLO / HELLO_ACK
@@ -157,8 +159,9 @@ If the client requested a different size and the server clamped it, the client s
 | `1 << 5` | `IMAGE_PASSTHROUGH` | Advertised; images travel in `OUTPUT` as terminal escape data. |
 | `1 << 6` | `CLIPBOARD_OSC52` | Advertised; OSC 52 sequences travel in `OUTPUT`. |
 | `1 << 7` | `EXIT_CODE` | Implemented in `EXIT`. |
+| `1 << 8` | `SESSION_LIST` | Implemented. `LIST_SESSIONS` / `SESSION_LIST`. |
 
-Hancho's default client feature mask is `0xE3` (resize, priority input, image passthrough, clipboard OSC 52 and exit code). A server never turns on a bit the client did not request.
+Hancho's default client feature mask is `0x1E3` (resize, priority input, image passthrough, clipboard OSC 52, exit code and session list). A server never turns on a bit the client did not request.
 
 ### Handshake sequence
 
@@ -178,19 +181,50 @@ client                                   server
   |<------------ EXIT --------------------|
 ```
 
+Control session (used to reconnect after a detach):
+
+```text
+client                                   server
+  |------------- HELLO (SHELL=list) ----->|
+  |<------------ HELLO_ACK ---------------|
+  |------------- LIST_SESSIONS ---------->|
+  |<------------ SESSION_LIST ------------|
+  |------------- CLOSE ------------------>|
+```
+
 Handshake validation failures send `ERROR` and close the connection; transport failures just close it. The server validates in this order: frame type, TLV decode, major version, token presence, token equality, size clamping, shell/target.
 
 ## 6. Sessions, shells and attachment
 
-- Without `attach:`, `SHELL` must be `cmd`, `powershell`, or `bash` (case-insensitive). Anything else returns `ShellNotAllowed`.
+- Without `attach:`, `SHELL` must be `cmd`, `powershell`, `bash`, or the control target `list` / `sessions` (case-insensitive). Anything else returns `ShellNotAllowed`.
+- `list` / `sessions` is a control session: it creates no PTY and sends no terminal output. The client can send `LIST_SESSIONS` and receives one `SESSION_LIST`, then closes the connection.
 - `cmd` starts `cmd.exe`, `powershell` starts `powershell.exe`, and `bash` uses Git Bash when installed, otherwise `bash.exe`. The working directory is the user profile and stdin is open.
 - `attach:<id>` attaches to an existing Hancho process **only if** it is a headless ConPTY job. Non-ConPTY jobs, jobs with no headless PTY, and unknown ids return `ShellNotAllowed`.
 - The server resizes the target job to the requested `SIZE` before taking the replay.
 - A new subscriber first receives the tail of the raw output (`history_bytes`) as `OUTPUT`, then live output. The replay is raw bytes and may begin in the middle of an escape sequence; feed it to the terminal parser as-is.
 - Several clients may attach to the same job. Each has its own `SESSION_ID` and receives its own replay.
-- An **attached** job keeps running when the client detaches, closes the connection or sends `CLOSE`.
-- A **shell started by this session** is killed when the session ends without the job already having exited.
+- An **attached** job keeps running when the client detaches or closes the connection without `CLOSE`.
+- A **shell started by this session** is now retained too. A lost connection, a client crash or a plain socket close only detaches; the shell keeps running and appears in the session list. Send `CLOSE` to terminate it explicitly.
+- Any retained ConPTY job can be reattached with `attach:<id>`. The client lists the retained sessions with `LIST_SESSIONS` and lets the user choose one or more.
 - If the attached job has already exited, the server still sends `HELLO_ACK`, the replay, and then `EXIT`.
+
+### 6.1 SESSION_LIST encoding
+
+`SESSION_LIST` is one frame with a little-endian binary payload:
+
+```text
+uint32 session_count
+repeat session_count times:
+    uint32 id
+    uint8  state          (Hancho ProcState: 0=running, 1=completed,
+                          2=failed, 3=timed out, 4=idle-timed out, 5=killed)
+    uint16 name_len
+    uint8  name[name_len]       (UTF-8)
+    uint16 command_len
+    uint8  command[command_len] (UTF-8)
+```
+
+The server sends at most 1024 entries, truncating names to 256 bytes and commands to 512 bytes so the frame stays below the 1 MiB limit. Unknown extra bytes after the last entry are ignored. `LIST_SESSIONS` itself has an empty payload.
 
 ## 7. Input, output and resize
 
@@ -220,7 +254,9 @@ RESIZED payload: uint16 cols, uint16 rows, uint16 reason
 
 ### CLOSE (`0x13`)
 
-Empty payload. The client asks to end the session. The server then removes the subscription and sends `EXIT` with reason `CLIENT_CLOSE`; an attached job keeps running.
+Empty payload. The client explicitly **terminates** the session. The server removes the subscription, closes the underlying ConPTY job (whether it was started by WCSP or attached with `attach:<id>`), sends `EXIT` with reason `CLIENT_CLOSE`, and the job disappears from the running-session list.
+
+A plain TCP disconnect (no `CLOSE`) is a **detach**: the server keeps the ConPTY session alive for a later reconnect. This is why closing the terminal client window can leave sessions running; the client asks whether to terminate or detach, and "Detach" simply closes the socket.
 
 ### EXIT (`0x22`)
 
@@ -267,7 +303,7 @@ Hancho's server:
 
 - Reads a client frame every 200 ms (also to notice a finished job).
 - Sets `SO_RCVTIMEO` on the client socket and a 5-second `SO_SNDTIMEO`.
-- Keeps at most **8 MiB** of queued `OUTPUT` per connection. If a client cannot keep up and the queue exceeds this, the session is disconnected to avoid blocking the ConPTY reader thread. No `EXIT` frame is guaranteed in this case.
+- Keeps at most **8 MiB** of queued `OUTPUT` per connection. A large replay temporarily raises that limit by the replay size so the replay is not mistaken for a slow client; the normal 8 MiB limit returns once the queue drains. If a client still cannot keep up, the session is disconnected (detached, not killed) to avoid blocking the ConPTY reader thread. No `EXIT` frame is guaranteed in this case.
 - Sends `PONG` at the front of the queue.
 - Does not send periodic `PING`; it only replies.
 - Replays at most `history_bytes` per new attachment (section 6).
@@ -295,18 +331,20 @@ Hancho's client:
 | Wire protocol, frame/TLV codecs | `src/wcsp/protocol.h`, `src/wcsp/protocol.cpp` |
 | Incremental frame reader | `src/wcsp/frame_reader.h`, `src/wcsp/frame_reader.cpp` |
 | Client backend (`ITerminalIo`) | `src/wcsp/remote_session.h`, `src/wcsp/remote_session.cpp` |
+| Console client (`wct.exe`) | `src/wct_main.cpp`, `src/wct_client.cpp` |
 | Server and job attachment | `src/term_server.h`, `src/term_server.cpp` |
 
-The server implementation is Windows-only. It does not spawn a command shell for `attach:<id>`; it subscribes to the existing headless ConPTY job. The standalone terminal client (`Hancho.exe terminal`, `src/term_client.cpp`) uses `RemoteSession`. The dashboard's embedded terminal tabs use the local ConPTY backend when the dashboard owns the core; a separate terminal client process attaches over WCSP.
+The server implementation is Windows-only. It does not spawn a command shell for `attach:<id>`; it subscribes to the existing headless ConPTY job. The standalone terminal client (`Hancho.exe terminal`, `src/term_client.cpp`) uses `RemoteSession`; the dashboard opens that client window instead of embedding terminal tabs. `wct.exe` is a console client for the same protocol: it runs in the current console, forwards raw input/output, and uses `Ctrl+]` to detach and `Ctrl+\` to send `CLOSE`.
 
-The current server sends an attachment replay as a **single `OUTPUT` frame**. Because the protocol limit is 1 MiB and `history_bytes` defaults to 32 MiB, a job with a large replay can exceed the limit; strict readers, including Hancho's own client, will reject that frame. Keep `terminal.history_bytes` at or below 1 MiB until the server splits replays across frames.
+The server splits an attachment replay into `OUTPUT` frames of at most **256 KiB**, so `history_bytes` (default 32 MiB) can be replayed without exceeding the 1 MiB frame limit. The server retains sessions after a disconnect; only a `CLOSE` frame ends them. The terminal client asks **Terminate / Detach / Cancel** when closing a tab or the window.
 
 ## 12. Minimal client checklist
 
 1. Connect over TCP and send `HELLO` with `MAGIC`, `VERSION` `1.0`, `SIZE`, `SHELL`, and `TOKEN`.
-2. Wait for `HELLO_ACK`; on `ERROR`, surface `code` and `message` and close.
+2. Wait for `HELLO_ACK`; on `ERROR`, surface `code` and `message` and close. Use `VERSION` `1.1` and `FEATURES` bit 8 to advertise session-list support.
 3. Parse frames incrementally and enforce the 1 MiB payload limit.
 4. Feed `OUTPUT` bytes to a VT parser without assuming UTF-8 boundaries or line boundaries.
 5. Send `INPUT` for keystrokes, `RESIZE` when the viewport changes, and `PING` periodically.
 6. Handle `RESIZED`, `PONG`, `EXIT`, and `ERROR`; ignore unknown frame types.
-7. Send `CLOSE` (or close the socket) when detaching. Attached jobs keep running; shells this session started are killed.
+7. To reconnect, open a control session (`SHELL=list`), send `LIST_SESSIONS`, read `SESSION_LIST`, and attach a chosen id with `attach:<id>`.
+8. Close the socket to detach and keep the session. Send `CLOSE` only to terminate it (the underlying ConPTY job is closed).

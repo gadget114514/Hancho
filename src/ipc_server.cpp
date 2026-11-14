@@ -551,6 +551,44 @@ std::string IpcServer::HandleRequestJson(const std::string& reqJson) {
         out["token"] = termServer_->Token();
         return out.dump();
     }
+    else if (action == "term_sessions") {
+        if (!termServer_ || !termServer_->IsRunning()) {
+            return "{\"ok\":true,\"sessions\":[]}";
+        }
+        auto sessions = termServer_->ListSessions();
+        nlohmann::json arr = nlohmann::json::array();
+        for (const auto& s : sessions) {
+            nlohmann::json item;
+            item["id"] = s.id;
+            item["remote"] = s.remoteAddr;
+            item["target"] = s.target;
+            item["connected_sec"] = s.connectedSec;
+            arr.push_back(std::move(item));
+        }
+        nlohmann::json out;
+        out["ok"] = true;
+        out["sessions"] = arr;
+        return out.dump();
+    }
+    else if (action == "term_kill_session") {
+        if (!termServer_) {
+            return "{\"ok\":false,\"error\":\"terminal server is not running\"}";
+        }
+        uint32_t sid = static_cast<uint32_t>(JsonGetInt(reqJson, "id", 0));
+        bool killed = termServer_->KillSession(sid);
+        nlohmann::json out;
+        out["ok"] = killed;
+        if (!killed) out["error"] = "session not found";
+        return out.dump();
+    }
+    else if (action == "term_set_token") {
+        if (!termServer_) {
+            return "{\"ok\":false,\"error\":\"terminal server is not running\"}";
+        }
+        std::string token = JsonGetString(reqJson, "token", "");
+        termServer_->SetToken(token);
+        return "{\"ok\":true}";
+    }
     else if (action == "triage_list") {
         return triageManager_ ? triageManager_->List(JsonGetString(reqJson, "state", "pending"))
                               : "{\"ok\":false,\"error\":\"triage manager is unavailable\"}";

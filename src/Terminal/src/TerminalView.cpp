@@ -153,6 +153,10 @@ void TerminalView::SetRemoteIo(std::unique_ptr<ITerminalIo> io) {
     remoteIo_ = std::move(io);
 }
 
+void TerminalView::TerminateRemoteSession() {
+    if (remoteIo_) remoteIo_->TerminateSession();
+}
+
 bool TerminalView::StartRemote(const std::wstring& target, std::wstring* error) {
     if (remoteIo_ && remoteIo_->IsRunning()) return true;
     if (!remoteIo_) {
@@ -349,6 +353,14 @@ LRESULT TerminalView::WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
     }
     case WM_ERASEBKGND:   return 1; // handled in OnPaint
     case WM_KEYDOWN:      OnKeyDown(wp, lp); return 0;
+    case WM_SYSKEYDOWN:
+        if (wp == VK_F4 || wp == VK_SPACE) {
+            return DefWindowProcW(hwnd, msg, wp, lp);
+        }
+        OnKeyDown(wp, lp);
+        return 0;
+    case WM_SYSKEYUP:     return 0;
+    case WM_SYSCHAR:      return 0;
     case WM_CHAR:         OnChar((wchar_t)wp); return 0;
 
     // ---- IME インライン入力 ----
@@ -1970,8 +1982,8 @@ std::string TerminalView::EncodeKey(WPARAM vk, bool ctrl, bool shift, bool alt) 
     // Alt prefix for control chars (Backspace / Enter / Escape)
     std::string altPfx = alt ? "\x1b" : "";
 
-    // Kitty keyboard: Ctrl+letter as CSI codepoint;mod u
-    if (vk >= 'A' && vk <= 'Z' && ctrl && buffer_.kittyKeyboardEnabled()) {
+    // Kitty keyboard: Ctrl/Alt+letter as CSI codepoint;mod u
+    if (vk >= 'A' && vk <= 'Z' && (ctrl || alt) && buffer_.kittyKeyboardEnabled()) {
         int codepoint = shift ? (int)vk : (int)(vk - 'A' + 'a');
         return "\x1b[" + std::to_string(codepoint) + modStr + "u";
     }
@@ -1988,6 +2000,32 @@ std::string TerminalView::EncodeKey(WPARAM vk, bool ctrl, bool shift, bool alt) 
         case VK_OEM_5:  return "\x1c"; // Ctrl+\ = FS
         case VK_OEM_6:  return "\x1d"; // Ctrl+] = GS
         case VK_OEM_3:  return "\x1e"; // Ctrl+` = RS (approx)
+        }
+    }
+
+    // Alt + letter / character (xterm standard: ESC + char)
+    if (alt) {
+        if (!ctrl) {
+            if (vk >= 'A' && vk <= 'Z') {
+                char c = shift ? static_cast<char>(vk) : static_cast<char>(vk - 'A' + 'a');
+                return std::string("\x1b") + c;
+            }
+            if (vk >= '0' && vk <= '9' && !shift) {
+                return std::string("\x1b") + static_cast<char>(vk);
+            }
+            // For other printable characters (punctuation, etc.)
+            BYTE kstate[256] = {};
+            if (shift) kstate[VK_SHIFT] = 0x80;
+            WCHAR wc[4] = {};
+            if (ToUnicode(static_cast<UINT>(vk), 0, kstate, wc, 4, 0) > 0 && wc[0] >= 0x20 && wc[0] < 0x7f) {
+                return std::string("\x1b") + static_cast<char>(wc[0]);
+            }
+        } else {
+            // Ctrl + Alt + letter: ESC + control-code
+            if (vk >= 'A' && vk <= 'Z') {
+                char c = static_cast<char>(vk - 'A' + 1);
+                return std::string("\x1b") + c;
+            }
         }
     }
 

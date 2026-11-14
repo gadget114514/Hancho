@@ -93,6 +93,14 @@ The skill starts with `hancho-cli.exe help --json`, so the commands it shows alw
 
 ## Release Notes
 
+### v0.9.17
+- **wct console client**: `wct.exe` connects to the WCSP terminal server from a normal console. `wct` starts a local PowerShell session, `wct <job-id>` attaches to a retained job, and `--host/--port/--token/--shell` connect to a remote core. `Ctrl+]` detaches (the ConPTY keeps running) and `Ctrl+\` terminates it. The installer adds `wct.exe` next to `hancho-cli.exe` and the PATH task now covers both.
+- **Retained sessions**: disconnecting no longer kills the ConPTY. Closing a tab or the window asks **Terminate / Detach / Cancel**: Terminate closes the server-side ConPTY; Detach keeps it for a later connection.
+- **Reconnect list**: the terminal client lists retained sessions on startup (and from `File > Reconnect to session...`) and reattaches the selected jobs. WCSP 1.1 adds the `LIST_SESSIONS` / `SESSION_LIST` control session (documented in `doc/wcsp.md`).
+- **Terminal client menu-only UI**: the New / Attach / Remote / Close toolbar buttons were removed; all commands are in the File menu, the tab right-click menu, and the Ctrl+T / Ctrl+W shortcuts.
+- **Theme**: the tab strip background and empty area now follow the dashboard theme instead of the system colour.
+- **Settings**: the WinConsoleServer tab shows WCSP connections and can refresh the token or disconnect a session.
+
 ### v0.9.16
 - **Tabbed terminal client window**: the WCSP client moved out of the dashboard into its own window (`Hancho.exe terminal`). Each tab is an independent session, so several local or remote consoles can be connected at once; `+ Launch` and `[>_]` open the client.
 - **Terminal client controls**: follows the dashboard theme, Copy/Paste in the Edit and right-click menus, always-on-top, window-position memory, and a byte-based scrollback budget (64-2048 MB per tab, default 1024 MB). `terminal.history_bytes` (default 32 MiB) controls the server-side replay budget; replays are split into frames, so a 6 MB (~100k-line) history attaches correctly.

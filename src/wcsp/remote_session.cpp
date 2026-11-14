@@ -262,6 +262,24 @@ void RemoteSession::Resize(int cols, int rows) {
 
 bool RemoteSession::IsRunning() const { return running_; }
 
+void RemoteSession::RequestSessionList() {
+    if (!running_) return;
+    wcs::Frame frame;
+    frame.type = wcs::FrameType::ListSessions;
+    EnqueueFrame(std::move(frame), true);
+}
+
+void RemoteSession::TerminateSession() {
+    if (!running_) {
+        Close();
+        return;
+    }
+    wcs::Frame frame;
+    frame.type = wcs::FrameType::Close;
+    SendFrame(frame);
+    Close();
+}
+
 void RemoteSession::Close() {
     std::lock_guard<std::mutex> closeLock(close_mutex_);
     stopping_ = true;
@@ -348,6 +366,17 @@ void RemoteSession::ReceiverLoop() {
             stopping_ = true;
             break;
         }
+        case wcs::FrameType::SessionList: {
+            std::vector<wcs::SessionInfo> sessions;
+            std::string decodeError;
+            if (wcs::DecodeSessionList(frame.payload.data(), frame.payload.size(),
+                                       sessions, &decodeError)) {
+                if (onSessionList) onSessionList(sessions);
+            } else {
+                SetError(L"bad SESSION_LIST: " + Utf8ToWide(decodeError));
+            }
+            break;
+        }
         case wcs::FrameType::Pong:
             break;
         default:
@@ -422,6 +451,7 @@ bool RemoteSession::SendAll(const uint8_t* data, size_t len) {
 
 bool RemoteSession::SendFrame(const wcs::Frame& frame) {
     std::vector<uint8_t> bytes = wcs::EncodeFrame(frame);
+    std::lock_guard<std::mutex> lock(send_mutex_);
     return SendAll(bytes.data(), bytes.size());
 }
 

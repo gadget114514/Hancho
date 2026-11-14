@@ -1,5 +1,5 @@
 cmake_minimum_required(VERSION 3.20)
-project(Hancho VERSION 0.9.16 LANGUAGES CXX)
+project(Hancho VERSION 0.9.17 LANGUAGES CXX)
 
 set(CMAKE_CXX_STANDARD 20)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
@@ -88,6 +88,12 @@ add_executable(Hancho
     ${WCSP_SOURCES}
 )
 
+# Build the dashboard as a GUI-subsystem binary so Windows never creates a
+# console window for it (shortcut, Run key, WMI auto-start or an MCP client all
+# used to flash one). Console output still works when a parent console or a
+# redirected pipe is inherited; see AttachParentConsoleForCli() in main.cpp.
+set_target_properties(Hancho PROPERTIES WIN32_EXECUTABLE TRUE)
+
 target_compile_definitions(Hancho PRIVATE ${PC_VERSION_DEFINITIONS})
 
 target_include_directories(Hancho PRIVATE
@@ -100,7 +106,8 @@ target_include_directories(Hancho PRIVATE
 
 if(MSVC)
     target_compile_options(Hancho PRIVATE /W4 /utf-8 /EHsc)
-    target_link_options(Hancho PRIVATE
+    # The GUI subsystem expects WinMain by default; this program uses main().
+    target_link_options(Hancho PRIVATE /ENTRY:mainCRTStartup
         "/MANIFESTDEPENDENCY:type='win32' name='Microsoft.Windows.Common-Controls' version='6.0.0.0' processorArchitecture='*' publicKeyToken='6595b64144ccf1df' language='*'")
 endif()
 
@@ -187,6 +194,50 @@ target_link_libraries(hancho-cli PRIVATE
     ws2_32
     powrprof
 )
+
+# wct: standalone WCSP terminal client for the console. It relays the remote
+# ConPTY to the current terminal unchanged (raw passthrough).
+add_executable(wct
+    src/wct_main.cpp
+    src/wct_client.cpp
+    src/common.cpp
+    src/ipc_client.cpp
+    ${WCSP_SOURCES}
+)
+
+target_compile_definitions(wct PRIVATE ${PC_VERSION_DEFINITIONS})
+
+target_include_directories(wct PRIVATE
+    src
+    include
+    src/wcsp
+)
+
+if(MSVC)
+    target_compile_options(wct PRIVATE /W4 /utf-8 /EHsc)
+endif()
+
+target_link_libraries(wct PRIVATE
+    user32
+    shell32
+    advapi32
+    crypt32
+    ws2_32
+    powrprof
+)
+
+# End-to-end smoke test for wct: runs wct inside a local ConPTY against an
+# isolated Hancho core and checks the WCSP echo round-trip.
+add_executable(wct_smoke
+    tests/wct_smoke.cpp
+)
+
+if(MSVC)
+    target_compile_options(wct_smoke PRIVATE /W4 /utf-8 /EHsc)
+endif()
+
+target_link_libraries(wct_smoke PRIVATE user32)
+add_dependencies(wct_smoke wct)
 
 # Headless smoke test for the task queue engine (deps, retries, chain guard, persistence).
 add_executable(taskqueue_smoke

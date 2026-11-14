@@ -39,5 +39,8 @@ public:
 
     virtual bool IsRunning() const = 0;
     virtual void Close() = 0;
+    // Ask the server to end the session explicitly (WCSP CLOSE frame).
+    // Close() alone only detaches; the server keeps the session for reconnect.
+    virtual void TerminateSession() {}
     virtual std::wstring LastError() const = 0;
 };

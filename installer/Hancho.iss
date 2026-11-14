@@ -3,7 +3,7 @@
 ; Prerequisites:
 ;   1. Build the Release binaries and assemble the payload into
 ;      dist\Hancho-v<version>-win64\ :
-;        Hancho.exe, hancho-cli.exe, conpty.dll, OpenConsole.exe,
+;        Hancho.exe, hancho-cli.exe, wct.exe, conpty.dll, OpenConsole.exe,
 ;        LICENSE, README.md, README-ja.md, doc\* (topic documents and doc\images)
 ;      tools\ (the ww task-card runner template) and skills\* (agent skills such as
 ;      skills\hancho) are taken from the repository directly.
@@ -64,12 +64,13 @@ Name: "japanese"; MessagesFile: "compiler:Languages\Japanese.isl"
 
 [Tasks]
 Name: "desktopicon"; Description: "{cm:CreateDesktopIcon}"; GroupDescription: "{cm:AdditionalIcons}"; Flags: unchecked
-Name: "addtopath"; Description: "Add hancho-cli.exe to the user PATH (recommended for CLI / LLM agents)"; GroupDescription: "Integration:"; Flags: checkedonce
+Name: "addtopath"; Description: "Add hancho-cli.exe and wct.exe to the user PATH (recommended for CLI / LLM agents)"; GroupDescription: "Integration:"; Flags: checkedonce
 Name: "autostartgui"; Description: "Start the Hancho dashboard at sign-in (tray)"; GroupDescription: "Integration:"; Flags: unchecked
 
 [Files]
 Source: "{#PayloadDir}\Hancho.exe"; DestDir: "{app}"; Flags: ignoreversion
 Source: "{#PayloadDir}\hancho-cli.exe"; DestDir: "{app}"; Flags: ignoreversion
+Source: "{#PayloadDir}\wct.exe"; DestDir: "{app}"; Flags: ignoreversion
 Source: "{#PayloadDir}\conpty.dll"; DestDir: "{app}"; Flags: ignoreversion
 Source: "{#PayloadDir}\OpenConsole.exe"; DestDir: "{app}"; Flags: ignoreversion
 Source: "{#PayloadDir}\LICENSE"; DestDir: "{app}"; Flags: ignoreversion

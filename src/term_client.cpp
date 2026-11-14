@@ -21,6 +21,7 @@
 #include "nlohmann/json.hpp"
 
 #include <algorithm>
+#include <chrono>
 #include <cstdio>
 #include <cstdint>
 #include <cwchar>
@@ -37,6 +38,7 @@ namespace {
 
 constexpr wchar_t kConnectDlgClass[] = L"HanchoTermConnectDlg";
 constexpr wchar_t kAttachDlgClass[] = L"HanchoTermAttachDlg";
+constexpr wchar_t kSessionsDlgClass[] = L"HanchoTermSessionsDlg";
 
 // One client window per data directory, so two Hancho instances with different
 // --data-dir values do not focus each other's terminal client.
@@ -59,10 +61,6 @@ constexpr UINT WM_CLIENT_SESSION_EXIT = WM_APP + 21;
 constexpr UINT WM_CLIENT_SESSION_ERROR = WM_APP + 22;
 
 constexpr int IDC_CLIENT_TAB = 5001;
-constexpr int IDC_CLIENT_BTN_NEW = 5002;
-constexpr int IDC_CLIENT_BTN_ATTACH = 5003;
-constexpr int IDC_CLIENT_BTN_CONNECT = 5004;
-constexpr int IDC_CLIENT_BTN_CLOSE = 5005;
 constexpr int IDC_CLIENT_STATUS = 5006;
 
 constexpr int IDM_NEW_PWSH = 5101;
@@ -85,6 +83,8 @@ constexpr int IDM_SCROLLBACK_256 = 5122;
 constexpr int IDM_SCROLLBACK_512 = 5123;
 constexpr int IDM_SCROLLBACK_1024 = 5124;
 constexpr int IDM_SCROLLBACK_2048 = 5125;
+constexpr int IDM_RECONNECT_SESSION = 5117;
+constexpr int IDM_TERMINATE_SESSION = 5118;
 
 constexpr int kStatusHeight = 26;
 
@@ -181,10 +181,6 @@ struct ClientState {
     HWND hwndMain = nullptr;
     HWND hwndTab = nullptr;
     HWND hwndStatus = nullptr;
-    HWND btnNew = nullptr;
-    HWND btnAttach = nullptr;
-    HWND btnConnect = nullptr;
-    HWND btnClose = nullptr;
     HMENU hMenuFile = nullptr;
     HMENU hMenuEdit = nullptr;
     HMENU hMenuSettings = nullptr;
@@ -204,9 +200,12 @@ struct ClientState {
     uint64_t localRetryAt = 0;
 
     bool autoAttach = true;
+    bool discoveryInitialized = false;
+    bool suppressAutoAttach = false;
     unsigned autoAttachTicks = 0;
     unsigned themeTicks = 0;
     std::set<int> autoFailedJobs;
+    std::set<int> startupIgnoredJobs;
 
     bool topmost = false;
     bool rememberWindow = true;
@@ -312,6 +311,18 @@ void ApplyClientTheme(ClientState* st, bool force) {
     if (!force && g_themeApplied && palette == g_palette) return;
     g_palette = palette;
     g_themeApplied = true;
+    {
+        char themeLog[96] = {};
+        std::snprintf(themeLog, sizeof(themeLog), "windowBg=%u,%u,%u panel=%u,%u,%u dark=%d",
+                      static_cast<unsigned>(GetRValue(palette.windowBg)),
+                      static_cast<unsigned>(GetGValue(palette.windowBg)),
+                      static_cast<unsigned>(GetBValue(palette.windowBg)),
+                      static_cast<unsigned>(GetRValue(palette.panel)),
+                      static_cast<unsigned>(GetGValue(palette.panel)),
+                      static_cast<unsigned>(GetBValue(palette.panel)),
+                      palette.dark ? 1 : 0);
+        WriteAuditLog("TERM_CLIENT_THEME", themeLog);
+    }
     if (g_bgBrush) DeleteObject(g_bgBrush);
     if (g_panelBrush) DeleteObject(g_panelBrush);
     g_bgBrush = CreateSolidBrush(palette.windowBg);
@@ -323,9 +334,6 @@ void ApplyClientTheme(ClientState* st, bool force) {
     InvalidateRect(st->hwndMain, nullptr, TRUE);
     if (st->hwndTab) InvalidateRect(st->hwndTab, nullptr, TRUE);
     if (st->hwndStatus) InvalidateRect(st->hwndStatus, nullptr, TRUE);
-    for (HWND button : {st->btnNew, st->btnAttach, st->btnConnect, st->btnClose}) {
-        if (button) InvalidateRect(button, nullptr, TRUE);
-    }
 }
 
 // ---------------------------------------------------------------------------
@@ -431,10 +439,9 @@ HWND AddDialogEdit(HWND parent, const wchar_t* text, int x, int y, int w, int h,
 }
 
 HWND AddDialogButton(HWND parent, const wchar_t* text, int id, int x, int y, int w, int h,
-                     bool defButton, bool ownerDraw = false) {
+                     bool defButton) {
     DWORD style = WS_CHILD | WS_VISIBLE | WS_TABSTOP;
-    if (ownerDraw) style |= BS_OWNERDRAW;
-    else style |= defButton ? BS_DEFPUSHBUTTON : BS_PUSHBUTTON;
+    style |= defButton ? BS_DEFPUSHBUTTON : BS_PUSHBUTTON;
     HWND button = CreateWindowExW(0, L"BUTTON", text, style,
                                   x, y, w, h, parent,
                                   reinterpret_cast<HMENU>(static_cast<INT_PTR>(id)),
@@ -729,6 +736,196 @@ bool RunAttachDialog(HWND owner, const std::vector<AttachItem>& items, int& sele
 }
 
 // ---------------------------------------------------------------------------
+// Retained-session picker
+// ---------------------------------------------------------------------------
+
+struct SessionsDlgState {
+    std::vector<wcs::SessionInfo> sessions;
+    std::vector<uint32_t> selectedIds;
+    HWND list = nullptr;
+    bool ok = false;
+};
+
+LRESULT CALLBACK SessionsDlgProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
+    auto* state = reinterpret_cast<SessionsDlgState*>(GetWindowLongPtrW(hwnd, GWLP_USERDATA));
+    switch (msg) {
+    case WM_CREATE: {
+        auto* cs = reinterpret_cast<CREATESTRUCTW*>(lParam);
+        state = reinterpret_cast<SessionsDlgState*>(cs->lpCreateParams);
+        SetWindowLongPtrW(hwnd, GWLP_USERDATA, reinterpret_cast<LONG_PTR>(state));
+        if (!state) return -1;
+
+        state->list = CreateWindowExW(WS_EX_CLIENTEDGE, L"LISTBOX", L"",
+            WS_CHILD | WS_VISIBLE | WS_TABSTOP | WS_VSCROLL | LBS_NOTIFY |
+                LBS_EXTENDEDSEL | LBS_NOINTEGRALHEIGHT,
+            16, 16, 648, 312, hwnd,
+            reinterpret_cast<HMENU>(static_cast<INT_PTR>(1002)),
+            nullptr, nullptr);
+        if (state->list && g_uiFont) {
+            SendMessageW(state->list, WM_SETFONT, reinterpret_cast<WPARAM>(g_uiFont), TRUE);
+        }
+        for (const auto& session : state->sessions) {
+            std::wstring label = L"#" + std::to_wstring(session.id) + L"  " +
+                                 Utf8ToWide(session.name);
+            if (!session.command.empty()) label += L"  —  " + Utf8ToWide(session.command);
+            if (label.size() > 200) label.resize(200);
+            SendMessageW(state->list, LB_ADDSTRING, 0,
+                         reinterpret_cast<LPARAM>(label.c_str()));
+        }
+        if (!state->sessions.empty()) {
+            SendMessageW(state->list, LB_SETSEL, TRUE, 0);
+            SendMessageW(state->list, LB_SETCURSEL, 0, 0);
+        }
+        AddDialogButton(hwnd, T(L"再接続", L"Reconnect", L"Reconectar"),
+                        IDOK, 488, 338, 86, 28, true);
+        AddDialogButton(hwnd, T(L"キャンセル", L"Cancel", L"Cancelar"),
+                        IDCANCEL, 580, 338, 84, 28, false);
+        SetFocus(state->list);
+        return 0;
+    }
+    case WM_COMMAND: {
+        const int id = LOWORD(wParam);
+        if (id == IDOK) {
+            if (!state || !state->list) return 0;
+            int count = static_cast<int>(SendMessageW(state->list, LB_GETSELCOUNT, 0, 0));
+            if (count <= 0) {
+                MessageBoxW(hwnd,
+                    T(L"再接続するセッションを選択してください。",
+                      L"Select at least one session to reconnect.",
+                      L"Selecciona al menos una sesión."),
+                    T(L"再接続", L"Reconnect", L"Reconectar"),
+                    MB_OK | MB_ICONWARNING);
+                return 0;
+            }
+            std::vector<int> indices(static_cast<size_t>(count));
+            SendMessageW(state->list, LB_GETSELITEMS, count,
+                         reinterpret_cast<LPARAM>(indices.data()));
+            for (int index : indices) {
+                if (index >= 0 && index < static_cast<int>(state->sessions.size())) {
+                    state->selectedIds.push_back(state->sessions[static_cast<size_t>(index)].id);
+                }
+            }
+            state->ok = true;
+            DestroyWindow(hwnd);
+        } else if (id == IDCANCEL) {
+            DestroyWindow(hwnd);
+        } else if (id == 1002 && HIWORD(wParam) == LBN_DBLCLK) {
+            SendMessageW(hwnd, WM_COMMAND, IDOK, 0);
+        }
+        return 0;
+    }
+    case WM_ERASEBKGND: {
+        RECT rc = {};
+        GetClientRect(hwnd, &rc);
+        FillRect(reinterpret_cast<HDC>(wParam), &rc,
+                 g_bgBrush ? g_bgBrush : reinterpret_cast<HBRUSH>(COLOR_BTNFACE + 1));
+        return 1;
+    }
+    case WM_CTLCOLORSTATIC:
+    case WM_CTLCOLORBTN: {
+        HDC hdc = reinterpret_cast<HDC>(wParam);
+        SetTextColor(hdc, g_palette.text);
+        SetBkColor(hdc, g_palette.windowBg);
+        SetBkMode(hdc, TRANSPARENT);
+        return reinterpret_cast<LRESULT>(g_bgBrush ? g_bgBrush
+                                                   : GetStockObject(WHITE_BRUSH));
+    }
+    case WM_CTLCOLORLISTBOX: {
+        HDC hdc = reinterpret_cast<HDC>(wParam);
+        SetTextColor(hdc, g_palette.listText);
+        SetBkColor(hdc, g_palette.panel);
+        return reinterpret_cast<LRESULT>(g_panelBrush ? g_panelBrush
+                                                      : GetStockObject(WHITE_BRUSH));
+    }
+    case WM_CLOSE:
+        DestroyWindow(hwnd);
+        return 0;
+    default:
+        break;
+    }
+    return DefWindowProcW(hwnd, msg, wParam, lParam);
+}
+
+bool RunSessionsDialog(HWND owner, SessionsDlgState& state) {
+    if (state.sessions.empty()) return false;
+    RECT rc = {0, 0, 680, 386};
+    const DWORD style = WS_POPUP | WS_CAPTION | WS_SYSMENU;
+    const DWORD exStyle = WS_EX_DLGMODALFRAME | WS_EX_CONTROLPARENT;
+    AdjustWindowRectEx(&rc, style, FALSE, exStyle);
+    HWND dlg = CreateWindowExW(exStyle, kSessionsDlgClass,
+                               T(L"保持中のセッションに再接続", L"Reconnect to a retained session",
+                                 L"Reconectar a una sesión conservada"),
+                               style, CW_USEDEFAULT, CW_USEDEFAULT,
+                               rc.right - rc.left, rc.bottom - rc.top,
+                               owner, nullptr, GetModuleHandleW(nullptr), &state);
+    if (!dlg) return false;
+
+    ApplyDashboardNativeTheme(dlg);
+    ApplyChildTheme(dlg, g_palette.dark);
+    CenterWindowOn(dlg, owner);
+    ShowWindow(dlg, SW_SHOW);
+    EnableWindow(owner, FALSE);
+    while (IsWindow(dlg)) {
+        MSG msg;
+        BOOL ret = GetMessageW(&msg, nullptr, 0, 0);
+        if (ret <= 0) break;
+        if (!IsDialogMessageW(dlg, &msg)) {
+            TranslateMessage(&msg);
+            DispatchMessageW(&msg);
+        }
+    }
+    EnableWindow(owner, TRUE);
+    SetForegroundWindow(owner);
+    return state.ok;
+}
+
+bool QuerySessions(const RemoteSettings& settings,
+                   std::vector<wcs::SessionInfo>& sessions, std::wstring& error) {
+    RemoteConfig cfg;
+    cfg.host = WideToUtf8(settings.host.empty() ? L"127.0.0.1" : settings.host);
+    cfg.port = static_cast<uint16_t>(settings.port > 0 ? settings.port : 9139);
+    cfg.token = WideToUtf8(settings.token);
+
+    RemoteSession query(cfg);
+    std::mutex mutex;
+    std::condition_variable cv;
+    bool done = false;
+    query.onSessionList = [&](const std::vector<wcs::SessionInfo>& list) {
+        std::lock_guard<std::mutex> lock(mutex);
+        sessions = list;
+        done = true;
+        cv.notify_all();
+    };
+
+    TerminalStartOptions opt;
+    opt.shell = L"list";
+    opt.cols = 80;
+    opt.rows = 25;
+    if (!query.Start(opt, &error)) {
+        if (error.empty()) {
+            error = T(L"セッション一覧を取得できません。", L"Could not read the session list.",
+                      L"No se pudo leer la lista de sesiones.");
+        }
+        return false;
+    }
+
+    query.RequestSessionList();
+    {
+        std::unique_lock<std::mutex> lock(mutex);
+        if (!cv.wait_for(lock, std::chrono::seconds(3), [&] { return done; })) {
+            error = T(L"セッション一覧の応答がありません。",
+                      L"The server did not answer the session-list request.",
+                      L"El servidor no respondió a la solicitud de sesiones.");
+            lock.unlock();
+            query.Close();
+            return false;
+        }
+    }
+    query.Close();
+    return true;
+}
+
+// ---------------------------------------------------------------------------
 // IPC helpers (local core)
 // ---------------------------------------------------------------------------
 
@@ -856,20 +1053,7 @@ void ApplyActiveLayout(ClientState* st) {
     }
 
     const int margin = 6;
-    const int buttonY = 4;
-    const int buttonH = 26;
-    int x = margin;
-    for (HWND button : {st->btnNew, st->btnAttach, st->btnConnect, st->btnClose}) {
-        if (!button) continue;
-        RECT br = {};
-        GetWindowRect(button, &br);
-        int bw = br.right - br.left;
-        if (bw <= 0) bw = 90;
-        MoveWindow(button, x, buttonY, bw, buttonH, TRUE);
-        x += bw + 6;
-    }
-
-    const int tabTop = buttonY + buttonH + 4;
+    const int tabTop = 4;
     const int tabH = 28;
     if (st->hwndTab) {
         MoveWindow(st->hwndTab, margin, tabTop, (std::max)(100, width - margin * 2), tabH, TRUE);
@@ -910,6 +1094,52 @@ void SetActiveTab(ClientState* st, int id) {
     InvalidateRect(st->hwndMain, nullptr, FALSE);
 }
 
+enum class CloseMode { Detach, Terminate, Cancel };
+
+// Ask what to do with one tab or every open tab when the user disconnects.
+CloseMode AskCloseMode(HWND owner, bool allSessions) {
+    TASKDIALOGCONFIG cfg = {};
+    cfg.cbSize = sizeof(cfg);
+    cfg.hwndParent = owner;
+    cfg.dwFlags = TDF_ALLOW_DIALOG_CANCELLATION | TDF_POSITION_RELATIVE_TO_WINDOW;
+    cfg.pszWindowTitle = T(L"Hancho ターミナル", L"Hancho Terminal", L"Hancho Terminal");
+    cfg.pszMainIcon = TD_WARNING_ICON;
+    cfg.pszMainInstruction = allSessions
+        ? T(L"開いているすべてのセッションをどうしますか？",
+            L"What should happen to all open sessions?",
+            L"¿Qué debe pasar con todas las sesiones abiertas?")
+        : T(L"このセッションをどうしますか？",
+            L"What should happen to this session?",
+            L"¿Qué debe pasar con esta sesión?");
+    cfg.pszContent = T(
+        L"「セッションを終了」はサーバー側の ConPTY を閉じ、セッション一覧から消します。\n"
+        L"「デタッチ」はサーバー側のセッションを開いたまま保持し、後続の接続を受け付けます。",
+        L"\"Terminate\" closes the server-side ConPTY and removes the session from the list.\n"
+        L"\"Detach\" keeps the server-side session open and allows later connections.",
+        L"\"Terminar\" cierra el ConPTY del servidor y elimina la sesión de la lista.\n"
+        L"\"Desconectar\" mantiene la sesión del servidor abierta y permite conexiones posteriores.");
+    TASKDIALOG_BUTTON buttons[3] = {
+        {1001, T(L"セッションを終了", L"Terminate session", L"Terminar sesión")},
+        {1002, T(L"デタッチ", L"Detach", L"Desconectar")},
+        {IDCANCEL, T(L"キャンセル", L"Cancel", L"Cancelar")},
+    };
+    cfg.pButtons = buttons;
+    cfg.cButtons = 3;
+    cfg.nDefaultButton = 1002;
+    int pressed = 0;
+    HRESULT hr = TaskDialogIndirect(&cfg, &pressed, nullptr, nullptr);
+    if (SUCCEEDED(hr)) {
+        if (pressed == 1001) return CloseMode::Terminate;
+        if (pressed == 1002) return CloseMode::Detach;
+        return CloseMode::Cancel;
+    }
+    const int fallback = MessageBoxW(owner, cfg.pszContent, cfg.pszMainInstruction,
+                                     MB_YESNOCANCEL | MB_ICONWARNING);
+    if (fallback == IDYES) return CloseMode::Terminate;
+    if (fallback == IDNO) return CloseMode::Detach;
+    return CloseMode::Cancel;
+}
+
 void DestroyTabView(SessionTab* tab) {
     if (!tab || !tab->view) return;
     tab->view->SetRemoteIo(nullptr);
@@ -918,13 +1148,18 @@ void DestroyTabView(SessionTab* tab) {
     tab->view.reset();
 }
 
-void CloseTabById(ClientState* st, int id) {
+void CloseTabById(ClientState* st, int id, bool terminate = false) {
     if (!st) return;
     const int index = FindTabIndex(st, id);
     if (index < 0) return;
 
+    SessionTab* closing = st->tabs[static_cast<size_t>(index)].get();
+    if (terminate && closing && closing->view) {
+        closing->view->TerminateRemoteSession();
+    }
+
     const bool wasActive = (st->activeId == id);
-    DestroyTabView(st->tabs[static_cast<size_t>(index)].get());
+    DestroyTabView(closing);
     st->tabs.erase(st->tabs.begin() + index);
 
     if (wasActive) {
@@ -1101,6 +1336,118 @@ void ShowRemoteConnect(ClientState* st) {
     }
 }
 
+void ShowReconnectDialog(ClientState* st, bool startup) {
+    if (!st) return;
+    WriteAuditLog("TERM_CLIENT_RECONNECT", startup ? "startup" : "manual");
+    struct SuppressAutoAttach {
+        ClientState* st;
+        explicit SuppressAutoAttach(ClientState* s) : st(s) { st->suppressAutoAttach = true; }
+        ~SuppressAutoAttach() { st->suppressAutoAttach = false; }
+    } suppress(st);
+
+    std::wstring error;
+    RemoteSettings settings;
+    bool haveEndpoint = EnsureLocalEndpoint(st, error);
+    if (haveEndpoint) {
+        settings.host = st->localHost;
+        settings.port = st->localPort;
+        settings.token = st->localToken;
+    } else if (!st->lastRemote.host.empty() && st->lastRemote.port > 0) {
+        settings = st->lastRemote;
+        haveEndpoint = true;
+    }
+    if (!haveEndpoint) {
+        if (!startup) {
+            MessageBoxW(st->hwndMain, error.c_str(),
+                        T(L"再接続", L"Reconnect", L"Reconectar"), MB_OK | MB_ICONERROR);
+        }
+        return;
+    }
+
+    std::vector<wcs::SessionInfo> all;
+    if (!QuerySessions(settings, all, error)) {
+        WriteAuditLog("TERM_CLIENT_SESSIONS_FAILED",
+                      WideToUtf8(settings.host) + ":" + std::to_string(settings.port) +
+                          " - " + WideToUtf8(error));
+        if (!startup) {
+            MessageBoxW(st->hwndMain, error.c_str(),
+                        T(L"再接続", L"Reconnect", L"Reconectar"), MB_OK | MB_ICONERROR);
+        }
+        return;
+    }
+
+    std::vector<wcs::SessionInfo> running;
+    for (const auto& session : all) {
+        if (session.state == 0) running.push_back(session);
+    }
+
+    if (startup) {
+        st->discoveryInitialized = true;
+        st->startupIgnoredJobs.clear();
+        for (const auto& session : running) {
+            st->startupIgnoredJobs.insert(static_cast<int>(session.id));
+        }
+    }
+
+    WriteAuditLog("TERM_CLIENT_SESSIONS",
+                  WideToUtf8(settings.host) + ":" + std::to_string(settings.port) +
+                      " total=" + std::to_string(all.size()) +
+                      " running=" + std::to_string(running.size()) +
+                      (startup ? " startup" : " manual"));
+    if (running.empty()) {
+        if (!startup) {
+            MessageBoxW(st->hwndMain,
+                T(L"保持中のセッションはありません。", L"There are no retained sessions.",
+                  L"No hay sesiones conservadas."),
+                T(L"再接続", L"Reconnect", L"Reconectar"), MB_OK | MB_ICONINFORMATION);
+        }
+        return;
+    }
+
+    SessionsDlgState dlg;
+    dlg.sessions = running;
+    if (!RunSessionsDialog(st->hwndMain, dlg)) return;
+
+    for (uint32_t id : dlg.selectedIds) {
+        std::wstring label = L"#" + std::to_wstring(id);
+        for (const auto& session : running) {
+            if (session.id == id) {
+                label += L" " + Utf8ToWide(session.name);
+                break;
+            }
+        }
+        std::wstring target = L"attach:" + std::to_wstring(id);
+        std::wstring addError;
+        if (AddSession(st, settings, target, label, static_cast<int>(id), addError) == 0) {
+            if (!startup) {
+                MessageBoxW(st->hwndMain, addError.c_str(),
+                            T(L"再接続", L"Reconnect", L"Reconectar"), MB_OK | MB_ICONERROR);
+            }
+        }
+    }
+}
+
+void TerminateActiveSession(ClientState* st) {
+    SessionTab* tab = FindTab(st, st->activeId);
+    if (!tab) return;
+    const std::wstring message = T(
+        L"このセッションを終了しますか？\r\n\r\n"
+        L"サーバーが起動したシェルは停止します。ダッシュボードのジョブに接続している場合は、"
+        L"切断されるだけでジョブは停止しません。",
+        L"Terminate this session?\r\n\r\n"
+        L"A shell started by the server will be stopped. An attached dashboard job is only "
+        L"detached and keeps running.",
+        L"¿Terminar esta sesión?\r\n\r\n"
+        L"Un shell iniciado por el servidor se detendrá. Un trabajo del panel solo se "
+        L"desconecta y sigue ejecutándose.");
+    if (MessageBoxW(st->hwndMain, message.c_str(),
+                    T(L"セッションを終了", L"Terminate session", L"Terminar sesión"),
+                    MB_YESNO | MB_ICONWARNING) != IDYES) {
+        return;
+    }
+    CloseTabById(st, tab->id, true);
+}
+
 void ReconnectActive(ClientState* st) {
     SessionTab* tab = FindTab(st, st->activeId);
     if (!tab) return;
@@ -1120,12 +1467,22 @@ void ReconnectActive(ClientState* st) {
 // Attaches to local ConPTY jobs that have no tab yet. This preserves the old
 // dashboard behavior where "+ Launch" immediately showed a terminal.
 void AutoAttachLocalJobs(ClientState* st) {
-    if (!st->autoAttach || st->closing) return;
+    if (!st->autoAttach || st->closing || st->suppressAutoAttach) return;
     std::wstring error;
     if (!EnsureLocalEndpoint(st, error)) return;
 
     std::vector<AttachItem> items;
     if (!FetchLocalConPtyJobs(items, error)) return;
+
+    // Sessions that already existed when the client started are offered in the
+    // reconnect picker instead of being attached automatically.
+    if (!st->discoveryInitialized) {
+        for (const auto& item : items) {
+            if (item.running) st->startupIgnoredJobs.insert(item.id);
+        }
+        st->discoveryInitialized = true;
+        return;
+    }
 
     std::set<int> known;
     for (const auto& tab : st->tabs) {
@@ -1138,6 +1495,7 @@ void AutoAttachLocalJobs(ClientState* st) {
         if (opened >= 8) break;
         if (!item.running) continue;
         if (known.count(item.id) != 0) continue;
+        if (st->startupIgnoredJobs.count(item.id) != 0) continue;
         if (st->autoFailedJobs.count(item.id) != 0) continue;
         if (item.label.find(L"wcsp-") != std::wstring::npos) continue;
 
@@ -1246,6 +1604,9 @@ HMENU BuildMenu(ClientState* st) {
     AppendMenuW(file, MF_STRING, IDM_CONNECT,
                 T(L"リモートに接続...", L"Connect to remote...",
                   L"Conectar a remoto..."));
+    AppendMenuW(file, MF_STRING, IDM_RECONNECT_SESSION,
+                T(L"セッションに再接続...", L"Reconnect to session...",
+                  L"Reconectar a una sesión..."));
     AppendMenuW(file, MF_SEPARATOR, 0, nullptr);
     AppendMenuW(file, MF_STRING, IDM_RECONNECT,
                 T(L"現在のタブを再接続", L"Reconnect current tab",
@@ -1253,6 +1614,9 @@ HMENU BuildMenu(ClientState* st) {
     AppendMenuW(file, MF_STRING, IDM_CLOSE,
                 T(L"現在のタブを閉じる	Ctrl+W", L"Close current tab	Ctrl+W",
                   L"Cerrar la pestaña actual	Ctrl+W"));
+    AppendMenuW(file, MF_STRING, IDM_TERMINATE_SESSION,
+                T(L"現在のセッションを終了...", L"Terminate current session...",
+                  L"Terminar la sesión actual..."));
     AppendMenuW(file, MF_SEPARATOR, 0, nullptr);
     AppendMenuW(file, MF_STRING, IDM_EXIT,
                 T(L"終了", L"Exit", L"Salir"));
@@ -1318,36 +1682,6 @@ HMENU BuildMenu(ClientState* st) {
     st->hMenuSettings = settings;
     st->hMenuScrollback = scroll;
     return menu;
-}
-
-void DrawClientButton(DRAWITEMSTRUCT* dis) {
-    if (!dis) return;
-    const bool pressed = (dis->itemState & ODS_SELECTED) != 0;
-    COLORREF bg = pressed ? g_palette.border : g_palette.panel;
-    HBRUSH bgBrush = CreateSolidBrush(bg);
-    FillRect(dis->hDC, &dis->rcItem, bgBrush);
-    DeleteObject(bgBrush);
-
-    HPEN borderPen = CreatePen(PS_SOLID, 1, g_palette.border);
-    HGDIOBJ oldPen = SelectObject(dis->hDC, borderPen);
-    HGDIOBJ oldBrush = SelectObject(dis->hDC, GetStockObject(NULL_BRUSH));
-    Rectangle(dis->hDC, dis->rcItem.left, dis->rcItem.top,
-              dis->rcItem.right, dis->rcItem.bottom);
-    SelectObject(dis->hDC, oldBrush);
-    SelectObject(dis->hDC, oldPen);
-    DeleteObject(borderPen);
-
-    wchar_t text[256] = {};
-    GetWindowTextW(dis->hwndItem, text, 256);
-    SetBkMode(dis->hDC, TRANSPARENT);
-    SetTextColor(dis->hDC, (dis->itemState & ODS_DISABLED) ? g_palette.muted : g_palette.text);
-    HGDIOBJ oldFont = SelectObject(dis->hDC,
-        g_uiFont ? g_uiFont : GetStockObject(DEFAULT_GUI_FONT));
-    RECT rc = dis->rcItem;
-    InflateRect(&rc, -4, 0);
-    DrawTextW(dis->hDC, text, -1, &rc,
-              DT_CENTER | DT_VCENTER | DT_SINGLELINE | DT_END_ELLIPSIS);
-    SelectObject(dis->hDC, oldFont);
 }
 
 void DrawClientTab(DRAWITEMSTRUCT* dis) {
@@ -1430,6 +1764,23 @@ void DrawClientStatus(ClientState* st, DRAWITEMSTRUCT* dis) {
     SelectObject(dis->hDC, oldFont);
 }
 
+LRESULT CALLBACK ClientTabSubclassProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam,
+                                        UINT_PTR, DWORD_PTR) {
+    if (msg == WM_ERASEBKGND) {
+        HDC hdc = reinterpret_cast<HDC>(wParam);
+        RECT rc = {};
+        GetClientRect(hwnd, &rc);
+        HBRUSH brush = CreateSolidBrush(g_palette.windowBg);
+        FillRect(hdc, &rc, brush);
+        DeleteObject(brush);
+        return 1;
+    }
+    if (msg == WM_THEMECHANGED) {
+        InvalidateRect(hwnd, nullptr, TRUE);
+    }
+    return DefSubclassProc(hwnd, msg, wParam, lParam);
+}
+
 void ShowClientContextMenu(ClientState* st, POINT pt) {
     if (!st) return;
     HMENU menu = CreatePopupMenu();
@@ -1449,6 +1800,9 @@ void ShowClientContextMenu(ClientState* st, POINT pt) {
     AppendMenuW(menu, MF_STRING, IDM_CONNECT,
                 T(L"リモートに接続...", L"Connect to remote...",
                   L"Conectar a remoto..."));
+    AppendMenuW(menu, MF_STRING, IDM_RECONNECT_SESSION,
+                T(L"セッションに再接続...", L"Reconnect to session...",
+                  L"Reconectar a una sesión..."));
     AppendMenuW(menu, MF_SEPARATOR, 0, nullptr);
     AppendMenuW(menu, MF_STRING | (tab ? 0 : MF_GRAYED), IDM_RECONNECT,
                 T(L"現在のタブを再接続", L"Reconnect current tab",
@@ -1456,6 +1810,9 @@ void ShowClientContextMenu(ClientState* st, POINT pt) {
     AppendMenuW(menu, MF_STRING | (tab ? 0 : MF_GRAYED), IDM_CLOSE,
                 T(L"現在のタブを閉じる", L"Close current tab",
                   L"Cerrar la pestaña actual"));
+    AppendMenuW(menu, MF_STRING | (tab ? 0 : MF_GRAYED), IDM_TERMINATE_SESSION,
+                T(L"現在のセッションを終了...", L"Terminate current session...",
+                  L"Terminar la sesión actual..."));
 
     int cmd = TrackPopupMenu(menu, TPM_RETURNCMD | TPM_RIGHTBUTTON,
                              pt.x, pt.y, 0, st->hwndMain, nullptr);
@@ -1474,22 +1831,16 @@ LRESULT CALLBACK ClientWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam
         if (!st) return -1;
         st->hwndMain = hwnd;
 
-        st->btnNew = AddDialogButton(hwnd, T(L"+ 新規", L"+ New", L"+ Nuevo"),
-                                     IDC_CLIENT_BTN_NEW, 0, 0, 92, 26, false, true);
-        st->btnAttach = AddDialogButton(hwnd, T(L"接続...", L"Attach...", L"Conectar..."),
-                                        IDC_CLIENT_BTN_ATTACH, 0, 0, 92, 26, false, true);
-        st->btnConnect = AddDialogButton(hwnd, T(L"リモート...", L"Remote...", L"Remoto..."),
-                                         IDC_CLIENT_BTN_CONNECT, 0, 0, 100, 26, false, true);
-        st->btnClose = AddDialogButton(hwnd, T(L"閉じる", L"Close", L"Cerrar"),
-                                       IDC_CLIENT_BTN_CLOSE, 0, 0, 82, 26, false, true);
-
         st->hwndTab = CreateWindowExW(0, WC_TABCONTROLW, L"",
             WS_CHILD | WS_VISIBLE | WS_CLIPSIBLINGS | WS_TABSTOP | TCS_OWNERDRAWFIXED,
             0, 0, 100, 28, hwnd,
             reinterpret_cast<HMENU>(static_cast<INT_PTR>(IDC_CLIENT_TAB)),
             GetModuleHandleW(nullptr), nullptr);
-        if (st->hwndTab && g_uiFont) {
-            SendMessageW(st->hwndTab, WM_SETFONT, reinterpret_cast<WPARAM>(g_uiFont), TRUE);
+        if (st->hwndTab) {
+            SetWindowSubclass(st->hwndTab, ClientTabSubclassProc, 1, 0);
+            if (g_uiFont) {
+                SendMessageW(st->hwndTab, WM_SETFONT, reinterpret_cast<WPARAM>(g_uiFont), TRUE);
+            }
         }
 
         st->hwndStatus = CreateWindowExW(0, L"STATIC", L"",
@@ -1553,10 +1904,6 @@ LRESULT CALLBACK ClientWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam
     case WM_DRAWITEM: {
         auto* dis = reinterpret_cast<DRAWITEMSTRUCT*>(lParam);
         if (!dis) break;
-        if (dis->CtlType == ODT_BUTTON) {
-            DrawClientButton(dis);
-            return TRUE;
-        }
         if (dis->CtlType == ODT_TAB) {
             DrawClientTab(dis);
             return TRUE;
@@ -1600,7 +1947,6 @@ LRESULT CALLBACK ClientWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam
         if (!st) break;
         const int id = LOWORD(wParam);
         switch (id) {
-        case IDC_CLIENT_BTN_NEW:
         case IDM_NEW_PWSH:
             ConnectLocalShell(st, L"powershell");
             return 0;
@@ -1610,20 +1956,26 @@ LRESULT CALLBACK ClientWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam
         case IDM_NEW_BASH:
             ConnectLocalShell(st, L"bash");
             return 0;
-        case IDC_CLIENT_BTN_ATTACH:
         case IDM_ATTACH:
             ShowAttachPicker(st);
             return 0;
-        case IDC_CLIENT_BTN_CONNECT:
         case IDM_CONNECT:
             ShowRemoteConnect(st);
             return 0;
-        case IDC_CLIENT_BTN_CLOSE:
-        case IDM_CLOSE:
-            CloseTabById(st, st->activeId);
+        case IDM_CLOSE: {
+            const CloseMode mode = AskCloseMode(hwnd, false);
+            if (mode == CloseMode::Cancel) return 0;
+            CloseTabById(st, st->activeId, mode == CloseMode::Terminate);
             return 0;
+        }
         case IDM_RECONNECT:
             ReconnectActive(st);
+            return 0;
+        case IDM_RECONNECT_SESSION:
+            ShowReconnectDialog(st, false);
+            return 0;
+        case IDM_TERMINATE_SESSION:
+            TerminateActiveSession(st);
             return 0;
         case IDM_EDIT_COPY: {
             SessionTab* tab = FindTab(st, st->activeId);
@@ -1701,8 +2053,7 @@ LRESULT CALLBACK ClientWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam
             return 0;
         }
         case IDM_EXIT:
-            SaveWindowState(st);
-            DestroyWindow(hwnd);
+            PostMessageW(hwnd, WM_CLOSE, 0, 0);
             return 0;
         default:
             break;
@@ -1785,10 +2136,22 @@ LRESULT CALLBACK ClientWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam
         }
         return 0;
 
-    case WM_CLOSE:
-        if (st) SaveWindowState(st);
+    case WM_CLOSE: {
+        if (st) {
+            if (!st->tabs.empty()) {
+                const CloseMode mode = AskCloseMode(hwnd, true);
+                if (mode == CloseMode::Cancel) return 0;
+                if (mode == CloseMode::Terminate) {
+                    for (auto& tab : st->tabs) {
+                        if (tab && tab->view) tab->view->TerminateRemoteSession();
+                    }
+                }
+            }
+            SaveWindowState(st);
+        }
         DestroyWindow(hwnd);
         return 0;
+    }
 
     case WM_DESTROY:
         if (st) {
@@ -1830,6 +2193,10 @@ void RegisterWindowClasses(HINSTANCE hInst) {
 
     dlg.lpfnWndProc = AttachDlgProc;
     dlg.lpszClassName = kAttachDlgClass;
+    RegisterClassExW(&dlg);
+
+    dlg.lpfnWndProc = SessionsDlgProc;
+    dlg.lpszClassName = kSessionsDlgClass;
     RegisterClassExW(&dlg);
 }
 
@@ -1933,6 +2300,14 @@ int RunTerminalClient(const TermClientOptions& options) {
 
     ShowWindow(hwnd, SW_SHOW);
     UpdateWindow(hwnd);
+
+    WriteAuditLog("TERM_CLIENT_START",
+                  std::string("autoConnect=") + (options.autoConnect ? "1" : "0") +
+                      " autoAttach=" + (options.autoAttach ? "1" : "0"));
+    if (!options.autoConnect && options.autoAttach) {
+        // Offer retained sessions before the timer starts auto-attaching new ones.
+        ShowReconnectDialog(&state, true);
+    }
 
     if (options.autoConnect) {
         const std::wstring target =

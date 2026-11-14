@@ -16,6 +16,7 @@
 #include "platform/platform.h"
 #include <shellapi.h>
 #include <cstdlib>
+#include <cstdio>
 #include <exception>
 #include <iostream>
 #include <thread>
@@ -537,6 +538,25 @@ static void HideOwnConsoleWindow() {
     }
 }
 
+// Hancho.exe is a GUI-subsystem binary, so Windows never creates a console window for
+// it (shortcut, Run key, WMI auto-start and MCP clients used to flash one). Console
+// modes still need somewhere to print: attach to the caller's console when one exists
+// and the standard handles are console handles. Redirections (files, pipes, MCP stdio)
+// are left untouched.
+static void AttachParentConsoleForCli() {
+    HANDLE hOut = GetStdHandle(STD_OUTPUT_HANDLE);
+    HANDLE hErr = GetStdHandle(STD_ERROR_HANDLE);
+    if ((hOut && GetFileType(hOut) != FILE_TYPE_CHAR) ||
+        (hErr && GetFileType(hErr) != FILE_TYPE_CHAR)) {
+        return;
+    }
+    if (!AttachConsole(ATTACH_PARENT_PROCESS)) return;
+    FILE* f = nullptr;
+    freopen_s(&f, "CONOUT$", "w", stdout);
+    freopen_s(&f, "CONOUT$", "w", stderr);
+    freopen_s(&f, "CONIN$", "r", stdin);
+}
+
 // Starts the background core without asking. The dashboard cannot work without a core, so the
 // old yes/no prompt only added a click to every launch. --no-prompt keeps the script-friendly
 // "fail instead of launching" behavior.
@@ -654,6 +674,8 @@ int main() {
                                   subcmd == "headless" || subcmd == "--headless");
     if (isGuiOrHeadless) {
         HideOwnConsoleWindow();
+    } else {
+        AttachParentConsoleForCli();
     }
 
     if (subcmd == "--help" || subcmd == "-h" || subcmd == "help") {

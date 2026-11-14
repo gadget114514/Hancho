@@ -4,6 +4,7 @@
 #include "gui_theme.h"
 #include "gui_ipmsg.h"
 #include "term_client.h"
+#include "term_server.h"
 #include "common.h"
 #include "llm_stream.h"
 #include "event_schema.h"
@@ -949,6 +950,12 @@ enum ControlId {
     IDC_SET_TRIAGE_KIND_BASE = 6066, // 6066..6070
     IDC_SET_TERM_LOCAL = 6071,
     IDC_SET_TERM_REMOTE = 6072,
+    IDC_SET_TERM_TOKEN = 6076,
+    IDC_SET_TERM_TOKEN_UPDATE = 6077,
+    IDC_SET_TERM_TOKEN_ROLL = 6078,
+    IDC_SET_TERM_SESSIONS_LIST = 6079,
+    IDC_SET_TERM_SESSIONS_KILL = 6080,
+    IDC_SET_TERM_SESSIONS_REFRESH = 6081,
     IDC_SET_USAGE_REFRESH_INTERVAL = 6073,
     IDC_SET_STREAM_REFRESH_INTERVAL = 6074,
     IDC_SET_PROCESS_METRICS_INTERVAL = 6075,
@@ -11187,7 +11194,15 @@ struct SettingsDlgState {
       HWND lblTermTitle = nullptr;
       HWND chkTermLocal = nullptr;
       HWND chkTermRemote = nullptr;
+      HWND lblTermToken = nullptr;
+      HWND editTermToken = nullptr;
+      HWND btnTermTokenApply = nullptr;
+      HWND btnTermTokenRoll = nullptr;
       HWND lblTermHint = nullptr;
+      HWND lblTermSessions = nullptr;
+      HWND listTermSessions = nullptr;
+      HWND btnTermKillSession = nullptr;
+      HWND btnTermRefreshSessions = nullptr;
       nlohmann::json terminalConfig = nlohmann::json::object();
       HWND lblSupervisorCommand = nullptr;
       HWND editSupervisorCommand = nullptr;
@@ -11368,11 +11383,75 @@ static void CommitSupervisorSettings(SettingsDlgState* ds) {
     GuiIpcCall(ds->dash, req, resp);
 }
 
+static void RefreshTermSessions(SettingsDlgState* ds) {
+    if (!ds || !ds->dash || !ds->listTermSessions) return;
+    SendMessageW(ds->listTermSessions, LVM_DELETEALLITEMS, 0, 0);
+
+    nlohmann::json req = {{"action", "term_sessions"}};
+    nlohmann::json resp;
+    if (!GuiIpcCall(ds->dash, req, resp) || !resp.value("ok", false)) return;
+    if (!resp.contains("sessions") || !resp["sessions"].is_array()) return;
+
+    int idx = 0;
+    for (const auto& item : resp["sessions"]) {
+        uint32_t sid = item.value("id", 0);
+        std::string remote = item.value("remote", "");
+        std::string target = item.value("target", "");
+        int64_t sec = item.value("connected_sec", 0);
+
+        std::wstring idStr = std::to_wstring(sid);
+        std::wstring remoteStr = Utf8ToWide(remote);
+        std::wstring targetStr = Utf8ToWide(target);
+
+        int min = static_cast<int>(sec / 60);
+        int remSec = static_cast<int>(sec % 60);
+        wchar_t timeBuf[64] = {};
+        if (min >= 60) {
+            int hrs = min / 60;
+            min %= 60;
+            swprintf_s(timeBuf, L"%dh %dm %ds", hrs, min, remSec);
+        } else {
+            swprintf_s(timeBuf, L"%dm %ds", min, remSec);
+        }
+
+        LVITEMW lvi = {};
+        lvi.mask = LVIF_TEXT | LVIF_PARAM;
+        lvi.iItem = idx;
+        lvi.iSubItem = 0;
+        lvi.pszText = const_cast<LPWSTR>(idStr.c_str());
+        lvi.lParam = static_cast<LPARAM>(sid);
+        SendMessageW(ds->listTermSessions, LVM_INSERTITEMW, 0, reinterpret_cast<LPARAM>(&lvi));
+
+        LVITEMW sub1 = {};
+        sub1.iItem = idx;
+        sub1.iSubItem = 1;
+        sub1.pszText = const_cast<LPWSTR>(remoteStr.c_str());
+        SendMessageW(ds->listTermSessions, LVM_SETITEMTEXTW, idx, reinterpret_cast<LPARAM>(&sub1));
+
+        LVITEMW sub2 = {};
+        sub2.iItem = idx;
+        sub2.iSubItem = 2;
+        sub2.pszText = const_cast<LPWSTR>(targetStr.c_str());
+        SendMessageW(ds->listTermSessions, LVM_SETITEMTEXTW, idx, reinterpret_cast<LPARAM>(&sub2));
+
+        LVITEMW sub3 = {};
+        sub3.iItem = idx;
+        sub3.iSubItem = 3;
+        sub3.pszText = timeBuf;
+        SendMessageW(ds->listTermSessions, LVM_SETITEMTEXTW, idx, reinterpret_cast<LPARAM>(&sub3));
+
+        idx++;
+    }
+}
+
 // Shows the controls of one tab page and hides the rest.
 static void SelectSettingsTab(SettingsDlgState* ds, int tab) {
     if (!ds) return;
     for (int p = 0; p < kSettingsTabCount; ++p) {
         for (HWND h : ds->tabPages[p]) ShowWindow(h, p == tab ? SW_SHOW : SW_HIDE);
+    }
+    if (tab == 2) {
+        RefreshTermSessions(ds);
     }
 }
 
@@ -11571,11 +11650,15 @@ static void LoadTerminalDialogConfig(SettingsDlgState* ds) {
     }
     const bool local = ds->terminalConfig.value("local", true);
     const bool remote = ds->terminalConfig.value("remote", false);
+    const std::string token = ds->terminalConfig.value("token", "");
     if (ds->chkTermLocal) {
         SendMessageW(ds->chkTermLocal, BM_SETCHECK, local ? BST_CHECKED : BST_UNCHECKED, 0);
     }
     if (ds->chkTermRemote) {
         SendMessageW(ds->chkTermRemote, BM_SETCHECK, remote ? BST_CHECKED : BST_UNCHECKED, 0);
+    }
+    if (ds->editTermToken) {
+        SetWindowTextW(ds->editTermToken, Utf8ToWide(token).c_str());
     }
 }
 
@@ -11589,10 +11672,35 @@ static void ApplyTerminalDialogConfig(SettingsDlgState* ds) {
         SendMessageW(ds->chkTermRemote, BM_GETCHECK, 0, 0) == BST_CHECKED;
     terminal["local"] = local;
     terminal["remote"] = remote;
+    if (ds->editTermToken) {
+        wchar_t buf[256] = {};
+        GetWindowTextW(ds->editTermToken, buf, 256);
+        std::wstring ws = buf;
+        size_t first = ws.find_first_not_of(L" \t\r\n");
+        size_t last = ws.find_last_not_of(L" \t\r\n");
+        std::string tokenUtf8 = (first == std::wstring::npos)
+            ? std::string()
+            : WideToUtf8(ws.substr(first, last - first + 1));
+        terminal["token"] = tokenUtf8;
+    }
     ds->terminalConfig = terminal;
     nlohmann::json req = {{"action", "config_set"}, {"patch", {{"terminal", terminal}}}};
     nlohmann::json resp;
     GuiIpcCall(ds->dash, req, resp);
+
+    if (ds->editTermToken) {
+        wchar_t buf[256] = {};
+        GetWindowTextW(ds->editTermToken, buf, 256);
+        std::wstring ws = buf;
+        size_t first = ws.find_first_not_of(L" \t\r\n");
+        size_t last = ws.find_last_not_of(L" \t\r\n");
+        if (first != std::wstring::npos) {
+            std::string tok = WideToUtf8(ws.substr(first, last - first + 1));
+            nlohmann::json tokReq = {{"action", "term_set_token"}, {"token", tok}};
+            nlohmann::json tokResp;
+            GuiIpcCall(ds->dash, tokReq, tokResp);
+        }
+    }
 }
 
 static void UpdateSettingsDialogTexts(HWND hwnd) {
@@ -11715,17 +11823,63 @@ static void UpdateSettingsDialogTexts(HWND hwnd) {
             L"Enable remote connections (WinConsoleTerminal on the LAN)",
             L"Activar conexiones remotas (WinConsoleTerminal en la LAN)"));
     }
+    if (ds->lblTermToken) {
+        SetWindowTextW(ds->lblTermToken, Tr(
+            L"リモート接続用トークン (Token):",
+            L"Remote connection token (Token):",
+            L"Token de conexión remota (Token):"));
+    }
+    if (ds->btnTermTokenApply) {
+        SetWindowTextW(ds->btnTermTokenApply, Tr(L"更新", L"Update", L"Actualizar"));
+    }
+    if (ds->btnTermTokenRoll) {
+        SetWindowTextW(ds->btnTermTokenRoll, Tr(L"再生成", L"Regenerate", L"Regenerar"));
+    }
     if (ds->lblTermHint) {
         SetWindowTextW(ds->lblTermHint, Tr(
             L"ローカル接続は、この PC のダッシュボードが ConPTY ジョブに接続するために使います。"
             L"リモート接続は config.json の terminal.host:port にバインドし、別 PC の WinConsoleTerminal から "
-            L"attach:<id> で接続できるようにします。暗号化はないため、信頼できる LAN でのみ有効にしてください。",
+            L"attach:<id> で接続できるようにします。暗号化はないため、信頼できる LAN でのみ有効にしてください。\r\n\r\n"
+            L"※トークンを空欄にして保存すると、コア起動時にランダムなトークンが自動生成されます。",
             L"Local connections let the dashboard on this PC attach to ConPTY jobs. Remote connections bind "
             L"terminal.host:port from config.json so WinConsoleTerminal on another PC can attach with "
-            L"attach:<id>. There is no encryption, so enable remote only on a trusted LAN.",
+            L"attach:<id>. There is no encryption, so enable remote only on a trusted LAN.\r\n\r\n"
+            L"* If the token is left empty and saved, a random token is auto-generated when the core starts.",
             L"Las conexiones locales permiten que el panel de este PC se conecte a los trabajos ConPTY. Las "
             L"conexiones remotas usan terminal.host:port de config.json para que WinConsoleTerminal de otro PC "
-            L"se conecte con attach:<id>. No hay cifrado; actívalas solo en una LAN de confianza."));
+            L"se conecte con attach:<id>. No hay cifrado; actívalas solo en una LAN de confianza.\r\n\r\n"
+            L"* Si el token se deja vacío, se generará uno aleatorio al iniciar el núcleo."));
+    }
+    if (ds->lblTermSessions) {
+        SetWindowTextW(ds->lblTermSessions, Tr(
+            L"現在のアクティブセッション一覧:",
+            L"Active Terminal Sessions:",
+            L"Sesiones de terminal activas:"));
+    }
+    if (ds->btnTermKillSession) {
+        SetWindowTextW(ds->btnTermKillSession, Tr(L"切断 (Kill)", L"Disconnect", L"Desconectar"));
+    }
+    if (ds->btnTermRefreshSessions) {
+        SetWindowTextW(ds->btnTermRefreshSessions, Tr(L"更新", L"Refresh", L"Actualizar"));
+    }
+    if (ds->listTermSessions) {
+        LVCOLUMNW col = {};
+        col.mask = LVCF_TEXT;
+        std::wstring col0 = L"ID";
+        col.pszText = const_cast<LPWSTR>(col0.c_str());
+        ListView_SetColumn(ds->listTermSessions, 0, &col);
+
+        std::wstring col1 = Tr(L"クライアント", L"Remote Address", L"Dirección");
+        col.pszText = const_cast<LPWSTR>(col1.c_str());
+        ListView_SetColumn(ds->listTermSessions, 1, &col);
+
+        std::wstring col2 = Tr(L"ターゲット / シェル", L"Target / Shell", L"Destino");
+        col.pszText = const_cast<LPWSTR>(col2.c_str());
+        ListView_SetColumn(ds->listTermSessions, 2, &col);
+
+        std::wstring col3 = Tr(L"接続時間", L"Duration", L"Duración");
+        col.pszText = const_cast<LPWSTR>(col3.c_str());
+        ListView_SetColumn(ds->listTermSessions, 3, &col);
     }
     if (ds->cmbTriageMode && ds->cmbTriageLlmMode) {
         int mode = static_cast<int>(SendMessageW(ds->cmbTriageMode, CB_GETCURSEL, 0, 0));
@@ -12162,8 +12316,52 @@ static LRESULT CALLBACK SettingsWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPAR
                 18, 84, 640, 24, hwnd, (HMENU)IDC_SET_TERM_LOCAL, hInst, nullptr);
             ds->chkTermRemote = CreateWindowExW(0, L"BUTTON", L"", WS_CHILD | WS_VISIBLE | WS_TABSTOP | BS_AUTOCHECKBOX,
                 18, 114, 640, 24, hwnd, (HMENU)IDC_SET_TERM_REMOTE, hInst, nullptr);
+            ds->lblTermToken = CreateWindowExW(0, L"STATIC", L"", WS_CHILD | WS_VISIBLE,
+                18, 148, 640, 20, hwnd, nullptr, hInst, nullptr);
+            ds->editTermToken = CreateWindowExW(WS_EX_CLIENTEDGE, L"EDIT", L"",
+                WS_CHILD | WS_VISIBLE | WS_TABSTOP | ES_AUTOHSCROLL,
+                18, 172, 390, 26, hwnd, (HMENU)IDC_SET_TERM_TOKEN, hInst, nullptr);
+            SendMessageW(ds->editTermToken, WM_SETFONT, (WPARAM)ds->dash->hFontUi, TRUE);
+            ds->btnTermTokenApply = CreateWindowExW(0, L"BUTTON", L"",
+                WS_CHILD | WS_VISIBLE | WS_TABSTOP,
+                416, 172, 80, 26, hwnd, (HMENU)IDC_SET_TERM_TOKEN_UPDATE, hInst, nullptr);
+            SendMessageW(ds->btnTermTokenApply, WM_SETFONT, (WPARAM)ds->dash->hFontUi, TRUE);
+            ds->btnTermTokenRoll = CreateWindowExW(0, L"BUTTON", L"",
+                WS_CHILD | WS_VISIBLE | WS_TABSTOP,
+                504, 172, 90, 26, hwnd, (HMENU)IDC_SET_TERM_TOKEN_ROLL, hInst, nullptr);
+            SendMessageW(ds->btnTermTokenRoll, WM_SETFONT, (WPARAM)ds->dash->hFontUi, TRUE);
             ds->lblTermHint = CreateWindowExW(0, L"STATIC", L"", WS_CHILD | WS_VISIBLE,
-                18, 152, 700, 80, hwnd, nullptr, hInst, nullptr);
+                18, 206, 700, 54, hwnd, nullptr, hInst, nullptr);
+
+            ds->lblTermSessions = CreateWindowExW(0, L"STATIC", L"", WS_CHILD | WS_VISIBLE,
+                18, 266, 640, 20, hwnd, nullptr, hInst, nullptr);
+            ds->listTermSessions = CreateWindowExW(WS_EX_CLIENTEDGE, WC_LISTVIEWW, L"",
+                WS_CHILD | WS_VISIBLE | WS_TABSTOP | LVS_REPORT | LVS_SINGLESEL | LVS_SHOWSELALWAYS,
+                18, 290, 560, 180, hwnd, (HMENU)IDC_SET_TERM_SESSIONS_LIST, hInst, nullptr);
+            ListView_SetExtendedListViewStyle(ds->listTermSessions, LVS_EX_FULLROWSELECT | LVS_EX_GRIDLINES);
+            {
+                LVCOLUMNW col = {};
+                col.mask = LVCF_TEXT | LVCF_WIDTH | LVCF_SUBITEM;
+                col.cx = 50;
+                col.pszText = const_cast<LPWSTR>(L"ID");
+                ListView_InsertColumn(ds->listTermSessions, 0, &col);
+                col.cx = 160;
+                col.pszText = const_cast<LPWSTR>(L"Remote");
+                ListView_InsertColumn(ds->listTermSessions, 1, &col);
+                col.cx = 190;
+                col.pszText = const_cast<LPWSTR>(L"Target");
+                ListView_InsertColumn(ds->listTermSessions, 2, &col);
+                col.cx = 130;
+                col.pszText = const_cast<LPWSTR>(L"Duration");
+                ListView_InsertColumn(ds->listTermSessions, 3, &col);
+            }
+
+            ds->btnTermKillSession = CreateWindowExW(0, L"BUTTON", L"",
+                WS_CHILD | WS_VISIBLE | WS_TABSTOP,
+                590, 290, 110, 28, hwnd, (HMENU)IDC_SET_TERM_SESSIONS_KILL, hInst, nullptr);
+            ds->btnTermRefreshSessions = CreateWindowExW(0, L"BUTTON", L"",
+                WS_CHILD | WS_VISIBLE | WS_TABSTOP,
+                590, 324, 110, 28, hwnd, (HMENU)IDC_SET_TERM_SESSIONS_REFRESH, hInst, nullptr);
 
             ds->lblWebUiTitle = CreateWindowExW(0, L"STATIC", L"", WS_CHILD | WS_VISIBLE,
                 18, 100, 640, 20, hwnd, nullptr, hInst, nullptr);
@@ -12397,6 +12595,18 @@ static LRESULT CALLBACK SettingsWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPAR
                 Tr(L"LAN 上の WinConsoleTerminal からのリモート接続を許可します。\n暗号化はないため、信頼できる LAN でのみ有効にしてください。",
                    L"Allows remote connections from WinConsoleTerminal on the LAN.\nThere is no encryption, so enable it only on a trusted LAN.",
                    L"Permite conexiones remotas desde WinConsoleTerminal en la LAN.\nNo hay cifrado; actívalo solo en una LAN de confianza."));
+            helpId(IDC_SET_TERM_TOKEN,
+                Tr(L"リモート端末クライアント（WinConsoleTerminal）が接続時に送信する認証トークンです。\n空欄にするとコア起動時に自動生成されます。",
+                   L"Authentication token that remote terminal clients must provide when connecting.\nLeave empty to auto-generate on core startup.",
+                   L"Token de autenticación para clientes de terminal remotos.\nDéjelo vacío para generarlo automáticamente."));
+            helpId(IDC_SET_TERM_TOKEN_UPDATE,
+                Tr(L"入力されたトークンを保存し、実行中の WinConsoleServer に即座に反映します。",
+                   L"Saves the entered token and applies it to the running WinConsoleServer immediately.",
+                   L"Guarda el token ingresado y lo aplica inmediatamente a WinConsoleServer."));
+            helpId(IDC_SET_TERM_TOKEN_ROLL,
+                Tr(L"新しいランダムなトークンを生成し、実行中の WinConsoleServer に即座に反映します。",
+                   L"Generates a new random token and applies it to the running WinConsoleServer immediately.",
+                   L"Genera un nuevo token aleatorio y lo aplica inmediatamente a WinConsoleServer."));
             helpId(IDC_SET_WEBUI_ENABLED,
                 Tr(L"ブラウザから操作できる Web UI を有効にします。\nアクセス URL は下の欄に表示されます。",
                    L"Enables the browser UI.\nThe access URL is shown in the box below.",
@@ -12436,6 +12646,7 @@ static LRESULT CALLBACK SettingsWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPAR
                                ds->lblTriageMode, ds->cmbTriageMode, ds->lblTriageLlmMode, ds->cmbTriageLlmMode,
                                ds->lblTriageKinds,
                                ds->lblTermTitle, ds->chkTermLocal, ds->chkTermRemote, ds->lblTermHint,
+                               ds->lblTermSessions, ds->listTermSessions, ds->btnTermKillSession, ds->btnTermRefreshSessions,
                              ds->lblWebUiTitle, ds->chkWebUi, ds->lblWebUiScope, ds->cmbWebUiScope,
                              ds->lblWebUiAllowedHosts, ds->editWebUiAllowedHosts,
                              ds->lblWebUiPort, ds->editWebUiPort, ds->lblWebUiUrl, ds->editWebUiUrl,
@@ -12483,7 +12694,10 @@ static LRESULT CALLBACK SettingsWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPAR
                     ds->lblProcessMetricsInterval, ds->editProcessMetricsInterval,
                     ds->lblPerformanceHint });
                 terminal.insert(terminal.end(), {
-                    ds->lblTermTitle, ds->chkTermLocal, ds->chkTermRemote, ds->lblTermHint });
+                    ds->lblTermTitle, ds->chkTermLocal, ds->chkTermRemote,
+                    ds->lblTermToken, ds->editTermToken,
+                    ds->btnTermTokenApply, ds->btnTermTokenRoll, ds->lblTermHint,
+                    ds->lblTermSessions, ds->listTermSessions, ds->btnTermKillSession, ds->btnTermRefreshSessions });
                 triage.insert(triage.end(), {
                     ds->lblTriageMode, ds->cmbTriageMode, ds->lblTriageLlmMode, ds->cmbTriageLlmMode,
                     ds->lblTriageKinds });
@@ -12583,6 +12797,68 @@ static LRESULT CALLBACK SettingsWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPAR
             }
             if (id == IDC_SET_TERM_LOCAL || id == IDC_SET_TERM_REMOTE) {
                 ApplyTerminalDialogConfig(ds);
+                return 0;
+            }
+            if (id == IDC_SET_TERM_TOKEN) {
+                if (HIWORD(wParam) == EN_KILLFOCUS) ApplyTerminalDialogConfig(ds);
+                return 0;
+            }
+            if (id == IDC_SET_TERM_TOKEN_UPDATE) {
+                wchar_t buf[256] = {};
+                if (ds->editTermToken) GetWindowTextW(ds->editTermToken, buf, 256);
+                std::wstring ws = buf;
+                size_t first = ws.find_first_not_of(L" \t\r\n");
+                if (first == std::wstring::npos) {
+                    std::string newToken = pc::GenerateTermToken();
+                    SetWindowTextW(ds->editTermToken, Utf8ToWide(newToken).c_str());
+                }
+                ApplyTerminalDialogConfig(ds);
+                DisplaySupervisorHint(ds->dash, Tr(L"WinConsoleServer", L"WinConsoleServer", L"WinConsoleServer"),
+                                      Tr(L"認証トークンを更新・反映しました。",
+                                         L"Authentication token updated and applied.",
+                                         L"Token de autenticación actualizado y aplicado."),
+                                      L"", 3);
+                return 0;
+            }
+            if (id == IDC_SET_TERM_TOKEN_ROLL) {
+                std::string newToken = pc::GenerateTermToken();
+                if (ds->editTermToken) {
+                    SetWindowTextW(ds->editTermToken, Utf8ToWide(newToken).c_str());
+                }
+                ApplyTerminalDialogConfig(ds);
+                DisplaySupervisorHint(ds->dash, Tr(L"WinConsoleServer", L"WinConsoleServer", L"WinConsoleServer"),
+                                      Tr(L"新しい認証トークンを生成し、反映しました。",
+                                         L"Generated and applied new authentication token.",
+                                         L"Nuevo token generado y aplicado."),
+                                      L"", 3);
+                return 0;
+            }
+            if (id == IDC_SET_TERM_SESSIONS_KILL) {
+                if (ds->listTermSessions) {
+                    int sel = static_cast<int>(SendMessageW(ds->listTermSessions, LVM_GETNEXTITEM, -1, LVNI_SELECTED));
+                    if (sel >= 0) {
+                        LVITEMW lvi = {};
+                        lvi.mask = LVIF_PARAM;
+                        lvi.iItem = sel;
+                        if (SendMessageW(ds->listTermSessions, LVM_GETITEMW, 0, reinterpret_cast<LPARAM>(&lvi))) {
+                            uint32_t sid = static_cast<uint32_t>(lvi.lParam);
+                            nlohmann::json req = {{"action", "term_kill_session"}, {"id", sid}};
+                            nlohmann::json resp;
+                            if (GuiIpcCall(ds->dash, req, resp) && resp.value("ok", false)) {
+                                DisplaySupervisorHint(ds->dash, Tr(L"WinConsoleServer", L"WinConsoleServer", L"WinConsoleServer"),
+                                                      Tr(L"セッションを切断しました。",
+                                                         L"Session disconnected.",
+                                                         L"Sesión desconectada."),
+                                                      L"", 3);
+                            }
+                            RefreshTermSessions(ds);
+                        }
+                    }
+                }
+                return 0;
+            }
+            if (id == IDC_SET_TERM_SESSIONS_REFRESH) {
+                RefreshTermSessions(ds);
                 return 0;
             }
             if (id == IDC_SET_WEBUI_ENABLED) {
@@ -12864,6 +13140,7 @@ static LRESULT CALLBACK SettingsWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPAR
         case WM_CLOSE:
             if (ds) CommitSoundSettings(ds);
             if (ds) CommitPerformanceSettings(ds);
+            if (ds) ApplyTerminalDialogConfig(ds);
             DestroyWindow(hwnd);
             return 0;
     }
