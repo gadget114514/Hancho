@@ -14,6 +14,10 @@
 #include <string>
 #include <vector>
 
+#ifndef WM_DPICHANGED
+#define WM_DPICHANGED 0x02E0
+#endif
+
 // ---------------------------------------------------------------------------
 // TerminalGridView
 //
@@ -60,6 +64,7 @@ private:
 
     bool EnsureRenderTarget();
     void ReleaseRenderTarget();
+    bool CreateTextFormats();
 
     void ComputeGridLayout();
     void GetCellRect(int index, D2D1_RECT_F& outRect) const;
@@ -102,6 +107,10 @@ private:
     IDWriteTextFormat*     labelFormat_  = nullptr;
     IDWriteTextFormat*     cellTextFormat_ = nullptr;
     ID2D1SolidColorBrush*  brush_        = nullptr;
+
+    // Window DPI scale. The render target runs at a fixed 96 DPI, so text
+    // formats (sized in DIPs) are scaled by this factor.
+    float dpiScale_ = 1.0f;
 
     // Colors
     D2D1_COLOR_F bgColor_;

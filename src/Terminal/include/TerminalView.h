@@ -15,6 +15,7 @@
 #include "ConPtySession.h"
 #include "ImageManager.h"
 #include "wcsp/iterminal_io.h"
+#include "wcsp/protocol.h"
 
 #include <functional>
 #include <memory>
@@ -26,8 +27,16 @@
 // Posted by the ConPTY reader thread to deliver output on the UI thread.
 #define WM_TERMINAL_OUTPUT (WM_USER + 200)
 
+// Posted by the WCSP receiver thread when the server reports an applied size.
+// lParam is a heap-allocated wcs::ResizedInfo owned by the window procedure.
+#define WM_TERMINAL_RESIZED (WM_USER + 201)
+
 // Sent to parent window to report taskbar progress (lParam = 0–10000, or -1 to clear).
 #define WM_TERMINAL_PROGRESS (WM_USER + 299)
+
+#ifndef WM_DPICHANGED
+#define WM_DPICHANGED 0x02E0
+#endif
 
 // ---------------------------------------------------------------------------
 // TerminalView
@@ -120,6 +129,8 @@ private:
     LRESULT OnCreate(HWND hwnd);
     void    OnDestroy();
     void    OnSize(int w, int h);
+    void    OnRemoteResized(const wcs::ResizedInfo& info);
+    void    ReassertSize();
     void    OnPaint();
     void    OnKeyDown(WPARAM vk, LPARAM lParam);
     void    OnChar(wchar_t ch);
@@ -135,7 +146,13 @@ private:
     // Rendering
     bool EnsureRenderTarget();
     void ReleaseRenderTarget();
+    bool CreateTextFormats();
     void UpdateMetrics();
+    float ScalePx(float value) const { return value * dpiScale_; }
+    float ScrollBarWidth() const { return kScrollBarWidth * dpiScale_; }
+    // Cells that fit in a w x h pixel client area (the scroll bar strip is
+    // excluded because OnPaint clips it away). False when metrics are not ready.
+    bool GridSizeFor(int w, int h, int& cols, int& rows) const;
     void DrawCell(ID2D1RenderTarget* rt, int row, int col,
                   const TerminalCell& cell, bool isCursor, bool cursorVisible,
                   bool isSelected = false);
@@ -211,6 +228,15 @@ private:
     float cellWidth_  = 8.0f;
     float cellHeight_ = 16.0f;
     float baseline_   = 12.0f;
+
+    // Window DPI scale (physical pixels per DIP). The render target is created
+    // at 96 DPI so Direct2D units are physical pixels; text formats are scaled
+    // by this factor.
+    float dpiScale_ = 1.0f;
+
+    // Set when another WCSP client changed the PTY size. The next focus or
+    // keystroke re-asserts this window's size (last-active-client-wins).
+    bool sizeMismatch_ = false;
 
     // Cursor blink
     bool   cursorBlink_   = true;   // current visible state (true = visible; starts visible so cursor shows at startup)

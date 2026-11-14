@@ -38,6 +38,7 @@ public:
     ~RemoteSession() override;
 
     void SetOutputSink(OutputFn fn) override;
+    void SetResizedHandler(ResizedFn fn) override;
     bool Start(const TerminalStartOptions& opt, std::wstring* error) override;
 
     void Write(const void* data, size_t len) override;

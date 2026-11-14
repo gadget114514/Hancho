@@ -381,6 +381,14 @@ LRESULT TerminalGridView::WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
     switch (msg) {
     case WM_CREATE:       return OnCreate(hwnd);
     case WM_DESTROY:      OnDestroy(); return 0;
+    case WM_DPICHANGED: {
+        const UINT dpi = HIWORD(wp);
+        if (dpi > 0) dpiScale_ = (float)dpi / 96.0f;
+        CreateTextFormats();
+        ReleaseRenderTarget();
+        InvalidateRect(hwnd, nullptr, FALSE);
+        return 0;
+    }
     case WM_PAINT:        OnPaint(); return 0;
     case WM_PRINTCLIENT: {
         HDC hdc = (HDC)wp;
@@ -391,7 +399,7 @@ LRESULT TerminalGridView::WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
             FillRect(hdc, &rcClient, bgBrush);
             DeleteObject(bgBrush);
 
-            HFONT hFontLbl = CreateFontW(-14, 0, 0, 0, FW_SEMIBOLD, FALSE, FALSE, FALSE, DEFAULT_CHARSET,
+            HFONT hFontLbl = CreateFontW(-(LONG)(14 * dpiScale_), 0, 0, 0, FW_SEMIBOLD, FALSE, FALSE, FALSE, DEFAULT_CHARSET,
                                          OUT_DEFAULT_PRECIS, CLIP_DEFAULT_PRECIS, CLEARTYPE_QUALITY, DEFAULT_PITCH, L"Segoe UI");
             HGDIOBJ oldF = SelectObject(hdc, hFontLbl);
             SetBkMode(hdc, TRANSPARENT);
@@ -469,34 +477,61 @@ LRESULT TerminalGridView::OnCreate(HWND hwnd) {
                         __uuidof(IDWriteFactory),
                         reinterpret_cast<IUnknown**>(&dwFactory_));
 
-    // Label text format (terminal name below thumbnail)
-    if (dwFactory_) {
-        dwFactory_->CreateTextFormat(
-            L"Segoe UI", nullptr,
-            DWRITE_FONT_WEIGHT_SEMI_BOLD, DWRITE_FONT_STYLE_NORMAL,
-            DWRITE_FONT_STRETCH_NORMAL,
-            11.0f * 96.0f / 72.0f,
-            L"", &labelFormat_);
-        if (labelFormat_) {
-            labelFormat_->SetTextAlignment(DWRITE_TEXT_ALIGNMENT_CENTER);
-            labelFormat_->SetParagraphAlignment(DWRITE_PARAGRAPH_ALIGNMENT_CENTER);
-            labelFormat_->SetWordWrapping(DWRITE_WORD_WRAPPING_NO_WRAP);
-        }
-
-        dwFactory_->CreateTextFormat(
-            L"Consolas", nullptr,
-            DWRITE_FONT_WEIGHT_REGULAR, DWRITE_FONT_STYLE_NORMAL,
-            DWRITE_FONT_STRETCH_NORMAL,
-            8.0f * 96.0f / 72.0f,
-            L"", &cellTextFormat_);
-        if (cellTextFormat_) {
-            cellTextFormat_->SetTextAlignment(DWRITE_TEXT_ALIGNMENT_LEADING);
-            cellTextFormat_->SetParagraphAlignment(DWRITE_PARAGRAPH_ALIGNMENT_NEAR);
-            cellTextFormat_->SetWordWrapping(DWRITE_WORD_WRAPPING_NO_WRAP);
+    // The process is system-DPI aware; Direct2D runs at 96 DPI and the text
+    // formats are enlarged by the window's DPI scale.
+    dpiScale_ = 1.0f;
+    {
+        using GetDpiForWindowFn = UINT(WINAPI*)(HWND);
+        HMODULE user32 = GetModuleHandleW(L"user32.dll");
+        auto getDpi = user32
+            ? reinterpret_cast<GetDpiForWindowFn>(
+                  GetProcAddress(user32, "GetDpiForWindow"))
+            : nullptr;
+        if (getDpi) {
+            const UINT dpi = getDpi(hwnd);
+            if (dpi > 0) dpiScale_ = (float)dpi / 96.0f;
+        } else if (HDC hdc = GetDC(hwnd)) {
+            const int dpi = GetDeviceCaps(hdc, LOGPIXELSX);
+            ReleaseDC(hwnd, hdc);
+            if (dpi > 0) dpiScale_ = (float)dpi / 96.0f;
         }
     }
+    if (dpiScale_ <= 0.0f) dpiScale_ = 1.0f;
 
+    CreateTextFormats();
     return 0;
+}
+
+bool TerminalGridView::CreateTextFormats() {
+    if (!dwFactory_) return false;
+    if (labelFormat_)    { labelFormat_->Release();    labelFormat_    = nullptr; }
+    if (cellTextFormat_) { cellTextFormat_->Release(); cellTextFormat_ = nullptr; }
+
+    // Label text format (terminal name below thumbnail)
+    dwFactory_->CreateTextFormat(
+        L"Segoe UI", nullptr,
+        DWRITE_FONT_WEIGHT_SEMI_BOLD, DWRITE_FONT_STYLE_NORMAL,
+        DWRITE_FONT_STRETCH_NORMAL,
+        11.0f * 96.0f / 72.0f * dpiScale_,
+        L"", &labelFormat_);
+    if (labelFormat_) {
+        labelFormat_->SetTextAlignment(DWRITE_TEXT_ALIGNMENT_CENTER);
+        labelFormat_->SetParagraphAlignment(DWRITE_PARAGRAPH_ALIGNMENT_CENTER);
+        labelFormat_->SetWordWrapping(DWRITE_WORD_WRAPPING_NO_WRAP);
+    }
+
+    dwFactory_->CreateTextFormat(
+        L"Consolas", nullptr,
+        DWRITE_FONT_WEIGHT_REGULAR, DWRITE_FONT_STYLE_NORMAL,
+        DWRITE_FONT_STRETCH_NORMAL,
+        8.0f * 96.0f / 72.0f * dpiScale_,
+        L"", &cellTextFormat_);
+    if (cellTextFormat_) {
+        cellTextFormat_->SetTextAlignment(DWRITE_TEXT_ALIGNMENT_LEADING);
+        cellTextFormat_->SetParagraphAlignment(DWRITE_PARAGRAPH_ALIGNMENT_NEAR);
+        cellTextFormat_->SetWordWrapping(DWRITE_WORD_WRAPPING_NO_WRAP);
+    }
+    return labelFormat_ != nullptr;
 }
 
 // ---------------------------------------------------------------------------
@@ -525,7 +560,8 @@ bool TerminalGridView::EnsureRenderTarget() {
         D2D1::RenderTargetProperties(
             D2D1_RENDER_TARGET_TYPE_DEFAULT,
             D2D1::PixelFormat(DXGI_FORMAT_B8G8R8A8_UNORM,
-                              D2D1_ALPHA_MODE_PREMULTIPLIED)),
+                              D2D1_ALPHA_MODE_PREMULTIPLIED),
+            96.0f, 96.0f),
         D2D1::HwndRenderTargetProperties(hwnd_, size),
         &renderTarget_);
     return SUCCEEDED(hr);

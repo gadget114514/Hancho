@@ -106,6 +106,8 @@ bool SendAll(SOCKET socket, const uint8_t* data, size_t len) {
     return true;
 }
 
+class TermConnection;
+
 struct TermShared {
     ProcessManager* pm = nullptr;
     std::string token;
@@ -113,9 +115,14 @@ struct TermShared {
     std::condition_variable cv;
     int activeSessions = 0;
     bool stopping = false;
-};
 
-class TermConnection;
+    // Live connections, used to forward a shared-job resize to the other
+    // clients attached to the same job (FeatureSizeSync).
+    std::mutex registryMutex;
+    std::unordered_map<uint32_t, std::weak_ptr<TermConnection>> registry;
+
+    void NotifyPeers(int jobId, uint32_t fromId, uint16_t cols, uint16_t rows);
+};
 
 class TermConnection {
 public:
@@ -165,6 +172,24 @@ public:
         return info;
     }
 
+    uint32_t Id() const { return id_; }
+    int JobId() const { return jobId_.load(); }
+    bool WantsSizeSync() const { return sizeSync_.load(); }
+
+    // Sends RESIZED{cols, rows, Peer} to this client when it negotiated
+    // FeatureSizeSync. Safe to call from another connection's thread.
+    void NotifyPeerResize(uint16_t cols, uint16_t rows) {
+        if (!sizeSync_.load()) return;
+        wcs::ResizedInfo info;
+        info.cols = cols;
+        info.rows = rows;
+        info.reason = wcs::ResizeReason::Peer;
+        wcs::Frame out;
+        out.type = wcs::FrameType::Resized;
+        out.payload = wcs::EncodeResized(info);
+        EnqueueFrame(std::move(out), true);
+    }
+
 private:
     bool ReadFrame(wcs::Frame& frame, int timeoutMs, std::string* error);
     bool SendFrame(const wcs::Frame& frame);
@@ -186,10 +211,11 @@ private:
 
     wcs::FrameReader reader_;
 
-    int jobId_ = 0;
+    std::atomic<int> jobId_{0};
     int subId_ = 0;
     bool spawned_ = false;
     bool terminateRequested_ = false;
+    std::atomic<bool> sizeSync_{false};  // HELLO and HELLO_ACK both had FeatureSizeSync
 
     std::mutex queueMutex_;
     std::condition_variable queueCv_;
@@ -208,6 +234,26 @@ private:
     std::string target_ = "(connecting)";
     std::chrono::steady_clock::time_point connectTime_;
 };
+
+void TermShared::NotifyPeers(int jobId, uint32_t fromId,
+                             uint16_t cols, uint16_t rows) {
+    if (jobId <= 0) return;
+    std::vector<std::shared_ptr<TermConnection>> targets;
+    {
+        std::lock_guard<std::mutex> lock(registryMutex);
+        for (const auto& kv : registry) {
+            std::shared_ptr<TermConnection> conn = kv.second.lock();
+            if (conn && conn->Id() != fromId && conn->JobId() == jobId) {
+                targets.push_back(std::move(conn));
+            }
+        }
+    }
+    // Enqueue outside the registry lock: EnqueueFrame takes the connection's
+    // own queue lock.
+    for (const auto& conn : targets) {
+        conn->NotifyPeerResize(cols, rows);
+    }
+}
 
 void TermConnection::ShutdownSocket() {
     if (socket_ != INVALID_SOCKET) {
@@ -423,7 +469,7 @@ bool TermConnection::HandleFrame(const wcs::Frame& frame, wcs::ExitReason& exitR
         int cols = std::clamp<int>(info.cols, wcs::kMinColumns, wcs::kMaxDimension);
         int rows = std::clamp<int>(info.rows, wcs::kMinRows, wcs::kMaxDimension);
         std::string err;
-        pm.ResizeTerminal(jobId_, cols, rows, err);
+        const bool resizedOk = pm.ResizeTerminal(jobId_, cols, rows, err);
 
         wcs::ResizedInfo resized;
         resized.cols = static_cast<uint16_t>(cols);
@@ -436,6 +482,14 @@ bool TermConnection::HandleFrame(const wcs::Frame& frame, wcs::ExitReason& exitR
         out.type = wcs::FrameType::Resized;
         out.payload = wcs::EncodeResized(resized);
         EnqueueFrame(std::move(out), true);
+
+        // Tell every other SizeSync client attached to the same job that the
+        // shared PTY size changed.
+        if (resizedOk) {
+            shared_->NotifyPeers(jobId_, id_,
+                                 static_cast<uint16_t>(cols),
+                                 static_cast<uint16_t>(rows));
+        }
         return false;
     }
 
@@ -532,6 +586,11 @@ void TermConnection::Run() {
     const uint16_t rows = static_cast<uint16_t>(
         std::clamp<int>(hello.rows, wcs::kMinRows, wcs::kMaxDimension));
 
+    // FeatureSizeSync is active only when both sides advertise it; HELLO_ACK
+    // carries hello.features & kDefaultFeatures (see below).
+    sizeSync_ = (hello.features & wcs::kDefaultFeatures &
+                 wcs::FeatureSizeSync) != 0;
+
     std::string shellName = hello.shell;
     const std::string lowerShell = ToLower(shellName);
     target_ = shellName.empty() ? "powershell" : shellName;
@@ -608,9 +667,13 @@ void TermConnection::Run() {
     }
 
     // Resize the existing job to the client's size before taking the replay.
+    // Other clients already attached to the same job learn about it when they
+    // negotiated FeatureSizeSync.
     {
         std::string resizeErr;
-        pm.ResizeTerminal(jobId_, cols, rows, resizeErr);
+        if (pm.ResizeTerminal(jobId_, cols, rows, resizeErr)) {
+            shared_->NotifyPeers(jobId_, id_, cols, rows);
+        }
     }
 
     {
@@ -839,6 +902,10 @@ void TermServer::Impl::AcceptLoop() {
             sessions[id] = conn;
         }
         {
+            std::lock_guard<std::mutex> lock(shared->registryMutex);
+            shared->registry[id] = conn;
+        }
+        {
             std::lock_guard<std::mutex> lock(shared->mutex);
             shared->activeSessions++;
         }
@@ -849,6 +916,10 @@ void TermServer::Impl::AcceptLoop() {
             {
                 std::lock_guard<std::mutex> lock(sessionsMutex);
                 sessions.erase(id);
+            }
+            {
+                std::lock_guard<std::mutex> lock(sharedState->registryMutex);
+                sharedState->registry.erase(id);
             }
             {
                 std::lock_guard<std::mutex> lock(sharedState->mutex);

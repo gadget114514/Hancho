@@ -13,7 +13,7 @@
 namespace wcs {
 
 constexpr uint16_t kProtocolMajor = 1;
-constexpr uint16_t kProtocolMinor = 1;
+constexpr uint16_t kProtocolMinor = 2;
 
 constexpr uint32_t kMaxPayloadBytes = 1024u * 1024u;
 constexpr uint16_t kMaxDimension = 1000;
@@ -59,11 +59,13 @@ enum Feature : uint32_t {
     FeatureClipboardOsc52   = 1u << 6,
     FeatureExitCode         = 1u << 7,
     FeatureSessionList      = 1u << 8,
+    FeatureSizeSync         = 1u << 9,
 };
 
 constexpr uint32_t kDefaultFeatures =
     FeatureResize | FeaturePriorityInput | FeatureImagePassthrough |
-    FeatureClipboardOsc52 | FeatureExitCode | FeatureSessionList;
+    FeatureClipboardOsc52 | FeatureExitCode | FeatureSessionList |
+    FeatureSizeSync;
 
 enum class ErrorCode : uint16_t {
     InvalidFrame     = 0x0001,
@@ -89,6 +91,7 @@ enum class ExitReason : uint16_t {
 enum class ResizeReason : uint16_t {
     Applied = 0,
     Clamped = 1,
+    Peer    = 2,  // another client changed the shared PTY size
 };
 
 // TLV type ids used by HELLO / HELLO_ACK.

@@ -2,7 +2,7 @@
 
 WCSP is the binary protocol Hancho uses to expose ConPTY terminal jobs over TCP. It was imported from WinConsoleServer and is implemented by the core's terminal server (`src/term_server.cpp`) and by the client in `src/wcsp/` (`RemoteSession`).
 
-This document describes protocol version **1.1**. Version 1.1 adds the retained-session list (`LIST_SESSIONS` / `SESSION_LIST`) and persistent sessions. The reference implementation is `src/wcsp/protocol.h` / `protocol.cpp`.
+This document describes protocol version **1.2**. Version 1.1 adds the retained-session list (`LIST_SESSIONS` / `SESSION_LIST`) and persistent sessions. Version 1.2 adds `FeatureSizeSync`, the `RESIZED` reason `PEER`, and the rule that terminal sizes are exchanged in **cells** only. The reference implementation is `src/wcsp/protocol.h` / `protocol.cpp`.
 
 ## 1. Transport and endpoint
 
@@ -100,7 +100,7 @@ Strings are UTF-8 without a NUL terminator. `ENV` may appear more than once. Unk
 | `0x06` | `AUTH_RESULT` | server → client | Reserved. |
 | `0x10` | `INPUT` | client → server | Implemented. Raw terminal input. |
 | `0x11` | `RESIZE` | client → server | Implemented. |
-| `0x12` | `RESIZED` | server → client | Implemented. Reports the applied (possibly clamped) size. |
+| `0x12` | `RESIZED` | server → client | Implemented. Reports the applied (possibly clamped) size, or a peer client's size. |
 | `0x13` | `CLOSE` | client → server | Implemented. Terminates the session: the underlying ConPTY job is closed. No payload. |
 | `0x14` | `PING` | both | Implemented. Payload is a `uint64` nonce. |
 | `0x15` | `PONG` | both | Implemented. Echoes the nonce. |
@@ -137,7 +137,7 @@ The server replies with `HELLO_ACK` after validating the request, resizing the t
 
 | TLV | Description |
 | :--- | :--- |
-| `VERSION` | Server version (`1.0`). |
+| `VERSION` | Server version (`1.2`). |
 | `NAME` | Server name (Hancho sends `WinConsoleServer`). |
 | `FEATURES` | Negotiated features: `hello.features & server_supported_features`. |
 | `SIZE` | Accepted `cols` × `rows` after clamping. |
@@ -160,8 +160,9 @@ If the client requested a different size and the server clamped it, the client s
 | `1 << 6` | `CLIPBOARD_OSC52` | Advertised; OSC 52 sequences travel in `OUTPUT`. |
 | `1 << 7` | `EXIT_CODE` | Implemented in `EXIT`. |
 | `1 << 8` | `SESSION_LIST` | Implemented. `LIST_SESSIONS` / `SESSION_LIST`. |
+| `1 << 9` | `SIZE_SYNC` | Implemented. Multi-client size negotiation (section 7). |
 
-Hancho's default client feature mask is `0x1E3` (resize, priority input, image passthrough, clipboard OSC 52, exit code and session list). A server never turns on a bit the client did not request.
+Hancho's default client feature mask is `0x3E3` (resize, priority input, image passthrough, clipboard OSC 52, exit code, session list and size sync). A server never turns on a bit the client did not request. `SIZE_SYNC` is active only when both `HELLO` and `HELLO_ACK` carry it.
 
 ### Handshake sequence
 
@@ -202,7 +203,7 @@ Handshake validation failures send `ERROR` and close the connection; transport f
 - `attach:<id>` attaches to an existing Hancho process **only if** it is a headless ConPTY job. Non-ConPTY jobs, jobs with no headless PTY, and unknown ids return `ShellNotAllowed`.
 - The server resizes the target job to the requested `SIZE` before taking the replay.
 - A new subscriber first receives the tail of the raw output (`history_bytes`) as `OUTPUT`, then live output. The replay is raw bytes and may begin in the middle of an escape sequence; feed it to the terminal parser as-is.
-- Several clients may attach to the same job. Each has its own `SESSION_ID` and receives its own replay.
+- Several clients may attach to the same job. Each has its own `SESSION_ID` and receives its own replay. When clients negotiate `SIZE_SYNC`, a resize from one is forwarded to the others as `RESIZED` with reason `PEER`; otherwise they must not assume the PTY keeps their requested size.
 - An **attached** job keeps running when the client detaches or closes the connection without `CLOSE`.
 - A **shell started by this session** is now retained too. A lost connection, a client crash or a plain socket close only detaches; the shell keeps running and appears in the session list. Send `CLOSE` to terminate it explicitly.
 - Any retained ConPTY job can be reattached with `attach:<id>`. The client lists the retained sessions with `LIST_SESSIONS` and lets the user choose one or more.
@@ -247,8 +248,11 @@ RESIZED payload: uint16 cols, uint16 rows, uint16 reason
 ```
 
 - `cols` is clamped to `2..1000`, `rows` to `1..1000`.
-- `reason` is `0` (`APPLIED`) when the requested size was accepted, or `1` (`CLAMPED`) when the reply contains a different size.
+- `reason` is `0` (`APPLIED`) when the requested size was accepted, `1` (`CLAMPED`) when the reply contains a different size, or `2` (`PEER`) when another client resized the shared PTY. Unknown reason values are ignored but still decoded.
+- After a successful `RESIZE`, the server sends `RESIZED{PEER}` to every *other* connection attached to the same job that negotiated `SIZE_SYNC`. Attaching a new client resizes the job during the handshake and notifies those peers the same way.
 - A malformed payload is ignored (the connection stays open).
+
+Sizes are exchanged in **cells** only. DPI, font size, display scaling and window chrome are client-local concerns: a client must compute `cols`/`rows` from the physical pixels of its viewport and its own cell metrics, and must never send pixels or DIPs. Hancho's client creates Direct2D at a fixed 96 DPI and scales glyph sizes by the window DPI so one cell metric is valid in both units.
 
 ## 8. CLOSE, EXIT and ERROR
 
@@ -341,10 +345,10 @@ The server splits an attachment replay into `OUTPUT` frames of at most **256 KiB
 ## 12. Minimal client checklist
 
 1. Connect over TCP and send `HELLO` with `MAGIC`, `VERSION` `1.0`, `SIZE`, `SHELL`, and `TOKEN`.
-2. Wait for `HELLO_ACK`; on `ERROR`, surface `code` and `message` and close. Use `VERSION` `1.1` and `FEATURES` bit 8 to advertise session-list support.
+2. Wait for `HELLO_ACK`; on `ERROR`, surface `code` and `message` and close. Use `VERSION` `1.2`, `FEATURES` bit 8 for session-list support and bit 9 for multi-client size sync.
 3. Parse frames incrementally and enforce the 1 MiB payload limit.
 4. Feed `OUTPUT` bytes to a VT parser without assuming UTF-8 boundaries or line boundaries.
 5. Send `INPUT` for keystrokes, `RESIZE` when the viewport changes, and `PING` periodically.
-6. Handle `RESIZED`, `PONG`, `EXIT`, and `ERROR`; ignore unknown frame types.
+6. Handle `RESIZED` (`APPLIED` / `CLAMPED` / `PEER`), `PONG`, `EXIT`, and `ERROR`; ignore unknown frame types. With `SIZE_SYNC`, re-assert your own size on the next focus or keystroke if a `PEER` resize wins.
 7. To reconnect, open a control session (`SHELL=list`), send `LIST_SESSIONS`, read `SESSION_LIST`, and attach a chosen id with `attach:<id>`.
 8. Close the socket to detach and keep the session. Send `CLOSE` only to terminate it (the underlying ConPTY job is closed).

@@ -23,7 +23,7 @@
   - `File` > **New local shell** (PowerShell / cmd / bash), **Attach to local job...** (`attach:<id>`) or **Connect to remote...** (host, port, token, target).
   - A right-click (or the **Edit** menu) offers **Copy** / **Paste**; a right-click on a tab also offers **Reconnect** and **Close**. New local ConPTY jobs started from the dashboard (`+ Launch`) are attached automatically.
   - **Settings** controls **Always on top**, **Remember window position**, automatic attach, and the byte-based **Scrollback** budget (64–2048 MB per tab; default 1024 MB).
-  - Hardware-accelerated Direct2D / DirectWrite / IME / Sixel VT terminal emulator (`TerminalView`), always at least **80 columns × 25 rows** so TUI apps (`claude`, `opencode`, `vim`, `htop`) do not wrap or corrupt their layout.
+  - Hardware-accelerated Direct2D / DirectWrite / IME / Sixel VT terminal emulator (`TerminalView`). The reported terminal size is computed from the physical pixel size of the viewport and the current font cell metrics, so it is correct at 100 %, 150 % and other display scales, and follows the window size (no artificial 80×25 floor).
   - Type directly into the terminal (full keyboard input, `Ctrl+C`, IME composition, mouse wheel scrollback, and text selection).
 - **Compact Icon Buttons with Hover Tooltips**:
   - **`[☰]`** Hide/Show Process List toggle
@@ -108,6 +108,7 @@
 ## 11. Terminal sessions (WCSP)
 - The core exposes every ConPTY job over the WinConsoleServer protocol (WCSP v1). The terminal client (`Hancho.exe terminal`, or the `[>_]` toolbar button) runs in its own window, separate from the dashboard. Each tab is an independent WCSP session, so several local or remote consoles can be connected at the same time; closing a tab or the client does not stop an attached job.
 - In the client, `File` > **New local shell** opens a PowerShell / cmd / bash job on the core, **Attach to local job...** lists the running ConPTY jobs (`attach:<id>`), and **Connect to remote...** connects to another Hancho core by host, port and token. New local jobs started from the dashboard (`+ Launch`) are attached automatically. Right-click a tab for **Reconnect** or **Close**.
+- The client reports its viewport size in cells. With WCSP `FeatureSizeSync`, when several clients attach to the same job the PTY follows the most recently active client: the others receive `RESIZED` reason `PEER` and re-assert their own size on the next focus or keystroke, like tmux. Display scaling (DPI) is handled locally and never leaks into the protocol.
 - Closing a tab or the client asks whether to **terminate** or **detach**. **Terminate** sends a WCSP `CLOSE` and closes the server-side ConPTY (whether it was started by the client or attached from the dashboard). **Detach** keeps the session open so `File` > **Reconnect to session...** can list and reopen it later.
 - The listener is configured in `<data-dir>/config.json`:
 

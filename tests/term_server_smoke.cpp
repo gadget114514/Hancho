@@ -283,6 +283,84 @@ int main(int argc, char** argv) {
                 spawnedProcess.value("state", "") != "running";
     Check(gone, "CLOSE terminates a retained spawned session");
 
+    // WCSP 1.2 FeatureSizeSync: a RESIZE from one client is forwarded to the
+    // other clients attached to the same job as RESIZED{reason=Peer}. A client
+    // that did not advertise the feature receives no Peer frame.
+    {
+        struct ResizeSink {
+            std::mutex mutex;
+            std::condition_variable cv;
+            std::vector<wcs::ResizedInfo> events;
+
+            void Add(const wcs::ResizedInfo& info) {
+                std::lock_guard<std::mutex> lock(mutex);
+                events.push_back(info);
+                cv.notify_all();
+            }
+            bool WaitFor(wcs::ResizeReason reason, uint16_t cols, uint16_t rows,
+                         int timeoutMs) {
+                std::unique_lock<std::mutex> lock(mutex);
+                return cv.wait_for(lock, std::chrono::milliseconds(timeoutMs), [&] {
+                    for (const auto& e : events) {
+                        if (e.reason == reason && e.cols == cols && e.rows == rows)
+                            return true;
+                    }
+                    return false;
+                });
+            }
+            bool HasReason(wcs::ResizeReason reason) {
+                std::lock_guard<std::mutex> lock(mutex);
+                for (const auto& e : events) {
+                    if (e.reason == reason) return true;
+                }
+                return false;
+            }
+        };
+
+        ResizeSink sinkA;
+        ResizeSink sinkB;
+        ResizeSink sinkLegacy;
+
+        RemoteConfig syncCfg = cfg;
+        syncCfg.features = wcs::kDefaultFeatures;  // includes FeatureSizeSync
+        RemoteSession syncA(syncCfg);
+        RemoteSession syncB(syncCfg);
+        syncA.SetResizedHandler([&](const wcs::ResizedInfo& info) { sinkA.Add(info); });
+        syncB.SetResizedHandler([&](const wcs::ResizedInfo& info) { sinkB.Add(info); });
+
+        RemoteConfig legacyCfg = cfg;
+        legacyCfg.features = wcs::kDefaultFeatures & ~wcs::FeatureSizeSync;
+        RemoteSession legacy(legacyCfg);
+        legacy.SetResizedHandler([&](const wcs::ResizedInfo& info) { sinkLegacy.Add(info); });
+
+        TerminalStartOptions sizeOpt;
+        sizeOpt.shell = L"attach:" + std::to_wstring(jobId);
+        sizeOpt.cols = 80;
+        sizeOpt.rows = 25;
+
+        Check(syncA.Start(sizeOpt, &error), "SizeSync client A attaches");
+        Check(syncB.Start(sizeOpt, &error), "SizeSync client B attaches");
+        Check(legacy.Start(sizeOpt, &error), "legacy client attaches without SizeSync");
+
+        // B's handshake also resizes the job; that may already notify A.
+        Sleep(200);
+        syncB.Resize(100, 30);
+        Check(sinkA.WaitFor(wcs::ResizeReason::Peer, 100, 30, 3000),
+              "SizeSync peer A receives RESIZED(Peer) from B's resize");
+
+        syncA.Resize(90, 20);
+        Check(sinkB.WaitFor(wcs::ResizeReason::Peer, 90, 20, 3000),
+              "SizeSync peer B receives RESIZED(Peer) from A's resize");
+
+        Sleep(300);
+        Check(!sinkLegacy.HasReason(wcs::ResizeReason::Peer),
+              "a client without FeatureSizeSync receives no Peer RESIZED");
+
+        syncA.Close();
+        syncB.Close();
+        legacy.Close();
+    }
+
     std::printf("\n%d passed, %d failed\n", g_passes, g_failures);
     return g_failures == 0 ? 0 : 1;
 }

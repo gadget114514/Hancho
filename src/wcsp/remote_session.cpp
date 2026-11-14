@@ -42,6 +42,10 @@ void RemoteSession::SetOutputSink(OutputFn fn) {
     sink_ = std::move(fn);
 }
 
+void RemoteSession::SetResizedHandler(ResizedFn fn) {
+    onResized = std::move(fn);
+}
+
 bool RemoteSession::Start(const TerminalStartOptions& opt, std::wstring* error) {
     if (running_) return true;
     stopping_ = false;

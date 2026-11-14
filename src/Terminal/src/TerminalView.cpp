@@ -168,19 +168,11 @@ bool TerminalView::StartRemote(const std::wstring& target, std::wstring* error) 
     opt.shell = target;
     opt.codePage = CP_UTF8;
 
-    int cols = static_cast<int>(buffer_.columns());
-    int rows = static_cast<int>(buffer_.rows());
+    int cols = 80;
+    int rows = 25;
     if (hwnd_) {
         RECT rc; GetClientRect(hwnd_, &rc);
-        if (rc.right - rc.left > 120 && rc.bottom - rc.top > 100) {
-            if (cellWidth_ > 0)
-                cols = std::max(80, static_cast<int>((rc.right - rc.left) / cellWidth_));
-            if (cellHeight_ > 0)
-                rows = std::max(25, static_cast<int>((rc.bottom - rc.top) / cellHeight_));
-        } else {
-            cols = 80;
-            rows = 25;
-        }
+        GridSizeFor(rc.right - rc.left, rc.bottom - rc.top, cols, rows);
     }
     opt.cols = cols;
     opt.rows = rows;
@@ -196,6 +188,13 @@ bool TerminalView::StartRemote(const std::wstring& target, std::wstring* error) 
         char* copy = new char[len];
         memcpy(copy, data, len);
         PostMessage(hwnd_, WM_TERMINAL_OUTPUT, (WPARAM)copy, (LPARAM)len);
+    });
+
+    // The receiver thread must never touch the buffer; hand the applied size
+    // to the UI thread.
+    remoteIo_->SetResizedHandler([this](const wcs::ResizedInfo& info) {
+        auto* copy = new wcs::ResizedInfo(info);
+        PostMessage(hwnd_, WM_TERMINAL_RESIZED, 0, (LPARAM)copy);
     });
 
     return remoteIo_->Start(opt, error);
@@ -216,17 +215,11 @@ bool TerminalView::StartSession(const std::wstring& shell,
     buffer_.setAmbiguousWide(codePage_ == 932);
 
     // Initial size from window, or reasonable default
-    int cols = (int)(buffer_.columns());
-    int rows = (int)(buffer_.rows());
+    int cols = 80;
+    int rows = 25;
     if (hwnd_) {
         RECT rc; GetClientRect(hwnd_, &rc);
-        if (rc.right - rc.left > 120 && rc.bottom - rc.top > 100) {
-            if (cellWidth_  > 0) cols = std::max(80, (int)((rc.right  - rc.left) / cellWidth_));
-            if (cellHeight_ > 0) rows = std::max(25, (int)((rc.bottom - rc.top)  / cellHeight_));
-        } else {
-            cols = 80;
-            rows = 25;
-        }
+        GridSizeFor(rc.right - rc.left, rc.bottom - rc.top, cols, rows);
     }
     {
         std::lock_guard<std::mutex> lock(bufferMutex_);
@@ -326,6 +319,17 @@ LRESULT TerminalView::WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
     case WM_CREATE:       return OnCreate(hwnd);
     case WM_DESTROY:      OnDestroy(); return 0;
     case WM_SIZE:         OnSize(LOWORD(lp), HIWORD(lp)); return 0;
+    case WM_DPICHANGED: {
+        const UINT dpi = HIWORD(wp);
+        if (dpi > 0) dpiScale_ = (float)dpi / 96.0f;
+        CreateTextFormats();
+        UpdateMetrics();
+        ReleaseRenderTarget();
+        RECT rc; GetClientRect(hwnd, &rc);
+        OnSize(rc.right - rc.left, rc.bottom - rc.top);
+        InvalidateRect(hwnd, nullptr, FALSE);
+        return 0;
+    }
     case WM_PAINT:        OnPaint(); return 0;
     case WM_PRINTCLIENT: {
         HDC hdc = (HDC)wp;
@@ -337,13 +341,14 @@ LRESULT TerminalView::WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
             DeleteObject(bg);
             std::wstring text = ExtractScreenText(0);
             if (!text.empty()) {
-                HFONT hFont = CreateFontW(-15, 0, 0, 0, FW_NORMAL, FALSE, FALSE, FALSE, DEFAULT_CHARSET,
+                HFONT hFont = CreateFontW(-(LONG)ScalePx(15.0f), 0, 0, 0, FW_NORMAL, FALSE, FALSE, FALSE, DEFAULT_CHARSET,
                                           OUT_DEFAULT_PRECIS, CLIP_DEFAULT_PRECIS, CLEARTYPE_QUALITY,
                                           FIXED_PITCH | FF_MODERN, L"Consolas");
                 HGDIOBJ oldF = SelectObject(hdc, hFont);
                 SetBkMode(hdc, TRANSPARENT);
                 SetTextColor(hdc, RGB(226, 232, 240));
-                RECT rcPad = {rc.left + 8, rc.top + 6, rc.right - 8, rc.bottom - 6};
+                RECT rcPad = {rc.left + (LONG)ScalePx(8.0f), rc.top + (LONG)ScalePx(6.0f),
+                              rc.right - (LONG)ScalePx(8.0f), rc.bottom - (LONG)ScalePx(6.0f)};
                 DrawTextW(hdc, text.c_str(), -1, &rcPad, DT_LEFT | DT_TOP | DT_NOPREFIX);
                 SelectObject(hdc, oldF);
                 DeleteObject(hFont);
@@ -533,6 +538,9 @@ LRESULT TerminalView::WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
         }
         return 0;
     case WM_SETFOCUS:
+        // Last-active-client-wins: re-assert this window's size after a peer
+        // client resized the shared PTY.
+        if (sizeMismatch_) ReassertSize();
         // Notify PTY of focus (if focus events enabled)
         if (buffer_.focusEventReportingEnabled())
             PtyWrite("\x1b[I", 3);
@@ -567,6 +575,14 @@ LRESULT TerminalView::WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
         size_t       len  = (size_t)lp;
         OnTerminalOutput(data, len);
         delete[] data;
+        return 0;
+    }
+    case WM_TERMINAL_RESIZED: {
+        auto* info = (wcs::ResizedInfo*)lp;
+        if (info) {
+            OnRemoteResized(*info);
+            delete info;
+        }
         return 0;
     }
     case WM_SETCURSOR:
@@ -619,28 +635,29 @@ LRESULT TerminalView::OnCreate(HWND hwnd) {
                         __uuidof(IDWriteFactory),
                         reinterpret_cast<IUnknown**>(&dwFactory_));
 
-    // Text format — prefer Cascadia Mono, fall back to Consolas
-    if (dwFactory_) {
-        HRESULT hr = dwFactory_->CreateTextFormat(
-            L"Cascadia Mono", nullptr,
-            DWRITE_FONT_WEIGHT_REGULAR, DWRITE_FONT_STYLE_NORMAL,
-            DWRITE_FONT_STRETCH_NORMAL,
-            11.0f * 96.0f / 72.0f,   // pt → dip
-            L"", &textFormat_);
-        if (FAILED(hr)) {
-            dwFactory_->CreateTextFormat(
-                L"Consolas", nullptr,
-                DWRITE_FONT_WEIGHT_REGULAR, DWRITE_FONT_STYLE_NORMAL,
-                DWRITE_FONT_STRETCH_NORMAL,
-                11.0f * 96.0f / 72.0f,
-                L"", &textFormat_);
-        }
-        if (textFormat_) {
-            textFormat_->SetTextAlignment(DWRITE_TEXT_ALIGNMENT_LEADING);
-            textFormat_->SetParagraphAlignment(DWRITE_PARAGRAPH_ALIGNMENT_NEAR);
-            textFormat_->SetWordWrapping(DWRITE_WORD_WRAPPING_NO_WRAP);
+    // The process is system-DPI aware: the window is in physical pixels and
+    // Direct2D will run at a fixed 96 DPI, so one D2D unit is one pixel.
+    // Fonts are enlarged by dpiScale_ instead.
+    dpiScale_ = 1.0f;
+    {
+        using GetDpiForWindowFn = UINT(WINAPI*)(HWND);
+        HMODULE user32 = GetModuleHandleW(L"user32.dll");
+        auto getDpi = user32
+            ? reinterpret_cast<GetDpiForWindowFn>(
+                  GetProcAddress(user32, "GetDpiForWindow"))
+            : nullptr;
+        if (getDpi) {
+            const UINT dpi = getDpi(hwnd);
+            if (dpi > 0) dpiScale_ = (float)dpi / 96.0f;
+        } else if (HDC hdc = GetDC(hwnd)) {
+            const int dpi = GetDeviceCaps(hdc, LOGPIXELSX);
+            ReleaseDC(hwnd, hdc);
+            if (dpi > 0) dpiScale_ = (float)dpi / 96.0f;
         }
     }
+    if (dpiScale_ <= 0.0f) dpiScale_ = 1.0f;
+
+    CreateTextFormats();
 
     // ---------------------------------------------------------------------------
     // %APPDATA%\Ecode\settings.ini の [Terminal] セクションから設定を読む
@@ -701,6 +718,36 @@ void TerminalView::OnDestroy() {
 }
 
 // ---------------------------------------------------------------------------
+// CreateTextFormats — (re)create the cell font for the current DPI scale
+// ---------------------------------------------------------------------------
+bool TerminalView::CreateTextFormats() {
+    if (!dwFactory_) return false;
+    if (textFormat_) { textFormat_->Release(); textFormat_ = nullptr; }
+
+    const float fontSize = 11.0f * 96.0f / 72.0f * dpiScale_;  // pt → px at 96 DPI
+    HRESULT hr = dwFactory_->CreateTextFormat(
+        L"Cascadia Mono", nullptr,
+        DWRITE_FONT_WEIGHT_REGULAR, DWRITE_FONT_STYLE_NORMAL,
+        DWRITE_FONT_STRETCH_NORMAL,
+        fontSize,
+        L"", &textFormat_);
+    if (FAILED(hr)) {
+        dwFactory_->CreateTextFormat(
+            L"Consolas", nullptr,
+            DWRITE_FONT_WEIGHT_REGULAR, DWRITE_FONT_STYLE_NORMAL,
+            DWRITE_FONT_STRETCH_NORMAL,
+            fontSize,
+            L"", &textFormat_);
+    }
+    if (textFormat_) {
+        textFormat_->SetTextAlignment(DWRITE_TEXT_ALIGNMENT_LEADING);
+        textFormat_->SetParagraphAlignment(DWRITE_PARAGRAPH_ALIGNMENT_NEAR);
+        textFormat_->SetWordWrapping(DWRITE_WORD_WRAPPING_NO_WRAP);
+    }
+    return textFormat_ != nullptr;
+}
+
+// ---------------------------------------------------------------------------
 // UpdateMetrics — measure one character cell
 // ---------------------------------------------------------------------------
 void TerminalView::UpdateMetrics() {
@@ -729,24 +776,99 @@ void TerminalView::UpdateMetrics() {
 // ---------------------------------------------------------------------------
 void TerminalView::OnSize(int w, int h) {
     ReleaseRenderTarget(); // recreate at new size
-    if (w <= 0 || h <= 0 || cellWidth_ <= 0 || cellHeight_ <= 0) return;
+    int cols = 0;
+    int rows = 0;
+    if (!GridSizeFor(w, h, cols, rows)) return;
 
-    int cols = std::max(80, (int)(w / cellWidth_));
-    int rows = std::max(25, (int)(h / cellHeight_));
-
-    if (cols != buffer_.columns() || rows != buffer_.rows()) {
+    const bool changed = cols != buffer_.columns() || rows != buffer_.rows();
+    if (changed) {
         {
             std::lock_guard<std::mutex> lock(bufferMutex_);
             buffer_.resize(cols, rows);
         }
-        if (PtyIsRunning())
-            PtyResize(cols, rows);
+    }
+    if (PtyIsRunning()) {
+        if (changed) PtyResize(cols, rows);
+        // This window is the active client now; a pending peer size is no
+        // longer relevant.
+        sizeMismatch_ = false;
     }
     ApplyScrollbackBudget();
     // Clamp scroll offset to new history size after resize
     const int maxScroll = std::max(0, buffer_.historyLineCount());
     scrollOffset_ = std::min(scrollOffset_, maxScroll);
     scrolledBack_ = (scrollOffset_ > 0);
+}
+
+bool TerminalView::GridSizeFor(int w, int h, int& cols, int& rows) const {
+    if (w <= 0 || h <= 0 || cellWidth_ <= 0 || cellHeight_ <= 0) return false;
+    const float usableW = (std::max)(0.0f, (float)w - ScrollBarWidth());
+    cols = (std::max)(2, (int)(usableW / cellWidth_));
+    rows = (std::max)(1, (int)((float)h / cellHeight_));
+    return true;
+}
+
+// ---------------------------------------------------------------------------
+// OnRemoteResized — applied size reported by the WCSP server (UI thread)
+// ---------------------------------------------------------------------------
+void TerminalView::OnRemoteResized(const wcs::ResizedInfo& info) {
+    if (!hwnd_) return;
+
+    int cols = std::clamp<int>(info.cols, wcs::kMinColumns, wcs::kMaxDimension);
+    int rows = std::clamp<int>(info.rows, wcs::kMinRows, wcs::kMaxDimension);
+
+    if (info.reason == wcs::ResizeReason::Peer) {
+        // Another client owns the size now. Keep the buffer at that size so
+        // output decodes with the same wrapping the server used; anything
+        // beyond this view is clipped by the renderer.
+        {
+            std::lock_guard<std::mutex> lock(bufferMutex_);
+            buffer_.resize(cols, rows);
+        }
+        sizeMismatch_ = true;
+        scrollOffset_ = 0;
+        scrolledBack_ = false;
+        InvalidateRect(hwnd_, nullptr, FALSE);
+        return;
+    }
+
+    // Applied echoes this client's own RESIZE. During a drag several replies
+    // are in flight, so following them would snap the buffer back to stale
+    // sizes; only a Clamped reply carries information the client lacks.
+    if (info.reason != wcs::ResizeReason::Clamped) return;
+    if (cols != buffer_.columns() || rows != buffer_.rows()) {
+        {
+            std::lock_guard<std::mutex> lock(bufferMutex_);
+            buffer_.resize(cols, rows);
+        }
+        const int maxScroll = std::max(0, buffer_.historyLineCount());
+        scrollOffset_ = std::min(scrollOffset_, maxScroll);
+        scrolledBack_ = (scrollOffset_ > 0);
+    }
+    sizeMismatch_ = false;
+    InvalidateRect(hwnd_, nullptr, FALSE);
+}
+
+// ---------------------------------------------------------------------------
+// ReassertSize — send this window's size after a peer changed the PTY
+// ---------------------------------------------------------------------------
+void TerminalView::ReassertSize() {
+    sizeMismatch_ = false;
+    if (!hwnd_ || cellWidth_ <= 0 || cellHeight_ <= 0) return;
+    if (!PtyIsRunning()) return;
+
+    RECT rc; GetClientRect(hwnd_, &rc);
+    int cols = 0;
+    int rows = 0;
+    if (!GridSizeFor(rc.right - rc.left, rc.bottom - rc.top, cols, rows)) return;
+    if (cols != buffer_.columns() || rows != buffer_.rows()) {
+        {
+            std::lock_guard<std::mutex> lock(bufferMutex_);
+            buffer_.resize(cols, rows);
+        }
+        PtyResize(cols, rows);
+    }
+    ScrollToBottom();
 }
 
 // ---------------------------------------------------------------------------
@@ -907,8 +1029,13 @@ bool TerminalView::EnsureRenderTarget() {
 
     RECT rc; GetClientRect(hwnd_, &rc);
     D2D1_SIZE_U size = D2D1::SizeU(rc.right - rc.left, rc.bottom - rc.top);
+    // Fixed 96 DPI: D2D units are physical pixels (the window is already
+    // system-DPI aware), which keeps all cell/pixel math unit-consistent.
     HRESULT hr = d2dFactory_->CreateHwndRenderTarget(
-        D2D1::RenderTargetProperties(),
+        D2D1::RenderTargetProperties(
+            D2D1_RENDER_TARGET_TYPE_DEFAULT,
+            D2D1::PixelFormat(),
+            96.0f, 96.0f),
         D2D1::HwndRenderTargetProperties(hwnd_, size),
         &renderTarget_);
     return SUCCEEDED(hr);
@@ -1135,7 +1262,7 @@ void TerminalView::OnPaint() {
     const int curRow = buffer_.cursorRow() + histLines;  // logical row of cursor
 
     // Clip rendering to exclude scroll bar area
-    const float clipRight = (float)(clientRc.right - clientRc.left) - kScrollBarWidth;
+    const float clipRight = (float)(clientRc.right - clientRc.left) - ScrollBarWidth();
     rt->PushAxisAlignedClip(D2D1::RectF(0, 0, clipRight, (float)(clientRc.bottom - clientRc.top)),
                             D2D1_ANTIALIAS_MODE_ALIASED);
 
@@ -1220,22 +1347,23 @@ void TerminalView::OnPaint() {
             for (size_t ci = 0; ci < imeComposition_.size(); ++ci) {
                 int cw = ImeCellWidth(std::wstring(1, imeComposition_[ci]));
                 float ux = cx + (float)cellPos * cellW;
-                float uy = cy + cellHeight_ - 1.5f;
+                float uy = cy + cellHeight_ - ScalePx(1.5f);
                 float uw = (float)cw * cellW;
                 BYTE attr = (ci < imeCompAttr_.size()) ? imeCompAttr_[ci] : ATTR_INPUT;
                 if (attr == ATTR_INPUT) {
                     if (auto* b = GetBrush(wavyCol)) {
-                        float amp = 1.5f, step = 2.0f;
+                        float amp = ScalePx(1.5f), step = ScalePx(2.0f);
+                        const float period = ScalePx(4.0f);
                         for (float wx = 0; wx < uw; wx += step) {
                             float x0 = ux + wx, x1 = ux + (std::min)(wx + step, uw);
-                            float y0 = uy + amp * sinf(wx / 4.0f * 3.14159f);
-                            float y1 = uy + amp * sinf((wx + step) / 4.0f * 3.14159f);
-                            rt->DrawLine(D2D1::Point2F(x0, y0), D2D1::Point2F(x1, y1), b, 1.0f);
+                            float y0 = uy + amp * sinf(wx / period * 3.14159f);
+                            float y1 = uy + amp * sinf((wx + step) / period * 3.14159f);
+                            rt->DrawLine(D2D1::Point2F(x0, y0), D2D1::Point2F(x1, y1), b, ScalePx(1.0f));
                         }
                     }
                 } else {
                     if (auto* b = GetBrush(lineCol))
-                        rt->DrawLine(D2D1::Point2F(ux, uy), D2D1::Point2F(ux + uw, uy), b, 1.0f);
+                        rt->DrawLine(D2D1::Point2F(ux, uy), D2D1::Point2F(ux + uw, uy), b, ScalePx(1.0f));
                 }
                 cellPos += cw;
             }
@@ -1367,8 +1495,8 @@ void TerminalView::DrawCell(ID2D1RenderTarget* rt, int row, int col,
     // Underline at text position
     if (cell.underline) {
         if (auto* b = GetBrush(dc)) {
-            float uy = y + baseline_ + 1.5f;
-            rt->DrawLine({textX, uy}, {textX + w, uy}, b, 1.0f);
+            float uy = y + baseline_ + ScalePx(1.5f);
+            rt->DrawLine({textX, uy}, {textX + w, uy}, b, ScalePx(1.0f));
         }
     }
 
@@ -1376,7 +1504,7 @@ void TerminalView::DrawCell(ID2D1RenderTarget* rt, int row, int col,
     if (cell.strikethrough) {
         if (auto* b = GetBrush(dc)) {
             float sy = y + baseline_ * 0.5f;
-            rt->DrawLine({textX, sy}, {textX + w, sy}, b, 1.0f);
+            rt->DrawLine({textX, sy}, {textX + w, sy}, b, ScalePx(1.0f));
         }
     }
 
@@ -1384,8 +1512,8 @@ void TerminalView::DrawCell(ID2D1RenderTarget* rt, int row, int col,
     if (hasHyperlink) {
         TermColor hc = TermColor::fromRgb(50, 140, 230);
         if (auto* b = GetBrush(hc)) {
-            float uy = y + baseline_ + 1.5f;
-            rt->DrawLine({textX, uy}, {textX + w, uy}, b, 1.0f);
+            float uy = y + baseline_ + ScalePx(1.5f);
+            rt->DrawLine({textX, uy}, {textX + w, uy}, b, ScalePx(1.0f));
         }
     }
 
@@ -1394,13 +1522,15 @@ void TerminalView::DrawCell(ID2D1RenderTarget* rt, int row, int col,
         TermColor cursorFg = buffer_.cursorColor().isDefault ? fg : buffer_.cursorColor();
         if (buffer_.cursorShape() == TerminalBuffer::CursorShape::Block) {
             if (auto* b = GetBrush(cursorFg))
-                rt->DrawRectangle(D2D1::RectF(bgX, y, bgX + w, y + h), b, 1.0f);
+                rt->DrawRectangle(D2D1::RectF(bgX, y, bgX + w, y + h), b, ScalePx(1.0f));
         } else if (buffer_.cursorShape() == TerminalBuffer::CursorShape::Underline) {
             if (auto* b = GetBrush(cursorFg))
-                rt->DrawLine({textX, y + h - 2}, {textX + cellWidth_, y + h - 2}, b, 2.0f);
+                rt->DrawLine({textX, y + h - ScalePx(2.0f)},
+                             {textX + cellWidth_, y + h - ScalePx(2.0f)},
+                             b, ScalePx(2.0f));
         } else if (buffer_.cursorShape() == TerminalBuffer::CursorShape::Bar) {
             if (auto* b = GetBrush(cursorFg))
-                rt->DrawLine({textX, y}, {textX, y + h}, b, 2.0f);
+                rt->DrawLine({textX, y}, {textX, y + h}, b, ScalePx(2.0f));
         }
     }
 }
@@ -1718,7 +1848,7 @@ void TerminalView::DrawScrollBar(ID2D1RenderTarget* rt) {
     RECT rc; GetClientRect(hwnd_, &rc);
     const float viewW = (float)(rc.right - rc.left);
     const float viewH = (float)(rc.bottom - rc.top);
-    const float barX = viewW - kScrollBarWidth;
+    const float barX = viewW - ScrollBarWidth();
     const float barYStart = buffer_.hasScrollRegion()
         ? buffer_.scrollTop()    * cellHeight_
         : 0.0f;
@@ -1740,7 +1870,7 @@ void TerminalView::DrawScrollBar(ID2D1RenderTarget* rt) {
     const int regionRows = buffer_.hasScrollRegion()
         ? buffer_.scrollBottom() - buffer_.scrollTop() + 1
         : std::max(1, (int)(viewH / cellHeight_));
-    const float thumbMinH = 16.0f;
+    const float thumbMinH = ScalePx(16.0f);
     const float thumbRatio = (float)regionRows / (float)(histLines + regionRows);
     float thumbH = std::max(thumbMinH, std::min(barH, barH * thumbRatio));
     // Thumb top position: 0 = top of history, (barH - thumbH) = bottom
@@ -1750,7 +1880,8 @@ void TerminalView::DrawScrollBar(ID2D1RenderTarget* rt) {
     TermColor thumbColor;
     thumbColor.r = 180; thumbColor.g = 180; thumbColor.b = 180; thumbColor.isDefault = false;
     if (auto* b = GetBrush(thumbColor, 0.7f))
-        rt->FillRectangle(D2D1::RectF(barX + 1, thumbY, viewW - 1, thumbY + thumbH), b);
+        rt->FillRectangle(D2D1::RectF(barX + ScalePx(1.0f), thumbY,
+                                      viewW - ScalePx(1.0f), thumbY + thumbH), b);
 }
 
 void TerminalView::DrawScrollIndicator(ID2D1RenderTarget* rt, const RECT& clientRc) {
@@ -1774,12 +1905,12 @@ void TerminalView::DrawScrollIndicator(ID2D1RenderTarget* rt, const RECT& client
 
     float textW = (float)wcslen(buf) * cellWidth_ * 0.6f;
     float textH = cellHeight_;
-    float padX = 6.0f;
-    float padY = 2.0f;
-    float x = (float)(clientRc.right - clientRc.left) - kScrollBarWidth - textW - padX * 2 - 4;
+    float padX = ScalePx(6.0f);
+    float padY = ScalePx(2.0f);
+    float x = (float)(clientRc.right - clientRc.left) - ScrollBarWidth() - textW - padX * 2 - ScalePx(4.0f);
     float y = buffer_.hasScrollRegion()
-        ? buffer_.scrollTop() * cellHeight_ + 2.0f
-        : 2.0f;
+        ? buffer_.scrollTop() * cellHeight_ + ScalePx(2.0f)
+        : ScalePx(2.0f);
 
     if (auto* b = GetBrush(bgCol, 0.75f))
         rt->FillRectangle(D2D1::RectF(x, y, x + textW + padX * 2, y + textH + padY * 2), b);
@@ -1870,6 +2001,9 @@ void TerminalView::OnContextMenu(int screenX, int screenY) {
 // Keyboard input
 // ---------------------------------------------------------------------------
 void TerminalView::OnKeyDown(WPARAM vk, LPARAM /*lParam*/) {
+    // First input after a peer resize: take the PTY back to this window's size.
+    if (sizeMismatch_) ReassertSize();
+
     bool ctrl  = (GetKeyState(VK_CONTROL) & 0x8000) != 0;
     bool shift = (GetKeyState(VK_SHIFT)   & 0x8000) != 0;
     bool alt   = (GetKeyState(VK_MENU)    & 0x8000) != 0;
@@ -1932,6 +2066,7 @@ void TerminalView::OnKeyDown(WPARAM vk, LPARAM /*lParam*/) {
 }
 
 void TerminalView::OnChar(wchar_t ch) {
+    if (sizeMismatch_) ReassertSize();
     // Ignore control characters already handled by OnKeyDown
     if (ch < 0x20 || ch == 0x7f) return;
     // IME 確定文字は WM_IME_COMPOSITION (GCS_RESULTSTR) で処理済み——二重送信を防ぐ
