@@ -166,10 +166,17 @@ static void LaunchGuiOutsideCallerTree() {
     std::wstring psScript = L"$cmd = [System.Text.Encoding]::Unicode.GetString([System.Convert]::FromBase64String('";
     psScript += b64CmdLine;
     psScript += L"')); "
+                L"try { "
                 L"$si = New-CimInstance -ClassName Win32_ProcessStartup -ClientOnly "
                 L"-Property @{CreateFlags=[uint32]0x10; ShowWindow=[uint16]0}; "
+                L"$r = Invoke-CimMethod -ClassName Win32_Process -MethodName Create "
+                L"-Arguments @{CommandLine=$cmd; ProcessStartupInformation=$si}; "
+                L"if ($r.ReturnValue -ne 0) { "
                 L"Invoke-CimMethod -ClassName Win32_Process -MethodName Create "
-                L"-Arguments @{CommandLine=$cmd; ProcessStartupInformation=$si} | Out-Null";
+                L"-Arguments @{CommandLine=$cmd} | Out-Null } "
+                L"} catch { "
+                L"Invoke-CimMethod -ClassName Win32_Process -MethodName Create "
+                L"-Arguments @{CommandLine=$cmd} | Out-Null }";
 
     std::wstring b64Script = Base64Encode(psScript);
 
