@@ -60,7 +60,7 @@
 
 ## 4. System Tray Integration
 - Click **`[⤓]`** (Tray icon button), minimize the window, or press the window close button (`[X]`) to hide Hancho into the **Windows System Tray** while keeping all background ConPTY processes and IPC/MCP services running.
-- Left-click or double-click the tray icon (or right-click to open the tray menu) to restore and expand the dashboard at any time.
+- Left-click or double-click the tray icon (or right-click to open the tray menu) to restore and expand the dashboard at any time. The tray menu separates **Close Dashboard** (keeps the core and jobs running) from **Quit Hancho (stop core and jobs)** (stops the core and all running jobs after confirmation).
 
 ## 5. Persistent Logs, State Recovery & `.done` Completion Marker Files
 - **Real-Time Per-Process Logs**: Every process's stdout/ConPTY stream is continuously written to `logs/proc_<id>_<name>_<YYYYMMDD_HHMMSS>.log` (or a custom `--log-file <path>`).

@@ -95,10 +95,13 @@ The skill starts with `hancho-cli.exe help --json`, so the commands it shows alw
 
 ---
 
-## Release Notes
-
+## Release Notes
+
+
+
 ### v0.9.18
-- **wct keys**: `Ctrl+]` detaches after a short timeout; `Ctrl+\` closes the session (WCSP `CLOSE`). Some Windows terminals filter `Ctrl+\`, so pressing `Ctrl+]` twice quickly also closes it.
+- **wct keys**: `Ctrl+]` detaches after a short timeout; press `Ctrl+]` twice quickly to close the session (WCSP `CLOSE`). `Ctrl+\` is no longer used.
+- **Tray**: the existing item is now **Close Dashboard** (the core and jobs keep running); **Quit Hancho (stop core and jobs)** stops the core and all jobs after confirmation.
 - **wct smoke test**: now runs against an in-process WCSP server and verifies both the detach (no `CLOSE`) and terminate (`CLOSE` frame) paths.
 
 ### v0.9.17

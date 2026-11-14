@@ -964,7 +964,8 @@ enum ControlId {
     IDM_TRAY_HIDE = 4003,
     IDM_TRAY_EXIT = 4004,
     IDM_TRAY_USAGE = 4005,
-    IDM_TRAY_MEMORY = 4006
+    IDM_TRAY_MEMORY = 4006,
+    IDM_TRAY_QUIT = 4007
 };
 
 enum class ShellType {
@@ -10990,7 +10991,12 @@ static void ShowTrayContextMenu(DashboardState* st) {
         AppendMenuW(hMenu, MF_STRING, IDM_TRAY_HIDE, Tr(L"タスクトレイに格納", L"Hide to Tray", L"Ocultar en bandeja"));
     }
     AppendMenuW(hMenu, MF_SEPARATOR, 0, nullptr);
-    AppendMenuW(hMenu, MF_STRING, IDM_TRAY_EXIT, Tr(L"Hancho を終了", L"Exit Hancho", L"Salir de Hancho"));
+    AppendMenuW(hMenu, MF_STRING, IDM_TRAY_EXIT,
+                Tr(L"ダッシュボードを閉じる", L"Close Dashboard", L"Cerrar panel"));
+    AppendMenuW(hMenu, MF_STRING, IDM_TRAY_QUIT,
+                Tr(L"Hancho を完全終了（コアも停止）",
+                   L"Quit Hancho (stop core and jobs)",
+                   L"Salir de Hancho (detener núcleo y trabajos)"));
 
     SetForegroundWindow(st->hwndMain);
     int cmd = TrackPopupMenu(hMenu, TPM_RETURNCMD | TPM_RIGHTBUTTON, pt.x, pt.y, 0, st->hwndMain, nullptr);
@@ -11036,6 +11042,24 @@ static void ShowTrayContextMenu(DashboardState* st) {
             HideToTray(st);
             return;
         }
+        st->allowExit = true;
+        DestroyWindow(st->hwndMain);
+    } else if (cmd == IDM_TRAY_QUIT) {
+        const std::wstring title = Tr(L"Hancho を完全終了", L"Quit Hancho", L"Salir de Hancho");
+        const std::wstring message = Tr(
+            L"Hancho を完全に終了しますか？\n\n"
+            L"コアと実行中のジョブもすべて停止します。",
+            L"Quit Hancho completely?\n\n"
+            L"The core and all running jobs will be stopped.",
+            L"¿Salir de Hancho por completo?\n\n"
+            L"Se detendrán el núcleo y todos los trabajos en ejecución.");
+        if (MessageBoxW(st->hwndMain, message.c_str(), title.c_str(),
+                        MB_YESNO | MB_ICONWARNING) != IDYES) {
+            return;
+        }
+        nlohmann::json response;
+        std::string error;
+        GuiIpcCall(st, {{"action", "quit"}}, response, &error);
         st->allowExit = true;
         DestroyWindow(st->hwndMain);
     }
