@@ -160,9 +160,16 @@ static void LaunchGuiOutsideCallerTree() {
 
     std::wstring b64CmdLine = Base64Encode(guiCmdLine);
 
+    // Win32_Process.Create gives a console-subsystem GUI a new console window when no
+    // startup information is supplied, so a grandchild `Hancho.exe gui` flashes a
+    // terminal at the user. Create that console hidden instead (SW_HIDE).
     std::wstring psScript = L"$cmd = [System.Text.Encoding]::Unicode.GetString([System.Convert]::FromBase64String('";
     psScript += b64CmdLine;
-    psScript += L"')); Invoke-CimMethod -ClassName Win32_Process -MethodName Create -Arguments @{CommandLine=$cmd} | Out-Null";
+    psScript += L"')); "
+                L"$si = New-CimInstance -ClassName Win32_ProcessStartup -ClientOnly "
+                L"-Property @{CreateFlags=[uint32]0x10; ShowWindow=[uint16]0}; "
+                L"Invoke-CimMethod -ClassName Win32_Process -MethodName Create "
+                L"-Arguments @{CommandLine=$cmd; ProcessStartupInformation=$si} | Out-Null";
 
     std::wstring b64Script = Base64Encode(psScript);
 
