@@ -21,4 +21,7 @@ The server side lives in `../term_server.h` / `../term_server.cpp`; it attaches
 WCSP sessions to `ProcessManager` ConPTY jobs instead of spawning its own shells
 (except for the `cmd` / `powershell` / `bash` compatibility modes).
 
+The console client is `wct.exe` (`../wct_main.cpp` / `../wct_client.cpp`); it
+relays the remote ConPTY to the current console without emulating it.
+
 The protocol reference is [`doc/wcsp.md`](../../doc/wcsp.md).

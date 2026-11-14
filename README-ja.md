@@ -28,6 +28,10 @@ Hancho には、1 コマンドだけ、順番のあるジョブのキュー、�
 
 詳しくは [概要](doc/overview-ja.md) を参照してください。`run_worker`、ジョブ終了後の PC サスペンド、ビヘイビアツリー、安定したイベントとアダプター、Hancho をやめるとき（卒業）の手順をまとめています。
 
+### ネットワークポート
+- **WinConsoleServer (WCSP)**: `terminal.remote` 有効時の既定は TCP **9139**。ローカルリスナーはループバックの一時ポートを使います。
+- **Chat（IPMsg）**: UDP / TCP **2426**。既定では無効です。
+
 ## Hancho スキルを使う
 
 `skills/hancho/SKILL.md` は、AI エージェントが Hancho をうまく使うためのスキルです。supervisor / Hancho / worker の役割、1 ジョブ = 1 コマンドの原則、`start` とタスクキューとビヘイビアツリーの使い分け、`run_worker`、トリアージ、Chat、メモリ、よくある失敗をまとめています。Markdown だけなのでビルドは不要です。
@@ -90,8 +94,12 @@ New-Item -ItemType Junction -Path .claude\skills\hancho -Target (Resolve-Path sk
 
 ## リリースノート
 
+### v0.9.18
+- **wct のキー**: `Ctrl+]` は短い待機後にデタッチ、`Ctrl+\` はセッションを終了（WCSP `CLOSE`）します。Windows ターミナルによっては `Ctrl+\` が渡らないため、`Ctrl+]` を素早く2回押しても終了できます。
+- **wct スモークテスト**: プロセス内の WCSP サーバーを使い、デタッチ（`CLOSE` なし）と終了（`CLOSE` フレーム）の両方を検証します。
+
 ### v0.9.17
-- **wct コンソールクライアント**: `wct.exe` は通常のコンソールから WCSP ターミナルサーバーへ接続します。`wct` でローカルの PowerShell、`wct <ジョブID>` で保持中のジョブに接続し、`--host/--port/--token/--shell` でリモートコアへ接続できます。`Ctrl+]` はデタッチ（ConPTY は継続）、`Ctrl+\` は終了です。インストーラーは `hancho-cli.exe` の隣に `wct.exe` を追加し、PATH 設定も両方に適用します。
+- **wct コンソールクライアント**: `wct.exe` は通常のコンソールから WCSP ターミナルサーバーへ接続します。`wct` でローカルの PowerShell、`wct <ジョブID>` で保持中のジョブに接続し、`--host/--port/--token/--shell` でリモートコアへ接続できます。`Ctrl+]` はデタッチ（ConPTY は継続）、`Ctrl+]` を2回で終了です。インストーラーは `hancho-cli.exe` の隣に `wct.exe` を追加し、PATH 設定も両方に適用します。
 - **セッション保持**: 切断しても ConPTY を停止しなくなりました。タブやウィンドウを閉じるときに **終了 / デタッチ / キャンセル** を選べます。終了はサーバー側の ConPTY を閉じ、デタッチは後から接続できるよう保持します。
 - **再接続一覧**: ターミナルクライアントは起動時と `ファイル > セッションに再接続...` で保持中セッションを一覧表示し、選択したジョブへ再接続します。WCSP 1.1 に `LIST_SESSIONS` / `SESSION_LIST` コントロールセッションを追加しました（`doc/wcsp.md`）。
 - **ターミナルクライアントのメニュー化**: 新規 / 接続 / リモート / 閉じるのツールバーボタンを削除しました。操作はファイルメニュー、タブの右クリック、`Ctrl+T` / `Ctrl+W` から行います。

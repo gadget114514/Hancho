@@ -38,8 +38,9 @@ USAGE:
 
   Leaving wct with Ctrl+] detaches: the remote ConPTY job keeps running and
   can be reattached with `wct <job-id>`. Ctrl+\ ends the session (WCSP CLOSE),
-  which terminates the remote job. The session also ends when the remote
-  shell exits.
+  which terminates the remote job. Some Windows terminals filter Ctrl+\, so
+  pressing Ctrl+] twice quickly also closes the session. The session also
+  ends when the remote shell exits.
 
 OPTIONS:
   --host <host>       Connect to a remote core instead of the local one.
@@ -58,6 +59,7 @@ A bare numeric argument is short for --attach <id>.
 KEYS:
   Ctrl+]              Detach and exit wct; the remote job keeps running.
   Ctrl+\              Close the session (terminate the remote job) and exit.
+  Ctrl+] twice        Same as Ctrl+\ (for terminals that filter Ctrl+\).
 
 EXAMPLES:
   wct                          # local PowerShell

@@ -334,7 +334,7 @@ Hancho's client:
 | Console client (`wct.exe`) | `src/wct_main.cpp`, `src/wct_client.cpp` |
 | Server and job attachment | `src/term_server.h`, `src/term_server.cpp` |
 
-The server implementation is Windows-only. It does not spawn a command shell for `attach:<id>`; it subscribes to the existing headless ConPTY job. The standalone terminal client (`Hancho.exe terminal`, `src/term_client.cpp`) uses `RemoteSession`; the dashboard opens that client window instead of embedding terminal tabs. `wct.exe` is a console client for the same protocol: it runs in the current console, forwards raw input/output, and uses `Ctrl+]` to detach and `Ctrl+\` to send `CLOSE`.
+The server implementation is Windows-only. It does not spawn a command shell for `attach:<id>`; it subscribes to the existing headless ConPTY job. The standalone terminal client (`Hancho.exe terminal`, `src/term_client.cpp`) uses `RemoteSession`; the dashboard opens that client window instead of embedding terminal tabs. `wct.exe` is a console client for the same protocol: it runs in the current console, forwards raw input/output, detaches with a single `Ctrl+]`, and sends `CLOSE` when `Ctrl+]` is pressed twice in quick succession.
 
 The server splits an attachment replay into `OUTPUT` frames of at most **256 KiB**, so `history_bytes` (default 32 MiB) can be replayed without exceeding the 1 MiB frame limit. The server retains sessions after a disconnect; only a `CLOSE` frame ends them. The terminal client asks **Terminate / Detach / Cancel** when closing a tab or the window.
 

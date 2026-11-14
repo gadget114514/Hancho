@@ -31,6 +31,10 @@ Hand Hancho one command, a queue of ordered jobs, or a whole behavior tree. It r
 
 See [Overview](doc/overview.md) for the working model in detail: `run_worker`, suspending the PC after a job, behavior trees, stable events and adapters, and how to leave Hancho without losing work.
 
+### Network ports
+- **WinConsoleServer (WCSP)**: TCP **9139** by default when `terminal.remote` is enabled. The local listener uses an ephemeral loopback port.
+- **Chat (IPMsg)**: UDP and TCP **2426**, off by default.
+
 ## Using the Hancho skill
 
 `skills/hancho/SKILL.md` teaches an AI agent how to drive Hancho well: the supervisor / Hancho / worker model, the one-command-per-job rule, `start` vs. task queues vs. behavior trees, `run_worker`, triage, Chat, memory and the common mistakes. It is a normal agent skill (Markdown only), so no build step is needed.
@@ -93,8 +97,12 @@ The skill starts with `hancho-cli.exe help --json`, so the commands it shows alw
 
 ## Release Notes
 
+### v0.9.18
+- **wct keys**: `Ctrl+]` detaches after a short timeout; `Ctrl+\` closes the session (WCSP `CLOSE`). Some Windows terminals filter `Ctrl+\`, so pressing `Ctrl+]` twice quickly also closes it.
+- **wct smoke test**: now runs against an in-process WCSP server and verifies both the detach (no `CLOSE`) and terminate (`CLOSE` frame) paths.
+
 ### v0.9.17
-- **wct console client**: `wct.exe` connects to the WCSP terminal server from a normal console. `wct` starts a local PowerShell session, `wct <job-id>` attaches to a retained job, and `--host/--port/--token/--shell` connect to a remote core. `Ctrl+]` detaches (the ConPTY keeps running) and `Ctrl+\` terminates it. The installer adds `wct.exe` next to `hancho-cli.exe` and the PATH task now covers both.
+- **wct console client**: `wct.exe` connects to the WCSP terminal server from a normal console. `wct` starts a local PowerShell session, `wct <job-id>` attaches to a retained job, and `--host/--port/--token/--shell` connect to a remote core. `Ctrl+]` detaches (the ConPTY keeps running) and `Ctrl+]` twice terminates it. The installer adds `wct.exe` next to `hancho-cli.exe` and the PATH task now covers both.
 - **Retained sessions**: disconnecting no longer kills the ConPTY. Closing a tab or the window asks **Terminate / Detach / Cancel**: Terminate closes the server-side ConPTY; Detach keeps it for a later connection.
 - **Reconnect list**: the terminal client lists retained sessions on startup (and from `File > Reconnect to session...`) and reattaches the selected jobs. WCSP 1.1 adds the `LIST_SESSIONS` / `SESSION_LIST` control session (documented in `doc/wcsp.md`).
 - **Terminal client menu-only UI**: the New / Attach / Remote / Close toolbar buttons were removed; all commands are in the File menu, the tab right-click menu, and the Ctrl+T / Ctrl+W shortcuts.

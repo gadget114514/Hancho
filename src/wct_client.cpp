@@ -28,15 +28,17 @@
 namespace pc {
 namespace {
 
-// Ctrl+] detaches: the socket closes without CLOSE, so the remote ConPTY job
-// stays alive and can be reattached with `wct <job-id>`. Ctrl+\ ends the
-// session: wct sends WCSP CLOSE, which terminates the remote job.
+// Ctrl+] once detaches: the socket closes without CLOSE, so the remote ConPTY
+// job stays alive and can be reattached with `wct <job-id>`. Ctrl+] twice in
+// quick succession, or Ctrl+backslash, ends the session: wct sends WCSP CLOSE,
+// which terminates the remote job.
 constexpr uint8_t kDetachKey = 0x1D; // Ctrl+]
-constexpr uint8_t kCloseKey = 0x1C;  // Ctrl+\
+constexpr uint8_t kCloseKey = 0x1C;  // Ctrl+backslash
+constexpr uint64_t kDoublePressMs = 600;
 
 enum class ExitRequest {
     None = 0,
-    Close,   // Ctrl+\: terminate the remote session
+    Close,   // Ctrl+backslash or Ctrl+] twice: terminate the remote session
     Detach,  // Ctrl+]: keep the remote session
 };
 constexpr int kDefaultRemotePort = 9139;
@@ -54,6 +56,8 @@ DWORD g_origInMode = 0;
 DWORD g_origOutMode = 0;
 std::atomic<bool> g_stop{false};
 std::atomic<ExitRequest> g_exitRequest{ExitRequest::None};
+std::atomic<bool> g_detachPending{false};
+std::atomic<uint64_t> g_detachDeadline{0};
 
 bool IsValidHandle(HANDLE h) {
     return h != nullptr && h != INVALID_HANDLE_VALUE;
@@ -296,6 +300,8 @@ int RunWct(const WctOptions& options) {
 
     g_stop = false;
     g_exitRequest = ExitRequest::None;
+    g_detachPending = false;
+    g_detachDeadline = 0;
     std::mutex messageMutex;
     std::string connectionError;
     bool exited = false;
@@ -336,7 +342,7 @@ int RunWct(const WctOptions& options) {
     // The remote replay arrives right after HELLO_ACK; print the hint first so it
     // stays in the local scrollback but never overlays a full-screen remote app.
     WriteText("\x1b[0m[wct] " + endpoint.host + ":" + std::to_string(endpoint.port) +
-              " (" + options.target + ") - Ctrl+] detaches, Ctrl+\\ closes\r\n");
+              " (" + options.target + ") - Ctrl+] detaches, Ctrl+\\ or Ctrl+]x2 closes\r\n");
 
     std::thread input([&] {
         std::vector<char> buffer(4096);
@@ -347,25 +353,33 @@ int RunWct(const WctOptions& options) {
             if (g_stop) break;
 
             const char* begin = buffer.data();
-            size_t stopAt = static_cast<size_t>(read);
+            std::string forward;
+            forward.reserve(read);
             for (size_t i = 0; i < read; ++i) {
                 const uint8_t byte = static_cast<uint8_t>(begin[i]);
                 if (byte == kCloseKey) {
                     g_exitRequest = ExitRequest::Close;
-                    stopAt = i;
+                    g_stop = true;
                     break;
                 }
                 if (byte == kDetachKey) {
-                    g_exitRequest = ExitRequest::Detach;
-                    stopAt = i;
-                    break;
+                    const uint64_t now = GetNowTickMs();
+                    if (g_detachPending.exchange(false)) {
+                        // Second Ctrl+] before the timeout: terminate.
+                        g_exitRequest = ExitRequest::Close;
+                        g_stop = true;
+                        break;
+                    }
+                    g_detachPending = true;
+                    g_detachDeadline = now + kDoublePressMs;
+                    continue; // consume the key; do not send it to the remote
                 }
+                forward.push_back(static_cast<char>(byte));
             }
-            if (stopAt > 0) remote->Write(begin, stopAt);
-            if (stopAt < static_cast<size_t>(read)) {
-                g_stop = true;
-                break;
+            if (!forward.empty()) {
+                remote->Write(forward.data(), forward.size());
             }
+            if (g_stop) break;
         }
     });
 
@@ -375,6 +389,12 @@ int RunWct(const WctOptions& options) {
 
     while (!g_stop) {
         const uint64_t now = GetNowTickMs();
+        if (g_detachPending.load() && now >= g_detachDeadline.load()) {
+            g_detachPending = false;
+            g_exitRequest = ExitRequest::Detach;
+            g_stop = true;
+            WakeInputThread();
+        }
         if (now - lastSizeCheck >= 100) {
             lastSizeCheck = now;
             int newCols = 0;
@@ -403,7 +423,7 @@ int RunWct(const WctOptions& options) {
         // Plain disconnect: the server keeps the ConPTY job for a later attach.
         remote->Close();
     } else {
-        // Ctrl+\ (or an abrupt wct exit) ends the session. TerminateSession
+        // Double Ctrl+] (or an abrupt wct exit) ends the session. TerminateSession
         // closes directly when the socket is already gone (EXIT/ERROR).
         remote->TerminateSession();
     }

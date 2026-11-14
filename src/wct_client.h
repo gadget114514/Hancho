@@ -20,7 +20,7 @@ struct WctOptions {
 
 // Runs wct in the current console and returns a process exit code.
 // Ctrl+] detaches (the ConPTY job keeps running for a later `wct <id>`);
-// Ctrl+\ ends the session (WCSP CLOSE terminates the remote job).
+// Ctrl+\ (or Ctrl+] twice) ends the session (WCSP CLOSE terminates the job).
 int RunWct(const WctOptions& options);
 
 } // namespace pc

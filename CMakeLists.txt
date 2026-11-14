@@ -1,5 +1,5 @@
 cmake_minimum_required(VERSION 3.20)
-project(Hancho VERSION 0.9.17 LANGUAGES CXX)
+project(Hancho VERSION 0.9.18 LANGUAGES CXX)
 
 set(CMAKE_CXX_STANDARD 20)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
@@ -230,13 +230,17 @@ target_link_libraries(wct PRIVATE
 # isolated Hancho core and checks the WCSP echo round-trip.
 add_executable(wct_smoke
     tests/wct_smoke.cpp
+    src/wcsp/protocol.cpp
+    src/wcsp/frame_reader.cpp
 )
+
+target_include_directories(wct_smoke PRIVATE src src/wcsp)
 
 if(MSVC)
     target_compile_options(wct_smoke PRIVATE /W4 /utf-8 /EHsc)
 endif()
 
-target_link_libraries(wct_smoke PRIVATE user32)
+target_link_libraries(wct_smoke PRIVATE ws2_32)
 add_dependencies(wct_smoke wct)
 
 # Headless smoke test for the task queue engine (deps, retries, chain guard, persistence).
