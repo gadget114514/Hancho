@@ -1,5 +1,5 @@
 cmake_minimum_required(VERSION 3.20)
-project(Hancho VERSION 0.9.15 LANGUAGES CXX)
+project(Hancho VERSION 0.9.16 LANGUAGES CXX)
 
 set(CMAKE_CXX_STANDARD 20)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
@@ -75,6 +75,7 @@ add_executable(Hancho
     src/bt_manager_api.cpp
     src/gui_dashboard.cpp
     src/gui_ipmsg.cpp
+    src/term_client.cpp
     src/app.rc
     src/agent_template.rc
     src/Terminal/src/ConPtySession.cpp

@@ -169,6 +169,7 @@ private:
     std::condition_variable queueCv_;
     std::deque<wcs::Frame> queue_;
     size_t queueBytes_ = 0;
+    size_t queueLimit_ = kMaxQueueBytes;
     std::vector<uint8_t> pendingLive_;
     bool replayPending_ = false;
     bool stopAfterDrain_ = false;
@@ -258,14 +259,18 @@ void TermConnection::OnJobOutput(const char* data, size_t len) {
                                 reinterpret_cast<const uint8_t*>(data),
                                 reinterpret_cast<const uint8_t*>(data) + len);
         } else {
-            wcs::Frame frame;
-            frame.type = wcs::FrameType::Output;
-            frame.payload.assign(reinterpret_cast<const uint8_t*>(data),
-                                 reinterpret_cast<const uint8_t*>(data) + len);
-            queueBytes_ += frame.payload.size();
-            queue_.push_back(std::move(frame));
+            constexpr size_t kLiveChunk = 256 * 1024;
+            for (size_t offset = 0; offset < len; offset += kLiveChunk) {
+                const size_t chunk = (std::min)(kLiveChunk, len - offset);
+                wcs::Frame frame;
+                frame.type = wcs::FrameType::Output;
+                frame.payload.assign(reinterpret_cast<const uint8_t*>(data) + offset,
+                                     reinterpret_cast<const uint8_t*>(data) + offset + chunk);
+                queueBytes_ += chunk;
+                queue_.push_back(std::move(frame));
+            }
         }
-        if (queueBytes_ + pendingLive_.size() > kMaxQueueBytes) overflow = true;
+        if (queueBytes_ + pendingLive_.size() > queueLimit_) overflow = true;
     }
     queueCv_.notify_one();
     if (overflow) {
@@ -278,21 +283,29 @@ void TermConnection::OnJobOutput(const char* data, size_t len) {
 
 void TermConnection::QueueReplay(const std::string& replay) {
     std::lock_guard<std::mutex> lock(queueMutex_);
+    // The protocol caps a single frame payload at kMaxPayloadBytes. A deep
+    // replay (tens of MB) must be split, otherwise the client's frame reader
+    // rejects it as "frame too large" and the terminal stays blank.
+    constexpr size_t kReplayChunk = 256 * 1024;
+    auto pushOutput = [this](const uint8_t* data, size_t len) {
+        for (size_t offset = 0; offset < len; offset += kReplayChunk) {
+            const size_t chunk = (std::min)(kReplayChunk, len - offset);
+            wcs::Frame frame;
+            frame.type = wcs::FrameType::Output;
+            frame.payload.assign(data + offset, data + offset + chunk);
+            queueBytes_ += chunk;
+            queue_.push_back(std::move(frame));
+        }
+    };
     if (!replay.empty()) {
-        wcs::Frame frame;
-        frame.type = wcs::FrameType::Output;
-        frame.payload.assign(reinterpret_cast<const uint8_t*>(replay.data()),
-                             reinterpret_cast<const uint8_t*>(replay.data()) + replay.size());
-        queueBytes_ += frame.payload.size();
-        queue_.push_back(std::move(frame));
+        pushOutput(reinterpret_cast<const uint8_t*>(replay.data()), replay.size());
     }
     if (!pendingLive_.empty()) {
-        wcs::Frame frame;
-        frame.type = wcs::FrameType::Output;
-        frame.payload = std::move(pendingLive_);
-        queueBytes_ += frame.payload.size();
+        pushOutput(pendingLive_.data(), pendingLive_.size());
         pendingLive_.clear();
-        queue_.push_back(std::move(frame));
+    }
+    if (queueBytes_ + kMaxQueueBytes > queueLimit_) {
+        queueLimit_ = queueBytes_ + kMaxQueueBytes;
     }
     replayPending_ = false;
 }
@@ -357,6 +370,7 @@ void TermConnection::WriterLoop() {
             } else {
                 queueBytes_ = 0;
             }
+            if (queueBytes_ < kMaxQueueBytes) queueLimit_ = kMaxQueueBytes;
         }
     }
 }
@@ -763,6 +777,7 @@ bool TermServer::Start(std::string& error) {
     std::string host = "0.0.0.0";
     uint16_t configPort = 9139;
     std::string token;
+    size_t historyBytes = 32ull * 1024 * 1024;
     if (cfg.contains("terminal") && cfg["terminal"].is_object()) {
         const nlohmann::json& t = cfg["terminal"];
         if (t.contains("local") && t["local"].is_boolean()) local = t["local"].get<bool>();
@@ -773,6 +788,12 @@ bool TermServer::Start(std::string& error) {
             if (p > 0 && p <= 65535) configPort = static_cast<uint16_t>(p);
         }
         if (t.contains("token") && t["token"].is_string()) token = t["token"].get<std::string>();
+        if (t.contains("history_bytes") && t["history_bytes"].is_number_integer()) {
+            int64_t hb = t["history_bytes"].get<int64_t>();
+            if (hb >= 64 * 1024 && hb <= 64ll * 1024 * 1024) {
+                historyBytes = static_cast<size_t>(hb);
+            }
+        }
     }
 
     bool configChanged = !cfg.contains("terminal") || !cfg["terminal"].is_object();
@@ -783,6 +804,10 @@ bool TermServer::Start(std::string& error) {
     if (!cfg["terminal"].contains("remote")) cfg["terminal"]["remote"] = false;
     if (!cfg["terminal"].contains("host")) cfg["terminal"]["host"] = "0.0.0.0";
     if (!cfg["terminal"].contains("port")) cfg["terminal"]["port"] = 9139;
+    if (!cfg["terminal"].contains("history_bytes")) {
+        cfg["terminal"]["history_bytes"] = 32ull * 1024 * 1024;
+        configChanged = true;
+    }
 
     if (!local && !remote) {
         if (configChanged && !dataDir.empty()) {
@@ -802,6 +827,10 @@ bool TermServer::Start(std::string& error) {
     }
 
     impl_->shared->token = token;
+    // Deep WCSP scrollback is bounded by bytes rather than lines so a job with
+    // long lines cannot use unbounded memory. The client uses the same budget
+    // for its own TerminalBuffer.
+    impl_->pm.SetTerminalHistoryBytes(historyBytes);
 
     WSADATA wsa{};
     if (WSAStartup(MAKEWORD(2, 2), &wsa) != 0) {

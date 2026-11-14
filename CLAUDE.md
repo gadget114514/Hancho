@@ -28,7 +28,7 @@
 3. **ビルド**: `cmake --build build --config Release --target Hancho hancho-cli` を実行し、`build\Release\hancho-cli.exe --version` が `x.y.z` を返すことを確認する。
 4. **コミットと push**: 変更をコミットして `git push origin main` する。
 5. **パッケージ**:
-   - `dist\Hancho-vx.y.z-win64\` を新しく作り、次をコピーする: `build\Release` の `Hancho.exe`、`hancho-cli.exe`、`conpty.dll`、`OpenConsole.exe`、およびルートの `LICENSE`、`README.md`、`README-ja.md`、`doc\`、`tools\`。
+   - `dist\Hancho-vx.y.z-win64\` を新しく作り、次をコピーする: `build\Release` の `Hancho.exe`、`hancho-cli.exe`、`conpty.dll`、`OpenConsole.exe`、およびルートの `LICENSE`、`README.md`、`README-ja.md`、`doc\`、`tools\`、`skills\`。
    - PowerShell の `Compress-Archive -Path <そのフォルダ> -DestinationPath dist\Hancho-vx.y.z-win64.zip` で zip を作る。
    - `installer\build_installer.cmd` で `dist\Hancho-vx.y.z-win64-setup.exe` を作る。
 6. **GitHub リリース**: `gh release create vx.y.z <setup.exe> <zip> --target main --title "Hancho vx.y.z" --notes-file dist/release-notes-vx.y.z.md` を実行し、タグが push したコミットを指していること、アセットが 2 つあることを確認する。

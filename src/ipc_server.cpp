@@ -1749,6 +1749,7 @@ std::string IpcServer::HandleRequestJson(const std::string& reqJson) {
                 if (!t.contains("host")) t["host"] = "0.0.0.0";
                 if (!t.contains("port")) t["port"] = 9139;
                 if (!t.contains("token")) t["token"] = "";
+                if (!t.contains("history_bytes")) t["history_bytes"] = 32 * 1024 * 1024;
             }
             {
                 nlohmann::json& m = EnsureChatBlock(cfg);
@@ -1815,6 +1816,10 @@ std::string IpcServer::HandleRequestJson(const std::string& reqJson) {
             }
             if (cfg.contains("llm_max_events") && cfg["llm_max_events"].is_number()) {
                 SetLlmMaxEvents(cfg["llm_max_events"].get<int64_t>());
+            }
+            if (cfg.contains("process_metrics_interval_ms") &&
+                cfg["process_metrics_interval_ms"].is_number_integer()) {
+                pm_.SetMetricsIntervalMs(static_cast<int>(cfg["process_metrics_interval_ms"].get<int64_t>()));
             }
             if (cfg.contains("restore_usage_graph") && cfg["restore_usage_graph"].is_boolean()) {
                 SetUsageHistoryPersistence(cfg["restore_usage_graph"].get<bool>());

@@ -157,11 +157,49 @@ int main(int argc, char** argv) {
         return false;
     };
 
-    Check(waitFor("hello-wcsp", 10000), "replay contains hello-wcsp");
+    const bool gotHello = waitFor("hello-wcsp", 10000);
+    {
+        std::lock_guard<std::mutex> lock(outputMutex);
+        std::printf("first replay bytes=%zu\n", output.size());
+    }
+    Check(gotHello, "replay contains hello-wcsp");
+
+    // Multi-session: a second client attaches to the same job and both receive
+    // the live output. This is what the tabbed terminal client uses.
+    std::mutex output2Mutex;
+    std::string output2;
+    RemoteSession session2(cfg);
+    session2.SetOutputSink([&](const char* data, size_t len) {
+        std::lock_guard<std::mutex> lock(output2Mutex);
+        output2.append(data, len);
+    });
+    Check(session2.Start(opt, &error), "a second client attaches to the same job");
+
+    auto waitFor2 = [&](const std::string& needle, int timeoutMs) {
+        const DWORD deadline = GetTickCount() + static_cast<DWORD>(timeoutMs);
+        while (GetTickCount() < deadline) {
+            {
+                std::lock_guard<std::mutex> lock(output2Mutex);
+                if (output2.find(needle) != std::string::npos) return true;
+            }
+            Sleep(50);
+        }
+        return false;
+    };
+
+    Check(waitFor2("hello-wcsp", 10000), "second session replay contains hello-wcsp");
+
+    const std::string command2 = "echo second-session\r";
+    session2.Write(command2.data(), command2.size());
+    Check(waitFor("second-session", 10000), "first session sees input from the second");
+    Check(waitFor2("second-session", 10000), "second session sees its own echo");
+
+    session2.Close();
+    Sleep(300);
 
     const std::string command = "echo second\r";
     session.Write(command.data(), command.size());
-    Check(waitFor("second", 10000), "input is echoed back through the PTY");
+    Check(waitFor("second", 10000), "first session keeps working after the second closes");
 
     session.Close();
 

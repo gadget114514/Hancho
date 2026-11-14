@@ -1,5 +1,6 @@
 #include "../include/TerminalView.h"
 #include <algorithm>
+#include <climits>
 #include <cstring>
 #include <shellapi.h>   // ShellExecuteW for hyperlink open
 #include <windowsx.h>  // GET_X_LPARAM / GET_Y_LPARAM
@@ -729,6 +730,7 @@ void TerminalView::OnSize(int w, int h) {
         if (PtyIsRunning())
             PtyResize(cols, rows);
     }
+    ApplyScrollbackBudget();
     // Clamp scroll offset to new history size after resize
     const int maxScroll = std::max(0, buffer_.historyLineCount());
     scrollOffset_ = std::min(scrollOffset_, maxScroll);
@@ -1593,6 +1595,18 @@ void TerminalView::CopySelectionToClipboard() const {
     CloseClipboard();
 }
 
+void TerminalView::CopySelection() {
+    CopySelectionToClipboard();
+}
+
+void TerminalView::PasteClipboard() {
+    PasteFromClipboard();
+}
+
+bool TerminalView::HasSelection() const {
+    return selAnchorRow_ >= 0 && selEndRow_ >= 0;
+}
+
 // ---------------------------------------------------------------------------
 // Mouse tracking
 // ---------------------------------------------------------------------------
@@ -1651,6 +1665,28 @@ int TerminalView::VisibleRows() const {
     if (cellHeight_ <= 0 || !hwnd_) return buffer_.rows();
     RECT rc; GetClientRect(hwnd_, &rc);
     return std::max(1, (int)((rc.bottom - rc.top) / cellHeight_));
+}
+
+void TerminalView::SetScrollbackBudget(int maxLines, size_t maxBytes) {
+    scrollbackMaxLines_ = (std::max)(100, maxLines);
+    scrollbackMaxBytes_ = maxBytes;
+    ApplyScrollbackBudget();
+}
+
+void TerminalView::ApplyScrollbackBudget() {
+    const int columns = (std::max)(1, static_cast<int>(buffer_.columns()));
+    int lines = scrollbackMaxLines_;
+    if (scrollbackMaxBytes_ > 0) {
+        const size_t perLine = sizeof(TerminalCell) * static_cast<size_t>(columns) + 64;
+        if (perLine > 0) {
+            const size_t budgetLines = scrollbackMaxBytes_ / perLine;
+            const int byBytes = budgetLines > static_cast<size_t>(INT_MAX)
+                                    ? INT_MAX
+                                    : static_cast<int>(budgetLines);
+            lines = (std::min)(lines, byBytes);
+        }
+    }
+    buffer_.setMaxHistoryLines((std::max)(100, lines));
 }
 
 void TerminalView::ScrollBy(int lines) {

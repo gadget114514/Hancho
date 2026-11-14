@@ -17,4 +17,8 @@ int RunIpmsgDialog(bool startHidden);
 // front. Returns false when no window exists.
 bool ActivateIpmsgDialog();
 
+// Sends draft text to the Chat compose box and activates the window.
+// If Chat is not running yet, launches it and waits briefly.
+bool SendDraftToIpmsgDialog(const std::wstring& text);
+
 } // namespace pc

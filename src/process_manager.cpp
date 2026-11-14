@@ -170,6 +170,14 @@ ProcessManager::ManagedProcess::~ManagedProcess() {
 
 ProcessManager::ProcessManager() {
     LoadState();
+    {
+        std::string content = ReadFileUtf8Wide(PathJoinWide(GetEffectiveDataDirectoryWide(), L"config.json"));
+        nlohmann::json cfg = nlohmann::json::parse(content, nullptr, false);
+        if (cfg.is_object() && cfg.contains("process_metrics_interval_ms") &&
+            cfg["process_metrics_interval_ms"].is_number_integer()) {
+            SetMetricsIntervalMs(static_cast<int>(cfg["process_metrics_interval_ms"].get<int64_t>()));
+        }
+    }
     // If the monitor loop throws, log it and restart it: exit detection and timeouts must keep working.
     monitorThread_ = std::thread([this] {
         while (!stopMonitor_) {
@@ -262,7 +270,8 @@ int ProcessManager::StartProcess(const StartProcessRequest& req, std::string& ou
 
     if (req.mode == ExecMode::ConPTY) {
         std::weak_ptr<ManagedProcess> weakProc = proc;
-        auto outputObserver = [weakProc](const char* data, size_t len) {
+        const size_t historyLimit = terminalHistoryBytes_;
+        auto outputObserver = [weakProc, historyLimit](const char* data, size_t len) {
             auto sp = weakProc.lock();
             if (!sp || len == 0) return;
             sp->lastOutputTickMs = GetNowTickMs();
@@ -276,12 +285,11 @@ int ProcessManager::StartProcess(const StartProcessRequest& req, std::string& ou
                 sp->totalBytesRead += len;
                 sp->outputVersion++;
                 logPathW = sp->logFilePathWide;
-                constexpr size_t kMaxRawBytes = 2 * 1024 * 1024;
-                if (sp->rawOutput.size() > kMaxRawBytes) {
-                    sp->rawOutput.erase(0, sp->rawOutput.size() - kMaxRawBytes);
+                if (sp->rawOutput.size() > historyLimit) {
+                    sp->rawOutput.erase(0, sp->rawOutput.size() - historyLimit);
                 }
-                if (sp->cleanOutput.size() > kMaxRawBytes) {
-                    sp->cleanOutput.erase(0, sp->cleanOutput.size() - kMaxRawBytes);
+                if (sp->cleanOutput.size() > historyLimit) {
+                    sp->cleanOutput.erase(0, sp->cleanOutput.size() - historyLimit);
                 }
                 // WCSP terminal subscribers are invoked while outputMutex is held so
                 // a subscriber's replay snapshot and live stream stay contiguous.
@@ -877,7 +885,11 @@ void ProcessManager::MonitorThreadFunc() {
                 }
             }
 
-            UpdateJobMetrics(*proc);
+            const uint64_t metricsIntervalMs = static_cast<uint64_t>(GetMetricsIntervalMs());
+            if (now - proc->lastMetricsTickMs >= metricsIntervalMs) {
+                proc->lastMetricsTickMs = now;
+                UpdateJobMetrics(*proc);
+            }
 
             if (proc->timeoutSec > 0) {
                 uint64_t elapsedSec = (now - proc->startTickMs) / 1000;
@@ -1175,7 +1187,7 @@ int ProcessManager::AddTerminalSubscriber(int id, std::function<void(const char*
         return -1;
     }
 
-    constexpr size_t kMaxReplayBytes = 512 * 1024;
+    const size_t kMaxReplayBytes = terminalReplayBytes_;
     std::lock_guard<std::mutex> outLock(proc->outputMutex);
     if (proc->rawOutput.size() > kMaxReplayBytes) {
         replay.assign(proc->rawOutput,

@@ -8,7 +8,7 @@ These files are copies of the client half of WinConsoleServer (commit `c76d4e7`)
 - `remote_session.h` / `remote_session.cpp`
 
 They implement the WCSP v1 wire protocol and the `RemoteSession` terminal backend
-used by `TerminalView` in the standalone dashboard.
+used by `TerminalView` in the standalone terminal client window (`src/term_client.cpp`).
 
 Local changes made when importing them into Hancho:
 
@@ -20,3 +20,5 @@ Local changes made when importing them into Hancho:
 The server side lives in `../term_server.h` / `../term_server.cpp`; it attaches
 WCSP sessions to `ProcessManager` ConPTY jobs instead of spawning its own shells
 (except for the `cmd` / `powershell` / `bash` compatibility modes).
+
+The protocol reference is [`doc/wcsp.md`](../../doc/wcsp.md).

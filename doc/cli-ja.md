@@ -136,7 +136,7 @@ hancho-cli.exe power suspend --dry-run   # 実際にはスリープせず確認
 
 対象ジョブが `succeeded` / `failed` / `cancelled` / `blocked` になると、他のタスクキュージョブ（`running` / `waiting` / `pending`）と Hancho 管理プロセスがなくなるまで待ちます。待機中に新しい作業が始まった場合はカウントダウンをやり直します。`--hibernate` で休止、`--dry-run` で確認できます。複数のジョブにフラグを付けた場合は、すべて終了してから発動します。`power_*` はローカルホスト専用です。
 
-**LAN チャット（`chat`、別名 `msg`、IPMsg 互換プロトコル）:**
+**LAN チャット（`chat`、別名 `msg` / `ipmsg`、IPMsg 互換プロトコル）:**
 
 ```powershell
 hancho-cli.exe chat status
@@ -158,7 +158,7 @@ hancho-cli.exe chat handler off
 hancho-cli.exe chat clear
 ```
 
-`chat`（別名 `msg`）は Chat ノード（IPMsg 互換プロトコル）を操作します: `status`、`on` / `off`（`chat.enabled` を書き換えてノードを再起動）、`peers`、`refresh`、`send`、`inbox`、`get`、`wait`、`read`、`download`、`log`、`handler`、`clear`。`send` の `<to>` はピアキー（`ip:port`）、IP、ニックネーム、全ピアを表す `*`、またはこのノード内のエージェントだけに届ける `local` / `self` です。`--file` は複数指定でき、`--stdin` は本文を標準入力から読みます。`wait` は新着メッセージをロングポーリングし（既定 60 秒）、次回用の `last_id` を返します。`chat download` は受信メッセージのファイルを取得し、`chat log` は日次の会話ログを検索します。
+`chat`（別名 `msg`、`ipmsg`）は Chat ノード（IPMsg 互換プロトコル）を操作します: `status`、`on` / `off`（`chat.enabled` を書き換えてノードを再起動）、`peers`、`refresh`、`send`、`inbox`、`get`、`wait`、`read`、`download`、`log`、`handler`、`clear`。`send` の `<to>` はピアキー（`ip:port`）、IP、ニックネーム、全ピアを表す `*`、またはこのノード内のエージェントだけに届ける `local` / `self` です。`--file` は複数指定でき、`--stdin` は本文を標準入力から読みます。`wait` は新着メッセージをロングポーリングし（既定 60 秒）、次回用の `last_id` を返します。`chat download` は受信メッセージのファイルを取得し、`chat log` は日次の会話ログを検索します。
 
 `chat handler` は受信メッセージに答える LLM（`config.json` の `chat.handler`）を表示・変更します。`on` / `off`、`--engine`、`--model`、`--agent`、`--cwd`、`--instructions`、`--taskqueue`、`--auto-reply on|off`、`--skip-permissions on|off`、`--timeout`、`--max-hops`、`--concurrency` を指定できます。LLM からは MCP `chat_handler` で同じ操作ができます。変更は `config.json` に保存され、ノードが再読み込みします（Chat 画面の **応答 LLM** バーも同じです）。`--json` は IPC の応答をそのまま出力します。
 

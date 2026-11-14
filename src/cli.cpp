@@ -1,4 +1,5 @@
 #include "cli.h"
+#include "parse_util.h"
 #include "common.h"
 #include "event_adapter.h"
 #include "llm_stream.h"
@@ -2557,7 +2558,7 @@ TRIAGE:
   triage manual <id>
       Mark a pending card as being handled manually and print an interactive prompt.
 
-CHAT (LAN messaging between people and LLM agents; alias: msg):
+CHAT (LAN messaging between people and LLM agents; aliases: msg, ipmsg):
   chat status | on | off | peers | refresh | clear
       status   Show the node, peers, unread count and handler.
       on/off   Enable or disable the node (writes chat.enabled and restarts it).
@@ -3148,7 +3149,7 @@ void PrintCliUsageJson() {
     std::cout << R"(
     {
       "name": "chat",
-      "aliases": ["msg"],
+      "aliases": ["msg", "ipmsg"],
       "description": "LAN chat (IPMsg compatible) between people and LLM agents: enable/disable the node, list peers, send text and files, receive and long-poll messages, download files, search the conversation log and configure the answering LLM handler. LAN only and unencrypted.",
       "usage": "hancho-cli chat <status|on|off|peers|refresh|send|inbox|get|wait|read|download|log|handler|clear> [options]",
       "subcommands": [
@@ -4457,9 +4458,7 @@ static std::string MemoryInjectCompareJsonCli(const std::string& jobName,
         };
         auto parseIso = [](const std::string& s) -> int64_t {
             int y = 0, mo = 0, d = 0, h = 0, mi = 0, se = 0;
-            char sep = 0;
-            if (std::sscanf(s.c_str(), "%d-%d-%d%c%d:%d:%d", &y, &mo, &d, &sep, &h, &mi, &se) < 7) return 0;
-            if (sep != 'T' && sep != ' ') return 0;
+            if (!ParseDateTimeFields(s, y, mo, d, h, mi, se)) return 0;
             std::tm tmv = {};
             tmv.tm_year = y - 1900;
             tmv.tm_mon = mo - 1;
@@ -4476,7 +4475,7 @@ static std::string MemoryInjectCompareJsonCli(const std::string& jobName,
                 sinceEpoch = static_cast<int64_t>(std::time(nullptr)) - secs;
             } else {
                 int y = 0, mo = 0, d = 0;
-                if (std::sscanf(since.c_str(), "%d-%d-%d", &y, &mo, &d) == 3) {
+                if (ParseDateFields(since, y, mo, d)) {
                     std::tm tmv = {};
                     tmv.tm_year = y - 1900;
                     tmv.tm_mon = mo - 1;
@@ -5351,7 +5350,7 @@ static int RunIpmsgCommand(const std::vector<std::string>& args, bool jsonOutput
 
     const std::string helpText =
         "Usage: hancho-cli chat <status|on|off|peers|refresh|send|inbox|get|wait|read|download|log|handler|clear>\n"
-        "       (alias: hancho-cli msg ...)\n"
+        "       (aliases: hancho-cli msg ..., hancho-cli ipmsg ...)\n"
         "\n"
         "  status                 Show the node state, peers, unread count and handler.\n"
         "  on | off               Enable or disable the Chat node (writes chat.enabled).\n"

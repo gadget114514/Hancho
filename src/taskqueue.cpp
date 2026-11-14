@@ -1,4 +1,5 @@
 #include "taskqueue.h"
+#include "parse_util.h"
 #include "common.h"
 #include "chain_guard.h"
 #include "event_schema.h"
@@ -586,9 +587,7 @@ static uint64_t EventSeqOf(const nlohmann::json& ev) {
 // "2026-11-10T09:12:33.120Z" (or without the fraction/zone) to UTC epoch seconds.
 static int64_t ParseIsoUtcSec(const std::string& s) {
     int y = 0, mo = 0, d = 0, h = 0, mi = 0, se = 0;
-    char sep = 0;
-    if (std::sscanf(s.c_str(), "%d-%d-%d%c%d:%d:%d", &y, &mo, &d, &sep, &h, &mi, &se) < 7) return 0;
-    if (sep != 'T' && sep != ' ') return 0;
+    if (!ParseDateTimeFields(s, y, mo, d, h, mi, se)) return 0;
     std::tm tmv = {};
     tmv.tm_year = y - 1900;
     tmv.tm_mon = mo - 1;
@@ -2131,7 +2130,7 @@ TaskQueueCounts TaskQueueManager::GetJobCounts() const {
                     const auto& lastAtt = job.attempts.back();
                     if (!lastAtt.start.empty()) {
                         int y = 0, mo = 0, d = 0, h = 0, mi = 0, sec = 0;
-                        if (sscanf_s(lastAtt.start.c_str(), "%d-%d-%d %d:%d:%d", &y, &mo, &d, &h, &mi, &sec) == 6) {
+                        if (ParseDateTimeFields(lastAtt.start, y, mo, d, h, mi, sec)) {
                             struct tm t = {};
                             t.tm_year = y - 1900;
                             t.tm_mon = mo - 1;
@@ -2570,6 +2569,7 @@ void TaskQueueManager::LoadQueues() {
         }
         queues_[tq.name] = tq;
     }
+    jobIndexDirty_ = true;
 }
 
 void TaskQueueManager::SaveQueue(const TaskQueue& tq) {
@@ -2800,27 +2800,49 @@ void TaskQueueManager::SetBtOrigin(const std::string& btId, const std::string& o
     else btOrigins_[btId] = o;
 }
 
-TaskQueueJob* TaskQueueManager::FindJob(const std::string& id, TaskQueue** outQueue) {
-    for (auto& [name, tq] : queues_) {
-        (void)name;
-        for (auto& job : tq.jobs) {
-            if (job.id == id) {
-                if (outQueue) *outQueue = &tq;
-                return &job;
-            }
+void TaskQueueManager::RebuildJobIndexLocked() const {
+    jobIndex_.clear();
+    for (const auto& [name, tq] : queues_) {
+        for (size_t i = 0; i < tq.jobs.size(); ++i) {
+            jobIndex_.emplace(tq.jobs[i].id, JobIndexEntry{name, i});
         }
     }
-    return nullptr;
+    jobIndexDirty_ = false;
+}
+
+TaskQueueJob* TaskQueueManager::FindJob(const std::string& id, TaskQueue** outQueue) {
+    if (jobIndexDirty_) RebuildJobIndexLocked();
+    auto entry = jobIndex_.find(id);
+    if (entry == jobIndex_.end()) return nullptr;
+    auto q = queues_.find(entry->second.queue);
+    if (q == queues_.end() || entry->second.index >= q->second.jobs.size() ||
+        q->second.jobs[entry->second.index].id != id) {
+        jobIndexDirty_ = true;
+        RebuildJobIndexLocked();
+        entry = jobIndex_.find(id);
+        if (entry == jobIndex_.end()) return nullptr;
+        q = queues_.find(entry->second.queue);
+        if (q == queues_.end() || entry->second.index >= q->second.jobs.size()) return nullptr;
+    }
+    if (outQueue) *outQueue = &q->second;
+    return &q->second.jobs[entry->second.index];
 }
 
 const TaskQueueJob* TaskQueueManager::FindJobConst(const std::string& id) const {
-    for (const auto& [name, tq] : queues_) {
-        (void)name;
-        for (const auto& job : tq.jobs) {
-            if (job.id == id) return &job;
-        }
+    if (jobIndexDirty_) RebuildJobIndexLocked();
+    auto entry = jobIndex_.find(id);
+    if (entry == jobIndex_.end()) return nullptr;
+    auto q = queues_.find(entry->second.queue);
+    if (q == queues_.end() || entry->second.index >= q->second.jobs.size() ||
+        q->second.jobs[entry->second.index].id != id) {
+        jobIndexDirty_ = true;
+        RebuildJobIndexLocked();
+        entry = jobIndex_.find(id);
+        if (entry == jobIndex_.end()) return nullptr;
+        q = queues_.find(entry->second.queue);
+        if (q == queues_.end() || entry->second.index >= q->second.jobs.size()) return nullptr;
     }
-    return nullptr;
+    return &q->second.jobs[entry->second.index];
 }
 
 
@@ -3661,6 +3683,7 @@ std::string TaskQueueManager::TaskQueueAdd(const std::string& taskqueue, const s
         if (j.num <= 0) j.num = nextJobNum_++;
     }
     queues_[taskqueue] = tq;
+    jobIndexDirty_ = true;
     ReevaluateAll();
     SaveQueue(queues_[taskqueue]);
     cv_.notify_all();
@@ -3722,6 +3745,7 @@ std::string TaskQueueManager::AddBtJob(const std::string& taskqueue, const std::
     job.num = nextJobNum_++;
     tq.jobs.push_back(job);
     queues_[taskqueue] = tq;
+    jobIndexDirty_ = true;
     ReevaluateAll();
     SaveQueue(queues_[taskqueue]);
     cv_.notify_all();
@@ -4283,6 +4307,7 @@ std::string TaskQueueManager::TaskQueuePurge(const std::string& taskqueue, const
         return std::find(states.begin(), states.end(), j.state) != states.end();
     }), jobs.end());
     size_t purged = before - jobs.size();
+    if (purged > 0) jobIndexDirty_ = true;
     it->second.version++;
     SaveQueue(it->second);
     return "{\"ok\":true,\"taskqueue\":\"" + JsonEscape(taskqueue) + "\",\"purged\":" + std::to_string(purged) + "}";
@@ -4312,6 +4337,7 @@ std::string TaskQueueManager::TaskQueuePurgeOlderThan(const std::string& taskque
         }), tq.jobs.end());
         size_t removed = before - tq.jobs.size();
         if (removed > 0) {
+            jobIndexDirty_ = true;
             purged += removed;
             tq.version++;
             SaveQueue(tq);
@@ -5707,6 +5733,7 @@ bool TaskQueueManager::RecordPlainRunLocked(const PlainRunState& state, std::str
         job.updatedAt = endTs;
         job.attempts.push_back(a);
         tq.jobs.push_back(std::move(job));
+        jobIndexDirty_ = true;
     }
 
     if (!state.logFile.empty()) {

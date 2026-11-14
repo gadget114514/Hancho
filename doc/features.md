@@ -17,22 +17,23 @@
   - Click **any column header** (`ID`, `Windows PID`, `Agent / Name`, `Status`, `Start Time`, `End Time`, `Uptime`, `Tree Procs`, `Memory`, `CPU Time`, `Idle`, `Latest Output Preview`, `Command Line`, `Job`) to toggle **Ascending (`▲`) / Descending (`▼`)** sort order.
   - `ID` is Hancho's internal number; `Windows PID` is the root process's OS PID, so you can find it immediately in Task Manager.
   - **CPU-Aware Idle Detection**: While a process's CPU time keeps increasing, it stays `RUNNING` instead of being shown as `IDLE / WAITING`, and it is not killed by `--idle-timeout`. CPU time includes all processes in the Win32 Job Object tree.
-- **Tab-Switched Full-Size Direct2D Terminal (`>= 80x25`)**:
-  - Embedded hardware-accelerated Direct2D / DirectWrite / IME / Sixel VT terminal emulator (`TerminalView` + `ConPtySession`).
-  - Switch between active terminals using the **Terminal Tab Bar** while always preserving at least **80 columns × 25 rows** of terminal viewport so TUI apps (`claude`, `opencode`, `vim`, `htop`) never wrap or corrupt their layout.
+- **Standalone Tabbed Terminal Client (`Hancho.exe terminal`, `[>_]`)**:
+  - The WCSP terminal client runs in its own window, separate from the dashboard. Open it from the **`[>_]`** toolbar button or with `Hancho.exe terminal`.
+  - Each tab is an independent WCSP session, so several local or remote consoles can be connected at the same time. Tabs keep running while you switch between them; close a tab with `Ctrl+W`.
+  - `File` > **New local shell** (PowerShell / cmd / bash), **Attach to local job...** (`attach:<id>`) or **Connect to remote...** (host, port, token, target).
+  - A right-click (or the **Edit** menu) offers **Copy** / **Paste**; a right-click on a tab also offers **Reconnect** and **Close**. New local ConPTY jobs started from the dashboard (`+ Launch`) are attached automatically.
+  - **Settings** controls **Always on top**, **Remember window position**, automatic attach, and the byte-based **Scrollback** budget (64–2048 MB per tab; default 1024 MB).
+  - Hardware-accelerated Direct2D / DirectWrite / IME / Sixel VT terminal emulator (`TerminalView`), always at least **80 columns × 25 rows** so TUI apps (`claude`, `opencode`, `vim`, `htop`) do not wrap or corrupt their layout.
   - Type directly into the terminal (full keyboard input, `Ctrl+C`, IME composition, mouse wheel scrollback, and text selection).
-- **Up to 16 Parallel Terminals in Live Grid View (`[▦]`)**:
-  - Click **`[▦]`** on the toolbar to open a live DWM thumbnail & snapshot grid (up to **16 parallel terminals** in a `4×4` matrix). Click any cell or use arrow keys + Enter to jump directly to that terminal tab.
 - **Compact Icon Buttons with Hover Tooltips**:
-  - **`[▦]`** Grid View toggle
   - **`[☰]`** Hide/Show Process List toggle
-  - **`[>_]`** Hide/Show Terminal Panel toggle
+  - **`[>_]`** Open the terminal client window
   - **`[⤓]`** Minimize to System Tray
   - All toolbar icon buttons provide instant status-aware hover tooltips.
 - **Triage**: Review one persistent card per failed job or other condition, with Hancho-collected information, candidate actions and a deterministic recommendation; choose and record a decision, request LLM advice, and track pending, acted, ignored or naturally resolved cards. See [Triage](triage.md).
 
 ## 2. Multi-Shell Launcher & `[Config]` Dialog (`cmd` / `powershell` / `bash`)
-- Click **`[+ Launch (...)]`** on the toolbar to immediately spawn a new interactive ConPTY terminal tab.
+- Click **`[+ Launch (...)]`** on the toolbar to immediately spawn a new interactive ConPTY job. The terminal client window opens and attaches to it automatically.
 - Open **`[Settings]`** → **`[Shell Config...]`** to select the default shell (`cmd`, `powershell`, or `bash` — auto-detecting Git Bash / WSL Bash), customize startup command lines, or launch any shell on the spot. Settings are persisted in `logs/config.json`.
 
 ![Shell Config Dialog](images/config_dialog.png)
@@ -40,7 +41,7 @@
 ## 3. History Management, Task Details & LLM JSON Tree Viewer
 - **Hide Ended Processes** (Settings dialog): A convenient checkbox in the Settings dialog lets you toggle hiding/showing finished processes so you can focus exclusively on currently running tasks without deleting history.
 - **`[Clear Ended]`** & **`[Reset Process IDs]`** (Settings dialog): Clear all completed/failed process history or renumber processes sequentially from `#1`.
-- **Right-Click Context Menu & Task Details Dialog**: Right-click any process row or terminal tab (or double-click a row) to terminate the process tree (**`Kill Tree`** with confirmation), inspect full command lines, working directory, PID/Job metrics, log paths, `.done` files, and output preview, or copy commands to the clipboard.
+- **Right-Click Context Menu & Task Details Dialog**: Right-click any process row (or double-click a row) to terminate the process tree (**`Kill Tree`** with confirmation), inspect full command lines, working directory, PID/Job metrics, log paths, `.done` files, and output preview, or copy commands to the clipboard.
 - **LLM JSON Output Streaming & Interactive Tree Viewer**:
   - Native streaming event capture for major AI coding agents (`claude`, `agy`, `opencode`, `codex`).
   - Automatically captures structured event streams into `<logfile>.stream.jsonl` in addition to raw console logs.
@@ -105,18 +106,17 @@
 - Trusted LAN only; nothing is encrypted. See [Chat](chat.md) for the protocol, configuration, security notes and examples.
 
 ## 11. Terminal sessions (WCSP)
-- The core exposes every ConPTY job over the WinConsoleServer protocol (WCSP v1). The standalone dashboard (`Hancho.exe gui`) attaches to those jobs through a local TCP listener and shows the live screen and keyboard input in the existing terminal tabs. Closing the dashboard, switching tabs or detaching does not stop the job.
+- The core exposes every ConPTY job over the WinConsoleServer protocol (WCSP v1). The terminal client (`Hancho.exe terminal`, or the `[>_]` toolbar button) runs in its own window, separate from the dashboard. Each tab is an independent WCSP session, so several local or remote consoles can be connected at the same time; closing a tab or the client does not stop an attached job.
+- In the client, `File` > **New local shell** opens a PowerShell / cmd / bash job on the core, **Attach to local job...** lists the running ConPTY jobs (`attach:<id>`), and **Connect to remote...** connects to another Hancho core by host, port and token. New local jobs started from the dashboard (`+ Launch`) are attached automatically. Right-click a tab for **Reconnect** or **Close**.
 - The listener is configured in `<data-dir>/config.json`:
 
   ```json
   "terminal": { "local": true, "remote": false, "host": "0.0.0.0", "port": 9139, "token": "" }
   ```
 
-  With `local: true` (the default) it binds `127.0.0.1` on an ephemeral port. The dashboard learns the address and token through the local named pipe (`term_endpoint`); when `token` is empty, a random token is generated on first start and written back to the config file.
-- Set `remote: true` to bind `host:port` so WinConsoleTerminal on another PC can connect:
-
-  `WinConsoleTerminal --host <pc> --port 9139 --shell powershell --token <token>`
-
-  Use `attach:<id>` as the shell/target to view an existing Hancho job instead of starting a new one.
-- Settings → **WinConsoleServer** has **local** and **remote** switches (`terminal.local` / `terminal.remote`). Turning both off stops the listener, so neither the dashboard nor WinConsoleTerminal can attach.
+  With `local: true` (the default) it binds `127.0.0.1` on an ephemeral port. The client learns the address and token through the local named pipe (`term_endpoint`); when `token` is empty, a random token is generated on first start and written back to the config file.
+- History depth is byte-based. `terminal.history_bytes` (default 32 MiB) caps the raw ConPTY history kept by the core and the replay sent when a client attaches. The client trims its own scrollback to Settings → **Scrollback** (64–2048 MB per tab, default 1024 MB), so a long-running console can be scrolled back thousands of lines without unbounded memory use.
+- Set `remote: true` to bind `host:port` so WinConsoleTerminal (`Hancho.exe terminal --host <pc> --port 9139 --shell powershell --token <token>`) or another client on the LAN can connect past the local core.
+- Settings → **WinConsoleServer** has **local** and **remote** switches (`terminal.local` / `terminal.remote`). Turning both off stops the listener, so neither the local dashboard nor a remote client can attach.
 - WCSP is plain TCP without encryption. Enable `remote` only on a trusted LAN and keep the token private.
+- The wire protocol (frames, TLVs, handshake, sessions and limits) is documented in [WCSP](wcsp.md).

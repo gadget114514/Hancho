@@ -97,6 +97,14 @@ ProcessManager::ManagedProcess::~ManagedProcess() {
 
 ProcessManager::ProcessManager() {
     LoadState();
+    {
+        std::string content = ReadFileUtf8Wide(PathJoinWide(GetEffectiveDataDirectoryWide(), L"config.json"));
+        nlohmann::json cfg = nlohmann::json::parse(content, nullptr, false);
+        if (cfg.is_object() && cfg.contains("process_metrics_interval_ms") &&
+            cfg["process_metrics_interval_ms"].is_number_integer()) {
+            SetMetricsIntervalMs(static_cast<int>(cfg["process_metrics_interval_ms"].get<int64_t>()));
+        }
+    }
     monitorThread_ = std::thread([this] {
         while (!stopMonitor_) {
             try {
@@ -480,7 +488,11 @@ void ProcessManager::MonitorThreadFunc() {
                 continue;
             }
 
-            UpdateJobMetrics(*proc);
+            const uint64_t metricsIntervalMs = static_cast<uint64_t>(GetMetricsIntervalMs());
+            if (now - proc->lastMetricsTickMs >= metricsIntervalMs) {
+                proc->lastMetricsTickMs = now;
+                UpdateJobMetrics(*proc);
+            }
 
             if (proc->timeoutSec > 0 && (now - proc->startTickMs) / 1000 >= static_cast<uint64_t>(proc->timeoutSec)) {
                 TerminateJobInternal(*proc, ProcState::TimedOut,

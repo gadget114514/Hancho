@@ -93,6 +93,16 @@ public:
     void SendInput(const std::string& utf8);
     void SendInput(const std::wstring& text);
 
+    // Clipboard helpers for the standalone terminal client's Edit menu.
+    void CopySelection();
+    void PasteClipboard();
+    bool HasSelection() const;
+
+    // Scrollback budget: the effective history line cap is the smaller of
+    // maxLines and what fits in maxBytes (0 = no byte limit). Applied again
+    // whenever the terminal is resized.
+    void SetScrollbackBudget(int maxLines, size_t maxBytes);
+
     // Window class name for RegisterClassEx
     static constexpr const wchar_t* kClassName = L"EcodeTerminalView";
     static bool RegisterWindowClass(HINSTANCE hInst);
@@ -148,6 +158,9 @@ private:
     void SendMouseClickToPty(int button, int px, int py, bool release);
 
     // Scrollback
+    void ApplyScrollbackBudget();
+    int scrollbackMaxLines_ = 100000;
+    size_t scrollbackMaxBytes_ = 0;
     static constexpr int kScrollBarWidth = 8;
     int  scrollOffset_ = 0;  // lines scrolled back (0 = bottom)
     int  maxScrollOffset_ = 0; // cached historyLineCount at last paint

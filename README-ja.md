@@ -22,118 +22,51 @@
 
 ---
 
-## Express
+## Hancho の概要
 
-- [Releases](https://github.com/gadget114514/Hancho/releases) ページを開き、最新の `Hancho-vx.y.z-win64-setup.exe` をダウンロードしてインストール（ポータブル版: `Hancho-vx.y.z-win64.zip`）
-- LLM に「PATH から hancho を探して、help を読んで使い方を把握して」と伝える
-- LLM に「タスクを作成して、hancho 経由で (opencode|claude|agy|codex) に実行させて」と伝える
-- 以上
+Hancho には、1 コマンドだけ、順番のあるジョブのキュー、あるいはビヘイビアツリー全体を渡せます。各ステップは専用のタイムアウト・成功判定・リトライ・リソースロック・ログを持つ実際の端末プロセスとして実行され、結果だけが LLM に返ります。計画を決めるのは supervisor LLM、プロセスを所有するのは Hancho です。
 
-LLM は `hancho help --json` を実行して使い方を理解します。
-手元の LLM を監督役（フロントエンド）として使い、別の LLM をワーカーとして指定できます。
+詳しくは [概要](doc/overview-ja.md) を参照してください。`run_worker`、ジョブ終了後の PC サスペンド、ビヘイビアツリー、安定したイベントとアダプター、Hancho をやめるとき（卒業）の手順をまとめています。
 
----
+## Hancho スキルを使う
 
-## ワーカー LLM に委任する: `run_worker`
+`skills/hancho/SKILL.md` は、AI エージェントが Hancho をうまく使うためのスキルです。supervisor / Hancho / worker の役割、1 ジョブ = 1 コマンドの原則、`start` とタスクキューとビヘイビアツリーの使い分け、`run_worker`、トリアージ、Chat、メモリ、よくある失敗をまとめています。Markdown だけなのでビルドは不要です。
 
-MCP ツール `run_worker` は、1つのタスクをワーカーの LLM CLI に任せ、終了まで待って最終結果だけを返します。ワーカーのやり取りは監督役のコンテキストに入らず、生のストリームは `stream_file` に残ります。
-
-```json
-{
-  "name": "run_worker",
-  "arguments": {
-    "cmd": "claude -p \"失敗しているテストを要約して\" --output-format stream-json --verbose",
-    "name": "test-summary",
-    "cwd": "D:/work/myproject",
-    "timeout_sec": 1800
-  }
-}
-```
-
-| 引数 | 意味 |
-| :--- | :--- |
-| `cmd`（必須） | ワーカーのコマンドライン。1コマンドのみ |
-| `name`, `cwd` | ダッシュボードの表示名、作業ディレクトリ |
-| `agent_type` | ストリーム形式: `claude`, `agy`, `opencode`, `auto`（既定はコマンドから判定） |
-| `timeout_sec`, `idle_timeout_sec` | この実行時間を超えたとき、またはこの時間出力がないときに強制終了（0 = 無制限） |
-| `supervisor_goal`, `supervisor_notes` | ダッシュボードに表示するテキスト |
-| `wait_ms` | 最大待ち時間（ミリ秒。既定の 0 はワーカー終了まで） |
-
-応答には `finished`, `success`, `state`, `exit_code`, `result`, `result_source`, `result_truncated`, `tool_calls`, `tool_errors`, `num_turns`, `permission_denials`, `total_tokens`, `cost_usd`, `log_file`, `stream_file` が含まれます。
-
-- `result` の上限は 64 KB で、切り詰めると `result_truncated` が true になります。ストリームに結果のイベントがないときは、`result` に出力の末尾の行が入り、`result_source` は `output` になります。
-- `wait_ms` が切れると、応答は `finished: false` とワーカーの現在の動作を返し、ワーカーは動き続けます。続きは、返された `id` を `wait_worker` に渡して待ちます。
-- ハーネスからはネイティブのサブエージェントには見えません。そう見せたいときは、`run_worker` を呼んで結果を返すだけの薄いカスタムエージェント（Claude Code なら `.claude/agents/<name>.md`、安価なモデル、このツールのみ）を定義します。その分のトークンがかかるため、`run_worker` を直接呼ぶのが最も安上がりです。
-- 順序・依存・リトライのある複数ステップには、[タスクキュー](doc/taskqueue-ja.md)を使ってください。
-
----
-
-## 指定タスクの終了後に PC をサスペンドする
-
-夜間のビルドや長時間のエージェント実行が終わったあと、PC を自動でスリープさせられます。対象ジョブが終了し、**他の全ジョブと Hancho 管理プロセスもアイドル**になってから猶予時間の後にサスペンドします。
+**1. 先に Hancho を用意する。** リリースをインストールし、`hancho-cli.exe` に `PATH` を通します。必要ならプロジェクトごとに MCP を一度だけ登録します。
 
 ```powershell
-hancho-cli.exe power suspend --after-job final-build --delay-sec 30
-hancho-cli.exe power status    # 他の実行数と残り秒数
-hancho-cli.exe power cancel    # 解除
+hancho-cli.exe --version
+hancho-cli.exe mcp install --client opencode   # Claude なら --client claude
 ```
 
-ジョブ登録時に `"suspendWhenDone": true, "suspendDelaySec": 30` を付けることもできます。MCP の `power_suspend` / `power_cancel` / `power_status` も同じ機能を提供します。`--hibernate` で休止、`--dry-run` で実行前確認ができます。
+**2. エージェントがスキルを探す場所に置く。** このリポジトリからなら（セットアップ後は同じものが `%LOCALAPPDATA%\Programs\Hancho\skills\hancho` にあります）:
 
----
+```powershell
+# opencode: プロジェクト単位
+New-Item -ItemType Directory -Force .opencode\skills | Out-Null
+New-Item -ItemType Junction -Path .opencode\skills\hancho -Target (Resolve-Path skills\hancho)
 
-## ビヘイビアツリー: 次に何をするかの判断を Hancho の中で行う
+# opencode: 全体（すべてのプロジェクト）
+New-Item -ItemType Directory -Force "$env:USERPROFILE\.config\opencode\skills" | Out-Null
+New-Item -ItemType Junction -Path "$env:USERPROFILE\.config\opencode\skills\hancho" -Target "D:\path\to\Hancho\skills\hancho"
 
-次の手順が前の結果しだいの作業（ビルド → 修正 → 再ビルド、テスト → 修正 → 再テスト、「このファイルが X なら Y をする」）では、これまで監督役の LLM が付きっきりでした。ジョブの終了を待ち、結果を読み、次を決めてジョブを足す、を繰り返していました。Hancho はビヘイビアツリー (BT) の実行機構を内蔵しました。LLM は作業全体を 1 つの JSON のツリーとして書き、`bt_start` で一度だけ渡します。Hancho がツリーをたどり、各手順を普通のタスクキューのジョブとして実行し、決まりきった判断は自分で行います。
+# Claude Code: プロジェクト単位
+New-Item -ItemType Directory -Force .claude\skills | Out-Null
+New-Item -ItemType Junction -Path .claude\skills\hancho -Target (Resolve-Path skills\hancho)
+```
 
-| | これまで（LLM が 1 手順ずつ回す） | ビヘイビアツリー |
-| :--- | :--- | :--- |
-| 次の手順を決めるのは | 監督役の LLM。手順ごとに 1 ターン | Hancho がツリーに従って決める（分岐、ループ、リトライ、条件の確認） |
-| トークンとターン | 手順ごとにターンとコンテキストを使う | `bt_start` 1 回。LLM が呼ばれるのは本当に判断が要るとき (`escalate`) と終了時だけ |
-| 監督役の LLM | 起きて見張り続ける必要がある | `bt_wait` で待つ、寝る、コンテキストが圧縮される、のどれでもツリーは進む |
-| 終わらないループ | LLM が止めるかどうか次第 | `retry` / `repeat` は `max` が必須。ツリー全体も `maxNodeRuns` と `maxWallSec` で打ち切る |
-| 機械的な確認 | LLM がログや終了コードを読む | 組み込みの条件: `exitCode`, `fileExists`, `fileNewer`, `outputMatches`, `jsonValue`, `var` |
-| 判断の記録 | 会話履歴に埋もれる | `escalate` が判断に必要な材料（目的、質問、基準、ログ、ファイル）をまとめて渡し、回答と理由を記録する |
-| 再起動 | LLM がどこまで進んだかを覚えておく必要がある | ツリーの状態は変化のたびに保存され、Hancho を再起動しても続きから進む |
-| ワーカーのエンジン | CLI ごとにコマンドラインを手で書く | `worker` の手順はエンジン名（`claude`, `agy`, `opencode`, `codex`、または `engines.json` の独自定義）で指定。1 つのツリーで混在できる |
+`hancho` フォルダをそのままコピーしてもかまいません（ジャンクションなら実体を 1 つに保てます）。opencode では `opencode.json` に `"skills": ["./skills"]` を追加する方法もあります。
 
-変わらない点: 各手順は今まで通りタスクキューのジョブで、タイムアウト、成功条件、リソースロック、ログを持ち、タスク一覧にも普通のジョブとして並びます。ツールバーの **BT** ボタン（Ctrl+Shift+B）で、どのノードがどのタスクを起動したか、各ツリーがどこまで進んだかを表示できます。LLM は `hancho-cli help --json` と下記のビヘイビアツリー関連資料から書き方を知ります。
+**3. エージェントを再起動または再読み込みして、普通に頼む。** スキルは説明文をもとに自動で提示されるので、「Hancho でビルドして」「この手順をキューにして」「worker LLM に任せて」のような依頼で読み込まれます。opencode では `@hancho` と名前で指定することもできます。
 
-### ビヘイビアツリー関連資料
+スキルは最初に `hancho-cli.exe help --json` を実行するため、表示されるコマンドは古い一覧ではなく、インストール済みバージョンのものになります。
 
-- **[ビヘイビアツリーガイド](doc/behavior-tree-ja.md)** ([English](doc/behavior-tree.md)): JSON 定義形式、全ノード種類、変数展開、ワーカーエンジン、`escalate` 判断パケット、完全なサンプル 3 例を含む総合ガイド。
-- **[トークン消費削減ガイド](doc/behavior-tree-token-optimization-ja.md)** ([English](doc/behavior-tree-token-optimization.md)): 中間ステップのトークン消費ゼロ化、`compact: true` による応答軽量化、`escalate` の行数・サイズ制限など、トークン効率を最大化する設計とベストプラクティス。
-- **[設計・実装計画書](doc/behavior-tree-plan.md)** ([English](doc/behavior-tree-plan-en.md)): ビヘイビアツリーの設計思想、状態マシンとタスクキューの統合、GUI 連携計画をまとめた設計書。
-
----
-
-## 安定したイベントとアダプター
-
-Hancho は生のストリームの隣に、版番号つきのイベント列を書き出します。ワーカープロセスの `logs/proc_<id>_<name>_stream.jsonl` は CLI の生の行を、`logs/proc_<id>_<name>.events.jsonl` は正規化した `hancho.event/1` イベント（`tool.call`、`tool.result`、`usage`、`run.ended` など）を持ちます。スキーマは [doc/schema/hancho.event.v1.json](doc/schema/hancho.event.v1.json) で配布します。
-
-- `hancho-cli worker stream <id>` は `.events.jsonl` の正規化イベント（`hancho.event/1`）を表示します。
-- MCP の `get_worker_stream` は同じ形式（`hancho.event/1`）を返します。
-- C++ を書かずに CLI を追加できます。`<data-dir>/adapters/<name>.json` を置く（Tier 1: `match`、`rules`、JSON Pointer の `map`）か、`exec` に変換プロセスを指定します（Tier 3: stdin に生の行、stdout に `hancho.event` 行）。
-- `engines.json` に `adapter` と `capabilities`（`jsonStream`、`resume`、`reportsUsage`、`reportsSubagents`、`permissionModes`）を書けます。
-- ラッパースクリプトから直接イベントを出せます。pipe モードのワーカーには `HANCHO_EVENT_PIPE` が渡され、`hancho-cli event emit --kind message --text "..."` で書き込めます。
-- `hancho-cli adapter test <name>` は `tests/adapters/<name>/` の入力と期待する `{kind, data}` を照合します。
-
-**イベント形式と旧形式の削除。** `hancho-cli worker stream` と MCP `get_worker_stream` は `hancho.event/1` を返します。以前の内部 `type` 文字列は v0.9.3 で非推奨になり、**v0.11.0** で削除されました。`--schema legacy`（CLI）または `schema: "legacy"`（MCP）を指定すると非対応エラーとなります。移行記録と `type` → `kind` の対応表は [doc/LLM-jsonstream-format.md](doc/LLM-jsonstream-format.md#legacy-type-strings-and-migration-to-hanchoevent1) にあります。
-
-## Hancho をやめるとき（卒業）
-
-Hancho は目的ではなく手段です。[Hancho v3 設計 §5.2](doc/design-v3.md) の理由を harness 側が満たしたら、作業を失わずにやめられます。
-
-1. `hancho-cli.exe mcp uninstall` で `.mcp.json` / `opencode.json` から Hancho の項目を外します。
-2. `hancho-cli.exe agent uninstall-template` で `.claude\agents\hancho-runner.md` を消します。
-3. データディレクトリは既定で残ります。消す場合はどちらかのコマンドに `--delete-data-dir` を付けます。
-
-Hancho のデータはすべて JSON / JSONL（タスクキュー、ビヘイビアツリー、ストリームイベント、意味的メモリ）で、Hancho がなくても読めます。やめる前に [design-v3.md §5.3–5.5](doc/design-v3.md) の機能対応表と置き換え条件を確認してください。この表はリリースごとに[リリースチェックリスト](doc/release-checklist-ja.md)で見直します。
 
 ## ドキュメント
 
 | ドキュメント | 内容 |
 | :--- | :--- |
+| [概要](doc/overview-ja.md) | 動作モデル、`run_worker`、サスペンド、ビヘイビアツリー、安定イベント、卒業 |
 | [スタート](doc/start-ja.md) | LLM エージェント向けクイックスタート、ビルド方法、`Hancho.exe` と `hancho-cli.exe` |
 | [主な特徴](doc/features-ja.md) | ダッシュボード GUI、シェル起動、履歴、トレイ、ログ、設定、タスクキュー概要 |
 | [CLI](doc/cli-ja.md) | `hancho-cli.exe` の使い方、stdin モード、完了通知 |
@@ -142,19 +75,30 @@ Hancho のデータはすべて JSON / JSONL（タスクキュー、ビヘイビ
 | [BT トークン削減ガイド](doc/behavior-tree-token-optimization-ja.md) | トークン削減アーキテクチャ、`compact: true`、軽量化パケット |
 | [BT 設計計画書](doc/behavior-tree-plan.md) | ビヘイビアツリーエンジンのアーキテクチャと実装計画 |
 | [MCP サーバー](doc/mcp-ja.md) | MCP 登録と MCP ツール |
+| [WCSP](doc/wcsp.md) | WinConsoleServer プロトコル（WCSP v1）: フレーミング、ハンドシェイク、フレーム、セッション、セキュリティ |
 | [データディレクトリ](doc/data-directory-ja.md) | プロジェクト内・git 管理の `--data-dir` |
 | [Pros/Cons](doc/pros-cons-comparison-ja.md) | サブエージェント等との使い分け |
 | [批判的比較](doc/critical-comparison-ja.md) | Hancho の限界と使うべきでないケースを辛口に整理 |
 | [競合比較](doc/competitive-comparison-ja.md) | エージェントフレームワークやメモリサービスとの位置づけ |
 | [Hancho v3 設計](doc/design-v3.md) | イベントスキーマとアダプター、ヘッドレス/リモート、意味的メモリ、失敗分析、卒業指針 |
 | [リリースチェックリスト](doc/release-checklist-ja.md) | リリースごとの卒業用機能対応表の見直しと片付けコマンドの確認 |
+| [CLI help 出力](doc/cli-help-ja.md) | `Hancho.exe --help` と `hancho-cli.exe help` の全文 |
+| [Hancho スキル](skills/hancho/SKILL.md) | Hancho をうまく使うためのエージェントスキル |
 | [tools/ww](tools/ww/README-ww.md) | 任意・独立のタスクカード実行テンプレート（Hancho の一部ではない） |
 
 ---
 
-（以下の help 本文は英語です）
-
-## リリースノート
+## リリースノート
+
+### v0.9.16
+- **タブ式ターミナルクライアント**: WCSP クライアントをダッシュボードから分離し、独立ウィンドウ（`Hancho.exe terminal`）にしました。タブごとに独立したセッションなので、ローカル/リモートのコンソールを複数同時に接続できます。`+ Launch` と `[>_]` でクライアントを開きます。
+- **ターミナルクライアントの操作**: ダッシュボードのテーマに追従し、編集メニューと右クリックにコピー/貼り付けを追加しました。常に手前、ウィンドウ位置の記憶、バイト単位のスクロールバック（タブごとに 64〜2048 MB、既定 1024 MB）に対応します。`terminal.history_bytes`（既定 32 MiB）がサーバー側のリプレイ量を決め、リプレイをフレーム分割することで 6 MB（約 10 万行）の履歴も正しく接続できます。
+- **ダッシュボード**: ウィンドウレイアウトを記憶し、状態に応じたツールチップを表示します。スタンドアロンのダッシュボードは内蔵ターミナルタブを描画しなくなりました。
+- **性能**: 使用量グラフと監視ペインの更新間隔を設定できるようにし、タスクキューの検索にジョブインデックスを使い、アイドル時のポーリング負荷を減らしました。
+- **Chat**: 「Hancho Chat に調査を依頼 (入力欄にコピー)」で入力欄に下書きを入れ、ワーカーの結果イベントから回答を取り出します。非表示起動した Chat はウィンドウを隠したままにします。
+- **自動起動**: クライアントはコンソールを隠し、非表示の WMI 起動に失敗しても動作を続けます。
+- **ドキュメント**: 概要、WCSP プロトコル、CLI help のページ、`skills/hancho` エージェントスキルを追加し、README を書き直しました。
+- **パース**: `sscanf` / `sscanf_s` を `src/parse_util.h` のヘルパーに置き換えました（MSVC C4996 警告なし）。
 
 ### v0.9.15
 - **トリアージ**: 失敗したタスクキュージョブ、BT のエスカレーション失敗、タスクに属さないプロセス失敗、見積もり乖離、リソース待ちのそれぞれに永続カードを作ります。Hancho が原因・背景・環境・条件・理由の情報、処置候補、決定論的な推奨を用意し、人がダッシュボード、`hancho-cli triage`、MCP の `triage_list` / `triage_get` / `triage_decide` から判断を選んで記録します。`triage_mode` で手動・半自動（既定。安全で高確信度の推奨は自動実行）・自動を選べ、任意の LLM 助言は非表示の `_triage` ジョブ、`triage handoff` は判断待ちカードを非表示の `_supervisor` キューのバッチ Supervisor に渡します。自然解消、フォロー、自動処置の確認、種別ごとのオン/オフに対応します。詳細は `doc/triage.md`。
@@ -345,527 +289,3 @@ Hancho のデータはすべて JSON / JSONL（タスクキュー、ビヘイビ
 
 それ以前のバージョン: [Releases](https://github.com/gadget114514/Hancho/releases)
 
-## 付録: `Hancho.exe --help` の出力
-
-```text
-Hancho 0.9.3 - Native Win32 Multi-LLM Process & ConPTY Manager + Live GUI Dashboard
-
-USAGE:
-  Hancho.exe [gui] [--data-dir <path>]
-      Launch the live Win32 Dashboard GUI and Named Pipe server.
-
-  Hancho.exe quit
-      Quit the running GUI, including one hidden in the system tray (its tray icon is removed).
-
-  Hancho.exe mcp [--data-dir <path>]
-      Run as a Model Context Protocol (MCP) stdio server for Claude.
-      Automatically connects to (or launches) the Win32 GUI Dashboard.
-
-  Hancho.exe --help
-      Show this help.
-
-  Hancho.exe --version
-      Show the version.
-
-OPTIONS (per launch):
-  --data-dir <path>   Store logs, state, task queues and config in <path>.
-                      Use a project-local directory to git-manage them. Each
-                      data dir gets its own dashboard instance (separate pipe).
-                      Equivalent environment variable: HANCHO_LOG_DIR.
-                      Consistency: pass the same --data-dir on every call, or embed
-                      it once with `hancho-cli.exe mcp install --data-dir <path>`.
-                      Different data dirs are isolated dashboard instances.
-
-WORKING MODEL (LLM orchestration):
-  Hancho is the execution layer for a supervising LLM.
-
-    Supervisor LLM (Claude Code, opencode, ...)
-      |  start_process   -> one long-running worker command
-      |  taskqueue_add   -> ordered/dependent worker jobs
-      |  bt_start        -> a behavior tree: steps, branches, retries, checks
-      v
-    Hancho
-      |  owns processes, timeouts, logs, retries, state
-      v
-    Worker LLM / build command
-      -> one job command; writes artifacts and logs
-
-    Audit LLM (監査役 / 品質評価エンジン)
-      -> observes telemetry (timing divergence, thrashing, task hygiene);
-         feeds corrective guidance back to the supervisor via hints & MCP.
-
-  Assumed structure:
-    1. The supervisor plans and declares jobs. It does not run the work itself,
-       does not chain commands, and does not fabricate success.
-    2. Each unit of work is one job with a one-line summary, its own timeoutSec,
-       and an optional success check (filesNewer / outputRegex). Steps or
-       dependencies become separate jobs linked with dependsOn.
-    3. Workers are ordinary processes and may themselves be LLM CLIs. Pass
-       detailed instructions via instructionsFile/instructionsText; workers read
-       {instructions} / PC_JOB_INSTRUCTIONS and write artifacts.
-       Role clarity: when supervisor and worker share the same engine
-       (Claude/Claude, opencode/opencode), roles can blur; prefer a different
-       worker engine or a clearly distinct worker role/prompt.
-    4. The supervisor observes with taskqueue_wait / taskqueue_list /
-       taskqueue_graph and reads logs; it never polls .done files.
-    5. On failure, fix the cause and call taskqueue_retry. Blocked dependents
-       resume automatically.
-    6. Keep the supervisor context small: read artifacts, not raw transcripts.
-    7. When the next step depends on results (build -> fix -> rebuild loops,
-       test -> fix -> retest, "if this file says X then ..."), do not watch and
-       add jobs by hand: write the whole plan as a behavior tree (BT) and submit
-       it once with bt_start. Hancho runs it, adding each step as an
-       ordinary job, and returns to you only when a decision is needed
-       (escalate) or the tree finishes. See BEHAVIOR TREES below.
-    8. The Audit LLM acts as an objective observer of the supervisor's orchestration.
-       It detects execution timing divergences (actual duration vs estimate),
-       prevents unmodified retry loops (thrashing), and closes the feedback loop
-       via popup hints and MCP responses. See doc/audit-llm-ja.md (English: doc/audit-llm.md).
-
-CONSOLE CLIENT / CLI SETUP:
-  Use hancho-cli.exe for CLI commands (start, list, logs, send, wait, kill, kill-all, clear).
-  It auto-starts the GUI dashboard and locates Hancho.exe in its folder.
-  Run `hancho-cli.exe help` for human-readable usage, or `hancho-cli.exe help --json` for
-  machine-readable commands and setup instructions for LLMs.
-
-COMPLETION NOTIFICATION / BACKGROUND TASKS:
-  `hancho-cli.exe start ... --wait --wait-ms 0 --json` keeps hancho-cli.exe alive until the
-  managed process exits. `--wait-ms 0` means unlimited wait. Exit code is 0 on
-  completion, the child exit code on failure, and 124 if the wait times out.
-  For an existing process: `hancho-cli.exe wait --id <id> --wait-ms 0 --json`.
-  Hancho also writes a .done JSON file on exit.
-
-MCP SERVER SETUP:
-  Register this executable in .mcp.json (Claude Code) or claude_desktop_config.json:
-    {
-      "mcpServers": {
-        "hancho": {
-          "command": "<absolute path to Hancho.exe>",
-          "args": ["mcp"]
-        }
-      }
-    }
-  Auto-register (recommended for LLM agents):
-    hancho-cli.exe mcp install                    (writes .mcp.json in the current directory)
-    hancho-cli.exe mcp install --client opencode  (writes/updates opencode.json)
-
-  PRECONDITIONS (LLM agents):
-    - Windows 10/11 x64, same user session as the dashboard; no admin required.
-    - The dashboard auto-starts on first use and owns the Named Pipe server.
-    - Logs, state and task queues live under logs/ (override: HANCHO_LOG_DIR).
-
-  MCP tools (34):
-    Process (6):
-      start_process, list_processes, get_process_output, send_process_input,
-      wait_process, kill_process
-    Worker (5):
-      run_worker, wait_worker, get_worker_stream, get_worker_state, update_worker_info
-    Task queue (13):
-      taskqueue_add, taskqueue_list, taskqueue_get, taskqueue_retry,
-      taskqueue_update, taskqueue_cancel, taskqueue_pause, taskqueue_resume,
-      taskqueue_wait, taskqueue_purge, taskqueue_link, taskqueue_unlink,
-      taskqueue_graph
-    Behavior tree (10):
-      bt_validate, bt_start, bt_get, bt_list, bt_wait, bt_resume, bt_retry,
-      bt_update, bt_cancel, bt_pause
-
-  HOW TO USE (decision guide):
-    - One command, e.g. a build script, CLI worker or shell -> start_process
-    - One task for a worker LLM, final result only         -> run_worker
-      Harnesses do not see this as a native sub-agent; a thin custom agent that
-      calls run_worker makes it one, at the cost of the wrapper's tokens.
-    - Multiple steps, fixed order or dependencies         -> taskqueue_add + dependsOn
-    - Steps whose next step depends on results: branches,
-      fix loops, checks, worker LLM steps, your decisions -> bt_start + bt_wait
-    - Never write &&, ||, a single &, PowerShell ';', newline chains or polling
-      loops. ChainGuard rejects them: one job = one command with its own timeoutSec.
-    - Required taskqueue job fields: id, command, summary, timeoutSec.
-      Optional: cwd, env, dependsOn, idle, maxAttempts, retryDelaySec, success,
-      killExclude, resources {write,read}, priority, instructionsFile / instructionsText.
-    - resources: jobs whose write/read sets overlap never run together (read/read is
-      fine). Paths/globs resolve against cwd; "@name" is a named lock.
-    - Success is verified: exit code AND optional filesNewer / outputRegex.
-    - States: waiting = queued and ready; pending = dependencies not satisfied;
-      blocked = a dependency failed; running; succeeded; failed; cancelled.
-    - Observe with taskqueue_wait / taskqueue_list / taskqueue_graph; after fixing
-      the cause use taskqueue_retry (blocked dependents resume automatically).
-
-  BEHAVIOR TREES (bt_*):
-    A behavior tree is one JSON document describing the whole workflow. Leaves run
-    work (job = one command, worker = one task for a worker LLM); composites decide
-    what runs next (sequence, fallback, parallel, if, retry, repeat, timeout);
-    conditions check results (fileExists, fileNewer, outputMatches, exitCode,
-    jsonValue, var, nodeState); escalate hands a decision back to you.
-    Flow:
-      1. bt_validate (optional), then bt_start {bt: {...}} or {file: "plan.json"}.
-      2. Loop on bt_wait {id, sinceVersion, timeoutMs}. It returns when the tree
-         finishes or waits for you (state "waitingForLlm" + a decision packet).
-      3. Answer with bt_resume {id, node, answer, rationale}. The packet holds the
-         question, guidance, allowed answers and the logs/files/vars you asked to
-         include, so you can decide even after your context was compacted.
-      4. On failure read bt_get {id, compact: true}; fix the cause (bt_update for
-         a non-running node's definition) and call bt_retry {id, from}.
-    Rules:
-      - retry / repeat need "max". Jobs need command, summary, timeoutSec; workers
-        need prompt, summary, timeoutSec and optionally engine / model (claude,
-        agy, opencode, codex or ones defined in <data dir>\engines.json).
-      - Write "intent" (the goal) and, on escalate, "question" + "guidance" for
-        your future self. ${name} expands variables; in command it is quoted as
-        one argument. Do not retry BT jobs with taskqueue_retry; use bt_retry.
-    Minimal example (build, and on failure let a worker fix it, up to 3 times):
-      {"id": "fix-build", "summary": "Build and fix", "intent": "Release build passes",
-       "cwd": "D:/repo",
-       "root": {"type": "retry", "max": 3, "child": {"type": "fallback", "children": [
-         {"type": "job", "id": "build", "summary": "Build", "timeoutSec": 1800,
-          "command": "cmake --build build --config Release"},
-         {"type": "sequence", "children": [
-           {"type": "worker", "id": "fix", "engine": "claude", "summary": "Fix build",
-            "timeoutSec": 3600, "prompt": "Fix the build errors in ${build.logFile}."},
-           {"type": "fail"}]}]}}}
-    Full format, every node type and three complete examples:
-      doc\behavior-tree.md (English), doc\behavior-tree-ja.md (Japanese), in the
-      Hancho installation folder. `hancho-cli.exe bt --help` lists the CLI.
-
-  For the full machine-readable guide (agent.quick_start, decision, states):
-    hancho-cli.exe help --json
-```
-
----
-
-## 付録: `hancho-cli.exe help` の出力
-
-```text
-hancho-cli 0.9.3 - Hancho console client
-
-USAGE:
-  hancho-cli [--json] <command> [options]
-
-GLOBAL OPTIONS:
-  --json, -j               Print machine-readable JSON instead of human-friendly text.
-  -h, --help               Show this help.
-  -V, --version            Show the version (also: hancho-cli version).
-
-DATA DIRECTORY (per invocation):
-  --data-dir <path>        Store logs, state, task queues and config in <path> for
-                           THIS hancho-cli call. May be placed before or after the command.
-                           Point it at a project folder to git-manage the data:
-                             hancho-cli.exe --data-dir .hancho taskqueue add --file jobs.json
-                             hancho-cli.exe taskqueue list main --data-dir .hancho
-                           Each data dir gets its own dashboard instance, so different
-                           projects can run at the same time.
-
-  CONSISTENCY (one data dir per project):
-    --data-dir is per invocation, not a global setting. To keep a project's
-    logs/state/task queues consistent:
-      1. Choose one project-local directory, e.g. .hancho in the project root.
-      2. Register the MCP server once with it:
-           hancho-cli.exe mcp install --data-dir .hancho
-         This writes "--data-dir .hancho" into the project's MCP config,
-         so every MCP tool call for the project uses the same directory.
-      3. Pass the same --data-dir on every direct hancho-cli call.
-      4. Relative paths resolve against the caller's current directory. MCP clients
-         normally start the server in the project root; if the cwd is uncertain,
-         put an absolute path in the MCP config.
-      5. Different data dirs are isolated (own dashboard instance, Named Pipe and
-         mutex); they never share processes or queues.
-      6. Verify: hancho-cli.exe --data-dir <path> help --json prints
-         "effective_data_dir", and the dashboard status bar shows the same path.
-
-HANCHO-CLI CONCEPTS:
-  Process IDs : Numeric IDs assigned by the dashboard (#1, #2, ...). Use them with
-                list --id, logs --id, send --id, wait --id and kill --id.
-  Modes       : pipe    = anonymous pipes (default; non-interactive CLI workers)
-                pty     = Win32 ConPTY (interactive TUI: opencode, claude)
-                console = separate visible console window
-  stdin       : pipe mode keeps stdin writable (hancho-cli send) unless --close-stdin;
-                close it for programs that wait for EOF.
-  Logs        : logs/proc_<id>_<name>_<timestamp>.log (or --log-file).
-  Streams     : logs/proc_<id>_<name>_stream.jsonl (raw) and
-                logs/proc_<id>_<name>.events.jsonl (normalized hancho.event/1).
-  Adapters    : <data dir>/adapters/<name>.json (Tier 1 declarative or Tier 3 exec).
-  Done file   : atomic JSON on exit (logs/proc_<id>.done or --done-file) with
-                state, exit_code, reason, log_file and done_file.
-  cwd / env   : --cwd defaults to the caller's directory; PWD and INIT_CWD are
-                set for the child and OLDPWD is removed.
-  JSON output : --json / -j before or after the command prints one JSON object.
-  Lifecycle   : start returns immediately unless --wait; use wait --id or the
-                .done file to detect completion.
-
-EXIT CODES:
-  0    success / completed
-  1    CLI or configuration error (also: process failure without --wait)
-  124  wait timed out while the process is still running
-       start --wait / wait return the managed process's exit code
-
-ENVIRONMENT:
-  HANCHO_LOG_DIR     Override the logs directory (state, logs, queues).
-  HANCHO_EVENT_PIPE  Set by Hancho for pipe-mode workers; hancho-cli event emit
-                     writes hancho.event/1 lines to this pipe.
-
-EXAMPLES:
-  hancho-cli.exe list --json
-  hancho-cli.exe start --name build --cmd "cmd /c build.cmd" --timeout 1800 --wait --wait-ms 0 --json
-  hancho-cli.exe start --name tui --pty --cmd "opencode"
-  hancho-cli.exe logs --id 1 --tail 80
-  hancho-cli.exe send --id 1 --input "status"
-  hancho-cli.exe taskqueue add --file jobs.json --taskqueue main
-  hancho-cli.exe mcp install --client opencode
-
-COMMANDS:
-  list [--id <id>]
-      List all managed processes and their live metrics.
-
-  logs --id <id> [--tail <lines>] [--wait-ms <ms>] [--raw]
-      Fetch process output logs (ANSI codes stripped by default unless --raw).
-
-  start [options] -- <command...>
-      Start a managed process (e.g. claude, opencode) under a Win32 Job Object.
-      Options:
-        --cmd "<command>"        Command line to execute
-        --name <label>           Display name on dashboard (e.g. "opencode-worker")
-        --mode <pty|pipe|console>
-                                 pty     = Win32 ConPTY interactive session
-                                 pipe    = Anonymous pipes (default; no ConPTY)
-                                 console = Separate visible console window
-        --pty                    Shortcut for --mode pty (enable ConPTY).
-        --open-stdin             Pipe mode only (default): keep stdin writable for hancho-cli send.
-        --close-stdin            Pipe mode only: close stdin after launch so non-interactive
-                                 programs (e.g. opencode run) receive EOF and can finish.
-        --cwd <dir>              Working directory (default: the caller's current directory)
-        --log-file <path>        Custom path for live output log
-        --done-file <path>       Custom completion marker file created on exit
-        --timeout <sec>          Max runtime timeout in seconds (0 = unlimited)
-        --idle-timeout <sec>     Hang timeout if no output for N seconds (0 = unlimited)
-        --eta <time>             Estimated end time shown in gray while running
-                                 (e.g. "18:30" or "2026-10-22 18:30:00").
-                                 If omitted, --timeout shows "remaining N seconds".
-         --estimate-end <time>    Alias for --eta
-         --agent-type <claude|agy|antigravity|opencode|codex|aider|ollama|adapter>
-                                  Hint worker type for JSON stream parsing (auto-detected if omitted).
-                                  A name with <data-dir>/adapters/<name>.json uses that Tier 1/3 adapter.
-         --json-stream            Enable JSONL stream parsing; writes <log>.stream.jsonl and the
-                                  normalized <log>.events.jsonl (hancho.event/1) for LLM workers.
-         --wait                   Block until process exits (unlimited unless --wait-ms is set)
-        --wait-ms <ms>           Max wait when --wait is set; initial output wait otherwise
-                                 (default: 500; 0 = unlimited with --wait)
-
-  send --id <id> --input "<text>" [--no-newline] [--wait-ms <ms>]
-      Send input text to a running process's stdin or ConPTY session.
-
-  wait --id <id> [--wait-ms <ms>]
-      Wait until the specified process exits (or wait-ms elapses).
-
-  kill --id <id>
-      Forcefully kill the entire process tree (Job Object) for <id>.
-
-  kill-all
-      Forcefully kill all running managed process trees.
-
-  clear
-      Remove finished processes from the dashboard list.
-
-  event emit --kind <kind> [--text <text>] [--tool <name>] [--activity <a>] [--target <t>]
-             [--status <s>] [--data <json>] [--pipe <name>]
-      Write one hancho.event/1 line to HANCHO_EVENT_PIPE (set for pipe-mode workers).
-
-  adapter test <name> [--file <adapter.json>] [--dir <test-dir>]
-      Run the Tier 1 declarative adapter against tests/adapters/<name>/*.input.jsonl and
-      *.expected.jsonl (each expected line is {kind, data}).
-
-  worker status <id>
-      Show current worker status, active tool, thoughts, message, and supervisor context.
-
-  worker stream <id> [--tail <n>] [--type <kind>] [--since <seq>] [--summary] [--schema <v1>]
-      View captured JSON streaming events for claude, agy, or opencode workers.
-      --schema v1 (default) returns the stable hancho.event/1 shape from <log>.events.jsonl.
-      --schema legacy is not supported (removed in v0.11.0).
-      --type matches the kind (tool.call, message, ...).
-
-  worker info <id> [--notes "<notes>"] [--goal "<goal>"]
-      Update supervisor notes or goal for an ongoing worker.
-
-  agent install-template [--path <dir>] [--dry-run]
-      Write the hancho-runner subagent to <dir>\.claude\agents\hancho-runner.md (default: the current
-      directory). It runs long commands through Hancho and returns a short summary.
-      An existing file is not overwritten.
-
-  agent uninstall-template [--path <dir>] [--dry-run] [--delete-data-dir]
-      Remove the hancho-runner subagent written by install-template (the inverse command).
-      Empty .claude\agents and .claude directories are removed too. Add --delete-data-dir
-      to also delete the data directory (kept by default).
-
-  mcp install [--client claude|opencode] [--path <file>] [--name <name>] [--data-dir <path>] [--dry-run]
-      Register Hancho as an MCP server automatically. Writes or updates
-      .mcp.json (Claude Code, default) or opencode.json (--client opencode).
-      --data-dir embeds "--data-dir <path>" in the generated MCP server args so the
-      project keeps its logs/state/task queues inside that directory.
-      --json prints the machine-readable result; --dry-run previews without writing.
-
-  mcp uninstall [--client claude|opencode] [--path <file>] [--name <name>] [--data-dir <path>]
-                [--delete-data-dir] [--dry-run]
-      Remove the Hancho entry from the MCP config (the inverse of mcp install).
-      The data directory is kept by default; add --delete-data-dir to delete it too.
-      The data directory is the one embedded by mcp install, --data-dir, or the default.
-
-LEAVING HANCHO (graduation):
-  Stop using Hancho without losing your work:
-    1. hancho-cli.exe mcp uninstall                  # remove MCP registration (keep data)
-    2. hancho-cli.exe agent uninstall-template       # remove hancho-runner.md
-    3. Delete the data directory only if you want to:
-         hancho-cli.exe mcp uninstall --delete-data-dir
-  While you keep it, all Hancho data stays in open formats: queues, behavior trees,
-  events and memory are JSON / JSONL and readable without Hancho.
-  When a harness covers your use, compare it with doc\design-v3.md sections 5.3-5.5
-  (feature map and conditions) before leaving. doc\release-checklist.md records the
-  per-release review of that table.
-
-TASK QUEUE:
-  taskqueue add --file <jobs.json> [--taskqueue <name>] [--concurrency <n>] [--notify-file <path>]
-                [--origin-label <text>]
-      Register jobs (array, or an object with "jobs"/"taskqueue"/"concurrency").
-      Each job records its origin: the caller's session id (CLAUDE_CODE_SESSION_ID
-      or PC_ORIGIN_SESSION), working folder and pid, plus --origin-label (or
-      PC_ORIGIN_LABEL). The dashboard shows it in the Origin column.
-      Each job needs id, command, summary, timeoutSec; dependsOn replaces '&&'.
-      Optional: cwd, env, dependsOn, idle, maxAttempts, retryDelaySec, success,
-      killExclude, resources {write,read}, defer, priority, instructionsFile/instructionsText.
-      resources: jobs whose write/read sets overlap (write/write, write/read) never
-      run together, across all queues; read/read may. Paths/globs resolve against
-      cwd; a bare file name (Foo.cs) means **/Foo.cs; "@name" is a named lock.
-      Disable with Settings / config.json resource_locks.
-      defer {exitCodes,delaySec,limit} (default [75], 60, 60): an attempt that exits
-      with one of exitCodes ("nothing ran, try again later", e.g. ww-run refusing an
-      overlapping card) goes back to pending after delaySec without using up
-      maxAttempts; after limit deferrals (0 = no limit) it is an ordinary failure.
-
-  taskqueue list [<name>] [--state <state>] [--since <period>] [--origin <self|label|session>] [--bt <id>]
-      List jobs with state, queue, summary and blockedBy. --since keeps only
-      jobs updated within the period (30m, 6h, 2d), e.g. --since 6h.
-      --bt <id> lists every job of a behavior tree across its parallel branch queues.
-      --origin self keeps only the jobs this session added.
-
-  taskqueue get <id> [--rev <n>] [--no-instructions]
-  taskqueue retry <id>
-  taskqueue retry --failed [<name>] [--since <period>]
-      Retry every failed job at once, optionally only one queue and only jobs
-      that failed within the period, e.g. `taskqueue retry --failed --since 6h`
-      retries the failures of the last 6 hours. Blocked dependents resume.
-  taskqueue cancel <id>
-  taskqueue pause|resume <name>
-  taskqueue graph [<name>] [--root <id>]     (ready, waiting_for, resource_wait, retry_in_sec, blocked)
-  taskqueue wait <name> [--since <version>] [--timeout-ms <ms>]
-  taskqueue purge <name> [--states succeeded,failed,cancelled]
-  taskqueue purge [<name>] --older-than-days <N>   (finished jobs not updated for N days; all queues if <name> omitted)
-  reset [--yes]                                    (delete ALL project data in the data directory; lists targets without --yes; refused while running)
-
-BEHAVIOR TREES (for LLM agents; next step depends on results):
-  bt validate|start --file <bt.json>    Check / register and run a behavior tree
-  bt wait --id <id> [--since-version <n>] [--timeout-ms <ms>]
-      Long-poll until the tree finishes or waits for your decision (escalate).
-  bt resume --id <id> --node <node> --answer <a> --rationale <why> [--vars <json>]
-  bt get --id <id> [--compact]  |  bt list
-  bt retry --id <id> [--from <node>] [--reset-counters]
-  bt update --id <id> [--node <node>] (--file <path> | --bt <json> | --patch <json>)
-  bt cancel --id <id>  |  bt pause --id <id> [--paused true|false]
-      Leaves: job (one command), worker (one task for a worker LLM; engine/model);
-      composites: sequence, fallback, parallel, if, retry/repeat (max required),
-      timeout; conditions: fileExists, fileNewer, outputMatches, exitCode,
-      jsonValue, var, nodeState; escalate returns a decision packet to you.
-      Each leaf runs as an ordinary task-queue job; retry BT jobs with bt retry,
-      not taskqueue retry. Full format and examples: doc\behavior-tree.md in the
-      installation folder; `hancho-cli bt --help` for all options.
-
-  start/run ... --allow-chain
-      Allow a chained command (&&, ||, &, ';') as a single process. Task-queue
-      jobs never allow chains; use dependsOn instead.
-
-COMPLETION / BACKGROUND TASKS:
-  Use --wait to keep hancho-cli.exe alive until the managed process exits. Add
-  --wait-ms 0 for an unlimited wait (or a positive value for a maximum).
-  The exit code is 0 on completion, the child exit code on failure, and 124
-  if the wait times out.
-
-    hancho-cli.exe start --name task --wait --wait-ms 0 --json --cmd "opencode run ..."
-    hancho-cli.exe wait --id <id> --wait-ms 0 --json
-
-  Hancho also writes a .done JSON file on exit. Without --wait,
-  start returns immediately; poll the .done file or call wait.
-
-SETUP FOR LLM AGENTS:
-  CLI:
-    Use hancho-cli.exe (recommended) or the legacy "Hancho.exe <command>" form.
-    Run "hancho-cli.exe help --json" to retrieve this help as machine-readable JSON.
-    hancho-cli.exe auto-starts the GUI dashboard on first use if it is not running.
-
-  MCP (stdio):
-    Register Hancho.exe in .mcp.json (Claude Code) or
-    claude_desktop_config.json (Claude Desktop):
-      {
-        "mcpServers": {
-          "hancho": {
-            "command": "D:\\wsgit\\Hancho\\build\\Release\\Hancho.exe",
-            "args": ["mcp"]
-          }
-        }
-      }
-
-    AUTO-REGISTER (for LLM agents; no manual JSON editing):
-      hancho-cli.exe mcp install                    # .mcp.json (Claude Code)
-      hancho-cli.exe mcp install --client opencode  # opencode.json
-      hancho-cli.exe mcp install --path <file> --json --dry-run
-
-    ORCHESTRATION MODEL (how an LLM should use this):
-      A supervising LLM uses Hancho as its execution layer to run
-      child-process worker LLMs/CLIs as managed jobs.
-
-        Supervisor LLM  ->  Hancho  ->  Worker LLM / build command
-        plans + declares    timeouts, logs,        one job command;
-        jobs                retries, state         writes artifacts
-
-      - The supervisor keeps its context small: it plans and declares jobs; it
-        does not run the work itself, chain commands, or fabricate success.
-      - One job = one command. Use start_process for a single worker; use
-        taskqueue_add with dependsOn for multiple steps or dependencies.
-      - When the next step depends on results (build -> fix -> rebuild,
-        test -> fix -> retest, branch on a file's content), do not watch and
-        add jobs by hand: write the plan as a behavior tree and submit it once
-        with bt_start, then loop on bt_wait and answer escalations with
-        bt_resume (answer + rationale). See BEHAVIOR TREES above and
-        doc\behavior-tree.md.
-      - Each job needs a one-line summary and its own timeoutSec. Pass detailed
-        instructions via instructionsFile/instructionsText; the worker reads
-        {instructions} / PC_JOB_INSTRUCTIONS and writes artifacts.
-      - Workers may be LLM CLIs (opencode run, claude -p, ...) or build scripts.
-      - Role clarity: when the supervisor and worker use the same engine
-        (e.g. Claude supervising `claude -p`, or opencode supervising
-        `opencode run`), roles can blur and cause confusion; prefer a
-        different worker engine for workers, or give workers a clearly
-        distinct role/prompt and avoid nested supervision.
-      - Verify success with exit code + filesNewer/outputRegex; observe with
-        taskqueue_wait / taskqueue_list / taskqueue_graph and logs; retry with
-        taskqueue_retry. Blocked dependents resume automatically.
-      - Never poll .done files; use taskqueue_wait or wait_process.
-      - Delegating to a worker LLM: run_worker blocks until the worker exits and
-        returns only its final result; the raw stream stays in stream_file.
-      - Your harness does not see Hancho as a native sub-agent. To have
-        it shown as one, define a thin custom agent (Claude Code:
-        .claude/agents/<name>.md, cheap model, this tool only) that calls run_worker
-        and returns the result. The wrapper costs extra tokens; calling run_worker
-        directly is cheapest.
-
-    MCP tools (34):
-      Process:    start_process, list_processes, get_process_output,
-                  send_process_input, wait_process, kill_process
-      Worker:     run_worker, wait_worker, get_worker_stream, get_worker_state,
-                  update_worker_info
-      Task queue: taskqueue_add, taskqueue_list, taskqueue_get, taskqueue_retry,
-                  taskqueue_update, taskqueue_cancel, taskqueue_pause, taskqueue_resume,
-                  taskqueue_wait, taskqueue_purge, taskqueue_link, taskqueue_unlink,
-                  taskqueue_graph
-      Behavior tree: bt_validate, bt_start, bt_get, bt_list, bt_wait, bt_resume,
-                  bt_retry, bt_update, bt_cancel, bt_pause
-
-NOTE:
-  The GUI dashboard is provided by Hancho.exe, which is auto-started
-  on first use if it is not already running.
-```

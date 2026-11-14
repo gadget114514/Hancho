@@ -1,6 +1,9 @@
 // LLM handler for incoming Chat messages. Each message that passes the
 // handler's filter becomes one Hancho task queue job whose worker answer is
 // sent back as a Chat reply.
+#ifndef _CRT_SECURE_NO_WARNINGS
+#define _CRT_SECURE_NO_WARNINGS
+#endif
 #include "ipmsg_handler.h"
 
 #include "common.h"
@@ -64,8 +67,9 @@ int64_t SteadyNowMs() {
     return duration_cast<milliseconds>(steady_clock::now().time_since_epoch()).count();
 }
 
-// Finds the first balanced JSON object in text (tolerates code fences and
-// surrounding prose) and parses it. Returns false when there is none.
+// Finds a balanced JSON object in text (tolerates code fences and surrounding
+// prose) and parses it. Prefers an object with "audience" or "text" when prose
+// contains multiple JSON objects. Returns false when there is none.
 bool ParseFirstJsonObject(const std::string& text, nlohmann::json& out) {
     std::string trimmed = TrimText(text);
     nlohmann::json direct = nlohmann::json::parse(trimmed, nullptr, false);
@@ -74,6 +78,8 @@ bool ParseFirstJsonObject(const std::string& text, nlohmann::json& out) {
         return true;
     }
 
+    nlohmann::json firstObj;
+    bool haveFirst = false;
     for (size_t start = 0; start < text.size(); ++start) {
         if (text[start] != '{') continue;
         int depth = 0;
@@ -97,13 +103,24 @@ bool ParseFirstJsonObject(const std::string& text, nlohmann::json& out) {
                     nlohmann::json cand =
                         nlohmann::json::parse(text.substr(start, i - start + 1), nullptr, false);
                     if (!cand.is_discarded() && cand.is_object()) {
-                        out = std::move(cand);
-                        return true;
+                        if ((cand.contains("audience") && cand["audience"].is_string()) ||
+                            (cand.contains("text") && cand["text"].is_string())) {
+                            out = std::move(cand);
+                            return true;
+                        }
+                        if (!haveFirst) {
+                            firstObj = std::move(cand);
+                            haveFirst = true;
+                        }
                     }
                     break;
                 }
             }
         }
+    }
+    if (haveFirst) {
+        out = std::move(firstObj);
+        return true;
     }
     return false;
 }
@@ -118,12 +135,18 @@ ParsedAnswer ParseAnswer(const std::string& raw) {
     ParsedAnswer answer;
     const std::string trimmed = TrimText(raw);
     nlohmann::json obj;
-    if (ParseFirstJsonObject(trimmed, obj) && obj.contains("audience") &&
-        obj["audience"].is_string()) {
-        std::string audience = ToLowerText(TrimText(obj["audience"].get<std::string>()));
-        if (audience == "none" || audience == "human" || audience == "agent") {
+    if (ParseFirstJsonObject(trimmed, obj)) {
+        std::string audience;
+        if (obj.contains("audience") && obj["audience"].is_string()) {
+            audience = ToLowerText(TrimText(obj["audience"].get<std::string>()));
+        }
+        const bool hasText = obj.contains("text") && obj["text"].is_string();
+        if (audience == "none" || audience == "human" || audience == "agent" || hasText) {
+            if (audience != "none" && audience != "human" && audience != "agent") {
+                audience = "human";
+            }
             answer.audience = audience;
-            if (obj.contains("text") && obj["text"].is_string()) {
+            if (hasText) {
                 answer.text = obj["text"].get<std::string>();
             }
             if (obj.contains("to_agent") && obj["to_agent"].is_string()) {
@@ -136,6 +159,71 @@ ParsedAnswer ParseAnswer(const std::string& raw) {
     answer.audience = "human";
     answer.text = trimmed;
     return answer;
+}
+
+bool ExtractWorkerResult(ProcessManager& pm, int processId, std::string& outText) {
+    outText.clear();
+    if (processId <= 0) return false;
+
+    AgentExtractedResult extracted = ExtractAgentResult(pm, processId, true);
+    if (!extracted.found) return false;
+    if (!extracted.result.empty() && extracted.source != "output") {
+        outText = extracted.result;
+        return true;
+    }
+
+    std::vector<LlmStreamEvent> events;
+    LlmAgentState state;
+    if (!pm.GetAgentStream(processId, 0, "", 0, events, state) || events.empty()) {
+        return false;
+    }
+
+    for (auto it = events.rbegin(); it != events.rend(); ++it) {
+        if (!it->rawJson.empty()) {
+            nlohmann::json raw = nlohmann::json::parse(it->rawJson, nullptr, false);
+            if (raw.is_object() && raw.contains("result")) {
+                const auto& res = raw["result"];
+                if (res.is_string() && !TrimText(res.get<std::string>()).empty()) {
+                    outText = res.get<std::string>();
+                    return true;
+                }
+                if (res.is_object()) {
+                    for (const char* key : {"response", "result", "text", "content"}) {
+                        if (res.contains(key) && res[key].is_string() &&
+                            !TrimText(res[key].get<std::string>()).empty()) {
+                            outText = res[key].get<std::string>();
+                            return true;
+                        }
+                    }
+                }
+            }
+        }
+        if ((it->type == "result" || it->type == "message") &&
+            !TrimText(it->content).empty() && it->content != "Message") {
+            outText = it->content;
+            return true;
+        }
+    }
+
+    std::string deltaCombined;
+    for (const auto& ev : events) {
+        if (ev.rawJson.empty()) continue;
+        nlohmann::json raw = nlohmann::json::parse(ev.rawJson, nullptr, false);
+        if (!raw.is_object() || !raw.contains("step_update") || !raw["step_update"].is_object()) {
+            continue;
+        }
+        const auto& su = raw["step_update"];
+        if (su.value("step_type", std::string()) == "agent_response" &&
+            su.contains("text_delta") && su["text_delta"].is_string()) {
+            deltaCombined += su["text_delta"].get<std::string>();
+        }
+    }
+    if (!TrimText(deltaCombined).empty()) {
+        outText = std::move(deltaCombined);
+        return true;
+    }
+
+    return false;
 }
 
 void RemoveCommandArg(std::string& cmd, const std::string& arg) {
@@ -458,7 +546,7 @@ void IpmsgHandler::HandleJobResult(const TrackedJob& entry, const IpmsgHandlerCo
     if (answer.audience == "none" || answer.text.empty()) {
         LogEvent("handler_no_reply",
                  {{"id", entry.messageId}, {"job_id", entry.jobId},
-                  {"reason", answer.text.empty() ? "empty-answer" : "audience-none"},
+                  {"reason", answer.audience == "none" ? "audience-none" : "empty-answer"},
                   {"peer", entry.peer}});
         return;
     }
@@ -549,18 +637,15 @@ void IpmsgHandler::CheckJobs() {
         if (job.state == "succeeded") {
             int processId = 0;
             if (!job.attempts.empty()) processId = job.attempts.back().processId;
-            AgentExtractedResult result;
-            if (processId > 0) {
-                result = ExtractAgentResult(pm_, processId, true);
-            }
-            if (!result.found || result.result.empty() || result.source == "output") {
+            std::string workerResult;
+            if (!ExtractWorkerResult(pm_, processId, workerResult)) {
                 LogEvent("handler_failed",
                          {{"id", entry.messageId}, {"job_id", jobId},
                           {"reason", "no-result"}, {"peer", entry.peer}});
                 std::lock_guard<std::mutex> lock(mutex_);
                 ++failedCount_;
             } else {
-                HandleJobResult(entry, cfg, result.result);
+                HandleJobResult(entry, cfg, workerResult);
                 std::lock_guard<std::mutex> lock(mutex_);
                 ++doneCount_;
             }

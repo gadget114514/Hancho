@@ -132,6 +132,15 @@ public:
         finishedCb_ = std::move(cb);
     }
 
+    // How often per-process CPU/memory metrics are sampled. 5 s is the default;
+    // it is user-configurable from the dashboard's Performance settings.
+    void SetMetricsIntervalMs(int ms) {
+        if (ms < 1000) ms = 1000;
+        if (ms > 60000) ms = 60000;
+        metricsIntervalMs_.store(ms);
+    }
+    int GetMetricsIntervalMs() const { return metricsIntervalMs_.load(); }
+
     void SetTerminalCallbacks(CreateTerminalCallback createCb, DestroyTerminalCallback destroyCb) {
         createTerminalCb_ = std::move(createCb);
         destroyTerminalCb_ = std::move(destroyCb);
@@ -170,6 +179,14 @@ public:
     int AddTerminalSubscriber(int id, std::function<void(const char*, size_t)> sink,
                               std::string& replay, std::string& err);
     void RemoveTerminalSubscriber(int id, int subId);
+    // Raw ConPTY history kept per job and the maximum replay sent to a new
+    // WCSP subscriber. Byte-based so deep scrollback costs a bounded amount of
+    // memory (config.json "terminal.history_bytes").
+    void SetTerminalHistoryBytes(size_t bytes) {
+        terminalHistoryBytes_ = bytes;
+        terminalReplayBytes_ = bytes;
+    }
+    size_t terminalHistoryBytes() const { return terminalHistoryBytes_; }
     bool WriteTerminalRaw(int id, const void* data, size_t len, bool front, std::string& err);
     bool ResizeTerminal(int id, int cols, int rows, std::string& err);
 
@@ -248,6 +265,7 @@ private:
         std::atomic<uint64_t> lastOutputTickMs{0};
         std::atomic<uint64_t> cpuTime100ns{0};
         std::atomic<uint64_t> lastCpuActivityTickMs{0};
+        uint64_t lastMetricsTickMs = 0;
         int timeoutSec = 0;
         int idleTimeoutSec = 0;
         int idleCpuSec = 0;
@@ -305,9 +323,12 @@ private:
     int nextId_ = 1;
     std::atomic<bool> stopMonitor_{false};
     std::thread monitorThread_;
+    std::atomic<int> metricsIntervalMs_{5000};
     CreateTerminalCallback createTerminalCb_;
     DestroyTerminalCallback destroyTerminalCb_;
     ProcessFinishedCallback finishedCb_;
+    size_t terminalHistoryBytes_ = 2 * 1024 * 1024;
+    size_t terminalReplayBytes_ = 512 * 1024;
     std::mutex cbMutex_;
 };
 

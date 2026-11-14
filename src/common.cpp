@@ -1,4 +1,5 @@
 #include "common.h"
+#include "parse_util.h"
 #include <tlhelp32.h>
 #include <iterator>
 #include <sstream>
@@ -367,8 +368,8 @@ std::string GetCurrentTimestampStr() {
 
 int64_t ParseTimestampStrToEpoch(const std::string& s) {
     if (s.empty()) return 0;
-    int y, mo, d, h, mi, se;
-    if (sscanf(s.c_str(), "%d-%d-%d %d:%d:%d", &y, &mo, &d, &h, &mi, &se) != 6) return 0;
+    int y = 0, mo = 0, d = 0, h = 0, mi = 0, se = 0;
+    if (!ParseDateTimeFields(s, y, mo, d, h, mi, se)) return 0;
     std::tm tmv = {};
     tmv.tm_year = y - 1900;
     tmv.tm_mon = mo - 1;

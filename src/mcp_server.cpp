@@ -1483,7 +1483,9 @@ int RunMcpServer() {
                     ipmsgReq["hops"] = getInt("hops", nullptr, 0);
                     ipmsgReq["files"] = getStringArray("files");
                 } else if (toolName == "chat_get") {
-                    ipmsgReq["id"] = getInt("messageId", "id", 0);
+                    int64_t msgId = getInt("messageId", "message_id", 0);
+                    if (msgId == 0) msgId = getInt("id", nullptr, 0);
+                    ipmsgReq["id"] = msgId;
                 } else if (toolName == "chat_inbox") {
                     ipmsgReq["since_id"] = getInt("sinceId", "since_id", 0);
                     ipmsgReq["agent"] = getStr("agent", nullptr, "");

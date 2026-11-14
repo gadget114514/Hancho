@@ -1,4 +1,5 @@
 #include "memory_record.h"
+#include "parse_util.h"
 #include "common.h"
 
 #include <algorithm>
@@ -1168,7 +1169,7 @@ PruneResult PruneRunRecords(const PruneOptions& options) {
             mf.size = sz;
 
             int y = 0, m = 0;
-            if (sscanf_s(stem.c_str(), "%04d-%02d", &y, &m) == 2 && y > 1900 && m >= 1 && m <= 12) {
+            if (ParseYearMonthFields(stem, y, m) && y > 1900 && m >= 1 && m <= 12) {
                 int nextY = (m == 12) ? y + 1 : y;
                 int nextM = (m == 12) ? 1 : m + 1;
                 char nextBuf[32];

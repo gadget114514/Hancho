@@ -2425,6 +2425,24 @@ LRESULT CALLBACK IpmsgWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam)
             }
             return 0;
         }
+        case WM_COPYDATA: {
+            if (!st) return FALSE;
+            auto* cds = reinterpret_cast<COPYDATASTRUCT*>(lParam);
+            if (cds && cds->dwData == 1 && cds->lpData && cds->cbData > 0) {
+                const wchar_t* text = reinterpret_cast<const wchar_t*>(cds->lpData);
+                if (st->composeText) {
+                    SetWindowTextW(st->composeText, text);
+                    int len = GetWindowTextLengthW(st->composeText);
+                    SendMessageW(st->composeText, EM_SETSEL, len, len);
+                }
+                ShowMainWindow(st);
+                if (st->composeText) {
+                    SetFocus(st->composeText);
+                }
+                return TRUE;
+            }
+            return FALSE;
+        }
         case WM_CLOSE:
             if (st && !st->exiting) {
                 SaveWindowPlacement(st);
@@ -2490,6 +2508,41 @@ bool ActivateIpmsgDialog() {
     return true;
 }
 
+bool SendDraftToIpmsgDialog(const std::wstring& text) {
+    HWND h = FindExistingDialog();
+    if (!h) {
+        wchar_t exePath[MAX_PATH] = {};
+        GetModuleFileNameW(nullptr, exePath, MAX_PATH);
+        std::wstring cmd = L"\"";
+        cmd += exePath;
+        cmd += L"\" ipmsg";
+        if (HasCustomDataDirectory()) {
+            cmd += L" --data-dir \"";
+            cmd += GetEffectiveDataDirectoryWide();
+            cmd += L"\"";
+        }
+        STARTUPINFOW si = {sizeof(si)};
+        PROCESS_INFORMATION pi = {};
+        if (CreateProcessW(nullptr, &cmd[0], nullptr, nullptr, FALSE, 0, nullptr, nullptr, &si, &pi)) {
+            CloseHandle(pi.hThread);
+            CloseHandle(pi.hProcess);
+        }
+        for (int i = 0; i < 30; ++i) {
+            Sleep(100);
+            h = FindExistingDialog();
+            if (h) break;
+        }
+    }
+    if (!h) return false;
+
+    COPYDATASTRUCT cds = {};
+    cds.dwData = 1;
+    cds.cbData = static_cast<DWORD>((text.size() + 1) * sizeof(wchar_t));
+    cds.lpData = const_cast<wchar_t*>(text.c_str());
+    SendMessageW(h, WM_COPYDATA, 0, reinterpret_cast<LPARAM>(&cds));
+    return true;
+}
+
 int RunIpmsgDialog(bool startHidden) {
     SetProcessDPIAware();
 
@@ -2506,8 +2559,10 @@ int RunIpmsgDialog(bool startHidden) {
     std::wstring mutexName = GetGuiMutexNameWide() + L"_ipmsg";
     HANDLE mutex = CreateMutexW(nullptr, FALSE, mutexName.c_str());
     if (mutex && GetLastError() == ERROR_ALREADY_EXISTS) {
-        if (HWND other = FindExistingDialog()) {
-            PostMessageW(other, g_showMessage, 0, 0);
+        if (!startHidden) {
+            if (HWND other = FindExistingDialog()) {
+                PostMessageW(other, g_showMessage, 0, 0);
+            }
         }
         CloseHandle(mutex);
         return 0;
@@ -2548,7 +2603,15 @@ int RunIpmsgDialog(bool startHidden) {
         st.windowPlacement.showCmd != SW_SHOWMINIMIZED &&
         st.windowPlacement.showCmd != SW_MINIMIZE &&
         MonitorFromRect(&st.windowPlacement.rcNormalPosition, MONITOR_DEFAULTTONULL) != nullptr;
-    if (validPlacement) SetWindowPlacement(hwnd, &st.windowPlacement);
+    if (validPlacement) {
+        WINDOWPLACEMENT wp = st.windowPlacement;
+        if (startHidden) {
+            wp.showCmd = SW_HIDE;
+        } else if (wp.showCmd == SW_HIDE) {
+            wp.showCmd = SW_SHOWNORMAL;
+        }
+        SetWindowPlacement(hwnd, &wp);
+    }
     if (!startHidden) {
         ShowWindow(hwnd, SW_SHOW);
         UpdateWindow(hwnd);

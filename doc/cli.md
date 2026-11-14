@@ -182,7 +182,7 @@ hancho-cli.exe power suspend --dry-run   # verify without sleeping
 
 The job may end as `succeeded`, `failed`, `cancelled` or `blocked`. The core then waits until no other task queue job (`running` / `waiting` / `pending`) and no Hancho-managed process is running. If new work starts during the countdown, the countdown is cancelled and restarted when the machine is idle again. Use `--hibernate` for hibernation and `--dry-run` to verify. When several jobs are armed, all of them must finish. `power_*` actions are local-host only.
 
-**LAN chat (`chat`, alias `msg`; IPMsg compatible protocol):**
+**LAN chat (`chat`, aliases `msg`, `ipmsg`; IPMsg compatible protocol):**
 
 ```powershell
 hancho-cli.exe chat status
@@ -204,7 +204,7 @@ hancho-cli.exe chat handler off
 hancho-cli.exe chat clear
 ```
 
-`chat` (alias `msg`) controls the Chat node (IPMsg compatible protocol): `status`, `on` / `off` (writes `chat.enabled` and restarts the node), `peers`, `refresh`, `send`, `inbox`, `get`, `wait`, `read`, `download`, `log`, `handler` and `clear`. In `send`, `<to>` is a peer key (`ip:port`), an IP or nickname, `*` for every peer, or `local` / `self` for agents on this node only; `--file` can be repeated and `--stdin` reads the text from stdin. `wait` long-polls for a new incoming message (default 60 s) and returns `last_id` for the next call. `chat download` fetches the files of an incoming message; `chat log` searches the daily conversation log.
+`chat` (aliases `msg`, `ipmsg`) controls the Chat node (IPMsg compatible protocol): `status`, `on` / `off` (writes `chat.enabled` and restarts the node), `peers`, `refresh`, `send`, `inbox`, `get`, `wait`, `read`, `download`, `log`, `handler` and `clear`. In `send`, `<to>` is a peer key (`ip:port`), an IP or nickname, `*` for every peer, or `local` / `self` for agents on this node only; `--file` can be repeated and `--stdin` reads the text from stdin. `wait` long-polls for a new incoming message (default 60 s) and returns `last_id` for the next call. `chat download` fetches the files of an incoming message; `chat log` searches the daily conversation log.
 
 `chat handler` shows or changes the LLM that answers incoming messages (`chat.handler` in `config.json`). Options: `on` / `off` (`--enabled`), `--engine`, `--model`, `--agent`, `--cwd`, `--instructions`, `--taskqueue`, `--auto-reply on|off`, `--skip-permissions on|off`, `--timeout`, `--max-hops`, `--concurrency`. An LLM can call the same via MCP `chat_handler`. The change is written to `config.json` and the node re-reads it (the Chat window's **Answering LLM** bar does the same). `--json` prints the raw IPC reply.
 
@@ -335,4 +335,4 @@ hancho-cli.exe export list
 | `agent` | `working_model` (supervisor → Hancho → worker LLM), `data_dir_consistency`, `decision`, `states`, `quick_start` |
 | `leaving` | Graduation steps, JSON / JSONL data formats, keep-or-delete-data behavior, and the release checklist |
 
-This makes it possible for an LLM to read `help --json`, register the MCP server, pick the right execution model, and start using the tool without extra instructions. The legacy `Hancho.exe <command>` form remains available for compatibility, but `hancho-cli.exe` is the recommended console interface. `Hancho.exe --help` documents the GUI/MCP server, the working model, and the same per-launch `--data-dir` option (see the [appendix](../README.md#appendix-hanchoexe---help)).
+This makes it possible for an LLM to read `help --json`, register the MCP server, pick the right execution model, and start using the tool without extra instructions. The legacy `Hancho.exe <command>` form remains available for compatibility, but `hancho-cli.exe` is the recommended console interface. `Hancho.exe --help` documents the GUI/MCP server, the working model, and the same per-launch `--data-dir` option (see the [appendix](cli-help.md#appendix-hanchoexe---help)).

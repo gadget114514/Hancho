@@ -1,7 +1,9 @@
 #include <winsock2.h>
+#include "parse_util.h"
 #include "gui_dashboard.h"
 #include "gui_theme.h"
 #include "gui_ipmsg.h"
+#include "term_client.h"
 #include "common.h"
 #include "llm_stream.h"
 #include "event_schema.h"
@@ -12,7 +14,6 @@
 #include "triage_text.h"
 #include "TerminalView.h"
 #include "TerminalGridView.h"
-#include "wcsp/remote_session.h"
 #include "SettingsManager.h"
 #include "remote_hosts.h"
 #include "ipc_client.h"
@@ -74,6 +75,16 @@ constexpr int kMinRefreshIntervalMs = 100;
 constexpr int kMaxRefreshIntervalMs = 60000;
 static int ClampRefreshIntervalMs(int ms) {
     return (std::clamp)(ms, kMinRefreshIntervalMs, kMaxRefreshIntervalMs);
+}
+// Other periodic polls (usage graph, stream pane, process metrics). User-configurable
+// from the Performance tab of the settings dialog.
+constexpr int kDefaultUsageRefreshIntervalMs = 5000;
+constexpr int kDefaultStreamRefreshIntervalMs = 5000;
+constexpr int kDefaultProcessMetricsIntervalMs = 5000;
+constexpr int kMinPerformanceIntervalMs = 1000;
+constexpr int kMaxPerformanceIntervalMs = 60000;
+static int ClampPerformanceIntervalMs(int ms) {
+    return (std::clamp)(ms, kMinPerformanceIntervalMs, kMaxPerformanceIntervalMs);
 }
 constexpr UINT_PTR TIMER_KPI_ANIM_ID  = 2;
 constexpr UINT_PTR TIMER_END_BLINK_ID = 3;     // list rows blinking after a process/task ends
@@ -471,6 +482,26 @@ static LRESULT CALLBACK HeaderSubclassProc(HWND hwnd, UINT msg, WPARAM wParam, L
     return res;
 }
 
+// Draws a list's header with the theme palette: the caller's WM_DRAWITEM forwards
+// ODT_HEADER here, and HeaderSubclassProc keeps the empty area behind the columns themed.
+static void ApplyThemedListHeader(HWND list) {
+    if (!list) return;
+    HWND header = ListView_GetHeader(list);
+    if (!header) return;
+    const int count = Header_GetItemCount(header);
+    for (int i = 0; i < count; ++i) {
+        HDITEMW hdi = {};
+        hdi.mask = HDI_FORMAT;
+        if (Header_GetItem(header, i, &hdi)) {
+            hdi.fmt |= HDF_OWNERDRAW;
+            Header_SetItem(header, i, &hdi);
+        }
+    }
+    SetWindowSubclass(header, HeaderSubclassProc, 1, 0);
+    ApplyNativeControlTheme(header, IsDarkThemeActive());
+    InvalidateRect(header, nullptr, TRUE);
+}
+
 // Draws the thumb of one native scrollbar inside its track rectangle, from the control's scroll info.
 static void PaintListScrollThumb(HDC hdc, HWND hwnd, int which, const RECT& bar, HBRUSH thumbBrush) {
     SCROLLINFO si = {};
@@ -613,6 +644,33 @@ static void DrawListRowSeparator(const NMLVCUSTOMDRAW* lvcd) {
     HGDIOBJ oldPen = SelectObject(hdc, pen);
     MoveToEx(hdc, rc.left, rc.bottom - 1, nullptr);
     LineTo(hdc, rc.right, rc.bottom - 1);
+    SelectObject(hdc, oldPen);
+    DeleteObject(pen);
+}
+
+// 1px theme-blended grid for the triage lists: replaces LVS_EX_GRIDLINES, whose native
+// lines are opaque and read as heavier than the rest of the dashboard.
+static void DrawTriageGridLines(const NMLVCUSTOMDRAW* lvcd) {
+    if (!lvcd) return;
+    HWND list = lvcd->nmcd.hdr.hwndFrom;
+    const int item = static_cast<int>(lvcd->nmcd.dwItemSpec);
+    RECT row = {};
+    if (!ListView_GetItemRect(list, item, &row, LVIR_BOUNDS)) return;
+    HDC hdc = lvcd->nmcd.hdc;
+    HPEN pen = CreatePen(PS_SOLID, 1, BlendColor(g_theme.border, g_theme.panel, 0.62f));
+    if (!pen) return;
+    HGDIOBJ oldPen = SelectObject(hdc, pen);
+    MoveToEx(hdc, row.left, row.bottom - 1, nullptr);
+    LineTo(hdc, row.right, row.bottom - 1);
+    for (int sub = 1; sub < 32; ++sub) {
+        RECT cell = {};
+        if (!ListView_GetSubItemRect(list, item, sub, LVIR_BOUNDS, &cell)) break;
+        const int x = cell.left;
+        if (x > row.left && x < row.right) {
+            MoveToEx(hdc, x, row.top, nullptr);
+            LineTo(hdc, x, row.bottom - 1);
+        }
+    }
     SelectObject(hdc, oldPen);
     DeleteObject(pen);
 }
@@ -891,6 +949,9 @@ enum ControlId {
     IDC_SET_TRIAGE_KIND_BASE = 6066, // 6066..6070
     IDC_SET_TERM_LOCAL = 6071,
     IDC_SET_TERM_REMOTE = 6072,
+    IDC_SET_USAGE_REFRESH_INTERVAL = 6073,
+    IDC_SET_STREAM_REFRESH_INTERVAL = 6074,
+    IDC_SET_PROCESS_METRICS_INTERVAL = 6075,
     IDM_TRAY_RESTORE = 4001,
     IDM_TRAY_GRID_VIEW = 4002,
     IDM_TRAY_HIDE = 4003,
@@ -958,12 +1019,6 @@ struct SupervisorHintRecord {
 constexpr size_t kSupervisorHintHistoryMax = 200;
 constexpr int kHintWndWidth = 560;
 constexpr int kHintWndHeight = 210;
-
-struct RemoteTerm {
-    std::unique_ptr<TerminalView> view;
-    bool failed = false;
-    uint64_t retryAt = 0;
-};
 
 struct DashboardState {
     ProcessManager* pm = nullptr;
@@ -1035,6 +1090,11 @@ struct DashboardState {
     bool memoryTrayWarned = false;
     std::wstring memoryWarningText;
     int refreshIntervalMs = kDefaultRefreshIntervalMs; // dashboard + terminal grid refresh period (ms)
+    int usageRefreshIntervalMs = kDefaultUsageRefreshIntervalMs;       // usage graph repaint period
+    int streamRefreshIntervalMs = kDefaultStreamRefreshIntervalMs;     // monitor/stream pane poll period
+    int processMetricsIntervalMs = kDefaultProcessMetricsIntervalMs;   // core CPU/memory sampling period
+    TaskQueueCounts taskQueueCountsCache;
+    uint64_t taskQueueCountsCacheTickMs = 0;
     int runningTotalCount = 0;  // processes in Running state + running queue jobs, from the last refresh
     int appliedRefreshMs = 0;   // period currently set on TIMER_REFRESH_ID
     RECT rcUsagePanel = {};
@@ -1144,12 +1204,8 @@ struct DashboardState {
     std::vector<ProcessSnapshot> cachedSnapshots;
 
     // WCSP terminal views (standalone dashboard: st->pm == nullptr).
-    std::unordered_map<int, RemoteTerm> remoteTerms;
-    bool termEndpointKnown = false;
-    uint64_t termEndpointRetryAt = 0;
-    std::string termHost = "127.0.0.1";
-    uint16_t termPort = 0;
-    std::string termToken;
+    // The standalone terminal client now runs in its own window/process; see
+    // src/term_client.cpp. The dashboard keeps no embedded terminal views.
     RECT rcKpiArea = {};
     RECT rcTerminalArea = {10, 300, 1380, 810};
     RECT rcStatusBar = {0, 814, 1400, 840};
@@ -1164,13 +1220,12 @@ static DashboardState* GetState(HWND hwnd) {
     return reinterpret_cast<DashboardState*>(GetWindowLongPtrW(hwnd, GWLP_USERDATA));
 }
 
-// Returns the TerminalView for a process: the in-process one when the dashboard
-// owns the core, or the WCSP remote view in the standalone dashboard.
+// Returns the in-process TerminalView when the dashboard owns the core. The
+// standalone dashboard has no embedded terminals; its client window lives in
+// a separate process (src/term_client.cpp).
 static TerminalView* GetTerminalViewForProcess(DashboardState* st, int id) {
-    if (!st || id <= 0) return nullptr;
-    if (st->pm) return st->pm->GetTerminalView(id);
-    auto it = st->remoteTerms.find(id);
-    return (it != st->remoteTerms.end()) ? it->second.view.get() : nullptr;
+    if (!st || id <= 0 || !st->pm) return nullptr;
+    return st->pm->GetTerminalView(id);
 }
 
 // ---------------------------------------------------------------------------
@@ -1377,6 +1432,12 @@ static bool GetAgentStateIpc(DashboardState* st, int procId, LlmAgentState& outS
 }
 
 static TaskQueueCounts FetchTaskQueueCountsIpc(DashboardState* st) {
+    if (st && st->taskQueueCountsCacheTickMs != 0) {
+        const uint64_t now = GetNowTickMs();
+        if (now >= st->taskQueueCountsCacheTickMs && now - st->taskQueueCountsCacheTickMs < 1000) {
+            return st->taskQueueCountsCache;
+        }
+    }
     nlohmann::json req = {{"action", "taskqueue_counts"}};
     nlohmann::json resp;
     if (GuiIpcCall(st, req, resp) && resp.value("ok", false)) {
@@ -1405,10 +1466,17 @@ static TaskQueueCounts FetchTaskQueueCountsIpc(DashboardState* st) {
             c.minRemainingSec = resp.value("min_remaining_sec", static_cast<int64_t>(-1));
             c.sumRemainingSec = resp.value("sum_remaining_sec", static_cast<int64_t>(-1));
         }
+        if (st) {
+            st->taskQueueCountsCache = c;
+            st->taskQueueCountsCacheTickMs = GetNowTickMs();
+        }
         return c;
     }
     if (st && st->tqm) {
-        return st->tqm->GetJobCounts();
+        TaskQueueCounts c = st->tqm->GetJobCounts();
+        st->taskQueueCountsCache = c;
+        st->taskQueueCountsCacheTickMs = GetNowTickMs();
+        return c;
     }
     return TaskQueueCounts{};
 }
@@ -1867,10 +1935,18 @@ static COLORREF KpiAccent(int index) {
 
 static float g_kpiBarPhase = 0.0f;
 
+// Triage KPI cards sit on the dialog background, so nudge their surface away from it:
+// a little lighter on dark themes, a little deeper on light ones.
+static COLORREF TriageKpiCardBgColor() {
+    return g_darkThemeActive ? BlendColor(g_theme.panel, g_theme.text, 0.07f)
+                             : BlendColor(g_theme.panel, g_theme.border, 0.14f);
+}
+
 static void DrawKpiCard(HDC hdc, const RECT& rc, const wchar_t* title, const std::wstring& value,
                         COLORREF accentColor, HFONT hFontUi, HFONT hFontKpiVal,
-                        float marqueePhase = -1.0f, const std::wstring& subText = L"") {
-    HBRUSH bgBrush = CreateSolidBrush(g_theme.panel);
+                        float marqueePhase = -1.0f, const std::wstring& subText = L"",
+                        bool triageTint = false) {
+    HBRUSH bgBrush = CreateSolidBrush(triageTint ? TriageKpiCardBgColor() : g_theme.panel);
     HPEN borderPen = CreatePen(PS_SOLID, 1, g_theme.border);
     HGDIOBJ oldBrush = SelectObject(hdc, bgBrush);
     HGDIOBJ oldPen = SelectObject(hdc, borderPen);
@@ -2511,7 +2587,7 @@ static void DrawDashboardCanvas(DashboardState* st, HDC hdcWindow) {
             HBRUSH tvBrush = CreateSolidBrush(g_theme.terminalBg);
             FillRect(hdc, &rcTv, tvBrush);
             DeleteObject(tvBrush);
-            if (st->pm || !st->remoteTerms.empty()) {
+            if (st->pm) {
                 TerminalView* tv = GetTerminalViewForProcess(st, snap->id);
                 if (tv) {
                     std::wstring termText = tv->ExtractScreenText(0);
@@ -2871,13 +2947,17 @@ static void UpdatePanelToggleLabels(DashboardState* st) {
         }
         if (st->hwndBtnToggleTerm) {
             UpdateControlTooltip(st->hwndToolbarTip, st->hwndMain, st->hwndBtnToggleTerm,
-                st->hideTerminalGrid
+                !st->pm
+                    ? Tr(L"ターミナルクライアントのウィンドウを開きます。\nタブで複数のコンソールに同時に接続できます。",
+                         L"Opens the terminal client window.\nConnect to several consoles at once with tabs.",
+                         L"Abre la ventana del cliente de terminal.\nConéctate a varias consolas a la vez con pestañas.")
+                    : (st->hideTerminalGrid
                     ? Tr(L"ターミナルのグリッド表示を再表示します。\n各プロセスの出力を並べて確認できます。",
                          L"Shows the terminal grid again.\nWatch the output of several processes side by side.",
                          L"Vuelve a mostrar la cuadrícula de terminales.\nObserva la salida de varios procesos a la vez.")
                     : Tr(L"ターミナルのグリッド表示を隠します。\n一覧と監視ペインを広く使えます。",
                          L"Hides the terminal grid.\nGives the lists and monitor pane more room.",
-                         L"Oculta la cuadrícula de terminales.\nDeja más espacio a las listas y al panel de monitor."));
+                         L"Oculta la cuadrícula de terminales.\nDeja más espacio a las listas y al panel de monitor.")));
         }
         if (st->hwndBtnStreamPane) {
             UpdateControlTooltip(st->hwndToolbarTip, st->hwndMain, st->hwndBtnStreamPane,
@@ -3534,7 +3614,7 @@ static std::string TimeOfDayText(const std::string& ts) {
 
 static std::string AddSecondsToTimestamp(const std::string& ts, int seconds) {
     int y = 0, mo = 0, d = 0, h = 0, mi = 0, s = 0;
-    if (sscanf_s(ts.c_str(), "%d-%d-%d %d:%d:%d", &y, &mo, &d, &h, &mi, &s) != 6) return "";
+    if (!ParseDateTimeFields(ts, y, mo, d, h, mi, s)) return "";
     struct tm t = {};
     t.tm_year = y - 1900;
     t.tm_mon = mo - 1;
@@ -4813,6 +4893,9 @@ static void ShowMemoryListDialog(DashboardState* st) {
 static void CopyTextToClipboard(HWND hwnd, const std::wstring& text);
 static void ShowTriageDialog(DashboardState* st, const std::wstring& filter = L"pendingTask",
                              const std::string& selectId = std::string());
+static void DisplaySupervisorHint(DashboardState* st, const std::wstring& category,
+                                  const std::wstring& summary, const std::wstring& prompt,
+                                  int autoDismissSec);
 
 // Column index of "Origin" in the task list (see UpdateTaskListColumnWidths).
 static const int kTaskListOriginCol = 9;
@@ -4823,6 +4906,82 @@ static std::wstring TaskListCellText(HWND list, int row, int col) {
     wchar_t buf[4096] = {};
     ListView_GetItemText(list, row, col, buf, static_cast<int>(sizeof(buf) / sizeof(buf[0])));
     return buf;
+}
+
+static std::wstring BuildTaskQueueInvestigationPrompt(DashboardState* st, const std::string& jobId) {
+    if (!st || jobId.empty()) return L"";
+    std::string err;
+    std::string resp = TaskQueueGetIpc(st, jobId, true, 0, err);
+    nlohmann::json rootJob = nlohmann::json::parse(resp, nullptr, false);
+    nlohmann::json job = (rootJob.is_object() && rootJob.contains("job") && rootJob["job"].is_object()) ? rootJob["job"] : rootJob;
+
+    std::wostringstream oss;
+    oss << Tr(L"以下のタスクキューのジョブについて、状況と原因を調査してください。\r\n\r\n",
+              L"Please investigate the state and cause of the following task-queue job.\r\n\r\n",
+              L"Por favor investigue el estado y causa del siguiente trabajo en la cola de tareas.\r\n\r\n");
+
+    std::string id = job.is_object() ? job.value("id", jobId) : jobId;
+    std::string name = job.is_object() ? job.value("name", "") : "";
+    std::string tq = job.is_object() ? job.value("taskqueue", "") : "";
+    std::string state = job.is_object() ? job.value("state", "") : "";
+    std::string target = job.is_object() ? job.value("target", "") : "";
+    std::string worker = job.is_object() ? job.value("worker", "") : "";
+    std::string summary = job.is_object() ? job.value("summary", "") : "";
+    int runCount = job.is_object() ? static_cast<int>(job.value("run_count", 0)) : 0;
+    int maxAttempts = job.is_object() ? static_cast<int>(job.value("max_attempts", 0)) : 0;
+    int timeoutSec = job.is_object() ? static_cast<int>(job.value("timeout_sec", 0)) : 0;
+
+    oss << L"- **Job ID**: " << Utf8ToWide(id) << L"\r\n";
+    if (!name.empty()) oss << L"- **Name**: " << Utf8ToWide(name) << L"\r\n";
+    if (!tq.empty()) oss << L"- **Queue**: " << Utf8ToWide(tq) << L"\r\n";
+    oss << L"- **State**: " << Utf8ToWide(state) << L"\r\n";
+    if (!worker.empty()) oss << L"- **Worker**: " << Utf8ToWide(worker) << L"\r\n";
+    if (runCount > 0 || maxAttempts > 0) {
+        oss << L"- **Run Count**: " << runCount << L" / " << maxAttempts << L"\r\n";
+    }
+    if (timeoutSec > 0) {
+        oss << L"- **Timeout**: " << timeoutSec << L" sec\r\n";
+    }
+    if (!summary.empty()) {
+        oss << L"- **Summary**: " << Utf8ToWide(summary) << L"\r\n";
+    }
+    if (!target.empty()) {
+        oss << L"- **Target / Action**: `" << Utf8ToWide(target) << L"`\r\n";
+    }
+
+    if (job.is_object() && job.contains("attempts") && job["attempts"].is_array() && !job["attempts"].empty()) {
+        const auto& lastAttempt = job["attempts"].back();
+        std::string errStr = lastAttempt.value("error", "");
+        if (!errStr.empty()) {
+            oss << L"- **Last Error**: " << Utf8ToWide(errStr) << L"\r\n";
+        }
+        int rootPid = static_cast<int>(lastAttempt.value("root_pid", 0));
+        if (rootPid > 0) {
+            oss << L"- **Last OS PID**: " << rootPid << L"\r\n";
+        }
+        std::string logFile = lastAttempt.value("log_file", "");
+        if (!logFile.empty()) {
+            oss << L"- **Log File**: `" << Utf8ToWide(logFile) << L"`\r\n";
+        }
+    }
+
+    if (job.is_object() && job.contains("payload")) {
+        oss << L"\r\n### Payload / Spec:\r\n```json\r\n"
+            << Utf8ToWide(job["payload"].dump(2)) << L"\r\n```\r\n";
+    }
+
+    oss << L"\r\n"
+        << Tr(L"【調査依頼】\r\n"
+              L"1. このタスクが停止または失敗している理由とエラー内容を分析してください。\r\n"
+              L"2. タスクを再開・再試行（Retry）すべきか、パラメータやスクリプトを修正すべきかを提示してください。\r\n",
+              L"Investigation requests:\r\n"
+              L"1. Analyze why this task is stuck or failing based on the job details and error output.\r\n"
+              L"2. Advise whether to retry the task or suggest fixes for the underlying cause.\r\n",
+              L"Solicitud de investigación:\r\n"
+              L"1. Analice por qué esta tarea está atascada o fallando según los detalles del trabajo.\r\n"
+              L"2. Indique si se debe reintentar o cómo solucionar la causa.\r\n");
+
+    return oss.str();
 }
 
 static void ShowTaskQueueContextMenu(DashboardState* st, const std::string& jobId, POINT ptScreen, const std::wstring& cellText) {
@@ -4868,6 +5027,9 @@ static void ShowTaskQueueContextMenu(DashboardState* st, const std::string& jobI
     if (resp.find("\"bt\":{") != std::string::npos) {
         AppendMenuW(hMenu, MF_STRING, 3111, Tr(L"ビヘイビアツリーで表示", L"Show in Behavior Tree", L"Ver en el árbol de comportamiento"));
     }
+    AppendMenuW(hMenu, MF_SEPARATOR, 0, nullptr);
+    AppendMenuW(hMenu, MF_STRING, 3120, Tr(L"LLM 調査用プロンプトをコピー", L"Copy LLM Investigation Prompt", L"Copiar prompt de investigación para LLM"));
+    AppendMenuW(hMenu, MF_STRING, 3121, Tr(L"Hancho Chat に調査を依頼 (入力欄にコピー)", L"Send to Hancho Chat (Compose)", L"Enviar al chat de Hancho"));
 
     int cmd = TrackPopupMenu(hMenu, TPM_RETURNCMD | TPM_RIGHTBUTTON, ptScreen.x, ptScreen.y, 0, st->hwndMain, nullptr);
     DestroyMenu(hMenu);
@@ -4919,6 +5081,22 @@ static void ShowTaskQueueContextMenu(DashboardState* st, const std::string& jobI
         auto it = st->triageJobs.find(jobId);
         if (it != st->triageJobs.end())
             ShowTriageDialog(st, L"all", it->second.value("cardId", std::string()));
+    } else if (cmd == 3120) {
+        std::wstring prompt = BuildTaskQueueInvestigationPrompt(st, jobId);
+        if (!prompt.empty()) {
+            CopyTextToClipboard(st->hwndMain, prompt);
+            DisplaySupervisorHint(st, Tr(L"LLM 調査", L"LLM Investigation", L"Investigación LLM"),
+                                  Tr(L"タスク調査用プロンプトをクリップボードにコピーしました。",
+                                     L"Copied task investigation prompt to clipboard.",
+                                     L"Prompt de investigación copiado al portapapeles."),
+                                  L"", 3);
+        }
+    } else if (cmd == 3121) {
+        std::wstring prompt = BuildTaskQueueInvestigationPrompt(st, jobId);
+        if (!prompt.empty()) {
+            CopyTextToClipboard(st->hwndMain, prompt);
+            pc::SendDraftToIpmsgDialog(prompt);
+        }
     }
     RefreshDashboardData(st);
 }
@@ -4947,11 +5125,14 @@ static bool ProcSnapshotMatchesSearch(const ProcessSnapshot& s, const std::wstri
 static std::wstring TriageHandoffLabel(const std::string& handoffState);
 static std::wstring TriageLifecycleLabel(const std::string& lifecycle);
 
-static void RefreshTaskQueueData(DashboardState* st, bool force = false) {
+static void RefreshTaskQueueData(DashboardState* st, bool force = false, bool useCachedList = false) {
     if (!st || !st->hwndTaskList) return;
     if (st->listDisplayMode == ListDisplayMode::ProcessOnly) return;
     std::string err;
-    std::string resp = TaskQueueListIpc(st, "", "", 0, err);
+    // The triage refresh does not change jobs, so re-render from the list already fetched
+    // this tick instead of asking the core for the same JSON a second time.
+    std::string resp = useCachedList ? st->lastTaskListJson
+                                     : TaskQueueListIpc(st, "", "", 0, err);
     // Nothing to do when the queue is unchanged and no job is running (only running rows show a countdown).
     int lang = static_cast<int>(g_uiLanguage);
     if (!force && resp == st->lastTaskListJson && lang == st->lastTaskListLang &&
@@ -5449,122 +5630,6 @@ static std::wstring KpiSignature(DashboardState* st) {
 
 static void UpdateTriageFromCore(DashboardState* st);
 
-// ---------------------------------------------------------------------------
-// Standalone dashboard: WCSP remote terminal views
-// ---------------------------------------------------------------------------
-static bool EnsureTermEndpoint(DashboardState* st) {
-    if (!st || st->pm) return false;
-    if (st->termEndpointKnown && st->termPort != 0) return true;
-
-    const uint64_t now = GetNowTickMs();
-    if (st->termEndpointRetryAt != 0 && now < st->termEndpointRetryAt) return false;
-
-    nlohmann::json resp;
-    if (GuiIpcCall(st, {{"action", "term_endpoint"}}, resp) && resp.value("ok", false)) {
-        st->termHost = resp.value("host", std::string("127.0.0.1"));
-        const int port = resp.value("port", 0);
-        st->termPort = (port > 0 && port <= 65535) ? static_cast<uint16_t>(port) : 0;
-        st->termToken = resp.value("token", std::string());
-        if (st->termPort != 0) {
-            st->termEndpointKnown = true;
-            st->termEndpointRetryAt = 0;
-            return true;
-        }
-    }
-    st->termEndpointKnown = false;
-    st->termEndpointRetryAt = now + 5000;
-    return false;
-}
-
-static void DestroyRemoteTerm(RemoteTerm& rt) {
-    if (rt.view) {
-        // Stop the WCSP receiver before the window goes away so no new chunks
-        // are posted to a destroyed HWND.
-        rt.view->SetRemoteIo(nullptr);
-        if (rt.view->Hwnd() && IsWindow(rt.view->Hwnd())) {
-            DestroyWindow(rt.view->Hwnd());
-        }
-        rt.view.reset();
-    }
-}
-
-static void SyncRemoteTerminals(DashboardState* st) {
-    if (!st || st->pm) return;
-    if (!EnsureTermEndpoint(st)) return;
-
-    const uint64_t now = GetNowTickMs();
-
-    std::unordered_set<int> keep;
-    for (const auto& s : st->cachedSnapshots) {
-        if (s.mode != ExecMode::ConPTY) continue;
-        const bool ended = s.state != ProcState::Running;
-        if (!ended || s.id == st->selectedProcId) keep.insert(s.id);
-    }
-    for (auto it = st->remoteTerms.begin(); it != st->remoteTerms.end();) {
-        if (keep.find(it->first) == keep.end()) {
-            DestroyRemoteTerm(it->second);
-            it = st->remoteTerms.erase(it);
-        } else {
-            ++it;
-        }
-    }
-
-    for (auto& s : st->cachedSnapshots) {
-        if (s.mode != ExecMode::ConPTY) continue;
-        const bool ended = s.state != ProcState::Running;
-        if (ended && s.id != st->selectedProcId) continue;
-
-        auto it = st->remoteTerms.find(s.id);
-        if (it == st->remoteTerms.end()) {
-            it = st->remoteTerms.emplace(s.id, RemoteTerm{}).first;
-        }
-        RemoteTerm& rt = it->second;
-        if (rt.view && rt.view->Hwnd() && IsWindow(rt.view->Hwnd())) {
-            s.terminalHwnd = rt.view->Hwnd();
-            continue;
-        }
-        if (rt.failed && now < rt.retryAt) continue;
-
-        RemoteConfig cfg;
-        cfg.host = st->termHost.empty() ? "127.0.0.1" : st->termHost;
-        cfg.port = st->termPort;
-        cfg.token = st->termToken;
-
-        auto view = std::make_unique<TerminalView>();
-        HWND hTv = view->Create(st->hwndMain);
-        if (!hTv) {
-            rt.failed = true;
-            rt.retryAt = now + 5000;
-            continue;
-        }
-        ShowWindow(hTv, SW_HIDE);
-        view->SetRemoteIo(std::make_unique<RemoteSession>(cfg));
-
-        std::wstring werr;
-        if (!view->StartRemote(L"attach:" + std::to_wstring(s.id), &werr)) {
-            DestroyWindow(hTv);
-            rt.failed = true;
-            if (ended) {
-                // An ended job (e.g. one restored after a core restart) has no
-                // ConPTY left to attach to; retrying would only repeat the error.
-                rt.retryAt = UINT64_MAX;
-            } else {
-                rt.retryAt = now + 5000;
-                // The core may have restarted on a new ephemeral port.
-                st->termEndpointKnown = false;
-                st->termPort = 0;
-            }
-            WriteAuditLog("TERM_REMOTE_ATTACH_FAILED", WideToUtf8(werr));
-            continue;
-        }
-
-        rt.failed = false;
-        rt.retryAt = 0;
-        rt.view = std::move(view);
-        s.terminalHwnd = hTv;
-    }
-}
-
 static void RefreshDashboardData(DashboardState* st) {
     if (!st) return;
     // Hidden in the tray: no one sees the lists, so only watch for finished processes (completion sound).
@@ -5606,6 +5671,8 @@ static void RefreshDashboardData(DashboardState* st) {
     }
     // Hold every update while a list scrollbar is dragged; the next tick after release catches up.
     if (g_scrollDragWnd && (g_scrollDragWnd == st->hwndList || g_scrollDragWnd == st->hwndTaskList)) return;
+    // Fetch counts once per refresh tick; the KPI signature and the paint below share the result.
+    st->taskQueueCountsCacheTickMs = 0;
     {
         const uint64_t chatNow = GetNowTickMs();
         if (chatNow - st->lastChatPollTickMs >= 3000) {
@@ -5702,7 +5769,6 @@ static void RefreshDashboardData(DashboardState* st) {
         }
     }
 
-    if (!st->pm) SyncRemoteTerminals(st);
     LayoutTerminalViews(st);
 
     int currentCount = ListView_GetItemCount(st->hwndList);
@@ -5849,7 +5915,7 @@ static void RefreshDashboardData(DashboardState* st) {
     }
     RefreshTaskQueueData(st);
     UpdateTriageFromCore(st);
-    RefreshTaskQueueData(st, true);
+    RefreshTaskQueueData(st, true, true);
     std::wstring kpiSig = KpiSignature(st);
     if (kpiSig != st->lastKpiSignature) {
         st->lastKpiSignature = std::move(kpiSig);
@@ -7640,6 +7706,7 @@ struct LlmStreamDlgState {
     HWND hwndEditPreview = nullptr;
     HWND hwndAgentIcon = nullptr;
     HWND hwndTooltip = nullptr;
+    HWND hwnd = nullptr;
     UINT_PTR timerId = 0;
     size_t lastEventCount = 0;
     uint64_t lastEventSeq = 0;
@@ -7679,12 +7746,16 @@ static int64_t ParseIsoUtcMs(const std::string& ts) {
     if (ts.size() < 20) return 0;
     std::tm tmv = {};
     int millis = 0;
-    if (std::sscanf(ts.c_str(), "%4d-%2d-%2dT%2d:%2d:%2d.%3dZ", &tmv.tm_year, &tmv.tm_mon,
-                    &tmv.tm_mday, &tmv.tm_hour, &tmv.tm_min, &tmv.tm_sec, &millis) < 6) {
+    int year = 0, month = 0, day = 0, hour = 0, minute = 0, second = 0;
+    if (!ParseIsoUtcFields(ts, year, month, day, hour, minute, second, millis)) {
         return 0;
     }
-    tmv.tm_year -= 1900;
-    tmv.tm_mon -= 1;
+    tmv.tm_year = year - 1900;
+    tmv.tm_mon = month - 1;
+    tmv.tm_mday = day;
+    tmv.tm_hour = hour;
+    tmv.tm_min = minute;
+    tmv.tm_sec = second;
     int64_t sec = static_cast<int64_t>(_mkgmtime64(&tmv));
     return sec * 1000 + millis;
 }
@@ -9299,6 +9370,7 @@ static LRESULT CALLBACK LlmStreamWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPA
             auto* cs = reinterpret_cast<CREATESTRUCTW*>(lParam);
             ds = reinterpret_cast<LlmStreamDlgState*>(cs->lpCreateParams);
             SetWindowLongPtrW(hwnd, GWLP_USERDATA, reinterpret_cast<LONG_PTR>(ds));
+            ds->hwnd = hwnd;
 
             ds->hFontMono = CreateFontW(-13, 0, 0, 0, FW_NORMAL, FALSE, FALSE, FALSE, DEFAULT_CHARSET,
                                         OUT_DEFAULT_PRECIS, CLIP_DEFAULT_PRECIS, CLEARTYPE_QUALITY,
@@ -9412,11 +9484,14 @@ static LRESULT CALLBACK LlmStreamWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPA
                     SendMessageW(ds->hwndTooltip, TTM_ADDTOOL, 0, (LPARAM)&ti);
                 }
             }
-            ds->timerId = SetTimer(hwnd, 1, 1000, nullptr);
+            ds->timerId = 1;
+            SetTimer(hwnd, 1, static_cast<UINT>(ds->dash ? ds->dash->streamRefreshIntervalMs
+                                                         : kDefaultStreamRefreshIntervalMs), nullptr);
             return 0;
         }
         case WM_TIMER: {
-            if (ds && !(ds->embedded && !IsWindowVisible(hwnd))) {
+            if (ds && wParam == 1 && !IsIconic(hwnd) &&
+                !(ds->embedded && !IsWindowVisible(hwnd))) {
                 ReloadStreamDialogData(hwnd, ds);
                 if (ds->hwndTooltip && ds->hwndAgentIcon) {
                     std::string modelTooltip = ds->agentState.model;
@@ -9842,6 +9917,71 @@ static void ApplyStreamPaneTheme(DashboardState* st) {
     InvalidateRect(st->hwndStreamPane, nullptr, TRUE);
 }
 
+static std::wstring BuildProcessInvestigationPrompt(DashboardState* st, int procId) {
+    if (!st || procId <= 0) return L"";
+    ProcessSnapshot snap;
+    if (!FetchProcessSnapshotIpc(st, procId, snap)) return L"";
+
+    std::string outUtf8;
+    GetProcessOutputIpc(st, procId, 50, outUtf8);
+
+    std::wostringstream oss;
+    if (snap.state == ProcState::Running) {
+        oss << Tr(L"以下のプロセスが停止またはハングしているように見えます。状況と原因を調査してください。\r\n\r\n",
+                  L"The following process appears to be stuck or hanging. Please investigate its state and cause.\r\n\r\n",
+                  L"El siguiente proceso parece estar bloqueado o congelado. Por favor investigue su estado y causa.\r\n\r\n");
+    } else {
+        oss << Tr(L"以下のプロセスが異常終了またはエラーとなったようです。状況と原因を調査してください。\r\n\r\n",
+                  L"The following process appears to have failed or exited abnormally. Please investigate its cause.\r\n\r\n",
+                  L"El siguiente proceso parece haber fallado o terminado anormalmente. Por favor investigue su causa.\r\n\r\n");
+    }
+
+    oss << L"- **Hancho Process ID**: " << snap.id << L"\r\n"
+        << L"- **OS PID**: " << snap.rootPid << L"\r\n"
+        << L"- **Name**: " << Utf8ToWide(snap.name) << L"\r\n"
+        << L"- **State**: " << Utf8ToWide(ProcStateToString(snap.state)) << L"\r\n"
+        << L"- **Exit Code**: " << snap.exitCode << L"\r\n"
+        << L"- **Start Time**: " << Utf8ToWide(snap.startTimeStr) << L"\r\n"
+        << L"- **Elapsed**: " << FormatElapsed(static_cast<int64_t>(snap.elapsedMs)) << L"\r\n";
+
+    if (snap.treeProcessCount > 0 || snap.treeMemoryBytes > 0) {
+        oss << L"- **Process Tree Count**: " << snap.treeProcessCount << L"\r\n"
+            << L"- **Memory**: " << (snap.treeMemoryBytes / (1024 * 1024)) << L" MB\r\n";
+    }
+
+    oss << L"- **Command Line**:\r\n  `" << Utf8ToWide(snap.commandLine) << L"`\r\n"
+        << L"- **Working Dir**: `" << Utf8ToWide(snap.workingDir) << L"`\r\n";
+
+    if (!snap.logFilePath.empty()) {
+        oss << L"- **Log File**: `" << Utf8ToWide(snap.logFilePath) << L"`\r\n";
+    }
+    if (!snap.streamFilePath.empty()) {
+        oss << L"- **Stream File**: `" << Utf8ToWide(snap.streamFilePath) << L"`\r\n";
+    }
+
+    if (!outUtf8.empty()) {
+        oss << L"\r\n### " << Tr(L"最新ログ出力 (抜粋)", L"Recent Output (Tail)", L"Salida reciente (extracto)") << L":\r\n```\r\n"
+            << NormalizeCrLfWide(outUtf8) << L"\r\n```\r\n";
+    }
+
+    oss << L"\r\n"
+        << Tr(L"【調査依頼】\r\n1. このプロセス（PID ",
+              L"Investigation requests:\r\n1. Check if this process (PID ",
+              L"Solicitud de investigación:\r\n1. Verifique si este proceso (PID ")
+        << snap.rootPid
+        << Tr(L"）および子プロセスが存在しているか、CPU使用率やスレッド状態（待機原因）を確認してください。\r\n"
+              L"2. ウィンドウが存在する場合、応答状態やモーダルダイアログ（MessageBox等）が表示されていないか確認してください。\r\n"
+              L"3. ログの末尾出力を分析し、なぜ止まっているのか、どう対処すべきか（プロセス終了、コード修正、設定変更等）を報告してください。\r\n",
+              L") and any child processes exist, and check CPU or thread wait reasons.\r\n"
+              L"2. If any windows exist, check if they are responsive or blocked by modal dialogs (e.g. MessageBox).\r\n"
+              L"3. Review the recent log output, determine why it is stuck or failing, and advise on corrective actions.\r\n",
+              L") y sus procesos hijos existen, y revise el uso de CPU o motivos de espera de hilos.\r\n"
+              L"2. Si existen ventanas, compruebe si responden o si están bloqueadas por cuadros de diálogo modales.\r\n"
+              L"3. Analice la salida de registro y sugiera cómo proceder.\r\n");
+
+    return oss.str();
+}
+
 static void ShowTaskContextMenu(DashboardState* st, int procId, POINT ptScreen) {
     if (!st || procId <= 0) return;
     ProcessSnapshot snap;
@@ -9858,6 +9998,9 @@ static void ShowTaskContextMenu(DashboardState* st, int procId, POINT ptScreen) 
     if (!snap.streamFilePath.empty()) {
         AppendMenuW(hMenu, MF_STRING, 3008, Tr(L"ストリームファイル (jsonl) を開く", L"Open Stream File (jsonl)", L"Abrir archivo de flujo (jsonl)"));
     }
+    AppendMenuW(hMenu, MF_SEPARATOR, 0, nullptr);
+    AppendMenuW(hMenu, MF_STRING, 3020, Tr(L"LLM 調査用プロンプトをコピー", L"Copy LLM Investigation Prompt", L"Copiar prompt de investigación para LLM"));
+    AppendMenuW(hMenu, MF_STRING, 3021, Tr(L"Hancho Chat に調査を依頼 (入力欄にコピー)", L"Send to Hancho Chat (Compose)", L"Enviar al chat de Hancho"));
     AppendMenuW(hMenu, MF_SEPARATOR, 0, nullptr);
     if (snap.state == ProcState::Running) {
         AppendMenuW(hMenu, MF_STRING, 3004, Tr(L"プロセスを終了 (子プロセスごと)", L"Kill Process (with child processes)", L"Terminar proceso (con procesos hijos)"));
@@ -9894,6 +10037,22 @@ static void ShowTaskContextMenu(DashboardState* st, int procId, POINT ptScreen) 
     } else if (cmd == 3003) {
         std::wstring logW = Utf8ToWide(snap.logFilePath);
         gui_platform::GetGuiPlatform()->OpenFileInEditor(st->hwndMain, logW);
+    } else if (cmd == 3020) {
+        std::wstring prompt = BuildProcessInvestigationPrompt(st, procId);
+        if (!prompt.empty()) {
+            CopyTextToClipboard(st->hwndMain, prompt);
+            DisplaySupervisorHint(st, Tr(L"LLM 調査", L"LLM Investigation", L"Investigación LLM"),
+                                  Tr(L"プロセス調査用プロンプトをクリップボードにコピーしました。",
+                                     L"Copied process investigation prompt to clipboard.",
+                                     L"Prompt de investigación copiado al portapapeles."),
+                                  L"", 3);
+        }
+    } else if (cmd == 3021) {
+        std::wstring prompt = BuildProcessInvestigationPrompt(st, procId);
+        if (!prompt.empty()) {
+            CopyTextToClipboard(st->hwndMain, prompt);
+            pc::SendDraftToIpmsgDialog(prompt);
+        }
     } else if (cmd == 3004) {
         if (gui_platform::GetGuiPlatform()->ShowMessageBox(
                 st->hwndMain,
@@ -10079,6 +10238,9 @@ static void LoadShellConfig(DashboardState* st) {
     st->hideEndedProcesses = JsonGetBool(content, "hide_ended", false);
     st->hideProcessList = JsonGetBool(content, "hide_process_list", false);
     st->hideTerminalGrid = JsonGetBool(content, "hide_terminal_grid", true);
+    // The standalone dashboard no longer embeds the WCSP client. Terminals are
+    // shown by the separate terminal client window (Hancho.exe terminal).
+    if (!st->pm) st->hideTerminalGrid = true;
     st->completionSoundEnabled = JsonGetBool(content, "completion_sound_enabled", true);
     st->completionSoundPath = JsonGetString(content, "completion_sound_path", "");
     st->endBlinkEnabled = JsonGetBool(content, "end_blink_enabled", true);
@@ -10131,6 +10293,13 @@ static void LoadShellConfig(DashboardState* st) {
     st->refreshIntervalMs = ClampRefreshIntervalMs(
         static_cast<int>(JsonGetInt(content, "refresh_interval_ms", kDefaultRefreshIntervalMs)));
     SettingsManager::Instance().SetTabGridRefreshIntervalMs(st->refreshIntervalMs);
+    st->usageRefreshIntervalMs = ClampPerformanceIntervalMs(static_cast<int>(
+        JsonGetInt(content, "usage_refresh_interval_ms", kDefaultUsageRefreshIntervalMs)));
+    st->streamRefreshIntervalMs = ClampPerformanceIntervalMs(static_cast<int>(
+        JsonGetInt(content, "stream_refresh_interval_ms", kDefaultStreamRefreshIntervalMs)));
+    st->processMetricsIntervalMs = ClampPerformanceIntervalMs(static_cast<int>(
+        JsonGetInt(content, "process_metrics_interval_ms", kDefaultProcessMetricsIntervalMs)));
+    if (st->pm) st->pm->SetMetricsIntervalMs(st->processMetricsIntervalMs);
     st->showSupervisorHints = JsonGetBool(content, "show_supervisor_hints", true);
     st->hintAutoDismissSec = static_cast<int>(JsonGetInt(content, "hint_auto_dismiss_sec", 7));
     // The supervisor runs only in batch; this is the engine name ("" = the default engine).
@@ -10218,7 +10387,10 @@ static void SaveShellConfig(const DashboardState* st) {
     ss << "],\n"
        << "  \"triage_supervisor_engine\": \"" << JsonEscape(st->supervisorCommand) << "\",\n"
         << listBg.str()
-        << "  \"refresh_interval_ms\": " << st->refreshIntervalMs << "\n"
+        << "  \"refresh_interval_ms\": " << st->refreshIntervalMs << ",\n"
+        << "  \"usage_refresh_interval_ms\": " << st->usageRefreshIntervalMs << ",\n"
+        << "  \"stream_refresh_interval_ms\": " << st->streamRefreshIntervalMs << ",\n"
+        << "  \"process_metrics_interval_ms\": " << st->processMetricsIntervalMs << "\n"
         << "}\n";
 
     std::string serialized = ss.str();
@@ -10442,6 +10614,10 @@ static void LaunchShellByType(DashboardState* st, ShellType type) {
     } else {
         st->selectedProcId = id;
         RefreshDashboardData(st);
+        if (!st->pm) {
+            // Terminals are shown by the standalone client window.
+            LaunchTerminalClientWindow();
+        }
         TerminalView* tv = GetTerminalViewForProcess(st, id);
         if (tv && tv->Hwnd()) {
             SetFocus(tv->Hwnd());
@@ -10798,7 +10974,9 @@ static void ShowTrayContextMenu(DashboardState* st) {
 
     HMENU hMenu = CreatePopupMenu();
     AppendMenuW(hMenu, MF_STRING | MF_DEFAULT, IDM_TRAY_RESTORE, Tr(L"ダッシュボードを復元", L"Restore Dashboard", L"Restaurar panel"));
-    AppendMenuW(hMenu, MF_STRING, IDM_TRAY_GRID_VIEW, Tr(L"グリッド表示を開く", L"Open Grid View", L"Abrir vista de cuadrícula"));
+    if (st->pm) {
+        AppendMenuW(hMenu, MF_STRING, IDM_TRAY_GRID_VIEW, Tr(L"グリッド表示を開く", L"Open Grid View", L"Abrir vista de cuadrícula"));
+    }
     AppendMenuW(hMenu, MF_STRING, IDM_TRAY_USAGE, Tr(L"トークン使用量グラフ", L"Token Usage Graph", L"Gráfico de uso de tokens"));
     AppendMenuW(hMenu, MF_STRING, IDM_TRAY_MEMORY, Tr(L"メモリ一覧...", L"Memory List...", L"Lista de memoria..."));
     if (IsWindowVisible(st->hwndMain)) {
@@ -10931,7 +11109,7 @@ static int ThemeButtonId(UiTheme theme) {
     }
 }
 
-static constexpr int kSettingsTabCount = 7;
+static constexpr int kSettingsTabCount = 8;
 
 struct SettingsDlgState {
     DashboardState* dash = nullptr;
@@ -10983,6 +11161,13 @@ struct SettingsDlgState {
       HWND editEventRetention = nullptr;
       HWND lblRefreshInterval = nullptr;
       HWND editRefreshInterval = nullptr;
+      HWND lblUsageRefreshInterval = nullptr;
+      HWND editUsageRefreshInterval = nullptr;
+      HWND lblStreamRefreshInterval = nullptr;
+      HWND editStreamRefreshInterval = nullptr;
+      HWND lblProcessMetricsInterval = nullptr;
+      HWND editProcessMetricsInterval = nullptr;
+      HWND lblPerformanceHint = nullptr;
       HWND lblListBg = nullptr;
       HWND btnListBg[kListRowKeyCount] = {};
       HWND btnListBgReset = nullptr;
@@ -11026,7 +11211,7 @@ struct SettingsDlgState {
        HWND hwndAboutDesc = nullptr;
        HWND tabCtrl = nullptr;
        // controls shown under each tab: 0 appearance, 1 behavior, 2 WinConsoleServer,
-       // 3 triage, 4 maintenance, 5 colors, 6 about
+       // 3 triage, 4 maintenance, 5 performance, 6 colors, 7 about
        std::vector<HWND> tabPages[kSettingsTabCount];
 };
 
@@ -11065,18 +11250,47 @@ static void CommitEventRetention(SettingsDlgState* ds) {
     SaveShellConfig(ds->dash);
 }
 
-// Reads the refresh interval box (ms), clamps it, restarts the dashboard refresh timer,
-// pushes the value to the terminal grid, and saves it.
-static void CommitRefreshInterval(SettingsDlgState* ds) {
-    if (!ds || !ds->dash || !ds->editRefreshInterval) return;
-    wchar_t text[64] = {};
-    GetWindowTextW(ds->editRefreshInterval, text, 64);
-    const int applied = ClampRefreshIntervalMs(_wtoi(text));
-    ds->dash->refreshIntervalMs = applied;
-    SettingsManager::Instance().SetTabGridRefreshIntervalMs(applied);
-    ApplyDashboardRefreshTimer(ds->dash);
-    SetWindowTextW(ds->editRefreshInterval, std::to_wstring(applied).c_str());
-    SaveShellConfig(ds->dash);
+// Reads the performance boxes (ms), clamps them, restarts the affected timers and saves.
+static void CommitPerformanceSettings(SettingsDlgState* ds) {
+    if (!ds || !ds->dash) return;
+    DashboardState* st = ds->dash;
+
+    auto readValue = [](HWND edit) -> int {
+        wchar_t text[64] = {};
+        GetWindowTextW(edit, text, 64);
+        return _wtoi(text);
+    };
+
+    if (ds->editRefreshInterval) {
+        const int applied = ClampRefreshIntervalMs(readValue(ds->editRefreshInterval));
+        st->refreshIntervalMs = applied;
+        SettingsManager::Instance().SetTabGridRefreshIntervalMs(applied);
+        ApplyDashboardRefreshTimer(st);
+        SetWindowTextW(ds->editRefreshInterval, std::to_wstring(applied).c_str());
+    }
+    if (ds->editUsageRefreshInterval) {
+        const int applied = ClampPerformanceIntervalMs(readValue(ds->editUsageRefreshInterval));
+        st->usageRefreshIntervalMs = applied;
+        if (st->hwndUsagePanel) {
+            SetTimer(st->hwndUsagePanel, 1, static_cast<UINT>(applied), nullptr);
+        }
+        SetWindowTextW(ds->editUsageRefreshInterval, std::to_wstring(applied).c_str());
+    }
+    if (ds->editStreamRefreshInterval) {
+        const int applied = ClampPerformanceIntervalMs(readValue(ds->editStreamRefreshInterval));
+        st->streamRefreshIntervalMs = applied;
+        if (st->streamPane && st->streamPane->hwnd) {
+            SetTimer(st->streamPane->hwnd, 1, static_cast<UINT>(applied), nullptr);
+        }
+        SetWindowTextW(ds->editStreamRefreshInterval, std::to_wstring(applied).c_str());
+    }
+    if (ds->editProcessMetricsInterval) {
+        const int applied = ClampPerformanceIntervalMs(readValue(ds->editProcessMetricsInterval));
+        st->processMetricsIntervalMs = applied;
+        if (st->pm) st->pm->SetMetricsIntervalMs(applied);
+        SetWindowTextW(ds->editProcessMetricsInterval, std::to_wstring(applied).c_str());
+    }
+    SaveShellConfig(st);
 }
 
 static void CommitSoundSettings(SettingsDlgState* ds) {
@@ -11425,6 +11639,7 @@ static void UpdateSettingsDialogTexts(HWND hwnd) {
             Tr(L"WinConsoleServer", L"WinConsoleServer", L"WinConsoleServer"),
             Tr(L"トリアージ", L"Triage", L"Triaje"),
             Tr(L"管理", L"Maintenance", L"Mantenimiento"),
+            Tr(L"パフォーマンス", L"Performance", L"Rendimiento"),
             Tr(L"色", L"Colors", L"Colores"),
             Tr(L"バージョン情報", L"About", L"Acerca de"),
         };
@@ -11566,9 +11781,36 @@ static void UpdateSettingsDialogTexts(HWND hwnd) {
         L"Events kept per process (100-100000, -1 = unlimited: may use up memory):",
         L"Eventos guardados por proceso (100-100000, -1 = sin límite: puede agotar la memoria):"));
     SetWindowTextW(ds->lblRefreshInterval, Tr(
-        L"更新間隔 (ms, 100〜60000, 既定 2000):",
-        L"Update interval (ms, 100-60000, default 2000):",
-        L"Intervalo de actualización (ms, 100-60000, predeterminado 2000):"));
+        L"ダッシュボード更新間隔 (ms, 100〜60000, 既定 2000):",
+        L"Dashboard update interval (ms, 100-60000, default 2000):",
+        L"Intervalo de actualización del panel (ms, 100-60000, predeterminado 2000):"));
+    if (ds->lblUsageRefreshInterval) {
+        SetWindowTextW(ds->lblUsageRefreshInterval, Tr(
+            L"使用量グラフ更新間隔 (ms, 1000〜60000, 既定 5000):",
+            L"Usage graph refresh interval (ms, 1000-60000, default 5000):",
+            L"Intervalo del gráfico de uso (ms, 1000-60000, predeterminado 5000):"));
+    }
+    if (ds->lblStreamRefreshInterval) {
+        SetWindowTextW(ds->lblStreamRefreshInterval, Tr(
+            L"監視ペイン更新間隔 (ms, 1000〜60000, 既定 5000):",
+            L"Monitor pane refresh interval (ms, 1000-60000, default 5000):",
+            L"Intervalo del panel de monitor (ms, 1000-60000, predeterminado 5000):"));
+    }
+    if (ds->lblProcessMetricsInterval) {
+        SetWindowTextW(ds->lblProcessMetricsInterval, Tr(
+            L"プロセスCPU/メモリ取得間隔 (ms, 1000〜60000, 既定 5000):",
+            L"Process CPU/memory sampling interval (ms, 1000-60000, default 5000):",
+            L"Intervalo de muestreo de CPU/memoria (ms, 1000-60000, predeterminado 5000):"));
+    }
+    if (ds->lblPerformanceHint) {
+        SetWindowTextW(ds->lblPerformanceHint, Tr(
+            L"値を大きくするとCPUとディスクI/Oを抑えられます。実行中のジョブが多いときは既定値のままを推奨します。\n"
+            L"プロセスCPU/メモリ取得間隔はコア側の設定です（実行中のプロセスに即時反映）。",
+            L"Larger values reduce CPU and disk I/O. Keep the defaults while many jobs are running.\n"
+            L"The process sampling interval is a core setting and applies immediately to running processes.",
+            L"Valores mayores reducen CPU y E/S de disco. Mantén los valores predeterminados con muchos trabajos.\n"
+            L"El intervalo de muestreo es un ajuste del núcleo y se aplica al instante."));
+    }
     {
         const bool darkMode = ListRowMode() == 0;
         std::wstring listBgLabel = Tr(
@@ -11795,11 +12037,39 @@ static LRESULT CALLBACK SettingsWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPAR
             SetWindowTextW(ds->editEventRetention, std::to_wstring(ds->dash->llmMaxEvents).c_str());
 
             ds->lblRefreshInterval = CreateWindowExW(0, L"STATIC", L"", WS_CHILD | WS_VISIBLE,
-                18, 332, 530, 20, hwnd, nullptr, hInst, nullptr);
+                18, 48, 530, 20, hwnd, nullptr, hInst, nullptr);
             ds->editRefreshInterval = CreateWindowExW(WS_EX_CLIENTEDGE, L"EDIT", L"",
                 WS_CHILD | WS_VISIBLE | WS_TABSTOP | ES_AUTOHSCROLL | ES_NUMBER,
-                560, 329, 110, 24, hwnd, (HMENU)IDC_SET_REFRESH_INTERVAL, hInst, nullptr);
+                560, 45, 110, 24, hwnd, (HMENU)IDC_SET_REFRESH_INTERVAL, hInst, nullptr);
             SetWindowTextW(ds->editRefreshInterval, std::to_wstring(ds->dash->refreshIntervalMs).c_str());
+
+            ds->lblUsageRefreshInterval = CreateWindowExW(0, L"STATIC", L"", WS_CHILD | WS_VISIBLE,
+                18, 84, 530, 20, hwnd, nullptr, hInst, nullptr);
+            ds->editUsageRefreshInterval = CreateWindowExW(WS_EX_CLIENTEDGE, L"EDIT", L"",
+                WS_CHILD | WS_VISIBLE | WS_TABSTOP | ES_AUTOHSCROLL | ES_NUMBER,
+                560, 81, 110, 24, hwnd, (HMENU)IDC_SET_USAGE_REFRESH_INTERVAL, hInst, nullptr);
+            SetWindowTextW(ds->editUsageRefreshInterval,
+                           std::to_wstring(ds->dash->usageRefreshIntervalMs).c_str());
+
+            ds->lblStreamRefreshInterval = CreateWindowExW(0, L"STATIC", L"", WS_CHILD | WS_VISIBLE,
+                18, 120, 530, 20, hwnd, nullptr, hInst, nullptr);
+            ds->editStreamRefreshInterval = CreateWindowExW(WS_EX_CLIENTEDGE, L"EDIT", L"",
+                WS_CHILD | WS_VISIBLE | WS_TABSTOP | ES_AUTOHSCROLL | ES_NUMBER,
+                560, 117, 110, 24, hwnd, (HMENU)IDC_SET_STREAM_REFRESH_INTERVAL, hInst, nullptr);
+            SetWindowTextW(ds->editStreamRefreshInterval,
+                           std::to_wstring(ds->dash->streamRefreshIntervalMs).c_str());
+
+            ds->lblProcessMetricsInterval = CreateWindowExW(0, L"STATIC", L"", WS_CHILD | WS_VISIBLE,
+                18, 156, 530, 20, hwnd, nullptr, hInst, nullptr);
+            ds->editProcessMetricsInterval = CreateWindowExW(WS_EX_CLIENTEDGE, L"EDIT", L"",
+                WS_CHILD | WS_VISIBLE | WS_TABSTOP | ES_AUTOHSCROLL | ES_NUMBER,
+                560, 153, 110, 24, hwnd, (HMENU)IDC_SET_PROCESS_METRICS_INTERVAL, hInst, nullptr);
+            SetWindowTextW(ds->editProcessMetricsInterval,
+                           std::to_wstring(ds->dash->processMetricsIntervalMs).c_str());
+
+            ds->lblPerformanceHint = CreateWindowExW(0, L"STATIC", L"", WS_CHILD | WS_VISIBLE,
+                18, 196, 700, 70, hwnd, nullptr, hInst, nullptr);
+            SendMessageW(ds->lblPerformanceHint, WM_SETFONT, (WPARAM)ds->dash->hFontUi, TRUE);
 
             // Row colors live on their own 色 tab, so these start at the top of the page.
             ds->lblListBg = CreateWindowExW(0, L"STATIC", L"", WS_CHILD,
@@ -12095,6 +12365,22 @@ static LRESULT CALLBACK SettingsWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPAR
                 Tr(L"内部用の hidden タスク（チャット処理など）もタスクキューに表示します。",
                    L"Also shows internal hidden tasks (such as chat handling) in the task queue.",
                    L"Muestra también las tareas internas ocultas (como el chat) en la cola."));
+            helpId(IDC_SET_REFRESH_INTERVAL,
+                Tr(L"プロセス一覧・タスクキュー・ターミナルの自動更新間隔です。\n大きくするとアイドル時のCPU使用量を抑えられます。",
+                   L"Automatic refresh interval for the process list, task queue and terminals.\nLarger values reduce idle CPU usage.",
+                   L"Intervalo de actualización automática de las listas y terminales.\nValores mayores reducen el uso de CPU en reposo."));
+            helpId(IDC_SET_USAGE_REFRESH_INTERVAL,
+                Tr(L"使用量グラフを再描画する間隔です。\nグラフを開いたままにするときは 5000ms 以上を推奨します。",
+                   L"How often the usage graph is repainted.\nUse 5000 ms or more when leaving the graph open.",
+                   L"Frecuencia de repintado del gráfico de uso.\nUsa 5000 ms o más si lo dejas abierto."));
+            helpId(IDC_SET_STREAM_REFRESH_INTERVAL,
+                Tr(L"監視ペインがプロセス状態とイベントログを確認する間隔です。\n大きくするとアイドル時のCPUとディスクI/Oを抑えられます。",
+                   L"How often the monitor pane checks process state and event logs.\nLarger values reduce idle CPU and disk I/O.",
+                   L"Frecuencia con la que el panel de monitor consulta estado y eventos.\nValores mayores reducen CPU y E/S en reposo."));
+            helpId(IDC_SET_PROCESS_METRICS_INTERVAL,
+                Tr(L"コアが各プロセスのCPU時間とメモリを取得する間隔です。\n大きくするとプロセスが多いときのCPU使用量を抑えられます。",
+                   L"How often the core samples CPU time and memory for each process.\nLarger values reduce CPU usage with many processes.",
+                   L"Frecuencia de muestreo de CPU y memoria por proceso en el núcleo.\nValores mayores reducen la CPU con muchos procesos."));
             helpId(IDC_SET_END_BLINK_ENABLED,
                 Tr(L"プロセスやタスクが終了したとき、一覧の行をしばらく点滅させます。\n終了を見落としにくくなります。",
                    L"Blinks the list row for a while when a process or task finishes.\nMakes endings harder to miss.",
@@ -12139,7 +12425,11 @@ static LRESULT CALLBACK SettingsWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPAR
                              ds->btnShell, ds->btnReset, ds->btnClear, ds->btnClose, ds->chkSound, ds->editSound,
                              ds->btnBrowseSound, ds->btnTestSound, ds->chkHideEnded, ds->chkUsageGraph, ds->chkRestoreUsageGraph,
                              ds->chkResourceLocks, ds->chkActivityStyle, ds->chkShowHiddenTasks, ds->lblEventRetention, ds->editEventRetention,
-                             ds->lblRefreshInterval, ds->editRefreshInterval, ds->btnListBgReset,
+                             ds->lblRefreshInterval, ds->editRefreshInterval,
+                             ds->lblUsageRefreshInterval, ds->editUsageRefreshInterval,
+                             ds->lblStreamRefreshInterval, ds->editStreamRefreshInterval,
+                             ds->lblProcessMetricsInterval, ds->editProcessMetricsInterval,
+                             ds->lblPerformanceHint, ds->btnListBgReset,
                               ds->chkEndBlink, ds->lblEndBlinkSec, ds->editEndBlinkSec,
                               ds->chkSupervisorHints, ds->lblHintAutoDismissSec, ds->editHintAutoDismissSec,
                                ds->lblSupervisorCommand, ds->editSupervisorCommand,
@@ -12166,6 +12456,7 @@ static LRESULT CALLBACK SettingsWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPAR
                 auto& terminal = ds->tabPages[2];
                 auto& triage = ds->tabPages[3];
                 auto& maintenance = ds->tabPages[4];
+                auto& performance = ds->tabPages[5];
                 appearance.insert(appearance.end(), {
                     ds->hwndLangLabel, ds->btnJa, ds->btnEn, ds->btnEs,
                     ds->hwndThemeLabel, ds->btnSystem, ds->btnDark, ds->btnLight, ds->btnPastel, ds->btnHc,
@@ -12174,7 +12465,7 @@ static LRESULT CALLBACK SettingsWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPAR
                     ds->btnDeepPurple, ds->btnPastelPurple, ds->btnDeepYellow, ds->btnPastelYellow,
                     ds->hwndSatLabel, ds->hwndSatCombo,
                     ds->lblProcFont, ds->cmbProcFont, ds->lblTaskFont, ds->cmbTaskFont });
-                auto& colors = ds->tabPages[5];
+                auto& colors = ds->tabPages[6];
                 colors.insert(colors.end(), { ds->lblListBg, ds->btnListBgReset });
                 colors.insert(colors.end(), ds->btnListBg, ds->btnListBg + kListRowKeyCount);
                 behavior.insert(behavior.end(), {
@@ -12182,10 +12473,15 @@ static LRESULT CALLBACK SettingsWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPAR
                     ds->hwndSoundHint, ds->chkHideEnded, ds->chkUsageGraph, ds->chkRestoreUsageGraph,
                     ds->chkResourceLocks, ds->chkActivityStyle, ds->chkShowHiddenTasks,
                     ds->lblEventRetention, ds->editEventRetention,
-                    ds->lblRefreshInterval, ds->editRefreshInterval,
                     ds->chkEndBlink, ds->lblEndBlinkSec, ds->editEndBlinkSec,
                     ds->chkSupervisorHints, ds->lblHintAutoDismissSec, ds->editHintAutoDismissSec,
                     ds->lblSupervisorCommand, ds->editSupervisorCommand });
+                performance.insert(performance.end(), {
+                    ds->lblRefreshInterval, ds->editRefreshInterval,
+                    ds->lblUsageRefreshInterval, ds->editUsageRefreshInterval,
+                    ds->lblStreamRefreshInterval, ds->editStreamRefreshInterval,
+                    ds->lblProcessMetricsInterval, ds->editProcessMetricsInterval,
+                    ds->lblPerformanceHint });
                 terminal.insert(terminal.end(), {
                     ds->lblTermTitle, ds->chkTermLocal, ds->chkTermRemote, ds->lblTermHint });
                 triage.insert(triage.end(), {
@@ -12197,7 +12493,7 @@ static LRESULT CALLBACK SettingsWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPAR
                     ds->lblWebUiTitle, ds->chkWebUi, ds->lblWebUiScope, ds->cmbWebUiScope,
                     ds->lblWebUiAllowedHosts, ds->editWebUiAllowedHosts,
                     ds->lblWebUiPort, ds->editWebUiPort, ds->lblWebUiUrl, ds->editWebUiUrl });
-                auto& about = ds->tabPages[6];
+                auto& about = ds->tabPages[7];
                 about.insert(about.end(), { ds->hwndAboutTitle, ds->hwndAboutVersion, ds->hwndAboutDesc });
             }
             SelectSettingsTab(ds, 0);
@@ -12223,7 +12519,7 @@ static LRESULT CALLBACK SettingsWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPAR
             if (id == IDCANCEL || id == IDOK) {
                 if (ds) CommitSoundSettings(ds);
                 if (ds) CommitEventRetention(ds);
-                if (ds) CommitRefreshInterval(ds);
+                if (ds) CommitPerformanceSettings(ds);
                 if (ds) CommitEndBlinkSettings(ds);
                 if (ds) CommitSupervisorSettings(ds);
                 DestroyWindow(hwnd);
@@ -12255,8 +12551,9 @@ static LRESULT CALLBACK SettingsWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPAR
                 if (HIWORD(wParam) == EN_KILLFOCUS) CommitEndBlinkSettings(ds);
                 return 0;
             }
-            if (id == IDC_SET_REFRESH_INTERVAL) {
-                if (HIWORD(wParam) == EN_KILLFOCUS) CommitRefreshInterval(ds);
+            if (id == IDC_SET_REFRESH_INTERVAL || id == IDC_SET_USAGE_REFRESH_INTERVAL ||
+                id == IDC_SET_STREAM_REFRESH_INTERVAL || id == IDC_SET_PROCESS_METRICS_INTERVAL) {
+                if (HIWORD(wParam) == EN_KILLFOCUS) CommitPerformanceSettings(ds);
                 return 0;
             }
             if (id == IDC_SET_HIDE_ENDED) {
@@ -12566,7 +12863,7 @@ static LRESULT CALLBACK SettingsWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPAR
         }
         case WM_CLOSE:
             if (ds) CommitSoundSettings(ds);
-            if (ds) CommitRefreshInterval(ds);
+            if (ds) CommitPerformanceSettings(ds);
             DestroyWindow(hwnd);
             return 0;
     }
@@ -13602,12 +13899,14 @@ static LRESULT CALLBACK UsagePanelWndProc(HWND hwnd, UINT msg, WPARAM wParam, LP
     switch (msg) {
         case WM_CREATE: {
             auto* cs = reinterpret_cast<CREATESTRUCTW*>(lParam);
-            SetWindowLongPtrW(hwnd, GWLP_USERDATA, reinterpret_cast<LONG_PTR>(cs->lpCreateParams));
-            SetTimer(hwnd, 1, 1000, nullptr);
+            auto* created = reinterpret_cast<DashboardState*>(cs->lpCreateParams);
+            SetWindowLongPtrW(hwnd, GWLP_USERDATA, reinterpret_cast<LONG_PTR>(created));
+            SetTimer(hwnd, 1, static_cast<UINT>(created ? created->usageRefreshIntervalMs
+                                                         : kDefaultUsageRefreshIntervalMs), nullptr);
             return 0;
         }
         case WM_TIMER:
-            if (wParam == 1) InvalidateRect(hwnd, nullptr, FALSE);
+            if (wParam == 1 && IsWindowVisible(hwnd)) InvalidateRect(hwnd, nullptr, FALSE);
             return 0;
         case WM_ERASEBKGND:
             return 1;
@@ -13715,6 +14014,7 @@ struct TriageDlgState {
     HFONT fontUi = nullptr;
     HWND filter = nullptr;
     HWND search = nullptr;
+    HWND btnSearch = nullptr;
     HWND modeLabel = nullptr;
     HWND emptyState = nullptr;
     HWND list = nullptr;
@@ -14591,8 +14891,11 @@ static void TriageLayout(HWND hwnd, TriageDlgState* ds) {
     RECT rc = {}; GetClientRect(hwnd, &rc);
     const int w = rc.right - rc.left, h = rc.bottom - rc.top, pad = 10;
     if (ds->filter) MoveWindow(ds->filter, pad, pad, 205, 260, TRUE);
-    if (ds->search) MoveWindow(ds->search, pad + 213, pad, 260, 24, TRUE);
-    if (ds->modeLabel) MoveWindow(ds->modeLabel, pad + 482, pad + 3, w - pad - (pad + 482), 24, TRUE);
+    const int searchX = pad + 213;
+    if (ds->search) MoveWindow(ds->search, searchX, pad, 260, 24, TRUE);
+    if (ds->btnSearch) MoveWindow(ds->btnSearch, searchX + 266, pad, 64, 24, TRUE);
+    const int modeX = searchX + 266 + 64 + 8;
+    if (ds->modeLabel) MoveWindow(ds->modeLabel, modeX, pad + 3, (std::max)(80, w - pad - modeX), 24, TRUE);
     const RECT oldSplitter = ds->splitterRc;
     const RECT oldVsplit = ds->vsplitRc;
     const int tileTop = 40, tileH = 64, tileGap = 6, top = 110, splitterH = 6;
@@ -14735,12 +15038,23 @@ static LRESULT CALLBACK TriageWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM
         SendMessageW(ds->filter, CB_SETCURSEL, selected, 0);
         ds->search = CreateWindowExW(WS_EX_CLIENTEDGE, L"EDIT", L"", WS_CHILD | WS_VISIBLE | WS_TABSTOP | ES_AUTOHSCROLL,
             0, 0, 260, 24, hwnd, reinterpret_cast<HMENU>(2930), instance, nullptr);
+        ds->btnSearch = CreateWindowExW(0, L"BUTTON", Tr(L"検索", L"Search", L"Buscar"),
+            WS_CHILD | WS_VISIBLE | WS_TABSTOP | BS_PUSHBUTTON,
+            0, 0, 64, 24, hwnd, reinterpret_cast<HMENU>(2931), instance, nullptr);
+        AddControlHelp(hwnd, ds->search,
+            Tr(L"一覧のカードをフリーテキストで絞り込みます。\nスペース区切りの語は AND 条件になります。Ctrl+F でここへ移動、Esc でクリアできます。",
+               L"Filters the cards by free text.\nSpace-separated terms are combined with AND. Ctrl+F focuses this box; Esc clears it.",
+               L"Filtra las tarjetas por texto libre.\nLos términos separados por espacios se combinan con Y. Ctrl+F enfoca el cuadro; Esc lo borra."));
+        AddControlHelp(hwnd, ds->btnSearch,
+            Tr(L"入力中の検索語で一覧を検索し直します。\n入力中も自動で反映されますが、明示的に再検索したいときに押します。",
+               L"Runs the search again with the current text.\nResults update as you type; press this to force a refresh.",
+               L"Vuelve a buscar con el texto actual.\nLos resultados se actualizan al escribir; pulsa para forzar la búsqueda."));
         ds->modeLabel = CreateWindowExW(0, L"STATIC", L"", WS_CHILD | WS_VISIBLE, 0, 0, 900, 24, hwnd, nullptr, instance, nullptr);
         ds->emptyState = CreateWindowExW(0, L"STATIC", L"", WS_CHILD | SS_CENTER | SS_CENTERIMAGE,
             40, 120, 1000, 36, hwnd, nullptr, instance, nullptr);
         ds->list = CreateWindowExW(WS_EX_CLIENTEDGE, WC_LISTVIEWW, L"", WS_CHILD | WS_VISIBLE | LVS_REPORT | LVS_SINGLESEL | LVS_SHOWSELALWAYS,
             10, 42, 1100, 250, hwnd, reinterpret_cast<HMENU>(2901), instance, nullptr);
-        ListView_SetExtendedListViewStyle(ds->list, LVS_EX_FULLROWSELECT | LVS_EX_GRIDLINES | LVS_EX_INFOTIP | LVS_EX_DOUBLEBUFFER);
+        ListView_SetExtendedListViewStyle(ds->list, LVS_EX_FULLROWSELECT | LVS_EX_INFOTIP | LVS_EX_DOUBLEBUFFER);
         MemoryListAddColumn(ds->list, 0, Tr(L"ライフサイクル", L"Lifecycle", L"Ciclo de vida"), 145);
         MemoryListAddColumn(ds->list, 1, Tr(L"種別", L"Kind", L"Tipo"), 120);
         MemoryListAddColumn(ds->list, 2, Tr(L"対象", L"Target", L"Objetivo"), 170);
@@ -14760,7 +15074,7 @@ static LRESULT CALLBACK TriageWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM
         ds->infoTable = CreateWindowExW(WS_EX_CLIENTEDGE, WC_LISTVIEWW, L"",
             WS_CHILD | WS_VISIBLE | LVS_REPORT | LVS_SINGLESEL | LVS_SHOWSELALWAYS | LVS_NOSORTHEADER,
             10, 322, 600, 300, hwnd, reinterpret_cast<HMENU>(2921), instance, nullptr);
-        ListView_SetExtendedListViewStyle(ds->infoTable, LVS_EX_FULLROWSELECT | LVS_EX_GRIDLINES | LVS_EX_INFOTIP | LVS_EX_DOUBLEBUFFER);
+        ListView_SetExtendedListViewStyle(ds->infoTable, LVS_EX_FULLROWSELECT | LVS_EX_INFOTIP | LVS_EX_DOUBLEBUFFER);
         MemoryListAddColumn(ds->infoTable, 0, Tr(L"区分", L"Section", L"Sección"), 90);
         MemoryListAddColumn(ds->infoTable, 1, Tr(L"内容", L"Detail", L"Detalle"), 500);
         ListView_SetBkColor(ds->infoTable, g_theme.panel); ListView_SetTextBkColor(ds->infoTable, g_theme.panel);
@@ -14844,7 +15158,7 @@ static LRESULT CALLBACK TriageWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM
                L"Actualiza la lista de triaje.\nIncluye nuevos fallos y resultados de acciones."));
         ds->listWideLabel = CreateWindowExW(0, L"STATIC", Tr(L"一覧全体:", L"List-wide:", L"Toda la lista:"),
             WS_CHILD | WS_VISIBLE, 0, 0, 82, 24, hwnd, nullptr, instance, nullptr);
-        HWND controls[] = {ds->filter, ds->search, ds->modeLabel, ds->emptyState, ds->list, ds->infoLabel, ds->infoTable,
+        HWND controls[] = {ds->filter, ds->search, ds->btnSearch, ds->modeLabel, ds->emptyState, ds->list, ds->infoLabel, ds->infoTable,
             ds->actionLabel, ds->detail, ds->reasonLabel, ds->multiplier, ds->reason,
             ds->btnRun, ds->btnAdvise, ds->btnLog, ds->btnSupervisor, ds->btnManual, ds->btnAllSupervisor, ds->btnAck,
             ds->btnAckAll, ds->btnClear, ds->btnShowPending, ds->btnMarkAll, ds->btnReload, ds->listWideLabel};
@@ -14854,6 +15168,13 @@ static LRESULT CALLBACK TriageWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM
                 if (label) SendMessageW(label, WM_SETFONT, reinterpret_cast<WPARAM>(ds->dash->hFontUiBold), TRUE);
         }
         ApplyNativeThemeToWindow(hwnd);
+        {
+            // Drop-downs use the same dark combo theme as the memory dialog, and the owner-drawn
+            // headers keep the list headers on the theme palette instead of the native grey.
+            const wchar_t* comboTheme = IsDarkThemeActive() ? L"DarkMode_CFD" : L"";
+            SetWindowTheme(ds->filter, comboTheme, nullptr);
+            SetWindowTheme(ds->multiplier, comboTheme, nullptr);
+        }
         RegisterHotKey(hwnd, 1, MOD_CONTROL, 'F');
         nlohmann::json config = nlohmann::json::parse(ReadFileUtf8Wide(GetConfigFilePathWide()), nullptr, false);
         if (config.is_object() && config.contains("triage_sort") && config["triage_sort"].is_object()) {
@@ -14863,7 +15184,9 @@ static LRESULT CALLBACK TriageWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM
             ds->sortDescending = sort.value("descending", true);
         }
         TriageUpdateHeaders(ds);
-        for (HWND child : {ds->filter, ds->search, ds->list, ds->infoTable, ds->detail, ds->reason,
+        ApplyThemedListHeader(ds->list);
+        ApplyThemedListHeader(ds->infoTable);
+        for (HWND child : {ds->filter, ds->search, ds->btnSearch, ds->list, ds->infoTable, ds->detail, ds->reason,
                            ds->btnRun, ds->btnAdvise, ds->btnLog, ds->btnSupervisor, ds->btnManual,
                            ds->btnAllSupervisor, ds->btnAck, ds->btnAckAll, ds->btnClear, ds->btnShowPending,
                            ds->btnMarkAll, ds->btnReload}) {
@@ -14942,7 +15265,20 @@ static LRESULT CALLBACK TriageWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM
                         }
                     }
                 }
-                return CDRF_NEWFONT;
+                return CDRF_NEWFONT | CDRF_NOTIFYPOSTPAINT;
+            }
+            if (cd->nmcd.dwDrawStage == CDDS_ITEMPOSTPAINT) {
+                DrawTriageGridLines(cd);
+                return CDRF_DODEFAULT;
+            }
+        }
+        if (nm && nm->hwndFrom == ds->infoTable && nm->code == NM_CUSTOMDRAW) {
+            auto* cd = reinterpret_cast<NMLVCUSTOMDRAW*>(lParam);
+            if (cd->nmcd.dwDrawStage == CDDS_PREPAINT) return CDRF_NOTIFYITEMDRAW;
+            if (cd->nmcd.dwDrawStage == CDDS_ITEMPREPAINT) return CDRF_NOTIFYPOSTPAINT;
+            if (cd->nmcd.dwDrawStage == CDDS_ITEMPOSTPAINT) {
+                DrawTriageGridLines(cd);
+                return CDRF_DODEFAULT;
             }
         }
         break;
@@ -14963,6 +15299,11 @@ static LRESULT CALLBACK TriageWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM
             GetWindowTextW(ds->search, text, static_cast<int>(std::size(text)));
             ds->searchText = text;
             TriageReload(ds); TriageLayout(hwnd, ds); return 0;
+        }
+        if (id == 2931) {
+            TriageReload(ds); TriageLayout(hwnd, ds);
+            if (ds->search) SetFocus(ds->search);
+            return 0;
         }
         if (id >= 3000 && id < 3000 + static_cast<int>(ds->radios.size())) {
             const size_t index = static_cast<size_t>(id - 3000);
@@ -15147,8 +15488,17 @@ static LRESULT CALLBACK TriageWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM
             ds->splitterDrag = false; ds->vsplitDrag = false; ReleaseCapture(); return 0;
         }
         break;
+    case WM_DRAWITEM: {
+        auto* dis = reinterpret_cast<DRAWITEMSTRUCT*>(lParam);
+        if (dis && dis->CtlType == ODT_HEADER) {
+            DrawHeaderItem(dis);
+            return TRUE;
+        }
+        break;
+    }
     case WM_CTLCOLORSTATIC:
     case WM_CTLCOLOREDIT:
+    case WM_CTLCOLORLISTBOX:
     case WM_CTLCOLORBTN: {
         // Labels, the read-only action text and the candidate radios follow the dashboard theme.
         HDC hdc = reinterpret_cast<HDC>(wParam);
@@ -15179,7 +15529,7 @@ static LRESULT CALLBACK TriageWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM
                 COLORREF accent = i == 7 ? g_theme.muted : urgent ? KpiAccent(4) : KpiAccent(i == 2 ? 1 : i == 3 ? 3 : 2);
                 DrawKpiCard(hdc, ds->tileRects[i], titles[i], std::to_wstring(ds->tileValues[i]), accent,
                     ds->dash ? ds->dash->hFontUiBold : ds->fontUi,
-                    ds->dash ? ds->dash->hFontKpiVal : nullptr, -1.0f, ds->tileSubtexts[i]);
+                    ds->dash ? ds->dash->hFontKpiVal : nullptr, -1.0f, ds->tileSubtexts[i], true);
                 if (ds->activeTile == i) {
                     HBRUSH active = CreateSolidBrush(g_theme.accent);
                     FrameRect(hdc, &ds->tileRects[i], active);
@@ -15996,8 +16346,10 @@ static LRESULT CALLBACK DashboardWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPA
                 WS_CHILD | WS_VISIBLE | BS_OWNERDRAW, 0, 0, 90, 24, hwnd, (HMENU)IDC_BTN_SETTINGS, nullptr, nullptr);
             st->hwndBtnKillAll = CreateWindowExW(0, L"BUTTON", L"Kill All",
                 WS_CHILD | WS_VISIBLE | BS_OWNERDRAW, 0, 0, 74, 24, hwnd, (HMENU)IDC_BTN_KILL_ALL, nullptr, nullptr);
-            st->hwndBtnGridView = CreateWindowExW(0, L"BUTTON", L"▦",
-                WS_CHILD | WS_VISIBLE | BS_OWNERDRAW, 0, 0, 28, 24, hwnd, (HMENU)IDC_BTN_GRID_VIEW, nullptr, nullptr);
+            if (st->pm) {
+                st->hwndBtnGridView = CreateWindowExW(0, L"BUTTON", L"▦",
+                    WS_CHILD | WS_VISIBLE | BS_OWNERDRAW, 0, 0, 28, 24, hwnd, (HMENU)IDC_BTN_GRID_VIEW, nullptr, nullptr);
+            }
             st->hwndBtnToggleList = CreateWindowExW(0, L"BUTTON", L"☰",
                 WS_CHILD | WS_VISIBLE | BS_OWNERDRAW, 0, 0, 28, 24, hwnd, (HMENU)IDC_BTN_TOGGLE_LIST, nullptr, nullptr);
             st->hwndBtnToggleTerm = CreateWindowExW(0, L"BUTTON", L">_",
@@ -16683,13 +17035,19 @@ static LRESULT CALLBACK DashboardWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPA
                 LayoutControls(st, rcClient.right, rcClient.bottom);
                 InvalidateRect(hwnd, nullptr, FALSE);
             } else if (id == IDC_BTN_TOGGLE_TERM) {
-                st->hideTerminalGrid = !st->hideTerminalGrid;
-                UpdatePanelToggleLabels(st);
-                SaveShellConfig(st);
-                RECT rcClient = {};
-                GetClientRect(hwnd, &rcClient);
-                LayoutControls(st, rcClient.right, rcClient.bottom);
-                InvalidateRect(hwnd, nullptr, FALSE);
+                if (!st->pm) {
+                    // The standalone dashboard's terminal client lives in its
+                    // own window/process (src/term_client.cpp).
+                    LaunchTerminalClientWindow();
+                } else {
+                    st->hideTerminalGrid = !st->hideTerminalGrid;
+                    UpdatePanelToggleLabels(st);
+                    SaveShellConfig(st);
+                    RECT rcClient = {};
+                    GetClientRect(hwnd, &rcClient);
+                    LayoutControls(st, rcClient.right, rcClient.bottom);
+                    InvalidateRect(hwnd, nullptr, FALSE);
+                }
             } else if (id == IDC_BTN_REFRESH) {
                 RefreshDashboardData(st);
                 if (st->streamPane && st->hwndStreamPane && IsWindowVisible(st->hwndStreamPane)) {

@@ -5,7 +5,8 @@
 ;      dist\Hancho-v<version>-win64\ :
 ;        Hancho.exe, hancho-cli.exe, conpty.dll, OpenConsole.exe,
 ;        LICENSE, README.md, README-ja.md, doc\* (topic documents and doc\images)
-;      tools\ (the ww task-card runner template) is taken from the repository directly.
+;      tools\ (the ww task-card runner template) and skills\* (agent skills such as
+;      skills\hancho) are taken from the repository directly.
 ;   2. Run installer\build_installer.cmd (it reads the version from CMakeLists.txt),
 ;      or compile with:  ISCC.exe /DMyAppVersion=<version> installer\Hancho.iss
 ;
@@ -76,6 +77,8 @@ Source: "{#PayloadDir}\README.md"; DestDir: "{app}"; Flags: ignoreversion
 Source: "{#PayloadDir}\README-ja.md"; DestDir: "{app}"; Flags: ignoreversion
 ; doc\: the topic documents the READMEs link to (doc/start.md, doc/cli.md, ...) and doc\images
 Source: "{#PayloadDir}\doc\*"; DestDir: "{app}\doc"; Flags: ignoreversion recursesubdirs createallsubdirs
+; skills\: agent skills (skills\hancho\SKILL.md); the README explains how to link them into opencode / Claude Code
+Source: "..\skills\*"; DestDir: "{app}\skills"; Flags: ignoreversion recursesubdirs createallsubdirs
 ; tools\ww: optional task-card runner template (copied into projects by an LLM agent; see tools\ww\README-ww.md)
 Source: "..\tools\*"; DestDir: "{app}\tools"; Flags: ignoreversion recursesubdirs createallsubdirs
 

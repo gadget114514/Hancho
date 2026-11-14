@@ -1,10 +1,12 @@
 #pragma once
 
 #include "process_manager.h"
+#include "parse_util.h"
 #include "nlohmann/json.hpp"
 #include <string>
 #include <vector>
 #include <map>
+#include <unordered_map>
 #include <mutex>
 #include <condition_variable>
 #include <atomic>
@@ -884,6 +886,13 @@ private:
     void CheckSuspendWhenDone();
     bool HasActiveOtherWork();
 
+    // id -> (queue name, index in that queue's jobs vector). Rebuilt lazily after any
+    // structural change (add/purge), so lookups stay O(1) instead of scanning every job.
+    struct JobIndexEntry {
+        std::string queue;
+        size_t index = 0;
+    };
+    void RebuildJobIndexLocked() const;
     TaskQueueJob* FindJob(const std::string& id, TaskQueue** outQueue);
     const TaskQueueJob* FindJobConst(const std::string& id) const;
     // Requeues one job (caller holds mutex_, has validated the state, and saves the queue).
@@ -943,6 +952,8 @@ private:
     mutable std::mutex mutex_;
     std::condition_variable cv_;
     std::map<std::string, TaskQueue> queues_;
+    mutable std::unordered_map<std::string, JobIndexEntry> jobIndex_;
+    mutable bool jobIndexDirty_ = true;
     std::map<std::string, TaskQueueOrigin> btOrigins_; // behavior tree id -> who started it
     std::map<std::string, std::string> lastNotice_; // taskqueue -> last emitted notice type
     int nextJobNum_ = 1;
@@ -987,9 +998,7 @@ inline bool IEquals(const std::string& a, const std::string& b) {
 
 inline int64_t ParseIsoEpoch(const std::string& s) {
     int y = 0, mo = 0, d = 0, h = 0, mi = 0, se = 0;
-    char sep = 0;
-    if (std::sscanf(s.c_str(), "%d-%d-%d%c%d:%d:%d", &y, &mo, &d, &sep, &h, &mi, &se) < 7) return 0;
-    if (sep != 'T' && sep != ' ') return 0;
+    if (!ParseDateTimeFields(s, y, mo, d, h, mi, se)) return 0;
     std::tm tmv = {};
     tmv.tm_year = y - 1900;
     tmv.tm_mon = mo - 1;
@@ -1007,7 +1016,7 @@ inline int64_t SinceEpoch(const std::string& since) {
         return static_cast<int64_t>(std::time(nullptr)) - secs;
     }
     int y = 0, mo = 0, d = 0;
-    if (std::sscanf(since.c_str(), "%d-%d-%d", &y, &mo, &d) == 3) {
+    if (ParseDateFields(since, y, mo, d)) {
         std::tm tmv = {};
         tmv.tm_year = y - 1900;
         tmv.tm_mon = mo - 1;
