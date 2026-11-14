@@ -992,7 +992,7 @@ struct DashboardState {
     int usagePanelHeight = 170;
     int usageRangeIndex = 1; // 0: 4h, 1: 24h (default), 2: 7d, 3: 30d, 4: 12m
     int usageGraphMode = 0; // 0: token kinds (default), 1: by provider/model
-    int ganttRangeIndex = 2; // Task Gantt window: 0: 6h, 1: 12h, 2: 24h (default), 3: All
+    int ganttRangeIndex = 2; // Task Gantt job count: 0: 3, 1: 5, 2: 10 (default)
     bool restoreUsageGraph = false;
     int64_t llmMaxEvents = kDefaultLlmMaxEvents;  // events kept per stream tracker; -1 = unlimited
     bool resourceLocks = true; // task queue resource locks (doc/resource-locks.md)
@@ -11607,9 +11607,13 @@ static void GetUsageColumnEdges(int width, int& col1Right, int& modelLeft, int& 
     ganttLeft = contentL + colW * 2 + 8;
 }
 
-static const int kGanttRangeCount = 4;
-static const wchar_t* const kGanttRangeLabels[kGanttRangeCount] = {L"6h", L"12h", L"24h", L"All"};
-static const int64_t kGanttRangeSec[kGanttRangeCount] = {6 * 3600, 12 * 3600, 24 * 3600, 0};
+// The Gantt shows the most recent N jobs and fits the time axis to them, so each choice
+// visibly changes the chart (a fixed 6h / 24h window looked the same when jobs were few).
+static const int kGanttRangeCount = 3;
+// The pane fits about ten rows, so the largest choice is 10.
+static const wchar_t* const kGanttRangeLabels[kGanttRangeCount] = {L"3", L"5", L"10"};
+static const int kGanttRangeRows[kGanttRangeCount] = {3, 5, 10};
+static const int kGanttRangeDefault = 2;
 
 static const wchar_t* GanttTitleText() {
     return Tr(L"タスク・ガント", L"TASK GANTT", L"GANTT DE TAREAS");
@@ -11672,18 +11676,24 @@ static COLORREF DesaturateColor(COLORREF c, float amount) {
 }
 
 static void DrawTaskGanttPane(HDC hdc, DashboardState* st, const RECT& plot,
-                              int64_t since, int64_t now) {
+                              int maxRows, int64_t now) {
     if (!st || plot.right - plot.left < 60 || plot.bottom - plot.top < 16) return;
-    if (now <= since) return;
+    if (maxRows < 1) maxRows = 1;
 
-    // The title and range buttons are drawn in the panel header (DrawUsagePanel).
+    // The title and count buttons are drawn in the panel header (DrawUsagePanel).
     std::vector<TaskGanttRow> rows;
     if (!st->lastTaskListJson.empty()) rows = BuildTaskGanttRows(st->lastTaskListJson, now);
     std::vector<const TaskGanttRow*> visible;
     visible.reserve(rows.size());
     for (const auto& row : rows) {
-        if (row.segments.empty() || row.lastEnd < since) continue;
+        if (row.segments.empty()) continue;
         visible.push_back(&row);
+    }
+    // Rows are in start order: keep the latest maxRows jobs (forecast rows included).
+    int hiddenEarlier = 0;
+    if (static_cast<int>(visible.size()) > maxRows) {
+        hiddenEarlier = static_cast<int>(visible.size()) - maxRows;
+        visible.erase(visible.begin(), visible.begin() + hiddenEarlier);
     }
 
     int x0 = plot.left;
@@ -11692,45 +11702,49 @@ static void DrawTaskGanttPane(HDC hdc, DashboardState* st, const RECT& plot,
     int bottom = plot.bottom - 15;
     if (bottom <= top) return;
 
-    // Rows are in start order. When they do not all fit, keep the most recent ones (the
-    // oldest are the least interesting) and say how many earlier rows were left out.
-    const int rowH = 16;
-    int nFit = (bottom - top) / rowH;
-    if (nFit < 1) nFit = 1;
-    const int total = static_cast<int>(visible.size());
-    int hiddenEarlier = 0;
-    if (total > nFit) {
-        int keep = nFit - 1;
-        if (keep < 1) keep = 1;
-        hiddenEarlier = total - keep;
-        visible.erase(visible.begin(), visible.begin() + hiddenEarlier);
+    // Rows grow to fill the pane (up to a comfortable maximum) so fewer jobs get thicker bars.
+    // When even the minimum height does not fit, the oldest rows are dropped as well.
+    const int reserve = hiddenEarlier > 0 ? 1 : 0;
+    int rowH = visible.empty() ? 16 : (bottom - top) / (static_cast<int>(visible.size()) + reserve);
+    if (rowH > 24) rowH = 24;
+    if (rowH < 14) {
+        rowH = 14;
+        int nFit = (bottom - top) / rowH;
+        if (nFit < 2) nFit = 2;
+        int keep = nFit - 1;  // one line for the "earlier" note
+        if (static_cast<int>(visible.size()) > keep) {
+            int drop = static_cast<int>(visible.size()) - keep;
+            hiddenEarlier += drop;
+            visible.erase(visible.begin(), visible.begin() + drop);
+        }
     }
     const int rowTop = top + (hiddenEarlier > 0 ? rowH : 0);
 
-    // The time axis covers only the rows that are drawn. Fitting it to every job in the
-    // range would squeeze the drawn rows into a few pixels when the range spans hours or days.
-    // since == 0 means "All"; with nothing to draw, fall back to the last 24 hours for the axis.
-    int64_t winStart = since > 0 ? since : now - 24 * 3600;
-    int64_t winEnd = now;
+    // The time axis fits the shown jobs: from the earliest start to the latest end (or now,
+    // whichever is later, so forecast rows and the NOW line stay in view), with a little margin.
+    int64_t minStart = now - 3600;
+    int64_t maxEnd = now;
     if (!visible.empty()) {
-        winStart = visible.front()->firstStart;
-        winEnd = visible.front()->lastEnd;
+        minStart = visible.front()->firstStart;
         for (const TaskGanttRow* row : visible) {
-            winStart = (std::min)(winStart, row->firstStart);
-            winEnd = (std::max)(winEnd, row->lastEnd);
+            minStart = (std::min)(minStart, row->firstStart);
+            maxEnd = (std::max)(maxEnd, row->lastEnd);
         }
-        int64_t span = winEnd - winStart;
-        if (span < 60) {
-            int64_t pad = (60 - span + 1) / 2;
-            winStart -= pad;
-            winEnd += pad;
-            span = winEnd - winStart;
-        }
-        int64_t pad = span / 20;
-        if (pad > 0) {
-            winStart -= pad;
-            winEnd += pad;
-        }
+    }
+    int64_t winStart = (std::min)(minStart, now);
+    int64_t winEnd = (std::max)(now, maxEnd);
+    int64_t span = winEnd - winStart;
+    if (span < 60) {
+        int64_t pad = (60 - span + 1) / 2;
+        winStart -= pad;
+        winEnd += pad;
+        span = winEnd - winStart;
+    }
+    int64_t pad = span / 40;
+    if (pad > 0) {
+        winStart -= pad;
+        winEnd += pad;
+        span = winEnd - winStart;
     }
 
     int labelW = (x1 - x0) * 2 / 5;
@@ -12235,7 +12249,7 @@ static void DrawUsagePanel(HWND hwnd, HDC hdc, DashboardState* st) {
     }
 
     int ganttIdx = st->ganttRangeIndex;
-    if (ganttIdx < 0 || ganttIdx >= kGanttRangeCount) ganttIdx = 2;
+    if (ganttIdx < 0 || ganttIdx >= kGanttRangeCount) ganttIdx = kGanttRangeDefault;
     {
         RECT gpills[kGanttRangeCount] = {};
         GetGanttPillRects(hdc, st->hFontUiBold, w, gpills);
@@ -12256,7 +12270,7 @@ static void DrawUsagePanel(HWND hwnd, HDC hdc, DashboardState* st) {
             DrawTextW(hdc, kGanttRangeLabels[i], -1, &gpills[i], DT_CENTER | DT_VCENTER | DT_SINGLELINE);
         }
     }
-    const int64_t ganttSince = kGanttRangeSec[ganttIdx] > 0 ? now - kGanttRangeSec[ganttIdx] : 0;
+    const int ganttMaxRows = kGanttRangeRows[ganttIdx];
     int gy0 = 30;
     int gy1 = h - 26;
     int graphW = gx1 - gx0;
@@ -12476,7 +12490,7 @@ static void DrawUsagePanel(HWND hwnd, HDC hdc, DashboardState* st) {
 
     if (tx1 - tx0 >= 60) {
         RECT ganttPlot = {tx0, gy0, tx1, gy1};
-        DrawTaskGanttPane(hdc, st, ganttPlot, ganttSince, now);
+        DrawTaskGanttPane(hdc, st, ganttPlot, ganttMaxRows, now);
     }
 
     SetTextColor(hdc, g_theme.muted);
