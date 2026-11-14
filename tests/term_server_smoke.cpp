@@ -166,6 +166,18 @@ int main(int argc, char** argv) {
     }
     Check(gotHello, "replay contains hello-wcsp");
 
+    // The Settings active-session list uses the term_sessions IPC action.
+    {
+        json active;
+        Check(IpcCall({{"action", "term_sessions"}}, active) && active.value("ok", false),
+              "term_sessions answers");
+        int activeCount = 0;
+        if (active.contains("sessions") && active["sessions"].is_array()) {
+            activeCount = static_cast<int>(active["sessions"].size());
+        }
+        Check(activeCount > 0, "term_sessions lists the active session");
+    }
+
     // Multi-session: a second client attaches to the same job and both receive
     // the live output. This is what the tabbed terminal client uses.
     std::mutex output2Mutex;

@@ -1828,6 +1828,7 @@ std::string IpcServer::HandleRequestJson(const std::string& reqJson) {
                 if (parsed.is_object()) cfg = parsed;
             }
             EnsureChatBlock(cfg);
+            const nlohmann::json before = cfg;
             if (patch.contains("ipmsg") && !patch.contains("chat")) {
                 patch["chat"] = patch["ipmsg"];
             }
@@ -1862,9 +1863,19 @@ std::string IpcServer::HandleRequestJson(const std::string& reqJson) {
             if (cfg.contains("restore_usage_graph") && cfg["restore_usage_graph"].is_boolean()) {
                 SetUsageHistoryPersistence(cfg["restore_usage_graph"].get<bool>());
             }
-            const bool webuiChanged = patch.contains("webui");
-            const bool chatChanged = patch.contains("chat");
-            const bool terminalChanged = patch.contains("terminal");
+            // Restart a listener only when its block actually changed. A caller that
+            // sends the whole config back (dashboard settings save, CLI) used to
+            // restart the terminal server and Chat on every unrelated change, and the
+            // GUI blocked on the restart chain while closing its Settings dialog.
+            auto blockOf = [](const nlohmann::json& j, const char* key) {
+                return j.is_object() && j.contains(key) ? j[key] : nlohmann::json();
+            };
+            auto blockChanged = [&](const char* key) {
+                return patch.contains(key) && blockOf(before, key) != blockOf(cfg, key);
+            };
+            const bool webuiChanged = blockChanged("webui");
+            const bool chatChanged = blockChanged("chat");
+            const bool terminalChanged = blockChanged("terminal");
             WriteFileAtomicWide(configPath, cfg.dump(2));
             if (webuiChanged) ScheduleWebUiRestart();
             if (chatChanged) ScheduleIpmsgRestart();

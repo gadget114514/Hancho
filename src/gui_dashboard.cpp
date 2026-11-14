@@ -10404,6 +10404,10 @@ static void SaveShellConfig(const DashboardState* st) {
     std::string serialized = ss.str();
     nlohmann::json cfgJson = nlohmann::json::parse(serialized, nullptr, false);
     if (!cfgJson.is_discarded()) {
+        // Only the keys the dashboard owns are sent to the core. Sending the merged
+        // file back made every save carry the "chat" and "terminal" blocks, which
+        // restarted those servers each time the Settings dialog was closed.
+        nlohmann::json ipcJson = cfgJson;
         // Preserve settings managed outside the dashboard (webui, memory, ...).
         // The old config is read before writing so this save does not drop them.
         std::string oldContent = ReadFileUtf8Wide(GetConfigFilePathWide());
@@ -10443,10 +10447,6 @@ static void SaveShellConfig(const DashboardState* st) {
         serialized = cfgJson.dump(2);
         WriteFileAtomicWide(GetConfigFilePathWide(), serialized);
 
-        // The file already carries "webui"; do not send it back as a patch or an
-        // unrelated settings save would restart the WebUI listener.
-        nlohmann::json ipcJson = cfgJson;
-        ipcJson.erase("webui");
         nlohmann::json req = {{"action", "config_set"}, {"config", ipcJson}};
         nlohmann::json resp;
         GuiIpcCall(const_cast<DashboardState*>(st), req, resp);
@@ -11141,9 +11141,11 @@ static int ThemeButtonId(UiTheme theme) {
 }
 
 static constexpr int kSettingsTabCount = 8;
+constexpr UINT_PTR kTermSessionsTimerId = 100;
 
 struct SettingsDlgState {
     DashboardState* dash = nullptr;
+    HWND hwnd = nullptr;
     HWND hwndTitle = nullptr;
     HWND hwndLangLabel = nullptr;
     HWND hwndThemeLabel = nullptr;
@@ -11277,7 +11279,8 @@ static void ApplyListRowBgChange(SettingsDlgState* ds, HWND hwnd) {
 
 // Reads the event retention box, applies it to every stream tracker and saves it. Out-of-range
 // values are clamped (see ClampLlmMaxEvents), and the box shows the value that was applied.
-static void CommitEventRetention(SettingsDlgState* ds) {
+// persist = false only reads the controls; the close path saves once at the end.
+static void CommitEventRetention(SettingsDlgState* ds, bool persist = true) {
     if (!ds || !ds->dash || !ds->editEventRetention) return;
     wchar_t text[64] = {};
     GetWindowTextW(ds->editEventRetention, text, 64);
@@ -11286,11 +11289,11 @@ static void CommitEventRetention(SettingsDlgState* ds) {
     ds->dash->llmMaxEvents = applied;
     std::wstring shown = std::to_wstring(applied);
     SetWindowTextW(ds->editEventRetention, shown.c_str());
-    SaveShellConfig(ds->dash);
+    if (persist) SaveShellConfig(ds->dash);
 }
 
 // Reads the performance boxes (ms), clamps them, restarts the affected timers and saves.
-static void CommitPerformanceSettings(SettingsDlgState* ds) {
+static void CommitPerformanceSettings(SettingsDlgState* ds, bool persist = true) {
     if (!ds || !ds->dash) return;
     DashboardState* st = ds->dash;
 
@@ -11329,21 +11332,21 @@ static void CommitPerformanceSettings(SettingsDlgState* ds) {
         if (st->pm) st->pm->SetMetricsIntervalMs(applied);
         SetWindowTextW(ds->editProcessMetricsInterval, std::to_wstring(applied).c_str());
     }
-    SaveShellConfig(st);
+    if (persist) SaveShellConfig(st);
 }
 
-static void CommitSoundSettings(SettingsDlgState* ds) {
+static void CommitSoundSettings(SettingsDlgState* ds, bool persist = true) {
     if (!ds || !ds->dash) return;
     wchar_t path[MAX_PATH * 4] = {};
     GetWindowTextW(ds->editSound, path, MAX_PATH * 4);
     ds->dash->completionSoundPath = WideToUtf8(path);
     ds->dash->completionSoundEnabled =
         (SendMessageW(ds->chkSound, BM_GETCHECK, 0, 0) == BST_CHECKED);
-    SaveShellConfig(ds->dash);
+    if (persist) SaveShellConfig(ds->dash);
 }
 
 // Reads the end-blink controls, clamps the seconds, and saves them.
-static void CommitEndBlinkSettings(SettingsDlgState* ds) {
+static void CommitEndBlinkSettings(SettingsDlgState* ds, bool persist = true) {
     if (!ds || !ds->dash || !ds->editEndBlinkSec) return;
     ds->dash->endBlinkEnabled = (SendMessageW(ds->chkEndBlink, BM_GETCHECK, 0, 0) == BST_CHECKED);
     wchar_t text[64] = {};
@@ -11351,10 +11354,23 @@ static void CommitEndBlinkSettings(SettingsDlgState* ds) {
     const int applied = ClampEndBlinkSeconds(_wtoi(text));
     ds->dash->endBlinkSeconds = applied;
     SetWindowTextW(ds->editEndBlinkSec, std::to_wstring(applied).c_str());
-    SaveShellConfig(ds->dash);
+    if (persist) SaveShellConfig(ds->dash);
 }
 
-static void CommitSupervisorSettings(SettingsDlgState* ds) {
+// Pushes the supervisor/triage settings the core needs; the dashboard also keeps
+// them in config.json, so this is only the live IPC patch.
+static void SendSupervisorSettings(SettingsDlgState* ds) {
+    if (!ds || !ds->dash) return;
+    nlohmann::json req = {{"action", "config_set"},
+                          {"patch", {{"triage_mode", ds->dash->triageMode},
+                                     {"triage_llm_mode", ds->dash->triageLlmMode},
+                                     {"triage_supervisor_engine", ds->dash->supervisorCommand},
+                                     {"triage_kinds", ds->triageKinds}}}};
+    nlohmann::json resp;
+    GuiIpcCall(ds->dash, req, resp);
+}
+
+static void CommitSupervisorSettings(SettingsDlgState* ds, bool persist = true) {
     if (!ds || !ds->dash) return;
     if (ds->chkSupervisorHints) {
         ds->dash->showSupervisorHints = (SendMessageW(ds->chkSupervisorHints, BM_GETCHECK, 0, 0) == BST_CHECKED);
@@ -11397,18 +11413,25 @@ static void CommitSupervisorSettings(SettingsDlgState* ds) {
         if (ds->chkTriageKinds[i])
             ds->triageKinds[kindKeys[i]] = SendMessageW(ds->chkTriageKinds[i], BM_GETCHECK, 0, 0) == BST_CHECKED;
     }
+    if (!persist) return;
     SaveShellConfig(ds->dash);
-    nlohmann::json req = {{"action", "config_set"},
-                          {"patch", {{"triage_mode", ds->dash->triageMode},
-                                     {"triage_llm_mode", ds->dash->triageLlmMode},
-                                     {"triage_supervisor_engine", ds->dash->supervisorCommand},
-                                     {"triage_kinds", ds->triageKinds}}}};
-    nlohmann::json resp;
-    GuiIpcCall(ds->dash, req, resp);
+    SendSupervisorSettings(ds);
 }
 
 static void RefreshTermSessions(SettingsDlgState* ds) {
     if (!ds || !ds->dash || !ds->listTermSessions) return;
+
+    // Keep the selected session selected across the periodic refresh.
+    uint32_t selectedId = 0;
+    int selectedRow = ListView_GetNextItem(ds->listTermSessions, -1, LVNI_SELECTED);
+    if (selectedRow >= 0) {
+        LVITEMW item = {};
+        item.mask = LVIF_PARAM;
+        item.iItem = selectedRow;
+        if (ListView_GetItem(ds->listTermSessions, &item)) {
+            selectedId = static_cast<uint32_t>(item.lParam);
+        }
+    }
     SendMessageW(ds->listTermSessions, LVM_DELETEALLITEMS, 0, 0);
 
     nlohmann::json req = {{"action", "term_sessions"}};
@@ -11464,6 +11487,10 @@ static void RefreshTermSessions(SettingsDlgState* ds) {
         sub3.pszText = timeBuf;
         SendMessageW(ds->listTermSessions, LVM_SETITEMTEXTW, idx, reinterpret_cast<LPARAM>(&sub3));
 
+        if (selectedId != 0 && sid == selectedId) {
+            ListView_SetItemState(ds->listTermSessions, idx, LVIS_SELECTED | LVIS_FOCUSED,
+                                  LVIS_SELECTED | LVIS_FOCUSED);
+        }
         idx++;
     }
 }
@@ -11475,7 +11502,10 @@ static void SelectSettingsTab(SettingsDlgState* ds, int tab) {
         for (HWND h : ds->tabPages[p]) ShowWindow(h, p == tab ? SW_SHOW : SW_HIDE);
     }
     if (tab == 2) {
+        if (ds->hwnd) SetTimer(ds->hwnd, kTermSessionsTimerId, 1000, nullptr);
         RefreshTermSessions(ds);
+    } else if (ds->hwnd) {
+        KillTimer(ds->hwnd, kTermSessionsTimerId);
     }
 }
 
@@ -12058,6 +12088,7 @@ static LRESULT CALLBACK SettingsWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPAR
             auto* cs = reinterpret_cast<CREATESTRUCTW*>(lParam);
             ds = reinterpret_cast<SettingsDlgState*>(cs->lpCreateParams);
             SetWindowLongPtrW(hwnd, GWLP_USERDATA, reinterpret_cast<LONG_PTR>(ds));
+            ds->hwnd = hwnd;
             HINSTANCE hInst = GetModuleHandleW(nullptr);
 
             // The title is no longer shown: the tab names say what each page is.
@@ -12744,6 +12775,12 @@ static LRESULT CALLBACK SettingsWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPAR
             SetWindowTheme(ds->tabCtrl, L"", L"");
             return 0;
         }
+        case WM_TIMER:
+            if (wParam == kTermSessionsTimerId && ds && ds->tabCtrl &&
+                TabCtrl_GetCurSel(ds->tabCtrl) == 2) {
+                RefreshTermSessions(ds);
+            }
+            return 0;
         case WM_NOTIFY: {
             auto* nm = reinterpret_cast<NMHDR*>(lParam);
             if (ds && nm->idFrom == IDC_SET_TAB && nm->code == TCN_SELCHANGE) {
@@ -12755,11 +12792,18 @@ static LRESULT CALLBACK SettingsWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPAR
         case WM_COMMAND: {
             int id = LOWORD(wParam);
             if (id == IDCANCEL || id == IDOK) {
-                if (ds) CommitSoundSettings(ds);
-                if (ds) CommitEventRetention(ds);
-                if (ds) CommitPerformanceSettings(ds);
-                if (ds) CommitEndBlinkSettings(ds);
-                if (ds) CommitSupervisorSettings(ds);
+                if (ds) {
+                    // Read every page once, then persist in one save and one IPC
+                    // round-trip. Saving per page queued several blocking config_set
+                    // calls on the UI thread, which is why closing felt frozen.
+                    CommitSoundSettings(ds, false);
+                    CommitEventRetention(ds, false);
+                    CommitPerformanceSettings(ds, false);
+                    CommitEndBlinkSettings(ds, false);
+                    CommitSupervisorSettings(ds, false);
+                    SaveShellConfig(ds->dash);
+                    SendSupervisorSettings(ds);
+                }
                 DestroyWindow(hwnd);
                 return 0;
             }
@@ -13162,9 +13206,13 @@ static LRESULT CALLBACK SettingsWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPAR
             return reinterpret_cast<LRESULT>(g_dialogBgBrush);
         }
         case WM_CLOSE:
-            if (ds) CommitSoundSettings(ds);
-            if (ds) CommitPerformanceSettings(ds);
-            if (ds) ApplyTerminalDialogConfig(ds);
+            if (ds) {
+                CommitSoundSettings(ds, false);
+                CommitPerformanceSettings(ds, false);
+                SaveShellConfig(ds->dash);
+                ApplyTerminalDialogConfig(ds);
+                KillTimer(hwnd, kTermSessionsTimerId);
+            }
             DestroyWindow(hwnd);
             return 0;
     }
