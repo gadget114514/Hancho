@@ -2,7 +2,9 @@
 
 **[English](README.md) | [日本語 (Japanese)](README-ja.md)**
 
-**Hancho** は、Claude Code や各種自動化スクリプトから複数のサブプロセス・対話型 CLI エージェント（`opencode`, `claude`, PowerShell, cmd, Git Bash 等）を並列起動・監視・制御し、**状況をひと目で把握できる Native Win32 + Direct2D マルチターミナルダッシュボード GUI** を備えたプロセスマネージャです。
+**Hancho**（班長）は、Windows で AI コーディングエージェントの作業を仕切る「現場の班長」です。LLM やあなたが仕事を渡すと、Hancho はそれを実際の端末プロセスとして順番どおりに、失敗すればリトライしながら走らせ、その様子をダッシュボードで見せます。
+
+この考えを軸に、ConPTY マルチターミナルのダッシュボード、依存関係・タイムアウト・リトライ付きのタスクキュー、複数手順の計画を任せられるビヘイビアツリー、**MCP** と **CLI** の両方からの操作を備えています。`claude`、`opencode`、`codex`、ビルドスクリプト、対話シェル（PowerShell、cmd、Git Bash）を同じように扱えます。
 
 バージョンは `hancho-cli.exe --version` で確認できます（現在: 0.9.14）。
 
