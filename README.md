@@ -100,6 +100,16 @@ The skill starts with `hancho-cli.exe help --json`, so the commands it shows alw
 
 
 
+### v0.9.21
+- **WebUI settings**: turning the browser UI off no longer freezes the dashboard. Listener restarts run on a dedicated serial worker, in-flight handlers are detached instead of waited for, and the dashboard IPC has a bounded timeout. A `webui_config_smoke` regression test covers the disable path.
+- **LAN WebUI**: WebSocket upgrades use the same Host / Origin rules as HTTP, so a browser on another PC can connect by IP or a configured `allowed_hosts` name while foreign origins are still rejected.
+- **WebUI token**: the WebUI tab has a token field and **Regenerate** button. The token is stored in `webui.token`, survives disabling and restarts, and rebuilds the access URL. Disabled shows a clear message instead of a stale token URL. Scope, host, port and token changes rebind immediately without restarting Hancho.
+- **Settings tabs**: separate **WebUI** and **Maintenance** tabs, the terminal tab is named **WinConsole**, and **Colors** became **Color details**. Shell Config, Reset Process IDs and Clear Ended moved to Maintenance.
+- **Chat**: clicking a message shows its body and attachments without reply mode (received and sent). Double-click or choose Reply in the destination combo to reply.
+- **Terminal sessions**: the `[🔌]` button opens the active connection list, shows a connection-count badge, and connect/disconnect tray notifications include the count. The `+ Launch` toolbar button is gone; use `[>_]` / HanchoTerm.
+- **Theme**: the light theme keeps the modern DWM window frame instead of classic caption buttons.
+- **Docs**: the README network ports section lists the WebUI port (TCP 9138).
+
 ### v0.9.20
 - **Standalone HanchoTerm.exe**: the WCSP terminal client is now its own executable (`HanchoTerm.exe`) instead of `Hancho.exe terminal`. The dashboard `[>_]` button launches it, the installer adds it with a Start Menu shortcut, and local core discovery (`term_endpoint` / `attach:<id>`) still works. `Hancho.exe terminal` now points to the new program.
 - **Terminal robustness**: the terminal ignores the temporary 100x100 size used while a view is hidden or being created, and the buffer bounds-checks cursor writes during resize, avoiding a wrong grid or a crash on some jobs.
