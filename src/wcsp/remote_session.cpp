@@ -49,6 +49,7 @@ void RemoteSession::SetResizedHandler(ResizedFn fn) {
 bool RemoteSession::Start(const TerminalStartOptions& opt, std::wstring* error) {
     if (running_) return true;
     stopping_ = false;
+    errorNotified_ = false;
 
     config_.shell = WideToUtf8(opt.shell);
     if (config_.shell.empty()) config_.shell = "cmd";
@@ -76,6 +77,7 @@ bool RemoteSession::Start(const TerminalStartOptions& opt, std::wstring* error) 
 
     running_ = true;
     next_ping_ms_ = NowMs() + 15000;
+    last_pong_ms_ = NowMs();
     receiver_ = std::thread(&RemoteSession::ReceiverLoop, this);
     sender_ = std::thread(&RemoteSession::SenderLoop, this);
     return true;
@@ -211,6 +213,7 @@ bool RemoteSession::Handshake(const TerminalStartOptions& opt, std::wstring* err
                 if (error) *error = L"protocol major version mismatch";
                 return false;
             }
+            job_id_ = ack.job_id;
             if (onResized && (ack.cols != hello.cols || ack.rows != hello.rows)) {
                 wcs::ResizedInfo info;
                 info.cols = ack.cols;
@@ -317,13 +320,13 @@ void RemoteSession::ReceiverLoop() {
         wcs::Frame frame;
         wcs::ReadResult rr = reader_.Next(frame, &parseError);
         if (rr == wcs::ReadResult::Error) {
-            SetError(L"protocol error: " + Utf8ToWide(parseError));
+            NotifyError(L"protocol error: " + Utf8ToWide(parseError));
             break;
         }
         if (rr == wcs::ReadResult::NeedMore) {
             int n = recv(socket_, (char*)buf.data(), (int)buf.size(), 0);
             if (n <= 0) {
-                if (!stopping_) SetError(L"connection closed");
+                if (!stopping_) NotifyError(L"connection closed");
                 break;
             }
             reader_.Append(buf.data(), (size_t)n);
@@ -362,12 +365,10 @@ void RemoteSession::ReceiverLoop() {
         case wcs::FrameType::Error: {
             wcs::ErrorInfo info;
             if (wcs::DecodeError(frame.payload.data(), frame.payload.size(), info)) {
-                SetError(Utf8ToWide(info.message));
-                if (onError) onError(info);
+                NotifyError(Utf8ToWide(info.message));
             } else {
-                SetError(L"server error");
+                NotifyError(L"server error");
             }
-            stopping_ = true;
             break;
         }
         case wcs::FrameType::SessionList: {
@@ -382,6 +383,7 @@ void RemoteSession::ReceiverLoop() {
             break;
         }
         case wcs::FrameType::Pong:
+            last_pong_ms_ = NowMs();
             break;
         default:
             break;
@@ -417,9 +419,7 @@ void RemoteSession::SenderLoop() {
 
         if (haveFrame) {
             if (!SendFrame(frame)) {
-                SetError(L"send failed");
-                stopping_ = true;
-                ShutdownSocket();
+                NotifyError(L"send failed");
                 break;
             }
             continue;
@@ -431,12 +431,16 @@ void RemoteSession::SenderLoop() {
             ping.type = wcs::FrameType::Ping;
             ping.payload = wcs::EncodePing(now);
             if (!SendFrame(ping)) {
-                SetError(L"send failed");
-                stopping_ = true;
-                ShutdownSocket();
+                NotifyError(L"send failed");
                 break;
             }
             next_ping_ms_ = now + 15000;
+        }
+
+        const uint64_t lastPong = last_pong_ms_.load();
+        if (lastPong > 0 && now - lastPong > 30000) {
+            NotifyError(L"connection timeout");
+            break;
         }
     }
     queue_cv_.notify_all();
@@ -471,6 +475,20 @@ void RemoteSession::EnqueueFrame(wcs::Frame frame, bool priority) {
 void RemoteSession::SetError(const std::wstring& error) {
     std::lock_guard<std::mutex> lock(error_mutex_);
     last_error_ = error;
+}
+
+void RemoteSession::NotifyError(const std::wstring& error) {
+    if (errorNotified_.exchange(true)) return;
+    SetError(error);
+    if (onError) {
+        wcs::ErrorInfo info;
+        info.code = wcs::ErrorCode::Internal;
+        info.message = WideToUtf8(error);
+        onError(info);
+    }
+    stopping_ = true;
+    ShutdownSocket();
+    queue_cv_.notify_all();
 }
 
 void RemoteSession::ShutdownSocket() {

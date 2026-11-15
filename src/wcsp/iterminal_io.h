@@ -46,6 +46,9 @@ public:
 
     virtual bool IsRunning() const = 0;
     virtual void Close() = 0;
+    // Server-side job id for this session, 0 when unknown. HanchoTerm uses it
+    // to reattach to the same retained session after a dropped connection.
+    virtual uint32_t JobId() const { return 0; }
     // Ask the server to end the session explicitly (WCSP CLOSE frame).
     // Close() alone only detaches; the server keeps the session for reconnect.
     virtual void TerminateSession() {}

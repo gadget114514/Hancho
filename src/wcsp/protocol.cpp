@@ -293,6 +293,7 @@ std::vector<uint8_t> EncodeHelloAck(const HelloAck& ack) {
     AppendTlv(out, TlvSize, size.data(), size.size());
 
     AppendTlvU32(out, TlvSessionId, ack.session_id);
+    if (ack.job_id > 0) AppendTlvU32(out, TlvJobId, ack.job_id);
     if (!ack.shell.empty()) AppendTlvString(out, TlvShell, ack.shell);
     AppendTlvString(out, TlvEncoding, "UTF-8");
     return out;
@@ -321,6 +322,12 @@ bool DecodeHelloAck(const uint8_t* data, size_t len, HelloAck& out,
         uint32_t value = 0;
         if (!TlvU32(session, value)) return Fail(error, "bad session id");
         out.session_id = value;
+    }
+    const Tlv* job = FindTlv(tlvs, TlvJobId);
+    if (job) {
+        uint32_t value = 0;
+        if (!TlvU32(job, value)) return Fail(error, "bad job id");
+        out.job_id = value;
     }
     out.name = TlvString(FindTlv(tlvs, TlvName));
     out.shell = TlvString(FindTlv(tlvs, TlvShell));

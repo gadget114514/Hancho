@@ -49,6 +49,7 @@ public:
     void Close() override;
     void TerminateSession() override;
     std::wstring LastError() const override;
+    uint32_t JobId() const override { return job_id_; }
 
     // Requests the server's retained-session list. The answer arrives on
     // onSessionList from the receiver thread.
@@ -70,6 +71,7 @@ private:
     bool SendFrame(const wcs::Frame& frame);
     void EnqueueFrame(wcs::Frame frame, bool priority);
     void SetError(const std::wstring& error);
+    void NotifyError(const std::wstring& error);
     void ShutdownSocket();
 
     RemoteConfig config_;
@@ -96,6 +98,9 @@ private:
     std::thread sender_;
 
     std::atomic<bool> running_{false};
+    uint32_t job_id_ = 0;
     std::atomic<bool> stopping_{false};
+    std::atomic<bool> errorNotified_{false};
+    std::atomic<uint64_t> last_pong_ms_{0};
     std::atomic<uint64_t> next_ping_ms_{0};
 };

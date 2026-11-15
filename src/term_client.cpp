@@ -29,6 +29,7 @@
 #include <memory>
 #include <set>
 #include <string>
+#include <thread>
 #include <vector>
 
 #pragma comment(lib, "comctl32.lib")
@@ -42,6 +43,8 @@ constexpr wchar_t kSessionsDlgClass[] = L"HanchoTermSessionsDlg";
 
 constexpr UINT WM_CLIENT_SESSION_EXIT = WM_APP + 21;
 constexpr UINT WM_CLIENT_SESSION_ERROR = WM_APP + 22;
+constexpr UINT WM_CLIENT_AUTO_RECONNECT = WM_APP + 23;
+constexpr UINT WM_CLIENT_AUTO_RECONNECT_FAILED = WM_APP + 24;
 
 constexpr int IDC_CLIENT_TAB = 5001;
 constexpr int IDC_CLIENT_STATUS = 5006;
@@ -147,7 +150,7 @@ struct RemoteSettings {
 };
 
 struct SessionTab {
-    enum class State { Connecting, Connected, Exited, Failed };
+    enum class State { Connecting, Connected, Exited, Reconnecting, Failed };
 
     int id = 0;
     std::unique_ptr<TerminalView> view;
@@ -159,12 +162,19 @@ struct SessionTab {
     State state = State::Connecting;
     int exitCode = 0;
     int localJobId = 0;
+    uint32_t serverJobId = 0;
+    bool autoReconnect = true;
+    bool reconnectInFlight = false;
+    uint64_t nextReconnectTickMs = 0;
+    int reconnectAttempts = 0;
 };
 
 struct ClientState {
     HWND hwndMain = nullptr;
     HWND hwndTab = nullptr;
+    HWND hwndTabTip = nullptr;
     HWND hwndStatus = nullptr;
+    std::wstring tabTipText;
     HMENU hMenuFile = nullptr;
     HMENU hMenuEdit = nullptr;
     HMENU hMenuSettings = nullptr;
@@ -318,6 +328,10 @@ void ApplyClientTheme(ClientState* st, bool force) {
     InvalidateRect(st->hwndMain, nullptr, TRUE);
     if (st->hwndTab) InvalidateRect(st->hwndTab, nullptr, TRUE);
     if (st->hwndStatus) InvalidateRect(st->hwndStatus, nullptr, TRUE);
+    if (st->hwndTabTip) {
+        SendMessageW(st->hwndTabTip, TTM_SETTIPBKCOLOR, 0, static_cast<LPARAM>(palette.panel));
+        SendMessageW(st->hwndTabTip, TTM_SETTIPTEXTCOLOR, 0, static_cast<LPARAM>(palette.text));
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -351,6 +365,8 @@ std::wstring StateSuffix(const SessionTab& tab) {
         suffix += L"]";
         return suffix;
     }
+    case SessionTab::State::Reconnecting:
+        return std::wstring(L" [") + T(L"再接続中", L"reconnecting", L"reconectando") + L"]";
     case SessionTab::State::Failed:
         return std::wstring(L" [") + T(L"エラー", L"error", L"error") + L"]";
     }
@@ -371,6 +387,7 @@ void SetTabItemText(ClientState* st, int index) {
     item.mask = TCIF_TEXT;
     item.pszText = text.data();
     TabCtrl_SetItem(st->hwndTab, index, &item);
+    InvalidateRect(st->hwndTab, nullptr, TRUE);
 }
 
 void RebuildTabControl(ClientState* st) {
@@ -1227,6 +1244,17 @@ int AddSession(ClientState* st, const RemoteSettings& settings, const std::wstri
     }
 
     added->state = SessionTab::State::Connected;
+    added->serverJobId = added->view->RemoteJobId();
+    if (added->serverJobId == 0 && localJobId > 0) {
+        added->serverJobId = static_cast<uint32_t>(localJobId);
+    }
+    if (added->localJobId == 0 && added->serverJobId > 0) {
+        added->localJobId = static_cast<int>(added->serverJobId);
+    }
+    added->reconnectInFlight = false;
+    added->reconnectAttempts = 0;
+    added->nextReconnectTickMs = 0;
+    added->detail.clear();
     added->view->SetScrollbackBudget(
         1000000, static_cast<size_t>(st->scrollbackMb) * 1024 * 1024);
     WriteAuditLog("TERM_CLIENT_CONNECT",
@@ -1463,20 +1491,182 @@ void TerminateActiveSession(ClientState* st) {
     CloseTabById(st, tab->id, true);
 }
 
-void ReconnectActive(ClientState* st) {
-    SessionTab* tab = FindTab(st, st->activeId);
+void UpdateStatus(ClientState* st);
+
+uint64_t ReconnectBackoffMs(int attempts) {
+    uint64_t delay = 1000;
+    for (int i = 0; i < attempts && delay < 30000; ++i) {
+        delay *= 2;
+        if (delay > 30000) delay = 30000;
+    }
+    return delay;
+}
+
+void ScheduleAutoReconnect(SessionTab* tab, const std::wstring& detail, int attempts) {
     if (!tab) return;
-    RemoteSettings settings = tab->settings;
-    std::wstring target = tab->target;
-    std::wstring label = tab->baseLabel;
-    const int jobId = tab->localJobId;
-    CloseTabById(st, tab->id);
+    tab->detail = detail;
+    tab->reconnectInFlight = false;
+    tab->reconnectAttempts = attempts;
+    if (tab->autoReconnect && tab->serverJobId > 0) {
+        tab->state = SessionTab::State::Reconnecting;
+        tab->nextReconnectTickMs = GetTickCount64() + ReconnectBackoffMs(attempts);
+    } else {
+        tab->state = SessionTab::State::Failed;
+        tab->nextReconnectTickMs = 0;
+    }
+}
+
+bool ProbeServerReachable(const std::wstring& host, int port, int timeoutMs) {
+    if (port <= 0) return false;
+    WSADATA wsa{};
+    if (WSAStartup(MAKEWORD(2, 2), &wsa) != 0) return false;
+
+    addrinfo hints{};
+    hints.ai_family = AF_UNSPEC;
+    hints.ai_socktype = SOCK_STREAM;
+    hints.ai_protocol = IPPROTO_TCP;
+
+    addrinfo* result = nullptr;
+    const std::string hostUtf8 = WideToUtf8(host.empty() ? L"127.0.0.1" : host);
+    const std::string portText = std::to_string(port);
+    bool reachable = false;
+    if (getaddrinfo(hostUtf8.c_str(), portText.c_str(), &hints, &result) == 0) {
+        for (addrinfo* ai = result; ai && !reachable; ai = ai->ai_next) {
+            SOCKET s = socket(ai->ai_family, ai->ai_socktype, ai->ai_protocol);
+            if (s == INVALID_SOCKET) continue;
+
+            u_long nonblocking = 1;
+            ioctlsocket(s, FIONBIO, &nonblocking);
+            int rc = connect(s, ai->ai_addr, static_cast<int>(ai->ai_addrlen));
+            if (rc == 0) {
+                reachable = true;
+            } else if (WSAGetLastError() == WSAEWOULDBLOCK) {
+                fd_set writefds;
+                FD_ZERO(&writefds);
+                FD_SET(s, &writefds);
+                timeval tv{};
+                tv.tv_sec = timeoutMs / 1000;
+                tv.tv_usec = (timeoutMs % 1000) * 1000;
+                if (select(0, nullptr, &writefds, nullptr, &tv) > 0) {
+                    int socketError = 0;
+                    int length = sizeof(socketError);
+                    if (getsockopt(s, SOL_SOCKET, SO_ERROR,
+                                   reinterpret_cast<char*>(&socketError), &length) == 0 &&
+                        socketError == 0) {
+                        reachable = true;
+                    }
+                }
+            }
+            closesocket(s);
+        }
+        freeaddrinfo(result);
+    }
+    WSACleanup();
+    return reachable;
+}
+
+void StartAutoReconnectProbe(HWND hwnd, int tabId, std::wstring host, int port) {
+    std::thread([hwnd, tabId, host = std::move(host), port]() {
+        const bool reachable = ProbeServerReachable(host, port, 800);
+        PostMessageW(hwnd, reachable ? WM_CLIENT_AUTO_RECONNECT
+                                     : WM_CLIENT_AUTO_RECONNECT_FAILED,
+                     static_cast<WPARAM>(tabId), 0);
+    }).detach();
+}
+
+// Creates the replacement session first, so a failed attempt leaves the
+// current tab and its error state in place.
+bool TryReconnectTab(ClientState* st, int tabId, bool autoMode) {
+    if (!st) return false;
+    SessionTab* tab = FindTab(st, tabId);
+    if (!tab) return false;
+
+    const int oldIndex = FindTabIndex(st, tabId);
+    const int previousActive = st->activeId;
+    const RemoteSettings settings = tab->settings;
+    const std::wstring target = tab->target;
+    const std::wstring label = tab->baseLabel;
+    const uint32_t serverJobId = tab->serverJobId;
+    int targetJobId = 0;
+    if (target.rfind(L"attach:", 0) == 0) {
+        targetJobId = static_cast<int>(std::wcstol(target.c_str() + 7, nullptr, 10));
+    }
+
+    std::wstring attachTarget;
+    if (serverJobId > 0) {
+        attachTarget = L"attach:" + std::to_wstring(serverJobId);
+    }
 
     std::wstring error;
-    if (AddSession(st, settings, target, label, jobId, error) == 0) {
-        MessageBoxW(st->hwndMain, error.c_str(),
-                    T(L"ターミナル", L"Terminal", L"Terminal"), MB_OK | MB_ICONERROR);
+    int newId = 0;
+    if (!attachTarget.empty()) {
+        newId = AddSession(st, settings, attachTarget, label,
+                           static_cast<int>(serverJobId), error);
     }
+    if (newId == 0 && !autoMode && !target.empty() && target != attachTarget) {
+        error.clear();
+        newId = AddSession(st, settings, target, label, targetJobId, error);
+    }
+
+    if (newId == 0) {
+        if (error.empty()) {
+            error = T(L"再接続に失敗しました。", L"Reconnect failed.", L"Error al reconectar.");
+        }
+        SessionTab* still = FindTab(st, tabId);
+        if (still) {
+            ScheduleAutoReconnect(still, error,
+                                  static_cast<int>(still->reconnectAttempts) + 1);
+            const int index = FindTabIndex(st, tabId);
+            SetTabItemText(st, index);
+            if (st->activeId == tabId) UpdateStatus(st);
+        }
+        if (!autoMode) {
+            MessageBoxW(st->hwndMain, error.c_str(),
+                        T(L"ターミナル", L"Terminal", L"Terminal"), MB_OK | MB_ICONERROR);
+        }
+        return false;
+    }
+
+    CloseTabById(st, tabId);
+
+    const int newIndex = FindTabIndex(st, newId);
+    if (newIndex >= 0 && oldIndex >= 0) {
+        int dest = oldIndex;
+        const int last = static_cast<int>(st->tabs.size()) - 1;
+        if (dest > last) dest = last;
+        if (dest >= 0 && dest != newIndex) {
+            auto moved = std::move(st->tabs[static_cast<size_t>(newIndex)]);
+            st->tabs.erase(st->tabs.begin() + newIndex);
+            if (dest > static_cast<int>(st->tabs.size())) {
+                dest = static_cast<int>(st->tabs.size());
+            }
+            st->tabs.insert(st->tabs.begin() + dest, std::move(moved));
+            RebuildTabControl(st);
+        }
+    }
+    SetActiveTab(st, previousActive == tabId ? newId : previousActive);
+    WriteAuditLog("TERM_CLIENT_RECONNECTED",
+                  autoMode ? "auto" : "manual");
+    return true;
+}
+
+void RunAutoReconnects(ClientState* st) {
+    if (!st) return;
+    const uint64_t now = GetTickCount64();
+    for (auto& tab : st->tabs) {
+        if (!tab || tab->state != SessionTab::State::Reconnecting) continue;
+        if (tab->reconnectInFlight) continue;
+        if (tab->serverJobId == 0) continue;
+        if (now < tab->nextReconnectTickMs) continue;
+        tab->reconnectInFlight = true;
+        StartAutoReconnectProbe(st->hwndMain, tab->id,
+                                tab->settings.host, tab->settings.port);
+    }
+}
+
+void ReconnectActive(ClientState* st) {
+    if (!st) return;
+    TryReconnectTab(st, st->activeId, false);
 }
 
 // Attaches to local ConPTY jobs that have no tab yet. This preserves the old
@@ -1541,9 +1731,16 @@ void UpdateTabTitles(ClientState* st) {
             SetTabItemText(st, static_cast<int>(i));
         }
 
-        if (tab->state == SessionTab::State::Connected && !tab->view->IsStarted()) {
-            tab->state = SessionTab::State::Exited;
-            tab->detail = tab->view->LastError();
+        if (tab->state == SessionTab::State::Connected && !tab->view->IsStarted() &&
+            !st->closing) {
+            const std::wstring lastError = tab->view->LastError();
+            if (lastError.empty()) {
+                tab->state = SessionTab::State::Exited;
+                tab->detail.clear();
+            } else {
+                ScheduleAutoReconnect(tab, lastError, 0);
+                if (st->activeId == tab->id) UpdateStatus(st);
+            }
             SetTabItemText(st, static_cast<int>(i));
         }
     }
@@ -1558,6 +1755,9 @@ void UpdateStatus(ClientState* st) {
     if (tab) {
         left = tab->settings.host + L":" + std::to_wstring(tab->settings.port);
         left += L"  " + tab->target;
+        if (tab->serverJobId > 0) {
+            left += L"  #" + std::to_wstring(tab->serverJobId);
+        }
         switch (tab->state) {
         case SessionTab::State::Connecting:
             right = T(L"接続中...", L"Connecting...", L"Conectando...");
@@ -1568,6 +1768,10 @@ void UpdateStatus(ClientState* st) {
         case SessionTab::State::Exited:
             right = T(L"終了", L"Exited", L"Finalizado");
             if (tab->exitCode != 0) right += L" (" + std::to_wstring(tab->exitCode) + L")";
+            if (!tab->detail.empty()) right += L" - " + tab->detail;
+            break;
+        case SessionTab::State::Reconnecting:
+            right = T(L"再接続中...", L"Reconnecting...", L"Reconectando...");
             if (!tab->detail.empty()) right += L" - " + tab->detail;
             break;
         case SessionTab::State::Failed:
@@ -1702,7 +1906,7 @@ HMENU BuildMenu(ClientState* st) {
     return menu;
 }
 
-void DrawClientTab(DRAWITEMSTRUCT* dis) {
+void DrawClientTab(ClientState* st, DRAWITEMSTRUCT* dis) {
     if (!dis) return;
     wchar_t text[256] = {};
     TCITEMW item = {};
@@ -1710,6 +1914,13 @@ void DrawClientTab(DRAWITEMSTRUCT* dis) {
     item.pszText = text;
     item.cchTextMax = 256;
     TabCtrl_GetItem(dis->hwndItem, dis->itemID, &item);
+
+    SessionTab::State state = SessionTab::State::Failed;
+    bool haveState = false;
+    if (st && dis->itemID < st->tabs.size() && st->tabs[static_cast<size_t>(dis->itemID)]) {
+        state = st->tabs[static_cast<size_t>(dis->itemID)]->state;
+        haveState = true;
+    }
 
     const bool selected = (dis->itemState & ODS_SELECTED) != 0 ||
                           TabCtrl_GetCurSel(dis->hwndItem) == static_cast<int>(dis->itemID);
@@ -1734,12 +1945,33 @@ void DrawClientTab(DRAWITEMSTRUCT* dis) {
         DeleteObject(accentBrush);
     }
 
+    if (haveState) {
+        COLORREF dotColor = RGB(148, 163, 184);
+        switch (state) {
+        case SessionTab::State::Connecting: dotColor = RGB(251, 191, 36); break;
+        case SessionTab::State::Connected:  dotColor = RGB(74, 222, 128); break;
+        case SessionTab::State::Exited:     dotColor = RGB(148, 163, 184); break;
+        case SessionTab::State::Reconnecting: dotColor = RGB(251, 191, 36); break;
+        case SessionTab::State::Failed:     dotColor = RGB(248, 113, 113); break;
+        }
+        const int cx = dis->rcItem.left + 11;
+        const int cy = (dis->rcItem.top + dis->rcItem.bottom) / 2;
+        HBRUSH dotBrush = CreateSolidBrush(dotColor);
+        HGDIOBJ oldDotBrush = SelectObject(dis->hDC, dotBrush);
+        HGDIOBJ oldDotPen = SelectObject(dis->hDC, GetStockObject(NULL_PEN));
+        Ellipse(dis->hDC, cx - 4, cy - 4, cx + 5, cy + 5);
+        SelectObject(dis->hDC, oldDotPen);
+        SelectObject(dis->hDC, oldDotBrush);
+        DeleteObject(dotBrush);
+    }
+
     SetBkMode(dis->hDC, TRANSPARENT);
     SetTextColor(dis->hDC, selected ? g_palette.accent : g_palette.text);
     HGDIOBJ oldFont = SelectObject(dis->hDC,
         g_uiFont ? g_uiFont : GetStockObject(DEFAULT_GUI_FONT));
     RECT rcText = dis->rcItem;
     InflateRect(&rcText, -6, 0);
+    if (haveState) rcText.left += 16;
     DrawTextW(dis->hDC, text, -1, &rcText,
               DT_CENTER | DT_VCENTER | DT_SINGLELINE | DT_END_ELLIPSIS);
     SelectObject(dis->hDC, oldFont);
@@ -1780,6 +2012,65 @@ void DrawClientStatus(ClientState* st, DRAWITEMSTRUCT* dis) {
     DrawTextW(dis->hDC, st->statusLeft.c_str(), -1, &rcAll,
               DT_LEFT | DT_VCENTER | DT_SINGLELINE | DT_END_ELLIPSIS);
     SelectObject(dis->hDC, oldFont);
+}
+
+std::wstring TabStateTooltip(const SessionTab& tab) {
+    switch (tab.state) {
+    case SessionTab::State::Connecting:
+        return T(L"接続中", L"Connecting", L"Conectando");
+    case SessionTab::State::Connected:
+        return T(L"接続済み", L"Connected", L"Conectado");
+    case SessionTab::State::Exited: {
+        std::wstring text = T(L"終了", L"Exited", L"Finalizado");
+        if (tab.exitCode != 0) text += L" (" + std::to_wstring(tab.exitCode) + L")";
+        return text;
+    }
+    case SessionTab::State::Reconnecting:
+        return T(L"再接続中", L"Reconnecting", L"Reconectando");
+    case SessionTab::State::Failed:
+        return T(L"切断 / エラー", L"Disconnected / error", L"Desconectado / error");
+    }
+    return L"-";
+}
+
+std::wstring BuildTabTooltip(ClientState* st, int index) {
+    if (!st || index < 0 || index >= static_cast<int>(st->tabs.size())) return {};
+    const SessionTab* tab = st->tabs[static_cast<size_t>(index)].get();
+    if (!tab) return {};
+
+    std::wstring text = tab->osTitle.empty() ? tab->baseLabel : tab->osTitle;
+    if (text.empty()) text = T(L"ターミナル", L"Terminal", L"Terminal");
+    text += L"\n";
+    text += T(L"状態: ", L"State: ", L"Estado: ");
+    text += TabStateTooltip(*tab);
+    text += L"\n";
+    text += T(L"ホスト: ", L"Host: ", L"Host: ");
+    text += tab->settings.host + L":" + std::to_wstring(tab->settings.port);
+    if (!tab->target.empty()) {
+        text += L"\n";
+        text += T(L"ターゲット: ", L"Target: ", L"Destino: ");
+        text += tab->target;
+    }
+    if (tab->serverJobId > 0) {
+        text += L"\n";
+        text += T(L"サーバージョブ: #", L"Server job: #", L"Trabajo del servidor: #");
+        text += std::to_wstring(tab->serverJobId);
+    }
+    text += L"\n";
+    text += T(L"タブID: ", L"Tab ID: ", L"ID de pestaña: ");
+    text += std::to_wstring(tab->id);
+    if (!tab->detail.empty()) {
+        text += L"\n";
+        text += T(L"詳細: ", L"Detail: ", L"Detalle: ");
+        text += tab->detail;
+    }
+    if (tab->state == SessionTab::State::Reconnecting) {
+        text += L"\n";
+        text += T(L"同じセッションへ自動的に再接続します。",
+                  L"Reconnecting to the same session automatically.",
+                  L"Reconectando automáticamente a la misma sesión.");
+    }
+    return text;
 }
 
 LRESULT CALLBACK ClientTabSubclassProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam,
@@ -1858,6 +2149,7 @@ LRESULT CALLBACK ClientWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam
             reinterpret_cast<HMENU>(static_cast<INT_PTR>(IDC_CLIENT_TAB)),
             GetModuleHandleW(nullptr), nullptr);
         if (st->hwndTab) {
+            SendMessageW(st->hwndTab, TCM_SETPADDING, 0, MAKELPARAM(16, 5));
             SetWindowSubclass(st->hwndTab, ClientTabSubclassProc, 1, 0);
             if (g_uiFont) {
                 SendMessageW(st->hwndTab, WM_SETFONT, reinterpret_cast<WPARAM>(g_uiFont), TRUE);
@@ -1871,6 +2163,19 @@ LRESULT CALLBACK ClientWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam
             GetModuleHandleW(nullptr), nullptr);
         if (st->hwndStatus && g_uiFont) {
             SendMessageW(st->hwndStatus, WM_SETFONT, reinterpret_cast<WPARAM>(g_uiFont), TRUE);
+        }
+
+        if (st->hwndTab) {
+            st->hwndTabTip = CreateWindowExW(
+                WS_EX_TOPMOST, TOOLTIPS_CLASSW, nullptr,
+                WS_POPUP | TTS_ALWAYSTIP | TTS_NOPREFIX,
+                CW_USEDEFAULT, CW_USEDEFAULT, CW_USEDEFAULT, CW_USEDEFAULT,
+                hwnd, nullptr, GetModuleHandleW(nullptr), nullptr);
+            if (st->hwndTabTip) {
+                SendMessageW(st->hwndTabTip, TTM_SETMAXTIPWIDTH, 0, 900);
+                SendMessageW(st->hwndTab, TCM_SETTOOLTIPS,
+                             reinterpret_cast<WPARAM>(st->hwndTabTip), 0);
+            }
         }
 
         ApplyClientTheme(st, true);
@@ -1926,7 +2231,7 @@ LRESULT CALLBACK ClientWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam
         auto* dis = reinterpret_cast<DRAWITEMSTRUCT*>(lParam);
         if (!dis) break;
         if (dis->CtlType == ODT_TAB) {
-            DrawClientTab(dis);
+            DrawClientTab(st, dis);
             return TRUE;
         }
         if (dis->CtlType == ODT_STATIC && st && dis->hwndItem == st->hwndStatus) {
@@ -2088,6 +2393,23 @@ LRESULT CALLBACK ClientWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam
     case WM_NOTIFY: {
         if (!st) break;
         auto* hdr = reinterpret_cast<NMHDR*>(lParam);
+        if (hdr && st->hwndTabTip && hdr->hwndFrom == st->hwndTabTip &&
+            hdr->code == TTN_GETDISPINFOW) {
+            auto* tip = reinterpret_cast<NMTTDISPINFOW*>(lParam);
+            int index = -1;
+            if (st->hwndTab) {
+                POINT pt = {};
+                GetCursorPos(&pt);
+                ScreenToClient(st->hwndTab, &pt);
+                TCHITTESTINFO hit = {};
+                hit.pt = pt;
+                index = TabCtrl_HitTest(st->hwndTab, &hit);
+                if (index < 0) index = TabCtrl_GetCurSel(st->hwndTab);
+            }
+            st->tabTipText = BuildTabTooltip(st, index);
+            tip->lpszText = const_cast<wchar_t*>(st->tabTipText.c_str());
+            return 0;
+        }
         if (hdr && hdr->idFrom == IDC_CLIENT_TAB && hdr->hwndFrom == st->hwndTab) {
             if (hdr->code == TCN_SELCHANGE) {
                 int index = TabCtrl_GetCurSel(st->hwndTab);
@@ -2123,6 +2445,8 @@ LRESULT CALLBACK ClientWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam
                 tab->state = SessionTab::State::Exited;
                 tab->exitCode = static_cast<int>(lParam);
                 tab->detail = tab->view ? tab->view->LastError() : std::wstring();
+                tab->reconnectInFlight = false;
+                tab->nextReconnectTickMs = 0;
                 const int index = FindTabIndex(st, tab->id);
                 SetTabItemText(st, index);
                 if (st->activeId == tab->id) UpdateStatus(st);
@@ -2135,8 +2459,37 @@ LRESULT CALLBACK ClientWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam
         if (st) {
             SessionTab* tab = FindTab(st, static_cast<int>(wParam));
             if (tab) {
-                tab->state = SessionTab::State::Failed;
-                tab->detail = tab->view ? tab->view->LastError() : std::wstring();
+                const std::wstring detail =
+                    tab->view ? tab->view->LastError()
+                              : T(L"接続が切れました。", L"Connection lost.", L"Conexión perdida.");
+                ScheduleAutoReconnect(tab, detail, 0);
+                const int index = FindTabIndex(st, tab->id);
+                SetTabItemText(st, index);
+                if (st->activeId == tab->id) UpdateStatus(st);
+            }
+        }
+        return 0;
+    }
+
+    case WM_CLIENT_AUTO_RECONNECT: {
+        if (st) {
+            SessionTab* tab = FindTab(st, static_cast<int>(wParam));
+            if (tab && tab->state == SessionTab::State::Reconnecting) {
+                tab->reconnectInFlight = false;
+                TryReconnectTab(st, tab->id, true);
+            }
+        }
+        return 0;
+    }
+
+    case WM_CLIENT_AUTO_RECONNECT_FAILED: {
+        if (st) {
+            SessionTab* tab = FindTab(st, static_cast<int>(wParam));
+            if (tab && tab->state == SessionTab::State::Reconnecting) {
+                tab->reconnectInFlight = false;
+                ++tab->reconnectAttempts;
+                tab->nextReconnectTickMs =
+                    GetTickCount64() + ReconnectBackoffMs(tab->reconnectAttempts);
                 const int index = FindTabIndex(st, tab->id);
                 SetTabItemText(st, index);
                 if (st->activeId == tab->id) UpdateStatus(st);
@@ -2148,6 +2501,7 @@ LRESULT CALLBACK ClientWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam
     case WM_TIMER:
         if (st) {
             UpdateTabTitles(st);
+            RunAutoReconnects(st);
             if (++st->autoAttachTicks >= 2) {
                 st->autoAttachTicks = 0;
                 AutoAttachLocalJobs(st);
@@ -2180,6 +2534,10 @@ LRESULT CALLBACK ClientWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam
     case WM_DESTROY:
         if (st) {
             KillTimer(hwnd, 1);
+            if (st->hwndTabTip && IsWindow(st->hwndTabTip)) {
+                DestroyWindow(st->hwndTabTip);
+            }
+            st->hwndTabTip = nullptr;
             CloseAllTabs(st);
         }
         if (g_uiFont) {

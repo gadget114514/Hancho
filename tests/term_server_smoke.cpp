@@ -146,6 +146,8 @@ int main(int argc, char** argv) {
     std::wstring error;
     Check(session.Start(opt, &error), "RemoteSession attaches to attach:" +
                                           std::to_string(jobId));
+    Check(session.JobId() == static_cast<uint32_t>(jobId),
+          "HELLO_ACK reports the attached job id");
 
     auto waitFor = [&](const std::string& needle, int timeoutMs) {
         const DWORD deadline = GetTickCount() + static_cast<DWORD>(timeoutMs);
@@ -276,6 +278,8 @@ int main(int argc, char** argv) {
         }
     }
     Check(spawnedId > 0, "spawned session is listed by IPC");
+    Check(spawned.JobId() == static_cast<uint32_t>(spawnedId),
+          "HELLO_ACK reports the spawned job id");
     spawned.Close();
     Sleep(700);
     json spawnedProcess;
@@ -289,6 +293,8 @@ int main(int argc, char** argv) {
     reattachOpt.cols = 80;
     reattachOpt.rows = 25;
     Check(reattached.Start(reattachOpt, &error), "retained spawned session can be reattached");
+    Check(reattached.JobId() == static_cast<uint32_t>(spawnedId),
+          "HELLO_ACK reports the reattached job id");
     reattached.TerminateSession();
     Sleep(700);
     bool gone = !FindProcess(spawnedId, spawnedProcess) ||

@@ -71,6 +71,9 @@ public:
     // L"attach:42" or L"powershell".
     bool StartRemote(const std::wstring& target, std::wstring* error = nullptr);
 
+    // Server-side job id of the remote session (0 when unknown).
+    uint32_t RemoteJobId() const { return remoteIo_ ? remoteIo_->JobId() : 0; }
+
     // Sends a WCSP CLOSE frame so the server ends a spawned session. A plain
     // close only detaches and keeps the session for reconnect.
     void TerminateRemoteSession();

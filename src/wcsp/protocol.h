@@ -107,6 +107,7 @@ enum TlvType : uint16_t {
     TlvClientId   = 0x0008,
     TlvSessionId  = 0x0009,
     TlvEncoding   = 0x000A,
+    TlvJobId      = 0x000B,
 };
 
 struct Frame {
@@ -136,6 +137,7 @@ struct HelloAck {
     uint16_t cols = 80;
     uint16_t rows = 24;
     uint32_t session_id = 0;
+    uint32_t job_id = 0;
     std::string name = "WinConsoleServer";
     std::string shell;
 };
