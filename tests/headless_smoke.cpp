@@ -136,6 +136,19 @@ int main() {
     }
     Check(connected, "headless core answers IPC ping");
     Check(ping.value("headless", false), "headless core reports headless=true");
+
+    // 1b. A request with a bounded wait (the dashboard never waits forever)
+    //     still gets its answer.
+    {
+        std::string resp;
+        std::string err;
+        bool timedOut = false;
+        const bool ok = SendIpcRequest("{\"action\":\"ping\"}", resp, err, false, 10000, &timedOut);
+        json pingBounded = json::parse(resp, nullptr, false);
+        Check(ok && pingBounded.value("ok", false),
+              "IPC request with a bounded wait returns the answer");
+        Check(!timedOut, "IPC request with a bounded wait did not time out");
+    }
     bool childOwnsDashboard = false;
     for (HWND w = FindWindowW(L"HanchoDashboardWnd", nullptr); w;
          w = FindWindowExW(nullptr, w, L"HanchoDashboardWnd", nullptr)) {

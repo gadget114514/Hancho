@@ -1031,6 +1031,88 @@ target_link_libraries(webui_smoke PRIVATE
     user32
 )
 
+# Headless regression test for the dashboard freeze when the WebUI is switched
+# off: config_set must answer while a WebSocket request is still running.
+add_executable(webui_config_smoke
+    tests/webui_config_smoke.cpp
+    src/ipc_server.cpp
+    src/ipc_server_remote.cpp
+    src/webui_server.cpp
+    src/ipmsg.cpp
+    src/ipmsg_handler.cpp
+    src/webui_assets.cpp
+    src/remote_client.cpp
+    src/remote_hosts.cpp
+    src/bt_manager.cpp
+    src/bt_manager_api.cpp
+    src/behavior_tree.cpp
+    src/behavior_tree_parse.cpp
+    src/behavior_tree_vars.cpp
+    src/behavior_tree_cond.cpp
+    src/behavior_tree_exec.cpp
+    src/behavior_tree_escalate.cpp
+    src/behavior_tree_state.cpp
+    src/behavior_tree_runtime.cpp
+    src/worker_engines.cpp
+    src/platform/platform_windows.cpp
+    src/taskqueue.cpp
+    src/triage.cpp
+    src/triage_manager.cpp
+    src/triage_text.cpp
+    src/memory_record.cpp
+    src/memory_search.cpp
+    src/chain_guard.cpp
+    src/process_manager.cpp
+    src/llm_stream.cpp
+    src/llm_stream_claude.cpp
+    src/llm_stream_opencode.cpp
+    src/llm_stream_agy.cpp
+    src/llm_stream_codex.cpp
+    src/event_schema.cpp
+    src/event_adapter.cpp
+    src/common.cpp
+    src/Terminal/src/ConPtySession.cpp
+    src/Terminal/src/ImageManager.cpp
+    src/Terminal/src/TerminalBuffer.cpp
+    src/Terminal/src/TerminalEmulator.cpp
+    src/Terminal/src/TerminalView.cpp
+    src/term_server.cpp
+    ${WCSP_SOURCES}
+)
+
+target_include_directories(webui_config_smoke PRIVATE
+    src
+    include
+    tests
+    src/Terminal/include
+    src/Terminal/src
+    src/wcsp
+)
+
+if(MSVC)
+    target_compile_options(webui_config_smoke PRIVATE /W4 /utf-8 /EHsc)
+endif()
+
+target_link_libraries(webui_config_smoke PRIVATE
+    user32
+    gdi32
+    comctl32
+    shell32
+    advapi32
+    psapi
+    ole32
+    shlwapi
+    imm32
+    winmm
+    d2d1
+    dwrite
+    dwmapi
+    windowscodecs
+    crypt32
+    ws2_32
+    "${CMAKE_CURRENT_SOURCE_DIR}/lib/libsixel.lib"
+)
+
 # Functional test for the WCSP terminal server: attaches to a running ConPTY job
 # through the core's IPC endpoint and verifies replay, input and detach.
 add_executable(term_server_smoke

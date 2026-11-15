@@ -23,7 +23,13 @@ public:
     // If token is empty, generates random token or uses HANCHO_TOKEN.
     bool Start(uint16_t port = 0, const std::string& token = "",
                const std::string& webuiDir = "", std::string* outError = nullptr);
-    void Stop();
+    // Stops the server. With waitForHandlers=false the listening socket is closed
+    // right away and in-flight WebSocket handlers are detached instead of waited
+    // for, so the caller is never blocked by a handler that takes long. The
+    // detached handlers keep the shared runtime state alive; the owner has to
+    // keep this object alive until they are done (see IpcServer, which parks
+    // retired servers and waits for them when the core shuts down).
+    void Stop(bool waitForHandlers = true);
 
     bool IsRunning() const;
     uint16_t GetPort() const { return port_; }
@@ -31,18 +37,22 @@ public:
     std::string GetUrl() const;
 
 private:
-    bool HandleHttpRequest(const std::string& method,
-                           const std::string& uri,
-                           const std::string& headers,
-                           const std::string& body,
-                           const std::string& peerAddress,
-                           std::string& outResponse);
+    // Runtime data handed to the HTTP and WebSocket handlers. A handler may
+    // still be running after Stop() returned, so the handlers must not depend
+    // on the lifetime of this object.
+    struct Runtime;
 
-    bool IsAllowedHostHeader(const std::string& hostVal) const;
-    bool IsAllowedOriginHeader(const std::string& originVal) const;
+    static bool HandleHttpRequest(const Runtime& runtime, const std::string& method,
+                                  const std::string& uri, const std::string& headers,
+                                  const std::string& body, const std::string& peerAddress,
+                                  std::string& outResponse);
+
+    static bool IsAllowedHostHeader(const Runtime& runtime, const std::string& hostVal);
+    static bool IsAllowedOriginHeader(const Runtime& runtime, const std::string& originVal);
 
     IpcHandler ipcHandler_;
     std::unique_ptr<remote::RemoteListener> listener_;
+    std::shared_ptr<Runtime> runtime_;
     uint16_t port_ = 0;
     std::string token_;
     std::string webuiDir_;

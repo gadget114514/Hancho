@@ -376,6 +376,13 @@ Automated tests verify HTTP asset serving, MIME types, token authorization, Host
 build\Release\webui_smoke.exe
 ```
 
+Switching the WebUI off from the dashboard settings (`config_set` with `webui.enabled=false`) must not block the caller: the listener is closed and the `.webui_port` / `.webui_token` files are cleaned up while the request is still running. `webui_config_smoke` keeps a WebSocket connection open, runs a request that blocks inside the core and checks that the `config_set` answer arrives within 2 seconds:
+
+```bash
+# Windows
+build\Release\webui_config_smoke.exe
+```
+
 ---
 
 ### 6.2 Packaging and Distribution Formats

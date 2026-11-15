@@ -25,14 +25,22 @@ bool IpcServer::Start() {
 
 void IpcServer::Stop() {
     if (stop_.exchange(true)) return;
-    if (webuiRestartThread_.joinable()) webuiRestartThread_.join();
-    {
-        std::lock_guard<std::mutex> lk(ipmsgRestartMutex_);
-        if (ipmsgRestartThread_.joinable()) ipmsgRestartThread_.join();
-    }
-    StopWebUiServer();
+    // Stop the restart workers first: they must not touch the servers while
+    // they are being closed.
+    webuiRestart_.Stop();
+    termRestart_.Stop();
+    ipmsgRestart_.Stop();
+    StopWebUiServer(true);
     StopIpmsg();
     if (ipmsgHandler_) ipmsgHandler_->Stop();
+    // Wait for the handlers that were detached by a config change.
+    {
+        std::lock_guard<std::mutex> lock(webuiMutex_);
+        for (auto& retired : retiredWebUiServers_) {
+            if (retired) retired->Stop(true);
+        }
+        retiredWebUiServers_.clear();
+    }
     StopRemoteListener();
     if (transport_) transport_->Stop();
     if (acceptThread_.joinable()) acceptThread_.join();

@@ -1148,6 +1148,25 @@ struct RemoteListener::State {
     mutable std::mutex clientSocketsMutex;
     std::vector<socket_t> clientSockets;
     std::atomic<uint64_t> nextSubId{1};
+
+    // Handshake between a starting handler and a stopping listener: once the
+    // listener stopped, no new handler may start, otherwise it could outlive
+    // the owner of the listener.
+    mutable std::mutex handlerStartMutex;
+    bool acceptingHandlers = false;
+
+    // Returns false when the listener is stopping and the handler must not run.
+    bool BeginHandler() {
+        std::lock_guard<std::mutex> lock(handlerStartMutex);
+        if (!acceptingHandlers) return false;
+        activeHandlers.fetch_add(1);
+        return true;
+    }
+    void EndHandler() { activeHandlers.fetch_sub(1); }
+    void StopAcceptingHandlers() {
+        std::lock_guard<std::mutex> lock(handlerStartMutex);
+        acceptingHandlers = false;
+    }
 };
 
 namespace {
@@ -1219,7 +1238,20 @@ void HandleRemoteClient(std::shared_ptr<RemoteListener::State> state, socket_t c
                 } catch (...) {}
             }
 
+            // The listener was stopped while the request was read: do not call
+            // into the core any more.
+            if (!state->running.load()) {
+                return;
+            }
+
             std::string httpResponse;
+            // Count the handler like the other request paths so that a stop
+            // waits for an HTTP request that is still running.
+            if (!state->BeginHandler()) return;
+            struct HandlerGuard {
+                std::shared_ptr<RemoteListener::State> state;
+                ~HandlerGuard() { state->EndHandler(); }
+            } guard{state};
             if (httpHandlerCopy(method, uri, headers, body, peerText, httpResponse)) {
                 SendAll(client, httpResponse.data(), httpResponse.size(), error);
                 return;
@@ -1251,7 +1283,7 @@ void HandleRemoteClient(std::shared_ptr<RemoteListener::State> state, socket_t c
         }
 
         std::string response;
-        state->activeHandlers.fetch_add(1);
+        if (!state->BeginHandler()) return;
         try {
             RemoteListener::Handler handlerCopy;
             {
@@ -1262,7 +1294,7 @@ void HandleRemoteClient(std::shared_ptr<RemoteListener::State> state, socket_t c
         } catch (...) {
             response = JsonError("internal error while handling the request");
         }
-        state->activeHandlers.fetch_sub(1);
+        state->EndHandler();
         if (response.empty()) response = JsonError("no IPC handler is installed");
         SendAll(client, response.data(), response.size(), error);
         return;
@@ -1425,8 +1457,8 @@ void HandleRemoteClient(std::shared_ptr<RemoteListener::State> state, socket_t c
         }
         if (request.empty()) continue;
 
+        if (!state->BeginHandler()) break;
         activeInFlight->fetch_add(1);
-        state->activeHandlers.fetch_add(1);
 
         std::thread([state, client, sendMutex, activeInFlight, request, peerText, loopback, authShared, subsMutex, activeSubs]() mutable {
             nlohmann::json reqDoc = nlohmann::json::parse(request, nullptr, false);
@@ -1672,7 +1704,7 @@ void HandleRemoteClient(std::shared_ptr<RemoteListener::State> state, socket_t c
             }
 
             activeInFlight->fetch_sub(1);
-            state->activeHandlers.fetch_sub(1);
+            state->EndHandler();
         }).detach();
     }
 
@@ -1799,44 +1831,58 @@ bool RemoteListener::Start(const std::string& bindHost, uint16_t port, const std
     state_->port = boundPort;
     state_->listenSocket = listener;
     state_->endpoint = "ws://" + state_->bindHost + ":" + std::to_string(boundPort);
+    {
+        std::lock_guard<std::mutex> lock(state_->handlerStartMutex);
+        state_->acceptingHandlers = true;
+    }
     state_->running.store(true);
     acceptThread_ = std::thread(RunRemoteAccept, state_);
     return true;
 }
 
-void RemoteListener::Stop() {
+void RemoteListener::Stop(bool waitForHandlers) {
     if (!state_) return;
-    if (!state_->running.exchange(false)) {
+    // No new handler may start from now on.
+    state_->StopAcceptingHandlers();
+    if (state_->running.exchange(false)) {
+        socket_t s = state_->listenSocket;
+        state_->listenSocket = kInvalidSocket;
+        if (s != kInvalidSocket) {
+            // Shutting down the listening socket wakes accept() on both platforms.
+#ifdef _WIN32
+            shutdown(s, SD_BOTH);
+            closesocket(s);
+#else
+            ::shutdown(s, SHUT_RDWR);
+            ::close(s);
+#endif
+        }
+
+        {
+            std::lock_guard<std::mutex> lock(state_->clientSocketsMutex);
+            for (socket_t cs : state_->clientSockets) {
+                if (cs != kInvalidSocket) {
+#ifdef _WIN32
+                    // shutdown() also wakes up a thread that is blocked in recv().
+                    shutdown(cs, SD_BOTH);
+                    closesocket(cs);
+#else
+                    ::shutdown(cs, SHUT_RDWR);
+                    ::close(cs);
+#endif
+                }
+            }
+            state_->clientSockets.clear();
+        }
+
+        if (acceptThread_.joinable()) acceptThread_.join();
+    }
+    if (!waitForHandlers) {
+        // The caller only wants the socket closed. Handlers that are still
+        // running keep the shared state alive and are detached instead of
+        // blocking the caller.
         return;
     }
-    socket_t s = state_->listenSocket;
-    state_->listenSocket = kInvalidSocket;
-    if (s != kInvalidSocket) {
-        // Shutting down the listening socket wakes accept() on both platforms.
-#ifdef _WIN32
-        closesocket(s);
-#else
-        ::shutdown(s, SHUT_RDWR);
-        ::close(s);
-#endif
-    }
-
-    {
-        std::lock_guard<std::mutex> lock(state_->clientSocketsMutex);
-        for (socket_t cs : state_->clientSockets) {
-            if (cs != kInvalidSocket) {
-#ifdef _WIN32
-                closesocket(cs);
-#else
-                ::shutdown(cs, SHUT_RDWR);
-                ::close(cs);
-#endif
-            }
-        }
-        state_->clientSockets.clear();
-    }
-
-    if (acceptThread_.joinable()) acceptThread_.join();
     // Give an in-flight IPC handler time to return before the owner is destroyed.
     // The cap keeps a stuck handler from blocking shutdown forever.
     for (int i = 0; i < 3000 && state_->activeHandlers.load() > 0; ++i) {

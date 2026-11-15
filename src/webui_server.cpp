@@ -247,6 +247,20 @@ void RestrictFilePermissions(const std::string& path) {
 
 } // namespace
 
+// Everything the HTTP and WebSocket handlers need. The handlers hold a shared
+// pointer to it, so a request that is still running stays valid even after the
+// WebUiServer object itself has been stopped and destroyed.
+struct WebUiServer::Runtime {
+    IpcHandler ipcHandler;
+    std::string token;
+    uint16_t port = 0;
+    std::string webuiDir;
+    std::string bindHost = "127.0.0.1";
+    bool allowRemote = false;
+    std::set<std::string> allowedHosts;
+    std::set<std::string> allowedOrigins;
+};
+
 WebUiServer::WebUiServer(IpcHandler ipcHandler)
     : ipcHandler_(std::move(ipcHandler)) {}
 
@@ -356,21 +370,34 @@ bool WebUiServer::Start(uint16_t port, const std::string& token,
 
     auto listener = std::make_unique<remote::RemoteListener>();
 
+    // Hand the handlers a shared snapshot instead of "this": a request that is
+    // still in flight must not touch a destroyed server.
+    auto runtime = std::make_shared<Runtime>();
+    runtime->ipcHandler = ipcHandler_;
+    runtime->token = token_;
+    runtime->port = port_;
+    runtime->webuiDir = webuiDir_;
+    runtime->bindHost = bindHost_;
+    runtime->allowRemote = allowRemote_;
+    runtime->allowedHosts = allowedHosts_;
+    runtime->allowedOrigins = allowedOrigins_;
+    runtime_ = runtime;
+
     // Configure HTTP request handler
-    listener->SetHttpHandler([this](const std::string& method,
-                                    const std::string& uri,
-                                    const std::string& headers,
-                                    const std::string& body,
-                                    const std::string& peerAddress,
-                                    std::string& outResponse) {
-        return HandleHttpRequest(method, uri, headers, body, peerAddress, outResponse);
+    listener->SetHttpHandler([runtime](const std::string& method,
+                                       const std::string& uri,
+                                       const std::string& headers,
+                                       const std::string& body,
+                                       const std::string& peerAddress,
+                                       std::string& outResponse) {
+        return HandleHttpRequest(*runtime, method, uri, headers, body, peerAddress, outResponse);
     });
 
     // Configure WebSocket / IPC handler
-    listener->SetHandler([this](const std::string& requestJson, const std::string& peer) {
+    listener->SetHandler([runtime](const std::string& requestJson, const std::string& peer) {
         (void)peer;
-        if (ipcHandler_) {
-            return ipcHandler_(requestJson);
+        if (runtime->ipcHandler) {
+            return runtime->ipcHandler(requestJson);
         }
         return std::string("{\"ok\":false,\"error\":\"no IPC handler\"}");
     });
@@ -387,10 +414,14 @@ bool WebUiServer::Start(uint16_t port, const std::string& token,
     return true;
 }
 
-void WebUiServer::Stop() {
+void WebUiServer::Stop(bool waitForHandlers) {
     if (listener_) {
-        listener_->Stop();
-        listener_.reset();
+        listener_->Stop(waitForHandlers);
+        if (waitForHandlers) {
+            listener_.reset();
+        }
+        // With detached handlers the listener is kept so that a later Stop()
+        // (the destructor) can still wait for them.
     }
     if (!tokenFilePath_.empty()) {
         std::remove(tokenFilePath_.c_str());
@@ -419,39 +450,37 @@ std::string WebUiServer::GetUrl() const {
     return url;
 }
 
-bool WebUiServer::IsAllowedHostHeader(const std::string& hostVal) const {
+bool WebUiServer::IsAllowedHostHeader(const Runtime& runtime, const std::string& hostVal) {
     if (hostVal.empty()) return true; // some simple clients omit Host
     std::string host = NormalizeHostToken(hostVal);
     if (host.empty()) return false;
     if (IsLoopbackHostName(host)) return true;
-    if (!allowRemote_) return false;
+    if (!runtime.allowRemote) return false;
     if (IsIpLiteral(host)) return true;
-    return allowedHosts_.count(host) > 0;
+    return runtime.allowedHosts.count(host) > 0;
 }
 
-bool WebUiServer::IsAllowedOriginHeader(const std::string& originVal) const {
+bool WebUiServer::IsAllowedOriginHeader(const Runtime& runtime, const std::string& originVal) {
     if (originVal.empty() || LowerCopy(TrimCopy(originVal)) == "null") return true;
     std::string host;
     if (!ParseOriginHost(originVal, host)) return false;
     if (IsLoopbackHostName(host)) return true;
-    if (!allowRemote_) return false;
-    if (allowedOrigins_.count(NormalizeOrigin(originVal)) > 0) return true;
+    if (!runtime.allowRemote) return false;
+    if (runtime.allowedOrigins.count(NormalizeOrigin(originVal)) > 0) return true;
     if (IsIpLiteral(host)) return true;
-    return allowedHosts_.count(host) > 0;
+    return runtime.allowedHosts.count(host) > 0;
 }
 
-bool WebUiServer::HandleHttpRequest(const std::string& method,
-                                    const std::string& uri,
-                                    const std::string& headers,
-                                    const std::string& body,
-                                    const std::string& peerAddress,
+bool WebUiServer::HandleHttpRequest(const Runtime& runtime, const std::string& method,
+                                    const std::string& uri, const std::string& headers,
+                                    const std::string& body, const std::string& peerAddress,
                                     std::string& outResponse) {
     (void)body;
     (void)peerAddress;
 
     // 1. Host header verification (DNS Rebinding prevention)
     std::string hostVal = GetHeaderValue(headers, "Host");
-    if (!IsAllowedHostHeader(hostVal)) {
+    if (!IsAllowedHostHeader(runtime, hostVal)) {
         outResponse = "HTTP/1.1 403 Forbidden\r\n"
                       "Content-Type: text/plain; charset=utf-8\r\n"
                       "Connection: close\r\n"
@@ -462,7 +491,7 @@ bool WebUiServer::HandleHttpRequest(const std::string& method,
 
     // 2. Origin header verification (CSRF prevention)
     std::string originVal = GetHeaderValue(headers, "Origin");
-    if (!IsAllowedOriginHeader(originVal)) {
+    if (!IsAllowedOriginHeader(runtime, originVal)) {
         outResponse = "HTTP/1.1 403 Forbidden\r\n"
                       "Content-Type: text/plain; charset=utf-8\r\n"
                       "Connection: close\r\n"
@@ -490,12 +519,12 @@ bool WebUiServer::HandleHttpRequest(const std::string& method,
     std::string cookieToken = ExtractCookieParam(cookieHeader, "hancho_token");
 
     bool authenticated = false;
-    if (token_.empty()) {
+    if (runtime.token.empty()) {
         authenticated = true;
     } else {
-        if (!tokenParam.empty() && tokenParam == token_) authenticated = true;
-        else if (!bearerToken.empty() && bearerToken == token_) authenticated = true;
-        else if (!cookieToken.empty() && cookieToken == token_) authenticated = true;
+        if (!tokenParam.empty() && tokenParam == runtime.token) authenticated = true;
+        else if (!bearerToken.empty() && bearerToken == runtime.token) authenticated = true;
+        else if (!cookieToken.empty() && cookieToken == runtime.token) authenticated = true;
     }
 
     // Handle /api/ endpoints
@@ -511,8 +540,8 @@ bool WebUiServer::HandleHttpRequest(const std::string& method,
 
         std::string jsonResp;
         if (path == "/api/jobs" || path == "/api/taskqueue") {
-            if (ipcHandler_) {
-                jsonResp = ipcHandler_("{\"action\":\"taskqueue_list\"}");
+            if (runtime.ipcHandler) {
+                jsonResp = runtime.ipcHandler("{\"action\":\"taskqueue_list\"}");
             } else {
                 jsonResp = "{\"ok\":false,\"error\":\"no IPC handler\"}";
             }
@@ -520,7 +549,7 @@ bool WebUiServer::HandleHttpRequest(const std::string& method,
             nlohmann::json info;
             info["ok"] = true;
             info["version"] = PC_VERSION;
-            info["port"] = port_;
+            info["port"] = runtime.port;
             info["headless"] = true;
             jsonResp = info.dump();
         } else {
@@ -552,7 +581,7 @@ bool WebUiServer::HandleHttpRequest(const std::string& method,
 
     // 4. Serve static assets
     std::string content, mimeType;
-    if (!GetWebUiAsset(path, webuiDir_, content, mimeType)) {
+    if (!GetWebUiAsset(path, runtime.webuiDir, content, mimeType)) {
         outResponse = "HTTP/1.1 404 Not Found\r\n"
                       "Content-Type: text/plain; charset=utf-8\r\n"
                       "Connection: close\r\n"
@@ -569,8 +598,8 @@ bool WebUiServer::HandleHttpRequest(const std::string& method,
        << "X-Content-Type-Options: nosniff\r\n";
 
     // Set cookie if authenticated via query param on index page
-    if (path == "/index.html" && !token_.empty() && tokenParam == token_) {
-        ss << "Set-Cookie: hancho_token=" << token_ << "; Path=/; SameSite=Strict; HttpOnly\r\n";
+    if (path == "/index.html" && !runtime.token.empty() && tokenParam == runtime.token) {
+        ss << "Set-Cookie: hancho_token=" << runtime.token << "; Path=/; SameSite=Strict; HttpOnly\r\n";
     }
 
     ss << "Connection: close\r\n\r\n"

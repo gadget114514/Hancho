@@ -249,7 +249,33 @@ static bool ConnectOrAutoStart(HANDLE& hPipe, std::string& outError) {
     return connected;
 }
 
-bool SendIpcRequest(const std::string& reqJson, std::string& outRespJson, std::string& outError, bool autoStartGui) {
+// Waits until the pipe has an answer to read. Returns false when the wait
+// timed out. The pipe is a message-mode pipe: PeekNamedPipe reports the size
+// of the next message without consuming it.
+static bool WaitForPipeData(HANDLE hPipe, int timeoutMs) {
+    const ULONGLONG deadline = GetTickCount64() + static_cast<ULONGLONG>(timeoutMs);
+    char peekBuf[4096];
+    while (true) {
+        DWORD bytesAvail = 0;
+        SetLastError(ERROR_SUCCESS);
+        const BOOL ok = PeekNamedPipe(hPipe, peekBuf, sizeof(peekBuf), nullptr, &bytesAvail, nullptr);
+        if (ok) {
+            if (bytesAvail > 0) return true;
+            // A pending message that is larger than the peek buffer still means
+            // that there is something to read.
+            if (GetLastError() == ERROR_MORE_DATA) return true;
+        } else if (GetLastError() == ERROR_BROKEN_PIPE) {
+            // The core closed the pipe: let the read below report the error.
+            return true;
+        }
+        if (GetTickCount64() >= deadline) return false;
+        Sleep(10);
+    }
+}
+
+bool SendIpcRequest(const std::string& reqJson, std::string& outRespJson, std::string& outError,
+                     bool autoStartGui, int timeoutMs, bool* outTimedOut) {
+    if (outTimedOut) *outTimedOut = false;
     HANDLE hPipe = INVALID_HANDLE_VALUE;
     if (!TryConnectPipe(hPipe)) {
         if (!autoStartGui) {
@@ -263,6 +289,13 @@ bool SendIpcRequest(const std::string& reqJson, std::string& outRespJson, std::s
     if (!WriteFile(hPipe, reqJson.data(), static_cast<DWORD>(reqJson.size()), &written, nullptr)) {
         CloseHandle(hPipe);
         outError = "WriteFile to Named Pipe failed.";
+        return false;
+    }
+
+    if (timeoutMs > 0 && !WaitForPipeData(hPipe, timeoutMs)) {
+        CloseHandle(hPipe);
+        outError = "The core did not answer within " + std::to_string(timeoutMs) + " ms.";
+        if (outTimedOut) *outTimedOut = true;
         return false;
     }
 

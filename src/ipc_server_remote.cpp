@@ -30,6 +30,50 @@ using RemoteFilesCheckCallback = std::function<bool(
 
 void SetRemoteFilesCheckCallback(RemoteFilesCheckCallback cb);
 
+ListenerRestartScheduler::~ListenerRestartScheduler() {
+    Stop();
+}
+
+void ListenerRestartScheduler::Schedule() {
+    {
+        std::lock_guard<std::mutex> lock(mutex_);
+        if (stop_) return;
+        ++generation_;
+        if (!running_) {
+            running_ = true;
+            thread_ = std::thread([this]() { Run(); });
+        }
+    }
+    cv_.notify_all();
+}
+
+void ListenerRestartScheduler::Stop() {
+    {
+        std::lock_guard<std::mutex> lock(mutex_);
+        stop_ = true;
+    }
+    cv_.notify_all();
+    if (thread_.joinable()) thread_.join();
+}
+
+void ListenerRestartScheduler::Run() {
+    uint64_t handled = 0;
+    while (true) {
+        uint64_t target = 0;
+        {
+            std::unique_lock<std::mutex> lock(mutex_);
+            cv_.wait(lock, [this, &handled]() { return stop_ || generation_ != handled; });
+            if (stop_) return;
+            target = generation_;
+        }
+        handled = target;
+        // Let the config_set reply reach the caller before the listener moves.
+        SleepMs(250);
+        if (stop_) return;
+        if (fn_) fn_();
+    }
+}
+
 namespace {
 
 constexpr uint64_t kWindowsToUnixEpochSec = 11644473600ULL;
@@ -559,31 +603,57 @@ void IpcServer::StartWebUiServer(const std::string& token) {
         WriteAuditLog("WEBUI_START_FAILED", err.empty() ? "cannot start WebUI" : err);
         return;
     }
+    std::lock_guard<std::mutex> lock(webuiMutex_);
     webUiServer_ = std::move(webui);
 }
 
-void IpcServer::StopWebUiServer() {
-    if (webUiServer_) {
-        webUiServer_->Stop();
+void IpcServer::StopWebUiServer(bool waitForHandlers) {
+    std::lock_guard<std::mutex> lock(webuiMutex_);
+    if (!webUiServer_) return;
+    if (waitForHandlers) {
+        webUiServer_->Stop(true);
         webUiServer_.reset();
+        return;
+    }
+    // Close the listening socket right away and detach the in-flight handlers:
+    // a request that is still running must not delay the next restart. The
+    // server is parked so the core can still wait for those handlers when it
+    // shuts down.
+    webUiServer_->Stop(false);
+    retiredWebUiServers_.push_back(std::move(webUiServer_));
+    // Keep the number of parked servers small. The oldest one is waited for
+    // before it is dropped, so no handler outlives the core.
+    while (retiredWebUiServers_.size() > 4) {
+        std::unique_ptr<WebUiServer> oldest = std::move(retiredWebUiServers_.front());
+        retiredWebUiServers_.erase(retiredWebUiServers_.begin());
+        oldest->Stop(true);
+        oldest.reset();
     }
 }
 
-void IpcServer::ScheduleWebUiRestart() {
-    if (webuiRestartThread_.joinable()) {
-        webuiRestartThread_.join();
+WebUiServer* IpcServer::GetWebUiServer() {
+    std::lock_guard<std::mutex> lock(webuiMutex_);
+    return webUiServer_.get();
+}
+
+void IpcServer::RestartWebUi() {
+    if (stop_.load()) return;
+    // Keep the session token so an open browser tab keeps working after the
+    // listener moves to a new port or scope.
+    std::string token;
+    {
+        std::lock_guard<std::mutex> lock(webuiMutex_);
+        if (webUiServer_) token = webUiServer_->GetToken();
     }
-    webuiRestartThread_ = std::thread([this]() {
-        // Let the config_set reply reach the caller before closing its connection.
-        SleepMs(250);
-        if (stop_.load()) return;
-        // Keep the session token so an open browser tab keeps working after the
-        // listener moves to a new port or scope.
-        std::string token = webUiServer_ ? webUiServer_->GetToken() : std::string();
-        StopWebUiServer();
-        if (stop_.load()) return;
-        StartWebUiServer(token);
-    });
+    StopWebUiServer(false);
+    if (stop_.load()) return;
+    StartWebUiServer(token);
+}
+
+void IpcServer::ScheduleWebUiRestart() {
+    // Never join or stop anything here: this runs in the IPC handler thread
+    // and the caller (dashboard or CLI) waits for the reply.
+    webuiRestart_.Schedule();
 }
 
 void IpcServer::StartTermServer() {
@@ -604,18 +674,15 @@ void IpcServer::StopTermServer() {
     }
 }
 
+void IpcServer::RestartTermServer() {
+    if (stop_.load()) return;
+    StopTermServer();
+    if (stop_.load()) return;
+    StartTermServer();
+}
+
 void IpcServer::ScheduleTermServerRestart() {
-    if (termRestartThread_.joinable()) {
-        termRestartThread_.join();
-    }
-    termRestartThread_ = std::thread([this]() {
-        // Let the config_set reply reach the caller before dropping sessions.
-        SleepMs(250);
-        if (stop_.load()) return;
-        StopTermServer();
-        if (stop_.load()) return;
-        StartTermServer();
-    });
+    termRestart_.Schedule();
 }
 
 void IpcServer::StartIpmsg() {
@@ -665,20 +732,15 @@ void IpcServer::StopIpmsg() {
     if (ipmsg_) ipmsg_->Stop();
 }
 
-void IpcServer::ScheduleIpmsgRestart() {
-    std::lock_guard<std::mutex> lk(ipmsgRestartMutex_);
+void IpcServer::RestartIpmsg() {
     if (stop_.load()) return;
-    if (ipmsgRestartThread_.joinable()) {
-        ipmsgRestartThread_.join();
-    }
-    ipmsgRestartThread_ = std::thread([this]() {
-        // Let the config_set reply reach the caller before closing its connection.
-        SleepMs(250);
-        if (stop_.load()) return;
-        StopIpmsg();
-        if (stop_.load()) return;
-        StartIpmsg();
-    });
+    StopIpmsg();
+    if (stop_.load()) return;
+    StartIpmsg();
+}
+
+void IpcServer::ScheduleIpmsgRestart() {
+    ipmsgRestart_.Schedule();
 }
 
 } // namespace pc

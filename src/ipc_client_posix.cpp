@@ -79,7 +79,8 @@ void SpawnCore() {
 } // namespace
 
 bool SendIpcRequest(const std::string& reqJson, std::string& outRespJson, std::string& outError,
-                    bool autoStartGui) {
+                     bool autoStartGui, int timeoutMs, bool* outTimedOut) {
+    if (outTimedOut) *outTimedOut = false;
     const std::string endpoint = GetIpcEndpointUtf8();
     std::string err;
     auto conn = platform::ConnectIpc(endpoint, 0, err);

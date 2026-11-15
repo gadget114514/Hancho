@@ -114,7 +114,10 @@ static std::string ExtractRawJsonValue(const std::string& json, const std::strin
 }
 
 IpcServer::IpcServer(ProcessManager& pm, TaskQueueManager& tqm, HWND notifyHwnd)
-    : pm_(pm), tqm_(tqm), btm_(nullptr), notifyHwnd_(notifyHwnd) {
+    : pm_(pm), tqm_(tqm), btm_(nullptr), notifyHwnd_(notifyHwnd),
+      webuiRestart_([this]() { RestartWebUi(); }),
+      termRestart_([this]() { RestartTermServer(); }),
+      ipmsgRestart_([this]() { RestartIpmsg(); }) {
     triageManager_ = std::make_unique<TriageManager>(pm_, tqm_, btm_);
     ipmsg_ = std::make_unique<IpmsgNode>();
     ipmsgHandler_ = std::make_unique<IpmsgHandler>(tqm_, pm_, ipmsg_.get());
@@ -122,7 +125,10 @@ IpcServer::IpcServer(ProcessManager& pm, TaskQueueManager& tqm, HWND notifyHwnd)
 }
 
 IpcServer::IpcServer(ProcessManager& pm, TaskQueueManager& tqm, BtManager* btm, HWND notifyHwnd)
-    : pm_(pm), tqm_(tqm), btm_(btm), notifyHwnd_(notifyHwnd) {
+    : pm_(pm), tqm_(tqm), btm_(btm), notifyHwnd_(notifyHwnd),
+      webuiRestart_([this]() { RestartWebUi(); }),
+      termRestart_([this]() { RestartTermServer(); }),
+      ipmsgRestart_([this]() { RestartIpmsg(); }) {
     triageManager_ = std::make_unique<TriageManager>(pm_, tqm_, btm_);
     ipmsg_ = std::make_unique<IpmsgNode>();
     ipmsgHandler_ = std::make_unique<IpmsgHandler>(tqm_, pm_, ipmsg_.get());
@@ -148,16 +154,23 @@ bool IpcServer::Start() {
 void IpcServer::Stop() {
     if (stop_.exchange(true)) return;
     if (triageManager_) triageManager_->Stop();
-    if (webuiRestartThread_.joinable()) webuiRestartThread_.join();
-    if (termRestartThread_.joinable()) termRestartThread_.join();
-    {
-        std::lock_guard<std::mutex> lk(ipmsgRestartMutex_);
-        if (ipmsgRestartThread_.joinable()) ipmsgRestartThread_.join();
-    }
-    StopWebUiServer();
+    // Stop the restart workers first: they must not touch the servers while
+    // they are being closed.
+    webuiRestart_.Stop();
+    termRestart_.Stop();
+    ipmsgRestart_.Stop();
+    StopWebUiServer(true);
     StopTermServer();
     StopIpmsg();
     if (ipmsgHandler_) ipmsgHandler_->Stop();
+    // Wait for the handlers that were detached by a config change.
+    {
+        std::lock_guard<std::mutex> lock(webuiMutex_);
+        for (auto& retired : retiredWebUiServers_) {
+            if (retired) retired->Stop(true);
+        }
+        retiredWebUiServers_.clear();
+    }
     StopRemoteListener();
     // Wake up blocking ConnectNamedPipe by opening a dummy connection
     HANDLE hDummy = CreateFileW(GetPipeNameWide().c_str(), GENERIC_READ | GENERIC_WRITE, 0, nullptr, OPEN_EXISTING, 0, nullptr);

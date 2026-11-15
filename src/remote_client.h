@@ -54,7 +54,12 @@ public:
     // bindHost empty or "*" means 0.0.0.0. token empty means "loopback only".
     bool Start(const std::string& bindHost, uint16_t port, const std::string& token,
                std::string& outError);
-    void Stop();
+    // Stops the listener. With waitForHandlers=false the call returns as soon as
+    // the sockets are closed: in-flight handlers are detached instead of waited
+    // for. Detached handlers keep the shared state alive, so the listener may be
+    // destroyed right after the call; the owner is responsible for giving the
+    // detached handlers a chance to finish before it goes away itself.
+    void Stop(bool waitForHandlers = true);
     bool Running() const;
     std::string Endpoint() const;
 

@@ -750,6 +750,7 @@ struct DashboardState {
     bool notifyTerminalSessions = true;
     bool termSessionNotifyInitialized = false;
     std::map<uint32_t, std::wstring> knownTermSessions;
+    int termSessionCount = 0;  // active WCSP connections (badge on the toolbar button)
     uint64_t nextTermSessionPollMs = 0;
     HWND hwndBtnUsage = nullptr;
     HWND hwndBtnHint = nullptr;
@@ -948,13 +949,21 @@ static TerminalView* GetTerminalViewForProcess(DashboardState* st, int id) {
 // Replaces direct state reads (st->pm, st->tqm, memory, config) with Named Pipe IPC calls
 // ---------------------------------------------------------------------------
 
+// The dashboard must never freeze on a core that stops answering. A request
+// that is not answered in time is reported as an error instead of blocking the
+// UI thread forever.
+static const int kGuiIpcTimeoutMs = 30000;
+
 static bool GuiIpcCall(DashboardState* st, const nlohmann::json& req, nlohmann::json& outResp, std::string* outError = nullptr) {
     std::string resp;
     std::string err;
     bool ok = false;
-    if (SendIpcRequest(req.dump(), resp, err, false)) {
+    bool timedOut = false;
+    if (SendIpcRequest(req.dump(), resp, err, false, kGuiIpcTimeoutMs, &timedOut)) {
         ok = true;
-    } else if (st && st->ipc) {
+    } else if (!timedOut && st && st->ipc) {
+        // A timeout is not repeated in-process: the request may still be
+        // running in the core and repeating it could run the action twice.
         resp = st->ipc->HandleRequestJson(req.dump());
         ok = !resp.empty();
     }
@@ -11172,16 +11181,29 @@ static std::wstring FormatTermSessionDuration(int64_t sec) {
     return buf;
 }
 
+static std::wstring TermSessionBalloonTitle(size_t count) {
+    wchar_t buf[64] = {};
+    swprintf_s(buf, L"Hancho Terminal (%zu)", count);
+    return buf;
+}
+
 // Poll the core and show a tray balloon when a WCSP client connects or disconnects.
 // The first poll only records the current sessions so startup does not notify.
+// The poll also runs with notifications off, so the toolbar button keeps its count.
 static void SyncTermSessionNotifications(DashboardState* st) {
-    if (!st || !st->notifyTerminalSessions) return;
+    if (!st) return;
     const uint64_t now = GetNowTickMs();
     if (st->nextTermSessionPollMs != 0 && now < st->nextTermSessionPollMs) return;
     st->nextTermSessionPollMs = now + 2000;
 
     std::vector<TermSessionRow> sessions;
-    if (!FetchTermSessions(st, sessions)) return;
+    const bool ok = FetchTermSessions(st, sessions);
+    const int count = ok ? static_cast<int>(sessions.size()) : 0;
+    if (st->termSessionCount != count) {
+        st->termSessionCount = count;
+        if (st->hwndBtnTermSessions) InvalidateRect(st->hwndBtnTermSessions, nullptr, FALSE);
+    }
+    if (!ok || !st->notifyTerminalSessions) return;
 
     std::map<uint32_t, std::wstring> current;
     for (const auto& row : sessions) {
@@ -11199,7 +11221,7 @@ static void SyncTermSessionNotifications(DashboardState* st) {
             if (st->knownTermSessions.find(entry.first) != st->knownTermSessions.end()) continue;
             WriteAuditLog("TERM_SESSION_NOTIFY", std::string("connected: ") + WideToUtf8(entry.second));
             gui_platform::GetGuiPlatform()->TrayShowBalloon(
-                st->nid, L"Hancho Terminal",
+                st->nid, TermSessionBalloonTitle(current.size()),
                 Tr(L"ターミナルが接続しました: ", L"Terminal connected: ", L"Terminal conectada: ") +
                     entry.second,
                 false);
@@ -11208,7 +11230,7 @@ static void SyncTermSessionNotifications(DashboardState* st) {
             if (current.find(entry.first) != current.end()) continue;
             WriteAuditLog("TERM_SESSION_NOTIFY", std::string("disconnected: ") + WideToUtf8(entry.second));
             gui_platform::GetGuiPlatform()->TrayShowBalloon(
-                st->nid, L"Hancho Terminal",
+                st->nid, TermSessionBalloonTitle(current.size()),
                 Tr(L"ターミナルが切断しました: ", L"Terminal disconnected: ", L"Terminal desconectada: ") +
                     entry.second,
                 false);
@@ -11276,6 +11298,11 @@ static void RefreshTermSessionsDialog(TermSessionsDlgState* ds) {
 
     std::vector<TermSessionRow> sessions;
     const bool ok = FetchTermSessions(ds->dash, sessions);
+    if (ok && ds->dash->termSessionCount != static_cast<int>(sessions.size())) {
+        ds->dash->termSessionCount = static_cast<int>(sessions.size());
+        if (ds->dash->hwndBtnTermSessions)
+            InvalidateRect(ds->dash->hwndBtnTermSessions, nullptr, FALSE);
+    }
 
     SendMessageW(ds->list, WM_SETREDRAW, FALSE, 0);
     ListView_DeleteAllItems(ds->list);
@@ -17296,6 +17323,9 @@ static LRESULT CALLBACK DashboardWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPA
             }
             if (st && dis->hwndItem == st->hwndBtnIpmsg && st->chatUnread > 0) {
                 DrawCountBadge(dis->hDC, dis->rcItem, st->chatUnread);
+            }
+            if (st && dis->hwndItem == st->hwndBtnTermSessions && st->termSessionCount > 0) {
+                DrawCountBadge(dis->hDC, dis->rcItem, st->termSessionCount);
             }
             return TRUE;
         }
