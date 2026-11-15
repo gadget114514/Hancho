@@ -289,6 +289,50 @@ void TerminalBuffer::tab() {
     cursorColumn_ = columns_ - 1;
 }
 
+// CHT (CSI Ps I) — Cursor Forward Tabulation
+void TerminalBuffer::tabForward(int count) {
+    pendingWrap_ = false;
+    const bool insideMargins = leftRightMarginEnabled_ &&
+                               cursorColumn_ >= leftMargin_ &&
+                               cursorColumn_ <= rightMargin_;
+    const int rightStop = insideMargins ? rightMargin_ : columns_ - 1;
+    int col = cursorColumn_;
+    for (int i = 0; i < std::max(1, count); ++i) {
+        int next = rightStop;
+        for (int c = col + 1; c <= rightStop; ++c) {
+            if ((size_t)c < tabStops_.size() && tabStops_[c]) {
+                next = c;
+                break;
+            }
+        }
+        col = next;
+        if (col >= rightStop) break;
+    }
+    cursorColumn_ = clamp(col, 0, columns_ - 1);
+}
+
+// CBT (CSI Ps Z) — Cursor Backward Tabulation
+void TerminalBuffer::tabBackward(int count) {
+    pendingWrap_ = false;
+    const bool insideMargins = leftRightMarginEnabled_ &&
+                               cursorColumn_ >= leftMargin_ &&
+                               cursorColumn_ <= rightMargin_;
+    const int leftStop = insideMargins ? leftMargin_ : 0;
+    int col = cursorColumn_;
+    for (int i = 0; i < std::max(1, count); ++i) {
+        int prev = leftStop;
+        for (int c = col - 1; c >= leftStop; --c) {
+            if ((size_t)c < tabStops_.size() && tabStops_[c]) {
+                prev = c;
+                break;
+            }
+        }
+        col = prev;
+        if (col <= leftStop) break;
+    }
+    cursorColumn_ = clamp(col, 0, columns_ - 1);
+}
+
 void TerminalBuffer::setTabStop() {
     if ((size_t)cursorColumn_ < tabStops_.size())
         tabStops_[cursorColumn_] = true;
@@ -717,7 +761,7 @@ void TerminalBuffer::savePrivateMode(int mode) {
     case 1049:
     case 1047:
     case 47:   savedPrivateMode1049_  = alternateScreenActive_; break;
-    case 2026: savedPrivateMode2026_  = cursorFilled_;          break;
+    case 2026: savedPrivateMode2026_  = syncOutputEnabled_;     break;
     }
 }
 
@@ -728,7 +772,7 @@ void TerminalBuffer::restorePrivateMode(int mode) {
     case 1049:
     case 1047:
     case 47:   useAlternateScreen(savedPrivateMode1049_); break;
-    case 2026: setCursorFilled(savedPrivateMode2026_); break;
+    case 2026: setSyncOutputEnabled(savedPrivateMode2026_); break;
     }
 }
 

@@ -363,7 +363,8 @@ struct DialogState {
     std::wstring currentTitle;
 
     bool replyActive = false;
-    bool peerRefreshActive = false; // suppress selection events while rebuilding the host list
+    bool peerRefreshActive = false;    // suppress selection events while rebuilding the host list
+    bool messageRefreshActive = false; // suppress reply mode while restoring the message selection
     std::string replyPeerKey;
     std::wstring replyLabel;
     uint64_t replyToId = 0;
@@ -729,7 +730,7 @@ void LayoutChat(DialogState* st, const RECT& pr) {
     Place(st->attachList, attachX, row2 + S(26), attachW, S(84) - S(26));
 
     const int row3 = row2 + S(88);
-    Place(st->composeHint, rx, row3 + S(5), (std::max)(S(80), rightW - S(120)), S(20));
+    Place(st->composeHint, rx, row3 + S(1), (std::max)(S(80), rightW - S(104)), S(34));
     Place(st->btnSend, rx + rightW - S(96), row3, S(96), S(28));
 }
 
@@ -1013,11 +1014,28 @@ int SelectedMessageIndex(DialogState* st) {
     return idx;
 }
 
+void UpdateDetailLabels(DialogState* st) {
+    if (!st) return;
+    const bool outgoing = st->selectedMessage.is_object() &&
+                          st->selectedMessage.value("direction", std::string()) == "out";
+    if (st->detailLabel) {
+        SetWindowTextW(st->detailLabel,
+                       outgoing ? T(L"送信本文", L"SENT MESSAGE", L"MENSAJE ENVIADO")
+                                : T(L"受信本文", L"RECEIVED MESSAGE", L"MENSAJE RECIBIDO"));
+    }
+    if (st->filesLabel) {
+        SetWindowTextW(st->filesLabel,
+                       outgoing ? T(L"送信添付ファイル", L"SENT ATTACHMENTS", L"ADJUNTOS ENVIADOS")
+                                : T(L"受信添付ファイル", L"RECEIVED ATTACHMENTS", L"ADJUNTOS RECIBIDOS"));
+    }
+}
+
 void ClearMessageDetail(DialogState* st) {
     if (!st) return;
     st->selectedMessage = nlohmann::json();
     if (st->msgText) SetWindowTextW(st->msgText, L"");
     if (st->files) ListView_DeleteAllItems(st->files);
+    UpdateDetailLabels(st);
     UpdateReplyDetailVisibility(st);
 }
 
@@ -1077,6 +1095,7 @@ void SelectMessage(DialogState* st, int idx) {
         SetMessageTimeCell(st, row, msg);
         InvalidateRect(st->messages, nullptr, FALSE);
     }
+    UpdateDetailLabels(st);
     UpdateReplyDetailVisibility(st);
 }
 
@@ -1138,6 +1157,9 @@ void LoadMessages(DialogState* st) {
     st->firstMessageLoad = false;
 
     if (selectedId) {
+        // Restoring the selection must not re-enter reply mode: the user may
+        // have pressed New (or picked a host) after selecting a received message.
+        st->messageRefreshActive = true;
         for (size_t i = 0; i < st->messagesJson.size(); ++i) {
             if (st->messagesJson[i].value("id", 0ULL) == selectedId) {
                 SelectRowByData(st->messages, static_cast<LPARAM>(i));
@@ -1145,6 +1167,7 @@ void LoadMessages(DialogState* st) {
                 break;
             }
         }
+        st->messageRefreshActive = false;
     } else {
         ClearMessageDetail(st);
     }
@@ -2393,9 +2416,9 @@ LRESULT CALLBACK IpmsgWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam)
                     if (ListView_GetItem(st->messages, &info)) {
                         const int idx = static_cast<int>(info.lParam);
                         SelectMessage(st, idx);
-                        // Clicking reads the message; reply mode is entered from the
-                        // destination combo or by double-clicking the row.
-                        if (st->replyActive) EnterReplyMode(st, idx);
+                        // Selecting a received message starts a reply. Selecting an
+                        // outgoing message leaves the destination/reply state alone.
+                        if (!st->messageRefreshActive) EnterReplyMode(st, idx);
                         LayoutCurrentPage(st);
                     }
                 }
@@ -2408,7 +2431,11 @@ LRESULT CALLBACK IpmsgWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam)
                     info.mask = LVIF_PARAM;
                     info.iItem = nm->iItem;
                     if (ListView_GetItem(st->messages, &info)) {
-                        SelectMessage(st, static_cast<int>(info.lParam));
+                        const int idx = static_cast<int>(info.lParam);
+                        SelectMessage(st, idx);
+                        // A click on an already-selected row produces no item-changed
+                        // event, so apply the reply rule here too.
+                        EnterReplyMode(st, idx);
                         LayoutCurrentPage(st);
                     }
                 }

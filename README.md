@@ -100,6 +100,16 @@ The skill starts with `hancho-cli.exe help --json`, so the commands it shows alw
 
 
 
+### v0.9.22
+- **Chat selection**: picking a host sets the destination back to the selected host(s); selecting a received (`in`) message enters reply mode, while selecting a sent (`out`) message leaves the current destination and reply state untouched. Refreshing the message list no longer re-enters reply mode after **New** or a host change.
+- **Terminal connections**: the `[🔌]` window now shows a lower **Retained sessions** list (running ConPTY jobs with command, active connection count and elapsed time) below the active connections. `term_sessions` reports the job id so sessions can be matched to their job.
+- **Dashboard rendering**: the parent-drawn terminal canvas repaints only the dirty region and reuses a size-matched GDI backbuffer and monospace font, cutting repaint cost while terminals animate.
+- **Terminal VT**: `?2026` is Synchronized Output, with a 100 ms watchdog so a missing reset cannot freeze the view. CHT/CBT and VPR are supported, DECST8C and the tab-stop reset modes are correct, and the `?2026` state is saved/restored with the alternate screen.
+- **HanchoTerm**: tabs reconnect to the same server session automatically after a disconnect (with backoff), show connection status dots, and have detailed tab tooltips. **File > Terminate all tab sessions...** stops every open session and closes the tabs after a confirmation.
+- **WebUI**: task start/end times, process end times and a chat refresh check are shown in the browser UI.
+- **Chat details**: the body and attachment labels follow the selected message (received or sent), and the compose hint has more room.
+- **Docs**: WCSP documents the `JOB_ID` TLV.
+
 ### v0.9.21
 - **WebUI settings**: turning the browser UI off no longer freezes the dashboard. Listener restarts run on a dedicated serial worker, in-flight handlers are detached instead of waited for, and the dashboard IPC has a bounded timeout. A `webui_config_smoke` regression test covers the disable path.
 - **LAN WebUI**: WebSocket upgrades use the same Host / Origin rules as HTTP, so a browser on another PC can connect by IP or a configured `allowed_hosts` name while foreign origins are still rejected.

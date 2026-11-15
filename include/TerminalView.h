@@ -245,6 +245,10 @@ private:
     bool   cursorBlink_   = true;   // current visible state (true = visible; starts visible so cursor shows at startup)
     UINT_PTR cursorTimer_ = 0;
 
+    // Synchronized output (?2026): repaint deadline while updates are batched.
+    ULONGLONG syncSinceTick_ = 0;
+    UINT_PTR  syncTimer_     = 0;
+
     // Output mutex (reader thread → UI thread via PostMessage; no lock needed,
     // but we need one for the chunk pointer lifetime)
     std::mutex outputMutex_;

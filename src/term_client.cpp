@@ -72,6 +72,7 @@ constexpr int IDM_SCROLLBACK_2048 = 5125;
 constexpr int IDM_RECONNECT_SESSION = 5117;
 constexpr int IDM_TERMINATE_SESSION = 5118;
 constexpr int IDM_RECONNECT_ALL = 5119;
+constexpr int IDM_TERMINATE_ALL = 5126;
 
 constexpr int kStatusHeight = 26;
 
@@ -1800,6 +1801,39 @@ void CloseAllTabs(ClientState* st) {
     st->activeId = 0;
 }
 
+void TerminateAllSessions(ClientState* st) {
+    if (!st || st->tabs.empty()) return;
+    wchar_t countText[96] = {};
+    swprintf_s(countText, T(L"%zu 個のタブを閉じます。", L"%zu tabs will be closed.",
+                            L"Se cerrarán %zu pestañas."),
+               st->tabs.size());
+    std::wstring message = T(
+        L"すべてのタブのセッションを終了しますか？\r\n\r\n"
+        L"サーバーが起動したシェルは停止します。ダッシュボードのジョブに接続している場合は、"
+        L"切断されるだけでジョブは停止しません。\r\n\r\n",
+        L"Terminate the sessions in every tab?\r\n\r\n"
+        L"A shell started by the server will be stopped. An attached dashboard job is only "
+        L"detached and keeps running.\r\n\r\n",
+        L"¿Terminar las sesiones de todas las pestañas?\r\n\r\n"
+        L"Un shell iniciado por el servidor se detendrá. Un trabajo del panel solo se "
+        L"desconecta y sigue ejecutándose.\r\n\r\n");
+    message += countText;
+    if (MessageBoxW(st->hwndMain, message.c_str(),
+                    T(L"すべてのセッションを終了", L"Terminate all sessions",
+                      L"Terminar todas las sesiones"),
+                    MB_YESNO | MB_ICONWARNING) != IDYES) {
+        return;
+    }
+    while (!st->tabs.empty()) {
+        CloseTabById(st, st->tabs.front()->id, true);
+    }
+    // Any session that survived the CLOSE (for example one that was already
+    // disconnected) is treated as pre-existing so auto-attach does not reopen it.
+    st->discoveryInitialized = false;
+    UpdateStatus(st);
+    InvalidateRect(st->hwndMain, nullptr, TRUE);
+}
+
 // ---------------------------------------------------------------------------
 // Menu / window
 // ---------------------------------------------------------------------------
@@ -1839,6 +1873,9 @@ HMENU BuildMenu(ClientState* st) {
     AppendMenuW(file, MF_STRING, IDM_TERMINATE_SESSION,
                 T(L"現在のセッションを終了...", L"Terminate current session...",
                   L"Terminar la sesión actual..."));
+    AppendMenuW(file, MF_STRING, IDM_TERMINATE_ALL,
+                T(L"すべてのタブのセッションを終了...", L"Terminate all tab sessions...",
+                  L"Terminar todas las sesiones de las pestañas..."));
     AppendMenuW(file, MF_SEPARATOR, 0, nullptr);
     AppendMenuW(file, MF_STRING, IDM_EXIT,
                 T(L"終了", L"Exit", L"Salir"));
@@ -2125,6 +2162,9 @@ void ShowClientContextMenu(ClientState* st, POINT pt) {
     AppendMenuW(menu, MF_STRING | (tab ? 0 : MF_GRAYED), IDM_TERMINATE_SESSION,
                 T(L"現在のセッションを終了...", L"Terminate current session...",
                   L"Terminar la sesión actual..."));
+    AppendMenuW(menu, MF_STRING | (st->tabs.empty() ? MF_GRAYED : 0), IDM_TERMINATE_ALL,
+                T(L"すべてのタブのセッションを終了...", L"Terminate all tab sessions...",
+                  L"Terminar todas las sesiones de las pestañas..."));
 
     int cmd = TrackPopupMenu(menu, TPM_RETURNCMD | TPM_RIGHTBUTTON,
                              pt.x, pt.y, 0, st->hwndMain, nullptr);
@@ -2305,6 +2345,9 @@ LRESULT CALLBACK ClientWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam
             return 0;
         case IDM_TERMINATE_SESSION:
             TerminateActiveSession(st);
+            return 0;
+        case IDM_TERMINATE_ALL:
+            TerminateAllSessions(st);
             return 0;
         case IDM_EDIT_COPY: {
             SessionTab* tab = FindTab(st, st->activeId);

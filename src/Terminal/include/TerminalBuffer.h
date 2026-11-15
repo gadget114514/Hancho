@@ -40,6 +40,8 @@ public:
     void reverseIndex();
     void backspace();
     void tab();
+    void tabForward(int count);
+    void tabBackward(int count);
     void moveCursorRelative(int rowDelta, int columnDelta);
     void moveCursorTo(int row, int column);
     void moveCursorColumn(int column);

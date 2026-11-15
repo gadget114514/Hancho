@@ -902,6 +902,13 @@ struct DashboardState {
     int taskListFontPx = kDefaultListFontPx;
     HFONT hFontProcList = nullptr;
     HFONT hFontTaskList = nullptr;
+    HFONT hFontTermCanvas = nullptr;   // monospace font for the parent-drawn terminal preview
+    // Reused GDI backbuffer for DrawDashboardCanvas; rebuilt only when the client size changes.
+    HDC canvasDc = nullptr;
+    HBITMAP canvasBmp = nullptr;
+    HGDIOBJ canvasOldBmp = nullptr;
+    int canvasW = 0;
+    int canvasH = 0;
 
     int selectedProcId = -1;
     std::string selectedJobKey;
@@ -1993,19 +2000,113 @@ static void LayoutTerminalViews(DashboardState* st) {
     }
 }
 
-static void DrawDashboardCanvas(DashboardState* st, HDC hdcWindow) {
+// Bottom status bar. Kept separate so a partial repaint can skip its string
+// building entirely when the bar is outside the dirty region.
+static void DrawDashboardStatusBar(DashboardState* st, HDC hdc) {
+    RECT rcSb = st->rcStatusBar;
+    HBRUSH sbBrush = CreateSolidBrush(g_theme.panel);
+    FillRect(hdc, &rcSb, sbBrush);
+    DeleteObject(sbBrush);
+
+    HPEN sbTopPen = CreatePen(PS_SOLID, 1, g_theme.border);
+    SelectObject(hdc, sbTopPen);
+    MoveToEx(hdc, rcSb.left, rcSb.top, nullptr);
+    LineTo(hdc, rcSb.right, rcSb.top);
+    DeleteObject(sbTopPen);
+
+    const ProcessSnapshot* selSnap = nullptr;
+    for (const auto& s : st->cachedSnapshots) {
+        if (s.id == st->selectedProcId) { selSnap = &s; break; }
+    }
+
+    std::wstringstream sbLeft;
+    if (selSnap) {
+        sbLeft << Tr(L"選択: #", L"Selected: #", L"Seleccionado: #") << selSnap->id << L" [" << Utf8ToWide(selSnap->name) << L"]  |  "
+               << StateLabelWide(selSnap->state, selSnap->idleMs >= 10000)
+               << L"  |  " << Tr(L"開始: ", L"Start: ", L"Inicio: ") << Utf8ToWide(selSnap->startTimeStr)
+               << L"  |  " << Tr(L"稼働時間: ", L"Uptime: ", L"Tiempo activo: ") << Utf8ToWide(FormatUptimeHMS(selSnap->elapsedMs));
+        if (selSnap->state == ProcState::Running && selSnap->timeoutSec > 0) {
+            int64_t remainingMs = static_cast<int64_t>(selSnap->timeoutSec) * 1000 - static_cast<int64_t>(selSnap->elapsedMs);
+            int64_t remSec = (remainingMs + 999) / 1000;
+            if (remSec < 0) remSec = 0;
+            sbLeft << L"  |  " << Tr(L"残り時間: ", L"Left: ", L"Restante: ") << FormatRemainingTime(remSec);
+        }
+        if (!selSnap->logFilePath.empty()) {
+            sbLeft << L"  |  " << Tr(L"ログ: ", L"Log: ", L"Registro: ") << Utf8ToWide(selSnap->logFilePath);
+        }
+        TerminalView* tv = GetTerminalViewForProcess(st, selSnap->id);
+        if (tv && !tv->Title().empty()) {
+            sbLeft << L"  |  " << Tr(L"タイトル: ", L"Title: ", L"Título: ") << tv->Title();
+        }
+        if (st->termProgressState > 0) {
+            sbLeft << L"  |  " << Tr(L"進捗: ", L"Progress: ", L"Progreso: ") << st->termProgressValue << L"%";
+        }
+    } else {
+        sbLeft << Tr(L"待機 — ログ保存先: ", L"Ready — Logs saved to: ", L"Listo — Registros en: ") << GetLogsDirectoryWide();
+    }
+    sbLeft << Tr(L"  |  Ctrl+T: プロセス / タスクキュー切替",
+                 L"  |  Ctrl+T: switch Processes / Task Queue",
+                 L"  |  Ctrl+T: cambiar Procesos / Cola de tareas");
+    if (st->memoryNearLimit && !st->memoryWarningText.empty()) {
+        sbLeft << L"  |  [" << st->memoryWarningText << L"]";
+    }
+
+    uint64_t dashElapsedMs = GetNowTickMs() - st->dashboardStartTickMs;
+    std::wstringstream sbRight;
+    sbRight << Tr(L"ダッシュボード起動: ", L"Dashboard Started: ", L"Panel iniciado: ") << Utf8ToWide(st->dashboardStartTimeStr)
+            << L"  |  " << Tr(L"稼働時間: ", L"Uptime: ", L"Tiempo activo: ") << Utf8ToWide(FormatUptimeHMS(dashElapsedMs))
+            << L"  |  IPC: \\\\.\\pipe\\HanchoIPC";
+
+    SelectObject(hdc, st->hFontUi);
+    RECT rcSbRight = {rcSb.right - 520, rcSb.top + 2, rcSb.right - 10, rcSb.bottom - 2};
+    SetTextColor(hdc, g_theme.muted);
+    DrawTextW(hdc, sbRight.str().c_str(), -1, &rcSbRight, DT_RIGHT | DT_VCENTER | DT_SINGLELINE | DT_END_ELLIPSIS);
+
+    RECT rcSbLeft = {rcSb.left + 10, rcSb.top + 2, rcSbRight.left - 12, rcSb.bottom - 2};
+    SetTextColor(hdc, g_theme.text);
+    DrawTextW(hdc, sbLeft.str().c_str(), -1, &rcSbLeft, DT_LEFT | DT_VCENTER | DT_SINGLELINE | DT_END_ELLIPSIS);
+}
+
+static bool RectsOverlap(const RECT& a, const RECT& b) {
+    RECT r;
+    return IntersectRect(&r, &a, &b) != FALSE;
+}
+
+static void DrawDashboardCanvas(DashboardState* st, HDC hdcWindow, const RECT* updateRc = nullptr) {
     RECT rcClient;
     GetClientRect(st->hwndMain, &rcClient);
     int width = rcClient.right - rcClient.left;
     int height = rcClient.bottom - rcClient.top;
     if (width <= 0 || height <= 0) return;
 
-    HDC hdc = CreateCompatibleDC(hdcWindow);
-    HBITMAP hbm = CreateCompatibleBitmap(hdcWindow, width, height);
-    HGDIOBJ oldBm = SelectObject(hdc, hbm);
+    // Only the region WM_PAINT asked for is redrawn and copied to the window; the
+    // rest of the window still shows the previous (identical) frame.
+    RECT rcBlit = rcClient;
+    if (updateRc && !IntersectRect(&rcBlit, &rcClient, updateRc)) return;
+
+    if (!st->canvasDc) st->canvasDc = CreateCompatibleDC(hdcWindow);
+    if (!st->canvasDc) return;
+    if (!st->canvasBmp || st->canvasW != width || st->canvasH != height) {
+        if (st->canvasBmp) {
+            SelectObject(st->canvasDc, st->canvasOldBmp);
+            DeleteObject(st->canvasBmp);
+            st->canvasBmp = nullptr;
+        }
+        st->canvasBmp = CreateCompatibleBitmap(hdcWindow, width, height);
+        if (!st->canvasBmp) return;
+        st->canvasOldBmp = SelectObject(st->canvasDc, st->canvasBmp);
+        st->canvasW = width;
+        st->canvasH = height;
+    }
+
+    HDC hdc = st->canvasDc;
+    const int savedDc = SaveDC(hdc);
+    // Clip everything to the dirty region so the pixels outside it stay identical
+    // to what the window currently shows.
+    IntersectClipRect(hdc, rcBlit.left, rcBlit.top, rcBlit.right, rcBlit.bottom);
 
     HBRUSH bgBrush = CreateSolidBrush(g_theme.windowBg);
-    FillRect(hdc, &rcClient, bgBrush);
+    FillRect(hdc, &rcBlit, bgBrush);
     DeleteObject(bgBrush);
 
     const auto& kpiSnaps = st->allSnapshots.empty() ? st->cachedSnapshots : st->allSnapshots;
@@ -2053,7 +2154,12 @@ static void DrawDashboardCanvas(DashboardState* st, HDC hdcWindow) {
     int availW = width - kpiMargin * 2 - kpiGap * (numCols - 1);
     int cardW = (std::max)(90, availW / numCols);
 
-    for (int row = 0; row < 2; ++row) {
+    // Partial repaints (the 60ms KPI bar animation) only touch the KPI strip; skip
+    // the card drawing and tooltip refresh when it is outside the dirty region.
+    const bool kpiVisible = st->rcKpiArea.bottom <= st->rcKpiArea.top ||
+                            RectsOverlap(rcBlit, st->rcKpiArea);
+
+    for (int row = 0; kpiVisible && row < 2; ++row) {
         int cardTop = (row == 0) ? kHeaderKpiTop : kHeaderKpiRow2Top;
         int cardBottom = (row == 0) ? kHeaderKpiRow1Bottom : kHeaderKpiBottom;
 
@@ -2065,6 +2171,8 @@ static void DrawDashboardCanvas(DashboardState* st, HDC hdcWindow) {
             rcCard.top = cardTop;
             rcCard.bottom = cardBottom;
             st->kpiCardRects[i] = rcCard;
+            // The animation repaints only its two cards; leave the other cards alone.
+            if (!RectsOverlap(rcBlit, rcCard)) continue;
 
             if (row == 0) {
                 // Top Row: Processes
@@ -2149,11 +2257,14 @@ static void DrawDashboardCanvas(DashboardState* st, HDC hdcWindow) {
             }
         }
     }
-    UpdateKpiTooltips(st, totalTreeProcs, activeRunning, idleWaiting, completedOk, failedOrKilled,
-                      tqCounts, minRemainingSec, tqCounts.minRemainingSec);
+    if (kpiVisible) {
+        UpdateKpiTooltips(st, totalTreeProcs, activeRunning, idleWaiting, completedOk, failedOrKilled,
+                          tqCounts, minRemainingSec, tqCounts.minRemainingSec);
+    }
 
     // Draggable splitter between process list and task list (when 2 rows)
-    if (st->rcRowsSplitter.bottom > st->rcRowsSplitter.top && st->listDisplayMode == ListDisplayMode::TwoRows) {
+    if (st->rcRowsSplitter.bottom > st->rcRowsSplitter.top && st->listDisplayMode == ListDisplayMode::TwoRows &&
+        RectsOverlap(rcBlit, st->rcRowsSplitter)) {
         HBRUSH spBrush = CreateSolidBrush(st->rowsSplitterDragging ? g_theme.border : g_theme.panel);
         FillRect(hdc, &st->rcRowsSplitter, spBrush);
         DeleteObject(spBrush);
@@ -2171,7 +2282,7 @@ static void DrawDashboardCanvas(DashboardState* st, HDC hdcWindow) {
     }
 
     // Draggable splitter above the JSON stream pane
-    if (st->rcStreamSplitter.bottom > st->rcStreamSplitter.top) {
+    if (st->rcStreamSplitter.bottom > st->rcStreamSplitter.top && RectsOverlap(rcBlit, st->rcStreamSplitter)) {
         HBRUSH spBrush = CreateSolidBrush(st->streamSplitterDragging ? g_theme.border : g_theme.panel);
         FillRect(hdc, &st->rcStreamSplitter, spBrush);
         DeleteObject(spBrush);
@@ -2189,7 +2300,7 @@ static void DrawDashboardCanvas(DashboardState* st, HDC hdcWindow) {
     }
 
     // Draggable splitter between the process list and the terminal area
-    if (st->rcSplitter.bottom > st->rcSplitter.top) {
+    if (st->rcSplitter.bottom > st->rcSplitter.top && RectsOverlap(rcBlit, st->rcSplitter)) {
         HBRUSH spBrush = CreateSolidBrush(st->splitterDragging ? g_theme.border : g_theme.panel);
         FillRect(hdc, &st->rcSplitter, spBrush);
         DeleteObject(spBrush);
@@ -2206,10 +2317,10 @@ static void DrawDashboardCanvas(DashboardState* st, HDC hdcWindow) {
         DeleteObject(gripPen);
     }
 
-    if (st->rcProcCaption.bottom > st->rcProcCaption.top) {
+    if (st->rcProcCaption.bottom > st->rcProcCaption.top && RectsOverlap(rcBlit, st->rcProcCaption)) {
         DrawListCaption(hdc, st->rcProcCaption, ProcListCaptionText(), g_theme.accent, st->hFontUiBold);
     }
-    if (st->rcTaskCaption.bottom > st->rcTaskCaption.top) {
+    if (st->rcTaskCaption.bottom > st->rcTaskCaption.top && RectsOverlap(rcBlit, st->rcTaskCaption)) {
         DrawListCaption(hdc, st->rcTaskCaption, TaskListCaptionText(),
                         IsDarkThemeActive() ? RGB(255, 190, 90) : RGB(200, 110, 0), st->hFontUiBold);
         // The failure summary follows the search button (and its edit box when open).
@@ -2234,7 +2345,7 @@ static void DrawDashboardCanvas(DashboardState* st, HDC hdcWindow) {
 
     // 2. Draw Headers & Borders around the active TerminalView tab
     if (st->termBanners.empty()) {
-        if (st->rcTerminalArea.bottom > st->rcTerminalArea.top) {
+        if (st->rcTerminalArea.bottom > st->rcTerminalArea.top && RectsOverlap(rcBlit, st->rcTerminalArea)) {
             RECT rcEmpty = st->rcTerminalArea;
             HBRUSH emptyBrush = CreateSolidBrush(g_theme.emptyBg);
             HPEN emptyPen = CreatePen(PS_SOLID, 1, g_theme.border);
@@ -2253,6 +2364,9 @@ static void DrawDashboardCanvas(DashboardState* st, HDC hdcWindow) {
         }
     } else {
         for (const auto& tb : st->termBanners) {
+            // Extracting the terminal text is expensive; skip banners that are
+            // outside the dirty region entirely (e.g. KPI-only animation frames).
+            if (!RectsOverlap(rcBlit, tb.rcBorder)) continue;
             const ProcessSnapshot* snap = nullptr;
             for (const auto& s : st->cachedSnapshots) {
                 if (s.id == tb.procId) { snap = &s; break; }
@@ -2318,15 +2432,16 @@ static void DrawDashboardCanvas(DashboardState* st, HDC hdcWindow) {
                 if (tv) {
                     std::wstring termText = tv->ExtractScreenText(0);
                     if (!termText.empty()) {
-                        HFONT hFontMono = CreateFontW(-15, 0, 0, 0, FW_NORMAL, FALSE, FALSE, FALSE, DEFAULT_CHARSET,
-                                                      OUT_DEFAULT_PRECIS, CLIP_DEFAULT_PRECIS, CLEARTYPE_QUALITY,
-                                                      FIXED_PITCH | FF_MODERN, L"Consolas");
-                        HGDIOBJ oldMono = SelectObject(hdc, hFontMono);
+                        if (!st->hFontTermCanvas) {
+                            st->hFontTermCanvas = CreateFontW(-15, 0, 0, 0, FW_NORMAL, FALSE, FALSE, FALSE, DEFAULT_CHARSET,
+                                                              OUT_DEFAULT_PRECIS, CLIP_DEFAULT_PRECIS, CLEARTYPE_QUALITY,
+                                                              FIXED_PITCH | FF_MODERN, L"Consolas");
+                        }
+                        HGDIOBJ oldMono = SelectObject(hdc, st->hFontTermCanvas);
                         SetTextColor(hdc, g_theme.text);
                         RECT rcPad = {rcTv.left + 8, rcTv.top + 6, rcTv.right - 8, rcTv.bottom - 6};
                         DrawTextW(hdc, termText.c_str(), -1, &rcPad, DT_LEFT | DT_TOP | DT_NOPREFIX);
                         SelectObject(hdc, oldMono);
-                        DeleteObject(hFontMono);
                     }
                 }
             }
@@ -2334,70 +2449,12 @@ static void DrawDashboardCanvas(DashboardState* st, HDC hdcWindow) {
     }
 
     // 3. Bottom Status Bar (replaces the old Send Input / Ctrl+C / Focus Term area)
-    RECT rcSb = st->rcStatusBar;
-    HBRUSH sbBrush = CreateSolidBrush(g_theme.panel);
-    FillRect(hdc, &rcSb, sbBrush);
-    DeleteObject(sbBrush);
-
-    HPEN sbTopPen = CreatePen(PS_SOLID, 1, g_theme.border);
-    SelectObject(hdc, sbTopPen);
-    MoveToEx(hdc, rcSb.left, rcSb.top, nullptr);
-    LineTo(hdc, rcSb.right, rcSb.top);
-    DeleteObject(sbTopPen);
-
-    const ProcessSnapshot* selSnap = nullptr;
-    for (const auto& s : st->cachedSnapshots) {
-        if (s.id == st->selectedProcId) { selSnap = &s; break; }
+    if (RectsOverlap(rcBlit, st->rcStatusBar)) {
+        DrawDashboardStatusBar(st, hdc);
     }
 
-    std::wstringstream sbLeft;
-    if (selSnap) {
-        sbLeft << Tr(L"選択: #", L"Selected: #", L"Seleccionado: #") << selSnap->id << L" [" << Utf8ToWide(selSnap->name) << L"]  |  "
-               << StateLabelWide(selSnap->state, selSnap->idleMs >= 10000)
-               << L"  |  " << Tr(L"開始: ", L"Start: ", L"Inicio: ") << Utf8ToWide(selSnap->startTimeStr)
-               << L"  |  " << Tr(L"稼働時間: ", L"Uptime: ", L"Tiempo activo: ") << Utf8ToWide(FormatUptimeHMS(selSnap->elapsedMs));
-        if (selSnap->state == ProcState::Running && selSnap->timeoutSec > 0) {
-            int64_t remainingMs = static_cast<int64_t>(selSnap->timeoutSec) * 1000 - static_cast<int64_t>(selSnap->elapsedMs);
-            int64_t remSec = (remainingMs + 999) / 1000;
-            if (remSec < 0) remSec = 0;
-            sbLeft << L"  |  " << Tr(L"残り時間: ", L"Left: ", L"Restante: ") << FormatRemainingTime(remSec);
-        }
-        if (!selSnap->logFilePath.empty()) {
-            sbLeft << L"  |  " << Tr(L"ログ: ", L"Log: ", L"Registro: ") << Utf8ToWide(selSnap->logFilePath);
-        }
-        TerminalView* tv = GetTerminalViewForProcess(st, selSnap->id);
-        if (tv && !tv->Title().empty()) {
-            sbLeft << L"  |  " << Tr(L"タイトル: ", L"Title: ", L"Título: ") << tv->Title();
-        }
-        if (st->termProgressState > 0) {
-            sbLeft << L"  |  " << Tr(L"進捗: ", L"Progress: ", L"Progreso: ") << st->termProgressValue << L"%";
-        }
-    } else {
-        sbLeft << Tr(L"待機 — ログ保存先: ", L"Ready — Logs saved to: ", L"Listo — Registros en: ") << GetLogsDirectoryWide();
-    }
-    sbLeft << Tr(L"  |  Ctrl+T: プロセス / タスクキュー切替",
-                 L"  |  Ctrl+T: switch Processes / Task Queue",
-                 L"  |  Ctrl+T: cambiar Procesos / Cola de tareas");
-    if (st->memoryNearLimit && !st->memoryWarningText.empty()) {
-        sbLeft << L"  |  [" << st->memoryWarningText << L"]";
-    }
-
-    uint64_t dashElapsedMs = GetNowTickMs() - st->dashboardStartTickMs;
-    std::wstringstream sbRight;
-    sbRight << Tr(L"ダッシュボード起動: ", L"Dashboard Started: ", L"Panel iniciado: ") << Utf8ToWide(st->dashboardStartTimeStr)
-            << L"  |  " << Tr(L"稼働時間: ", L"Uptime: ", L"Tiempo activo: ") << Utf8ToWide(FormatUptimeHMS(dashElapsedMs))
-            << L"  |  IPC: \\\\.\\pipe\\HanchoIPC";
-
-    SelectObject(hdc, st->hFontUi);
-    RECT rcSbRight = {rcSb.right - 520, rcSb.top + 2, rcSb.right - 10, rcSb.bottom - 2};
-    SetTextColor(hdc, g_theme.muted);
-    DrawTextW(hdc, sbRight.str().c_str(), -1, &rcSbRight, DT_RIGHT | DT_VCENTER | DT_SINGLELINE | DT_END_ELLIPSIS);
-
-    RECT rcSbLeft = {rcSb.left + 10, rcSb.top + 2, rcSbRight.left - 12, rcSb.bottom - 2};
-    SetTextColor(hdc, g_theme.text);
-    DrawTextW(hdc, sbLeft.str().c_str(), -1, &rcSbLeft, DT_LEFT | DT_VCENTER | DT_SINGLELINE | DT_END_ELLIPSIS);
-
-    if (st->showUsagePanel && st->rcUsageSplitter.bottom > st->rcUsageSplitter.top) {
+    if (st->showUsagePanel && st->rcUsageSplitter.bottom > st->rcUsageSplitter.top &&
+        RectsOverlap(rcBlit, st->rcUsageSplitter)) {
         RECT rc = st->rcUsageSplitter;
         HBRUSH spBrush = CreateSolidBrush(st->usageSplitterDragging ? g_theme.border : g_theme.panel);
         FillRect(hdc, &rc, spBrush);
@@ -2412,10 +2469,13 @@ static void DrawDashboardCanvas(DashboardState* st, HDC hdcWindow) {
     }
 
     SelectObject(hdc, oldFont);
-    BitBlt(hdcWindow, 0, 0, width, height, hdc, 0, 0, SRCCOPY);
-    SelectObject(hdc, oldBm);
-    DeleteObject(hbm);
-    DeleteDC(hdc);
+    const int blitW = rcBlit.right - rcBlit.left;
+    const int blitH = rcBlit.bottom - rcBlit.top;
+    if (blitW > 0 && blitH > 0) {
+        BitBlt(hdcWindow, rcBlit.left, rcBlit.top, blitW, blitH,
+               hdc, rcBlit.left, rcBlit.top, SRCCOPY);
+    }
+    if (savedDc) RestoreDC(hdc, savedDc);
 }
 
 static const wchar_t* ColumnTitle(int index) {
@@ -5647,7 +5707,10 @@ static void RefreshDashboardData(DashboardState* st) {
     std::wstring kpiSig = KpiSignature(st);
     if (kpiSig != st->lastKpiSignature) {
         st->lastKpiSignature = std::move(kpiSig);
-        InvalidateRect(st->hwndMain, &st->rcKpiArea, FALSE);
+        // The canvas now repaints only the dirty region, so ask for the whole
+        // window here: the KPI strip, status bar and terminal banners all carry
+        // values that change with the same refresh tick.
+        InvalidateRect(st->hwndMain, nullptr, FALSE);
     }
     // The usage panel repaints itself every second; repaint it here only when the highlighted process changes.
     if (st->showUsagePanel && st->selectedProcId != st->lastUsagePanelProcId) {
@@ -18004,7 +18067,7 @@ static LRESULT CALLBACK DashboardWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPA
             PAINTSTRUCT ps;
             HDC hdc = BeginPaint(hwnd, &ps);
             if (st) {
-                DrawDashboardCanvas(st, hdc);
+                DrawDashboardCanvas(st, hdc, &ps.rcPaint);
             }
             EndPaint(hwnd, &ps);
             return 0;
@@ -18027,6 +18090,16 @@ static LRESULT CALLBACK DashboardWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPA
                 if (st->hFontKpiVal) DeleteObject(st->hFontKpiVal);
                 if (st->hFontProcList) DeleteObject(st->hFontProcList);
                 if (st->hFontTaskList) DeleteObject(st->hFontTaskList);
+                if (st->hFontTermCanvas) DeleteObject(st->hFontTermCanvas);
+                if (st->canvasBmp) {
+                    SelectObject(st->canvasDc, st->canvasOldBmp);
+                    DeleteObject(st->canvasBmp);
+                    st->canvasBmp = nullptr;
+                }
+                if (st->canvasDc) {
+                    DeleteDC(st->canvasDc);
+                    st->canvasDc = nullptr;
+                }
             }
             PostQuitMessage(0);
             return 0;

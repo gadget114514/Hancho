@@ -17,6 +17,11 @@
 #pragma comment(lib, "shell32.lib")
 #pragma comment(lib, "comctl32.lib")
 
+// Watchdog for synchronized output (?2026): repaint if the closing ?2026l never
+// arrives. Kept separate from the cursor blink timer, which only runs on focus.
+static constexpr UINT_PTR kSyncOutputTimerId = 2;
+static constexpr ULONGLONG kSyncOutputMaxHoldMs = 100;
+
 static bool isSafeUrlScheme(const std::wstring& url) {
     return _wcsnicmp(url.c_str(), L"http://", 7) == 0 ||
            _wcsnicmp(url.c_str(), L"https://", 8) == 0 ||
@@ -602,6 +607,18 @@ LRESULT TerminalView::WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
         return DefWindowProcW(hwnd, msg, wp, lp);
 
     case WM_TIMER:
+        if (wp == syncTimer_) {
+            // Synchronized output fallback: keep repainting while the mode is
+            // still on, so a forgotten ?2026l cannot freeze the view.
+            if (buffer_.syncOutputEnabled()) {
+                syncSinceTick_ = GetTickCount64();
+                InvalidateRect(hwnd, nullptr, FALSE);
+            } else {
+                KillTimer(hwnd, syncTimer_);
+                syncTimer_ = 0;
+            }
+            return 0;
+        }
         if (wp == cursorTimer_) {
             if (buffer_.cursorBlink() && buffer_.cursorVisible()) {
                 cursorBlink_ = !cursorBlink_;
@@ -715,6 +732,7 @@ LRESULT TerminalView::OnCreate(HWND hwnd) {
 // ---------------------------------------------------------------------------
 void TerminalView::OnDestroy() {
     StopCursorTimer();
+    if (syncTimer_) { KillTimer(hwnd_, syncTimer_); syncTimer_ = 0; }
     if (tooltip_) { DestroyWindow(tooltip_); tooltip_ = nullptr; }
     if (textFormat_) { textFormat_->Release(); textFormat_ = nullptr; }
     if (brush_)      { brush_->Release();      brush_      = nullptr; }
@@ -969,9 +987,19 @@ void TerminalView::OnTerminalOutput(const char* data, size_t len) {
         hadUnsupported = emulator_.consumeUnsupportedFlag();
     }
 
-    // flush if not inside a synchronised update (?2026)
-    if (!buffer_.syncOutputEnabled())
+    // Wait for the end of a synchronized update (?2026l) before painting, but
+    // never leave the view frozen if the app forgets to reset the mode.
+    if (buffer_.syncOutputEnabled()) {
+        if (syncSinceTick_ == 0) syncSinceTick_ = GetTickCount64();
+        if (GetTickCount64() - syncSinceTick_ >= kSyncOutputMaxHoldMs)
+            InvalidateRect(hwnd_, nullptr, FALSE);
+        if (!syncTimer_)
+            syncTimer_ = SetTimer(hwnd_, kSyncOutputTimerId, (UINT)kSyncOutputMaxHoldMs, nullptr);
+    } else {
+        syncSinceTick_ = 0;
+        if (syncTimer_) { KillTimer(hwnd_, syncTimer_); syncTimer_ = 0; }
         InvalidateRect(hwnd_, nullptr, FALSE);
+    }
 
     // VT debug: send raw ESC sequences to parent's *Messages* buffer
     // Cache the value to avoid reading settings.ini from disk on every chunk.

@@ -446,6 +446,12 @@ void TerminalEmulator::handleCsi(const std::wstring& raw, wchar_t fin) {
             buffer_->clearLine(paramInt(splitParams(rest), 0, 0), currentAttrs_);
             return;
         }
+        if (prefix == L'?' && fin == L'W') {
+            // DECST8C: Set Tab at Every 8 Columns
+            if (paramInt(splitParams(rest), 0, 5) == 5)
+                buffer_->resetTabStops();
+            return;
+        }
         // fall through for unrecognised prefixes — strip prefix so numeric params parse correctly
         params = rest;
     }
@@ -544,7 +550,7 @@ void TerminalEmulator::handleCsi(const std::wstring& raw, wchar_t fin) {
                 case 1047:
                 case 1049: enabled = buffer_->alternateScreenActive();       break;
                 case 2004: enabled = buffer_->bracketedPasteEnabled();        break;
-                case 2026: enabled = buffer_->cursorFilled();                break;
+                case 2026: enabled = buffer_->syncOutputEnabled();            break;
                 }
                 wchar_t buf[64];
                 swprintf(buf, 64, L"\x1b[?%d;%d$y", ps, enabled ? 1 : 2);
@@ -576,8 +582,11 @@ void TerminalEmulator::handleCsi(const std::wstring& raw, wchar_t fin) {
     case L'H': case L'f':
         buffer_->moveCursorTo(P(0,1) - 1, P(1,1) - 1); break;
     case L'd': buffer_->moveCursorRow(P(0,1) - 1);                    break;
+    case L'e': buffer_->moveCursorRelative(std::max(1, P(0,1)), 0);   break; // VPR
     case L'`': buffer_->moveCursorColumn(P(0,1) - 1);                 break;
     case L'a': buffer_->moveCursorRelative(0, std::max(1, P(0,1)));   break;
+    case L'I': buffer_->tabForward(std::max(1, P(0,1)));              break; // CHT
+    case L'Z': buffer_->tabBackward(std::max(1, P(0,1)));             break; // CBT
 
     // --- erase ---
     case L'J': buffer_->clearScreenMode(P(0,0), currentAttrs_); break;
@@ -646,8 +655,9 @@ void TerminalEmulator::handleCsi(const std::wstring& raw, wchar_t fin) {
     case L'g': {
         int mode = P(0, 0);
         if (mode == 0)      buffer_->clearTabStop();
-        else if (mode == 1 || mode == 2) buffer_->clearAllTabStops();
-        else if (mode == 3) buffer_->resetTabStops();
+        else if (mode == 3) buffer_->clearAllTabStops();   // clear all tab stops
+        else if (mode == 1 || mode == 2 || mode == 4 || mode == 5)
+            buffer_->clearAllTabStops();                   // line-wide (single line here)
         break;
     }
 
@@ -713,13 +723,8 @@ void TerminalEmulator::handlePrivateMode(const std::wstring& params, bool enable
         case 2004: buffer_->setBracketedPasteEnabled(enabled);        break;
         // Windows Terminal extensions
         case 2026: {
-            buffer_->setCursorFilled(enabled);
-            if (i + 2 < modes.size()) {
-                int cw = 0, ch = 0;
-                try { cw = std::stoi(modes[i + 1]); } catch(...) {}
-                try { ch = std::stoi(modes[i + 2]); } catch(...) {}
-                buffer_->setCursorScale(cw, ch);
-            }
+            // DECSET 2026 — Synchronized Output
+            buffer_->setSyncOutputEnabled(enabled);
             break;
         }
         case 2027:
