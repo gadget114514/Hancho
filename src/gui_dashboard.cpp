@@ -2697,9 +2697,9 @@ static void UpdatePanelToggleLabels(DashboardState* st) {
         }
         if (st->hwndBtnTermSessions)
             UpdateControlTooltip(st->hwndToolbarTip, st->hwndMain, st->hwndBtnTermSessions,
-                Tr(L"WinConsoleServer のアクティブな接続一覧を開きます。\n接続元・ターゲット・接続時間の確認と、セッションの切断ができます。",
-                   L"Opens the active WinConsoleServer connections.\nReview the client, target and duration, and disconnect sessions.",
-                   L"Abre las conexiones activas de WinConsoleServer.\nRevisa el cliente, el destino y la duración y desconecta sesiones."));
+                Tr(L"WinConsoleServer の接続を表示します。\n上段はアクティブな接続、下段はコアが保持しているセッションです。\n接続元・接続時間の確認と、セッションの切断ができます。",
+                   L"Shows WinConsoleServer connections.\nThe upper list is active connections and the lower list is sessions retained by the core.\nReview clients and durations, and disconnect sessions.",
+                   L"Muestra las conexiones de WinConsoleServer.\nLa lista superior son las conexiones activas y la inferior las sesiones conservadas por el núcleo.\nRevisa clientes y duraciones, y desconecta sesiones."));
         if (st->hwndBtnBtView) {
             UpdateControlTooltip(st->hwndToolbarTip, st->hwndMain, st->hwndBtnBtView,
                 Tr(L"ビヘイビアツリーのデバッグ表示を開きます。\n各タスクを起動したノードと、ツリーの実行の進み具合を確認できます。\nショートカット: Ctrl+Shift+B",
@@ -11150,6 +11150,7 @@ static void CommitSupervisorSettings(SettingsDlgState* ds, bool persist = true) 
 
 struct TermSessionRow {
     uint32_t id = 0;
+    uint32_t jobId = 0;
     std::string remote;
     std::string target;
     int64_t connectedSec = 0;
@@ -11166,6 +11167,7 @@ static bool FetchTermSessions(DashboardState* st, std::vector<TermSessionRow>& o
         if (!item.is_object()) continue;
         TermSessionRow row;
         row.id = item.value("id", 0);
+        row.jobId = item.value("job_id", 0U);
         row.remote = item.value("remote", std::string());
         row.target = item.value("target", std::string());
         row.connectedSec = item.value("connected_sec", static_cast<int64_t>(0));
@@ -11249,6 +11251,7 @@ constexpr int IDC_TERM_DLG_LIST = 7101;
 constexpr int IDC_TERM_DLG_KILL = 7102;
 constexpr int IDC_TERM_DLG_REFRESH = 7103;
 constexpr int IDC_TERM_DLG_NOTIFY = 7104;
+constexpr int IDC_TERM_DLG_RETAINED = 7105;
 constexpr UINT_PTR kTermSessionsDlgTimerId = 101;
 
 struct TermSessionsDlgState {
@@ -11256,6 +11259,8 @@ struct TermSessionsDlgState {
     HWND lblTitle = nullptr;
     HWND lblStatus = nullptr;
     HWND list = nullptr;
+    HWND lblRetained = nullptr;
+    HWND listRetained = nullptr;
     HWND chkNotify = nullptr;
     HWND btnKill = nullptr;
     HWND btnRefresh = nullptr;
@@ -11269,12 +11274,23 @@ static void LayoutTermSessionsDialog(TermSessionsDlgState* ds, int width, int he
     const int gap = 8;
     const int listTop = margin + headerH + gap;
     const int bottomY = height - margin - btnH;
-    const int listH = (std::max)(80, bottomY - gap - listTop);
+    const int areaBottom = bottomY - gap;
+    const int areaH = (std::max)(120, areaBottom - listTop);
+    // Active connections get the upper ~45%, retained sessions the rest.
+    const int activeH = (std::max)(80, (areaH - headerH - gap) * 45 / 100);
+    const int retainedLabelY = listTop + activeH + gap;
+    const int retainedTop = retainedLabelY + headerH;
+    const int retainedH = (std::max)(60, areaBottom - retainedTop);
+    const int columnW = (std::max)(200, width - margin * 2);
     if (ds->lblTitle) MoveWindow(ds->lblTitle, margin, margin, 320, headerH, TRUE);
     if (ds->lblStatus)
         MoveWindow(ds->lblStatus, (std::max)(margin, width - margin - 380), margin, 380, headerH, TRUE);
     if (ds->list)
-        MoveWindow(ds->list, margin, listTop, (std::max)(200, width - margin * 2), listH, TRUE);
+        MoveWindow(ds->list, margin, listTop, columnW, activeH, TRUE);
+    if (ds->lblRetained)
+        MoveWindow(ds->lblRetained, margin, retainedLabelY, 420, headerH, TRUE);
+    if (ds->listRetained)
+        MoveWindow(ds->listRetained, margin, retainedTop, columnW, retainedH, TRUE);
     if (ds->chkNotify)
         MoveWindow(ds->chkNotify, margin, bottomY,
                    (std::max)(180, width - margin * 2 - 230), btnH, TRUE);
@@ -11346,6 +11362,62 @@ static void RefreshTermSessionsDialog(TermSessionsDlgState* ds) {
     SendMessageW(ds->list, WM_SETREDRAW, TRUE, 0);
     InvalidateRect(ds->list, nullptr, TRUE);
 
+    if (ds->listRetained) {
+        std::vector<ProcessSnapshot> snaps = FetchProcessSnapshotsIpc(ds->dash);
+        std::map<uint32_t, int> attached;
+        for (const auto& row : sessions) {
+            if (row.jobId != 0) attached[row.jobId]++;
+        }
+
+        SendMessageW(ds->listRetained, WM_SETREDRAW, FALSE, 0);
+        ListView_DeleteAllItems(ds->listRetained);
+        int retainedIndex = 0;
+        for (const auto& snap : snaps) {
+            if (snap.mode != ExecMode::ConPTY || snap.state != ProcState::Running) continue;
+            const std::wstring idStr = std::to_wstring(snap.id);
+            const std::wstring nameStr = Utf8ToWide(snap.name);
+            const std::wstring commandStr = Utf8ToWide(snap.commandLine);
+            const auto attachedIt = attached.find(static_cast<uint32_t>(snap.id));
+            const std::wstring attachedStr =
+                (attachedIt != attached.end() && attachedIt->second > 0)
+                    ? std::to_wstring(attachedIt->second)
+                    : std::wstring();
+            const std::wstring elapsedStr =
+                FormatTermSessionDuration(static_cast<int64_t>(snap.elapsedMs / 1000));
+
+            LVITEMW lvi = {};
+            lvi.mask = LVIF_TEXT | LVIF_PARAM;
+            lvi.iItem = retainedIndex;
+            lvi.iSubItem = 0;
+            lvi.pszText = const_cast<LPWSTR>(idStr.c_str());
+            lvi.lParam = static_cast<LPARAM>(snap.id);
+            SendMessageW(ds->listRetained, LVM_INSERTITEMW, 0, reinterpret_cast<LPARAM>(&lvi));
+
+            auto setSub = [&](int sub, const std::wstring& text) {
+                LVITEMW item = {};
+                item.iItem = retainedIndex;
+                item.iSubItem = sub;
+                item.pszText = const_cast<LPWSTR>(text.c_str());
+                SendMessageW(ds->listRetained, LVM_SETITEMTEXTW, retainedIndex,
+                             reinterpret_cast<LPARAM>(&item));
+            };
+            setSub(1, nameStr);
+            setSub(2, commandStr);
+            setSub(3, attachedStr);
+            setSub(4, elapsedStr);
+            ++retainedIndex;
+        }
+        SendMessageW(ds->listRetained, WM_SETREDRAW, TRUE, 0);
+        InvalidateRect(ds->listRetained, nullptr, TRUE);
+
+        if (ds->lblRetained) {
+            std::wstring label = Tr(L"保持中のセッション", L"Retained sessions",
+                                    L"Sesiones conservadas");
+            label += L" (" + std::to_wstring(retainedIndex) + L")";
+            SetWindowTextW(ds->lblRetained, label.c_str());
+        }
+    }
+
     if (ds->lblStatus) {
         std::wstring status;
         if (!ok) {
@@ -11371,8 +11443,7 @@ static LRESULT CALLBACK TermSessionsWndProc(HWND hwnd, UINT msg, WPARAM wParam, 
 
         HINSTANCE hInst = GetModuleHandleW(nullptr);
         ds->lblTitle = CreateWindowExW(0, L"STATIC",
-            Tr(L"アクティブなターミナル接続 (WCSP)", L"Active terminal connections (WCSP)",
-               L"Conexiones de terminal activas (WCSP)"),
+            Tr(L"アクティブな接続", L"Active connections", L"Conexiones activas"),
             WS_CHILD | WS_VISIBLE | SS_LEFT, 0, 0, 10, 10, hwnd, nullptr, hInst, nullptr);
         ds->lblStatus = CreateWindowExW(0, L"STATIC", L"",
             WS_CHILD | WS_VISIBLE | SS_RIGHT, 0, 0, 10, 10, hwnd, nullptr, hInst, nullptr);
@@ -11397,6 +11468,33 @@ static LRESULT CALLBACK TermSessionsWndProc(HWND hwnd, UINT msg, WPARAM wParam, 
             col.pszText = const_cast<LPWSTR>(L"Duration");
             ListView_InsertColumn(ds->list, 3, &col);
         }
+
+        ds->lblRetained = CreateWindowExW(0, L"STATIC", L"",
+            WS_CHILD | WS_VISIBLE | SS_LEFT, 0, 0, 10, 10, hwnd, nullptr, hInst, nullptr);
+        ds->listRetained = CreateWindowExW(WS_EX_CLIENTEDGE, WC_LISTVIEWW, L"",
+            WS_CHILD | WS_VISIBLE | WS_TABSTOP | LVS_REPORT | LVS_SINGLESEL | LVS_SHOWSELALWAYS,
+            0, 0, 10, 10, hwnd, reinterpret_cast<HMENU>(static_cast<INT_PTR>(IDC_TERM_DLG_RETAINED)),
+            hInst, nullptr);
+        ListView_SetExtendedListViewStyle(ds->listRetained, LVS_EX_FULLROWSELECT | LVS_EX_GRIDLINES);
+        {
+            LVCOLUMNW col = {};
+            col.mask = LVCF_TEXT | LVCF_WIDTH | LVCF_SUBITEM;
+            col.cx = 50;
+            col.pszText = const_cast<LPWSTR>(L"ID");
+            ListView_InsertColumn(ds->listRetained, 0, &col);
+            col.cx = 160;
+            col.pszText = const_cast<LPWSTR>(L"Name");
+            ListView_InsertColumn(ds->listRetained, 1, &col);
+            col.cx = 300;
+            col.pszText = const_cast<LPWSTR>(L"Command / Shell");
+            ListView_InsertColumn(ds->listRetained, 2, &col);
+            col.cx = 90;
+            col.pszText = const_cast<LPWSTR>(L"Connections");
+            ListView_InsertColumn(ds->listRetained, 3, &col);
+            col.cx = 120;
+            col.pszText = const_cast<LPWSTR>(L"Elapsed");
+            ListView_InsertColumn(ds->listRetained, 4, &col);
+        }
         ds->chkNotify = CreateWindowExW(0, L"BUTTON",
             Tr(L"接続・切断を通知", L"Notify on connect/disconnect",
                L"Notificar conexión/desconexión"),
@@ -11412,21 +11510,26 @@ static LRESULT CALLBACK TermSessionsWndProc(HWND hwnd, UINT msg, WPARAM wParam, 
             WS_CHILD | WS_VISIBLE | WS_TABSTOP, 0, 0, 10, 10, hwnd,
             reinterpret_cast<HMENU>(static_cast<INT_PTR>(IDC_TERM_DLG_REFRESH)), hInst, nullptr);
 
-        for (HWND control : {ds->lblTitle, ds->lblStatus, ds->list, ds->chkNotify,
+        for (HWND control : {ds->lblTitle, ds->lblStatus, ds->list,
+                             ds->lblRetained, ds->listRetained, ds->chkNotify,
                              ds->btnKill, ds->btnRefresh}) {
             if (!control) continue;
-            HFONT font = control == ds->lblTitle ? ds->dash->hFontUiBold : ds->dash->hFontUi;
+            HFONT font = (control == ds->lblTitle || control == ds->lblRetained)
+                             ? ds->dash->hFontUiBold
+                             : ds->dash->hFontUi;
             if (font) SendMessageW(control, WM_SETFONT, reinterpret_cast<WPARAM>(font), TRUE);
         }
 
         ApplyDashboardNativeTheme(hwnd);
-        ApplyNativeControlTheme(ds->list, IsDarkThemeActive());
-        if (HWND header = ListView_GetHeader(ds->list)) {
-            ApplyNativeControlTheme(header, IsDarkThemeActive());
+        for (HWND list : {ds->list, ds->listRetained}) {
+            ApplyNativeControlTheme(list, IsDarkThemeActive());
+            if (HWND header = ListView_GetHeader(list)) {
+                ApplyNativeControlTheme(header, IsDarkThemeActive());
+            }
+            ListView_SetBkColor(list, g_theme.panel);
+            ListView_SetTextBkColor(list, g_theme.panel);
+            ListView_SetTextColor(list, g_theme.listText);
         }
-        ListView_SetBkColor(ds->list, g_theme.panel);
-        ListView_SetTextBkColor(ds->list, g_theme.panel);
-        ListView_SetTextColor(ds->list, g_theme.listText);
 
         RECT rc = {};
         GetClientRect(hwnd, &rc);
@@ -11488,8 +11591,8 @@ static LRESULT CALLBACK TermSessionsWndProc(HWND hwnd, UINT msg, WPARAM wParam, 
     }
     case WM_GETMINMAXINFO: {
         auto* mmi = reinterpret_cast<MINMAXINFO*>(lParam);
-        mmi->ptMinTrackSize.x = 520;
-        mmi->ptMinTrackSize.y = 300;
+        mmi->ptMinTrackSize.x = 560;
+        mmi->ptMinTrackSize.y = 460;
         return 0;
     }
     case WM_ERASEBKGND: {
@@ -11561,8 +11664,8 @@ static void ShowTermSessionsDialog(DashboardState* st) {
     } else {
         SystemParametersInfoW(SPI_GETWORKAREA, 0, &rc, 0);
     }
-    const int width = 760;
-    const int height = 460;
+    const int width = 820;
+    const int height = 620;
     const int x = rc.left + ((rc.right - rc.left) - width) / 2;
     const int y = rc.top + ((rc.bottom - rc.top) - height) / 2;
 

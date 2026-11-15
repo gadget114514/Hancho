@@ -11,6 +11,7 @@ class ProcessManager;
 
 struct TermSessionInfo {
     uint32_t id = 0;
+    uint32_t jobId = 0;     // ConPTY job the session is attached to (0 before attach)
     std::string remoteAddr; // e.g. "127.0.0.1:54321"
     std::string target;     // e.g. "powershell" or "attach:12"
     int64_t connectedSec = 0;

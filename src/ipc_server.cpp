@@ -573,6 +573,7 @@ std::string IpcServer::HandleRequestJson(const std::string& reqJson) {
         for (const auto& s : sessions) {
             nlohmann::json item;
             item["id"] = s.id;
+            item["job_id"] = s.jobId;
             item["remote"] = s.remoteAddr;
             item["target"] = s.target;
             item["connected_sec"] = s.connectedSec;

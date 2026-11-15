@@ -165,6 +165,7 @@ public:
     TermSessionInfo GetInfo() const {
         TermSessionInfo info;
         info.id = id_;
+        info.jobId = static_cast<uint32_t>(jobId_.load());
         info.remoteAddr = remoteAddr_;
         info.target = target_;
         auto now = std::chrono::steady_clock::now();
