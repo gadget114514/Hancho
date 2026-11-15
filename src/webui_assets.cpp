@@ -175,11 +175,12 @@ const char kIndexHtml_0[] = R"HTML_0(<!DOCTYPE html>
               <th style="width: 100px;">Memory</th>
               <th style="width: 80px;">Exit</th>
               <th style="width: 140px;">Started</th>
+              <th style="width: 140px;">End time</th>
               <th style="width: 220px; text-align: center;">Actions</th>
             </tr>
           </thead>
           <tbody id="proc-tbody">
-            <tr class="empty-row"><td colspan="9">Loading processes...</td></tr>
+            <tr class="empty-row"><td colspan="10">Loading processes...</td></tr>
           </tbody>
         </table>
       </div>
@@ -276,12 +277,14 @@ const char kIndexHtml_0[] = R"HTML_0(<!DOCTYPE html>
 const char kIndexHtml_1[] = R"HTML_1(              <th>Command</th>
               <th style="width: 80px;">Exit</th>
               <th style="width: 90px;">Duration</th>
+              <th style="width: 150px;">Started</th>
+              <th style="width: 150px;">Ended</th>
               <th style="width: 140px;">Updated</th>
               <th style="width: 180px; text-align: center;">Actions</th>
             </tr>
           </thead>
           <tbody id="tq-tbody">
-            <tr class="empty-row"><td colspan="9">Loading task queue...</td></tr>
+            <tr class="empty-row"><td colspan="11">Loading task queue...</td></tr>
           </tbody>
         </table>
       </div>
@@ -2151,6 +2154,33 @@ const char kAppJs_1[] = R"JS_1(    if (data.events && Array.isArray(data.events)
     }
   }
 
+  function parseTimestamp(value) {
+    if (!value) return null;
+    if (typeof value === 'number') return new Date(value * 1000);
+    const text = String(value);
+    const d = new Date(text.includes('T') ? text : text.replace(' ', 'T'));
+    return isNaN(d.getTime()) ? null : d;
+  }
+
+  function formatDateTime(value) {
+    if (!value) return '-';
+    const d = parseTimestamp(value);
+    if (!d) return String(value);
+    const pad = n => String(n).padStart(2, '0');
+    return `${d.getFullYear()}-${pad(d.getMonth() + 1)}-${pad(d.getDate())} ` +
+           `${pad(d.getHours())}:${pad(d.getMinutes())}:${pad(d.getSeconds())}`;
+  }
+
+  function taskAttemptTimes(job) {
+    const attempts = Array.isArray(job.attempts) ? job.attempts : [];
+    const last = attempts.length ? attempts[attempts.length - 1] : null;
+    const start = (last && (last.start || last.started_at)) ||
+                  job.started_at || job.startedAt || job.start_time || '';
+    const end = (last && (last.end || last.ended_at)) ||
+                job.ended_at || job.endedAt || job.finished_at || job.finishedAt || '';
+    return { start, end };
+  }
+
   function formatBytes(bytes) {
     if (bytes === undefined || bytes === null || isNaN(bytes)) return '-';
     const b = Number(bytes);
@@ -2203,6 +2233,8 @@ const char kAppJs_1[] = R"JS_1(    if (data.events && Array.isArray(data.events)
       return;
     }
 
+    filtered.sort((a, b) => Number(b.id) - Number(a.id));
+
     let html = '';
     for (const p of filtered) {
       const id = p.id;
@@ -2213,6 +2245,7 @@ const char kAppJs_1[] = R"JS_1(    if (data.events && Array.isArray(data.events)
       const mem = formatBytes(p.memory_bytes || p.workingSetSize);
       const exitCode = p.exit_code !== undefined ? p.exit_code : '-';
       const started = formatTime(p.start_time || p.createdAt);
+      const ended = formatTime(p.end_time);
 
       const isRunning = (p.state || '').toLowerCase() === 'running';
 
@@ -2340,23 +2373,42 @@ const char kAppJs_1[] = R"JS_1(    if (data.events && Array.isArray(data.events)
 )JS_1";
 const char kAppJs_2[] = R"JS_2(    if (filtered.length === 0) {
       const msg = state.jobs.length === 0 ? 'No jobs in queue.' : 'No jobs match current filter.';
-      elTqTbody.innerHTML = `<tr class="empty-row"><td colspan="9">${escapeHtml(msg)}</td></tr>`;
+      elTqTbody.innerHTML = `<tr class="empty-row"><td colspan="11">${escapeHtml(msg)}</td></tr>`;
       return;
     }
 
     let html = '';
     for (const job of filtered) {
       const key = escapeHtml(job.key || job.id || '-');
-      const name = escapeHtml(job.name || '(unnamed)');
+      const name = escapeHtml(job.name || job.summary || '(unnamed)');
       const queue = escapeHtml(job.taskqueue || job.queue || 'default');
-      const cmd = escapeHtml(job.commandLine || job.cmd || '-');
+      const cmd = escapeHtml(job.command || job.commandLine || job.cmd || '-');
       const stateBadge = `<span class="${getBadgeClass(job.state)}">${escapeHtml(job.state || 'unknown')}</span>`;
-      const exitCode = job.exitCode !== undefined ? job.exitCode : '-';
-      const duration = formatDuration(job.durationSec || job.elapsedSec);
-      const updated = formatTime(job.updatedAt || job.createdAt);
+      const attempts = Array.isArray(job.attempts) ? job.attempts : [];
+      const lastAttempt = attempts.length ? attempts[attempts.length - 1] : null;
+      const exitValue = job.exit_code !== undefined ? job.exit_code
+        : (lastAttempt && lastAttempt.exit_code !== undefined ? lastAttempt.exit_code : job.exitCode);
+      const exitCode = exitValue !== undefined ? exitValue : '-';
 
       const isRunning = (job.state || '').toLowerCase() === 'running';
       const isFailed = (job.state || '').toLowerCase() === 'failed';
+
+      const { start: startAt, end: endAt } = taskAttemptTimes(job);
+      const started = startAt ? formatDateTime(startAt) : '-';
+      const ended = endAt ? formatDateTime(endAt) : (isRunning ? 'running' : '-');
+      let durationSec = job.duration_sec !== undefined ? job.duration_sec
+        : (job.durationSec !== undefined ? job.durationSec
+        : (job.elapsed_sec !== undefined ? job.elapsed_sec : job.elapsedSec));
+      if (durationSec === undefined && startAt && endAt) {
+        const startDate = parseTimestamp(startAt);
+        const endDate = parseTimestamp(endAt);
+        if (startDate && endDate) {
+          durationSec = Math.max(0, (endDate.getTime() - startDate.getTime()) / 1000);
+        }
+      }
+      const duration = formatDuration(durationSec);
+      const updatedRaw = job.updated_at || job.updatedAt || job.created_at || job.createdAt;
+      const updated = formatDateTime(updatedRaw);
 
       html += `<tr data-job-key="${key}">
         <td>${stateBadge}</td>
@@ -2366,6 +2418,8 @@ const char kAppJs_2[] = R"JS_2(    if (filtered.length === 0) {
         <td class="job-cmd" title="${cmd}">${cmd}</td>
         <td>${exitCode}</td>
         <td>${duration}</td>
+        <td title="${escapeHtml(startAt)}">${started}</td>
+        <td title="${escapeHtml(endAt)}">${ended}</td>
         <td>${updated}</td>
         <td style="text-align: center;">
           <button class="btn btn-sm btn-job-details" data-key="${key}">Details</button>

@@ -2277,6 +2277,24 @@ LRESULT CALLBACK IpmsgWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam)
             }
             switch (id) {
                 case IDC_BTN_REFRESH_PEERS: {
+                    nlohmann::json status;
+                    bool enabled = st->running;
+                    if (IpcCall({{"action", "chat_status"}}, status)) {
+                        if (status.contains("config") && status["config"].is_object()) {
+                            enabled = status["config"].value("enabled", false);
+                        } else {
+                            enabled = status.value("running", false);
+                        }
+                    }
+                    if (!enabled) {
+                        MessageBoxW(hwnd,
+                                    T(L"チャットが有効でない（チャット設定で有効にしてください）",
+                                      L"Chat is not enabled (enable it in the chat settings)",
+                                      L"El chat no está activado (actívalo en los ajustes del chat)"),
+                                    T(L"チャット", L"Chat", L"Chat"),
+                                    MB_ICONINFORMATION | MB_OK);
+                        break;
+                    }
                     nlohmann::json resp;
                     IpcCall({{"action", "chat_refresh"}}, resp);
                     SetTimer(hwnd, TIMER_PEERS, 800, nullptr);
