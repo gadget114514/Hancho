@@ -641,10 +641,16 @@ void Place(HWND h, int x, int y, int w, int hgt) {
     MoveWindow(h, x, y, w, hgt, TRUE);
 }
 
-// The received body and attachments are shown only while composing a reply.
+// The received body and attachments are shown for the selected message, whether or
+// not the lower pane is composing a reply.
+bool ShowMessageDetail(const DialogState* st) {
+    return st && st->currentPage == 0 &&
+           (st->replyActive || st->selectedMessage.is_object());
+}
+
 void UpdateReplyDetailVisibility(DialogState* st) {
     if (!st) return;
-    const bool show = st->replyActive && st->currentPage == 0;
+    const bool show = ShowMessageDetail(st);
     HWND controls[] = {st->detailLabel, st->msgText, st->filesLabel, st->files,
                        st->btnDownload, st->btnOpenFolder};
     for (HWND h : controls) {
@@ -671,10 +677,10 @@ void LayoutChat(DialogState* st, const RECT& pr) {
     Place(st->peers, rx, pr.top + S(44), rightW,
           (std::max)(S(40), hostBottom - static_cast<int>(pr.top) - S(44)));
 
-    // Left: the message list, plus the received body and attachments while replying.
+    // Left: the message list, plus the selected message body and attachments.
     const int msgTop = pr.top;
     Place(st->msgLabel, pr.left, msgTop, lw, S(20));
-    if (st->replyActive) {
+    if (ShowMessageDetail(st)) {
         int msgH = (pr.bottom - msgTop - S(20) - S(8)) * 45 / 100;
         if (msgH < S(60)) msgH = S(60);
         Place(st->messages, pr.left, msgTop + S(20), lw, msgH);
@@ -1012,6 +1018,7 @@ void ClearMessageDetail(DialogState* st) {
     st->selectedMessage = nlohmann::json();
     if (st->msgText) SetWindowTextW(st->msgText, L"");
     if (st->files) ListView_DeleteAllItems(st->files);
+    UpdateReplyDetailVisibility(st);
 }
 
 void PopulateFiles(DialogState* st, const nlohmann::json& message) {
@@ -1070,6 +1077,7 @@ void SelectMessage(DialogState* st, int idx) {
         SetMessageTimeCell(st, row, msg);
         InvalidateRect(st->messages, nullptr, FALSE);
     }
+    UpdateReplyDetailVisibility(st);
 }
 
 void LoadMessages(DialogState* st) {
@@ -2367,8 +2375,10 @@ LRESULT CALLBACK IpmsgWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam)
                     if (ListView_GetItem(st->messages, &info)) {
                         const int idx = static_cast<int>(info.lParam);
                         SelectMessage(st, idx);
-                        // A selected message means reply; a selected host means a new send.
-                        if (st->replyActive || GetFocus() == st->messages) EnterReplyMode(st, idx);
+                        // Clicking reads the message; reply mode is entered from the
+                        // destination combo or by double-clicking the row.
+                        if (st->replyActive) EnterReplyMode(st, idx);
+                        LayoutCurrentPage(st);
                     }
                 }
                 return 0;
@@ -2380,7 +2390,23 @@ LRESULT CALLBACK IpmsgWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam)
                     info.mask = LVIF_PARAM;
                     info.iItem = nm->iItem;
                     if (ListView_GetItem(st->messages, &info)) {
-                        EnterReplyMode(st, static_cast<int>(info.lParam));
+                        SelectMessage(st, static_cast<int>(info.lParam));
+                        LayoutCurrentPage(st);
+                    }
+                }
+                return 0;
+            }
+            if (hdr->idFrom == IDC_MESSAGES && hdr->code == NM_DBLCLK) {
+                auto* nm = reinterpret_cast<NMITEMACTIVATE*>(lParam);
+                if (nm && nm->iItem >= 0) {
+                    LVITEMW info = {};
+                    info.mask = LVIF_PARAM;
+                    info.iItem = nm->iItem;
+                    if (ListView_GetItem(st->messages, &info)) {
+                        const int idx = static_cast<int>(info.lParam);
+                        SelectMessage(st, idx);
+                        EnterReplyMode(st, idx);
+                        LayoutCurrentPage(st);
                     }
                 }
                 return 0;

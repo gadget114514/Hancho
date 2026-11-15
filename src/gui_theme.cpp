@@ -275,12 +275,21 @@ void ApplyNativeControlTheme(HWND hwnd, bool dark) {
     SetWindowTheme(hwnd, dark ? L"DarkMode_Explorer" : L"", dark ? nullptr : L"");
 }
 
+// The top-level window frame must not be un-themed in light mode: passing empty
+// strings to SetWindowTheme disables visual styles, so the caption falls back to
+// the classic 24x24 buttons and the modern DWM frame is lost. nullptr restores
+// the default theme, keeping the caption buttons identical in every theme.
+static void ApplyWindowFrameTheme(HWND hwnd, bool dark) {
+    ApplyDarkModeApi(hwnd, dark);
+    SetWindowTheme(hwnd, dark ? L"DarkMode_Explorer" : nullptr, nullptr);
+}
+
 void ApplyNativeThemeToWindow(HWND hwnd, bool dark) {
     if (!hwnd) return;
     BOOL darkFlag = dark ? TRUE : FALSE;
     DwmSetWindowAttribute(hwnd, 20, &darkFlag, sizeof(darkFlag));
     DwmSetWindowAttribute(hwnd, 19, &darkFlag, sizeof(darkFlag));
-    ApplyNativeControlTheme(hwnd, dark);
+    ApplyWindowFrameTheme(hwnd, dark);
     for (HWND child = GetWindow(hwnd, GW_CHILD); child; child = GetWindow(child, GW_HWNDNEXT)) {
         ApplyNativeControlTheme(child, dark);
         if (GetWindow(child, GW_CHILD)) {

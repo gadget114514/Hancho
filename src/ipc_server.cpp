@@ -531,7 +531,7 @@ std::string IpcServer::HandleChatAction(const std::string& action, const std::st
 
 std::string IpcServer::HandleRequestJson(const std::string& reqJson) {
     std::string action = JsonGetString(reqJson, "action", "");
-    if (action != "ping") {
+    if (action != "ping" && action != "term_sessions") {
         WriteAuditLog("IPC_REQ", RedactIpcToken(reqJson));
     }
     std::ostringstream oss;

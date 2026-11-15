@@ -558,7 +558,6 @@ constexpr int kMinStreamPaneH      = 160;
 constexpr int64_t kLongStepMs      = 30000;
 
 enum ControlId {
-    IDC_BTN_START = 1005,
     IDC_BTN_KILL_SEL = 1006,
     IDC_BTN_KILL_ALL = 1007,
     IDC_BTN_CLEAR = 1008,
@@ -588,6 +587,7 @@ enum ControlId {
     IDC_EDIT_SEARCH_PROC = 1049,
     IDC_EDIT_SEARCH_TASK = 1050,
     IDC_BTN_IPMSG = 1051,
+    IDC_BTN_TERM_SESSIONS = 1052,  // active WCSP terminal connections
     IDC_SET_LANG_JA = 6001,
     IDC_SET_LANG_EN = 6002,
     IDC_SET_LANG_ES = 6003,
@@ -653,9 +653,7 @@ enum ControlId {
     IDC_SET_TERM_TOKEN = 6076,
     IDC_SET_TERM_TOKEN_UPDATE = 6077,
     IDC_SET_TERM_TOKEN_ROLL = 6078,
-    IDC_SET_TERM_SESSIONS_LIST = 6079,
-    IDC_SET_TERM_SESSIONS_KILL = 6080,
-    IDC_SET_TERM_SESSIONS_REFRESH = 6081,
+    IDC_SET_TERM_SESSIONS_OPEN = 6082,
     IDC_SET_USAGE_REFRESH_INTERVAL = 6073,
     IDC_SET_STREAM_REFRESH_INTERVAL = 6074,
     IDC_SET_PROCESS_METRICS_INTERVAL = 6075,
@@ -739,7 +737,6 @@ struct DashboardState {
     WINDOWPLACEMENT windowPlacement = {sizeof(WINDOWPLACEMENT)};
     int processListColumnWidths[14] = {52, 78, 100, 100, 120, 140, 85, 65, 72, 78, 70, 185, 175, 80};
     int taskListColumnWidths[11] = {90, 350, 100, 150, 105, 115, 190, 110, 82, 150, 200};
-    HWND hwndBtnStart = nullptr;
     HWND hwndBtnSettings = nullptr;
     HWND hwndBtnKillSel = nullptr;
     HWND hwndBtnKillAll = nullptr;
@@ -748,6 +745,12 @@ struct DashboardState {
     HWND hwndBtnHideTray = nullptr;
     HWND hwndBtnToggleList = nullptr;
     HWND hwndBtnToggleTerm = nullptr;
+    HWND hwndBtnTermSessions = nullptr;
+    HWND hwndTermSessionsDlg = nullptr;
+    bool notifyTerminalSessions = true;
+    bool termSessionNotifyInitialized = false;
+    std::map<uint32_t, std::wstring> knownTermSessions;
+    uint64_t nextTermSessionPollMs = 0;
     HWND hwndBtnUsage = nullptr;
     HWND hwndBtnHint = nullptr;
     HWND hwndBtnHistory = nullptr;
@@ -2232,9 +2235,9 @@ static void DrawDashboardCanvas(DashboardState* st, HDC hdcWindow) {
 
             SetTextColor(hdc, g_theme.muted);
             SelectObject(hdc, st->hFontUiBold);
-            DrawTextW(hdc, Tr(L"アクティブな TerminalView がありません。[+ Launch] または Claude CLI / MCP から起動してください。",
-                                  L"No active TerminalView sessions. Click [+ New Shell] above or start via Claude CLI / MCP.",
-                                  L"No hay sesiones TerminalView activas. Use [+ Launch] o inicie desde Claude CLI / MCP."),
+            DrawTextW(hdc, Tr(L"アクティブな TerminalView がありません。HanchoTerm.exe または Claude CLI / MCP から起動してください。",
+                                  L"No active TerminalView sessions. Start one from HanchoTerm.exe, Claude CLI or MCP.",
+                                  L"No hay sesiones TerminalView activas. Inicie una desde HanchoTerm.exe, Claude CLI o MCP."),
                       -1, &rcEmpty, DT_CENTER | DT_VCENTER | DT_SINGLELINE);
         }
     } else {
@@ -2681,6 +2684,11 @@ static void UpdatePanelToggleLabels(DashboardState* st) {
                          L"Shows LLM events for the selected process (tool calls, token usage) below the lists.",
                          L"Muestra los eventos LLM del proceso seleccionado (llamadas y uso de tokens) bajo las listas."));
         }
+        if (st->hwndBtnTermSessions)
+            UpdateControlTooltip(st->hwndToolbarTip, st->hwndMain, st->hwndBtnTermSessions,
+                Tr(L"WinConsoleServer のアクティブな接続一覧を開きます。\n接続元・ターゲット・接続時間の確認と、セッションの切断ができます。",
+                   L"Opens the active WinConsoleServer connections.\nReview the client, target and duration, and disconnect sessions.",
+                   L"Abre las conexiones activas de WinConsoleServer.\nRevisa el cliente, el destino y la duración y desconecta sesiones."));
         if (st->hwndBtnBtView) {
             UpdateControlTooltip(st->hwndToolbarTip, st->hwndMain, st->hwndBtnBtView,
                 Tr(L"ビヘイビアツリーのデバッグ表示を開きます。\n各タスクを起動したノードと、ツリーの実行の進み具合を確認できます。\nショートカット: Ctrl+Shift+B",
@@ -2692,12 +2700,6 @@ static void UpdatePanelToggleLabels(DashboardState* st) {
                 Tr(L"プロセス一覧・タスクキュー・ターミナル・監視ペインを今すぐ更新します。\n通常は設定した更新間隔で自動更新されます。",
                    L"Refreshes the process list, task queue, terminals and monitor pane now.\nThey otherwise update automatically at the configured interval.",
                    L"Actualiza ahora las listas, las terminales y el panel de monitor.\nNormalmente se actualizan solos según el intervalo configurado."));
-        }
-        if (st->hwndBtnStart) {
-            UpdateControlTooltip(st->hwndToolbarTip, st->hwndMain, st->hwndBtnStart,
-                Tr(L"新しいターミナルを開き、既定のシェルでプロセスを起動します。\n使用するシェルは「設定 → 表示 → シェル構成」で変更できます。",
-                   L"Opens a new terminal and starts a process with the configured default shell.\nChange it in Settings > Appearance > Shell Config.",
-                   L"Abre una terminal nueva e inicia un proceso con el shell predeterminado.\nCámbialo en Ajustes > Apariencia > Configurar shell."));
         }
         if (st->hwndBtnSettings) {
             UpdateControlTooltip(st->hwndToolbarTip, st->hwndMain, st->hwndBtnSettings,
@@ -2886,6 +2888,7 @@ static bool TickEndBlink(DashboardState* st) {
 }
 
 static void RefreshDashboardData(DashboardState* st);
+static void SyncTermSessionNotifications(DashboardState* st);
 static void SyncStreamPane(DashboardState* st);
 static void EnsureStreamPane(DashboardState* st);
 static void SaveShellConfig(const DashboardState* st);
@@ -5344,6 +5347,8 @@ static void UpdateTriageFromCore(DashboardState* st);
 
 static void RefreshDashboardData(DashboardState* st) {
     if (!st) return;
+    // Works while the dashboard is hidden in the tray too.
+    SyncTermSessionNotifications(st);
     // Hidden in the tray: no one sees the lists, so only watch for finished processes (completion sound).
     if (!IsWindowVisible(st->hwndMain) || IsIconic(st->hwndMain)) {
         st->allSnapshots = FetchProcessSnapshotsIpc(st);
@@ -5929,12 +5934,12 @@ static void LayoutControls(DashboardState* st, int width, int height) {
     struct ToolbarButton { HWND hwnd; int w; };
     const ToolbarButton buttons[] = {
         {st->hwndBtnViewTasks, 150},
-        {st->hwndBtnStart, 160},
         {st->hwndBtnSettings, 90},
         {st->hwndBtnKillAll, 74},
         {st->hwndBtnGridView, 28},
         {st->hwndBtnToggleList, 28},
         {st->hwndBtnToggleTerm, 30},
+        {st->hwndBtnTermSessions, 28},
         {st->hwndBtnStreamPane, 28},
         {st->hwndBtnBtView, 34},
         {st->hwndBtnUsage, 28},
@@ -9950,6 +9955,7 @@ static void LoadShellConfig(DashboardState* st) {
     st->hideEndedProcesses = JsonGetBool(content, "hide_ended", false);
     st->hideProcessList = JsonGetBool(content, "hide_process_list", false);
     st->hideTerminalGrid = JsonGetBool(content, "hide_terminal_grid", true);
+    st->notifyTerminalSessions = JsonGetBool(content, "terminal_notify", true);
     // The standalone dashboard no longer embeds the WCSP client. Terminals are
     // shown by the separate terminal client window (Hancho.exe terminal).
     if (!st->pm) st->hideTerminalGrid = true;
@@ -10064,6 +10070,7 @@ static void SaveShellConfig(const DashboardState* st) {
        << "  \"hide_ended\": " << (st->hideEndedProcesses ? "true" : "false") << ",\n"
        << "  \"hide_process_list\": " << (st->hideProcessList ? "true" : "false") << ",\n"
        << "  \"hide_terminal_grid\": " << (st->hideTerminalGrid ? "true" : "false") << ",\n"
+       << "  \"terminal_notify\": " << (st->notifyTerminalSessions ? "true" : "false") << ",\n"
        << "  \"completion_sound_enabled\": " << (st->completionSoundEnabled ? "true" : "false") << ",\n"
        << "  \"completion_sound_path\": \"" << JsonEscape(st->completionSoundPath) << "\",\n"
        << "  \"end_blink_enabled\": " << (st->endBlinkEnabled ? "true" : "false") << ",\n"
@@ -10159,16 +10166,6 @@ static void SaveShellConfig(const DashboardState* st) {
     }
 }
 
-static void UpdateLaunchButtonLabel(DashboardState* st) {
-    if (!st || !st->hwndBtnStart) return;
-    std::wstring label = Tr(L"+ 起動 (", L"+ Launch (", L"+ Iniciar (");
-    if (st->defaultShell == ShellType::Cmd) label += L"cmd";
-    else if (st->defaultShell == ShellType::Bash) label += L"bash";
-    else label += L"powershell";
-    label += L")";
-    SetWindowTextW(st->hwndBtnStart, label.c_str());
-}
-
 static void ApplyListTheme(DashboardState* st) {
     if (!st || !st->hwndList) return;
     ListView_SetBkColor(st->hwndList, g_theme.panel);
@@ -10206,7 +10203,6 @@ static void UpdateClock(DashboardState* st) {
 
 static void UpdateToolbarLabels(DashboardState* st) {
     if (!st) return;
-    UpdateLaunchButtonLabel(st);
     if (st->hwndBtnSettings)
         SetWindowTextW(st->hwndBtnSettings, Tr(L"設定", L"Settings", L"Ajustes"));
     if (st->hwndBtnKillAll)
@@ -10217,6 +10213,8 @@ static void UpdateToolbarLabels(DashboardState* st) {
         SetWindowTextW(st->hwndBtnToggleList, L"☰");
     if (st->hwndBtnToggleTerm)
         SetWindowTextW(st->hwndBtnToggleTerm, L">_");
+    if (st->hwndBtnTermSessions)
+        SetWindowTextW(st->hwndBtnTermSessions, L"🔌");
     if (st->hwndBtnHideTray)
         SetWindowTextW(st->hwndBtnHideTray, L"⤓");
     if (st->hwndBtnHint)
@@ -10337,11 +10335,6 @@ static void LaunchShellByType(DashboardState* st, ShellType type) {
     }
 }
 
-static void LaunchFromToolbar(DashboardState* st) {
-    if (!st) return;
-    LaunchShellByType(st, st->defaultShell);
-}
-
 struct ShellConfigDlgState {
     DashboardState* dash = nullptr;
     HWND hwndRadCmd = nullptr;
@@ -10366,7 +10359,6 @@ static void ApplyShellConfigFromDialog(HWND hwnd, ShellConfigDlgState* cs) {
     cs->dash->bashCommand = WideToUtf8(buf);
 
     SaveShellConfig(cs->dash);
-    UpdateLaunchButtonLabel(cs->dash);
 }
 
 static LRESULT CALLBACK ShellConfigWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
@@ -10864,8 +10856,7 @@ static int ThemeButtonId(UiTheme theme) {
     }
 }
 
-static constexpr int kSettingsTabCount = 8;
-constexpr UINT_PTR kTermSessionsTimerId = 100;
+static constexpr int kSettingsTabCount = 9;
 
 struct SettingsDlgState {
     DashboardState* dash = nullptr;
@@ -10949,10 +10940,7 @@ struct SettingsDlgState {
       HWND btnTermTokenApply = nullptr;
       HWND btnTermTokenRoll = nullptr;
       HWND lblTermHint = nullptr;
-      HWND lblTermSessions = nullptr;
-      HWND listTermSessions = nullptr;
-      HWND btnTermKillSession = nullptr;
-      HWND btnTermRefreshSessions = nullptr;
+      HWND btnTermSessionsOpen = nullptr;
       nlohmann::json terminalConfig = nlohmann::json::object();
       HWND lblSupervisorCommand = nullptr;
       HWND editSupervisorCommand = nullptr;
@@ -10975,8 +10963,8 @@ struct SettingsDlgState {
        HWND hwndAboutVersion = nullptr;
        HWND hwndAboutDesc = nullptr;
        HWND tabCtrl = nullptr;
-       // controls shown under each tab: 0 appearance, 1 behavior, 2 WinConsoleServer,
-       // 3 triage, 4 maintenance, 5 performance, 6 colors, 7 about
+        // controls shown under each tab: 0 appearance, 1 behavior, 2 WinConsole,
+        // 3 triage, 4 WebUI, 5 maintenance, 6 performance, 7 colors, 8 about
        std::vector<HWND> tabPages[kSettingsTabCount];
 };
 
@@ -11142,94 +11130,431 @@ static void CommitSupervisorSettings(SettingsDlgState* ds, bool persist = true) 
     SendSupervisorSettings(ds);
 }
 
-static void RefreshTermSessions(SettingsDlgState* ds) {
-    if (!ds || !ds->dash || !ds->listTermSessions) return;
+// ---------------------------------------------------------------------------
+// Active WCSP terminal connections (standalone dialog)
+// ---------------------------------------------------------------------------
 
-    // Keep the selected session selected across the periodic refresh.
+struct TermSessionRow {
+    uint32_t id = 0;
+    std::string remote;
+    std::string target;
+    int64_t connectedSec = 0;
+};
+
+static bool FetchTermSessions(DashboardState* st, std::vector<TermSessionRow>& out) {
+    out.clear();
+    if (!st) return false;
+    nlohmann::json req = {{"action", "term_sessions"}};
+    nlohmann::json resp;
+    if (!GuiIpcCall(st, req, resp) || !resp.value("ok", false)) return false;
+    if (!resp.contains("sessions") || !resp["sessions"].is_array()) return false;
+    for (const auto& item : resp["sessions"]) {
+        if (!item.is_object()) continue;
+        TermSessionRow row;
+        row.id = item.value("id", 0);
+        row.remote = item.value("remote", std::string());
+        row.target = item.value("target", std::string());
+        row.connectedSec = item.value("connected_sec", static_cast<int64_t>(0));
+        if (row.id != 0) out.push_back(std::move(row));
+    }
+    return true;
+}
+
+static std::wstring FormatTermSessionDuration(int64_t sec) {
+    const int64_t minutes = sec / 60;
+    const int64_t remSec = sec % 60;
+    wchar_t buf[64] = {};
+    if (minutes >= 60) {
+        swprintf_s(buf, L"%lldh %lldm %llds", minutes / 60, minutes % 60, remSec);
+    } else {
+        swprintf_s(buf, L"%lldm %llds", minutes, remSec);
+    }
+    return buf;
+}
+
+// Poll the core and show a tray balloon when a WCSP client connects or disconnects.
+// The first poll only records the current sessions so startup does not notify.
+static void SyncTermSessionNotifications(DashboardState* st) {
+    if (!st || !st->notifyTerminalSessions) return;
+    const uint64_t now = GetNowTickMs();
+    if (st->nextTermSessionPollMs != 0 && now < st->nextTermSessionPollMs) return;
+    st->nextTermSessionPollMs = now + 2000;
+
+    std::vector<TermSessionRow> sessions;
+    if (!FetchTermSessions(st, sessions)) return;
+
+    std::map<uint32_t, std::wstring> current;
+    for (const auto& row : sessions) {
+        std::wstring label = Utf8ToWide(row.remote);
+        if (!row.target.empty()) label += L" - " + Utf8ToWide(row.target);
+        current[row.id] = std::move(label);
+    }
+    if (!st->termSessionNotifyInitialized) {
+        st->knownTermSessions = std::move(current);
+        st->termSessionNotifyInitialized = true;
+        return;
+    }
+    if (st->trayAdded) {
+        for (const auto& entry : current) {
+            if (st->knownTermSessions.find(entry.first) != st->knownTermSessions.end()) continue;
+            WriteAuditLog("TERM_SESSION_NOTIFY", std::string("connected: ") + WideToUtf8(entry.second));
+            gui_platform::GetGuiPlatform()->TrayShowBalloon(
+                st->nid, L"Hancho Terminal",
+                Tr(L"ターミナルが接続しました: ", L"Terminal connected: ", L"Terminal conectada: ") +
+                    entry.second,
+                false);
+        }
+        for (const auto& entry : st->knownTermSessions) {
+            if (current.find(entry.first) != current.end()) continue;
+            WriteAuditLog("TERM_SESSION_NOTIFY", std::string("disconnected: ") + WideToUtf8(entry.second));
+            gui_platform::GetGuiPlatform()->TrayShowBalloon(
+                st->nid, L"Hancho Terminal",
+                Tr(L"ターミナルが切断しました: ", L"Terminal disconnected: ", L"Terminal desconectada: ") +
+                    entry.second,
+                false);
+        }
+    }
+    st->knownTermSessions = std::move(current);
+}
+
+constexpr wchar_t kTermSessionsWndClass[] = L"HanchoTermSessionsWnd";
+constexpr int IDC_TERM_DLG_LIST = 7101;
+constexpr int IDC_TERM_DLG_KILL = 7102;
+constexpr int IDC_TERM_DLG_REFRESH = 7103;
+constexpr int IDC_TERM_DLG_NOTIFY = 7104;
+constexpr UINT_PTR kTermSessionsDlgTimerId = 101;
+
+struct TermSessionsDlgState {
+    DashboardState* dash = nullptr;
+    HWND lblTitle = nullptr;
+    HWND lblStatus = nullptr;
+    HWND list = nullptr;
+    HWND chkNotify = nullptr;
+    HWND btnKill = nullptr;
+    HWND btnRefresh = nullptr;
+};
+
+static void LayoutTermSessionsDialog(TermSessionsDlgState* ds, int width, int height) {
+    if (!ds) return;
+    const int margin = 16;
+    const int headerH = 20;
+    const int btnH = 28;
+    const int gap = 8;
+    const int listTop = margin + headerH + gap;
+    const int bottomY = height - margin - btnH;
+    const int listH = (std::max)(80, bottomY - gap - listTop);
+    if (ds->lblTitle) MoveWindow(ds->lblTitle, margin, margin, 320, headerH, TRUE);
+    if (ds->lblStatus)
+        MoveWindow(ds->lblStatus, (std::max)(margin, width - margin - 380), margin, 380, headerH, TRUE);
+    if (ds->list)
+        MoveWindow(ds->list, margin, listTop, (std::max)(200, width - margin * 2), listH, TRUE);
+    if (ds->chkNotify)
+        MoveWindow(ds->chkNotify, margin, bottomY,
+                   (std::max)(180, width - margin * 2 - 230), btnH, TRUE);
+    int right = width - margin;
+    auto place = [&](HWND button, int buttonWidth) {
+        if (!button) return;
+        right -= buttonWidth;
+        MoveWindow(button, right, bottomY, buttonWidth, btnH, TRUE);
+        right -= gap;
+    };
+    place(ds->btnKill, 110);
+    place(ds->btnRefresh, 80);
+}
+
+static void RefreshTermSessionsDialog(TermSessionsDlgState* ds) {
+    if (!ds || !ds->dash || !ds->list) return;
+
     uint32_t selectedId = 0;
-    int selectedRow = ListView_GetNextItem(ds->listTermSessions, -1, LVNI_SELECTED);
+    const int selectedRow = ListView_GetNextItem(ds->list, -1, LVNI_SELECTED);
     if (selectedRow >= 0) {
         LVITEMW item = {};
         item.mask = LVIF_PARAM;
         item.iItem = selectedRow;
-        if (ListView_GetItem(ds->listTermSessions, &item)) {
-            selectedId = static_cast<uint32_t>(item.lParam);
-        }
+        if (ListView_GetItem(ds->list, &item)) selectedId = static_cast<uint32_t>(item.lParam);
     }
-    SendMessageW(ds->listTermSessions, LVM_DELETEALLITEMS, 0, 0);
 
-    nlohmann::json req = {{"action", "term_sessions"}};
-    nlohmann::json resp;
-    if (!GuiIpcCall(ds->dash, req, resp) || !resp.value("ok", false)) return;
-    if (!resp.contains("sessions") || !resp["sessions"].is_array()) return;
+    std::vector<TermSessionRow> sessions;
+    const bool ok = FetchTermSessions(ds->dash, sessions);
 
-    int idx = 0;
-    for (const auto& item : resp["sessions"]) {
-        uint32_t sid = item.value("id", 0);
-        std::string remote = item.value("remote", "");
-        std::string target = item.value("target", "");
-        int64_t sec = item.value("connected_sec", 0);
-
-        std::wstring idStr = std::to_wstring(sid);
-        std::wstring remoteStr = Utf8ToWide(remote);
-        std::wstring targetStr = Utf8ToWide(target);
-
-        int min = static_cast<int>(sec / 60);
-        int remSec = static_cast<int>(sec % 60);
-        wchar_t timeBuf[64] = {};
-        if (min >= 60) {
-            int hrs = min / 60;
-            min %= 60;
-            swprintf_s(timeBuf, L"%dh %dm %ds", hrs, min, remSec);
-        } else {
-            swprintf_s(timeBuf, L"%dm %ds", min, remSec);
-        }
+    SendMessageW(ds->list, WM_SETREDRAW, FALSE, 0);
+    ListView_DeleteAllItems(ds->list);
+    int index = 0;
+    for (const auto& row : sessions) {
+        const std::wstring idStr = std::to_wstring(row.id);
+        const std::wstring remoteStr = Utf8ToWide(row.remote);
+        const std::wstring targetStr = Utf8ToWide(row.target);
+        const std::wstring timeStr = FormatTermSessionDuration(row.connectedSec);
 
         LVITEMW lvi = {};
         lvi.mask = LVIF_TEXT | LVIF_PARAM;
-        lvi.iItem = idx;
+        lvi.iItem = index;
         lvi.iSubItem = 0;
         lvi.pszText = const_cast<LPWSTR>(idStr.c_str());
-        lvi.lParam = static_cast<LPARAM>(sid);
-        SendMessageW(ds->listTermSessions, LVM_INSERTITEMW, 0, reinterpret_cast<LPARAM>(&lvi));
+        lvi.lParam = static_cast<LPARAM>(row.id);
+        SendMessageW(ds->list, LVM_INSERTITEMW, 0, reinterpret_cast<LPARAM>(&lvi));
 
-        LVITEMW sub1 = {};
-        sub1.iItem = idx;
-        sub1.iSubItem = 1;
-        sub1.pszText = const_cast<LPWSTR>(remoteStr.c_str());
-        SendMessageW(ds->listTermSessions, LVM_SETITEMTEXTW, idx, reinterpret_cast<LPARAM>(&sub1));
+        auto setSub = [&](int sub, const std::wstring& text) {
+            LVITEMW item = {};
+            item.iItem = index;
+            item.iSubItem = sub;
+            item.pszText = const_cast<LPWSTR>(text.c_str());
+            SendMessageW(ds->list, LVM_SETITEMTEXTW, index, reinterpret_cast<LPARAM>(&item));
+        };
+        setSub(1, remoteStr);
+        setSub(2, targetStr);
+        setSub(3, timeStr);
 
-        LVITEMW sub2 = {};
-        sub2.iItem = idx;
-        sub2.iSubItem = 2;
-        sub2.pszText = const_cast<LPWSTR>(targetStr.c_str());
-        SendMessageW(ds->listTermSessions, LVM_SETITEMTEXTW, idx, reinterpret_cast<LPARAM>(&sub2));
-
-        LVITEMW sub3 = {};
-        sub3.iItem = idx;
-        sub3.iSubItem = 3;
-        sub3.pszText = timeBuf;
-        SendMessageW(ds->listTermSessions, LVM_SETITEMTEXTW, idx, reinterpret_cast<LPARAM>(&sub3));
-
-        if (selectedId != 0 && sid == selectedId) {
-            ListView_SetItemState(ds->listTermSessions, idx, LVIS_SELECTED | LVIS_FOCUSED,
+        if (selectedId != 0 && row.id == selectedId) {
+            ListView_SetItemState(ds->list, index, LVIS_SELECTED | LVIS_FOCUSED,
                                   LVIS_SELECTED | LVIS_FOCUSED);
         }
-        idx++;
+        ++index;
+    }
+    SendMessageW(ds->list, WM_SETREDRAW, TRUE, 0);
+    InvalidateRect(ds->list, nullptr, TRUE);
+
+    if (ds->lblStatus) {
+        std::wstring status;
+        if (!ok) {
+            status = Tr(L"接続一覧を取得できませんでした。",
+                        L"Could not read the connection list.",
+                        L"No se pudo leer la lista de conexiones.");
+        } else {
+            status = std::to_wstring(sessions.size()) +
+                     Tr(L" 件のアクティブな接続", L" active connections", L" conexiones activas");
+        }
+        SetWindowTextW(ds->lblStatus, status.c_str());
     }
 }
 
+static LRESULT CALLBACK TermSessionsWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
+    auto* ds = reinterpret_cast<TermSessionsDlgState*>(GetWindowLongPtrW(hwnd, GWLP_USERDATA));
+    switch (msg) {
+    case WM_CREATE: {
+        auto* cs = reinterpret_cast<CREATESTRUCTW*>(lParam);
+        ds = reinterpret_cast<TermSessionsDlgState*>(cs->lpCreateParams);
+        SetWindowLongPtrW(hwnd, GWLP_USERDATA, reinterpret_cast<LONG_PTR>(ds));
+        if (!ds || !ds->dash) return -1;
+
+        HINSTANCE hInst = GetModuleHandleW(nullptr);
+        ds->lblTitle = CreateWindowExW(0, L"STATIC",
+            Tr(L"アクティブなターミナル接続 (WCSP)", L"Active terminal connections (WCSP)",
+               L"Conexiones de terminal activas (WCSP)"),
+            WS_CHILD | WS_VISIBLE | SS_LEFT, 0, 0, 10, 10, hwnd, nullptr, hInst, nullptr);
+        ds->lblStatus = CreateWindowExW(0, L"STATIC", L"",
+            WS_CHILD | WS_VISIBLE | SS_RIGHT, 0, 0, 10, 10, hwnd, nullptr, hInst, nullptr);
+        ds->list = CreateWindowExW(WS_EX_CLIENTEDGE, WC_LISTVIEWW, L"",
+            WS_CHILD | WS_VISIBLE | WS_TABSTOP | LVS_REPORT | LVS_SINGLESEL | LVS_SHOWSELALWAYS,
+            0, 0, 10, 10, hwnd, reinterpret_cast<HMENU>(static_cast<INT_PTR>(IDC_TERM_DLG_LIST)),
+            hInst, nullptr);
+        ListView_SetExtendedListViewStyle(ds->list, LVS_EX_FULLROWSELECT | LVS_EX_GRIDLINES);
+        {
+            LVCOLUMNW col = {};
+            col.mask = LVCF_TEXT | LVCF_WIDTH | LVCF_SUBITEM;
+            col.cx = 60;
+            col.pszText = const_cast<LPWSTR>(L"ID");
+            ListView_InsertColumn(ds->list, 0, &col);
+            col.cx = 190;
+            col.pszText = const_cast<LPWSTR>(L"Remote");
+            ListView_InsertColumn(ds->list, 1, &col);
+            col.cx = 260;
+            col.pszText = const_cast<LPWSTR>(L"Target / Shell");
+            ListView_InsertColumn(ds->list, 2, &col);
+            col.cx = 140;
+            col.pszText = const_cast<LPWSTR>(L"Duration");
+            ListView_InsertColumn(ds->list, 3, &col);
+        }
+        ds->chkNotify = CreateWindowExW(0, L"BUTTON",
+            Tr(L"接続・切断を通知", L"Notify on connect/disconnect",
+               L"Notificar conexión/desconexión"),
+            WS_CHILD | WS_VISIBLE | WS_TABSTOP | BS_AUTOCHECKBOX,
+            0, 0, 10, 10, hwnd, reinterpret_cast<HMENU>(static_cast<INT_PTR>(IDC_TERM_DLG_NOTIFY)),
+            hInst, nullptr);
+        SendMessageW(ds->chkNotify, BM_SETCHECK,
+                     ds->dash->notifyTerminalSessions ? BST_CHECKED : BST_UNCHECKED, 0);
+        ds->btnKill = CreateWindowExW(0, L"BUTTON", Tr(L"切断 (Kill)", L"Disconnect", L"Desconectar"),
+            WS_CHILD | WS_VISIBLE | WS_TABSTOP, 0, 0, 10, 10, hwnd,
+            reinterpret_cast<HMENU>(static_cast<INT_PTR>(IDC_TERM_DLG_KILL)), hInst, nullptr);
+        ds->btnRefresh = CreateWindowExW(0, L"BUTTON", Tr(L"更新", L"Refresh", L"Actualizar"),
+            WS_CHILD | WS_VISIBLE | WS_TABSTOP, 0, 0, 10, 10, hwnd,
+            reinterpret_cast<HMENU>(static_cast<INT_PTR>(IDC_TERM_DLG_REFRESH)), hInst, nullptr);
+
+        for (HWND control : {ds->lblTitle, ds->lblStatus, ds->list, ds->chkNotify,
+                             ds->btnKill, ds->btnRefresh}) {
+            if (!control) continue;
+            HFONT font = control == ds->lblTitle ? ds->dash->hFontUiBold : ds->dash->hFontUi;
+            if (font) SendMessageW(control, WM_SETFONT, reinterpret_cast<WPARAM>(font), TRUE);
+        }
+
+        ApplyDashboardNativeTheme(hwnd);
+        ApplyNativeControlTheme(ds->list, IsDarkThemeActive());
+        if (HWND header = ListView_GetHeader(ds->list)) {
+            ApplyNativeControlTheme(header, IsDarkThemeActive());
+        }
+        ListView_SetBkColor(ds->list, g_theme.panel);
+        ListView_SetTextBkColor(ds->list, g_theme.panel);
+        ListView_SetTextColor(ds->list, g_theme.listText);
+
+        RECT rc = {};
+        GetClientRect(hwnd, &rc);
+        LayoutTermSessionsDialog(ds, rc.right, rc.bottom);
+        SetTimer(hwnd, kTermSessionsDlgTimerId, 1000, nullptr);
+        RefreshTermSessionsDialog(ds);
+        return 0;
+    }
+    case WM_SIZE: {
+        if (ds) LayoutTermSessionsDialog(ds, LOWORD(lParam), HIWORD(lParam));
+        return 0;
+    }
+    case WM_TIMER: {
+        if (wParam == kTermSessionsDlgTimerId && ds) {
+            RefreshTermSessionsDialog(ds);
+            return 0;
+        }
+        break;
+    }
+    case WM_COMMAND: {
+        if (!ds) break;
+        const int id = LOWORD(wParam);
+        if (id == IDC_TERM_DLG_KILL) {
+            const int selected = ListView_GetNextItem(ds->list, -1, LVNI_SELECTED);
+            if (selected >= 0) {
+                LVITEMW item = {};
+                item.mask = LVIF_PARAM;
+                item.iItem = selected;
+                if (ListView_GetItem(ds->list, &item)) {
+                    const uint32_t sessionId = static_cast<uint32_t>(item.lParam);
+                    nlohmann::json resp;
+                    GuiIpcCall(ds->dash, {{"action", "term_kill_session"}, {"id", sessionId}}, resp);
+                    RefreshTermSessionsDialog(ds);
+                }
+            }
+            return 0;
+        }
+        if (id == IDC_TERM_DLG_REFRESH) {
+            RefreshTermSessionsDialog(ds);
+            return 0;
+        }
+        if (id == IDC_TERM_DLG_NOTIFY) {
+            ds->dash->notifyTerminalSessions =
+                SendMessageW(ds->chkNotify, BM_GETCHECK, 0, 0) == BST_CHECKED;
+            ds->dash->termSessionNotifyInitialized = false;
+            ds->dash->knownTermSessions.clear();
+            SaveShellConfig(ds->dash);
+            return 0;
+        }
+        break;
+    }
+    case WM_NOTIFY: {
+        auto* nm = reinterpret_cast<NMHDR*>(lParam);
+        if (ds && nm->idFrom == IDC_TERM_DLG_LIST && nm->code == NM_DBLCLK) {
+            SendMessageW(hwnd, WM_COMMAND, MAKEWPARAM(IDC_TERM_DLG_KILL, 0), 0);
+            return 0;
+        }
+        break;
+    }
+    case WM_GETMINMAXINFO: {
+        auto* mmi = reinterpret_cast<MINMAXINFO*>(lParam);
+        mmi->ptMinTrackSize.x = 520;
+        mmi->ptMinTrackSize.y = 300;
+        return 0;
+    }
+    case WM_ERASEBKGND: {
+        RECT rc = {};
+        GetClientRect(hwnd, &rc);
+        FillRect(reinterpret_cast<HDC>(wParam), &rc,
+                 g_dialogBgBrush ? g_dialogBgBrush : reinterpret_cast<HBRUSH>(COLOR_BTNFACE + 1));
+        return 1;
+    }
+    case WM_CTLCOLORSTATIC:
+    case WM_CTLCOLORBTN: {
+        HDC hdc = reinterpret_cast<HDC>(wParam);
+        SetTextColor(hdc, g_theme.text);
+        SetBkColor(hdc, g_theme.windowBg);
+        SetBkMode(hdc, TRANSPARENT);
+        return reinterpret_cast<LRESULT>(g_dialogBgBrush ? g_dialogBgBrush
+                                                         : GetStockObject(WHITE_BRUSH));
+    }
+    case WM_CTLCOLORLISTBOX: {
+        HDC hdc = reinterpret_cast<HDC>(wParam);
+        SetTextColor(hdc, g_theme.listText);
+        SetBkColor(hdc, g_theme.panel);
+        return reinterpret_cast<LRESULT>(GetStockObject(WHITE_BRUSH));
+    }
+    case WM_CLOSE:
+        DestroyWindow(hwnd);
+        return 0;
+    case WM_DESTROY:
+        KillTimer(hwnd, kTermSessionsDlgTimerId);
+        if (ds) {
+            if (ds->dash && ds->dash->hwndTermSessionsDlg == hwnd) {
+                ds->dash->hwndTermSessionsDlg = nullptr;
+            }
+            delete ds;
+            SetWindowLongPtrW(hwnd, GWLP_USERDATA, 0);
+        }
+        return 0;
+    default:
+        break;
+    }
+    return DefWindowProcW(hwnd, msg, wParam, lParam);
+}
+
+static void ShowTermSessionsDialog(DashboardState* st) {
+    if (!st) return;
+    if (st->hwndTermSessionsDlg && IsWindow(st->hwndTermSessionsDlg)) {
+        if (IsIconic(st->hwndTermSessionsDlg)) ShowWindow(st->hwndTermSessionsDlg, SW_RESTORE);
+        else ShowWindow(st->hwndTermSessionsDlg, SW_SHOW);
+        SetForegroundWindow(st->hwndTermSessionsDlg);
+        return;
+    }
+
+    WNDCLASSEXW wc = {};
+    wc.cbSize = sizeof(wc);
+    wc.style = CS_HREDRAW | CS_VREDRAW;
+    wc.lpfnWndProc = TermSessionsWndProc;
+    wc.hInstance = GetModuleHandleW(nullptr);
+    wc.hCursor = LoadCursorW(nullptr, IDC_ARROW);
+    wc.hbrBackground = reinterpret_cast<HBRUSH>(COLOR_BTNFACE + 1);
+    wc.lpszClassName = kTermSessionsWndClass;
+    RegisterClassExW(&wc);
+
+    auto* ds = new TermSessionsDlgState();
+    ds->dash = st;
+
+    RECT rc = {};
+    if (st->hwndMain && IsWindow(st->hwndMain)) {
+        GetWindowRect(st->hwndMain, &rc);
+    } else {
+        SystemParametersInfoW(SPI_GETWORKAREA, 0, &rc, 0);
+    }
+    const int width = 760;
+    const int height = 460;
+    const int x = rc.left + ((rc.right - rc.left) - width) / 2;
+    const int y = rc.top + ((rc.bottom - rc.top) - height) / 2;
+
+    HWND hwnd = CreateWindowExW(
+        WS_EX_DLGMODALFRAME,
+        kTermSessionsWndClass,
+        Tr(L"ターミナル接続", L"Terminal Connections", L"Conexiones de terminal"),
+        WS_OVERLAPPEDWINDOW | WS_CLIPCHILDREN | WS_VISIBLE,
+        x, y, width, height,
+        st->hwndMain, nullptr, GetModuleHandleW(nullptr), ds);
+    if (!hwnd) {
+        WriteAuditLog("TERM_SESSIONS_DIALOG", std::string("create failed err=") + std::to_string(GetLastError()));
+        delete ds;
+        return;
+    }
+    st->hwndTermSessionsDlg = hwnd;
+    ShowWindow(hwnd, SW_SHOW);
+    SetForegroundWindow(hwnd);
+}
 // Shows the controls of one tab page and hides the rest.
 static void SelectSettingsTab(SettingsDlgState* ds, int tab) {
     if (!ds) return;
     for (int p = 0; p < kSettingsTabCount; ++p) {
         for (HWND h : ds->tabPages[p]) ShowWindow(h, p == tab ? SW_SHOW : SW_HIDE);
-    }
-    if (tab == 2) {
-        if (ds->hwnd) SetTimer(ds->hwnd, kTermSessionsTimerId, 1000, nullptr);
-        RefreshTermSessions(ds);
-    } else if (ds->hwnd) {
-        KillTimer(ds->hwnd, kTermSessionsTimerId);
     }
 }
 
@@ -11522,11 +11847,12 @@ static void UpdateSettingsDialogTexts(HWND hwnd) {
         const wchar_t* const tabNames[kSettingsTabCount] = {
             Tr(L"表示", L"Appearance", L"Apariencia"),
             Tr(L"動作・通知", L"Behavior & alerts", L"Comportamiento y avisos"),
-            Tr(L"WinConsoleServer", L"WinConsoleServer", L"WinConsoleServer"),
+            Tr(L"WinConsole", L"WinConsole", L"WinConsole"),
             Tr(L"トリアージ", L"Triage", L"Triaje"),
+            Tr(L"WebUI", L"WebUI", L"WebUI"),
             Tr(L"管理", L"Maintenance", L"Mantenimiento"),
             Tr(L"パフォーマンス", L"Performance", L"Rendimiento"),
-            Tr(L"色", L"Colors", L"Colores"),
+            Tr(L"色詳細", L"Color details", L"Detalles de color"),
             Tr(L"バージョン情報", L"About", L"Acerca de"),
         };
         for (int t = 0; t < kSettingsTabCount; ++t) {
@@ -11628,36 +11954,8 @@ static void UpdateSettingsDialogTexts(HWND hwnd) {
             L"se conecte con attach:<id>. No hay cifrado; actívalas solo en una LAN de confianza.\r\n\r\n"
             L"* Si el token se deja vacío, se generará uno aleatorio al iniciar el núcleo."));
     }
-    if (ds->lblTermSessions) {
-        SetWindowTextW(ds->lblTermSessions, Tr(
-            L"現在のアクティブセッション一覧:",
-            L"Active Terminal Sessions:",
-            L"Sesiones de terminal activas:"));
-    }
-    if (ds->btnTermKillSession) {
-        SetWindowTextW(ds->btnTermKillSession, Tr(L"切断 (Kill)", L"Disconnect", L"Desconectar"));
-    }
-    if (ds->btnTermRefreshSessions) {
-        SetWindowTextW(ds->btnTermRefreshSessions, Tr(L"更新", L"Refresh", L"Actualizar"));
-    }
-    if (ds->listTermSessions) {
-        LVCOLUMNW col = {};
-        col.mask = LVCF_TEXT;
-        std::wstring col0 = L"ID";
-        col.pszText = const_cast<LPWSTR>(col0.c_str());
-        ListView_SetColumn(ds->listTermSessions, 0, &col);
-
-        std::wstring col1 = Tr(L"クライアント", L"Remote Address", L"Dirección");
-        col.pszText = const_cast<LPWSTR>(col1.c_str());
-        ListView_SetColumn(ds->listTermSessions, 1, &col);
-
-        std::wstring col2 = Tr(L"ターゲット / シェル", L"Target / Shell", L"Destino");
-        col.pszText = const_cast<LPWSTR>(col2.c_str());
-        ListView_SetColumn(ds->listTermSessions, 2, &col);
-
-        std::wstring col3 = Tr(L"接続時間", L"Duration", L"Duración");
-        col.pszText = const_cast<LPWSTR>(col3.c_str());
-        ListView_SetColumn(ds->listTermSessions, 3, &col);
+    if (ds->btnTermSessionsOpen) {
+        SetWindowTextW(ds->btnTermSessionsOpen, Tr(L"接続一覧を開く", L"Open Connections", L"Abrir conexiones"));
     }
     if (ds->cmbTriageMode && ds->cmbTriageLlmMode) {
         int mode = static_cast<int>(SendMessageW(ds->cmbTriageMode, CB_GETCURSEL, 0, 0));
@@ -12112,35 +12410,10 @@ static LRESULT CALLBACK SettingsWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPAR
             ds->lblTermHint = CreateWindowExW(0, L"STATIC", L"", WS_CHILD | WS_VISIBLE,
                 18, 206, 700, 54, hwnd, nullptr, hInst, nullptr);
 
-            ds->lblTermSessions = CreateWindowExW(0, L"STATIC", L"", WS_CHILD | WS_VISIBLE,
-                18, 266, 640, 20, hwnd, nullptr, hInst, nullptr);
-            ds->listTermSessions = CreateWindowExW(WS_EX_CLIENTEDGE, WC_LISTVIEWW, L"",
-                WS_CHILD | WS_VISIBLE | WS_TABSTOP | LVS_REPORT | LVS_SINGLESEL | LVS_SHOWSELALWAYS,
-                18, 290, 560, 180, hwnd, (HMENU)IDC_SET_TERM_SESSIONS_LIST, hInst, nullptr);
-            ListView_SetExtendedListViewStyle(ds->listTermSessions, LVS_EX_FULLROWSELECT | LVS_EX_GRIDLINES);
-            {
-                LVCOLUMNW col = {};
-                col.mask = LVCF_TEXT | LVCF_WIDTH | LVCF_SUBITEM;
-                col.cx = 50;
-                col.pszText = const_cast<LPWSTR>(L"ID");
-                ListView_InsertColumn(ds->listTermSessions, 0, &col);
-                col.cx = 160;
-                col.pszText = const_cast<LPWSTR>(L"Remote");
-                ListView_InsertColumn(ds->listTermSessions, 1, &col);
-                col.cx = 190;
-                col.pszText = const_cast<LPWSTR>(L"Target");
-                ListView_InsertColumn(ds->listTermSessions, 2, &col);
-                col.cx = 130;
-                col.pszText = const_cast<LPWSTR>(L"Duration");
-                ListView_InsertColumn(ds->listTermSessions, 3, &col);
-            }
+            ds->btnTermSessionsOpen = CreateWindowExW(0, L"BUTTON", L"",
+                WS_CHILD | WS_VISIBLE | WS_TABSTOP,
+                18, 266, 200, 28, hwnd, (HMENU)IDC_SET_TERM_SESSIONS_OPEN, hInst, nullptr);
 
-            ds->btnTermKillSession = CreateWindowExW(0, L"BUTTON", L"",
-                WS_CHILD | WS_VISIBLE | WS_TABSTOP,
-                590, 290, 110, 28, hwnd, (HMENU)IDC_SET_TERM_SESSIONS_KILL, hInst, nullptr);
-            ds->btnTermRefreshSessions = CreateWindowExW(0, L"BUTTON", L"",
-                WS_CHILD | WS_VISIBLE | WS_TABSTOP,
-                590, 324, 110, 28, hwnd, (HMENU)IDC_SET_TERM_SESSIONS_REFRESH, hInst, nullptr);
 
             ds->lblWebUiTitle = CreateWindowExW(0, L"STATIC", L"", WS_CHILD | WS_VISIBLE,
                 18, 100, 640, 20, hwnd, nullptr, hInst, nullptr);
@@ -12425,7 +12698,7 @@ static LRESULT CALLBACK SettingsWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPAR
                                ds->lblTriageMode, ds->cmbTriageMode, ds->lblTriageLlmMode, ds->cmbTriageLlmMode,
                                ds->lblTriageKinds,
                                ds->lblTermTitle, ds->chkTermLocal, ds->chkTermRemote, ds->lblTermHint,
-                               ds->lblTermSessions, ds->listTermSessions, ds->btnTermKillSession, ds->btnTermRefreshSessions,
+                               ds->btnTermSessionsOpen,
                              ds->lblWebUiTitle, ds->chkWebUi, ds->lblWebUiScope, ds->cmbWebUiScope,
                              ds->lblWebUiAllowedHosts, ds->editWebUiAllowedHosts,
                              ds->lblWebUiPort, ds->editWebUiPort, ds->lblWebUiUrl, ds->editWebUiUrl,
@@ -12445,8 +12718,9 @@ static LRESULT CALLBACK SettingsWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPAR
                 auto& behavior = ds->tabPages[1];
                 auto& terminal = ds->tabPages[2];
                 auto& triage = ds->tabPages[3];
-                auto& maintenance = ds->tabPages[4];
-                auto& performance = ds->tabPages[5];
+                auto& webui = ds->tabPages[4];
+                auto& maintenance = ds->tabPages[5];
+                auto& performance = ds->tabPages[6];
                 appearance.insert(appearance.end(), {
                     ds->hwndLangLabel, ds->btnJa, ds->btnEn, ds->btnEs,
                     ds->hwndThemeLabel, ds->btnSystem, ds->btnDark, ds->btnLight, ds->btnPastel, ds->btnHc,
@@ -12455,7 +12729,7 @@ static LRESULT CALLBACK SettingsWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPAR
                     ds->btnDeepPurple, ds->btnPastelPurple, ds->btnDeepYellow, ds->btnPastelYellow,
                     ds->hwndSatLabel, ds->hwndSatCombo,
                     ds->lblProcFont, ds->cmbProcFont, ds->lblTaskFont, ds->cmbTaskFont });
-                auto& colors = ds->tabPages[6];
+                auto& colors = ds->tabPages[7];
                 colors.insert(colors.end(), { ds->lblListBg, ds->btnListBgReset });
                 colors.insert(colors.end(), ds->btnListBg, ds->btnListBg + kListRowKeyCount);
                 behavior.insert(behavior.end(), {
@@ -12476,17 +12750,17 @@ static LRESULT CALLBACK SettingsWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPAR
                     ds->lblTermTitle, ds->chkTermLocal, ds->chkTermRemote,
                     ds->lblTermToken, ds->editTermToken,
                     ds->btnTermTokenApply, ds->btnTermTokenRoll, ds->lblTermHint,
-                    ds->lblTermSessions, ds->listTermSessions, ds->btnTermKillSession, ds->btnTermRefreshSessions });
+                    ds->btnTermSessionsOpen });
                 triage.insert(triage.end(), {
                     ds->lblTriageMode, ds->cmbTriageMode, ds->lblTriageLlmMode, ds->cmbTriageLlmMode,
                     ds->lblTriageKinds });
                 triage.insert(triage.end(), ds->chkTriageKinds, ds->chkTriageKinds + 5);
                 maintenance.insert(maintenance.end(), { ds->btnShell, ds->btnReset, ds->btnClear });
-                maintenance.insert(maintenance.end(), {
+                webui.insert(webui.end(), {
                     ds->lblWebUiTitle, ds->chkWebUi, ds->lblWebUiScope, ds->cmbWebUiScope,
                     ds->lblWebUiAllowedHosts, ds->editWebUiAllowedHosts,
                     ds->lblWebUiPort, ds->editWebUiPort, ds->lblWebUiUrl, ds->editWebUiUrl });
-                auto& about = ds->tabPages[7];
+                auto& about = ds->tabPages[8];
                 about.insert(about.end(), { ds->hwndAboutTitle, ds->hwndAboutVersion, ds->hwndAboutDesc });
             }
             SelectSettingsTab(ds, 0);
@@ -12499,12 +12773,6 @@ static LRESULT CALLBACK SettingsWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPAR
             SetWindowTheme(ds->tabCtrl, L"", L"");
             return 0;
         }
-        case WM_TIMER:
-            if (wParam == kTermSessionsTimerId && ds && ds->tabCtrl &&
-                TabCtrl_GetCurSel(ds->tabCtrl) == 2) {
-                RefreshTermSessions(ds);
-            }
-            return 0;
         case WM_NOTIFY: {
             auto* nm = reinterpret_cast<NMHDR*>(lParam);
             if (ds && nm->idFrom == IDC_SET_TAB && nm->code == TCN_SELCHANGE) {
@@ -12625,32 +12893,8 @@ static LRESULT CALLBACK SettingsWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPAR
                                       L"", 3);
                 return 0;
             }
-            if (id == IDC_SET_TERM_SESSIONS_KILL) {
-                if (ds->listTermSessions) {
-                    int sel = static_cast<int>(SendMessageW(ds->listTermSessions, LVM_GETNEXTITEM, -1, LVNI_SELECTED));
-                    if (sel >= 0) {
-                        LVITEMW lvi = {};
-                        lvi.mask = LVIF_PARAM;
-                        lvi.iItem = sel;
-                        if (SendMessageW(ds->listTermSessions, LVM_GETITEMW, 0, reinterpret_cast<LPARAM>(&lvi))) {
-                            uint32_t sid = static_cast<uint32_t>(lvi.lParam);
-                            nlohmann::json req = {{"action", "term_kill_session"}, {"id", sid}};
-                            nlohmann::json resp;
-                            if (GuiIpcCall(ds->dash, req, resp) && resp.value("ok", false)) {
-                                DisplaySupervisorHint(ds->dash, Tr(L"WinConsoleServer", L"WinConsoleServer", L"WinConsoleServer"),
-                                                      Tr(L"セッションを切断しました。",
-                                                         L"Session disconnected.",
-                                                         L"Sesión desconectada."),
-                                                      L"", 3);
-                            }
-                            RefreshTermSessions(ds);
-                        }
-                    }
-                }
-                return 0;
-            }
-            if (id == IDC_SET_TERM_SESSIONS_REFRESH) {
-                RefreshTermSessions(ds);
+            if (id == IDC_SET_TERM_SESSIONS_OPEN) {
+                ShowTermSessionsDialog(ds->dash);
                 return 0;
             }
             if (id == IDC_SET_WEBUI_ENABLED) {
@@ -12935,7 +13179,6 @@ static LRESULT CALLBACK SettingsWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPAR
                 CommitPerformanceSettings(ds, false);
                 SaveShellConfig(ds->dash);
                 ApplyTerminalDialogConfig(ds);
-                KillTimer(hwnd, kTermSessionsTimerId);
             }
             DestroyWindow(hwnd);
             return 0;
@@ -16413,8 +16656,6 @@ static LRESULT CALLBACK DashboardWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPA
             st->hFontKpiVal = CreateFontW(-14, 0, 0, 0, FW_BOLD, FALSE, FALSE, FALSE, DEFAULT_CHARSET,
                                           OUT_DEFAULT_PRECIS, CLIP_DEFAULT_PRECIS, CLEARTYPE_QUALITY, DEFAULT_PITCH, L"Segoe UI");
 
-            st->hwndBtnStart = CreateWindowExW(0, L"BUTTON", L"+ Launch (powershell)",
-                WS_CHILD | WS_VISIBLE | BS_OWNERDRAW, 0, 0, 160, 24, hwnd, (HMENU)IDC_BTN_START, nullptr, nullptr);
             st->hwndBtnSettings = CreateWindowExW(0, L"BUTTON", Tr(L"設定", L"Settings", L"Ajustes"),
                 WS_CHILD | WS_VISIBLE | BS_OWNERDRAW, 0, 0, 90, 24, hwnd, (HMENU)IDC_BTN_SETTINGS, nullptr, nullptr);
             st->hwndBtnKillAll = CreateWindowExW(0, L"BUTTON", L"Kill All",
@@ -16427,6 +16668,8 @@ static LRESULT CALLBACK DashboardWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPA
                 WS_CHILD | WS_VISIBLE | BS_OWNERDRAW, 0, 0, 28, 24, hwnd, (HMENU)IDC_BTN_TOGGLE_LIST, nullptr, nullptr);
             st->hwndBtnToggleTerm = CreateWindowExW(0, L"BUTTON", L">_",
                 WS_CHILD | WS_VISIBLE | BS_OWNERDRAW, 0, 0, 30, 24, hwnd, (HMENU)IDC_BTN_TOGGLE_TERM, nullptr, nullptr);
+            st->hwndBtnTermSessions = CreateWindowExW(0, L"BUTTON", L"🔌",
+                WS_CHILD | WS_VISIBLE | BS_OWNERDRAW, 0, 0, 28, 24, hwnd, (HMENU)IDC_BTN_TERM_SESSIONS, nullptr, nullptr);
             st->hwndBtnHideTray = CreateWindowExW(0, L"BUTTON", L"⤓",
                 WS_CHILD | WS_VISIBLE | BS_OWNERDRAW, 0, 0, 28, 24, hwnd, (HMENU)IDC_BTN_HIDE_TRAY, nullptr, nullptr);
             st->hwndBtnViewTasks = CreateWindowExW(0, L"BUTTON", L"Task Queue",
@@ -16496,6 +16739,7 @@ static LRESULT CALLBACK DashboardWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPA
                 addTool(st->hwndBtnGridView);
                 addTool(st->hwndBtnToggleList);
                 addTool(st->hwndBtnToggleTerm);
+                addTool(st->hwndBtnTermSessions);
                 addTool(st->hwndBtnStreamPane);
                 addTool(st->hwndBtnBtView);
                 addTool(st->hwndBtnHideTray);
@@ -16503,7 +16747,6 @@ static LRESULT CALLBACK DashboardWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPA
                 addTool(st->hwndBtnHint);
                 addTool(st->hwndBtnHistory);
                 addTool(st->hwndBtnIpmsg);
-                addTool(st->hwndBtnStart);
                 addTool(st->hwndBtnSettings);
                 addTool(st->hwndBtnKillAll);
                 addTool(st->hwndBtnViewTasks);
@@ -16588,9 +16831,9 @@ static LRESULT CALLBACK DashboardWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPA
             SetWindowSubclass(st->hwndTab, TabSubclassProc, 1, 0);
 
             HWND uiCtrls[] = {
-                st->hwndBtnStart, st->hwndBtnSettings, st->hwndBtnKillAll,
+                st->hwndBtnSettings, st->hwndBtnKillAll,
                 st->hwndBtnGridView,
-                st->hwndBtnToggleList, st->hwndBtnToggleTerm, st->hwndBtnStreamPane, st->hwndBtnBtView, st->hwndBtnHideTray, st->hwndBtnRefresh,
+                st->hwndBtnToggleList, st->hwndBtnToggleTerm, st->hwndBtnTermSessions, st->hwndBtnStreamPane, st->hwndBtnBtView, st->hwndBtnHideTray, st->hwndBtnRefresh,
                 st->hwndBtnHint, st->hwndBtnHistory, st->hwndBtnIpmsg, st->hwndClock,
                 st->hwndBtnViewTasks, st->hwndList, st->hwndTaskList, st->hwndTab
             };
@@ -17060,9 +17303,7 @@ static LRESULT CALLBACK DashboardWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPA
         case WM_COMMAND: {
             if (!st) return 0;
             int id = LOWORD(wParam);
-            if (id == IDC_BTN_START) {
-                LaunchFromToolbar(st);
-            } else if (id == IDC_BTN_SETTINGS) {
+            if (id == IDC_BTN_SETTINGS) {
                 ShowSettingsDialog(st);
             } else if (id == IDC_BTN_KILL_SEL) {
                 if (st->selectedProcId > 0) {
@@ -17146,6 +17387,8 @@ static LRESULT CALLBACK DashboardWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPA
                     LayoutControls(st, rcClient.right, rcClient.bottom);
                     InvalidateRect(hwnd, nullptr, FALSE);
                 }
+            } else if (id == IDC_BTN_TERM_SESSIONS) {
+                ShowTermSessionsDialog(st);
             } else if (id == IDC_BTN_REFRESH) {
                 RefreshDashboardData(st);
                 if (st->streamPane && st->hwndStreamPane && IsWindowVisible(st->hwndStreamPane)) {

@@ -21,19 +21,21 @@
   - The WCSP terminal client runs in its own window, separate from the dashboard. Open it from the **`[>_]`** toolbar button or with `HanchoTerm.exe`.
   - Each tab is an independent WCSP session, so several local or remote consoles can be connected at the same time. Tabs keep running while you switch between them; close a tab with `Ctrl+W`.
   - `File` > **New local shell** (PowerShell / cmd / bash), **Attach to local job...** (`attach:<id>`) or **Connect to remote...** (host, port, token, target).
-  - A right-click (or the **Edit** menu) offers **Copy** / **Paste**; a right-click on a tab also offers **Reconnect** and **Close**. New local ConPTY jobs started from the dashboard (`+ Launch`) are attached automatically.
+  - A right-click (or the **Edit** menu) offers **Copy** / **Paste**; a right-click on a tab also offers **Reconnect** and **Close**. New local ConPTY jobs are attached automatically.
   - **Settings** controls **Always on top**, **Remember window position**, automatic attach, and the byte-based **Scrollback** budget (64–2048 MB per tab; default 1024 MB).
+  - The dashboard **`[🔌]`** button opens the active connections list in its own window: ID, client address, target/shell and duration, with **Disconnect** and **Refresh**. Connect/disconnect tray notifications are on by default and can be toggled with **Notify on connect/disconnect** (`terminal_notify` in `config.json`). Settings → **WinConsoleServer** also has an **Open Connections** button.
   - Hardware-accelerated Direct2D / DirectWrite / IME / Sixel VT terminal emulator (`TerminalView`). The reported terminal size is computed from the physical pixel size of the viewport and the current font cell metrics, so it is correct at 100 %, 150 % and other display scales, and follows the window size (no artificial 80×25 floor).
   - Type directly into the terminal (full keyboard input, `Ctrl+C`, IME composition, mouse wheel scrollback, and text selection).
 - **Compact Icon Buttons with Hover Tooltips**:
   - **`[☰]`** Hide/Show Process List toggle
   - **`[>_]`** Open the terminal client window
+  - **`[🔌]`** Open the active WinConsoleServer connections
   - **`[⤓]`** Minimize to System Tray
   - All toolbar icon buttons provide instant status-aware hover tooltips.
 - **Triage**: Review one persistent card per failed job or other condition, with Hancho-collected information, candidate actions and a deterministic recommendation; choose and record a decision, request LLM advice, and track pending, acted, ignored or naturally resolved cards. See [Triage](triage.md).
 
 ## 2. Multi-Shell Launcher & `[Config]` Dialog (`cmd` / `powershell` / `bash`)
-- Click **`[+ Launch (...)]`** on the toolbar to immediately spawn a new interactive ConPTY job. The terminal client window opens and attaches to it automatically.
+- Start an interactive console from **`HanchoTerm.exe`** (`File` > **New local shell**) or from the Settings **Shell Config** buttons. The dashboard toolbar no longer has a `+ Launch` button; the `[>_]` button opens the terminal client.
 - Open **`[Settings]`** → **`[Shell Config...]`** to select the default shell (`cmd`, `powershell`, or `bash` — auto-detecting Git Bash / WSL Bash), customize startup command lines, or launch any shell on the spot. Settings are persisted in `logs/config.json`.
 
 ![Shell Config Dialog](images/config_dialog.png)
@@ -107,7 +109,7 @@
 
 ## 11. Terminal sessions (WCSP)
 - The core exposes every ConPTY job over the WinConsoleServer protocol (WCSP v1). The terminal client (`HanchoTerm.exe`, or the `[>_]` toolbar button) runs in its own window, separate from the dashboard. Each tab is an independent WCSP session, so several local or remote consoles can be connected at the same time; closing a tab or the client does not stop an attached job.
-- In the client, `File` > **New local shell** opens a PowerShell / cmd / bash job on the core, **Attach to local job...** lists the running ConPTY jobs (`attach:<id>`), and **Connect to remote...** connects to another Hancho core by host, port and token. New local jobs started from the dashboard (`+ Launch`) are attached automatically. Right-click a tab for **Reconnect** or **Close**.
+- In the client, `File` > **New local shell** opens a PowerShell / cmd / bash job on the core, **Attach to local job...** lists the running ConPTY jobs (`attach:<id>`), and **Connect to remote...** connects to another Hancho core by host, port and token. New local jobs started by HanchoTerm, CLI or MCP are attached automatically. Right-click a tab for **Reconnect** or **Close**.
 - The client reports its viewport size in cells. With WCSP `FeatureSizeSync`, when several clients attach to the same job the PTY follows the most recently active client: the others receive `RESIZED` reason `PEER` and re-assert their own size on the next focus or keystroke, like tmux. Display scaling (DPI) is handled locally and never leaks into the protocol.
 - Closing a tab or the client asks whether to **terminate** or **detach**. **Terminate** sends a WCSP `CLOSE` and closes the server-side ConPTY (whether it was started by the client or attached from the dashboard). **Detach** keeps the session open so `File` > **Reconnect to session...** can list and reopen it later. The same picker's **Connect all** button, and `File` > **Connect to all retained sessions**, open a tab for every running session at once (sessions already open are skipped).
 - The listener is configured in `<data-dir>/config.json`:

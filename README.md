@@ -32,6 +32,7 @@ Hand Hancho one command, a queue of ordered jobs, or a whole behavior tree. It r
 See [Overview](doc/overview.md) for the working model in detail: `run_worker`, suspending the PC after a job, behavior trees, stable events and adapters, and how to leave Hancho without losing work.
 
 ### Network ports
+- **WebUI (browser dashboard)**: TCP **9138** by default. It listens on `127.0.0.1` unless the exposure scope is LAN, in which case it binds `0.0.0.0`; token authentication is always required.
 - **WinConsoleServer (WCSP)**: TCP **9139** by default when `terminal.remote` is enabled. The local listener uses an ephemeral loopback port.
 - **Chat (IPMsg)**: UDP and TCP **2426**, off by default.
 
@@ -126,7 +127,7 @@ The skill starts with `hancho-cli.exe help --json`, so the commands it shows alw
 - **Settings**: the WinConsoleServer tab shows WCSP connections and can refresh the token or disconnect a session.
 
 ### v0.9.16
-- **Tabbed terminal client window**: the WCSP client moved out of the dashboard into its own executable and window (`HanchoTerm.exe`). Each tab is an independent session, so several local or remote consoles can be connected at once; `+ Launch` and `[>_]` open the client.
+- **Tabbed terminal client window**: the WCSP client moved out of the dashboard into its own executable and window (`HanchoTerm.exe`). Each tab is an independent session, so several local or remote consoles can be connected at once; `[>_]` opens the terminal client; `[🔌]` opens the active connection list with connect/disconnect notifications.
 - **Terminal client controls**: follows the dashboard theme, Copy/Paste in the Edit and right-click menus, always-on-top, window-position memory, and a byte-based scrollback budget (64-2048 MB per tab, default 1024 MB). `terminal.history_bytes` (default 32 MiB) controls the server-side replay budget; replays are split into frames, so a 6 MB (~100k-line) history attaches correctly.
 - **Dashboard**: remembers the window layout and shows status-aware tooltips; the standalone dashboard no longer draws embedded terminal tabs.
 - **Performance**: the usage graph and monitor pane have configurable refresh intervals, task-queue lookups use a job index, and idle polling does less work.

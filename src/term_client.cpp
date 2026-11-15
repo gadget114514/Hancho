@@ -1480,7 +1480,7 @@ void ReconnectActive(ClientState* st) {
 }
 
 // Attaches to local ConPTY jobs that have no tab yet. This preserves the old
-// dashboard behavior where "+ Launch" immediately showed a terminal.
+// old dashboard behavior where a launched shell immediately showed a terminal.
 void AutoAttachLocalJobs(ClientState* st) {
     if (!st->autoAttach || st->closing || st->suppressAutoAttach) return;
     std::wstring error;
