@@ -28,6 +28,19 @@ using RemoteFilesCheckCallback = std::function<bool(
     uint64_t startFiletime,
     std::string& outDetail)>;
 
+namespace {
+std::string ConfiguredWebUiToken() {
+    nlohmann::json cfg = nlohmann::json::parse(
+        ReadFileUtf8Wide(PathJoinWide(GetEffectiveDataDirectoryWide(), L"config.json")),
+        nullptr, false);
+    if (cfg.is_object() && cfg.contains("webui") && cfg["webui"].is_object() &&
+        cfg["webui"].contains("token") && cfg["webui"]["token"].is_string()) {
+        return cfg["webui"]["token"].get<std::string>();
+    }
+    return std::string();
+}
+} // namespace
+
 void SetRemoteFilesCheckCallback(RemoteFilesCheckCallback cb);
 
 ListenerRestartScheduler::~ListenerRestartScheduler() {
@@ -639,15 +652,17 @@ WebUiServer* IpcServer::GetWebUiServer() {
 void IpcServer::RestartWebUi() {
     if (stop_.load()) return;
     // Keep the session token so an open browser tab keeps working after the
-    // listener moves to a new port or scope.
-    std::string token;
+    // listener moves to a new port or scope. A token edited in the settings
+    // dialog lives in config.json and wins over the previous one.
+    std::string fallbackToken;
     {
         std::lock_guard<std::mutex> lock(webuiMutex_);
-        if (webUiServer_) token = webUiServer_->GetToken();
+        if (webUiServer_) fallbackToken = webUiServer_->GetToken();
     }
+    const std::string configured = ConfiguredWebUiToken();
     StopWebUiServer(false);
     if (stop_.load()) return;
-    StartWebUiServer(token);
+    StartWebUiServer(configured.empty() ? fallbackToken : std::string());
 }
 
 void IpcServer::ScheduleWebUiRestart() {

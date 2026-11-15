@@ -44,12 +44,18 @@ public:
                                            const std::string& body,
                                            const std::string& peerAddress,
                                            std::string& outResponse)>;
+    // Validates the Host / Origin of a WebSocket upgrade. The WebUI supplies its
+    // own rules so LAN IP literals and configured hostnames work; when unset the
+    // listener keeps the conservative loopback-only check.
+    using UpgradeValidator = std::function<bool(const std::string& hostVal,
+                                                const std::string& originVal)>;
 
     RemoteListener();
     ~RemoteListener();
 
     void SetHandler(Handler handler);
     void SetHttpHandler(HttpHandler httpHandler);
+    void SetUpgradeValidator(UpgradeValidator validator);
 
     // bindHost empty or "*" means 0.0.0.0. token empty means "loopback only".
     bool Start(const std::string& bindHost, uint16_t port, const std::string& token,

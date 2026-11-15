@@ -1144,6 +1144,8 @@ struct RemoteListener::State {
     Handler handler;
     mutable std::mutex httpHandlerMutex;
     HttpHandler httpHandler;
+    mutable std::mutex upgradeValidatorMutex;
+    UpgradeValidator upgradeValidator;
 
     mutable std::mutex clientSocketsMutex;
     std::vector<socket_t> clientSockets;
@@ -1315,10 +1317,17 @@ void HandleRemoteClient(std::shared_ptr<RemoteListener::State> state, socket_t c
         return;
     }
 
-    // Defense-in-depth: If httpHandler is set, verify Host & Origin
+    // Defense-in-depth: verify Host & Origin on the upgrade. The WebUI installs
+    // a validator with its own scope rules; other HTTP listeners keep the
+    // conservative loopback-only check.
     {
-        bool hasHttp = false;
+        RemoteListener::UpgradeValidator validator;
         {
+            std::lock_guard<std::mutex> lock(state->upgradeValidatorMutex);
+            validator = state->upgradeValidator;
+        }
+        bool hasHttp = validator != nullptr;
+        if (!hasHttp) {
             std::lock_guard<std::mutex> lock(state->httpHandlerMutex);
             hasHttp = (state->httpHandler != nullptr);
         }
@@ -1331,16 +1340,6 @@ void HandleRemoteClient(std::shared_ptr<RemoteListener::State> state, socket_t c
                 hostVal.erase(0, hostVal.find_first_not_of(" \t"));
                 hostVal.erase(hostVal.find_last_not_of(" \t\r\n") + 1);
             }
-            std::string h = hostVal;
-            size_t colon = h.find(':');
-            if (colon != std::string::npos) h = h.substr(0, colon);
-            for (char& c : h) c = static_cast<char>(std::tolower(static_cast<unsigned char>(c)));
-            if (!h.empty() && h != "localhost" && h != "127.0.0.1" && h != "[::1]" && h != "::1") {
-                std::string forbidden = "HTTP/1.1 403 Forbidden\r\nContent-Type: text/plain\r\nConnection: close\r\nContent-Length: 23\r\n\r\nForbidden: invalid Host\n";
-                SendAll(client, forbidden.data(), forbidden.size(), error);
-                return;
-            }
-
             std::string originVal;
             size_t oPos = LowerAscii(headers).find("origin:");
             if (oPos != std::string::npos) {
@@ -1349,17 +1348,34 @@ void HandleRemoteClient(std::shared_ptr<RemoteListener::State> state, socket_t c
                 originVal.erase(0, originVal.find_first_not_of(" \t"));
                 originVal.erase(originVal.find_last_not_of(" \t\r\n") + 1);
             }
-            std::string o = originVal;
-            for (char& c : o) c = static_cast<char>(std::tolower(static_cast<unsigned char>(c)));
-            if (!o.empty() && o != "null" &&
-                o.rfind("http://localhost:", 0) != 0 && o != "http://localhost" &&
-                o.rfind("http://127.0.0.1:", 0) != 0 && o != "http://127.0.0.1" &&
-                o.rfind("http://[::1]:", 0) != 0 && o != "http://[::1]" &&
-                o.rfind("https://localhost:", 0) != 0 && o != "https://localhost" &&
-                o.rfind("https://127.0.0.1:", 0) != 0 && o != "https://127.0.0.1") {
-                std::string forbidden = "HTTP/1.1 403 Forbidden\r\nContent-Type: text/plain\r\nConnection: close\r\nContent-Length: 25\r\n\r\nForbidden: invalid Origin\n";
-                SendAll(client, forbidden.data(), forbidden.size(), error);
-                return;
+            if (validator) {
+                if (!validator(hostVal, originVal)) {
+                    std::string forbidden = "HTTP/1.1 403 Forbidden\r\nContent-Type: text/plain\r\nConnection: close\r\nContent-Length: 23\r\n\r\nForbidden: invalid Host\n";
+                    SendAll(client, forbidden.data(), forbidden.size(), error);
+                    return;
+                }
+            } else {
+                std::string h = hostVal;
+                size_t colon = h.find(':');
+                if (colon != std::string::npos) h = h.substr(0, colon);
+                for (char& c : h) c = static_cast<char>(std::tolower(static_cast<unsigned char>(c)));
+                if (!h.empty() && h != "localhost" && h != "127.0.0.1" && h != "[::1]" && h != "::1") {
+                    std::string forbidden = "HTTP/1.1 403 Forbidden\r\nContent-Type: text/plain\r\nConnection: close\r\nContent-Length: 23\r\n\r\nForbidden: invalid Host\n";
+                    SendAll(client, forbidden.data(), forbidden.size(), error);
+                    return;
+                }
+                std::string o = originVal;
+                for (char& c : o) c = static_cast<char>(std::tolower(static_cast<unsigned char>(c)));
+                if (!o.empty() && o != "null" &&
+                    o.rfind("http://localhost:", 0) != 0 && o != "http://localhost" &&
+                    o.rfind("http://127.0.0.1:", 0) != 0 && o != "http://127.0.0.1" &&
+                    o.rfind("http://[::1]:", 0) != 0 && o != "http://[::1]" &&
+                    o.rfind("https://localhost:", 0) != 0 && o != "https://localhost" &&
+                    o.rfind("https://127.0.0.1:", 0) != 0 && o != "https://127.0.0.1") {
+                    std::string forbidden = "HTTP/1.1 403 Forbidden\r\nContent-Type: text/plain\r\nConnection: close\r\nContent-Length: 25\r\n\r\nForbidden: invalid Origin\n";
+                    SendAll(client, forbidden.data(), forbidden.size(), error);
+                    return;
+                }
             }
         }
     }
@@ -1768,6 +1784,11 @@ void RemoteListener::SetHandler(Handler handler) {
 void RemoteListener::SetHttpHandler(HttpHandler httpHandler) {
     std::lock_guard<std::mutex> lock(state_->httpHandlerMutex);
     state_->httpHandler = std::move(httpHandler);
+}
+
+void RemoteListener::SetUpgradeValidator(UpgradeValidator validator) {
+    std::lock_guard<std::mutex> lock(state_->upgradeValidatorMutex);
+    state_->upgradeValidator = std::move(validator);
 }
 
 bool RemoteListener::Start(const std::string& bindHost, uint16_t port, const std::string& token,

@@ -90,12 +90,13 @@ hancho-cli ui
 | `scope` | `loopback`（既定）、`lan`、`custom` | `loopback` は `127.0.0.1` にバインドし、ループバックの `Host` / `Origin` だけを許可。`lan` / `custom` は `host` にバインドし、IP リテラルと `allowed_hosts` / `allowed_origins` を許可。 |
 | `host` | `0.0.0.0`、`127.0.0.1`、IP、ホスト名 | `lan` / `custom` のバインド先。`0.0.0.0` は全インターフェース。 |
 | `port` | `1..65535` | 待ち受けポート（既定 `9138`）。 |
+| `token` | 文字列 | セッショントークン。初回起動時に保存され、無効化や再起動をまたいで維持されます。変更するとローテーションできます。 |
 | `allowed_hosts` | ホスト名 | `Host` / `Origin` で追加許可する名前（マシン名など）。 |
 | `allowed_origins` | 完全なオリジン | 追加許可する `http(s)://host:port`。 |
 
 環境変数でも上書きできます（ヘッドレス / テスト用）: `HANCHO_WEBUI_HOST`、`HANCHO_WEBUI_SCOPE`、`HANCHO_WEBUI_ALLOWED_HOSTS`、`HANCHO_WEBUI_ALLOWED_ORIGINS`、`HANCHO_WEBUI_PORT`、`HANCHO_WEBUI_DISABLE`。CLI フラグ（`--webui-host`、`--webui-scope`、`--webui-allowed-hosts`、`--webui-allowed-origins`、`--webui-port`、`--webui-disable`）は同じ変数に反映されます。
 
-`config_set` で `webui` を変更すると、リスナーはバックグラウンドで自動的に再起動します。Windows ダッシュボードの「設定」→「管理」タブに、有効 / 無効、公開範囲（ローカル / LAN）、追加許可ホストの設定があります。`port` と `allowed_origins` は `config.json` で指定します。
+`config_set` で `webui` を変更すると、リスナーは呼び出し元をブロックせずバックグラウンドで再起動します。Windows ダッシュボードの「設定」→「WebUI」タブに、有効 / 無効、公開範囲（ローカル / LAN）、追加許可ホスト、ポート、トークンの設定があります。`allowed_origins` は `config.json` で指定します。
 
 **セキュリティ:** `lan` / `custom` はローカルホスト限定の制限を意図的に緩めます。非ループバック接続にもセッショントークンは必須ですが TLS はありません。信頼できる LAN または VPN でのみ使い、Windows ではポートを明示的に許可してください:
 

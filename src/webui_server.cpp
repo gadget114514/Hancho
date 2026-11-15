@@ -12,6 +12,7 @@
 #include <iomanip>
 #include <algorithm>
 #include <cctype>
+#include <mutex>
 #include <vector>
 
 #ifndef _WIN32
@@ -185,6 +186,7 @@ struct WebUiSettings {
     std::string scope = "loopback";
     std::string host = "0.0.0.0";
     uint16_t port = 0;
+    std::string token;
     std::vector<std::string> allowedHosts;
     std::vector<std::string> allowedOrigins;
 };
@@ -199,6 +201,7 @@ WebUiSettings LoadWebUiSettings() {
         if (w.contains("enabled") && w["enabled"].is_boolean()) s.enabled = w["enabled"].get<bool>();
         if (w.contains("scope") && w["scope"].is_string()) s.scope = w["scope"].get<std::string>();
         if (w.contains("host") && w["host"].is_string()) s.host = w["host"].get<std::string>();
+        if (w.contains("token") && w["token"].is_string()) s.token = w["token"].get<std::string>();
         if (w.contains("port") && w["port"].is_number_integer()) {
             int64_t value = w["port"].get<int64_t>();
             if (value > 0 && value <= 65535) s.port = static_cast<uint16_t>(value);
@@ -243,6 +246,26 @@ void RestrictFilePermissions(const std::string& path) {
 #else
     (void)path;
 #endif
+}
+
+// The token has to survive "browser UI disabled" and restarts so the access URL
+// in Settings stays valid. The first start seeds config.json; later starts and
+// the settings dialog keep using that value.
+void PersistWebUiTokenIfMissing(const std::string& token) {
+    if (token.empty()) return;
+    static std::mutex mutex;
+    std::lock_guard<std::mutex> lock(mutex);
+    std::wstring configPath = PathJoinWide(GetEffectiveDataDirectoryWide(), L"config.json");
+    nlohmann::json cfg = nlohmann::json::parse(ReadFileUtf8Wide(configPath), nullptr, false);
+    if (!cfg.is_object()) cfg = nlohmann::json::object();
+    if (cfg.contains("webui") && cfg["webui"].is_object() &&
+        cfg["webui"].contains("token") && cfg["webui"]["token"].is_string() &&
+        !cfg["webui"]["token"].get<std::string>().empty()) {
+        return;
+    }
+    if (!cfg.contains("webui") || !cfg["webui"].is_object()) cfg["webui"] = nlohmann::json::object();
+    cfg["webui"]["token"] = token;
+    WriteFileAtomicWide(configPath, cfg.dump(2));
 }
 
 } // namespace
@@ -331,6 +354,7 @@ bool WebUiServer::Start(uint16_t port, const std::string& token,
     port_ = listenPort;
 
     std::string sessionToken = token;
+    if (sessionToken.empty()) sessionToken = TrimCopy(settings.token);
     if (sessionToken.empty()) {
         const char* envToken = std::getenv("HANCHO_TOKEN");
         if (envToken && *envToken) {
@@ -393,6 +417,15 @@ bool WebUiServer::Start(uint16_t port, const std::string& token,
         return HandleHttpRequest(*runtime, method, uri, headers, body, peerAddress, outResponse);
     });
 
+    // The WebSocket upgrade must use the same Host / Origin rules as HTTP, so a
+    // LAN browser (IP literal or configured hostname) can connect while foreign
+    // origins are still rejected.
+    listener->SetUpgradeValidator([runtime](const std::string& hostVal,
+                                            const std::string& originVal) {
+        return IsAllowedHostHeader(*runtime, hostVal) &&
+               IsAllowedOriginHeader(*runtime, originVal);
+    });
+
     // Configure WebSocket / IPC handler
     listener->SetHandler([runtime](const std::string& requestJson, const std::string& peer) {
         (void)peer;
@@ -410,6 +443,7 @@ bool WebUiServer::Start(uint16_t port, const std::string& token,
     }
 
     listener_ = std::move(listener);
+    PersistWebUiTokenIfMissing(token_);
     WriteAuditLog("WEBUI_LISTEN", GetUrl());
     return true;
 }

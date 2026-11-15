@@ -644,6 +644,8 @@ enum ControlId {
     IDC_SET_WEBUI_SCOPE = 6060,
     IDC_SET_WEBUI_ALLOWED_HOSTS = 6061,
     IDC_SET_WEBUI_PORT = 6062,
+    IDC_SET_WEBUI_TOKEN = 6083,
+    IDC_SET_WEBUI_TOKEN_ROLL = 6084,
     IDC_SET_SHOW_HIDDEN_TASKS = 6063,
     IDC_SET_TRIAGE_MODE = 6064,
     IDC_SET_TRIAGE_LLM_MODE = 6065,
@@ -10959,9 +10961,12 @@ struct SettingsDlgState {
       HWND cmbWebUiScope = nullptr;
        HWND lblWebUiAllowedHosts = nullptr;
        HWND editWebUiAllowedHosts = nullptr;
-       HWND lblWebUiPort = nullptr;
-       HWND editWebUiPort = nullptr;
-       HWND lblWebUiUrl = nullptr;
+        HWND lblWebUiPort = nullptr;
+        HWND editWebUiPort = nullptr;
+        HWND lblWebUiToken = nullptr;
+        HWND editWebUiToken = nullptr;
+        HWND btnWebUiTokenRoll = nullptr;
+        HWND lblWebUiUrl = nullptr;
        HWND editWebUiUrl = nullptr;
        nlohmann::json webuiConfig;
       HWND lblProcFont = nullptr;
@@ -11638,9 +11643,15 @@ static std::string ReadWebUiSessionToken() {
     return token;
 }
 
-// Builds the URL a browser should open, using the port currently typed in the dialog.
-// The token comes from the running server's .webui_token file (same as `hancho-cli web`).
+// Builds the URL a browser should open, using the port and token currently
+// shown in the dialog. Disabled means there is nothing to open.
 static std::wstring BuildWebUiAccessUrl(SettingsDlgState* ds) {
+    const bool enabled = !ds->chkWebUi ||
+        SendMessageW(ds->chkWebUi, BM_GETCHECK, 0, 0) == BST_CHECKED;
+    if (!enabled) {
+        return Tr(L"（ブラウザ UI は無効です）", L"(the browser UI is disabled)",
+                  L"(la interfaz web está desactivada)");
+    }
     int port = 9138;
     if (ds->editWebUiPort) {
         wchar_t text[32] = {};
@@ -11662,12 +11673,14 @@ static std::wstring BuildWebUiAccessUrl(SettingsDlgState* ds) {
         }
     }
     std::wstring url = L"http://" + host + L":" + std::to_wstring(port) + L"/";
-    const bool enabled = !ds->chkWebUi ||
-        SendMessageW(ds->chkWebUi, BM_GETCHECK, 0, 0) == BST_CHECKED;
-    if (enabled) {
-        const std::string token = ReadWebUiSessionToken();
-        if (!token.empty()) url += L"?token=" + Utf8ToWide(token);
+    std::string token;
+    if (ds->editWebUiToken) {
+        wchar_t text[256] = {};
+        GetWindowTextW(ds->editWebUiToken, text, 256);
+        token = TrimWebUiItem(WideToUtf8(text));
     }
+    if (token.empty()) token = ReadWebUiSessionToken();
+    if (!token.empty()) url += L"?token=" + Utf8ToWide(token);
     return url;
 }
 
@@ -11711,6 +11724,11 @@ static void LoadWebUiDialogConfig(SettingsDlgState* ds) {
     }
     if (ds->editWebUiPort) {
         SetWindowTextW(ds->editWebUiPort, std::to_wstring(port).c_str());
+    }
+    std::string token = ds->webuiConfig.value("token", std::string());
+    if (token.empty()) token = ReadWebUiSessionToken();
+    if (ds->editWebUiToken) {
+        SetWindowTextW(ds->editWebUiToken, Utf8ToWide(token).c_str());
     }
     UpdateWebUiAccessUrl(ds);
 }
@@ -11763,6 +11781,18 @@ static void ApplyWebUiDialogConfig(SettingsDlgState* ds) {
         }
     }
     webui["port"] = port;
+
+    std::string token;
+    if (ds->editWebUiToken) {
+        wchar_t text[256] = {};
+        GetWindowTextW(ds->editWebUiToken, text, 256);
+        token = TrimWebUiItem(WideToUtf8(text));
+        if (token.empty()) {
+            token = pc::GenerateTermToken();
+            SetWindowTextW(ds->editWebUiToken, Utf8ToWide(token).c_str());
+        }
+    }
+    if (!token.empty()) webui["token"] = token;
     ds->webuiConfig = webui;
 
     nlohmann::json req = {{"action", "config_set"}, {"patch", {{"webui", webui}}}};
@@ -12025,6 +12055,12 @@ static void UpdateSettingsDialogTexts(HWND hwnd) {
     }
     if (ds->lblWebUiPort) {
         SetWindowTextW(ds->lblWebUiPort, Tr(L"ポート:", L"Port:", L"Puerto:"));
+    }
+    if (ds->lblWebUiToken) {
+        SetWindowTextW(ds->lblWebUiToken, Tr(L"トークン:", L"Token:", L"Token:"));
+    }
+    if (ds->btnWebUiTokenRoll) {
+        SetWindowTextW(ds->btnWebUiTokenRoll, Tr(L"再生成", L"Regenerate", L"Regenerar"));
     }
     if (ds->lblWebUiUrl) {
         SetWindowTextW(ds->lblWebUiUrl, Tr(
@@ -12468,6 +12504,14 @@ static LRESULT CALLBACK SettingsWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPAR
             ds->editWebUiUrl = CreateWindowExW(WS_EX_CLIENTEDGE, L"EDIT", L"",
                 WS_CHILD | WS_VISIBLE | ES_AUTOHSCROLL | ES_READONLY,
                 18, 302, 640, 26, hwnd, nullptr, hInst, nullptr);
+            ds->lblWebUiToken = CreateWindowExW(0, L"STATIC", L"", WS_CHILD | WS_VISIBLE,
+                18, 338, 640, 20, hwnd, nullptr, hInst, nullptr);
+            ds->editWebUiToken = CreateWindowExW(WS_EX_CLIENTEDGE, L"EDIT", L"",
+                WS_CHILD | WS_VISIBLE | WS_TABSTOP | ES_AUTOHSCROLL,
+                18, 362, 420, 26, hwnd, (HMENU)IDC_SET_WEBUI_TOKEN, hInst, nullptr);
+            ds->btnWebUiTokenRoll = CreateWindowExW(0, L"BUTTON", L"",
+                WS_CHILD | WS_VISIBLE | WS_TABSTOP,
+                446, 362, 100, 26, hwnd, (HMENU)IDC_SET_WEBUI_TOKEN_ROLL, hInst, nullptr);
 
             ds->lblProcFont = CreateWindowExW(0, L"STATIC", L"", WS_CHILD | WS_VISIBLE,
                 18, 458, 530, 20, hwnd, nullptr, hInst, nullptr);
@@ -12690,6 +12734,14 @@ static LRESULT CALLBACK SettingsWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPAR
                 Tr(L"ブラウザから操作できる Web UI を有効にします。\nアクセス URL は下の欄に表示されます。",
                    L"Enables the browser UI.\nThe access URL is shown in the box below.",
                    L"Activa la interfaz web.\nLa URL de acceso aparece en el cuadro inferior."));
+            helpId(IDC_SET_WEBUI_TOKEN,
+                Tr(L"Web UI のアクセスに使うトークンです。\n変更すると実行中のサーバーを再起動して新しいトークンで待ち受けます。",
+                   L"Token used to access the WebUI.\nChanging it restarts the running server with the new token.",
+                   L"Token de acceso a la interfaz web.\nAl cambiarlo, el servidor se reinicia con el nuevo token."));
+            helpId(IDC_SET_WEBUI_TOKEN_ROLL,
+                Tr(L"新しいランダムなトークンを生成します。\n実行中の Web UI は新しいトークンで再起動します。",
+                   L"Generates a new random token.\nThe running WebUI restarts with the new token.",
+                   L"Genera un token aleatorio nuevo.\nLa interfaz web se reinicia con el nuevo token."));
             for (int h = 0; h < 5; ++h) {
                 helpId(IDC_SET_TRIAGE_KIND_BASE + h,
                     Tr(L"この種別の失敗をトリアージの対象に含めます。\n外すと、その失敗は自動でカード化されません。",
@@ -12729,6 +12781,7 @@ static LRESULT CALLBACK SettingsWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPAR
                              ds->lblWebUiTitle, ds->chkWebUi, ds->lblWebUiScope, ds->cmbWebUiScope,
                              ds->lblWebUiAllowedHosts, ds->editWebUiAllowedHosts,
                              ds->lblWebUiPort, ds->editWebUiPort, ds->lblWebUiUrl, ds->editWebUiUrl,
+                             ds->lblWebUiToken, ds->editWebUiToken, ds->btnWebUiTokenRoll,
                              ds->lblProcFont, ds->cmbProcFont, ds->lblTaskFont, ds->cmbTaskFont };
              for (HWND h : ctrls) SendMessageW(h, WM_SETFONT, (WPARAM)ds->dash->hFontUi, TRUE);
              for (HWND h : ds->chkTriageKinds) if (h) SendMessageW(h, WM_SETFONT, (WPARAM)ds->dash->hFontUi, TRUE);
@@ -12786,7 +12839,8 @@ static LRESULT CALLBACK SettingsWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPAR
                 webui.insert(webui.end(), {
                     ds->lblWebUiTitle, ds->chkWebUi, ds->lblWebUiScope, ds->cmbWebUiScope,
                     ds->lblWebUiAllowedHosts, ds->editWebUiAllowedHosts,
-                    ds->lblWebUiPort, ds->editWebUiPort, ds->lblWebUiUrl, ds->editWebUiUrl });
+                    ds->lblWebUiPort, ds->editWebUiPort, ds->lblWebUiUrl, ds->editWebUiUrl,
+                    ds->lblWebUiToken, ds->editWebUiToken, ds->btnWebUiTokenRoll });
                 auto& about = ds->tabPages[8];
                 about.insert(about.end(), { ds->hwndAboutTitle, ds->hwndAboutVersion, ds->hwndAboutDesc });
             }
@@ -12938,6 +12992,18 @@ static LRESULT CALLBACK SettingsWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPAR
             }
             if (id == IDC_SET_WEBUI_PORT) {
                 if (HIWORD(wParam) == EN_KILLFOCUS) ApplyWebUiDialogConfig(ds);
+                return 0;
+            }
+            if (id == IDC_SET_WEBUI_TOKEN) {
+                if (HIWORD(wParam) == EN_KILLFOCUS) ApplyWebUiDialogConfig(ds);
+                return 0;
+            }
+            if (id == IDC_SET_WEBUI_TOKEN_ROLL) {
+                if (ds->editWebUiToken) {
+                    const std::string token = pc::GenerateTermToken();
+                    SetWindowTextW(ds->editWebUiToken, Utf8ToWide(token).c_str());
+                }
+                ApplyWebUiDialogConfig(ds);
                 return 0;
             }
             if (id == IDC_SET_RESOURCE_LOCKS) {

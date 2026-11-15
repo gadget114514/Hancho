@@ -90,12 +90,13 @@ The server is loopback-only by default. Exposure is controlled by the `webui` ob
 | `scope` | `loopback` (default), `lan`, `custom` | `loopback` binds `127.0.0.1` and accepts only loopback `Host` / `Origin`. `lan` / `custom` bind `host` and accept IP literals plus `allowed_hosts` / `allowed_origins`. |
 | `host` | `0.0.0.0`, `127.0.0.1`, an IP, or a hostname | Bind address for `lan` / `custom`. `0.0.0.0` listens on all interfaces. |
 | `port` | `1..65535` | Listen port (default `9138`). |
+| `token` | string | Session token. Seeded on the first start and kept here so it survives disabling and restarts; change it to rotate. |
 | `allowed_hosts` | hostnames | Extra names accepted in `Host` / `Origin` (for example a machine name). |
 | `allowed_origins` | exact origins | Extra `http(s)://host:port` origins accepted. |
 
 Environment overrides (for headless/test use): `HANCHO_WEBUI_HOST`, `HANCHO_WEBUI_SCOPE`, `HANCHO_WEBUI_ALLOWED_HOSTS`, `HANCHO_WEBUI_ALLOWED_ORIGINS`, `HANCHO_WEBUI_PORT`, `HANCHO_WEBUI_DISABLE`. CLI flags map to the same variables (`--webui-host`, `--webui-scope`, `--webui-allowed-hosts`, `--webui-allowed-origins`, `--webui-port`, `--webui-disable`).
 
-Changing `webui` through `config_set` restarts the listener in the background. On the Windows dashboard, Settings -> Maintenance exposes Enabled, Exposure (Loopback / LAN), and Allowed hosts; `port` and `allowed_origins` stay in `config.json`.
+Changing `webui` through `config_set` restarts the listener in the background without blocking the caller. On the Windows dashboard, Settings -> WebUI exposes Enabled, Exposure (Loopback / LAN), Allowed hosts, Port and Token; `allowed_origins` stays in `config.json`.
 
 **Security:** `lan` / `custom` intentionally relax the localhost-only restriction. The session token is still required for non-loopback clients, but there is no TLS. Use this only on a trusted LAN or VPN, and open the port explicitly on Windows, for example:
 
