@@ -14,6 +14,7 @@ param(
     [string]$Queue = "cards",
     [switch]$Parallel,
     [ValidateRange(0, 64)][int]$Concurrency = 0,
+    [string]$HanchoDataDir = $env:HANCHO_LOG_DIR,
     [switch]$DryRun
 )
 
@@ -26,6 +27,11 @@ $data = $paths.DataDir
 # Tool folder as the job command must name it, e.g. Tools\ww-unity.
 $toolRel = "Tools\" + (Split-Path -Leaf $PSScriptRoot)
 $hanchoCli = if ($env:HANCHO_CLI) { $env:HANCHO_CLI } else { Join-Path $env:LOCALAPPDATA "Programs\Hancho\hancho-cli.exe" }
+# The dashboard and hancho-cli must use the same data directory. Pass -HanchoDataDir (or set
+# HANCHO_LOG_DIR) when the dashboard was started with --data-dir; every CLI call below then
+# targets the same core, so a registered card cannot land in a different queue.
+$hanchoDataArgs = @()
+if ($HanchoDataDir) { $hanchoDataArgs = @('--data-dir', $HanchoDataDir) }
 
 # The text under a "## <heading>" line, up to the next "## " line. $Heading is a regex.
 function Get-CardSection([string]$Text, [string]$Heading) {
@@ -135,7 +141,7 @@ function Get-KnownJobIds {
     # hancho-cli writes UTF-8 (job summaries can hold Japanese); read it as UTF-8 or ConvertFrom-Json fails.
     $prevEncoding = [Console]::OutputEncoding
     [Console]::OutputEncoding = [System.Text.Encoding]::UTF8
-    try { $raw = (& $hanchoCli --json taskqueue list 2>&1 | Out-String) }
+    try { $raw = (& $hanchoCli @hanchoDataArgs --json taskqueue list 2>&1 | Out-String) }
     finally { [Console]::OutputEncoding = $prevEncoding }
     $obj = $raw | ConvertFrom-Json
     if (-not $obj.ok) { throw "[ww-enqueue] hancho-cli taskqueue list failed: $raw" }
@@ -179,7 +185,7 @@ if ($DryRun) {
 }
 $addArgs = @('taskqueue', 'add', '--file', $jsonPath, '--taskqueue', $Queue)
 if ($Concurrency -gt 0) { $addArgs += @('--concurrency', [string]$Concurrency) }
-& $hanchoCli @addArgs
+& $hanchoCli @addArgs @hanchoDataArgs
 if ($LASTEXITCODE -ne 0) { Write-Host "[ww-enqueue] hancho-cli taskqueue add failed (exit $LASTEXITCODE)" -ForegroundColor Red; exit $LASTEXITCODE }
 Write-Host "[ww-enqueue] registered $($jobs.Count) job(s) in queue '$Queue'" -ForegroundColor Green
 exit 0

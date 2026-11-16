@@ -3694,7 +3694,8 @@ std::string TaskQueueManager::TaskQueueAdd(const std::string& taskqueue, const s
         if (i > 0) oss << ",";
         oss << "\"" << JsonEscape(newJobs[i].id) << "\"";
     }
-    oss << "],\"concurrency\":" << queues_[taskqueue].concurrency << "}";
+    oss << "],\"concurrency\":" << queues_[taskqueue].concurrency
+        << ",\"data_dir\":\"" << JsonEscape(WideToUtf8(GetEffectiveDataDirectoryWide())) << "\"}";
     return oss.str();
 }
 

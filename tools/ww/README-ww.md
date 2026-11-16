@@ -171,6 +171,10 @@ hancho-cli.exe taskqueue wait ww
 
 `-Out <file>` writes the file without adding it (default with `-Queue`: `ww-data\jobs\`),
 `-TimeoutSec` sets every job's timeout (7200), `-Worktree` makes worktree jobs without resources.
+If the dashboard was started with `--data-dir`, pass the same directory with
+`-HanchoDataDir <dir>` (or set `HANCHO_LOG_DIR`) so `ww-run`/`ww-enqueue` add jobs to the core the
+dashboard is watching. `taskqueue add` prints the `data_dir` it used; compare it with the data
+directory in the dashboard title when a job does not appear.
 The hand-written equivalent; hancho-cli never starts jobs whose `resources` overlap (on by default;
 Settings checkbox):
 

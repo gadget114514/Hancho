@@ -32,6 +32,7 @@ param(
     [int]$TimeoutSec = 7200,
     [string]$Queue = "",
     [int]$Concurrency = 3,
+    [string]$HanchoDataDir = $env:HANCHO_LOG_DIR,
     [switch]$Help
 )
 
@@ -194,7 +195,11 @@ if ($Jobs) {
         Write-Host "[ww-run] hancho-cli.exe not found (set HANCHO_CLI or add it to PATH); add the file by hand" -ForegroundColor Red
         exit 1
     }
-    & $hanchoCli taskqueue add --file $outPath --taskqueue $Queue --concurrency $Concurrency
+    # Keep the dashboard and hancho-cli on the same data directory. Pass -HanchoDataDir
+    # (or set HANCHO_LOG_DIR) when the dashboard uses a project-local --data-dir.
+    $hanchoDataArgs = @()
+    if ($HanchoDataDir) { $hanchoDataArgs = @('--data-dir', $HanchoDataDir) }
+    & $hanchoCli @hanchoDataArgs taskqueue add --file $outPath --taskqueue $Queue --concurrency $Concurrency
     if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
     Write-Host "[ww-run] queued in '$Queue'. Wait: hancho-cli.exe taskqueue wait $Queue   Graph: hancho-cli.exe taskqueue graph $Queue"
     exit 0

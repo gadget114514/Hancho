@@ -5,6 +5,28 @@ The catalog should format the value shown in the second column; `text` remains t
 unknown keys and the English sentence sent to language models. User-provided names, commands,
 paths, log contents, host names, and other data inside `v` are not translated.
 
+## Summary (top-level)
+
+`info.summary` is added when LLM advice finishes. It has one item and is shown first in the
+information pane.
+
+| Key | `v` shape | Display |
+|---|---|---|
+| `summary` | string | The LLM's self-contained summary of the card |
+
+## Intent
+
+The intent section says what the target was trying to do. It is shown before the cause.
+
+| Card | Key | `v` shape | English template |
+|---|---|---|---|
+| Job failure | `summary` | string | `{value}` (job summary) |
+| Job failure | `instructions` | string | instructions text (displayed line by line, capped) |
+| Job failure | `instructionsSource` | path string | `instructions source: {value}` |
+| BT escalation | `treeIntent` | string | `{value}` |
+| Process failure | `command` | string | `command: {value}` |
+| Timing divergence / resource wait | `summary` | string | `{value}` (job summary) |
+
 ## Job failure — cause
 
 | Key | `v` shape | English template |

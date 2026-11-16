@@ -28,6 +28,8 @@ what is different.
 - **`ww-enqueue`**: registers cards as hancho-cli jobs, locking `@unity-editor` for Unity cards.
   Card `Mode:` lines `static` and `tools` skip the Unity lock. The card path prefixes it accepts
   (`Assets/`, `Tools/`, `data/`) are fixed in `Get-CardPaths`; change them for another project.
+  Pass `-HanchoDataDir <dir>` (or set `HANCHO_LOG_DIR`) when the dashboard uses `--data-dir`, so the
+  jobs land in the core the dashboard is watching. `taskqueue add` reports the `data_dir` it used.
 - **`ww-wait`**: blocks until named hancho-cli jobs finish.
 - **Unity CPU progress** (`ww-watch`): Unity.exe CPU counts as progress with its own threshold,
   `-MinUnityCpuDelta` (default 30 s), so an idle editor does not hide a stall.

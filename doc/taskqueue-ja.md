@@ -67,6 +67,8 @@ hancho-cli.exe taskqueue wait main --since 0 --timeout-ms 30000
 | `planned` | 実行中のビヘイビアツリーが後で起動する job/worker 葉の仮行。実際にはキューに保存されていない。`taskqueue_list` は `include_planned: true` のときだけ返し（ダッシュボードは指定する）、ツリーが別の枝に進むか終了すると消える。 |
 | `succeeded` / `failed` / `cancelled` | 終了状態。failed は `maxAttempts` まで自動再実行。 |
 
+`taskqueue add` の応答には、登録先の `data_dir` が入ります。追加した ID と一緒に報告してください。ダッシュボードにジョブが出ない場合は、ダッシュボードのタイトルに表示されたデータディレクトリと照合します（別のコア／データディレクトリに登録すると、そのダッシュボードには出ません）。公開 API から追加したジョブは `hidden` を指定しても無視されるため、登録したジョブはタスクキューに表示されます。内部用の hidden ジョブは従来どおり既定で非表示です。設定の **hidden タスクも表示** で含められます。
+
 **失敗の診断と `failure-rules.json`**
 
 失敗した試行には診断 (`failure`) が付きます（試行と `jobAttemptFailed` / `jobFailed` イベント）。内容は `class`, `confidence`, `summary`, `detail`, `evidence`, `lastActivity`, `suggestedAction`, `retryAt` です。`hancho-cli taskqueue why <id>`、GUI、MCP の `taskqueue_get` / `taskqueue_wait`、memory の集計が同じレコードを使います。

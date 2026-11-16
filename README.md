@@ -92,6 +92,7 @@ The skill starts with `hancho-cli.exe help --json`, so the commands it shows alw
 | [Overview](doc/overview.md) | Working model, `run_worker`, suspend, behavior trees, stable events, graduation |
 | [Start](doc/start.md) | Quick start for LLM agents, build instructions, `Hancho.exe` vs. `hancho-cli.exe` |
 | [Key Features](doc/features.md) | Dashboard GUI, shell launcher, history, tray, logs, Job Objects, settings, task queue overview |
+| [Triage improvements](doc/triage-improvements.md) | LLM summary, intent section and readability fixes |
 | [Console CLI](doc/cli.md) | `hancho-cli.exe` usage, JSON output, stdin modes, completion, `help --json` keys |
 | [Task Queue](doc/taskqueue.md) | Ordered jobs, dependencies, job fields, states, ChainGuard |
 | [Behavior Trees](doc/behavior-tree.md) | BT format, node types, variables, worker engines, escalate, examples |

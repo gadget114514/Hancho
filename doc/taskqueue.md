@@ -67,6 +67,8 @@ Jobs that a behavior tree adds carry the origin of the `bt_start` call. The dash
 | `planned` | A provisional row for an idle job/worker leaf of a running behavior tree. It is not a stored queue job; `taskqueue_list` emits it only with `include_planned: true` (the dashboard does), and it disappears when the tree moves to another branch or finishes. |
 | `succeeded` / `failed` / `cancelled` | Terminal states. Failed jobs auto-retry up to `maxAttempts`. |
 
+`taskqueue add` reports the `data_dir` that received the jobs. Report it with the added IDs; if the dashboard does not show a job, compare it with the data directory in the dashboard title. A job added through the public API cannot set `hidden` (it is reserved for Hancho's own internal jobs), so anything reported as registered appears in the task list. Internal hidden jobs stay hidden by default; **Show hidden tasks** in Settings includes them.
+
 **Failure diagnosis and `failure-rules.json`**
 
 Each failed attempt gets a diagnosis (`failure` on the attempt and on `jobAttemptFailed` / `jobFailed` events): `class`, `confidence`, `summary`, `detail`, `evidence`, `lastActivity`, `suggestedAction` and `retryAt`. `hancho-cli taskqueue why <id>` prints it; the GUI, MCP `taskqueue_get` / `taskqueue_wait` and memory stats use the same record.
