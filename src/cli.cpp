@@ -2611,6 +2611,9 @@ TASK QUEUE:
       or PC_ORIGIN_SESSION), working folder and pid, plus --origin-label (or
       PC_ORIGIN_LABEL). The dashboard shows it in the Origin column.
       Each job needs id, command, summary, timeoutSec; dependsOn replaces '&&'.
+      Do not set hidden on jobs you register: hidden is reserved for Hancho's
+      own internal jobs. A hidden job appears in the task list only when
+      "Show hidden tasks" is enabled.
       Optional: cwd, host, env, dependsOn, idle, maxAttempts, retryDelaySec, success,
       killExclude, resources {write,read}, defer, priority, estimateSec,
       suspendWhenDone, suspendDelaySec, suspendHibernate,
@@ -3031,7 +3034,7 @@ void PrintCliUsageJson() {
       "description": "Manage the persistent task queue: ordered jobs, dependencies, per-job timeouts, success checks and automatic retries.",
       "usage": "hancho-cli taskqueue <add|list|get|why|retry|cancel|pause|resume|graph|wait|purge> ...",
       "subcommands": [
-        {"name": "add", "usage": "hancho-cli taskqueue add --file <jobs.json> [--taskqueue <name>] [--concurrency <n>] [--notify-file <path>] [--origin-label <text>]", "description": "Register jobs. Each job needs id, command, summary and timeoutSec; dependsOn replaces shell chaining. The caller's session id, working folder and --origin-label are recorded as the job's origin. suspendWhenDone/suspendDelaySec/suspendHibernate arm the PC to suspend after that job and all other work is idle."},
+        {"name": "add", "usage": "hancho-cli taskqueue add --file <jobs.json> [--taskqueue <name>] [--concurrency <n>] [--notify-file <path>] [--origin-label <text>]", "description": "Register jobs. Each job needs id, command, summary and timeoutSec; dependsOn replaces shell chaining. The caller's session id, working folder and --origin-label are recorded as the job's origin. suspendWhenDone/suspendDelaySec/suspendHibernate arm the PC to suspend after that job and all other work is idle. Do not set hidden on jobs you register: it is reserved for Hancho's internal jobs and hides the row unless Show hidden tasks is on."},
         {"name": "list", "usage": "hancho-cli taskqueue list [<name>] [--state <state>] [--since <period>] [--origin <self|label|session>] [--bt <id>]", "description": "List jobs with state, queue, summary and blockedBy. --since keeps only jobs updated within the period (e.g. 30m, 6h, 2d). --origin self keeps only the jobs this session added. --bt <id> lists every job of a behavior tree across its parallel branch queues. Each job also carries resource_wait and, once succeeded with estimateSec, timing_feedback (see audit). The dashboard adds provisional 'planned' rows for idle BT leaves; taskqueue_list returns them only with include_planned: true."},
         {"name": "record-plain", "usage": "hancho-cli taskqueue record-plain --cmd <cmd> [--name <name>] [--exit-code <n>] [--log <path>] [--summary <text>]", "description": "Record a plain execution outside a queue into logs/taskqueues/plain.json."},
         {"name": "get", "usage": "hancho-cli taskqueue get <id> [--rev <n>] [--no-instructions]", "description": "Show one job with attempts and instructions."},
@@ -3054,7 +3057,7 @@ void PrintCliUsageJson() {
       "subcommands": [
         {"name": "list", "usage": "hancho-cli triage list [--all|--state <pending|acted|ignored|resolved|open|follow_up>]", "description": "List triage cards by lifecycle and task/process KPI counts."},
         {"name": "show", "usage": "hancho-cli triage show <id>", "description": "Show card information, recommendations, outcome, branches, LLM advice, candidates and decision."},
-        {"name": "advise", "usage": "hancho-cli triage advise <id>", "description": "Request LLM advice as a hidden task-queue job."},
+        {"name": "advise", "usage": "hancho-cli triage advise <id>", "description": "Request LLM advice. The engine starts directly as a worker process, not as a task-queue job, so it answers at once."},
         {"name": "decide", "usage": "hancho-cli triage decide <id> <candidateId> [--reason <text>] [--multiplier <n>] [--answer <text>]", "description": "Run a listed candidate and record the decision."},
         {"name": "ack", "usage": "hancho-cli triage ack <id> | hancho-cli triage ack --all-auto", "description": "Mark automatic decisions as reviewed."},
         {"name": "handoff", "usage": "hancho-cli triage handoff <id>... | hancho-cli triage handoff --all", "description": "Hand pending cards to a batch supervisor (hidden job in queue _supervisor, with a timeout). Cards stay pending until it records decisions."},

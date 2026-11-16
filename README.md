@@ -120,6 +120,13 @@ The application icons are modeled on the character "Telephone Cat" (電話猫, D
 
 
 
+### v0.9.24
+- **Triage advice is immediate**: advice now runs as an ordinary worker process instead of a hidden `_triage` queue job, so asking for advice starts at once instead of waiting behind queued work. `triage_llm_concurrency` (default 2) limits how many advice engines run at the same time.
+- **Triage window performance**: resizing and splitter drags coalesce their layout work, child controls repaint once when the drag settles, and a refresh rewrites only the rows and cells that changed. GDI brushes and pens are cached per theme, and the window does no work while it is hidden or minimized.
+- **Triage list actions**: right-click the list to copy the target or the whole row, or fit the columns to their content. Ctrl+C copies the target.
+- **Task queue**: `hidden: true` on a registered job is honoured (internal jobs stay hidden), and `taskqueue add` reports the data directory that received the jobs.
+- **Installer icon**: the setup executable now uses the Hancho app icon.
+
 ### v0.9.23
 - **Triage summary**: the information pane starts with a self-contained LLM summary, followed by intent, cause, background, environment, conditions and reason. In the default uncertain mode an unreviewed card gets the summary automatically, so its state can be judged without opening a file.
 - **Triage intent**: failed jobs show their captured instructions in the intent section, so a long task-file path no longer hides what the job was asked to do.

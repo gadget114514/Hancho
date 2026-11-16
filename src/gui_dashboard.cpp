@@ -133,6 +133,7 @@ static bool g_activityStyle = true;
 static bool g_darkThemeActive = false;  // cached by ApplyTheme for cheap per-row colour picks
 static ThemeColors g_theme = {};
 static HBRUSH g_dialogBgBrush = nullptr;
+static int g_themeGeneration = 0;
 
 static UiLanguage DetectDefaultLanguage() {
     wchar_t buf[16] = {};
@@ -152,6 +153,7 @@ static UiLanguage DetectDefaultLanguage() {
 static void ApplyTheme() {
     g_theme = ThemeFor(g_uiTheme);
     g_darkThemeActive = IsDarkUiTheme(g_uiTheme);
+    ++g_themeGeneration;
     if (g_dialogBgBrush) {
         DeleteObject(g_dialogBgBrush);
     }
@@ -159,6 +161,40 @@ static void ApplyTheme() {
 }
 static bool IsDarkThemeActive() {
     return IsDarkUiTheme(g_uiTheme);
+}
+
+// Brushes and pens used while painting are created once per theme instead of once per item
+// or per paint. Triage redraws its KPI strip and every list row, so the old per-paint
+// CreateSolidBrush/CreatePen churn dominated the window's CPU use.
+struct CachedBrushEntry { COLORREF color; HBRUSH brush; };
+struct CachedPenEntry { COLORREF color; int width; HPEN pen; };
+static std::vector<CachedBrushEntry> g_brushCache;
+static std::vector<CachedPenEntry> g_penCache;
+static int g_gdiCacheGeneration = -1;
+
+static void TrimGdiCache() {
+    if (g_gdiCacheGeneration == g_themeGeneration) return;
+    g_gdiCacheGeneration = g_themeGeneration;
+    for (const auto& entry : g_brushCache) if (entry.brush) DeleteObject(entry.brush);
+    for (const auto& entry : g_penCache) if (entry.pen) DeleteObject(entry.pen);
+    g_brushCache.clear();
+    g_penCache.clear();
+}
+
+static HBRUSH CachedSolidBrush(COLORREF color) {
+    TrimGdiCache();
+    for (const auto& entry : g_brushCache) if (entry.color == color) return entry.brush;
+    HBRUSH brush = CreateSolidBrush(color);
+    if (brush) g_brushCache.push_back({color, brush});
+    return brush;
+}
+
+static HPEN CachedPen(COLORREF color, int width = 1) {
+    TrimGdiCache();
+    for (const auto& entry : g_penCache) if (entry.color == color && entry.width == width) return entry.pen;
+    HPEN pen = CreatePen(PS_SOLID, width, color);
+    if (pen) g_penCache.push_back({color, width, pen});
+    return pen;
 }
 
 static void ApplyNativeThemeToWindow(HWND hwnd) {
@@ -180,9 +216,8 @@ static void DrawHeaderItem(DRAWITEMSTRUCT* dis) {
     hdiText.pszText = text;
     hdiText.cchTextMax = 256;
     SendMessageW(dis->hwndItem, HDM_GETITEMW, dis->itemID, reinterpret_cast<LPARAM>(&hdiText));
-    HBRUSH bgBrush = CreateSolidBrush(HeaderBgColor());
+    HBRUSH bgBrush = CachedSolidBrush(HeaderBgColor());
     FillRect(dis->hDC, &dis->rcItem, bgBrush);
-    DeleteObject(bgBrush);
 
     SetBkMode(dis->hDC, TRANSPARENT);
     SetTextColor(dis->hDC, g_theme.text);
@@ -193,14 +228,13 @@ static void DrawHeaderItem(DRAWITEMSTRUCT* dis) {
     DrawTextW(dis->hDC, text, -1, &rc, DT_LEFT | DT_VCENTER | DT_SINGLELINE | DT_END_ELLIPSIS);
     SelectObject(dis->hDC, oldFont);
 
-    HPEN borderPen = CreatePen(PS_SOLID, 1, g_theme.border);
+    HPEN borderPen = CachedPen(g_theme.border);
     HGDIOBJ oldPen = SelectObject(dis->hDC, borderPen);
     MoveToEx(dis->hDC, dis->rcItem.right - 1, dis->rcItem.top, nullptr);
     LineTo(dis->hDC, dis->rcItem.right - 1, dis->rcItem.bottom);
     MoveToEx(dis->hDC, dis->rcItem.left, dis->rcItem.bottom - 1, nullptr);
     LineTo(dis->hDC, dis->rcItem.right, dis->rcItem.bottom - 1);
     SelectObject(dis->hDC, oldPen);
-    DeleteObject(borderPen);
 }
 
 static LRESULT CALLBACK HeaderSubclassProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam,
@@ -209,9 +243,8 @@ static LRESULT CALLBACK HeaderSubclassProc(HWND hwnd, UINT msg, WPARAM wParam, L
         HDC hdc = reinterpret_cast<HDC>(wParam);
         RECT rc = {};
         GetClientRect(hwnd, &rc);
-        HBRUSH brush = CreateSolidBrush(HeaderBgColor());
+        HBRUSH brush = CachedSolidBrush(HeaderBgColor());
         FillRect(hdc, &rc, brush);
-        DeleteObject(brush);
         return 1;
     }
     LRESULT res = DefSubclassProc(hwnd, msg, wParam, lParam);
@@ -225,15 +258,13 @@ static LRESULT CALLBACK HeaderSubclassProc(HWND hwnd, UINT msg, WPARAM wParam, L
                 if (rcLast.right < rcClient.right) {
                     HDC hdc = GetDC(hwnd);
                     RECT rcEmpty = { rcLast.right, rcClient.top, rcClient.right, rcClient.bottom };
-                    HBRUSH brush = CreateSolidBrush(HeaderBgColor());
+                    HBRUSH brush = CachedSolidBrush(HeaderBgColor());
                     FillRect(hdc, &rcEmpty, brush);
-                    DeleteObject(brush);
-                    HPEN borderPen = CreatePen(PS_SOLID, 1, g_theme.border);
+                    HPEN borderPen = CachedPen(g_theme.border);
                     HGDIOBJ oldPen = SelectObject(hdc, borderPen);
                     MoveToEx(hdc, rcEmpty.left, rcEmpty.bottom - 1, nullptr);
                     LineTo(hdc, rcEmpty.right, rcEmpty.bottom - 1);
                     SelectObject(hdc, oldPen);
-                    DeleteObject(borderPen);
                     ReleaseDC(hwnd, hdc);
                 }
             }
@@ -417,7 +448,7 @@ static void DrawTriageGridLines(const NMLVCUSTOMDRAW* lvcd) {
     RECT row = {};
     if (!ListView_GetItemRect(list, item, &row, LVIR_BOUNDS)) return;
     HDC hdc = lvcd->nmcd.hdc;
-    HPEN pen = CreatePen(PS_SOLID, 1, BlendColor(g_theme.border, g_theme.panel, 0.62f));
+    HPEN pen = CachedPen(BlendColor(g_theme.border, g_theme.panel, 0.62f));
     if (!pen) return;
     HGDIOBJ oldPen = SelectObject(hdc, pen);
     MoveToEx(hdc, row.left, row.bottom - 1, nullptr);
@@ -432,7 +463,6 @@ static void DrawTriageGridLines(const NMLVCUSTOMDRAW* lvcd) {
         }
     }
     SelectObject(hdc, oldPen);
-    DeleteObject(pen);
 }
 
 // Low-saturation variant of a theme row color (keeps brightness, mutes the hue).
@@ -1695,20 +1725,17 @@ static void DrawKpiCard(HDC hdc, const RECT& rc, const wchar_t* title, const std
                         COLORREF accentColor, HFONT hFontUi, HFONT hFontKpiVal,
                         float marqueePhase = -1.0f, const std::wstring& subText = L"",
                         bool triageTint = false) {
-    HBRUSH bgBrush = CreateSolidBrush(triageTint ? TriageKpiCardBgColor() : g_theme.panel);
-    HPEN borderPen = CreatePen(PS_SOLID, 1, g_theme.border);
+    HBRUSH bgBrush = CachedSolidBrush(triageTint ? TriageKpiCardBgColor() : g_theme.panel);
+    HPEN borderPen = CachedPen(g_theme.border);
     HGDIOBJ oldBrush = SelectObject(hdc, bgBrush);
     HGDIOBJ oldPen = SelectObject(hdc, borderPen);
     RoundRect(hdc, rc.left, rc.top, rc.right, rc.bottom, 6, 6);
     SelectObject(hdc, oldBrush);
     SelectObject(hdc, oldPen);
-    DeleteObject(bgBrush);
-    DeleteObject(borderPen);
 
     RECT rcStripe = {rc.left + 3, rc.top + 1, rc.right - 3, rc.top + 5};
-    HBRUSH stripeBrush = CreateSolidBrush(accentColor);
+    HBRUSH stripeBrush = CachedSolidBrush(accentColor);
     FillRect(hdc, &rcStripe, stripeBrush);
-    DeleteObject(stripeBrush);
 
     if (marqueePhase >= 0.0f) {
         int stripeLeft = static_cast<int>(rcStripe.left);
@@ -1720,9 +1747,8 @@ static void DrawKpiCard(HDC hdc, const RECT& rc, const wchar_t* title, const std
         RECT rcBand = {(std::max)(stripeLeft, bandLeft), rcStripe.top,
                        (std::min)(stripeRight, bandLeft + bandW), rcStripe.bottom};
         if (rcBand.right > rcBand.left) {
-            HBRUSH bandBrush = CreateSolidBrush(BlendColor(accentColor, RGB(255, 255, 255), 0.55f));
+            HBRUSH bandBrush = CachedSolidBrush(BlendColor(accentColor, RGB(255, 255, 255), 0.55f));
             FillRect(hdc, &rcBand, bandBrush);
-            DeleteObject(bandBrush);
         }
     }
 
@@ -14672,6 +14698,20 @@ struct TriageDlgState {
     // rebuilding unchanged rows, text and radios each time made the window flicker and reset scrolling.
     std::string shownListSignature;
     std::string shownCardDump = "\x01";  // never equal to a real dump, so the first update always draws
+    nlohmann::json shownListResponse;
+    std::vector<std::string> shownRowIds;
+    std::vector<nlohmann::json> shownRowCards;
+    std::vector<std::vector<std::wstring>> shownRowCells;
+    std::wstring shownInfoSignature;
+    std::wstring shownCandidateSignature;
+    std::vector<std::wstring> radioBaseLabels;
+    std::vector<std::wstring> radioCaptions;
+    std::wstring shownTitle;
+    std::wstring shownDetail;
+    std::wstring shownMode;
+    std::wstring shownRunCaption;
+    std::wstring shownEmpty;
+    bool reloadPending = false;
 };
 
 static void CopyTriageListSelection(HWND hwnd, TriageDlgState* ds, bool row);
@@ -14957,6 +14997,7 @@ static std::wstring TriageLower(std::wstring text) {
 }
 
 static bool TriageSearchMatches(const nlohmann::json& card, const std::wstring& query) {
+    if (query.empty()) return true;
     std::wstring searchable = Utf8ToWide(card.value("id", std::string())) + L" " + Utf8ToWide(card.dump());
     for (int col = 0; col < 11; ++col) searchable += L" " + TriageColumnText(card, col);
     searchable = TriageLower(std::move(searchable));
@@ -15025,6 +15066,12 @@ static bool TriageIsAutoUnreviewed(const nlohmann::json& card) {
     return (by == "hancho-auto" || by == "llm-auto") && !decision.value("reviewed", false);
 }
 
+static void SetTriageText(HWND control, const std::wstring& text, std::wstring& shown) {
+    if (!control || text == shown) return;
+    shown = text;
+    SetWindowTextW(control, text.c_str());
+}
+
 static void TriageUpdateTitle(HWND hwnd, TriageDlgState* ds) {
     if (!hwnd || !ds || !ds->dash) return;
     const int pending = ds->dash->pendingTriageTask + ds->dash->pendingTriageProcess;
@@ -15036,7 +15083,7 @@ static void TriageUpdateTitle(HWND hwnd, TriageDlgState* ds) {
     std::wstring title = Tr(L"Hancho トリアージ — 判断待ち ", L"Hancho Triage — ", L"Hancho Triaje — ") + std::to_wstring(pending);
     title += Tr(L" 件", L" awaiting decision", L" pendientes");
     if (hiddenPending > 0) title += Tr(L"（非表示 ", L" (hidden ", L" (ocultas ") + std::to_wstring(hiddenPending) + L")";
-    SetWindowTextW(hwnd, title.c_str());
+    SetTriageText(hwnd, title, ds->shownTitle);
 }
 
 static void TriageUpdateSelection(TriageDlgState* ds) {
@@ -15054,10 +15101,12 @@ static void TriageUpdateSelection(TriageDlgState* ds) {
     const std::string cardDump = has ? ds->selectedCard.dump() : std::string();
     if (cardDump == ds->shownCardDump) return;
     ds->shownCardDump = cardDump;
+    const bool ackWasVisible = ds->btnAck && IsWindowVisible(ds->btnAck);
+    const bool multiplierWasVisible = ds->multiplier && IsWindowVisible(ds->multiplier);
+    const size_t radioCountBefore = ds->radios.size();
     // Left pane: the information table, one row per line, the section name on its first row.
     if (ds->infoTable) {
-        SendMessageW(ds->infoTable, WM_SETREDRAW, FALSE, 0);
-        ListView_DeleteAllItems(ds->infoTable);
+        std::vector<std::pair<std::wstring, std::wstring>> infoRows;
         if (has) {
             const auto info = ds->selectedCard.value("info", nlohmann::json::object());
             const char* sectionKeys[] = {"summary", "intent", "cause", "background", "environment", "conditions", "reason"};
@@ -15069,7 +15118,6 @@ static void TriageUpdateSelection(TriageDlgState* ds) {
                 };
                 return line.empty() || endsWith(": ") || endsWith(":") || endsWith(": null") || endsWith(": []");
             };
-            int row = 0;
             for (int i = 0; i < 7; ++i) {
                 std::vector<std::wstring> lines;
                 // Summary and intent are prose; keep their punctuation-only endings (for example a
@@ -15093,19 +15141,34 @@ static void TriageUpdateSelection(TriageDlgState* ds) {
                 }
                 if (lines.empty()) lines.push_back(L"—");
                 for (size_t j = 0; j < lines.size(); ++j) {
-                    LVITEMW item = {}; item.mask = LVIF_TEXT; item.iItem = row;
                     std::wstring section = j == 0
                         ? Utf8ToWide(TriageLabel(TriageDisplayLanguage(), "section", sectionKeys[i]))
                         : std::wstring();
-                    item.pszText = const_cast<wchar_t*>(section.c_str());
-                    ListView_InsertItem(ds->infoTable, &item);
-                    ListView_SetItemText(ds->infoTable, row, 1, const_cast<wchar_t*>(lines[j].c_str()));
-                    ++row;
+                    infoRows.emplace_back(std::move(section), std::move(lines[j]));
                 }
             }
         }
-        SendMessageW(ds->infoTable, WM_SETREDRAW, TRUE, 0);
-        InvalidateRect(ds->infoTable, nullptr, TRUE);
+        std::wstring infoSignature;
+        for (const auto& row : infoRows) {
+            infoSignature += row.first;
+            infoSignature += L'\x1f';
+            infoSignature += row.second;
+            infoSignature += L'\x1e';
+        }
+        if (infoSignature != ds->shownInfoSignature) {
+            ds->shownInfoSignature = infoSignature;
+            SendMessageW(ds->infoTable, WM_SETREDRAW, FALSE, 0);
+            ListView_DeleteAllItems(ds->infoTable);
+            for (size_t i = 0; i < infoRows.size(); ++i) {
+                LVITEMW item = {}; item.mask = LVIF_TEXT; item.iItem = static_cast<int>(i);
+                item.pszText = const_cast<wchar_t*>(infoRows[i].first.c_str());
+                ListView_InsertItem(ds->infoTable, &item);
+                ListView_SetItemText(ds->infoTable, static_cast<int>(i), 1,
+                                     const_cast<wchar_t*>(infoRows[i].second.c_str()));
+            }
+            SendMessageW(ds->infoTable, WM_SETREDRAW, TRUE, 0);
+            InvalidateRect(ds->infoTable, nullptr, TRUE);
+        }
     }
 
     // Right pane: advice, decision, lifecycle outcome and follow-up links.
@@ -15171,10 +15234,8 @@ static void TriageUpdateSelection(TriageDlgState* ds) {
     } else {
         text = Tr(L"カードを選択してください。", L"Select a card.", L"Selecciona una tarjeta.");
     }
-    if (ds->detail) SetWindowTextW(ds->detail, text.c_str());
+    SetTriageText(ds->detail, text, ds->shownDetail);
 
-    for (HWND radio : ds->radios) if (radio) DestroyWindow(radio);
-    ds->radios.clear();
     const bool pending = has && ds->selectedCard.value("state", std::string()) == "pending";
     std::string preferred;
     const auto advice = has ? ds->selectedCard.value("advice", nlohmann::json()) : nlohmann::json();
@@ -15184,15 +15245,32 @@ static void TriageUpdateSelection(TriageDlgState* ds) {
         auto rec = ds->selectedCard.value("recommendation", nlohmann::json::object());
         preferred = rec.value("candidateId", std::string());
     }
+    std::vector<std::pair<std::string, std::wstring>> candidates;
     if (has && ds->selectedCard.contains("candidates") && ds->selectedCard["candidates"].is_array()) {
-        int i = 0;
         for (const auto& candidate : ds->selectedCard["candidates"]) {
             if (!candidate.is_object()) continue;
             const std::string id = candidate.value("id", std::string());
             std::wstring label = TriageCandidateLabel(ds->selectedCard, id) + L" — " +
                 Utf8ToWide(pc::TriageCandidateEffect(TriageDisplayLanguage(), id,
                     candidate.value("effect", std::string())));
-            if (id == preferred) label = L"★ " + std::wstring(Tr(L"推奨: ", L"Recommended: ", L"Recomendado: ")) + label;
+            candidates.emplace_back(id, std::move(label));
+        }
+    }
+    std::wstring candidateSignature = pending ? L"1" : L"0";
+    for (const auto& candidate : candidates) {
+        candidateSignature += Utf8ToWide(candidate.first);
+        candidateSignature += L'\x1f';
+        candidateSignature += candidate.second;
+        candidateSignature += L'\x1e';
+    }
+    if (candidateSignature != ds->shownCandidateSignature || ds->radios.size() != candidates.size()) {
+        ds->shownCandidateSignature = candidateSignature;
+        for (HWND radio : ds->radios) if (radio) DestroyWindow(radio);
+        ds->radios.clear();
+        ds->radioBaseLabels.clear();
+        ds->radioCaptions.clear();
+        for (size_t i = 0; i < candidates.size(); ++i) {
+            const std::wstring& label = candidates[i].second;
             // Candidates are only offered while the card awaits a decision.
             HWND radio = CreateWindowExW(0, L"BUTTON", label.c_str(),
                 WS_CHILD | WS_VISIBLE | WS_TABSTOP | BS_AUTORADIOBUTTON | (i == 0 ? WS_GROUP : 0) | (pending ? 0 : WS_DISABLED),
@@ -15204,10 +15282,25 @@ static void TriageUpdateSelection(TriageDlgState* ds) {
             if (radio) SetWindowTheme(radio, L"", L"");
             if (radio) SetWindowSubclass(radio, TriageChildSubclassProc, 1, 0);
             ds->radios.push_back(radio);
-            if (id == preferred) SendMessageW(radio, BM_SETCHECK, BST_CHECKED, 0);
-            ++i;
+            ds->radioBaseLabels.push_back(label);
         }
-        if (!ds->radios.empty() && preferred.empty()) SendMessageW(ds->radios.front(), BM_SETCHECK, BST_CHECKED, 0);
+        ds->radioCaptions.assign(ds->radios.size(), std::wstring());
+    }
+    if (ds->radioCaptions.size() != ds->radios.size())
+        ds->radioCaptions.assign(ds->radios.size(), std::wstring());
+    for (size_t i = 0; i < ds->radios.size() && i < candidates.size(); ++i) {
+        if (!ds->radios[i]) continue;
+        std::wstring caption = ds->radioBaseLabels[i];
+        if (candidates[i].first == preferred)
+            caption = L"★ " + std::wstring(Tr(L"推奨: ", L"Recommended: ", L"Recomendado: ")) + caption;
+        if (ds->radioCaptions[i] != caption) {
+            ds->radioCaptions[i] = caption;
+            SetWindowTextW(ds->radios[i], caption.c_str());
+        }
+        const WPARAM check = (candidates[i].first == preferred || (preferred.empty() && i == 0))
+            ? BST_CHECKED : BST_UNCHECKED;
+        if (SendMessageW(ds->radios[i], BM_GETCHECK, 0, 0) != static_cast<LRESULT>(check))
+            SendMessageW(ds->radios[i], BM_SETCHECK, check, 0);
     }
     bool hasTimeoutChoice = false;
     if (has && ds->selectedCard.contains("candidates") && ds->selectedCard["candidates"].is_array()) {
@@ -15233,9 +15326,13 @@ static void TriageUpdateSelection(TriageDlgState* ds) {
         const std::wstring caption = chosen.empty()
             ? Tr(L"▶ 選んだ処置を実行", L"▶ Run selected action", L"▶ Ejecutar acción seleccionada")
             : Tr(L"▶ 実行: ", L"▶ Run: ", L"▶ Ejecutar: ") + TriageCandidateLabel(ds->selectedCard, chosen);
-        SetWindowTextW(ds->btnRun, caption.c_str());
+        SetTriageText(ds->btnRun, caption, ds->shownRunCaption);
     }
-    TriageLayout(GetParent(ds->list), ds);
+    const bool ackVisible = ds->btnAck && IsWindowVisible(ds->btnAck);
+    const bool multiplierVisible = ds->multiplier && IsWindowVisible(ds->multiplier);
+    if (ds->lastLayoutTickMs == 0 || ds->radios.size() != radioCountBefore ||
+        ackVisible != ackWasVisible || multiplierVisible != multiplierWasVisible)
+        TriageLayout(GetParent(ds->list), ds);
 }
 
 static void TriagePersistSort(TriageDlgState* ds) {
@@ -15294,6 +15391,17 @@ static void TriageReload(TriageDlgState* ds, const nlohmann::json* response = nu
         if (!GuiIpcCall(ds->dash, req, listed) || !listed.value("ok", false)) return;
     }
     if (!listed.value("ok", false)) return;
+    const auto counts = listed.value("counts", nlohmann::json::object());
+    std::vector<std::string> hiddenIds(ds->dash->hiddenTriageCards.begin(), ds->dash->hiddenTriageCards.end());
+    std::sort(hiddenIds.begin(), hiddenIds.end());
+    std::string hiddenSignature;
+    for (const auto& id : hiddenIds) { hiddenSignature += id; hiddenSignature += '\n'; }
+    const std::wstring filter = ds->filterKey;
+    std::string chrome = WideToUtf8(filter) + "|" + WideToUtf8(ds->searchText) + "|" +
+        std::to_string(ds->sortColumn) + (ds->sortDescending ? "d|" : "a|") +
+        listed.value("mode", std::string()) + "|" + listed.value("llmMode", std::string()) + "|" +
+        counts.dump() + "|" + hiddenSignature + "|" + ds->selectedId;
+    if (listed == ds->shownListResponse && chrome == ds->shownListSignature) return;
     ds->allCards.clear();
     std::unordered_set<std::string> present;
     if (listed.contains("cards") && listed["cards"].is_array()) {
@@ -15310,7 +15418,6 @@ static void TriageReload(TriageDlgState* ds, const nlohmann::json* response = nu
     }
     if (hiddenChanged) SaveTriageHiddenCards(ds->dash);
     ds->rows.clear();
-    const std::wstring filter = ds->filterKey;
     int filterTotal = 0;
     for (const auto& card : ds->allCards) {
         const std::string state = card.value("state", std::string());
@@ -15335,11 +15442,14 @@ static void TriageReload(TriageDlgState* ds, const nlohmann::json* response = nu
         ds->rows.push_back(card);
     }
     ds->searchMatches = static_cast<int>(ds->rows.size());
-    const auto counts = listed.value("counts", nlohmann::json::object());
     TriageUpdateKpis(ds, counts);
-    auto compareText = [](const std::wstring& a, const std::wstring& b) {
-        const auto la = TriageLower(a), lb = TriageLower(b);
-        return la < lb ? -1 : la > lb ? 1 : 0;
+    std::unordered_map<std::string, std::wstring> sortTextCache;
+    auto sortText = [&](const nlohmann::json& card) -> const std::wstring& {
+        const std::string id = card.value("id", std::string());
+        auto it = sortTextCache.find(id);
+        if (it == sortTextCache.end())
+            it = sortTextCache.emplace(id, TriageLower(TriageColumnText(card, ds->sortColumn))).first;
+        return it->second;
     };
     std::stable_sort(ds->rows.begin(), ds->rows.end(), [&](const nlohmann::json& a, const nlohmann::json& b) {
         int cmp = 0;
@@ -15362,51 +15472,96 @@ static void TriageReload(TriageDlgState* ds, const nlohmann::json* response = nu
             const int64_t ea = ParseTimestampStrToEpoch(ta), eb = ParseTimestampStrToEpoch(tb);
             cmp = ea < eb ? -1 : ea > eb ? 1 : 0;
         } else {
-            cmp = compareText(TriageColumnText(a, ds->sortColumn), TriageColumnText(b, ds->sortColumn));
+            const auto& ka = sortText(a);
+            const auto& kb = sortText(b);
+            cmp = ka < kb ? -1 : ka > kb ? 1 : 0;
         }
         return ds->sortDescending ? cmp > 0 : cmp < 0;
     });
-    // Nothing changed since the last reload: leave the list, selection and scroll position alone.
-    std::string signature = WideToUtf8(filter) + "|" + WideToUtf8(ds->searchText) + "|" +
-        std::to_string(ds->sortColumn) + (ds->sortDescending ? "d|" : "a|") +
-        listed.value("mode", std::string()) + "|" + listed.value("llmMode", std::string()) + "|";
-    for (const auto& card : ds->rows) signature += card.dump();
-    signature += "|" + counts.dump() + "|" + std::to_string(filterTotal);
-    if (signature == ds->shownListSignature) return;
-    ds->shownListSignature = signature;
-    ds->loading = true;
-    SendMessageW(ds->list, WM_SETREDRAW, FALSE, 0);
-    // Keep the scroll position across a rebuild.
-    const int topIndex = ListView_GetTopIndex(ds->list);
-    ListView_DeleteAllItems(ds->list);
+    // Reuse the row text when the card JSON is unchanged, and write only the cells whose
+    // text differs from what is on screen, so a refresh does not rebuild the ListView.
+    std::vector<std::string> oldIds = std::move(ds->shownRowIds);
+    std::vector<nlohmann::json> oldCards = std::move(ds->shownRowCards);
+    std::vector<std::vector<std::wstring>> oldCells = std::move(ds->shownRowCells);
+    std::unordered_map<std::string, size_t> oldIndex;
+    oldIndex.reserve(oldIds.size());
+    for (size_t i = 0; i < oldIds.size(); ++i) oldIndex.emplace(oldIds[i], i);
+    auto buildCells = [](const nlohmann::json& card) {
+        std::vector<std::wstring> cells;
+        cells.reserve(11);
+        cells.push_back(TriageLifecycleLabel(card.value("lifecycle", std::string())));
+        cells.push_back(TriageKindLabel(card));
+        cells.push_back(TriageTargetText(card));
+        cells.push_back(TriageRecommendation(card));
+        cells.push_back(TriageAdviceStatus(card));
+        cells.push_back(TriageRouteLabel(card));
+        cells.push_back(TriageDecisionText(card));
+        cells.push_back(TriageOutcomeText(card));
+        cells.push_back(TriageReviewStatus(card));
+        cells.push_back(Utf8ToWide(card.value("createdAt", std::string())));
+        cells.push_back(Utf8ToWide(card.value("updatedAt", card.value("createdAt", std::string()))));
+        return cells;
+    };
+    std::vector<std::string> newIds(ds->rows.size());
+    std::vector<nlohmann::json> newCards(ds->rows.size());
+    std::vector<std::vector<std::wstring>> newCells(ds->rows.size());
     for (size_t i = 0; i < ds->rows.size(); ++i) {
         const auto& card = ds->rows[i];
-        std::wstring state = TriageLifecycleLabel(card.value("lifecycle", std::string()));
-        LVITEMW item = {};
-        item.mask = LVIF_TEXT | LVIF_PARAM;
-        item.iItem = static_cast<int>(i);
-        item.lParam = static_cast<LPARAM>(i);
-        item.pszText = state.data();
-        ListView_InsertItem(ds->list, &item);
-        std::wstring cells[] = {
-            TriageKindLabel(card), TriageTargetText(card), TriageRecommendation(card),
-            TriageAdviceStatus(card), TriageRouteLabel(card), TriageDecisionText(card),
-            TriageOutcomeText(card), TriageReviewStatus(card),
-            Utf8ToWide(card.value("createdAt", std::string())),
-            Utf8ToWide(card.value("updatedAt", card.value("createdAt", std::string())))};
-        for (int c = 0; c < static_cast<int>(std::size(cells)); ++c)
-            ListView_SetItemText(ds->list, static_cast<int>(i), c + 1, cells[c].data());
-        if (card.value("id", std::string()) == ds->selectedId)
-            ListView_SetItemState(ds->list, static_cast<int>(i), LVIS_SELECTED | LVIS_FOCUSED, LVIS_SELECTED | LVIS_FOCUSED);
+        newIds[i] = card.value("id", std::string());
+        newCards[i] = card;
+        const auto it = oldIndex.find(newIds[i]);
+        if (it != oldIndex.end() && it->second < oldCards.size() && oldCards[it->second] == card)
+            newCells[i] = oldCells[it->second];
+        else
+            newCells[i] = buildCells(card);
     }
-    if (topIndex > 0 && topIndex < static_cast<int>(ds->rows.size())) {
-        RECT itemRc = {};
-        if (ListView_GetItemRect(ds->list, 0, &itemRc, LVIR_BOUNDS))
-            ListView_Scroll(ds->list, 0, topIndex * (itemRc.bottom - itemRc.top));
+    const int desiredRows = static_cast<int>(newIds.size());
+    const int currentRows = ListView_GetItemCount(ds->list);
+    ds->loading = true;
+    if (desiredRows > currentRows) {
+        for (int i = currentRows; i < desiredRows; ++i) {
+            LVITEMW item = {};
+            item.mask = LVIF_TEXT | LVIF_PARAM;
+            item.iItem = i;
+            item.lParam = static_cast<LPARAM>(i);
+            item.pszText = const_cast<wchar_t*>(L"");
+            ListView_InsertItem(ds->list, &item);
+        }
+    } else if (desiredRows < currentRows) {
+        for (int i = currentRows - 1; i >= desiredRows; --i) ListView_DeleteItem(ds->list, i);
     }
-    SendMessageW(ds->list, WM_SETREDRAW, TRUE, 0);
-    InvalidateRect(ds->list, nullptr, FALSE);
+    for (int i = 0; i < desiredRows; ++i) {
+        const auto& cells = newCells[static_cast<size_t>(i)];
+        const bool hadRow = i < static_cast<int>(oldCells.size());
+        for (int c = 0; c < 11; ++c) {
+            if (hadRow && oldCells[static_cast<size_t>(i)][static_cast<size_t>(c)] == cells[static_cast<size_t>(c)])
+                continue;
+            ListView_SetItemText(ds->list, i, c, const_cast<wchar_t*>(cells[static_cast<size_t>(c)].c_str()));
+        }
+    }
+    const int selectedRow = ListView_GetNextItem(ds->list, -1, LVNI_SELECTED);
+    int targetRow = -1;
+    if (!ds->selectedId.empty()) {
+        for (int i = 0; i < desiredRows; ++i) {
+            if (newIds[static_cast<size_t>(i)] == ds->selectedId) { targetRow = i; break; }
+        }
+    }
+    const bool selectionMatches = selectedRow >= 0 && selectedRow < desiredRows &&
+        newIds[static_cast<size_t>(selectedRow)] == ds->selectedId;
+    if (!selectionMatches) {
+        if (selectedRow >= 0)
+            ListView_SetItemState(ds->list, selectedRow, 0, LVIS_SELECTED | LVIS_FOCUSED);
+        if (targetRow >= 0)
+            ListView_SetItemState(ds->list, targetRow, LVIS_SELECTED | LVIS_FOCUSED,
+                                  LVIS_SELECTED | LVIS_FOCUSED);
+    }
     ds->loading = false;
+    ds->shownRowIds = std::move(newIds);
+    ds->shownRowCards = std::move(newCards);
+    ds->shownRowCells = std::move(newCells);
+    ds->shownListResponse = listed;
+    ds->shownListSignature = chrome;
+    const bool ackAllWasVisible = ds->btnAckAll && IsWindowVisible(ds->btnAckAll);
     TriageUpdateTitle(GetParent(ds->list), ds);
     TriageUpdateSelection(ds);
     if (ds->btnShowPending) EnableWindow(ds->btnShowPending, !ds->dash->hiddenTriageCards.empty());
@@ -15417,7 +15572,7 @@ static void TriageReload(TriageDlgState* ds, const nlohmann::json* response = nu
     if (ds->btnClear) EnableWindow(ds->btnClear, !ds->rows.empty());
     if (ds->btnAllSupervisor) EnableWindow(ds->btnAllSupervisor, ds->dash->pendingTriageTask +
         ds->dash->pendingTriageProcess + ds->dash->pendingTriageOther > 0);
-    TriageLayout(GetParent(ds->list), ds);
+    const bool ackAllVisible = ds->btnAckAll && IsWindowVisible(ds->btnAckAll);
     std::wstring mode = Tr(L"処置モード: ", L"Triage mode: ", L"Modo: ");
     const std::string modeValue = listed.value("mode", ds->dash->triageMode);
     mode += modeValue == "manual" ? Tr(L"手動", L"manual", L"manual") :
@@ -15430,7 +15585,7 @@ static void TriageReload(TriageDlgState* ds, const nlohmann::json* response = nu
         mode += L"   ｜   " + std::wstring(Tr(L"検索: ", L"Search: ", L"Buscar: ")) +
             std::to_wstring(ds->searchMatches) + L" / " + std::to_wstring(filterTotal) + Tr(L" 件", L" cards", L" tarjetas");
     }
-    if (ds->modeLabel) SetWindowTextW(ds->modeLabel, mode.c_str());
+    SetTriageText(ds->modeLabel, mode, ds->shownMode);
     const bool taskOnly = filter == L"pendingTask";
     int hiddenPending = 0;
     for (const auto& card : ds->allCards) {
@@ -15439,6 +15594,7 @@ static void TriageReload(TriageDlgState* ds, const nlohmann::json* response = nu
         if (taskOnly && kind != "job_failure" && kind != "bt_escalation_failure") continue;
         if (ds->dash->hiddenTriageCards.count(card.value("id", std::string()))) ++hiddenPending;
     }
+    const bool emptyWasVisible = ds->emptyState && IsWindowVisible(ds->emptyState);
     if (ds->emptyState) {
         const bool allHiddenPending = (filter == L"pending" || taskOnly) && ds->searchText.empty() &&
             ds->rows.empty() && hiddenPending > 0;
@@ -15451,9 +15607,13 @@ static void TriageReload(TriageDlgState* ds, const nlohmann::json* response = nu
                    L" pending cards are hidden. Use ‘Show pending again’ to restore them.",
                    L" tarjetas pendientes están ocultas. Usa ‘Mostrar pendientes’ para restaurarlas.");
         }
-        SetWindowTextW(ds->emptyState, emptyText.c_str());
-        ShowWindow(ds->emptyState, allHiddenPending ? SW_SHOW : SW_HIDE);
+        SetTriageText(ds->emptyState, emptyText, ds->shownEmpty);
+        if ((IsWindowVisible(ds->emptyState) != 0) != allHiddenPending)
+            ShowWindow(ds->emptyState, allHiddenPending ? SW_SHOW : SW_HIDE);
     }
+    const bool emptyVisible = ds->emptyState && IsWindowVisible(ds->emptyState);
+    if (ds->lastLayoutTickMs == 0 || ackAllVisible != ackAllWasVisible || emptyVisible != emptyWasVisible)
+        TriageLayout(GetParent(ds->list), ds);
 }
 
 struct TriageConfirmState { HWND edit = nullptr; bool done = false; bool accepted = false; std::wstring reason; };
@@ -15558,6 +15718,9 @@ static bool ShowTriageBulkConfirm(HWND parent, int count, const std::wstring& br
 
 static void TriageLayout(HWND hwnd, TriageDlgState* ds) {
     if (!ds) return;
+    // A minimized dialog has no useful client area; laying out to the 0x0 size would only
+    // wake it up and repaint children that nobody can see.
+    if (IsIconic(hwnd)) return;
     if (ds->layoutPending) {
         KillTimer(hwnd, TIMER_TRIAGE_LAYOUT_ID);
         ds->layoutPending = false;
@@ -15924,7 +16087,35 @@ static LRESULT CALLBACK TriageWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM
         }
         return 0;
     }
-    case WM_SIZE: TriageRequestResizeLayout(hwnd, ds); return 0;
+    case WM_SHOWWINDOW:
+        if (ds && wParam) {
+            if (ds->reloadPending) {
+                ds->reloadPending = false;
+                if (ds->dash) TriageReload(ds, &ds->dash->triageResponse);
+            }
+            if (ds->lastLayoutTickMs == 0) TriageLayout(hwnd, ds);
+            return 0;
+        }
+        if (ds && !wParam) {
+            KillTimer(hwnd, TIMER_TRIAGE_LAYOUT_ID);
+            KillTimer(hwnd, TIMER_TRIAGE_SETTLE_ID);
+            ds->layoutPending = false;
+        }
+        break;
+    case WM_SIZE:
+        if (ds && (wParam == SIZE_MINIMIZED || IsIconic(hwnd))) {
+            KillTimer(hwnd, TIMER_TRIAGE_LAYOUT_ID);
+            KillTimer(hwnd, TIMER_TRIAGE_SETTLE_ID);
+            ds->layoutPending = false;
+            ds->reloadPending = true;
+            return 0;
+        }
+        if (ds && ds->reloadPending) {
+            ds->reloadPending = false;
+            if (ds->dash) TriageReload(ds, &ds->dash->triageResponse);
+        }
+        TriageRequestResizeLayout(hwnd, ds);
+        return 0;
     case WM_TIMER:
         if (ds && wParam == TIMER_TRIAGE_LAYOUT_ID) {
             KillTimer(hwnd, TIMER_TRIAGE_LAYOUT_ID);
@@ -15934,12 +16125,19 @@ static LRESULT CALLBACK TriageWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM
         }
         if (ds && wParam == TIMER_TRIAGE_SETTLE_ID) {
             KillTimer(hwnd, TIMER_TRIAGE_SETTLE_ID);
+            if (IsIconic(hwnd) || !IsWindowVisible(hwnd)) return 0;
             RedrawWindow(hwnd, nullptr, nullptr, RDW_INVALIDATE | RDW_ALLCHILDREN);
             return 0;
         }
         break;
     case WM_PC_TRIAGE_REFRESH:
-        if (ds && ds->dash) TriageReload(ds, &ds->dash->triageResponse);
+        if (ds && ds->dash) {
+            if (IsIconic(hwnd) || !IsWindowVisible(hwnd)) {
+                ds->reloadPending = true;
+                return 0;
+            }
+            TriageReload(ds, &ds->dash->triageResponse);
+        }
         return 0;
     case WM_HOTKEY:
         if (ds && wParam == 1 && ds->search) { SetFocus(ds->search); return 0; }
@@ -15959,7 +16157,7 @@ static LRESULT CALLBACK TriageWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM
             return 0;
         }
         if (nm && nm->hwndFrom == ds->list && nm->code == LVN_ITEMCHANGED) {
-            if (!ds->loading) { TriageUpdateSelection(ds); TriageLayout(hwnd, ds); }
+            if (!ds->loading) TriageUpdateSelection(ds);
             return 0;
         }
         if (nm && nm->hwndFrom == ds->list && nm->code == NM_RCLICK) {
@@ -16304,17 +16502,14 @@ static LRESULT CALLBACK TriageWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM
                     ds->dash ? ds->dash->hFontUiBold : ds->fontUi,
                     ds->dash ? ds->dash->hFontKpiVal : nullptr, -1.0f, ds->tileSubtexts[i], true);
                 if (ds->activeTile == i) {
-                    HBRUSH active = CreateSolidBrush(g_theme.accent);
-                    FrameRect(hdc, &ds->tileRects[i], active);
-                    DeleteObject(active);
+                    FrameRect(hdc, &ds->tileRects[i], CachedSolidBrush(g_theme.accent));
                 }
             }
-            HBRUSH brush = CreateSolidBrush(g_theme.border);
+            HBRUSH brush = CachedSolidBrush(g_theme.border);
             if (ds->splitterRc.bottom > ds->splitterRc.top && RectsOverlap(ps.rcPaint, ds->splitterRc))
                 FillRect(hdc, &ds->splitterRc, brush);
             if (ds->vsplitRc.right > ds->vsplitRc.left && RectsOverlap(ps.rcPaint, ds->vsplitRc))
                 FillRect(hdc, &ds->vsplitRc, brush);
-            DeleteObject(brush);
         }
         EndPaint(hwnd, &ps); return 0;
     }
