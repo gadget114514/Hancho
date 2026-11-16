@@ -1863,7 +1863,6 @@ static TaskQueueJob ParseJob(const std::string& j) {
     job.memory = ParseMemory(JsonFieldObj(j, "memory", ""));
     job.priority = static_cast<int>(JsonFieldInt(j, "priority", 0));
     job.hidden = JsonFieldBool(j, "hidden", false);
-    job.hidden = JsonFieldBool(j, "hidden", false);
     job.suspendWhenDone = JsonFieldBool(j, "suspend_when_done", false);
     job.suspendDelaySec = static_cast<int>(JsonFieldInt(j, "suspend_delay_sec", 0));
     if (job.suspendDelaySec < 0) job.suspendDelaySec = 0;
@@ -3521,6 +3520,7 @@ static bool ParseNewJob(const std::string& rawJson, const std::string& taskqueue
         return false;
     }
     job.priority = static_cast<int>(JsonFieldInt(j, "priority", 0));
+    job.hidden = JsonFieldBool(j, "hidden", false);
     job.suspendWhenDone = JsonFieldBool(j, "suspend_when_done", false);
     job.suspendDelaySec = static_cast<int>(JsonFieldInt(j, "suspend_delay_sec", 0));
     if (job.suspendDelaySec < 0) {

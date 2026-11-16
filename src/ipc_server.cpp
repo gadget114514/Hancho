@@ -1257,24 +1257,18 @@ std::string IpcServer::HandleRequestJson(const std::string& reqJson) {
         std::string err;
         std::string resp;
         if (action == "taskqueue_add") {
-            std::string jobsRaw = ExtractRawJsonValue(reqJson, "jobs");
+            const std::string jobsRaw = ExtractRawJsonValue(reqJson, "jobs");
             // A job that names a host must reference a registered, enabled host.
             nlohmann::json jobsDoc = nlohmann::json::parse(jobsRaw, nullptr, false);
             if (jobsDoc.is_array()) {
                 std::vector<std::string> wantedHosts;
-                bool removedHidden = false;
-                for (auto& job : jobsDoc) {
+                for (const auto& job : jobsDoc) {
                     if (!job.is_object()) continue;
-                    // External callers (CLI, MCP, an LLM) must not make a job invisible:
-                    // "hidden" is reserved for Hancho's own internal jobs. Strip it so
-                    // anything registered through the public API shows in the task list.
-                    if (job.erase("hidden") > 0) removedHidden = true;
                     auto it = job.find("host");
                     if (it != job.end() && it->is_string() && !it->get<std::string>().empty()) {
                         wantedHosts.push_back(it->get<std::string>());
                     }
                 }
-                if (removedHidden) jobsRaw = jobsDoc.dump();
                 if (!wantedHosts.empty()) {
                     HostRegistry registry;
                     std::string hostErr;

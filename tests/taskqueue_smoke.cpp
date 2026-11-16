@@ -488,6 +488,19 @@ int main() {
     std::string addResp = tqm.TaskQueueAdd("main", jobs, 0, "", err);
     Check(JsonGetBool(addResp, "ok", false), "taskqueue_add ok: " + err);
 
+    {
+        // hidden is a caller's choice: the queue must preserve it (the dashboard has a
+        // "Show hidden tasks" option). Internal jobs use the same field.
+        std::string hiddenErr;
+        std::string hiddenResp = tqm.TaskQueueAdd("hiddenq",
+            R"([{"id":"HID","command":"cmd /c exit 0","summary":"hidden job","timeout_sec":30,"hidden":true}])",
+            0, "", hiddenErr);
+        std::string hiddenJob = tqm.TaskQueueGet("HID", false, 0, hiddenErr);
+        Check(JsonGetBool(hiddenResp, "ok", false) &&
+              hiddenJob.find("\"hidden\":true") != std::string::npos,
+              "taskqueue_add keeps hidden=true");
+    }
+
     Check(WaitForState(tqm, "A", "succeeded", 20000), "A succeeded");
     Check(WaitForState(tqm, "B", "succeeded", 20000), "B succeeded after A");
     Check(WaitForState(tqm, "C", "failed", 20000), "C failed");
