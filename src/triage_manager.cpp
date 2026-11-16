@@ -327,6 +327,8 @@ void TriageManager::Refresh() {
         llmMode_ = llmMode == "manual" || llmMode == "always" || llmMode == "uncertain" ? llmMode : "uncertain";
         llmEngine_ = engine;
         llmModel_ = model;
+        llmConcurrency_ = static_cast<int>(std::clamp<long long>(
+            GetNumber(config, "triage_llm_concurrency", llmConcurrency_), 1, 8));
         supervisorEngine_ = supervisorEngine;
         supervisorModel_ = supervisorModel;
         supervisorTimeoutSec_ = static_cast<int>(std::clamp<long long>(supervisorTimeout, 60, 7200));
@@ -365,144 +367,163 @@ void TriageManager::Refresh() {
 
 void TriageManager::PumpAdvice() {
     std::lock_guard<std::mutex> adviceLock(adviceMutex_);
-    std::string err;
-    const std::string queueResponse = tqm_.TaskQueueList("_triage", "", 0, err, "", "", true);
-    json queue = json::parse(queueResponse, nullptr, false);
-    json queueJobs = queue.is_object() && queue.contains("jobs") && queue["jobs"].is_array()
-        ? queue["jobs"] : json::array();
-    std::string finishedCardId;
-    std::string finishedJobId;
-    std::string finishedState;
-    json finishedJob;
+
+    // Advice runs are plain worker processes, not task-queue jobs: the answer must start at
+    // once instead of waiting behind queued work or other cards.
+    struct AdviceRun {
+        std::string cardId;
+        std::string adviceId;
+        int processId = 0;
+    };
+    std::vector<AdviceRun> runs;
     {
         std::lock_guard<std::mutex> lock(mutex_);
-        for (auto& card : store_["cards"]) {
+        for (const auto& card : store_["cards"]) {
             if (GetString(card, "adviceState") != "running") continue;
-            json advice = GetObject(card, "advice");
-            const std::string jobId = GetString(advice, "jobId");
-            if (jobId.empty()) continue;
-            auto found = std::find_if(queueJobs.begin(), queueJobs.end(), [&](const json& job) {
-                return GetString(job, "id") == jobId;
-            });
-            if (found == queueJobs.end()) continue;
-            const std::string state = GetString(*found, "state");
-            if (state == "pending" || state == "running" || state == "waiting" || state == "blocked") continue;
-            finishedCardId = GetString(card, "id");
-            finishedJobId = jobId;
-            finishedState = state;
-            finishedJob = *found;
-            break;
+            const json advice = GetObject(card, "advice");
+            AdviceRun run;
+            run.cardId = GetString(card, "id");
+            run.adviceId = GetString(advice, "adviceId", GetString(advice, "jobId"));
+            run.processId = static_cast<int>(GetNumber(advice, "processId", 0));
+            runs.push_back(std::move(run));
         }
     }
 
-    std::vector<std::tuple<std::string, std::string, std::string>> automatic;
-    if (!finishedCardId.empty()) {
-        json parsedAdvice;
-        std::string adviceError;
-        const std::string resultText = ReadFileUtf8Wide(AdviceResultPath(finishedJobId));
-        {
-            std::lock_guard<std::mutex> lock(mutex_);
-            auto found = std::find_if(store_["cards"].begin(), store_["cards"].end(), [&](const json& card) {
-                return GetString(card, "id") == finishedCardId;
-            });
-            if (found != store_["cards"].end()) {
-                if (finishedState == "succeeded" && ParseTriageAdvice(resultText, *found, parsedAdvice, adviceError)) {
-                    parsedAdvice["jobId"] = finishedJobId;
-                    parsedAdvice["at"] = GetCurrentTimestampStr();
-                    (*found)["advice"] = std::move(parsedAdvice);
-                    (*found)["adviceState"] = "done";
-                } else {
-                    if (adviceError.empty()) {
-                        adviceError = finishedState == "succeeded" ? "LLM result file is missing or invalid"
-                                                                  : "LLM advice job ended in state " + finishedState;
-                        json attempts = finishedJob.value("attempts", json::array());
-                        if (!attempts.empty() && attempts.back().is_object()) {
-                            const json failure = GetObject(attempts.back(), "failure");
-                            const std::string summary = GetString(failure, "summary");
-                            if (!summary.empty()) adviceError += ": " + summary;
-                        }
-                    }
-                    (*found)["advice"] = {{"source", "llm"}, {"jobId", finishedJobId},
-                                          {"at", GetCurrentTimestampStr()}, {"error", adviceError}};
-                    (*found)["adviceState"] = "failed";
-                }
-                (*found)["updatedAt"] = GetCurrentTimestampStr();
-                std::string by, whyNot;
-                const std::string choice = TriageAutoChoice(store_, *found, mode_, by, whyNot);
-                if (!choice.empty()) automatic.emplace_back(finishedCardId, choice, by);
-                SaveLocked();
-            }
+    struct FinishedAdvice {
+        AdviceRun run;
+        std::string resultText;
+        std::string error;
+    };
+    std::vector<FinishedAdvice> finished;
+    for (const auto& run : runs) {
+        ProcessSnapshot snapshot;
+        const bool tracked = run.processId > 0 && pm_.GetSnapshot(run.processId, snapshot);
+        // A running process is still working; only its end (or a lost record) finishes the card.
+        if (tracked && snapshot.state == ProcState::Running) continue;
+        FinishedAdvice done;
+        done.run = run;
+        if (!run.adviceId.empty()) done.resultText = ReadFileUtf8Wide(AdviceResultPath(run.adviceId));
+        if (done.resultText.empty()) {
+            if (run.processId <= 0) done.error = "the advice run was interrupted";
+            else if (!tracked) done.error = "the advice run ended without a result file";
+            else done.error = "the advice run ended in state " + ProcStateToString(snapshot.state);
         }
+        finished.push_back(std::move(done));
+    }
+
+    std::vector<std::tuple<std::string, std::string, std::string>> automatic;
+    bool changed = false;
+    {
+        std::lock_guard<std::mutex> lock(mutex_);
+        for (const auto& done : finished) {
+            auto found = std::find_if(store_["cards"].begin(), store_["cards"].end(), [&](const json& card) {
+                return GetString(card, "id") == done.run.cardId;
+            });
+            if (found == store_["cards"].end()) continue;
+            json parsedAdvice;
+            std::string adviceError;
+            if (ParseTriageAdvice(done.resultText, *found, parsedAdvice, adviceError)) {
+                parsedAdvice["adviceId"] = done.run.adviceId;
+                parsedAdvice["at"] = GetCurrentTimestampStr();
+                (*found)["advice"] = std::move(parsedAdvice);
+                (*found)["adviceState"] = "done";
+            } else {
+                if (adviceError.empty())
+                    adviceError = done.error.empty() ? "LLM result file is missing or invalid" : done.error;
+                (*found)["advice"] = {{"source", "llm"}, {"adviceId", done.run.adviceId},
+                                      {"at", GetCurrentTimestampStr()}, {"error", adviceError}};
+                (*found)["adviceState"] = "failed";
+            }
+            (*found)["updatedAt"] = GetCurrentTimestampStr();
+            std::string by, whyNot;
+            const std::string choice = TriageAutoChoice(store_, *found, mode_, by, whyNot);
+            if (!choice.empty()) automatic.emplace_back(done.run.cardId, choice, by);
+            changed = true;
+        }
+        if (changed) SaveLocked();
     }
     for (const auto& [cardId, candidateId, by] : automatic) {
         DecideInternal(cardId, candidateId, "Automatic triage advice", json::object(), by);
     }
 
-    // Start the next requested card only when there is no advice worker in flight.
-    json cardToStart;
-    std::string jobId;
-    std::string engineName;
-    std::string modelName;
-    {
-        std::lock_guard<std::mutex> lock(mutex_);
-        const bool active = std::any_of(store_["cards"].begin(), store_["cards"].end(), [](const json& card) {
-            return GetString(card, "adviceState") == "running";
-        });
-        if (active) return;
-        auto requested = std::find_if(store_["cards"].begin(), store_["cards"].end(), [](const json& card) {
-            return GetString(card, "state") == "pending" && GetString(card, "adviceState") == "requested";
-        });
-        if (requested == store_["cards"].end()) return;
-        cardToStart = *requested;
-        const int sequence = static_cast<int>(GetNumber(store_, "nextAdvice", 0)) + 1;
-        store_["nextAdvice"] = sequence;
-        jobId = "triage-" + GetString(cardToStart, "id") + "-" + std::to_string(sequence);
-        engineName = llmEngine_;
-        modelName = llmModel_;
-        if (engineName.empty()) engineName = btm_ ? btm_->DefaultEngine() : std::string();
-    }
-
-    WorkerEngineRegistry localEngines;
-    const WorkerEngineRegistry* engines = nullptr;
-    if (btm_) engines = &btm_->Engines();
-    else {
-        const std::string engineConfig = ReadFileUtf8Wide(PathJoinWide(GetLogsDirectoryWide(), L"engines.json"));
-        if (!engineConfig.empty()) {
-            std::string loadError;
-            if (!localEngines.LoadFromJson(engineConfig, loadError)) {
-                std::lock_guard<std::mutex> lock(mutex_);
-                auto card = std::find_if(store_["cards"].begin(), store_["cards"].end(), [&](const json& item) {
-                    return GetString(item, "id") == GetString(cardToStart, "id");
-                });
-                if (card != store_["cards"].end()) {
-                    (*card)["advice"] = {{"source", "llm"}, {"error", loadError}};
-                    (*card)["adviceState"] = "failed";
-                    SaveLocked();
-                }
-                return;
-            }
+    // Start requested cards while the advice slots are free. Each run is started directly,
+    // so a request never waits for other queue work to finish first.
+    for (;;) {
+        json cardToStart;
+        std::string adviceId;
+        std::string engineName;
+        std::string modelName;
+        {
+            std::lock_guard<std::mutex> lock(mutex_);
+            const int active = static_cast<int>(std::count_if(
+                store_["cards"].begin(), store_["cards"].end(),
+                [](const json& card) { return GetString(card, "adviceState") == "running"; }));
+            if (active >= (std::max)(1, llmConcurrency_)) return;
+            auto requested = std::find_if(store_["cards"].begin(), store_["cards"].end(), [](const json& card) {
+                return GetString(card, "state") == "pending" && GetString(card, "adviceState") == "requested";
+            });
+            if (requested == store_["cards"].end()) return;
+            cardToStart = *requested;
+            const int sequence = static_cast<int>(GetNumber(store_, "nextAdvice", 0)) + 1;
+            store_["nextAdvice"] = sequence;
+            adviceId = "triage-" + GetString(cardToStart, "id") + "-" + std::to_string(sequence);
+            engineName = llmEngine_;
+            modelName = llmModel_;
+            if (engineName.empty()) engineName = btm_ ? btm_->DefaultEngine() : std::string();
+            // Reserve the slot before starting, so a failed start cannot be picked up twice.
+            (*requested)["adviceState"] = "running";
+            (*requested)["advice"] = {{"source", "llm"}, {"adviceId", adviceId},
+                                      {"at", GetCurrentTimestampStr()}, {"processId", 0}};
+            (*requested)["updatedAt"] = GetCurrentTimestampStr();
+            SaveLocked();
         }
-        if (engineName.empty()) engineName = localEngines.DefaultEngine();
-        engines = &localEngines;
+        StartAdviceProcess(cardToStart, adviceId, engineName, modelName);
     }
-    if (!engines || engineName.empty()) {
+}
+
+void TriageManager::StartAdviceProcess(const json& cardToStart, const std::string& adviceId,
+                                       const std::string& engineName, const std::string& modelName) {
+    auto fail = [&](const std::string& message) {
         std::lock_guard<std::mutex> lock(mutex_);
         auto card = std::find_if(store_["cards"].begin(), store_["cards"].end(), [&](const json& item) {
             return GetString(item, "id") == GetString(cardToStart, "id");
         });
         if (card != store_["cards"].end()) {
-            (*card)["advice"] = {{"source", "llm"}, {"error", "no worker engine is configured"}};
+            (*card)["advice"] = {{"source", "llm"}, {"adviceId", adviceId},
+                                  {"at", GetCurrentTimestampStr()}, {"error", message}};
             (*card)["adviceState"] = "failed";
+            (*card)["updatedAt"] = GetCurrentTimestampStr();
             SaveLocked();
         }
+    };
+
+    WorkerEngineRegistry localEngines;
+    const WorkerEngineRegistry* engines = nullptr;
+    if (btm_) {
+        engines = &btm_->Engines();
+    } else {
+        const std::string engineConfig = ReadFileUtf8Wide(PathJoinWide(GetLogsDirectoryWide(), L"engines.json"));
+        if (!engineConfig.empty()) {
+            std::string loadError;
+            if (!localEngines.LoadFromJson(engineConfig, loadError)) {
+                fail(loadError);
+                return;
+            }
+        }
+        engines = &localEngines;
+    }
+    std::string selectedEngine = engineName;
+    if (selectedEngine.empty() && engines) selectedEngine = engines->DefaultEngine();
+    if (!engines || selectedEngine.empty()) {
+        fail("no worker engine is configured");
         return;
     }
 
-    const std::wstring resultPath = AdviceResultPath(jobId);
+    const std::wstring resultPath = AdviceResultPath(adviceId);
     EnsureDirectoryWide(PathJoinWide(TriageDirectory(), L"results"));
     RemoveFileWide(resultPath);
     const std::wstring instructionPath = PathJoinWide(PathJoinWide(TriageDirectory(), L"instructions"),
-        Utf8ToWide(SanitizeFileNameComponent(jobId)) + L".md");
+        Utf8ToWide(SanitizeFileNameComponent(adviceId)) + L".md");
     EnsureDirectoryWide(PathJoinWide(TriageDirectory(), L"instructions"));
     // Answer in the dashboard's UI language so the advice reads naturally next to the card.
     json uiConfig = json::parse(ReadConfig(), nullptr, false);
@@ -514,50 +535,48 @@ void TriageManager::PumpAdvice() {
     const std::string launchPrompt = "Read the instructions file " + WideToUtf8(instructionPath) +
         " and write the required JSON result to the file named by PC_TRIAGE_RESULT_FILE.";
     std::string command, streamType, commandError, adapter;
-    if (!engines->BuildCommand(engineName, modelName, launchPrompt, 300, command, streamType, commandError, &adapter)) {
-        std::lock_guard<std::mutex> lock(mutex_);
-        auto card = std::find_if(store_["cards"].begin(), store_["cards"].end(), [&](const json& item) {
-            return GetString(item, "id") == GetString(cardToStart, "id");
-        });
-        if (card != store_["cards"].end()) {
-            (*card)["advice"] = {{"source", "llm"}, {"error", commandError}};
-            (*card)["adviceState"] = "failed";
-            SaveLocked();
-        }
+    if (!engines->BuildCommand(selectedEngine, modelName, launchPrompt, 300,
+                               command, streamType, commandError, &adapter)) {
+        fail(commandError);
         return;
     }
-    json env = {{"PC_TRIAGE_RESULT_FILE", WideToUtf8(resultPath)}};
-    if (!adapter.empty()) env["HANCHO_ADAPTER"] = adapter;
-    json job = {{"id", jobId}, {"name", "triage-llm"}, {"summary", "Triage advice for " + GetString(cardToStart, "id")},
-                {"command", command}, {"cwd", WideToUtf8(GetEffectiveDataDirectoryWide())},
-                {"instructions_text", instruction}, {"timeout_sec", 300}, {"max_attempts", 1},
-                {"hidden", true}, {"agent_type", engineName}, {"env", env}};
-    const std::string addResponse = tqm_.TaskQueueAdd("_triage", json::array({job}).dump(), 1, "", err);
-    std::string addError;
-    if (!err.empty() || !ResponseOk(addResponse, addError)) {
-        if (err.empty()) err = addError;
-        std::lock_guard<std::mutex> lock(mutex_);
-        auto card = std::find_if(store_["cards"].begin(), store_["cards"].end(), [&](const json& item) {
-            return GetString(item, "id") == GetString(cardToStart, "id");
-        });
-        if (card != store_["cards"].end()) {
-            (*card)["advice"] = {{"source", "llm"}, {"error", err}};
-            (*card)["adviceState"] = "failed";
-            SaveLocked();
-        }
+
+    EnsureDirectoryWide(PathJoinWide(TriageDirectory(), L"logs"));
+    StartProcessRequest req;
+    req.name = "triage-llm";
+    req.commandLine = command;
+    req.workingDir = WideToUtf8(GetEffectiveDataDirectoryWide());
+    req.mode = ExecMode::Pipe;
+    req.openStdin = false;
+    req.timeoutSec = 300;
+    req.logFile = WideToUtf8(PathJoinWide(PathJoinWide(TriageDirectory(), L"logs"),
+        Utf8ToWide(SanitizeFileNameComponent(adviceId)) + L".log"));
+    req.agentType = selectedEngine;
+    req.jsonStream = true;
+    req.supervisorGoal = "Triage advice for " + GetString(cardToStart, "id");
+    req.supervisorNotes = "Triage card " + GetString(cardToStart, "id");
+    req.env["PC_TRIAGE_RESULT_FILE"] = WideToUtf8(resultPath);
+    if (!adapter.empty()) {
+        req.agentType = adapter;
+        req.jsonStream = true;
+    }
+    std::string startError;
+    const int processId = pm_.StartProcess(req, startError);
+    if (processId <= 0) {
+        fail(startError.empty() ? "failed to start the advice engine" : startError);
         return;
     }
-    {
-        std::lock_guard<std::mutex> lock(mutex_);
-        auto card = std::find_if(store_["cards"].begin(), store_["cards"].end(), [&](const json& item) {
-            return GetString(item, "id") == GetString(cardToStart, "id");
-        });
-        if (card != store_["cards"].end() && GetString(*card, "state") == "pending") {
-            (*card)["advice"] = {{"source", "llm"}, {"jobId", jobId}, {"at", GetCurrentTimestampStr()}};
-            (*card)["adviceState"] = "running";
-            (*card)["updatedAt"] = GetCurrentTimestampStr();
-            SaveLocked();
-        }
+
+    std::lock_guard<std::mutex> lock(mutex_);
+    auto card = std::find_if(store_["cards"].begin(), store_["cards"].end(), [&](const json& item) {
+        return GetString(item, "id") == GetString(cardToStart, "id");
+    });
+    if (card != store_["cards"].end() && GetString(*card, "state") == "pending") {
+        (*card)["advice"] = {{"source", "llm"}, {"adviceId", adviceId}, {"processId", processId},
+                             {"at", GetCurrentTimestampStr()}, {"logFile", req.logFile}};
+        (*card)["adviceState"] = "running";
+        (*card)["updatedAt"] = GetCurrentTimestampStr();
+        SaveLocked();
     }
 }
 

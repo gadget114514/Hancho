@@ -47,6 +47,10 @@ private:
     void Loop();
     void SaveLocked();
     void PumpAdvice();
+    // Runs the advice engine as an ordinary worker process (not a queue job) so an answer
+    // starts immediately instead of waiting behind the task queue.
+    void StartAdviceProcess(const nlohmann::json& card, const std::string& adviceId,
+                            const std::string& engineName, const std::string& modelName);
     void UpdateHandoffsLocked(const nlohmann::json& supervisorJobs);
     // Follows each handled card's job to the end of its lifecycle (rerunning, succeeded, failed again,
     // cancelled, not rerun) and links a card to the card that follows it.
@@ -68,6 +72,9 @@ private:
     std::string llmMode_ = "uncertain";
     std::string llmEngine_;
     std::string llmModel_;
+    // How many advice engines may run at once. The runs are independent processes, but
+    // bounding them keeps a burst of new cards from starting one engine per card.
+    int llmConcurrency_ = 2;
     std::string supervisorEngine_;
     std::string supervisorModel_;
     int supervisorTimeoutSec_ = 1800;

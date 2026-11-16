@@ -91,6 +91,8 @@ constexpr UINT_PTR TIMER_KPI_ANIM_ID  = 2;
 constexpr UINT_PTR TIMER_END_BLINK_ID = 3;     // list rows blinking after a process/task ends
 constexpr UINT_PTR TIMER_HINT_COUNTDOWN_ID = 4; // countdown for supervisor guidance hint popup
 constexpr UINT_PTR TIMER_QUIT_WAIT_ID = 5;     // waits for the core to exit after "Quit Hancho"
+constexpr UINT_PTR TIMER_TRIAGE_LAYOUT_ID = 6; // coalesces expensive triage layout during resize/drag
+constexpr UINT_PTR TIMER_TRIAGE_SETTLE_ID = 7; // repaints children once after a resize/drag settles
 constexpr UINT kEndBlinkTimerMs = 200;         // repaint period while a blink is running
 constexpr ULONGLONG kEndBlinkHalfPeriodMs = 400;  // on/off toggle period of the blink
 constexpr int kDefaultEndBlinkSec = 5;
@@ -14650,6 +14652,10 @@ struct TriageDlgState {
     RECT vsplitRc = {};
     int vsplitLeft = 0;
     int vsplitMaxW = 0;
+    // Resizing sends WM_SIZE many times per second. Every layout moves a dozen child
+    // windows and invalidates all of them, so coalesce the work to roughly 40 fps.
+    uint64_t lastLayoutTickMs = 0;
+    bool layoutPending = false;
     std::wstring filterKey = L"pendingTask";  // default filter: task triage awaiting decision
     std::wstring searchText;
     std::string selectedId;
@@ -14667,6 +14673,8 @@ struct TriageDlgState {
     std::string shownListSignature;
     std::string shownCardDump = "\x01";  // never equal to a real dump, so the first update always draws
 };
+
+static void CopyTriageListSelection(HWND hwnd, TriageDlgState* ds, bool row);
 
 static LRESULT CALLBACK TriageChildSubclassProc(HWND child, UINT msg, WPARAM wParam, LPARAM lParam,
                                                 UINT_PTR, DWORD_PTR) {
@@ -14686,8 +14694,66 @@ static LRESULT CALLBACK TriageChildSubclassProc(HWND child, UINT msg, WPARAM wPa
             SetFocus(ds->search);
             return 0;
         }
+        if (wParam == 'C' && ds && child == ds->list &&
+            ((GetKeyState(VK_CONTROL) & 0x8000) || (GetAsyncKeyState(VK_CONTROL) & 0x8000))) {
+            CopyTriageListSelection(parent, ds, false);
+            return 0;
+        }
     }
     return DefSubclassProc(child, msg, wParam, lParam);
+}
+
+static void CopyTriageListSelection(HWND hwnd, TriageDlgState* ds, bool row) {
+    if (!ds || !ds->list) return;
+    const int selected = ListView_GetNextItem(ds->list, -1, LVNI_SELECTED);
+    if (selected < 0) return;
+    std::wstring text;
+    if (!row) {
+        wchar_t target[2048] = {};
+        ListView_GetItemText(ds->list, selected, 2, target, static_cast<int>(std::size(target)));
+        text = target;
+    } else {
+        const int columns = Header_GetItemCount(ListView_GetHeader(ds->list));
+        for (int c = 0; c < columns; ++c) {
+            wchar_t cell[2048] = {};
+            ListView_GetItemText(ds->list, selected, c, cell, static_cast<int>(std::size(cell)));
+            if (c) text += L"\t";
+            text += cell;
+        }
+    }
+    if (!text.empty()) CopyTextToClipboard(hwnd, text);
+}
+
+static void FitTriageColumns(HWND list) {
+    if (!list) return;
+    HDC hdc = GetDC(list);
+    if (!hdc) return;
+    HFONT font = reinterpret_cast<HFONT>(SendMessageW(list, WM_GETFONT, 0, 0));
+    HGDIOBJ oldFont = SelectObject(hdc, font ? font : GetStockObject(DEFAULT_GUI_FONT));
+    const int count = Header_GetItemCount(ListView_GetHeader(list));
+    for (int c = 0; c < count; ++c) {
+        int width = 0;
+        wchar_t header[256] = {};
+        LVCOLUMNW column = {};
+        column.mask = LVCF_TEXT;
+        column.pszText = header;
+        column.cchTextMax = static_cast<int>(std::size(header));
+        ListView_GetColumn(list, c, &column);
+        SIZE size = {};
+        if (GetTextExtentPoint32W(hdc, header, static_cast<int>(wcslen(header)), &size))
+            width = static_cast<int>(size.cx);
+        const int rows = ListView_GetItemCount(list);
+        for (int r = 0; r < rows; ++r) {
+            wchar_t text[2048] = {};
+            ListView_GetItemText(list, r, c, text, static_cast<int>(std::size(text)));
+            if (GetTextExtentPoint32W(hdc, text, static_cast<int>(wcslen(text)), &size))
+                width = (std::max)(width, static_cast<int>(size.cx));
+        }
+        width = (std::clamp)(width + 18, 70, c == 2 ? 900 : 700);
+        ListView_SetColumnWidth(list, c, width);
+    }
+    SelectObject(hdc, oldFont);
+    ReleaseDC(list, hdc);
 }
 
 static int TriageTileForFilter(const std::wstring& key) {
@@ -15492,16 +15558,25 @@ static bool ShowTriageBulkConfirm(HWND parent, int count, const std::wstring& br
 
 static void TriageLayout(HWND hwnd, TriageDlgState* ds) {
     if (!ds) return;
+    if (ds->layoutPending) {
+        KillTimer(hwnd, TIMER_TRIAGE_LAYOUT_ID);
+        ds->layoutPending = false;
+    }
+    ds->lastLayoutTickMs = GetTickCount64();
     RECT rc = {}; GetClientRect(hwnd, &rc);
     const int w = rc.right - rc.left, h = rc.bottom - rc.top, pad = 10;
-    if (ds->filter) MoveWindow(ds->filter, pad, pad, 205, 260, TRUE);
+    // Move controls without repainting each one. A resize sends many WM_SIZE messages;
+    // asking every MoveWindow to paint synchronously made dragging and resizing very slow.
+    // One invalidation at the end (and the normal WM_PAINT coalescing) is enough.
+    auto move = [](HWND child, int x, int y, int cx, int cy) {
+        if (child) MoveWindow(child, x, y, cx, cy, FALSE);
+    };
+    move(ds->filter, pad, pad, 205, 260);
     const int searchX = pad + 213;
-    if (ds->search) MoveWindow(ds->search, searchX, pad, 260, 24, TRUE);
-    if (ds->btnSearch) MoveWindow(ds->btnSearch, searchX + 266, pad, 64, 24, TRUE);
+    move(ds->search, searchX, pad, 260, 24);
+    move(ds->btnSearch, searchX + 266, pad, 64, 24);
     const int modeX = searchX + 266 + 64 + 8;
-    if (ds->modeLabel) MoveWindow(ds->modeLabel, modeX, pad + 3, (std::max)(80, w - pad - modeX), 24, TRUE);
-    const RECT oldSplitter = ds->splitterRc;
-    const RECT oldVsplit = ds->vsplitRc;
+    move(ds->modeLabel, modeX, pad + 3, (std::max)(80, w - pad - modeX), 24);
     const int tileTop = 40, tileH = 64, tileGap = 6, top = 110, splitterH = 6;
     ds->tileRowRc = {pad, tileTop, w - pad, tileTop + tileH};
     const int listWideH = 34;
@@ -15513,19 +15588,19 @@ static void TriageLayout(HWND hwnd, TriageDlgState* ds) {
     ds->splitterRc = {pad, top + listH, w - pad, top + listH + splitterH};
     ds->splitContentTop = top;
     ds->splitMaxList = maxList;
-    if (ds->list) MoveWindow(ds->list, pad, top, w - pad * 2, listH, TRUE);
+    move(ds->list, pad, top, w - pad * 2, listH);
     if (ds->emptyState) {
-        MoveWindow(ds->emptyState, pad + 30, top + listH / 2 - 18, w - pad * 2 - 60, 36, TRUE);
+        move(ds->emptyState, pad + 30, top + listH / 2 - 18, w - pad * 2 - 60, 36);
         SetWindowPos(ds->emptyState, HWND_TOP, 0, 0, 0, 0,
                      SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE);
     }
 
     const int bulkTop = top + listH + splitterH + 2;
     int bx = pad;
-    if (ds->listWideLabel) MoveWindow(ds->listWideLabel, bx, bulkTop + 6, 82, 22, TRUE);
+    move(ds->listWideLabel, bx, bulkTop + 6, 82, 22);
     bx += 86;
     auto bulkPlace = [&](HWND control, int width) {
-        if (control && IsWindowVisible(control)) { MoveWindow(control, bx, bulkTop, width, 30, TRUE); bx += width + 5; }
+        if (control && IsWindowVisible(control)) { move(control, bx, bulkTop, width, 30); bx += width + 5; }
     };
     bulkPlace(ds->btnAllSupervisor, 175); bulkPlace(ds->btnAckAll, 230); bulkPlace(ds->btnMarkAll, 175);
     bulkPlace(ds->btnClear, 84); bulkPlace(ds->btnShowPending, 170); bulkPlace(ds->btnReload, 105);
@@ -15544,17 +15619,21 @@ static void TriageLayout(HWND hwnd, TriageDlgState* ds) {
     ds->vsplitRc = {pad + infoW, lowerTop, pad + infoW + splitterH, contentBottom};
     ds->vsplitLeft = pad;
     ds->vsplitMaxW = maxInfoW;
-    if (ds->infoLabel) MoveWindow(ds->infoLabel, pad, lowerTop, infoW, labelH - 2, TRUE);
+    move(ds->infoLabel, pad, lowerTop, infoW, labelH - 2);
     if (ds->infoTable) {
-        MoveWindow(ds->infoTable, pad, paneTop, infoW, paneH, TRUE);
-        // Section column fixed, content column takes the rest of the pane.
-        ListView_SetColumnWidth(ds->infoTable, 0, 90);
-        ListView_SetColumnWidth(ds->infoTable, 1, (std::max)(120, infoW - 90 - GetSystemMetrics(SM_CXVSCROLL) - 6));
+        move(ds->infoTable, pad, paneTop, infoW, paneH);
+        // Section column fixed, content column takes the rest of the pane. Only touch the
+        // list view when the width actually changed: SetColumnWidth relayouts and repaints it.
+        const int contentW = (std::max)(120, infoW - 90 - GetSystemMetrics(SM_CXVSCROLL) - 6);
+        if (ListView_GetColumnWidth(ds->infoTable, 0) != 90)
+            ListView_SetColumnWidth(ds->infoTable, 0, 90);
+        if (ListView_GetColumnWidth(ds->infoTable, 1) != contentW)
+            ListView_SetColumnWidth(ds->infoTable, 1, contentW);
     }
 
     const int rx = pad + infoW + splitterH;
     const int rw = (std::max)(minPaneW, w - pad - rx);
-    if (ds->actionLabel) MoveWindow(ds->actionLabel, rx, lowerTop, rw, labelH - 2, TRUE);
+    move(ds->actionLabel, rx, lowerTop, rw, labelH - 2);
     const int reasonH = 24, actionButtonH = 27, actionGap = 4;
     const int actionRows = 3;
     const int actionsTop = contentBottom - actionRows * actionButtonH - (actionRows - 1) * actionGap;
@@ -15564,15 +15643,15 @@ static void TriageLayout(HWND hwnd, TriageDlgState* ds) {
     const int radioH = candidateRows > 0 ? (std::clamp)(maxCandidateH / candidateRows, 18, 22) : 0;
     const int candidateH = radioH * candidateRows;
     const int candidateTop = reasonY - 6 - candidateH;
-    if (ds->detail) MoveWindow(ds->detail, rx, paneTop, rw, (std::max)(70, candidateTop - 6 - paneTop), TRUE);
+    move(ds->detail, rx, paneTop, rw, (std::max)(70, candidateTop - 6 - paneTop));
     for (size_t i = 0; i < ds->radios.size(); ++i)
-        MoveWindow(ds->radios[i], rx + 2, candidateTop + static_cast<int>(i) * radioH, rw - 4, radioH, TRUE);
+        move(ds->radios[i], rx + 2, candidateTop + static_cast<int>(i) * radioH, rw - 4, radioH);
     const bool multiplierVisible = ds->multiplier && IsWindowVisible(ds->multiplier);
     const int reasonLabelW = 50;
-    if (ds->reasonLabel) MoveWindow(ds->reasonLabel, rx, reasonY + 3, reasonLabelW, reasonH - 3, TRUE);
-    if (ds->multiplier) MoveWindow(ds->multiplier, rx + rw - 90, reasonY, 90, 200, TRUE);
-    if (ds->reason) MoveWindow(ds->reason, rx + reasonLabelW, reasonY,
-                               rw - reasonLabelW - (multiplierVisible ? 96 : 0), reasonH, TRUE);
+    move(ds->reasonLabel, rx, reasonY + 3, reasonLabelW, reasonH - 3);
+    move(ds->multiplier, rx + rw - 90, reasonY, 90, 200);
+    move(ds->reason, rx + reasonLabelW, reasonY,
+         rw - reasonLabelW - (multiplierVisible ? 96 : 0), reasonH);
 
     const int buttonW = (rw - 6) / 2;
     HWND actionButtons[] = {ds->btnRun, ds->btnAdvise, ds->btnSupervisor, ds->btnManual, ds->btnLog, ds->btnAck};
@@ -15580,7 +15659,7 @@ static void TriageLayout(HWND hwnd, TriageDlgState* ds) {
     for (HWND button : actionButtons) {
         if (!button || !IsWindowVisible(button)) continue;
         const int col = visibleIndex % 2, row = visibleIndex / 2;
-        MoveWindow(button, rx + col * (buttonW + 6), actionsTop + row * (actionButtonH + actionGap), buttonW, actionButtonH, TRUE);
+        move(button, rx + col * (buttonW + 6), actionsTop + row * (actionButtonH + actionGap), buttonW, actionButtonH);
         ++visibleIndex;
     }
     const int tileW = (w - 2 * pad - 7 * tileGap) / 8;
@@ -15588,14 +15667,44 @@ static void TriageLayout(HWND hwnd, TriageDlgState* ds) {
         ds->tileRects[i] = {pad + i * (tileW + tileGap), tileTop,
             i == 7 ? w - pad : pad + i * (tileW + tileGap) + tileW, tileTop + tileH};
     }
-    // Repaint only where the divider bars were and are now, not the whole window (that flickered).
-    const RECT* splitterRects[] = {&oldSplitter, &oldVsplit, &ds->splitterRc, &ds->vsplitRc};
-    for (const RECT* rect : splitterRects)
-        if (rect->right > rect->left && rect->bottom > rect->top) InvalidateRect(hwnd, rect, TRUE);
+    // Everything that moved needs one repaint, but only once. Invalidate the parent now
+    // (the KPI strip and dividers), and repaint the child controls after the resize or
+    // splitter drag settles. Repainting every list view inside each WM_SIZE made resizing
+    // the dialog extremely slow.
+    InvalidateRect(hwnd, nullptr, TRUE);
+    SetTimer(hwnd, TIMER_TRIAGE_SETTLE_ID, 70, nullptr);
 }
 
-static void TriageRunIpc(TriageDlgState* ds, const nlohmann::json& request, bool reload = true) {
-    if (!ds || !ds->dash) return;
+static void TriageRequestLayout(HWND hwnd, TriageDlgState* ds) {
+    if (!ds) return;
+    const uint64_t now = GetTickCount64();
+    if (now - ds->lastLayoutTickMs < 25) {
+        if (!ds->layoutPending) {
+            ds->layoutPending = true;
+            SetTimer(hwnd, TIMER_TRIAGE_LAYOUT_ID, 25, nullptr);
+        }
+        return;
+    }
+    TriageLayout(hwnd, ds);
+}
+
+// Window resizing is the expensive case: every layout moves a dozen child windows and
+// makes the list views recalculate their layout. Update a few times per second while the
+// frame is moving, then apply the final layout when the drag stops.
+static void TriageRequestResizeLayout(HWND hwnd, TriageDlgState* ds) {
+    if (!ds) return;
+    const uint64_t now = GetTickCount64();
+    if (now - ds->lastLayoutTickMs >= 120) {
+        TriageLayout(hwnd, ds);
+        return;
+    }
+    if (!ds->layoutPending) {
+        ds->layoutPending = true;
+        SetTimer(hwnd, TIMER_TRIAGE_LAYOUT_ID, 120, nullptr);
+    }
+}
+
+static void TriageRunIpc(TriageDlgState* ds, const nlohmann::json& request, bool reload = true) {    if (!ds || !ds->dash) return;
     nlohmann::json response;
     if (!GuiIpcCall(ds->dash, request, response) || !response.value("ok", false)) {
         gui_platform::GetGuiPlatform()->ShowMessageBox(GetParent(ds->list),
@@ -15799,7 +15908,36 @@ static LRESULT CALLBACK TriageWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM
         TriageReload(ds);
         return 0;
     }
-    case WM_SIZE: TriageLayout(hwnd, ds); return 0;
+    case WM_EXITSIZEMOVE:
+        if (ds) {
+            KillTimer(hwnd, TIMER_TRIAGE_LAYOUT_ID);
+            ds->layoutPending = false;
+            TriageLayout(hwnd, ds);
+            return 0;
+        }
+        break;
+    case WM_GETMINMAXINFO: {
+        auto* mmi = reinterpret_cast<MINMAXINFO*>(lParam);
+        if (mmi) {
+            mmi->ptMinTrackSize.x = 900;
+            mmi->ptMinTrackSize.y = 600;
+        }
+        return 0;
+    }
+    case WM_SIZE: TriageRequestResizeLayout(hwnd, ds); return 0;
+    case WM_TIMER:
+        if (ds && wParam == TIMER_TRIAGE_LAYOUT_ID) {
+            KillTimer(hwnd, TIMER_TRIAGE_LAYOUT_ID);
+            ds->layoutPending = false;
+            TriageLayout(hwnd, ds);
+            return 0;
+        }
+        if (ds && wParam == TIMER_TRIAGE_SETTLE_ID) {
+            KillTimer(hwnd, TIMER_TRIAGE_SETTLE_ID);
+            RedrawWindow(hwnd, nullptr, nullptr, RDW_INVALIDATE | RDW_ALLCHILDREN);
+            return 0;
+        }
+        break;
     case WM_PC_TRIAGE_REFRESH:
         if (ds && ds->dash) TriageReload(ds, &ds->dash->triageResponse);
         return 0;
@@ -15822,6 +15960,31 @@ static LRESULT CALLBACK TriageWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM
         }
         if (nm && nm->hwndFrom == ds->list && nm->code == LVN_ITEMCHANGED) {
             if (!ds->loading) { TriageUpdateSelection(ds); TriageLayout(hwnd, ds); }
+            return 0;
+        }
+        if (nm && nm->hwndFrom == ds->list && nm->code == NM_RCLICK) {
+            auto* nmia = reinterpret_cast<NMITEMACTIVATE*>(lParam);
+            int selected = nmia ? nmia->iItem : -1;
+            if (selected < 0) selected = ListView_GetNextItem(ds->list, -1, LVNI_SELECTED);
+            if (selected >= 0) {
+                ListView_SetItemState(ds->list, selected, LVIS_SELECTED | LVIS_FOCUSED,
+                                      LVIS_SELECTED | LVIS_FOCUSED);
+                POINT pt = {};
+                GetCursorPos(&pt);
+                HMENU menu = CreatePopupMenu();
+                AppendMenuW(menu, MF_STRING, 3201, Tr(L"対象をコピー", L"Copy target", L"Copiar objetivo"));
+                AppendMenuW(menu, MF_STRING, 3202, Tr(L"行をコピー", L"Copy row", L"Copiar fila"));
+                AppendMenuW(menu, MF_SEPARATOR, 0, nullptr);
+                AppendMenuW(menu, MF_STRING, 3203, Tr(L"列幅を内容に合わせる", L"Fit columns to content", L"Ajustar columnas al contenido"));
+                const int cmd = TrackPopupMenu(menu, TPM_RETURNCMD | TPM_RIGHTBUTTON,
+                                               pt.x, pt.y, 0, hwnd, nullptr);
+                DestroyMenu(menu);
+                if (cmd == 3203) {
+                    FitTriageColumns(ds->list);
+                } else if (cmd == 3201 || cmd == 3202) {
+                    CopyTriageListSelection(hwnd, ds, cmd == 3202);
+                }
+            }
             return 0;
         }
         if (nm && nm->hwndFrom == ds->list && nm->code == LVN_GETINFOTIPW) {
@@ -15890,6 +16053,9 @@ static LRESULT CALLBACK TriageWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM
     case WM_COMMAND: {
         if (!ds) break;
         const int id = LOWORD(wParam);
+        if (id == 3201) { CopyTriageListSelection(hwnd, ds, false); return 0; }
+        if (id == 3202) { CopyTriageListSelection(hwnd, ds, true); return 0; }
+        if (id == 3203) { FitTriageColumns(ds->list); return 0; }
         if (id == 2907 && HIWORD(wParam) == CBN_SELCHANGE) {
             static const wchar_t* filters[] = {L"pending", L"pendingProcess", L"pendingTask", L"autoUnreviewed",
                 L"handling", L"running", L"waiting", L"follow_up", L"done", L"open", L"all", L"acted", L"ignored", L"resolved"};
@@ -16073,11 +16239,11 @@ static LRESULT CALLBACK TriageWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM
     case WM_MOUSEMOVE:
         if (ds && ds->splitterDrag) {
             ds->listPaneH = (std::clamp)(GET_Y_LPARAM(lParam) - ds->splitContentTop, 100, ds->splitMaxList);
-            TriageLayout(hwnd, ds); return 0;
+            TriageRequestLayout(hwnd, ds); return 0;
         }
         if (ds && ds->vsplitDrag) {
             ds->infoPaneW = (std::clamp)(GET_X_LPARAM(lParam) - ds->vsplitLeft, 260, ds->vsplitMaxW);
-            TriageLayout(hwnd, ds); return 0;
+            TriageRequestLayout(hwnd, ds); return 0;
         }
         break;
     case WM_SETCURSOR:
@@ -16089,7 +16255,9 @@ static LRESULT CALLBACK TriageWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM
         break;
     case WM_LBUTTONUP:
         if (ds && (ds->splitterDrag || ds->vsplitDrag)) {
-            ds->splitterDrag = false; ds->vsplitDrag = false; ReleaseCapture(); return 0;
+            ds->splitterDrag = false; ds->vsplitDrag = false; ReleaseCapture();
+            TriageLayout(hwnd, ds);
+            return 0;
         }
         break;
     case WM_DRAWITEM: {
@@ -16129,6 +16297,7 @@ static LRESULT CALLBACK TriageWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM
                 Tr(L"自動・未確認", L"AUTO UNREVIEWED", L"AUTO SIN REVISAR"),
                 Tr(L"完了", L"DONE", L"COMPLETADO")};
             for (int i = 0; i < 8; ++i) {
+                if (!RectsOverlap(ps.rcPaint, ds->tileRects[i])) continue;
                 const bool urgent = (i == 0 || i == 1 || i == 5 || i == 6) && ds->tileValues[i] > 0;
                 COLORREF accent = i == 7 ? g_theme.muted : urgent ? KpiAccent(4) : KpiAccent(i == 2 ? 1 : i == 3 ? 3 : 2);
                 DrawKpiCard(hdc, ds->tileRects[i], titles[i], std::to_wstring(ds->tileValues[i]), accent,
@@ -16141,8 +16310,10 @@ static LRESULT CALLBACK TriageWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM
                 }
             }
             HBRUSH brush = CreateSolidBrush(g_theme.border);
-            if (ds->splitterRc.bottom > ds->splitterRc.top) FillRect(hdc, &ds->splitterRc, brush);
-            if (ds->vsplitRc.right > ds->vsplitRc.left) FillRect(hdc, &ds->vsplitRc, brush);
+            if (ds->splitterRc.bottom > ds->splitterRc.top && RectsOverlap(ps.rcPaint, ds->splitterRc))
+                FillRect(hdc, &ds->splitterRc, brush);
+            if (ds->vsplitRc.right > ds->vsplitRc.left && RectsOverlap(ps.rcPaint, ds->vsplitRc))
+                FillRect(hdc, &ds->vsplitRc, brush);
             DeleteObject(brush);
         }
         EndPaint(hwnd, &ps); return 0;
@@ -16151,6 +16322,8 @@ static LRESULT CALLBACK TriageWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM
     case WM_NCDESTROY:
         if (ds) {
             UnregisterHotKey(hwnd, 1);
+            KillTimer(hwnd, TIMER_TRIAGE_LAYOUT_ID);
+            KillTimer(hwnd, TIMER_TRIAGE_SETTLE_ID);
             for (HWND radio : ds->radios) if (radio && IsWindow(radio)) DestroyWindow(radio);
             if (ds->dash && ds->dash->hwndHintHistory == hwnd) ds->dash->hwndHintHistory = nullptr;
             delete ds;
@@ -16179,16 +16352,29 @@ static void ShowTriageDialog(DashboardState* st, const std::wstring& filter, con
     ds->activeTile = TriageTileForFilter(filter);
     static bool registered = false; const HINSTANCE instance = GetModuleHandleW(nullptr);
     if (!registered) {
-        WNDCLASSEXW wc = {}; wc.cbSize = sizeof(wc); wc.style = CS_HREDRAW | CS_VREDRAW;
+        WNDCLASSEXW wc = {}; wc.cbSize = sizeof(wc); wc.style = 0;
         wc.lpfnWndProc = TriageWndProc; wc.hInstance = instance; wc.hCursor = LoadCursorW(nullptr, IDC_ARROW);
         wc.hbrBackground = g_dialogBgBrush; wc.lpszClassName = L"HanchoTriageWnd";
         RegisterClassExW(&wc); registered = true;
     }
-    RECT parent = {}; GetWindowRect(st->hwndMain, &parent);
-    const int width = 1480, height = 980;
-    HWND dialog = CreateWindowExW(WS_EX_DLGMODALFRAME, L"HanchoTriageWnd", Tr(L"Hancho トリアージ", L"Hancho Triage", L"Hancho Triaje"),
-        WS_OVERLAPPEDWINDOW | WS_VISIBLE | WS_CLIPCHILDREN, parent.left + ((parent.right - parent.left) - width) / 2,
-        parent.top + ((parent.bottom - parent.top) - height) / 2, width, height, st->hwndMain, nullptr, instance, ds);
+    // Keep the whole frame on the monitor: the old fixed 1480x980 window could be larger
+    // than the screen, which put the resize borders out of reach.
+    RECT work = {};
+    HMONITOR monitor = MonitorFromWindow(st->hwndMain, MONITOR_DEFAULTTONEAREST);
+    MONITORINFO mi = {};
+    mi.cbSize = sizeof(mi);
+    if (monitor && GetMonitorInfoW(monitor, &mi)) work = mi.rcWork;
+    else SystemParametersInfoW(SPI_GETWORKAREA, 0, &work, 0);
+    const int workW = (std::max)(900, static_cast<int>(work.right - work.left));
+    const int workH = (std::max)(600, static_cast<int>(work.bottom - work.top));
+    const int width = (std::min)(1480, workW - 40);
+    const int height = (std::min)(980, workH - 40);
+    const int x = work.left + (workW - width) / 2;
+    const int y = work.top + (workH - height) / 2;
+    HWND dialog = CreateWindowExW(WS_EX_APPWINDOW, L"HanchoTriageWnd",
+        Tr(L"Hancho トリアージ", L"Hancho Triage", L"Hancho Triaje"),
+        WS_OVERLAPPEDWINDOW | WS_THICKFRAME | WS_MAXIMIZEBOX | WS_VISIBLE | WS_CLIPCHILDREN,
+        x, y, width, height, st->hwndMain, nullptr, instance, ds);
     if (dialog) {
         st->hwndHintHistory = dialog; ShowWindow(dialog, SW_SHOW); SetForegroundWindow(dialog);
     } else delete ds;
