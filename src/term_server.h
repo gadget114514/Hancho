@@ -33,6 +33,7 @@ public:
 
     bool IsRunning() const;
     uint16_t Port() const;
+    bool RemoteEnabled() const;
     std::string Token() const;
     void SetToken(const std::string& token);
 

@@ -239,9 +239,23 @@ json BuildJobFailureCard(const json& job, const TriageInputs& in) {
     const json conditions = Object(job, "success");
     const json activity = Object(failure, "lastActivity");
 
-    json info = {{"cause", json::array()}, {"background", json::array()},
+    json info = {{"intent", json::array()}, {"cause", json::array()}, {"background", json::array()},
                  {"environment", json::array()}, {"conditions", json::array()},
                  {"reason", json::array()}};
+    // What the job was trying to do, before the cause: the one-line summary and the captured
+    // instructions. The instructions text saves the reader from following a long task-file path.
+    const std::string name = String(job, "name", jobId);
+    const std::string jobSummary = String(job, "summary");
+    AddItem(info["intent"], "summary", jobSummary, jobSummary);
+    const json instructions = Object(job, "instructions");
+    const std::string instructionsText = String(instructions, "text");
+    if (!instructionsText.empty())
+        AddItem(info["intent"], "instructions", Clip(instructionsText, 8000),
+                "instructions: " + Clip(instructionsText, 500));
+    const std::string instructionsSource = String(instructions, "source");
+    if (!instructionsSource.empty())
+        AddItem(info["intent"], "instructionsSource", instructionsSource,
+                "instructions source: " + instructionsSource);
     const std::string failureText = failureClass.empty() ? "unknown" : failureClass;
     AddItem(info["cause"], "failureClass", {{"class", failureText}, {"confidence", Confidence(failure)}},
             "failure class: " + failureText + " (" + Confidence(failure) + " confidence)");
@@ -295,8 +309,6 @@ json BuildJobFailureCard(const json& job, const TriageInputs& in) {
         AddItem(info["cause"], "lastActivity", value, text);
     }
 
-    const std::string name = String(job, "name", jobId);
-    const std::string jobSummary = String(job, "summary");
     AddItem(info["background"], "jobName", name, "name: " + name);
     AddItem(info["background"], "jobSummary", jobSummary, jobSummary);
     AddItem(info["background"], "command", String(job, "command"), "command: " + String(job, "command"));
@@ -635,9 +647,10 @@ nlohmann::json BuildTriageCandidates(const TriageInputs& in) {
             const std::string key = "timing:" + jobId;
             const long long duration = Number(timing, "duration_sec", 0);
             const long long estimate = Number(timing, "estimate_sec", Number(job, "estimate_sec", 0));
-            json info = {{"cause", json::array()}, {"background", json::array()},
+            json info = {{"intent", json::array()}, {"cause", json::array()}, {"background", json::array()},
                          {"environment", json::array()}, {"conditions", json::array()},
                          {"reason", json::array()}};
+            AddItem(info["intent"], "summary", String(job, "summary"), String(job, "summary"));
             AddItem(info["cause"], "timingAccuracy", accuracy, "timing accuracy: " + accuracy);
             AddItem(info["background"], "jobName", String(job, "name", jobId), "name: " + String(job, "name", jobId));
             AddItem(info["background"], "jobSummary", String(job, "summary"), String(job, "summary"));
@@ -684,9 +697,10 @@ nlohmann::json BuildTriageCandidates(const TriageInputs& in) {
         const std::string resourceWait = String(job, "resource_wait");
         if (!resourceWait.empty() && resourceWait != "null") {
             const std::string key = "res:" + jobId + "=" + resourceWait;
-            json info = {{"cause", json::array()}, {"background", json::array()},
+            json info = {{"intent", json::array()}, {"cause", json::array()}, {"background", json::array()},
                          {"environment", json::array()}, {"conditions", json::array()},
                          {"reason", json::array()}};
+            AddItem(info["intent"], "summary", String(job, "summary"), String(job, "summary"));
             AddItem(info["cause"], "resourceWait", resourceWait, "waiting for resource: " + resourceWait);
             AddItem(info["background"], "jobName", String(job, "name", jobId), "name: " + String(job, "name", jobId));
             AddItem(info["background"], "jobSummary", String(job, "summary"), String(job, "summary"));
@@ -744,9 +758,10 @@ nlohmann::json BuildTriageCandidates(const TriageInputs& in) {
         if (btId.empty() || nodeId.empty()) continue;
         const std::string key = "esc:" + btId + "/" + nodeId;
         const std::string detail = String(failure, "detail", "escalation failed");
-        json info = {{"cause", json::array()}, {"background", json::array()},
+        json info = {{"intent", json::array()}, {"cause", json::array()}, {"background", json::array()},
                      {"environment", json::array()}, {"conditions", json::array()},
                      {"reason", json::array()}};
+        AddItem(info["intent"], "treeIntent", String(failure, "treeIntent"), String(failure, "treeIntent"));
         AddItem(info["cause"], "escalationFailure", detail, "behavior tree escalation failed: " + detail);
         AddItem(info["background"], "treeId", btId, "BT: " + btId);
         AddItem(info["background"], "treeName", String(failure, "treeName"), "tree: " + String(failure, "treeName"));
@@ -801,9 +816,10 @@ nlohmann::json BuildProcessTriageCandidates(const nlohmann::json& processes) {
         const long long elapsedMs = Number(process, "elapsed_ms", 0);
         const long long timeoutSec = Number(process, "timeout_sec", 0);
         const long long idleTimeoutSec = Number(process, "idle_timeout_sec", 0);
-        json info = {{"cause", json::array()}, {"background", json::array()},
+        json info = {{"intent", json::array()}, {"cause", json::array()}, {"background", json::array()},
                      {"environment", json::array()}, {"conditions", json::array()},
                      {"reason", json::array()}};
+        AddItem(info["intent"], "command", command, "command: " + command);
         AddItem(info["cause"], "endState", state, "state: " + state);
         if (process.contains("exit_code") && process["exit_code"].is_number() && Number(process, "exit_code", -1) >= 0)
             AddItem(info["cause"], "exitCode", Number(process, "exit_code", -1),
@@ -903,14 +919,24 @@ std::vector<std::string> MergeTriageCards(nlohmann::json& store,
                 const json lifecycle = (*found).value("lifecycle", json());
                 const std::string adviceState = String(*found, "adviceState", "none");
                 const std::string createdAt = String(*found, "createdAt", String(candidate, "createdAt", now));
+                // The LLM summary is the first thing the person reads, so lift it into the
+                // information table as a top-level "summary" section while the card is pending.
+                json candidateInfo = Object(candidate, "info");
+                const std::string adviceSummary = String(advice, "summary");
+                if (!adviceSummary.empty()) {
+                    if (!candidateInfo.is_object()) candidateInfo = json::object();
+                    candidateInfo["summary"] = json::array(
+                        {json{{"k", "summary"}, {"v", adviceSummary}, {"text", adviceSummary}}});
+                }
                 // Leave the card untouched (and its updatedAt stable) when nothing Hancho derives has changed.
-                if (Object(*found, "info") == Object(candidate, "info") &&
+                if (Object(*found, "info") == candidateInfo &&
                     (*found).value("candidates", json()) == candidate.value("candidates", json()) &&
                     Object(*found, "recommendation") == Object(candidate, "recommendation") &&
                     Object(*found, "flags") == Object(candidate, "flags")) {
                     continue;
                 }
                 *found = candidate;
+                (*found)["info"] = std::move(candidateInfo);
                 (*found)["createdAt"] = createdAt;
                 (*found)["updatedAt"] = now;
                 (*found)["advice"] = advice.empty() ? json(nullptr) : advice;
@@ -973,9 +999,13 @@ bool TriageNeedsLlm(const nlohmann::json& card, const std::string& mode,
     if (Lower(mode) == "auto") return true;
     if (Lower(llmMode) == "manual" || Lower(llmMode) == "always") return true;
     if (Lower(llmMode) != "uncertain") return false;
+    const json info = Object(card, "info");
+    // The summary is what the person reads first, so in "uncertain" mode a card without one is
+    // worth a single LLM call: the same call also returns the advice. Once it is recorded the
+    // card stops being uncertain for this reason.
+    if (Array(info, "summary").empty()) return true;
     if (Lower(String(Object(card, "recommendation"), "confidence", "low")) == "low") return true;
     const json flags = Object(card, "flags");
-    const json info = Object(card, "info");
     const json background = Array(info, "background");
     std::string currentClass;
     for (const auto& item : Array(info, "cause")) {
@@ -1105,7 +1135,11 @@ std::string BuildTriageAdvicePacket(const nlohmann::json& card, const std::strin
     out << "# Hancho triage advice\n\n"
         << "Read the card information and choose exactly one listed candidate id. Reply with a JSON object matching the required schema.\n\n"
         << "Do not run any command or edit any file. Only read the listed log files if needed. Choose exactly one candidate id, explain why in 2-4 sentences, and state what the human should watch out for. "
-        << "Write rationale, caution and infoNeeded in the language given by the \"language\" field (for example ja = Japanese); keep candidateId and confidence exactly as specified.\n\n"
+        << "Write rationale, caution, infoNeeded and summary in the language given by the \"language\" field (for example ja = Japanese); keep candidateId and confidence exactly as specified.\n\n"
+        << "The summary is what the person reads first. Make it self-contained: state what the target was trying to "
+           "do, what happened (including the relevant failure detail), the likely cause, and what the person should "
+           "decide. Do not merely point at a file path; write the substance into the summary so it can be judged "
+           "without opening anything.\n\n"
         << "```json\n" << packet.dump(2) << "\n```\n";
     return out.str();
 }
@@ -1269,7 +1303,7 @@ std::string BuildTriageHandoffInstructions(const nlohmann::json& cards, const st
     }
     out
         << "For each card:\n"
-        << "1. Read its information (cause, background, environment, conditions, reason). Read the listed log "
+        << "1. Read its information (summary, intent, cause, background, environment, conditions, reason). Read the listed log "
            "files when you need more detail. `" << cli << " triage show <id>` prints the current card and "
            "`" << cli << " taskqueue why <jobId>` the failure diagnosis.\n"
         << "2. Choose exactly one candidate id from that card.\n"
@@ -1295,7 +1329,7 @@ std::string BuildTriageHandoffInstructions(const nlohmann::json& cards, const st
 }
 
 const char* TriageAdviceOutputSchema() {
-    return R"({"type":"object","required":["candidateId","confidence","rationale"],"properties":{"candidateId":{"type":"string"},"confidence":{"type":"string"},"rationale":{"type":"string"},"caution":{"type":"string"},"infoNeeded":{"type":"string"}}})";
+    return R"({"type":"object","required":["summary","candidateId","confidence","rationale"],"properties":{"summary":{"type":"string"},"candidateId":{"type":"string"},"confidence":{"type":"string"},"rationale":{"type":"string"},"caution":{"type":"string"},"infoNeeded":{"type":"string"}}})";
 }
 
 bool ParseTriageAdvice(const std::string& resultJson, const nlohmann::json& card,
@@ -1310,7 +1344,8 @@ bool ParseTriageAdvice(const std::string& resultJson, const nlohmann::json& card
     if (confidence != "high" && confidence != "medium" && confidence != "low") {
         err = "confidence must be high, medium, or low"; return false;
     }
-    outAdvice = {{"source", "llm"}, {"candidateId", candidateId}, {"confidence", confidence},
+    outAdvice = {{"source", "llm"}, {"summary", String(parsed, "summary")},
+                 {"candidateId", candidateId}, {"confidence", confidence},
                  {"rationale", String(parsed, "rationale")}, {"caution", String(parsed, "caution")},
                  {"infoNeeded", String(parsed, "infoNeeded")}, {"jobId", ""}, {"at", ""}};
     return true;

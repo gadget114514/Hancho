@@ -220,6 +220,8 @@ constexpr UINT_PTR TIMER_POLL = 1;
 constexpr UINT_PTR TIMER_PEERS = 2;
 constexpr UINT_PTR TIMER_RELOAD = 3;
 constexpr UINT kTrayId = 1;
+constexpr int kChatAppIconResourceId = 2;
+constexpr int kChatTrayIconResourceId = 4;  // the tray keeps the classic chat icon
 
 enum ControlId : int {
     IDC_TAB = 2100,
@@ -402,6 +404,218 @@ bool IsCheckboxControl(const DialogState* st, HWND h) {
            h == st->setSkipPermissions;
 }
 
+COLORREF BlendColor(COLORREF from, COLORREF to, float t) {
+    auto mix = [t](int a, int b) { return static_cast<int>(a + (b - a) * t + 0.5f); };
+    return RGB(mix(GetRValue(from), GetRValue(to)),
+               mix(GetGValue(from), GetGValue(to)),
+               mix(GetBValue(from), GetBValue(to)));
+}
+
+// List header background: the window colour with a slight tint of the theme accent.
+COLORREF ChatHeaderBgColor(const DashboardPalette& p) {
+    return BlendColor(p.windowBg, p.accent, 0.12f);
+}
+
+// Owner-draws one list header item so its text and background follow the theme.
+void DrawChatHeaderItem(DRAWITEMSTRUCT* dis) {
+    if (!dis || !dis->hwndItem || !g_state) return;
+    const DashboardPalette& p = g_state->palette;
+    wchar_t text[256] = {};
+    HDITEMW hdiText = {};
+    hdiText.mask = HDI_TEXT;
+    hdiText.pszText = text;
+    hdiText.cchTextMax = 256;
+    SendMessageW(dis->hwndItem, HDM_GETITEMW, dis->itemID, reinterpret_cast<LPARAM>(&hdiText));
+    HBRUSH bgBrush = CreateSolidBrush(ChatHeaderBgColor(p));
+    FillRect(dis->hDC, &dis->rcItem, bgBrush);
+    DeleteObject(bgBrush);
+
+    SetBkMode(dis->hDC, TRANSPARENT);
+    SetTextColor(dis->hDC, p.text);
+    HFONT font = reinterpret_cast<HFONT>(SendMessageW(GetParent(dis->hwndItem), WM_GETFONT, 0, 0));
+    HGDIOBJ oldFont = SelectObject(dis->hDC, font ? font : GetStockObject(DEFAULT_GUI_FONT));
+    RECT rc = dis->rcItem;
+    InflateRect(&rc, -8, -1);
+    DrawTextW(dis->hDC, text, -1, &rc, DT_LEFT | DT_VCENTER | DT_SINGLELINE | DT_END_ELLIPSIS);
+    SelectObject(dis->hDC, oldFont);
+
+    HPEN borderPen = CreatePen(PS_SOLID, 1, p.border);
+    HGDIOBJ oldPen = SelectObject(dis->hDC, borderPen);
+    MoveToEx(dis->hDC, dis->rcItem.right - 1, dis->rcItem.top, nullptr);
+    LineTo(dis->hDC, dis->rcItem.right - 1, dis->rcItem.bottom);
+    MoveToEx(dis->hDC, dis->rcItem.left, dis->rcItem.bottom - 1, nullptr);
+    LineTo(dis->hDC, dis->rcItem.right, dis->rcItem.bottom - 1);
+    SelectObject(dis->hDC, oldPen);
+    DeleteObject(borderPen);
+}
+
+LRESULT CALLBACK ChatHeaderSubclassProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam,
+                                        UINT_PTR, DWORD_PTR) {
+    if (msg == WM_ERASEBKGND && g_state) {
+        HDC hdc = reinterpret_cast<HDC>(wParam);
+        RECT rc = {};
+        GetClientRect(hwnd, &rc);
+        HBRUSH brush = CreateSolidBrush(ChatHeaderBgColor(g_state->palette));
+        FillRect(hdc, &rc, brush);
+        DeleteObject(brush);
+        return 1;
+    }
+    LRESULT res = DefSubclassProc(hwnd, msg, wParam, lParam);
+    if (msg == WM_PAINT && g_state) {
+        int count = Header_GetItemCount(hwnd);
+        if (count > 0) {
+            RECT rcLast = {};
+            if (Header_GetItemRect(hwnd, count - 1, &rcLast)) {
+                RECT rcClient = {};
+                GetClientRect(hwnd, &rcClient);
+                if (rcLast.right < rcClient.right) {
+                    HDC hdc = GetDC(hwnd);
+                    RECT rcEmpty = { rcLast.right, rcClient.top, rcClient.right, rcClient.bottom };
+                    HBRUSH brush = CreateSolidBrush(ChatHeaderBgColor(g_state->palette));
+                    FillRect(hdc, &rcEmpty, brush);
+                    DeleteObject(brush);
+                    HPEN borderPen = CreatePen(PS_SOLID, 1, g_state->palette.border);
+                    HGDIOBJ oldPen = SelectObject(hdc, borderPen);
+                    MoveToEx(hdc, rcEmpty.left, rcEmpty.bottom - 1, nullptr);
+                    LineTo(hdc, rcEmpty.right, rcEmpty.bottom - 1);
+                    SelectObject(hdc, oldPen);
+                    DeleteObject(borderPen);
+                    ReleaseDC(hwnd, hdc);
+                }
+            }
+        }
+    }
+    return res;
+}
+
+// Draws the thumb of one native scrollbar inside its track rectangle, from the control's scroll info.
+void PaintListScrollThumb(HDC hdc, HWND hwnd, int which, const RECT& bar, HBRUSH thumbBrush) {
+    SCROLLINFO si = {};
+    si.cbSize = sizeof(si);
+    si.fMask = SIF_ALL;
+    if (!GetScrollInfo(hwnd, which, &si)) return;
+    int range = si.nMax - si.nMin + 1;
+    if (si.nPage == 0 || range <= 0 || static_cast<int>(si.nPage) >= range) return;
+    bool vert = which == SB_VERT;
+    int trackLen = vert ? (bar.bottom - bar.top) : (bar.right - bar.left);
+    int thumbLen = (std::max)(16, trackLen * static_cast<int>(si.nPage) / range);
+    int scrollable = range - static_cast<int>(si.nPage);
+    int thumbPos = (trackLen - thumbLen) * (si.nPos - si.nMin) / scrollable;
+    thumbPos = (std::clamp)(thumbPos, 0, trackLen - thumbLen);
+    RECT thumb = bar;
+    if (vert) {
+        thumb.top += thumbPos;
+        thumb.bottom = thumb.top + thumbLen;
+        thumb.left += 3;
+        thumb.right -= 3;
+    } else {
+        thumb.left += thumbPos;
+        thumb.right = thumb.left + thumbLen;
+        thumb.top += 3;
+        thumb.bottom -= 3;
+    }
+    FillRect(hdc, &thumb, thumbBrush);
+}
+
+// Composes one scrollbar off screen and copies it in one step, so the bare track is never visible.
+void PaintListScrollBarBuffered(HDC hdc, HWND hwnd, int which, const RECT& bar,
+                                HBRUSH trackBrush, HBRUSH thumbBrush) {
+    int w = bar.right - bar.left;
+    int h = bar.bottom - bar.top;
+    if (w <= 0 || h <= 0) return;
+    HDC memDc = CreateCompatibleDC(hdc);
+    HBITMAP bmp = CreateCompatibleBitmap(hdc, w, h);
+    if (memDc && bmp) {
+        HGDIOBJ oldBmp = SelectObject(memDc, bmp);
+        RECT local = {0, 0, w, h};
+        FillRect(memDc, &local, trackBrush);
+        PaintListScrollThumb(memDc, hwnd, which, local, thumbBrush);
+        BitBlt(hdc, bar.left, bar.top, w, h, memDc, 0, 0, SRCCOPY);
+        SelectObject(memDc, oldBmp);
+    }
+    if (bmp) DeleteObject(bmp);
+    if (memDc) DeleteDC(memDc);
+}
+
+// The native list scrollbars are painted by the system in the default colours. Repaint them
+// over with the active theme after each message, so the track and thumb follow the theme.
+void PaintThemedListScrollBars(HWND hwnd) {
+    if (!g_state) return;
+    DWORD style = static_cast<DWORD>(GetWindowLongPtrW(hwnd, GWL_STYLE));
+    bool vert = (style & WS_VSCROLL) != 0;
+    bool horz = (style & WS_HSCROLL) != 0;
+    if (!vert && !horz) return;
+    HDC hdc = GetWindowDC(hwnd);
+    if (!hdc) return;
+    RECT wr = {};
+    GetWindowRect(hwnd, &wr);
+    RECT cr = {};
+    GetClientRect(hwnd, &cr);
+    POINT origin = {0, 0};
+    ClientToScreen(hwnd, &origin);
+    int offX = origin.x - wr.left;
+    int offY = origin.y - wr.top;
+    int cw = cr.right - cr.left;
+    int ch = cr.bottom - cr.top;
+    int sbw = GetSystemMetrics(SM_CXVSCROLL);
+    int sbh = GetSystemMetrics(SM_CYHSCROLL);
+    HBRUSH trackBrush = CreateSolidBrush(g_state->palette.panel);
+    HBRUSH thumbBrush = CreateSolidBrush(g_state->palette.border);
+    if (vert) {
+        RECT bar = {offX + cw, offY, offX + cw + sbw, offY + ch - (horz ? sbh : 0)};
+        PaintListScrollBarBuffered(hdc, hwnd, SB_VERT, bar, trackBrush, thumbBrush);
+    }
+    if (horz) {
+        RECT bar = {offX, offY + ch, offX + cw - (vert ? sbw : 0), offY + ch + sbh};
+        PaintListScrollBarBuffered(hdc, hwnd, SB_HORZ, bar, trackBrush, thumbBrush);
+    }
+    if (vert && horz) {
+        RECT corner = {offX + cw, offY + ch, offX + cw + sbw, offY + ch + sbh};
+        HBRUSH cornerBrush = CreateSolidBrush(g_state->palette.windowBg);
+        FillRect(hdc, &corner, cornerBrush);
+        DeleteObject(cornerBrush);
+    }
+    DeleteObject(trackBrush);
+    DeleteObject(thumbBrush);
+    ReleaseDC(hwnd, hdc);
+}
+
+LRESULT CALLBACK ChatListSubclassProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam,
+                                      UINT_PTR, DWORD_PTR) {
+    if (msg == WM_DRAWITEM) {
+        auto* dis = reinterpret_cast<DRAWITEMSTRUCT*>(lParam);
+        if (dis && dis->CtlType == ODT_HEADER) {
+            DrawChatHeaderItem(dis);
+            return TRUE;
+        }
+    }
+    LRESULT res = DefSubclassProc(hwnd, msg, wParam, lParam);
+    if (msg != WM_NCDESTROY && msg != WM_DESTROY) PaintThemedListScrollBars(hwnd);
+    return res;
+}
+
+// Makes a list's header owner-drawn so its text/background follow the theme, and hooks its
+// scrollbars so they are repainted with the same palette.
+void ApplyThemedChatList(HWND list) {
+    if (!list) return;
+    HWND header = ListView_GetHeader(list);
+    if (header) {
+        const int count = Header_GetItemCount(header);
+        for (int i = 0; i < count; ++i) {
+            HDITEMW hdi = {};
+            hdi.mask = HDI_FORMAT;
+            if (Header_GetItem(header, i, &hdi)) {
+                hdi.fmt |= HDF_OWNERDRAW;
+                Header_SetItem(header, i, &hdi);
+            }
+        }
+        SetWindowSubclass(header, ChatHeaderSubclassProc, 1, 0);
+        ApplyNativeControlTheme(header, g_state ? g_state->palette.dark : false);
+        InvalidateRect(header, nullptr, TRUE);
+    }
+    SetWindowSubclass(list, ChatListSubclassProc, 1, 0);
+}
+
 // Applies the dashboard palette to the dialog, its lists and its controls.
 // The dialog is a separate process, so the theme is read from config.json.
 void ApplyDialogTheme(DialogState* st, bool force = false) {
@@ -473,6 +687,10 @@ void ApplyDialogTheme(DialogState* st, bool force = false) {
             }
         }
     }
+    ApplyThemedChatList(st->peers);
+    ApplyThemedChatList(st->messages);
+    ApplyThemedChatList(st->files);
+    ApplyThemedChatList(st->logList);
     InvalidateRect(st->hwnd, nullptr, TRUE);
 }
 
@@ -851,7 +1069,7 @@ void AddTrayIcon(DialogState* st) {
     st->nid.uID = kTrayId;
     st->nid.uFlags = NIF_ICON | NIF_MESSAGE | NIF_TIP;
     st->nid.uCallbackMessage = kTrayMessage;
-    st->nid.hIcon = LoadIconW(st->inst, MAKEINTRESOURCEW(2));
+    st->nid.hIcon = LoadIconW(st->inst, MAKEINTRESOURCEW(kChatTrayIconResourceId));
     if (!st->nid.hIcon) st->nid.hIcon = LoadIconW(nullptr, IDI_APPLICATION);
     wcsncpy_s(st->nid.szTip, L"Hancho Chat", _TRUNCATE);
     if (Shell_NotifyIconW(NIM_ADD, &st->nid)) st->trayAdded = true;
@@ -2652,7 +2870,7 @@ int RunIpmsgDialog(bool startHidden) {
     wc.style = CS_HREDRAW | CS_VREDRAW;
     wc.lpfnWndProc = IpmsgWndProc;
     wc.hInstance = st.inst;
-    wc.hIcon = LoadIconW(st.inst, MAKEINTRESOURCEW(2));
+    wc.hIcon = LoadIconW(st.inst, MAKEINTRESOURCEW(kChatAppIconResourceId));
     if (!wc.hIcon) wc.hIcon = LoadIconW(nullptr, IDI_APPLICATION);
     wc.hIconSm = wc.hIcon;
     wc.hCursor = LoadCursorW(nullptr, IDC_ARROW);

@@ -44,6 +44,11 @@ USAGE:
 
 OPTIONS:
   --host <host>       Connect to a remote core instead of the local one.
+                      If <host> is a name from <data-dir>/hosts.json, it is
+                      resolved like --remote.
+  --remote <name>     Connect through a host registered in
+                      <data-dir>/hosts.json. Its IPC endpoint supplies the WCSP
+                      port and token.
   --port <port>       Remote WCSP port (default 9139).
   --token <token>     WCSP shared token (or the HANCHO_TERM_TOKEN env var).
   --local             Force local core discovery even if --host was given.
@@ -66,6 +71,7 @@ EXAMPLES:
   wct 12                       # attach to local job #12
   wct --shell cmd
   wct --host 192.168.1.10 --token <token> --attach 12
+  wct --remote buildbox --attach 12
 )";
 }
 
@@ -138,6 +144,12 @@ int main() {
             sawHost = true;
         } else if (a.rfind("--host=", 0) == 0) {
             options.host = a.substr(7);
+            sawHost = true;
+        } else if (a == "--remote") {
+            if (!requireValue(i, a, options.registryHost)) return 1;
+            sawHost = true;
+        } else if (a.rfind("--remote=", 0) == 0) {
+            options.registryHost = a.substr(9);
             sawHost = true;
         } else if (a == "--port") {
             std::string value;

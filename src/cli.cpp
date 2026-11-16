@@ -3983,7 +3983,7 @@ int PrintResponse(const std::string& action, const std::string& respJson, bool j
                       << TriageLabel(language, "kind", card.value("kind", std::string()))
                       << " — " << TriageLabel(language, "lifecycle", card.value("lifecycle", std::string("pending"))) << "\n";
             const json info = card.value("info", json::object());
-            for (const auto& section : {"cause", "background", "environment", "conditions", "reason"}) {
+            for (const auto& section : {"summary", "intent", "cause", "background", "environment", "conditions", "reason"}) {
                 std::cout << "\n" << TriageLabel(language, "section", section) << ":\n";
                 const json lines = info.value(section, json::array());
                 for (const auto& line : lines) {

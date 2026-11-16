@@ -14,6 +14,7 @@
 #include "power.h"
 #include "platform/platform.h"
 #include <shellapi.h>
+#include <atomic>
 #include <cstdlib>
 #include <cstdio>
 #include <exception>
@@ -284,6 +285,103 @@ struct CoreHostContext {
     bool quit = false;
 };
 
+static std::wstring FileNameOf(const std::wstring& path) {
+    const size_t slash = path.find_last_of(L"\\/");
+    return slash == std::wstring::npos ? path : path.substr(slash + 1);
+}
+
+static bool SameFileName(const std::wstring& path, const wchar_t* name) {
+    return _wcsicmp(FileNameOf(path).c_str(), name) == 0;
+}
+
+static bool SameFileVersion(const std::wstring& path, const std::wstring& reference) {
+    WIN32_FILE_ATTRIBUTE_DATA a = {}, b = {};
+    if (!GetFileAttributesExW(path.c_str(), GetFileExInfoStandard, &a)) return false;
+    if (!GetFileAttributesExW(reference.c_str(), GetFileExInfoStandard, &b)) return false;
+    return a.nFileSizeHigh == b.nFileSizeHigh && a.nFileSizeLow == b.nFileSizeLow &&
+           a.ftLastWriteTime.dwHighDateTime == b.ftLastWriteTime.dwHighDateTime &&
+           a.ftLastWriteTime.dwLowDateTime == b.ftLastWriteTime.dwLowDateTime;
+}
+
+// Task Manager shows the image file name, so the core, dashboard and chat get their own
+// names instead of three identical Hancho.exe rows. A copy is created next to the
+// executable; a stale one is replaced when the app is updated. Copies are used instead of
+// hard links so a running alias does not keep the installed Hancho.exe locked during an
+// update. If the directory is not writable we fall back to the current executable.
+static std::wstring EnsureRoleExecutable(const wchar_t* roleName) {
+    wchar_t exeBuf[MAX_PATH] = {};
+    if (!GetModuleFileNameW(nullptr, exeBuf, MAX_PATH)) return L"";
+    const std::wstring exe = exeBuf;
+    if (SameFileName(exe, roleName)) return exe;
+    const size_t slash = exe.find_last_of(L"\\/");
+    if (slash == std::wstring::npos) return exe;
+    const std::wstring alias = exe.substr(0, slash + 1) + roleName;
+    if (SameFileVersion(alias, exe)) return alias;
+    // HanchoChat.exe is built as its own binary with the chat icon. Never replace it with
+    // a copy of Hancho.exe just because its embedded icon makes the file differ.
+    if (SameFileName(alias, L"HanchoChat.exe") &&
+        GetFileAttributesW(alias.c_str()) != INVALID_FILE_ATTRIBUTES) {
+        return alias;
+    }
+    DeleteFileW(alias.c_str());
+    if (!CopyFileW(exe.c_str(), alias.c_str(), FALSE)) return exe;
+    return alias;
+}
+
+static std::wstring QuoteArg(const std::wstring& arg) {
+    if (arg.empty()) return L"\"\"";
+    if (arg.find_first_of(L" \t") == std::wstring::npos && arg.find(L'"') == std::wstring::npos)
+        return arg;
+    std::wstring out = L"\"";
+    size_t backslashes = 0;
+    for (wchar_t ch : arg) {
+        if (ch == L'\\') {
+            ++backslashes;
+            continue;
+        }
+        if (ch == L'"') {
+            out.append(backslashes * 2 + 1, L'\\');
+            out += L'"';
+            backslashes = 0;
+            continue;
+        }
+        out.append(backslashes, L'\\');
+        backslashes = 0;
+        out += ch;
+    }
+    out.append(backslashes * 2, L'\\');
+    out += L'"';
+    return out;
+}
+
+// Relaunches the current command under the role-named executable. Returns true when a
+// new process was started (the caller exits), false when we are already the role binary.
+static bool RelaunchAsRole(const wchar_t* roleName, const std::vector<std::string>& args,
+                           const std::string& dataDirArg) {
+    wchar_t exeBuf[MAX_PATH] = {};
+    if (!GetModuleFileNameW(nullptr, exeBuf, MAX_PATH)) return false;
+    if (SameFileName(exeBuf, roleName)) return false;
+    const std::wstring alias = EnsureRoleExecutable(roleName);
+    if (!SameFileName(alias, roleName)) return false;
+
+    std::wstring cmd = QuoteArg(alias);
+    if (!dataDirArg.empty()) cmd += L" --data-dir " + QuoteArg(Utf8ToWide(dataDirArg));
+    for (size_t i = 1; i < args.size(); ++i) cmd += L" " + QuoteArg(Utf8ToWide(args[i]));
+
+    STARTUPINFOW si = {};
+    si.cb = sizeof(si);
+    PROCESS_INFORMATION pi = {};
+    std::vector<wchar_t> cmdBuf(cmd.begin(), cmd.end());
+    cmdBuf.push_back(L'\0');
+    if (!CreateProcessW(alias.c_str(), cmdBuf.data(), nullptr, nullptr, FALSE,
+                        0, nullptr, nullptr, &si, &pi)) {
+        return false;
+    }
+    CloseHandle(pi.hThread);
+    CloseHandle(pi.hProcess);
+    return true;
+}
+
 static void CoreHostShowGui(CoreHostContext* ctx) {
     if (!ctx) return;
     HWND dash = FindWindowW(kDashboardClass, nullptr);
@@ -294,10 +392,9 @@ static void CoreHostShowGui(CoreHostContext* ctx) {
         return;
     }
     // Launch standalone GUI as a separate process
-    wchar_t exePath[MAX_PATH] = {};
-    GetModuleFileNameW(nullptr, exePath, MAX_PATH);
+    const std::wstring guiExe = EnsureRoleExecutable(L"HanchoDashboard.exe");
     std::wstring cmd = L"\"";
-    cmd += exePath;
+    cmd += guiExe;
     cmd += L"\" gui";
     if (HasCustomDataDirectory()) {
         cmd += L" --data-dir \"";
@@ -380,106 +477,152 @@ static int RunCoreHost(platform::IInstanceLock* instanceLock, bool showGuiAtStar
         std::abort();
     });
 
-    ProcessManager pm;
-    TaskQueueManager tqm;
-    tqm.SetProcessManager(&pm);
-    pm.SetProcessFinishedCallback([&tqm](int pid, int ec, const std::string& kind) {
-        tqm.OnProcessFinished(pid, ec, kind);
-    });
-    BtManager btm(pm, tqm);
-    tqm.SetSuspendCallback([](const std::string& jobId, const std::string& state,
-                              bool hibernate) {
-        (void)jobId;
-        (void)state;
-        SleepMs(500);
-        std::string err;
-        if (!pc::SuspendSystem(hibernate, err)) {
-            WriteAuditLog("POWER_FAILED", err);
+    int exitCode = 0;
+    {
+        ProcessManager pm;
+        TaskQueueManager tqm;
+        tqm.SetProcessManager(&pm);
+        pm.SetProcessFinishedCallback([&tqm](int pid, int ec, const std::string& kind) {
+            tqm.OnProcessFinished(pid, ec, kind);
+        });
+        BtManager btm(pm, tqm);
+        tqm.SetSuspendCallback([](const std::string& jobId, const std::string& state,
+                                  bool hibernate) {
+            (void)jobId;
+            (void)state;
+            SleepMs(500);
+            std::string err;
+            if (!pc::SuspendSystem(hibernate, err)) {
+                WriteAuditLog("POWER_FAILED", err);
+            }
+        });
+
+        WNDCLASSEXW wc = {};
+        wc.cbSize = sizeof(wc);
+        wc.lpfnWndProc = CoreHostWndProc;
+        wc.hInstance = GetModuleHandleW(nullptr);
+        wc.lpszClassName = kCoreHostClass;
+        RegisterClassExW(&wc);
+
+        CoreHostContext ctx;
+        ctx.pm = &pm;
+        ctx.tqm = &tqm;
+        ctx.btm = &btm;
+
+        IpcServer ipc(pm, tqm, &btm);
+        ctx.ipc = &ipc;
+        ipc.SetHeadless(true);
+
+        HWND hwnd = CreateWindowExW(0, kCoreHostClass, L"Hancho Core", WS_POPUP,
+                                    0, 0, 0, 0, nullptr, nullptr, wc.hInstance, &ctx);
+        if (!hwnd) {
+            exitCode = 1;
+        } else {
+            g_coreHostHwnd = hwnd;
+            SetConsoleCtrlHandler(CoreHostCtrlHandler, TRUE);
+
+            ipc.SetGuiShowCallback([hwnd] {
+                PostMessageW(hwnd, WM_PC_HOST_SHOW_GUI, 0, 0);
+            });
+            ipc.SetShutdownCallback([hwnd] {
+                PostMessageW(hwnd, WM_PC_HOST_QUIT, 0, 0);
+            });
+            ipc.SetPowerCallback([](bool hibernate, std::string& outError) {
+                return pc::SuspendSystem(hibernate, outError);
+            });
+
+            ipc.Start();
+            if (showGuiAtStart) CoreHostShowGui(&ctx);
+
+            MSG msg;
+            while (!ctx.quit && GetMessageW(&msg, nullptr, 0, 0) > 0) {
+                TranslateMessage(&msg);
+                DispatchMessageW(&msg);
+            }
+
+            // Ask an attached dashboard to close and wait for its thread.
+            if (ctx.guiRunning) {
+                if (HWND dash = FindOwnWindow(kDashboardClass)) {
+                    PostMessageW(dash, RegisterWindowMessageW(L"HanchoQuit"), 0, 0);
+                }
+            }
+            if (ctx.guiThread.joinable()) ctx.guiThread.join();
+
+            // A shutdown that waits forever looks like "Hancho never exits". The components stop
+            // in an order that cannot deadlock, but a stuck web/chat/terminal worker or job tree
+            // must not keep the process alive: terminate it (job objects kill the children) after
+            // a bounded grace period.
+            std::atomic<bool> shutdownFinished{false};
+            std::thread watchdog([&shutdownFinished] {
+                for (int i = 0; i < 100; ++i) {
+                    Sleep(100);
+                    if (shutdownFinished.load()) return;
+                }
+                WriteAuditLog("SHUTDOWN_HANG", "core did not finish shutting down in 10 s");
+                TerminateProcess(GetCurrentProcess(), 1);
+            });
+
+            ipc.SetGuiShowCallback(nullptr);
+            ipc.SetShutdownCallback(nullptr);
+            ipc.SetPowerCallback(nullptr);
+            ipc.Stop();
+            pm.SetProcessFinishedCallback(nullptr);
+            tqm.SetSuspendCallback(nullptr);
+            btm.Shutdown();
+            tqm.ShutdownTaskQueueManager();
+            pm.KillAllRunning();
+
+            shutdownFinished = true;
+            if (watchdog.joinable()) watchdog.join();
+            g_coreHostHwnd = nullptr;
         }
-    });
-
-    WNDCLASSEXW wc = {};
-    wc.cbSize = sizeof(wc);
-    wc.lpfnWndProc = CoreHostWndProc;
-    wc.hInstance = GetModuleHandleW(nullptr);
-    wc.lpszClassName = kCoreHostClass;
-    RegisterClassExW(&wc);
-
-    CoreHostContext ctx;
-    ctx.pm = &pm;
-    ctx.tqm = &tqm;
-    ctx.btm = &btm;
-
-    IpcServer ipc(pm, tqm, &btm);
-    ctx.ipc = &ipc;
-    ipc.SetHeadless(true);
-
-    HWND hwnd = CreateWindowExW(0, kCoreHostClass, L"Hancho Core", WS_POPUP,
-                                0, 0, 0, 0, nullptr, nullptr, wc.hInstance, &ctx);
-    if (!hwnd) {
-        if (instanceLock) instanceLock->Release();
-        return 1;
     }
-    g_coreHostHwnd = hwnd;
-    SetConsoleCtrlHandler(CoreHostCtrlHandler, TRUE);
-
-    ipc.SetGuiShowCallback([hwnd] {
-        PostMessageW(hwnd, WM_PC_HOST_SHOW_GUI, 0, 0);
-    });
-    ipc.SetShutdownCallback([hwnd] {
-        PostMessageW(hwnd, WM_PC_HOST_QUIT, 0, 0);
-    });
-    ipc.SetPowerCallback([](bool hibernate, std::string& outError) {
-        return pc::SuspendSystem(hibernate, outError);
-    });
-
-    ipc.Start();
-    if (showGuiAtStart) CoreHostShowGui(&ctx);
-
-    MSG msg;
-    while (!ctx.quit && GetMessageW(&msg, nullptr, 0, 0) > 0) {
-        TranslateMessage(&msg);
-        DispatchMessageW(&msg);
-    }
-
-    // Ask an attached dashboard to close and wait for its thread.
-    if (ctx.guiRunning) {
-        if (HWND dash = FindOwnWindow(kDashboardClass)) {
-            PostMessageW(dash, RegisterWindowMessageW(L"HanchoQuit"), 0, 0);
-        }
-    }
-    if (ctx.guiThread.joinable()) ctx.guiThread.join();
-
-    ipc.SetGuiShowCallback(nullptr);
-    ipc.SetShutdownCallback(nullptr);
-    ipc.SetPowerCallback(nullptr);
-    ipc.Stop();
-    pm.SetProcessFinishedCallback(nullptr);
-    tqm.SetSuspendCallback(nullptr);
-    btm.Shutdown();
-    tqm.ShutdownTaskQueueManager();
-
-    g_coreHostHwnd = nullptr;
+    // Keep the instance lock until the process managers have killed the jobs and saved
+    // their state. A dashboard waiting for this mutex then knows the core is really gone.
     if (instanceLock) instanceLock->Release();
-    return 0;
+    return exitCode;
 }
 
 // Asks the running core (headless host or dashboard) to exit and waits for it to go.
+static DWORD CorePidFromPing() {
+    std::string resp, err;
+    if (!SendIpcRequest("{\"action\":\"ping\"}", resp, err, false, 2000)) return 0;
+    return static_cast<DWORD>(JsonGetInt(resp, "pid", 0));
+}
+
+// Waits for the core process to exit and terminates it when it is still alive after the
+// grace period. Returns false when the process handle could not be opened.
+static bool WaitForCoreExitOrKill(DWORD pid, int timeoutMs, bool& killed) {
+    killed = false;
+    if (pid == 0) return false;
+    HANDLE process = OpenProcess(SYNCHRONIZE | PROCESS_TERMINATE, FALSE, pid);
+    if (!process) return false;
+    if (WaitForSingleObject(process, static_cast<DWORD>(timeoutMs)) != WAIT_OBJECT_0) {
+        killed = TerminateProcess(process, 1) != FALSE;
+        WaitForSingleObject(process, 3000);
+    }
+    CloseHandle(process);
+    return true;
+}
+
 static int RunQuitCommand() {
     if (HasCustomDataDirectory()) {
+        const DWORD pid = CorePidFromPing();
         std::string resp, err;
-        if (!SendIpcRequest("{\"action\":\"quit\"}", resp, err, false)) {
+        const bool sent = SendIpcRequest("{\"action\":\"quit\"}", resp, err, false, 5000);
+        if (!sent && pid == 0 && !IsHanchoRunningForDataDirWide()) {
             std::cout << "Hancho is not running" << std::endl;
             return 1;
         }
-        for (int i = 0; i < 100 && IsHanchoRunningForDataDirWide(); ++i) {
-            Sleep(100);
+        bool killed = false;
+        if (!WaitForCoreExitOrKill(pid, 10000, killed)) {
+            for (int i = 0; i < 100 && IsHanchoRunningForDataDirWide(); ++i) Sleep(100);
         }
         if (IsHanchoRunningForDataDirWide()) {
             std::cout << "Hancho did not exit within 10 seconds" << std::endl;
             return 1;
         }
-        std::cout << "Hancho quit" << std::endl;
+        std::cout << (killed ? "Hancho quit (forced)" : "Hancho quit") << std::endl;
         return 0;
     }
     HWND coreTarget = FindWindowW(kCoreHostClass, nullptr);
@@ -488,18 +631,24 @@ static int RunQuitCommand() {
         std::cout << "Hancho is not running" << std::endl;
         return 1;
     }
+    DWORD pid = 0;
+    if (coreTarget) GetWindowThreadProcessId(coreTarget, &pid);
+    else GetWindowThreadProcessId(dashTarget, &pid);
     UINT quitMessage = RegisterWindowMessageW(L"HanchoQuit");
     if (coreTarget) PostMessageW(coreTarget, quitMessage, 0, 0);
     if (dashTarget) PostMessageW(dashTarget, quitMessage, 0, 0);
-    for (int i = 0; i < 100 && (FindWindowW(kCoreHostClass, nullptr) ||
-                                FindWindowW(kDashboardClass, nullptr)); ++i) {
-        Sleep(100);
+    bool killed = false;
+    if (!WaitForCoreExitOrKill(pid, 10000, killed)) {
+        for (int i = 0; i < 100 && (FindWindowW(kCoreHostClass, nullptr) ||
+                                    FindWindowW(kDashboardClass, nullptr)); ++i) {
+            Sleep(100);
+        }
     }
     if (FindWindowW(kCoreHostClass, nullptr) || FindWindowW(kDashboardClass, nullptr)) {
         std::cout << "Hancho did not exit within 10 seconds" << std::endl;
         return 1;
     }
-    std::cout << "Hancho quit" << std::endl;
+    std::cout << (killed ? "Hancho quit (forced)" : "Hancho quit") << std::endl;
     return 0;
 }
 
@@ -581,11 +730,9 @@ static bool StartCoreHeadless() {
         return false;
     }
 
-    wchar_t exePath[MAX_PATH] = {};
-    GetModuleFileNameW(nullptr, exePath, MAX_PATH);
-
+    const std::wstring coreExe = EnsureRoleExecutable(L"HanchoCore.exe");
     std::wstring cmd = L"\"";
-    cmd += exePath;
+    cmd += coreExe;
     cmd += L"\" --headless";
     if (HasCustomDataDirectory()) {
         cmd += L" --data-dir \"";
@@ -722,6 +869,14 @@ int main() {
         else std::cout << "Hancho " PC_VERSION << std::endl;
         return 0;
     }
+
+    // Give each role its own image name so Task Manager shows which process is which.
+    // The short-lived original process exits as soon as the role-named one has started.
+    const wchar_t* roleName = nullptr;
+    if (subcmd == "chat" || subcmd == "ipmsg") roleName = L"HanchoChat.exe";
+    else if (subcmd == "headless" || subcmd == "--headless") roleName = L"HanchoCore.exe";
+    else if (subcmd == "gui" || subcmd == "--gui") roleName = L"HanchoDashboard.exe";
+    if (roleName && RelaunchAsRole(roleName, args, dataDirArg)) return 0;
 
     if (subcmd == "mcp") {
         return RunMcpServer();

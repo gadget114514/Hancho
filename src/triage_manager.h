@@ -3,9 +3,11 @@
 #include "nlohmann/json.hpp"
 
 #include <atomic>
+#include <condition_variable>
 #include <mutex>
 #include <string>
 #include <thread>
+#include <unordered_map>
 #include <vector>
 
 namespace pc {
@@ -59,6 +61,8 @@ private:
     std::mutex mutex_;
     std::mutex refreshMutex_;
     std::mutex adviceMutex_;
+    std::mutex stopMutex_;
+    std::condition_variable stopCv_;
     nlohmann::json store_;
     std::string mode_ = "semi";
     std::string llmMode_ = "uncertain";
@@ -68,6 +72,9 @@ private:
     std::string supervisorModel_;
     int supervisorTimeoutSec_ = 1800;
     std::string language_ = "en";
+    // Captured instructions text per "jobId#rev", so the once-a-second refresh does not
+    // re-fetch it from the task queue for every failed job.
+    std::unordered_map<std::string, std::string> instructionsCache_;
     std::atomic<bool> running_{false};
     std::atomic<uint64_t> lastRefreshTickMs_{0};
     std::thread thread_;

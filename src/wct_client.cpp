@@ -10,6 +10,8 @@
 #include "common.h"
 #include "ipc_client.h"
 #include "nlohmann/json.hpp"
+#include "remote_client.h"
+#include "remote_hosts.h"
 #include "wcsp/remote_session.h"
 
 #include <algorithm>
@@ -198,14 +200,77 @@ BOOL WINAPI CtrlHandler(DWORD type) {
     }
 }
 
+bool ResolveRegistryEndpoint(const std::string& name, Endpoint& endpoint,
+                             std::string& error) {
+    std::string response;
+    std::string callError;
+    if (!remote::CallHost(name, "{\"action\":\"term_remote_endpoint\"}", response,
+                          callError, 15000)) {
+        error = callError.empty() ? "remote host request failed" : callError;
+        return false;
+    }
+    nlohmann::json json = nlohmann::json::parse(response, nullptr, false);
+    if (json.is_discarded() || !json.is_object() || !json.value("ok", false)) {
+        if (json.is_object() && json.contains("error") && json["error"].is_string())
+            error = json["error"].get<std::string>();
+        else
+            error = "remote host did not return a terminal endpoint";
+        return false;
+    }
+    const int port = json.value("port", 0);
+    const std::string token = json.value("token", std::string());
+    if (port <= 0 || port > 65535 || token.empty()) {
+        error = "remote host returned an invalid terminal endpoint";
+        return false;
+    }
+
+    HostRegistry registry;
+    std::string loadError;
+    if (!registry.Load(loadError)) {
+        error = loadError;
+        return false;
+    }
+    RemoteHost host;
+    if (!registry.Get(name, host)) {
+        error = "host not registered: " + name;
+        return false;
+    }
+    std::string addressHost;
+    uint16_t ipcPort = 0;
+    std::string parseError;
+    if (!ParseRemoteAddress(host.address, addressHost, ipcPort, parseError)) {
+        error = parseError;
+        return false;
+    }
+    endpoint.host = addressHost;
+    endpoint.port = port;
+    endpoint.token = token;
+    return true;
+}
+
 bool ResolveEndpoint(const WctOptions& options, Endpoint& endpoint, std::string& error) {
+    if (!options.registryHost.empty())
+        return ResolveRegistryEndpoint(options.registryHost, endpoint, error);
+
     const bool remote = !options.local && !options.host.empty();
     if (remote) {
+        // A registered name is the easiest way to reach another PC: hosts.json holds
+        // the IPC address and token, and the remote core returns the WCSP port and
+        // token through term_remote_endpoint. An explicit --port/--token keeps the
+        // direct WCSP path for clients that do not use hosts.json.
+        if (options.port == 0 && options.token.empty()) {
+            HostRegistry registry;
+            std::string loadError;
+            RemoteHost registered;
+            if (registry.Load(loadError) && registry.Get(options.host, registered))
+                return ResolveRegistryEndpoint(options.host, endpoint, error);
+        }
         endpoint.host = options.host;
         endpoint.port = options.port > 0 ? options.port : kDefaultRemotePort;
         endpoint.token = options.token.empty() ? EnvToken() : options.token;
         if (endpoint.token.empty()) {
-            error = "a WCSP token is required for --host (use --token or HANCHO_TERM_TOKEN)";
+            error = "a WCSP token is required for --host (use --token or HANCHO_TERM_TOKEN; "
+                    "or register the host in hosts.json and use --remote <name>)";
             return false;
         }
         return true;

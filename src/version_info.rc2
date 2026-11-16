@@ -12,8 +12,13 @@
 #define PC_FILE_DESCRIPTION "Hancho Terminal"
 #define PC_ORIGINAL_FILENAME "HanchoTerm.exe"
 #else
+#ifdef PC_CHAT
+#define PC_FILE_DESCRIPTION "Hancho Chat"
+#define PC_ORIGINAL_FILENAME "HanchoChat.exe"
+#else
 #define PC_FILE_DESCRIPTION "Hancho"
 #define PC_ORIGINAL_FILENAME "Hancho.exe"
+#endif
 #endif
 #endif
 

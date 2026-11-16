@@ -3,7 +3,7 @@
 ; Prerequisites:
 ;   1. Build the Release binaries and assemble the payload into
 ;      dist\Hancho-v<version>-win64\ :
-;        Hancho.exe, HanchoTerm.exe, hancho-cli.exe, wct.exe, conpty.dll, OpenConsole.exe,
+;        Hancho.exe, HanchoChat.exe, HanchoTerm.exe, hancho-cli.exe, wct.exe, conpty.dll, OpenConsole.exe,
 ;        LICENSE, README.md, README-ja.md, doc\* (topic documents and doc\images)
 ;      tools\ (the ww task-card runner template) and skills\* (agent skills such as
 ;      skills\hancho) are taken from the repository directly.
@@ -69,6 +69,7 @@ Name: "autostartgui"; Description: "Start the Hancho dashboard at sign-in (tray)
 
 [Files]
 Source: "{#PayloadDir}\Hancho.exe"; DestDir: "{app}"; Flags: ignoreversion
+Source: "{#PayloadDir}\HanchoChat.exe"; DestDir: "{app}"; Flags: ignoreversion
 Source: "{#PayloadDir}\HanchoTerm.exe"; DestDir: "{app}"; Flags: ignoreversion
 Source: "{#PayloadDir}\hancho-cli.exe"; DestDir: "{app}"; Flags: ignoreversion
 Source: "{#PayloadDir}\wct.exe"; DestDir: "{app}"; Flags: ignoreversion
@@ -101,6 +102,9 @@ Filename: "{app}\{#MyAppExeName}"; Description: "{cm:LaunchProgram,{#StringChang
 
 [UninstallDelete]
 Type: filesandordirs; Name: "{app}\logs"
+Type: files; Name: "{app}\HanchoCore.exe"
+Type: files; Name: "{app}\HanchoDashboard.exe"
+Type: files; Name: "{app}\HanchoChat.exe"
 
 [Code]
 function NeedsAddPath(Param: string): Boolean;

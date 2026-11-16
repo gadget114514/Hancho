@@ -550,8 +550,9 @@ std::string IpcServer::HandleRequestJson(const std::string& reqJson) {
     std::ostringstream oss;
 
     if (action == "ping") {
-        return "{\"ok\":true,\"status\":\"running\",\"headless\":"
-               + std::string(headless_ ? "true" : "false") + "}";
+        return "{\"ok\":true,\"status\":\"running\",\"pid\":" +
+               std::to_string(GetCurrentProcessId()) + ",\"headless\":" +
+               std::string(headless_ ? "true" : "false") + "}";
     }
     else if (action == "term_endpoint") {
         if (!termServer_ || !termServer_->IsRunning() || termServer_->Port() == 0) {
@@ -560,6 +561,22 @@ std::string IpcServer::HandleRequestJson(const std::string& reqJson) {
         nlohmann::json out;
         out["ok"] = true;
         out["host"] = "127.0.0.1";
+        out["port"] = termServer_->Port();
+        out["token"] = termServer_->Token();
+        return out.dump();
+    }
+    else if (action == "term_remote_endpoint") {
+        // Used by wct on another PC: the caller already knows the reachable IPC host,
+        // so only the WCSP port and token are returned. The terminal server must have
+        // been started with terminal.remote enabled.
+        if (!termServer_ || !termServer_->IsRunning() || termServer_->Port() == 0) {
+            return "{\"ok\":false,\"error\":\"terminal server is not running\"}";
+        }
+        if (!termServer_->RemoteEnabled()) {
+            return "{\"ok\":false,\"error\":\"remote terminal connections are disabled (set terminal.remote to true)\"}";
+        }
+        nlohmann::json out;
+        out["ok"] = true;
         out["port"] = termServer_->Port();
         out["token"] = termServer_->Token();
         return out.dump();

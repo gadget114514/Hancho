@@ -6,7 +6,7 @@
 
 Built around that one idea: a ConPTY multi-terminal dashboard, a task queue with dependencies, timeouts and retries, behavior trees for multi-step plans, and control from both **MCP** and the **CLI**. It treats `claude`, `opencode`, `codex`, build scripts and interactive shells alike.
 
-Check the version with `hancho-cli.exe --version` (current: 0.9.14).
+Check the version with `hancho-cli.exe --version` (current: 0.9.23).
 
 ### Who is this for?
 
@@ -30,6 +30,21 @@ The dashboard has an **execution monitor pane** below the process and task lists
 Hand Hancho one command, a queue of ordered jobs, or a whole behavior tree. It runs each step as a real terminal process with its own timeout, success check, retries, resource locks and logs, and reports the result back to your LLM. The supervisor LLM stays in charge of the plan; Hancho owns the processes.
 
 See [Overview](doc/overview.md) for the working model in detail: `run_worker`, suspending the PC after a job, behavior trees, stable events and adapters, and how to leave Hancho without losing work.
+
+### Executables
+
+| File | Description |
+| :--- | :--- |
+| `Hancho.exe` | Main entry point. With no arguments (or `gui`) it starts or attaches to the core and opens the dashboard; it also hosts the CLI and MCP commands. |
+| `HanchoDashboard.exe` | Dashboard role process. Created next to `Hancho.exe` on first launch so Task Manager shows it separately; it uses the app icon and keeps the classic tray icon. |
+| `HanchoCore.exe` | Headless core role process (process manager, task queue, behavior trees, IPC, WebUI, WCSP). Created next to `Hancho.exe` on first launch. |
+| `HanchoChat.exe` | Chat (IPMsg) dialog, built as its own binary with the chat icon. Open it with `Hancho.exe chat` (or `ipmsg`). |
+| `HanchoTerm.exe` | Standalone tabbed WinConsoleServer (WCSP) terminal client. The dashboard's `[>_]` button launches it; it can also connect to a remote core. |
+| `hancho-cli.exe` | Console CLI for scripts and MCP clients: task queue, behavior trees, triage, memory, worker engines, exports and more. |
+| `wct.exe` | Console WCSP terminal client for the current terminal window. `wct` opens a local shell; `wct <job-id>` reattaches to a retained job; `--remote <name>` connects through a host registered in `hosts.json`. |
+| `OpenConsole.exe` | ConPTY support host shipped with Hancho, used by the terminal backend; it is not launched by hand. |
+
+`conpty.dll` is the matching ConPTY library; keep it next to the executables.
 
 ### Network ports
 - **WebUI (browser dashboard)**: TCP **9138** by default. It listens on `127.0.0.1` unless the exposure scope is LAN, in which case it binds `0.0.0.0`; token authentication is always required.
@@ -96,9 +111,24 @@ The skill starts with `hancho-cli.exe help --json`, so the commands it shows alw
 
 ---
 
+## Icons
+
+The application icons are modeled on the character "Telephone Cat" (電話猫, Denwa Neko) by Kumamine. The face portion uses Kumamine's character "Telephone Cat".
+
 ## Release Notes
 
 
+
+### v0.9.23
+- **Triage summary**: the information pane starts with a self-contained LLM summary, followed by intent, cause, background, environment, conditions and reason. In the default uncertain mode an unreviewed card gets the summary automatically, so its state can be judged without opening a file.
+- **Triage intent**: failed jobs show their captured instructions in the intent section, so a long task-file path no longer hides what the job was asked to do.
+- **Triage readability**: candidate radio labels follow the dashboard theme (they were black on dark themes), and prose headings ending with a colon are kept.
+- **Quit Hancho**: the core releases its instance lock only after jobs stop and state is saved, a 10-second shutdown watchdog and force-terminate fallback finish a stuck quit, and quit IPC calls have timeouts. Quit now completes in about one second.
+- **Process names**: the core, dashboard and chat run as `HanchoCore.exe`, `HanchoDashboard.exe` and `HanchoChat.exe`, so Task Manager distinguishes them.
+- **Icons**: Hancho and HanchoDashboard use `hanchoappico-512x512.ico`; HanchoChat is built as its own binary with `hanchochat-512x512.ico`, so its file icon is the chat icon. The tray icons are unchanged.
+- **Chat**: list headers and scrollbars follow the active theme.
+- **wct remote**: `wct --remote <name>` looks the host up in `hosts.json`, asks its core for the WCSP endpoint through the authenticated IPC channel, and connects with the returned port and token. `--host <name>` resolves a registered name the same way; `--host/--port/--token` still works for direct connections.
+- **Docs**: the READMEs list each executable and its role, and have an Icons section crediting Kumamine's "Telephone Cat" character.
 
 ### v0.9.22
 - **Chat selection**: picking a host sets the destination back to the selected host(s); selecting a received (`in`) message enters reply mode, while selecting a sent (`out`) message leaves the current destination and reply state untouched. Refreshing the message list no longer re-enters reply mode after **New** or a host change.

@@ -218,6 +218,13 @@ int main() {
                       {"autoRetries", json::array()}};
         const auto added = MergeTriageCards(store, fresh, now);
         const bool initiallyPending = added.size() == 1 && store["cards"][0]["state"] == "pending";
+        // The LLM summary is lifted into the card's information table as the top section.
+        store["cards"][0]["adviceState"] = "done";
+        store["cards"][0]["advice"] = {{"summary", "Build timed out while compiling; retry with more time."},
+                                       {"candidateId", "retry_raise_timeout"}, {"confidence", "high"}};
+        MergeTriageCards(store, fresh, "2026-11-14 12:00:30");
+        const bool summaryLifted = store["cards"][0]["info"].contains("summary") &&
+            store["cards"][0]["info"]["summary"].size() == 1;
         MergeTriageCards(store, json::array(), "2026-11-14 12:01:00");
         const bool resolved = store["cards"][0]["state"] == "resolved";
         json acted = fresh.front();
@@ -226,8 +233,8 @@ int main() {
         acted["state"] = "acted";
         store["cards"].push_back(acted);
         MergeTriageCards(store, json::array(), "2026-11-14 12:02:00");
-        Check(initiallyPending && resolved && store["cards"].back()["state"] == "acted",
-              "merge pending, natural resolution, and acted preservation");
+        Check(initiallyPending && summaryLifted && resolved && store["cards"].back()["state"] == "acted",
+              "merge pending, LLM summary, natural resolution, and acted preservation");
     }
 
     // Per-kind settings suppress new cards, resolve pending cards with a reason, and preserve decisions.
@@ -284,8 +291,9 @@ int main() {
         const bool unknownRejected = !ParseTriageAdvice(
             R"({"candidateId":"not-real","confidence":"high","rationale":"No."})", card, advice, err);
         const bool validAccepted = ParseTriageAdvice(
-            R"({"candidateId":"retry_raise_timeout","confidence":"medium","rationale":"The task was progressing.","caution":"Check the timeout cap."})",
-            card, advice, err) && advice.value("candidateId", std::string()) == "retry_raise_timeout";
+            R"({"summary":"The build timed out while compiling; retry with a longer timeout.","candidateId":"retry_raise_timeout","confidence":"medium","rationale":"The task was progressing.","caution":"Check the timeout cap."})",
+            card, advice, err) && advice.value("candidateId", std::string()) == "retry_raise_timeout" &&
+            advice.value("summary", std::string()).find("timed out") != std::string::npos;
         Check(unknownRejected && validAccepted, "LLM advice candidate validation");
     }
 

@@ -1,0 +1,7 @@
+#define PC_CHAT
+1 ICON "../images/hanchochat-512x512.ico"
+2 ICON "../images/hanchochat-512x512.ico"
+3 ICON "../images/app.ico"
+4 ICON "../images/chat512x512.ico"
+
+#include "version_info.rc2"

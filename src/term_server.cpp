@@ -875,6 +875,7 @@ struct TermServer::Impl {
     std::atomic<bool> wsaStarted{false};
     SOCKET listenSocket = INVALID_SOCKET;
     std::atomic<uint16_t> port{0};
+    std::atomic<bool> remote{false};
     std::mutex sessionsMutex;
     std::unordered_map<uint32_t, std::shared_ptr<TermConnection>> sessions;
     std::atomic<uint32_t> nextId{1};
@@ -1022,6 +1023,7 @@ bool TermServer::Start(std::string& error) {
     }
 
     impl_->shared->token = token;
+    impl_->remote = remote;
     // Deep WCSP scrollback is bounded by bytes rather than lines so a job with
     // long lines cannot use unbounded memory. The client uses the same budget
     // for its own TerminalBuffer.
@@ -1135,6 +1137,10 @@ bool TermServer::IsRunning() const {
 
 uint16_t TermServer::Port() const {
     return impl_ ? impl_->port.load() : 0;
+}
+
+bool TermServer::RemoteEnabled() const {
+    return impl_ && impl_->remote.load();
 }
 
 std::string TermServer::Token() const {

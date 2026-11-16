@@ -11,6 +11,9 @@ namespace pc {
 struct WctOptions {
     bool local = true;
     std::string host;
+    // Name from <data-dir>/hosts.json. When set, wct asks that core for its remote
+    // WCSP endpoint (port and token) and connects to the same host over WCSP.
+    std::string registryHost;
     // Remote WCSP port. 0 means the default (9139) when host is set.
     int port = 0;
     std::string token;

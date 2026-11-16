@@ -605,9 +605,10 @@ void IpcServer::StopRemoteListener() {
 
 void IpcServer::StartWebUiServer(const std::string& token) {
     auto webui = std::make_unique<WebUiServer>([this](const std::string& reqJson) {
-        if (JsonGetString(reqJson, "action", "") == "term_endpoint") {
-            return std::string("{\"ok\":false,\"error\":\"term_endpoint is only available ")
-                   + "on the local host\"}";
+        const std::string action = JsonGetString(reqJson, "action", "");
+        if (action == "term_endpoint" || action == "term_remote_endpoint") {
+            return std::string("{\"ok\":false,\"error\":\"terminal endpoints are only available ")
+                   + "on the local host or an authenticated remote IPC connection\"}";
         }
         return HandleRequestJson(reqJson);
     });

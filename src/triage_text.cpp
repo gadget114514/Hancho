@@ -148,6 +148,8 @@ std::string TranslateToken(Lang lang, const std::string& type, const std::string
         if (value == "timing_divergence") return Pick(lang, "見積もり乖離", "Timing divergence", "Desviación de tiempo");
         if (value == "resource_wait") return Pick(lang, "リソース待ち", "Resource wait", "Espera de recurso");
     } else if (type == "section") {
+        if (value == "summary") return Pick(lang, "要約", "Summary", "Resumen");
+        if (value == "intent") return Pick(lang, "目的", "Intent", "Propósito");
         if (value == "cause") return Pick(lang, "原因", "Cause", "Causa");
         if (value == "background") return Pick(lang, "背景", "Background", "Contexto");
         if (value == "environment") return Pick(lang, "環境", "Environment", "Entorno");
@@ -173,6 +175,7 @@ std::string InfoPrefix(Lang lang, const std::string& key) {
     if (key == "checkDetail") return Pick(lang, "成功判定に失敗: ", "Success check failed: ", "Falló la comprobación de éxito: ");
     if (key == "eventSequence") return Pick(lang, "イベント番号: ", "Event sequence: ", "Secuencia del evento: ");
     if (key == "jobName" || key == "processName") return Pick(lang, "名前: ", "Name: ", "Nombre: ");
+    if (key == "instructionsSource") return Pick(lang, "指示元: ", "Instructions source: ", "Origen de las instrucciones: ");
     if (key == "command") return Pick(lang, "コマンド: ", "Command: ", "Comando: ");
     if (key == "queue") return Pick(lang, "キュー: ", "Queue: ", "Cola: ");
     if (key == "behaviorTree") return Pick(lang, "BT: ", "BT: ", "BT: ");
@@ -350,7 +353,31 @@ std::vector<std::string> TriageFormatInfoRows(const std::string& language, const
         catch (...) { return val(); }
     };
 
-    if (key == "summary" || key == "jobSummary" || key == "timingAdvice" || key == "treeFailureReason")
+    if (key == "summary" || key == "instructions" || key == "treeIntent") {
+        // The captured instructions are the clearest statement of what the target was trying to do.
+        // Show them line by line (a list row cannot hold newlines) and cap very long files.
+        std::vector<std::string> rows;
+        const std::string textValue = val();
+        size_t start = 0;
+        size_t shown = 0;
+        bool truncated = false;
+        while (start <= textValue.size()) {
+            if (rows.size() >= 50 || shown >= 6000) { truncated = true; break; }
+            size_t end = textValue.find('\n', start);
+            if (end == std::string::npos) end = textValue.size();
+            std::string line = textValue.substr(start, end - start);
+            if (!line.empty() && line.back() == '\r') line.pop_back();
+            if (!line.empty()) {
+                rows.push_back(line);
+                shown += line.size();
+            }
+            if (end == textValue.size()) break;
+            start = end + 1;
+        }
+        if (truncated) rows.push_back(Pick(lang, "…（以下省略）", "… (truncated)", "… (truncado)"));
+        return rows;
+    }
+    if (key == "jobSummary" || key == "timingAdvice" || key == "treeFailureReason")
         return val().empty() ? std::vector<std::string>() : std::vector<std::string>{val()};
     if (key == "failureClass" && value.is_object()) {
         return {Pick(lang, "失敗分類: ", "Failure class: ", "Clase de fallo: ") +

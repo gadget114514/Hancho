@@ -95,6 +95,7 @@ void CollectEscalations(const json& node, const std::string& btId, const json& t
             json item = {{"btId", btId}, {"nodeId", nodeId},
                          {"detail", GetString(status, "detail", "escalation failed")},
                          {"treeName", GetString(treeMeta, "name")},
+                         {"treeIntent", GetString(treeMeta, "intent")},
                          {"treeState", GetString(treeMeta, "state")},
                          {"queue", GetString(treeMeta, "queue")},
                          {"question", GetString(node, "question")}, {"options", options},
@@ -208,16 +209,25 @@ void TriageManager::Start() {
 
 void TriageManager::Stop() {
     if (!running_.exchange(false)) return;
+    {
+        std::lock_guard<std::mutex> lock(stopMutex_);
+    }
+    stopCv_.notify_all();
     if (thread_.joinable()) thread_.join();
 }
 
 void TriageManager::Loop() {
+    std::unique_lock<std::mutex> lock(stopMutex_);
     while (running_) {
-        std::this_thread::sleep_for(std::chrono::seconds(5));
-        if (!running_) break;
+        if (stopCv_.wait_for(lock, std::chrono::seconds(5),
+                             [this] { return !running_.load(); })) {
+            break;
+        }
+        lock.unlock();
         try { Refresh(); }
         catch (const std::exception& e) { WriteAuditLog("TRIAGE_REFRESH_ERR", e.what()); }
         catch (...) { WriteAuditLog("TRIAGE_REFRESH_ERR", "unknown exception"); }
+        lock.lock();
     }
 }
 
@@ -248,6 +258,31 @@ void TriageManager::Refresh() {
     }
     json jobs = listed.is_object() && listed.contains("jobs") && listed["jobs"].is_array()
         ? listed["jobs"] : json::array();
+    // The list RPC omits the instructions text to keep its payload small. For a failed job the
+    // captured instructions say most clearly what it was trying to do, so fetch them (cached by
+    // job id + revision) and add them to the card's intent section.
+    for (auto& job : jobs) {
+        if (!job.is_object() || GetString(job, "state") != "failed") continue;
+        const json listedInstructions = GetObject(job, "instructions");
+        const std::string cacheKey = GetString(job, "id") + "#" +
+            std::to_string(GetNumber(listedInstructions, "rev", 0));
+        auto cached = instructionsCache_.find(cacheKey);
+        if (cached == instructionsCache_.end()) {
+            std::string getErr;
+            json got = json::parse(tqm_.TaskQueueGet(GetString(job, "id"), true, 0, getErr),
+                                   nullptr, false);
+            json instructions = json::object();
+            if (getErr.empty() && got.is_object() && got.value("ok", false))
+                instructions = GetObject(GetObject(got, "job"), "instructions");
+            // An empty cached entry also remembers "this job has no instructions text", so the
+            // once-a-second refresh does not keep asking the task queue for it.
+            cached = instructionsCache_.emplace(
+                cacheKey, GetString(instructions, "text").empty() ? std::string() : instructions.dump()).first;
+            while (instructionsCache_.size() > 500) instructionsCache_.erase(instructionsCache_.begin());
+        }
+        if (cached->second.empty()) continue;
+        job["instructions"] = json::parse(cached->second, nullptr, false);
+    }
     TriageInputs inputs;
     inputs.jobs = jobs;
     inputs.config = config;

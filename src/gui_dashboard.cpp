@@ -96,6 +96,7 @@ constexpr ULONGLONG kEndBlinkHalfPeriodMs = 400;  // on/off toggle period of the
 constexpr int kDefaultEndBlinkSec = 5;
 constexpr UINT TRAY_ICON_ID           = 1;
 constexpr int  APP_ICON_RESOURCE_ID   = 1;
+constexpr int  TRAY_ICON_RESOURCE_ID  = 3;
 
 static HICON LoadAppIcon() {
     HICON hIcon = static_cast<HICON>(LoadImageW(
@@ -110,6 +111,15 @@ static HICON LoadAppSmallIcon() {
         IMAGE_ICON, GetSystemMetrics(SM_CXSMICON), GetSystemMetrics(SM_CYSMICON),
         LR_SHARED));
     return hIcon ? hIcon : LoadIconW(nullptr, IDI_APPLICATION);
+}
+
+// The notification area keeps the classic icon; only the window/exe icon changes.
+static HICON LoadTrayIcon() {
+    HICON hIcon = static_cast<HICON>(LoadImageW(
+        GetModuleHandleW(nullptr), MAKEINTRESOURCEW(TRAY_ICON_RESOURCE_ID),
+        IMAGE_ICON, GetSystemMetrics(SM_CXSMICON), GetSystemMetrics(SM_CYSMICON),
+        LR_SHARED));
+    return hIcon ? hIcon : LoadAppSmallIcon();
 }
 
 enum class UiLanguage { Japanese, English, Spanish };
@@ -917,6 +927,9 @@ struct DashboardState {
     // core has actually stopped (see TIMER_QUIT_WAIT_ID).
     bool waitingForCoreExit = false;
     DWORD64 coreExitWaitStartMs = 0;
+    // Process handle for the core captured before "Quit Hancho", so the wait is on the
+    // actual process and a stuck core can be terminated instead of blocking forever.
+    HANDLE coreProcessHandle = nullptr;
     NOTIFYICONDATAW nid = {};
     bool trayAdded = false;
 
@@ -963,12 +976,13 @@ static TerminalView* GetTerminalViewForProcess(DashboardState* st, int id) {
 // UI thread forever.
 static const int kGuiIpcTimeoutMs = 30000;
 
-static bool GuiIpcCall(DashboardState* st, const nlohmann::json& req, nlohmann::json& outResp, std::string* outError = nullptr) {
+static bool GuiIpcCall(DashboardState* st, const nlohmann::json& req, nlohmann::json& outResp,
+                       std::string* outError = nullptr, int timeoutMs = kGuiIpcTimeoutMs) {
     std::string resp;
     std::string err;
     bool ok = false;
     bool timedOut = false;
-    if (SendIpcRequest(req.dump(), resp, err, false, kGuiIpcTimeoutMs, &timedOut)) {
+    if (SendIpcRequest(req.dump(), resp, err, false, timeoutMs, &timedOut)) {
         ok = true;
     } else if (!timedOut && st && st->ipc) {
         // A timeout is not repeated in-process: the request may still be
@@ -10703,7 +10717,7 @@ static void InitTrayIcon(DashboardState* st) {
     st->nid.uID = 1;
     st->nid.uFlags = NIF_ICON | NIF_MESSAGE | NIF_TIP;
     st->nid.uCallbackMessage = WM_PC_TRAYICON;
-    st->nid.hIcon = LoadAppSmallIcon();
+    st->nid.hIcon = LoadTrayIcon();
     wcscpy_s(st->nid.szTip, L"Hancho — Multi-Terminal ConPTY Dashboard");
     st->trayAdded = gui_platform::GetGuiPlatform()->TrayAdd(st->nid);
 }
@@ -10829,25 +10843,31 @@ static void ShowTrayContextMenu(DashboardState* st) {
         }
         nlohmann::json response;
         std::string error;
-        const bool sent = GuiIpcCall(st, {{"action", "quit"}}, response, &error);
-        if (!sent && IsHanchoRunningForDataDirWide()) {
-            // The core did not accept the request (or did not answer), so it may
-            // still be running. Keep the dashboard open instead of hiding it.
-            const std::wstring failed = Tr(
-                L"Hancho コアを停止できませんでした。\n\n",
-                L"Could not stop the Hancho core.\n\n",
-                L"No se pudo detener el núcleo de Hancho.\n\n") +
-                Utf8ToWide(error);
-            MessageBoxW(st->hwndMain, failed.c_str(), title.c_str(), MB_OK | MB_ICONERROR);
-            return;
+        // Capture the core process before asking it to stop: the handle lets us wait for the
+        // real process and terminate it if a worker ignores the graceful shutdown.
+        if (st->coreProcessHandle) {
+            CloseHandle(st->coreProcessHandle);
+            st->coreProcessHandle = nullptr;
         }
+        nlohmann::json ping;
+        if (GuiIpcCall(st, {{"action", "ping"}}, ping, nullptr, 2000)) {
+            const DWORD corePid = static_cast<DWORD>(ping.value("pid", 0));
+            if (corePid != 0 && corePid != GetCurrentProcessId())
+                st->coreProcessHandle = OpenProcess(SYNCHRONIZE | PROCESS_TERMINATE, FALSE, corePid);
+        }
+        const bool sent = GuiIpcCall(st, {{"action", "quit"}}, response, &error, 5000);
         if (!IsHanchoRunningForDataDirWide()) {
             st->allowExit = true;
             DestroyWindow(st->hwndMain);
             return;
         }
-        // The core answers before it starts its shutdown sequence, so wait for
-        // its instance lock to be released before closing the dashboard.
+        if (!sent) {
+            // The core is still there but did not answer in time. Wait for the bounded
+            // grace period below and then terminate it, instead of leaving both stuck.
+            WriteAuditLog("GUI_QUIT", "quit request failed: " + error);
+        }
+        // The core answers before it starts its shutdown sequence, so wait for the
+        // process (or its instance lock) to go before closing the dashboard.
         st->waitingForCoreExit = true;
         st->coreExitWaitStartMs = GetTickCount64();
         SetTimer(st->hwndMain, TIMER_QUIT_WAIT_ID, 100, nullptr);
@@ -14974,7 +14994,7 @@ static void TriageUpdateSelection(TriageDlgState* ds) {
         ListView_DeleteAllItems(ds->infoTable);
         if (has) {
             const auto info = ds->selectedCard.value("info", nlohmann::json::object());
-            const char* sectionKeys[] = {"cause", "background", "environment", "conditions", "reason"};
+            const char* sectionKeys[] = {"summary", "intent", "cause", "background", "environment", "conditions", "reason"};
             // Lines that carry no information ("cwd: ", "...: null", "...: []") only push the useful ones down.
             auto empty = [](const std::string& line) {
                 auto endsWith = [&](const char* suffix) {
@@ -14984,8 +15004,14 @@ static void TriageUpdateSelection(TriageDlgState* ds) {
                 return line.empty() || endsWith(": ") || endsWith(":") || endsWith(": null") || endsWith(": []");
             };
             int row = 0;
-            for (int i = 0; i < 5; ++i) {
+            for (int i = 0; i < 7; ++i) {
                 std::vector<std::wstring> lines;
+                // Summary and intent are prose; keep their punctuation-only endings (for example a
+                // heading line "Steps:") while still dropping empty lines.
+                const bool prose = i <= 1;
+                auto keep = [&](const std::string& entry) {
+                    return !entry.empty() && (prose || !empty(entry));
+                };
                 if (info.is_object() && info.contains(sectionKeys[i]) && info[sectionKeys[i]].is_array()) {
                     for (const auto& line : info[sectionKeys[i]]) {
                         std::string value;
@@ -14993,10 +15019,10 @@ static void TriageUpdateSelection(TriageDlgState* ds) {
                         else if (line.is_object()) {
                             const auto formatted = TriageFormatInfoRows(TriageDisplayLanguage(), line);
                             for (const auto& entry : formatted)
-                                if (!empty(entry)) lines.push_back(Utf8ToWide(entry));
+                                if (keep(entry)) lines.push_back(Utf8ToWide(entry));
                             continue;
                         }
-                        if (!empty(value)) lines.push_back(Utf8ToWide(value));
+                        if (keep(value)) lines.push_back(Utf8ToWide(value));
                     }
                 }
                 if (lines.empty()) lines.push_back(L"—");
@@ -15107,6 +15133,9 @@ static void TriageUpdateSelection(TriageDlgState* ds) {
                 10, 10, 900, 22, GetParent(ds->detail), reinterpret_cast<HMENU>(static_cast<INT_PTR>(3000 + i)),
                 GetModuleHandleW(nullptr), nullptr);
             if (radio && ds->fontUi) SendMessageW(radio, WM_SETFONT, reinterpret_cast<WPARAM>(ds->fontUi), TRUE);
+            // Themed radios paint their label with the system text colour (black on Hancho's dark
+            // palettes). Disabling the visual style lets WM_CTLCOLORSTATIC apply the theme colour.
+            if (radio) SetWindowTheme(radio, L"", L"");
             if (radio) SetWindowSubclass(radio, TriageChildSubclassProc, 1, 0);
             ds->radios.push_back(radio);
             if (id == preferred) SendMessageW(radio, BM_SETCHECK, BST_CHECKED, 0);
@@ -15643,8 +15672,8 @@ static LRESULT CALLBACK TriageWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM
         MemoryListAddColumn(ds->list, 10, Tr(L"更新", L"Updated", L"Actualizado"), 140);
         ListView_SetBkColor(ds->list, g_theme.panel); ListView_SetTextBkColor(ds->list, g_theme.panel); ListView_SetTextColor(ds->list, g_theme.listText);
         ds->infoLabel = CreateWindowExW(0, L"STATIC",
-            Tr(L"■ 情報（原因・背景・環境・条件・理由）", L"■ Information (cause, background, environment, conditions, reason)",
-               L"■ Información (causa, contexto, entorno, condiciones, motivo)"),
+            Tr(L"■ 情報（要約・目的・原因・背景・環境・条件・理由）", L"■ Information (summary, intent, cause, background, environment, conditions, reason)",
+               L"■ Información (resumen, propósito, causa, contexto, entorno, condiciones, motivo)"),
             WS_CHILD | WS_VISIBLE, 10, 300, 500, 20, hwnd, nullptr, instance, nullptr);
         ds->infoTable = CreateWindowExW(WS_EX_CLIENTEDGE, WC_LISTVIEWW, L"",
             WS_CHILD | WS_VISIBLE | LVS_REPORT | LVS_SINGLESEL | LVS_SHOWSELALWAYS | LVS_NOSORTHEADER,
@@ -17243,25 +17272,35 @@ static LRESULT CALLBACK DashboardWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPA
                 InvalidateRect(hwnd, &st->kpiCardRects[9], FALSE);
                 }
             } else if (wParam == TIMER_QUIT_WAIT_ID && st) {
-                if (!st->waitingForCoreExit) {
-                    KillTimer(hwnd, TIMER_QUIT_WAIT_ID);
-                } else if (!IsHanchoRunningForDataDirWide()) {
+                auto finishQuit = [&] {
+                    if (st->coreProcessHandle) {
+                        CloseHandle(st->coreProcessHandle);
+                        st->coreProcessHandle = nullptr;
+                    }
                     st->waitingForCoreExit = false;
                     KillTimer(hwnd, TIMER_QUIT_WAIT_ID);
                     st->allowExit = true;
                     DestroyWindow(hwnd);
-                } else if (GetTickCount64() - st->coreExitWaitStartMs > 10000) {
-                    st->waitingForCoreExit = false;
+                };
+                if (!st->waitingForCoreExit) {
                     KillTimer(hwnd, TIMER_QUIT_WAIT_ID);
-                    MessageBoxW(hwnd,
-                        Tr(L"Hancho コアが 10 秒以内に終了しませんでした。\n\n"
-                           L"`Hancho.exe quit` でもう一度試してください。",
-                           L"The Hancho core did not exit within 10 seconds.\n\n"
-                           L"Try again with `Hancho.exe quit`.",
-                           L"El núcleo de Hancho no se detuvo en 10 segundos.\n\n"
-                           L"Vuelve a intentarlo con `Hancho.exe quit`."),
-                        Tr(L"Hancho を完全終了", L"Quit Hancho", L"Salir de Hancho"),
-                        MB_OK | MB_ICONWARNING);
+                } else if (st->coreProcessHandle &&
+                           WaitForSingleObject(st->coreProcessHandle, 0) == WAIT_OBJECT_0) {
+                    finishQuit();
+                } else if (!IsHanchoRunningForDataDirWide()) {
+                    finishQuit();
+                } else if (GetTickCount64() - st->coreExitWaitStartMs > 10000) {
+                    // The graceful shutdown did not finish. Terminate the core instead of
+                    // leaving an unclosable window and an invisible process behind.
+                    bool killed = false;
+                    if (st->coreProcessHandle) {
+                        killed = TerminateProcess(st->coreProcessHandle, 1) != FALSE;
+                        WaitForSingleObject(st->coreProcessHandle, 3000);
+                    }
+                    WriteAuditLog("GUI_QUIT", killed
+                        ? "core terminated after it ignored the 10 s shutdown grace period"
+                        : "core did not exit after 10 s and could not be terminated");
+                    finishQuit();
                 }
             }
             return 0;
@@ -18078,6 +18117,10 @@ static LRESULT CALLBACK DashboardWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPA
             KillTimer(hwnd, TIMER_KPI_ANIM_ID);
             KillTimer(hwnd, TIMER_QUIT_WAIT_ID);
             if (st) {
+                if (st->coreProcessHandle) {
+                    CloseHandle(st->coreProcessHandle);
+                    st->coreProcessHandle = nullptr;
+                }
                 if (st->waitingForCoreExit) st->waitingForCoreExit = false;
                 if (st->hwndHintWnd) {
                     DestroyWindow(st->hwndHintWnd);

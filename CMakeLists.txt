@@ -1,5 +1,5 @@
 cmake_minimum_required(VERSION 3.20)
-project(Hancho VERSION 0.9.22 LANGUAGES CXX)
+project(Hancho VERSION 0.9.23 LANGUAGES CXX)
 
 set(CMAKE_CXX_STANDARD 20)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
@@ -28,7 +28,7 @@ set(WCSP_SOURCES
     src/wcsp/remote_session.cpp
 )
 
-add_executable(Hancho
+set(HANCHO_SOURCES
     src/main.cpp
     src/common.cpp
     src/power.cpp
@@ -78,7 +78,6 @@ add_executable(Hancho
     src/gui_theme.cpp
     src/term_launch.cpp
     src/term_window.cpp
-    src/app.rc
     src/agent_template.rc
     src/Terminal/src/ConPtySession.cpp
     src/Terminal/src/ImageManager.cpp
@@ -90,15 +89,14 @@ add_executable(Hancho
     ${WCSP_SOURCES}
 )
 
-# Build the dashboard as a GUI-subsystem binary so Windows never creates a
-# console window for it (shortcut, Run key, WMI auto-start or an MCP client all
-# used to flash one). Console output still works when a parent console or a
-# redirected pipe is inherited; see AttachParentConsoleForCli() in main.cpp.
-set_target_properties(Hancho PROPERTIES WIN32_EXECUTABLE TRUE)
+# The program code is compiled once and linked into both the main Hancho binary
+# and the Chat binary. Only the embedded app icon differs (HanchoChat.exe uses
+# the chat icon for its file icon as well).
+add_library(HanchoObjects OBJECT ${HANCHO_SOURCES})
 
-target_compile_definitions(Hancho PRIVATE ${PC_VERSION_DEFINITIONS})
+target_compile_definitions(HanchoObjects PUBLIC ${PC_VERSION_DEFINITIONS})
 
-target_include_directories(Hancho PRIVATE
+target_include_directories(HanchoObjects PUBLIC
     src
     include
     src/Terminal/include
@@ -107,35 +105,65 @@ target_include_directories(Hancho PRIVATE
 )
 
 if(MSVC)
-    target_compile_options(Hancho PRIVATE /W4 /utf-8 /EHsc)
-    # The GUI subsystem expects WinMain by default; this program uses main().
-    target_link_options(Hancho PRIVATE /ENTRY:mainCRTStartup
-        "/MANIFESTDEPENDENCY:type='win32' name='Microsoft.Windows.Common-Controls' version='6.0.0.0' processorArchitecture='*' publicKeyToken='6595b64144ccf1df' language='*'")
+    target_compile_options(HanchoObjects PRIVATE /W4 /utf-8 /EHsc)
 endif()
 
-target_link_libraries(Hancho PRIVATE
-    user32
-    gdi32
-    comctl32
-    comdlg32
-    uxtheme
-    shell32
-    advapi32
-    psapi
-    ole32
-    shlwapi
-    imm32
-    winmm
-    d2d1
-    dwrite
-    dwmapi
-    windowscodecs
-    crypt32
-    ws2_32
-    iphlpapi
-    powrprof
-    "${CMAKE_CURRENT_SOURCE_DIR}/lib/libsixel.lib"
-)
+function(add_hancho_executable target rc_file)
+    add_executable(${target} ${rc_file} $<TARGET_OBJECTS:HanchoObjects>)
+
+    # Build as a GUI-subsystem binary so Windows never creates a console window
+    # for it (shortcut, Run key, WMI auto-start or an MCP client all used to
+    # flash one). Console output still works when a parent console or a
+    # redirected pipe is inherited; see AttachParentConsoleForCli() in main.cpp.
+    set_target_properties(${target} PROPERTIES WIN32_EXECUTABLE TRUE)
+
+    target_compile_definitions(${target} PRIVATE ${PC_VERSION_DEFINITIONS})
+
+    target_include_directories(${target} PRIVATE
+        src
+        include
+        src/Terminal/include
+        src/Terminal/src
+        src/wcsp
+    )
+
+    if(MSVC)
+        target_compile_options(${target} PRIVATE /W4 /utf-8 /EHsc)
+        # The GUI subsystem expects WinMain by default; this program uses main().
+        target_link_options(${target} PRIVATE /ENTRY:mainCRTStartup
+            "/MANIFESTDEPENDENCY:type='win32' name='Microsoft.Windows.Common-Controls' version='6.0.0.0' processorArchitecture='*' publicKeyToken='6595b64144ccf1df' language='*'")
+    endif()
+
+    target_link_libraries(${target} PRIVATE
+        user32
+        gdi32
+        comctl32
+        comdlg32
+        uxtheme
+        shell32
+        advapi32
+        psapi
+        ole32
+        shlwapi
+        imm32
+        winmm
+        d2d1
+        dwrite
+        dwmapi
+        windowscodecs
+        crypt32
+        ws2_32
+        iphlpapi
+        powrprof
+        "${CMAKE_CURRENT_SOURCE_DIR}/lib/libsixel.lib"
+    )
+endfunction()
+
+add_hancho_executable(Hancho src/app.rc)
+add_hancho_executable(HanchoChat src/app_chat.rc)
+# The chat binary launches the core/gui from the same folder; building it also
+# ensures Hancho.exe and the ConPTY support files are present in the output.
+add_dependencies(HanchoChat Hancho)
 
 add_custom_command(TARGET Hancho POST_BUILD
     COMMAND ${CMAKE_COMMAND} -E copy_if_different
@@ -204,6 +232,8 @@ add_executable(wct
     src/wct_client.cpp
     src/common.cpp
     src/ipc_client.cpp
+    src/remote_client.cpp
+    src/remote_hosts.cpp
     ${WCSP_SOURCES}
 )
 
