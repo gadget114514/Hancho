@@ -168,8 +168,8 @@ MCP SERVER SETUP:
     Behavior tree (10):
       bt_validate, bt_start, bt_get, bt_list, bt_wait, bt_resume, bt_retry,
       bt_update, bt_cancel, bt_pause
-    Power (3):
-      power_suspend, power_cancel, power_status
+    Power (4):
+      power_suspend, power_shutdown, power_cancel, power_status
     Chat (11):
       chat_status, chat_peers, chat_refresh, chat_send, chat_get, chat_inbox,
       chat_wait, chat_read, chat_download, chat_log, chat_handler
@@ -487,14 +487,14 @@ static int RunCoreHost(platform::IInstanceLock* instanceLock, bool showGuiAtStar
         });
         BtManager btm(pm, tqm);
         tqm.SetSuspendCallback([](const std::string& jobId, const std::string& state,
-                                  bool hibernate) {
+                                  const std::string& action) {
             (void)jobId;
             (void)state;
             SleepMs(500);
             std::string err;
-            if (!pc::SuspendSystem(hibernate, err)) {
-                WriteAuditLog("POWER_FAILED", err);
-            }
+            const bool ok = action == "shutdown" ? pc::ShutdownSystem(err)
+                                                 : pc::SuspendSystem(action == "hibernate", err);
+            if (!ok) WriteAuditLog("POWER_FAILED", err);
         });
 
         WNDCLASSEXW wc = {};
@@ -527,8 +527,9 @@ static int RunCoreHost(platform::IInstanceLock* instanceLock, bool showGuiAtStar
             ipc.SetShutdownCallback([hwnd] {
                 PostMessageW(hwnd, WM_PC_HOST_QUIT, 0, 0);
             });
-            ipc.SetPowerCallback([](bool hibernate, std::string& outError) {
-                return pc::SuspendSystem(hibernate, outError);
+            ipc.SetPowerCallback([](const std::string& action, std::string& outError) {
+                return action == "shutdown" ? pc::ShutdownSystem(outError)
+                                            : pc::SuspendSystem(action == "hibernate", outError);
             });
 
             ipc.Start();

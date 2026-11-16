@@ -74,8 +74,9 @@ hancho-cli.exe mcp uninstall --delete-data-dir           # データディレク
 | ツール | 説明 |
 | :--- | :--- |
 | `power_suspend` | PC をサスペンド。`jobId` を指定すると、そのジョブの終了後に他の全ジョブと管理プロセスがアイドルになるまで待ってから実行。省略すると `delaySec`（既定 3）後に即時実行。`hibernate` で休止、`dryRun` で確認のみ。ローカルホスト専用。 |
-| `power_cancel` | 武装中の `suspendWhenDone` をすべて解除し、カウントダウンを中止。 |
-| `power_status` | 武装中のジョブ、フェーズ（`waiting_target` / `waiting_others` / `countdown`）、他の実行中ジョブ・プロセス数、残り秒数を返す。 |
+| `power_shutdown` | PC をシャットダウン。`jobId` を指定すると、そのジョブの終了後に他の全ジョブと管理プロセスがアイドルになるまで待ってから実行。省略すると `delaySec`（既定 3）後に即時実行。`dryRun` で確認のみ。shutdown と suspend の両方が armed なら shutdown が優先。シャットダウン権限が必要で、拒否されたら Hancho を管理者として起動。ローカルホスト専用。 |
+| `power_cancel` | 武装中の `suspendWhenDone` / `shutdownWhenDone` をすべて解除し、カウントダウンを中止。 |
+| `power_status` | 武装中のジョブ、現在のアクション、フェーズ（`waiting_target` / `waiting_others` / `countdown`）、他の実行中ジョブ・プロセス数、残り秒数を返す。 |
 
 **Chat（LAN メッセージ）操作**
 

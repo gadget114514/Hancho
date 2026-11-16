@@ -120,6 +120,11 @@ The application icons are modeled on the character "Telephone Cat" (電話猫, D
 
 
 
+### v0.9.25
+- **Shut down when tasks finish**: `hancho-cli power shutdown --after-job <id>` (or a job's `shutdownWhenDone` / `shutdownDelaySec`) powers the PC off after that job and every other job and Hancho-managed process is idle. `power suspend` is unchanged; when both are armed, a shutdown wins. Power actions need the shutdown privilege, so run Hancho elevated if Windows refuses.
+- **Help and skill**: `power shutdown` is documented in `hancho-cli help`, `help --json`, the MCP tools (`power_shutdown`) and the Hancho skill, next to suspend.
+- **Power privilege check**: Settings -> Maintenance shows whether Hancho holds the shutdown privilege (and why not), and `power status` reports it as `can_power`.
+
 ### v0.9.24
 - **Triage advice is immediate**: advice now runs as an ordinary worker process instead of a hidden `_triage` queue job, so asking for advice starts at once instead of waiting behind queued work. `triage_llm_concurrency` (default 2) limits how many advice engines run at the same time.
 - **Triage window performance**: resizing and splitter drags coalesce their layout work, child controls repaint once when the drag settles, and a refresh rewrites only the rows and cells that changed. GDI brushes and pens are cached per theme, and the window does no work while it is hidden or minimized.

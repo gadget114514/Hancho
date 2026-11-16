@@ -2332,6 +2332,7 @@ EXAMPLES:
   hancho-cli.exe run --file queue.json --exit-on-drain --report junit.xml
   hancho-cli.exe bt start --file tree.json
   hancho-cli.exe power suspend --after-job final-build --delay-sec 30
+  hancho-cli.exe power shutdown --after-job final-build --delay-sec 30
   hancho-cli.exe chat send 127.0.0.1:2426 "build finished" --from-agent builder --audience human
   hancho-cli.exe chat wait --since 0 --timeout 30
   hancho-cli.exe mcp install --client opencode
@@ -2535,11 +2536,17 @@ REMOTE HOSTS:
       job / managed process is idle. Without --after-job, suspend after a short
       delay. --hibernate uses hibernation instead of sleep. --dry-run only reports
       what would happen.
+  power shutdown [--after-job <id>] [--delay-sec <n>] [--dry-run]
+      Shut the PC down after the specified task queue job finishes and every
+      other job / managed process is idle. Without --after-job, shut down after a
+      short delay. A shutdown wins over a suspend when both are armed. Jobs can
+      also be armed at registration with suspendWhenDone / shutdownWhenDone (and
+      suspendDelaySec / shutdownDelaySec).
   power cancel
-      Disarm every pending suspend.
+      Disarm every pending suspend or shutdown.
   power status
-      Show armed jobs, the current phase, and how many other jobs / managed
-      processes are still running.
+      Show armed jobs, the current action and phase, and how many other jobs /
+      managed processes are still running.
 
 TRIAGE:
   triage list [--all | --state <pending|acted|ignored|resolved|open|follow_up>]
@@ -2617,6 +2624,7 @@ TASK QUEUE:
       Optional: cwd, host, env, dependsOn, idle, maxAttempts, retryDelaySec, success,
       killExclude, resources {write,read}, defer, priority, estimateSec,
       suspendWhenDone, suspendDelaySec, suspendHibernate,
+      shutdownWhenDone, shutdownDelaySec,
       instructionsFile/instructionsText.
       estimateSec is your expected run time; Hancho compares it with the actual
       duration (see AUDIT below).
@@ -2807,7 +2815,7 @@ SETUP FOR LLM AGENTS:
 "                  taskqueue_graph\n"
 "      Behavior tree: bt_validate, bt_start, bt_get, bt_list, bt_wait, bt_resume,\n"
 "                  bt_retry, bt_update, bt_cancel, bt_pause\n"
-"      Power:      power_suspend, power_cancel, power_status\n"
+"      Power:      power_suspend, power_shutdown, power_cancel, power_status\n"
 "      Chat:       chat_status, chat_peers, chat_refresh, chat_send, chat_get,\n"
 "                  chat_inbox, chat_wait, chat_read, chat_download, chat_log, chat_handler\n"
 "      Memory:     memory_search, memory_get, memory_brief, memory_stats, memory_note,\n"
@@ -3034,7 +3042,7 @@ void PrintCliUsageJson() {
       "description": "Manage the persistent task queue: ordered jobs, dependencies, per-job timeouts, success checks and automatic retries.",
       "usage": "hancho-cli taskqueue <add|list|get|why|retry|cancel|pause|resume|graph|wait|purge> ...",
       "subcommands": [
-        {"name": "add", "usage": "hancho-cli taskqueue add --file <jobs.json> [--taskqueue <name>] [--concurrency <n>] [--notify-file <path>] [--origin-label <text>]", "description": "Register jobs. Each job needs id, command, summary and timeoutSec; dependsOn replaces shell chaining. The caller's session id, working folder and --origin-label are recorded as the job's origin. suspendWhenDone/suspendDelaySec/suspendHibernate arm the PC to suspend after that job and all other work is idle. Do not set hidden on jobs you register: it is reserved for Hancho's internal jobs and hides the row unless Show hidden tasks is on."},
+        {"name": "add", "usage": "hancho-cli taskqueue add --file <jobs.json> [--taskqueue <name>] [--concurrency <n>] [--notify-file <path>] [--origin-label <text>]", "description": "Register jobs. Each job needs id, command, summary and timeoutSec; dependsOn replaces shell chaining. The caller's session id, working folder and --origin-label are recorded as the job's origin. suspendWhenDone/suspendDelaySec/suspendHibernate arm the PC to suspend, and shutdownWhenDone/shutdownDelaySec arm it to shut down, after that job and all other work is idle. Do not set hidden on jobs you register: it is reserved for Hancho's internal jobs and hides the row unless Show hidden tasks is on."},
         {"name": "list", "usage": "hancho-cli taskqueue list [<name>] [--state <state>] [--since <period>] [--origin <self|label|session>] [--bt <id>]", "description": "List jobs with state, queue, summary and blockedBy. --since keeps only jobs updated within the period (e.g. 30m, 6h, 2d). --origin self keeps only the jobs this session added. --bt <id> lists every job of a behavior tree across its parallel branch queues. Each job also carries resource_wait and, once succeeded with estimateSec, timing_feedback (see audit). The dashboard adds provisional 'planned' rows for idle BT leaves; taskqueue_list returns them only with include_planned: true."},
         {"name": "record-plain", "usage": "hancho-cli taskqueue record-plain --cmd <cmd> [--name <name>] [--exit-code <n>] [--log <path>] [--summary <text>]", "description": "Record a plain execution outside a queue into logs/taskqueues/plain.json."},
         {"name": "get", "usage": "hancho-cli taskqueue get <id> [--rev <n>] [--no-instructions]", "description": "Show one job with attempts and instructions."},
@@ -3139,7 +3147,8 @@ void PrintCliUsageJson() {
       "usage": "hancho-cli power <suspend|cancel|status> [options]",
       "subcommands": [
         {"name": "suspend", "usage": "hancho-cli power suspend [--after-job <id>] [--delay-sec <n>] [--hibernate] [--dry-run]", "description": "Suspend now (after delay-sec, default 3), or arm the given job. The job may also be armed at registration with suspendWhenDone/suspendDelaySec. The core waits until every other task queue job and managed process is idle before the delay starts; new work cancels the countdown."},
-        {"name": "cancel", "usage": "hancho-cli power cancel", "description": "Clear suspendWhenDone on every job and cancel the countdown."},
+        {"name": "shutdown", "usage": "hancho-cli power shutdown [--after-job <id>] [--delay-sec <n>] [--dry-run]", "description": "Shut the PC down now (after delay-sec, default 3), or arm the given job. The job may also be armed at registration with shutdownWhenDone/shutdownDelaySec. A shutdown wins over a suspend when both are armed."},
+        {"name": "cancel", "usage": "hancho-cli power cancel", "description": "Clear suspendWhenDone/shutdownWhenDone on every job and cancel the countdown."},
         {"name": "status", "usage": "hancho-cli power status", "description": "Show armed jobs, the phase (waiting_target, waiting_others, countdown), other jobs/processes still running, and seconds until suspend."}
       ],
       "options": [
@@ -3288,7 +3297,7 @@ void PrintCliUsageJson() {
           }
         }
       },
-      "tools": ["start_process", "list_processes", "get_process_output", "send_process_input", "wait_process", "kill_process", "run_worker", "wait_worker", "get_worker_stream", "get_worker_state", "update_worker_info", "taskqueue_add", "taskqueue_list", "taskqueue_get", "taskqueue_retry", "taskqueue_update", "taskqueue_cancel", "taskqueue_pause", "taskqueue_resume", "taskqueue_wait", "taskqueue_purge", "taskqueue_link", "taskqueue_unlink", "taskqueue_graph", "bt_validate", "bt_start", "bt_get", "bt_list", "bt_wait", "bt_resume", "bt_retry", "bt_update", "bt_cancel", "bt_pause", "power_suspend", "power_cancel", "power_status", "chat_status", "chat_peers", "chat_refresh", "chat_send", "chat_get", "chat_inbox", "chat_wait", "chat_read", "chat_download", "chat_log", "chat_handler", "memory_search", "memory_get", "memory_brief", "memory_stats", "memory_note", "memory_retract", "memory_approve", "usage_stats", "usage_export"]
+      "tools": ["start_process", "list_processes", "get_process_output", "send_process_input", "wait_process", "kill_process", "run_worker", "wait_worker", "get_worker_stream", "get_worker_state", "update_worker_info", "taskqueue_add", "taskqueue_list", "taskqueue_get", "taskqueue_retry", "taskqueue_update", "taskqueue_cancel", "taskqueue_pause", "taskqueue_resume", "taskqueue_wait", "taskqueue_purge", "taskqueue_link", "taskqueue_unlink", "taskqueue_graph", "bt_validate", "bt_start", "bt_get", "bt_list", "bt_wait", "bt_resume", "bt_retry", "bt_update", "bt_cancel", "bt_pause", "power_suspend", "power_shutdown", "power_cancel", "power_status", "chat_status", "chat_peers", "chat_refresh", "chat_send", "chat_get", "chat_inbox", "chat_wait", "chat_read", "chat_download", "chat_log", "chat_handler", "memory_search", "memory_get", "memory_brief", "memory_stats", "memory_note", "memory_retract", "memory_approve", "usage_stats", "usage_export"]
     }
   },
   "leaving": {
@@ -3376,7 +3385,7 @@ void PrintCliUsageJson() {
     },
     "taskqueue_job": {
       "required": ["id", "command", "summary", "timeoutSec"],
-      "optional": ["cwd", "env", "dependsOn", "idle", "maxAttempts", "retryDelaySec", "defer", "success", "killExclude", "resources", "priority", "suspendWhenDone", "suspendDelaySec", "suspendHibernate", "instructionsFile", "instructionsText"],
+      "optional": ["cwd", "env", "dependsOn", "idle", "maxAttempts", "retryDelaySec", "defer", "success", "killExclude", "resources", "priority", "suspendWhenDone", "suspendDelaySec", "suspendHibernate", "shutdownWhenDone", "shutdownDelaySec", "instructionsFile", "instructionsText"],
       "summary": "One line, max 200 chars; exported as PC_JOB_SUMMARY and substituted for {summary}.",
       "timeoutSec": "Per job; > 0 and <= queue maxTimeoutSec (default 7200). Never summed.",
       "success": "exitCode (default 0) AND filesNewer (exist and newer than the attempt start) AND outputRegex (last 200 log lines) AND testReport (JUnit/NUnit XML: newer than the attempt start, at least one test, none failed; failed test names go into the failure detail).",
@@ -5104,20 +5113,25 @@ static int RunPowerCommand(const std::vector<std::string>& args, bool jsonOutput
     };
 
     if (op == "help" || op == "--help" || op == "-h") {
-        std::cout << "Usage: hancho-cli power <suspend|cancel|status> [options]\n"
+        std::cout << "Usage: hancho-cli power <suspend|shutdown|cancel|status> [options]\n"
                      "\n"
                      "  suspend [--after-job <id>] [--delay-sec <n>] [--hibernate] [--dry-run]\n"
                      "      Suspend now, or arm a job so the PC suspends after it and all\n"
                      "      other jobs / managed processes become idle.\n"
+                     "  shutdown [--after-job <id>] [--delay-sec <n>] [--dry-run]\n"
+                     "      Shut the PC down now, or arm a job so it shuts down after it and\n"
+                     "      all other jobs / managed processes become idle. A shutdown wins\n"
+                     "      over a suspend when both are armed.\n"
                      "  cancel\n"
-                     "      Disarm every pending suspend.\n"
+                     "      Disarm every pending suspend or shutdown.\n"
                      "  status\n"
                      "      Show armed jobs, the current phase and how many other jobs and\n"
                      "      managed processes are still running.\n";
         return 0;
     }
 
-    if (op == "suspend") {
+    if (op == "suspend" || op == "shutdown") {
+        const bool shutdown = op == "shutdown";
         std::string jobId;
         int delaySec = 3;
         bool hibernate = false;
@@ -5129,19 +5143,21 @@ static int RunPowerCommand(const std::vector<std::string>& args, bool jsonOutput
             } else if (a == "--delay-sec" && i + 1 < args.size()) {
                 try { delaySec = std::stoi(args[++i]); } catch (...) { delaySec = 3; }
             } else if (a == "--hibernate") {
+                if (shutdown) return fail("--hibernate is only valid with power suspend");
                 hibernate = true;
             } else if (a == "--dry-run") {
                 dryRun = true;
             } else {
-                return fail("unknown power suspend option: " + a);
+                return fail("unknown power " + op + " option: " + a);
             }
         }
         if (delaySec < 0) delaySec = 0;
         if (delaySec > 86400) delaySec = 86400;
+        const std::string verb = shutdown ? "shut down" : "suspend";
 
         if (!jobId.empty()) {
             nlohmann::json req;
-            req["action"] = "power_suspend";
+            req["action"] = shutdown ? "power_shutdown" : "power_suspend";
             req["job_id"] = jobId;
             req["delay_sec"] = delaySec;
             req["hibernate"] = hibernate;
@@ -5152,17 +5168,11 @@ static int RunPowerCommand(const std::vector<std::string>& args, bool jsonOutput
                 std::cout << resp << "\n";
             } else {
                 nlohmann::json j = nlohmann::json::parse(resp, nullptr, false);
-                if (j.value("dry_run", false)) {
-                    std::cout << "Would arm job '" << jobId << "' (state "
-                              << j.value("state", std::string("?")) << "): suspend after it and\n"
-                              << "all other jobs / managed processes become idle (delay "
-                              << delaySec << "s).\n";
-                } else {
-                    std::cout << "Armed job '" << jobId << "' (state "
-                              << j.value("state", std::string("?")) << "): suspend after it and\n"
-                              << "all other jobs / managed processes become idle (delay "
-                              << delaySec << "s).\n";
-                }
+                const std::string prefix = j.value("dry_run", false) ? "Would arm job '" : "Armed job '";
+                std::cout << prefix << jobId << "' (state "
+                          << j.value("state", std::string("?")) << "): " << verb << " after it and\n"
+                          << "all other jobs / managed processes become idle (delay "
+                          << delaySec << "s).\n";
             }
             return 0;
         }
@@ -5170,23 +5180,27 @@ static int RunPowerCommand(const std::vector<std::string>& args, bool jsonOutput
         if (jsonOutput) {
             nlohmann::json out;
             out["ok"] = true;
-            out["suspending"] = !dryRun;
+            out["suspending"] = !shutdown && !dryRun;
+            out["shutting_down"] = shutdown && !dryRun;
             out["dry_run"] = dryRun;
             out["delay_sec"] = delaySec;
+            out["action"] = shutdown ? "shutdown" : (hibernate ? "hibernate" : "sleep");
             out["hibernate"] = hibernate;
+            out["shutdown"] = shutdown;
             std::cout << out.dump() << "\n";
         } else if (dryRun) {
-            std::cout << "Dry run: would suspend"
+            std::cout << "Dry run: would " << verb
                       << (hibernate ? " (hibernate)" : "") << " in " << delaySec << " s.\n";
         } else {
-            std::cout << "Suspending" << (hibernate ? " (hibernate)" : "") << " in "
-                      << delaySec << " s.\n";
+            std::cout << (shutdown ? "Shutting down" : "Suspending")
+                      << (hibernate ? " (hibernate)" : "") << " in " << delaySec << " s.\n";
         }
         std::cout.flush();
         if (dryRun) return 0;
         if (delaySec > 0) SleepMs(static_cast<uint32_t>(delaySec) * 1000);
         std::string err;
-        if (!SuspendSystem(hibernate, err)) return fail(err);
+        const bool ok = shutdown ? ShutdownSystem(err) : SuspendSystem(hibernate, err);
+        if (!ok) return fail(err);
         return 0;
     }
 
@@ -5199,7 +5213,7 @@ static int RunPowerCommand(const std::vector<std::string>& args, bool jsonOutput
             std::cout << resp << "\n";
         } else {
             nlohmann::json j = nlohmann::json::parse(resp, nullptr, false);
-            std::cout << "Cancelled " << j.value("cleared", 0) << " armed suspend(s).\n";
+            std::cout << "Cancelled " << j.value("cleared", 0) << " armed power action(s).\n";
         }
         return 0;
     }
@@ -5215,26 +5229,31 @@ static int RunPowerCommand(const std::vector<std::string>& args, bool jsonOutput
         }
         nlohmann::json j = nlohmann::json::parse(resp, nullptr, false);
         if (!j.value("armed", false)) {
-            std::cout << "No suspend is armed.\n";
+            std::cout << "No power action is armed.\n";
             return 0;
         }
         std::cout << "Phase: " << j.value("phase", std::string("idle")) << "\n";
+        std::cout << "Action: " << j.value("action", std::string("none")) << "\n";
+        std::cout << "Power actions: " << (j.value("can_power", false) ? "available" : "unavailable");
+        if (!j.value("power_privilege_error", std::string()).empty())
+            std::cout << " (" << j.value("power_privilege_error", std::string()) << ")";
+        std::cout << "\n";
         if (j.contains("jobs") && j["jobs"].is_array()) {
             for (const auto& job : j["jobs"]) {
                 std::cout << "  job " << job.value("id", std::string("?")) << " (state "
                           << job.value("state", std::string("?")) << ", delay "
-                          << job.value("delay_sec", 0) << "s"
-                          << (job.value("hibernate", false) ? ", hibernate" : "") << ")\n";
+                          << job.value("delay_sec", 0) << "s, "
+                          << job.value("action", std::string("sleep")) << ")\n";
             }
         }
         std::cout << "Other work: " << j.value("other_jobs", 0) << " job(s), "
                   << j.value("other_processes", 0) << " managed process(es)\n";
-        int sec = j.value("seconds_until_suspend", 0);
-        if (sec > 0) std::cout << "Suspending in " << sec << " s.\n";
+        int sec = j.value("seconds_until_power", j.value("seconds_until_suspend", 0));
+        if (sec > 0) std::cout << "Power action in " << sec << " s.\n";
         return 0;
     }
 
-    return fail("unknown power command: " + op + " (suspend, cancel, status)");
+    return fail("unknown power command: " + op + " (suspend, shutdown, cancel, status)");
 }
 
 static int RunIpmsgCommand(const std::vector<std::string>& args, bool jsonOutput) {

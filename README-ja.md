@@ -117,6 +117,11 @@ New-Item -ItemType Junction -Path .claude\skills\hancho -Target (Resolve-Path sk
 
 
 
+### v0.9.25
+- **タスク終了後にシャットダウン**: `hancho-cli power shutdown --after-job <id>`（またはジョブの `shutdownWhenDone` / `shutdownDelaySec`）で、そのジョブと他の全ジョブ・Hancho 管理プロセスがアイドルになった後に PC の電源を切ります。`power suspend` はそのまま。両方 armed のときは shutdown が優先です。電源操作にはシャットダウン権限が必要で、Windows に拒否されたら Hancho を管理者として起動してください。
+- **ヘルプと skill**: `power shutdown` を `hancho-cli help`、`help --json`、MCP ツール（`power_shutdown`）、Hancho skill に suspend と並べて記載しました。
+- **電源権限の確認**: 設定 → 管理 に、Hancho がシャットダウン権限を持っているか（持っていない理由も）を表示します。`power status` も `can_power` で返します。
+
 ### v0.9.24
 - **トリアージの助言がすぐ返る**: 助言は hidden な `_triage` キュージョブではなく通常の worker プロセスとして起動するので、キュー内の他の仕事を待たずにすぐ始まります。同時に動かす数は `triage_llm_concurrency`（既定 2）で制限します。
 - **トリアージウィンドウの性能**: リサイズとスプリッタのドラッグ中はレイアウトを間引き、ドラッグが落ち着いたら子コントロールを一度だけ再描画します。更新時は変化した行・セルだけを書き換えます。GDI のブラシとペンはテーマごとにキャッシュし、非表示・最小化中は何もしません。

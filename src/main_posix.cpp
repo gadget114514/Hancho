@@ -94,20 +94,21 @@ int main(int argc, char** argv) {
 
     pc::BtManager btm(pm, tqm);
     tqm.SetSuspendCallback([](const std::string& jobId, const std::string& state,
-                              bool hibernate) {
+                              const std::string& action) {
         (void)jobId;
         (void)state;
         pc::SleepMs(500);
         std::string err;
-        if (!pc::SuspendSystem(hibernate, err)) {
-            pc::WriteAuditLog("POWER_FAILED", err);
-        }
+        const bool ok = action == "shutdown" ? pc::ShutdownSystem(err)
+                                             : pc::SuspendSystem(action == "hibernate", err);
+        if (!ok) pc::WriteAuditLog("POWER_FAILED", err);
     });
     pc::IpcServer server(pm, tqm, &btm);
     server.SetHeadless(true);
     server.SetShutdownCallback([] { g_stop = true; });
-    server.SetPowerCallback([](bool hibernate, std::string& outError) {
-        return pc::SuspendSystem(hibernate, outError);
+    server.SetPowerCallback([](const std::string& action, std::string& outError) {
+        return action == "shutdown" ? pc::ShutdownSystem(outError)
+                                    : pc::SuspendSystem(action == "hibernate", outError);
     });
 
     if (!server.Start()) {

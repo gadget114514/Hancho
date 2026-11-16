@@ -60,7 +60,7 @@ hancho-cli.exe power status    # 他の実行数と残り秒数
 hancho-cli.exe power cancel    # 解除
 ```
 
-ジョブ登録時に `"suspendWhenDone": true, "suspendDelaySec": 30` を付けることもできます。MCP の `power_suspend` / `power_cancel` / `power_status` も同じ機能を提供します。`--hibernate` で休止、`--dry-run` で実行前確認ができます。
+ジョブ登録時に `"suspendWhenDone": true, "suspendDelaySec": 30` や `"shutdownWhenDone": true, "shutdownDelaySec": 30` を付けることもできます。MCP の `power_suspend` / `power_shutdown` / `power_cancel` / `power_status` も同じ機能を提供し、両方が armed なら shutdown が優先されます。`--hibernate` で休止、`--dry-run` で実行前確認ができます。
 
 ---
 

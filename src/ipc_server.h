@@ -79,8 +79,9 @@ public:
         std::lock_guard<std::mutex> lock(cbMutex_);
         shutdownCb_ = std::move(cb);
     }
-    // Local suspend implementation used by `power_suspend` (MCP / CLI).
-    using PowerCallback = std::function<bool(bool hibernate, std::string& outError)>;
+    // Local power implementation used by `power_suspend` / `power_shutdown` (MCP / CLI).
+    // action is "sleep", "hibernate" or "shutdown".
+    using PowerCallback = std::function<bool(const std::string& action, std::string& outError)>;
     void SetPowerCallback(PowerCallback cb) {
         std::lock_guard<std::mutex> lock(cbMutex_);
         powerCb_ = std::move(cb);

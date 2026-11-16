@@ -180,6 +180,23 @@ hancho-cli.exe power cancel   # disarm
 hancho-cli.exe power suspend --dry-run   # verify without sleeping
 ```
 
+**Shut down after a specific task and all other work:**
+
+```powershell
+# After this job, and after every other job / managed process is idle, power off in 30s
+hancho-cli.exe power shutdown --after-job final-build --delay-sec 30
+
+# Or arm the job at registration time
+# {"id":"final-build","command":"...","summary":"...","timeoutSec":600,
+#  "shutdownWhenDone":true,"shutdownDelaySec":30}
+
+hancho-cli.exe power shutdown --dry-run   # verify without shutting down
+```
+
+A shutdown request wins over a suspend request when both are armed. Power actions need the
+shutdown privilege; run Hancho elevated if Windows refuses. `power suspend|shutdown` without
+`--after-job` runs after `--delay-sec` (default 3).
+
 The job may end as `succeeded`, `failed`, `cancelled` or `blocked`. The core then waits until no other task queue job (`running` / `waiting` / `pending`) and no Hancho-managed process is running. If new work starts during the countdown, the countdown is cancelled and restarted when the machine is idle again. Use `--hibernate` for hibernation and `--dry-run` to verify. When several jobs are armed, all of them must finish. `power_*` actions are local-host only.
 
 **LAN chat (`chat`, aliases `msg`, `ipmsg`; IPMsg compatible protocol):**

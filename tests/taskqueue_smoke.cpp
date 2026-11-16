@@ -2060,8 +2060,11 @@ int main() {
             powerTqm.OnProcessFinished(pid, ec, kind);
         });
         std::atomic<int> fired{0};
-        powerTqm.SetSuspendCallback([&fired](const std::string&, const std::string&, bool) {
+        std::atomic<int> shutDowns{0};
+        powerTqm.SetSuspendCallback([&fired, &shutDowns](const std::string&, const std::string&,
+                                                         const std::string& action) {
             fired.fetch_add(1);
+            if (action == "shutdown") shutDowns.fetch_add(1);
         });
 
         std::string err;
@@ -2088,14 +2091,26 @@ int main() {
         Check(JsonGetBool(powerTqm.TaskQueueAdd("powerq2", cancelJob, 0, "", err), "ok", false),
               "power: cancel job added");
         Check(WaitForState(powerTqm, "PW2", "running", 10000), "power: cancel job running");
-        std::string cancelResp = powerTqm.ClearSuspendWhenDone(err);
+        std::string cancelResp = powerTqm.ClearPowerWhenDone(err);
         Check(JsonGetInt(cancelResp, "cleared", 0) == 1, "power: cancel clears the armed flag");
-        Check(!JsonGetBool(powerTqm.SuspendStatusJson(), "armed", true),
+        Check(!JsonGetBool(powerTqm.PowerStatusJson(), "armed", true),
               "power: status reports not armed");
         int firedBefore = fired.load();
         Check(WaitForState(powerTqm, "PW2", "succeeded", 15000), "power: cancel job finished");
         Sleep(1500);
         Check(fired.load() == firedBefore, "power: cancel prevents suspend");
+
+        // A shutdown request arms the same monitor but runs the shutdown action.
+        const std::string shutJob =
+            R"([{"id":"PW3","command":"cmd /c exit 0","summary":"shutdown job","timeoutSec":30,"shutdownWhenDone":true,"shutdownDelaySec":1}])";
+        Check(JsonGetBool(powerTqm.TaskQueueAdd("powerq3", shutJob, 0, "", err), "ok", false),
+              "power: shutdown job added");
+        Check(WaitForState(powerTqm, "PW3", "succeeded", 15000), "power: shutdown job finished");
+        uint64_t shutStart = GetNowTickMs();
+        while (shutDowns.load() == 0 && GetNowTickMs() - shutStart < 8000) Sleep(100);
+        Check(shutDowns.load() == 1, "power: shutdown fires with the shutdown action");
+        const std::string shutStatus = powerTqm.PowerStatusJson();
+        Check(!JsonGetBool(shutStatus, "armed", true), "power: shutdown flag cleared");
 
         powerTqm.SetSuspendCallback(nullptr);
         powerTqm.ShutdownTaskQueueManager();

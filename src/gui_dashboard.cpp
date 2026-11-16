@@ -11087,6 +11087,7 @@ struct SettingsDlgState {
        HWND hwndAboutTitle = nullptr;
        HWND hwndAboutVersion = nullptr;
        HWND hwndAboutDesc = nullptr;
+       HWND hwndPowerPrivilege = nullptr;
        HWND tabCtrl = nullptr;
         // controls shown under each tab: 0 appearance, 1 behavior, 2 WinConsole,
         // 3 triage, 4 WebUI, 5 maintenance, 6 performance, 7 colors, 8 about
@@ -12077,6 +12078,31 @@ static void ApplyTerminalDialogConfig(SettingsDlgState* ds) {
     }
 }
 
+// Ask the core (the process that would power the PC down) whether it holds the
+// shutdown privilege, and show the answer on the Maintenance tab.
+static void RefreshPowerPrivilegeText(SettingsDlgState* ds) {
+    if (!ds || !ds->hwndPowerPrivilege) return;
+    std::wstring text;
+    nlohmann::json response;
+    if (!ds->dash || !GuiIpcCall(ds->dash, {{"action", "power_status"}}, response) ||
+        !response.value("ok", false)) {
+        text = Tr(L"電源操作: 不明（コアに接続できません）",
+                  L"Power actions: unknown (the core is not reachable)",
+                  L"Acciones de energía: desconocido (no se puede contactar con el núcleo)");
+    } else if (response.value("can_power", false)) {
+        text = Tr(L"電源操作: 可能（サスペンド / シャットダウンの権限があります）",
+                  L"Power actions: available (the shutdown privilege is held)",
+                  L"Acciones de energía: disponibles (se tiene el privilegio de apagado)");
+    } else {
+        const std::string reason = response.value("power_privilege_error", std::string());
+        text = Tr(L"電源操作: 不可（Hancho を管理者として起動してください）",
+                  L"Power actions: unavailable (run Hancho elevated)",
+                  L"Acciones de energía: no disponibles (ejecuta Hancho como administrador)");
+        if (!reason.empty()) text += L" [" + Utf8ToWide(reason) + L"]";
+    }
+    SetWindowTextW(ds->hwndPowerPrivilege, text.c_str());
+}
+
 static void UpdateSettingsDialogTexts(HWND hwnd) {
     auto* ds = reinterpret_cast<SettingsDlgState*>(GetWindowLongPtrW(hwnd, GWLP_USERDATA));
     if (!ds) return;
@@ -12114,6 +12140,7 @@ static void UpdateSettingsDialogTexts(HWND hwnd) {
     SetWindowTextW(ds->chkActivityStyle, Tr(L"実行状態監視ペイン: 行を色分けし、アイコンを表示", L"Execution monitor pane: colour rows and show icons", L"Panel de ejecución: colorear filas y mostrar iconos"));
     SetWindowTextW(ds->chkShowHiddenTasks, Tr(L"hidden タスクも表示", L"Show hidden tasks", L"Mostrar tareas ocultas"));
     SetWindowTextW(ds->btnClose, Tr(L"閉じる", L"Close", L"Cerrar"));
+    RefreshPowerPrivilegeText(ds);
     {
         const wchar_t* const tabNames[kSettingsTabCount] = {
             Tr(L"表示", L"Appearance", L"Apariencia"),
@@ -12485,6 +12512,10 @@ static LRESULT CALLBACK SettingsWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPAR
                 402, 48, 180, 32, hwnd, (HMENU)IDC_SET_CLEAR_ENDED, hInst, nullptr);
             ds->btnClose = CreateWindowExW(0, L"BUTTON", L"", WS_CHILD | WS_VISIBLE | BS_OWNERDRAW,
                 560, 784, 110, 32, hwnd, (HMENU)IDCANCEL, hInst, nullptr);
+            // Static version of the power status, so a person can see before arming a job
+            // whether this Hancho can actually suspend or shut the PC down.
+            ds->hwndPowerPrivilege = CreateWindowExW(0, L"STATIC", L"", WS_CHILD | SS_LEFT,
+                18, 92, 700, 48, hwnd, nullptr, hInst, nullptr);
 
             ds->hwndSoundLabel = CreateWindowExW(0, L"STATIC", L"", WS_CHILD | WS_VISIBLE,
                 18, 48, 300, 20, hwnd, nullptr, hInst, nullptr);
@@ -13005,6 +13036,7 @@ static LRESULT CALLBACK SettingsWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPAR
             SendMessageW(ds->hwndAboutTitle, WM_SETFONT, (WPARAM)ds->dash->hFontUiBold, TRUE);
             SendMessageW(ds->hwndAboutVersion, WM_SETFONT, (WPARAM)ds->dash->hFontUi, TRUE);
             SendMessageW(ds->hwndAboutDesc, WM_SETFONT, (WPARAM)ds->dash->hFontUi, TRUE);
+            SendMessageW(ds->hwndPowerPrivilege, WM_SETFONT, (WPARAM)ds->dash->hFontUi, TRUE);
 
             // Sort the controls into their tab pages.
             {
@@ -13049,7 +13081,8 @@ static LRESULT CALLBACK SettingsWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPAR
                     ds->lblTriageMode, ds->cmbTriageMode, ds->lblTriageLlmMode, ds->cmbTriageLlmMode,
                     ds->lblTriageKinds });
                 triage.insert(triage.end(), ds->chkTriageKinds, ds->chkTriageKinds + 5);
-                maintenance.insert(maintenance.end(), { ds->btnShell, ds->btnReset, ds->btnClear });
+                maintenance.insert(maintenance.end(), { ds->btnShell, ds->btnReset, ds->btnClear,
+                                                         ds->hwndPowerPrivilege });
                 webui.insert(webui.end(), {
                     ds->lblWebUiTitle, ds->chkWebUi, ds->lblWebUiScope, ds->cmbWebUiScope,
                     ds->lblWebUiAllowedHosts, ds->editWebUiAllowedHosts,
@@ -13072,6 +13105,7 @@ static LRESULT CALLBACK SettingsWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPAR
             auto* nm = reinterpret_cast<NMHDR*>(lParam);
             if (ds && nm->idFrom == IDC_SET_TAB && nm->code == TCN_SELCHANGE) {
                 SelectSettingsTab(ds, TabCtrl_GetCurSel(ds->tabCtrl));
+                if (TabCtrl_GetCurSel(ds->tabCtrl) == 5) RefreshPowerPrivilegeText(ds);
                 return 0;
             }
             break;

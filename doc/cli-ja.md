@@ -134,6 +134,23 @@ hancho-cli.exe power cancel   # 武装を解除
 hancho-cli.exe power suspend --dry-run   # 実際にはスリープせず確認
 ```
 
+**シャットダウン（指定タスクと他の全作業が終わったら電源オフ）:**
+
+```powershell
+# このジョブが終わり、他の全ジョブと管理プロセスもアイドルになってから 30 秒後に電源オフ
+hancho-cli.exe power shutdown --after-job final-build --delay-sec 30
+
+# 登録時にジョブへ指定することもできる
+# {"id":"final-build","command":"...","summary":"...","timeoutSec":600,
+#  "shutdownWhenDone":true,"shutdownDelaySec":30}
+
+hancho-cli.exe power shutdown --dry-run   # 実際には電源オフせず確認
+```
+
+shutdown と suspend の両方が armed のときは shutdown が優先されます。電源操作には
+シャットダウン権限が必要で、Windows に拒否されたら Hancho を管理者として起動してください。
+`--after-job` を省くと `--delay-sec`（既定 3）後に実行します。
+
 対象ジョブが `succeeded` / `failed` / `cancelled` / `blocked` になると、他のタスクキュージョブ（`running` / `waiting` / `pending`）と Hancho 管理プロセスがなくなるまで待ちます。待機中に新しい作業が始まった場合はカウントダウンをやり直します。`--hibernate` で休止、`--dry-run` で確認できます。複数のジョブにフラグを付けた場合は、すべて終了してから発動します。`power_*` はローカルホスト専用です。
 
 **LAN チャット（`chat`、別名 `msg` / `ipmsg`、IPMsg 互換プロトコル）:**

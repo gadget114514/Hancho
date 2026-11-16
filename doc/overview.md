@@ -57,7 +57,7 @@ hancho-cli.exe power status    # other work still running, seconds left
 hancho-cli.exe power cancel    # disarm
 ```
 
-You can also set `"suspendWhenDone": true, "suspendDelaySec": 30` when registering the job. The MCP tools `power_suspend` / `power_cancel` / `power_status` expose the same feature. Use `--hibernate` for hibernation and `--dry-run` to verify without sleeping.
+You can also set `"suspendWhenDone": true, "suspendDelaySec": 30` or `"shutdownWhenDone": true, "shutdownDelaySec": 30` when registering the job. The MCP tools `power_suspend` / `power_shutdown` / `power_cancel` / `power_status` expose the same feature; a shutdown wins over a suspend when both are armed. Use `--hibernate` for hibernation and `--dry-run` to verify without sleeping or shutting down.
 
 ## Behavior trees: the next-step decisions run inside Hancho
 

@@ -554,6 +554,10 @@ struct TaskQueueJob {
     bool suspendWhenDone = false;
     int suspendDelaySec = 0;       // 0 = default grace period
     bool suspendHibernate = false; // false = sleep
+    // Armed by `hancho-cli power shutdown --after-job <id>` or a job's shutdownWhenDone.
+    // A shutdown request wins over a suspend request when both are armed.
+    bool shutdownWhenDone = false;
+    int shutdownDelaySec = 0;      // 0 = default grace period
     std::string state;
     std::vector<TaskQueueAttempt> attempts;
     std::string blockedBy;
@@ -766,8 +770,9 @@ public:
     using JobFinishedCallback = std::function<void(const TaskQueueJob& snapshot, const std::string& finalState)>;
     using BtRetryCallback = std::function<bool(const TaskQueueBtRef& ref, bool resetCounters, std::string& outError)>;
     // Invoked on the scheduler thread when a flagged job and all other work are idle.
+    // action is "sleep", "hibernate" or "shutdown".
     using SuspendCallback = std::function<void(const std::string& jobId, const std::string& state,
-                                               bool hibernate)>;
+                                               const std::string& action)>;
 
     void SetProcessFinishedCallback(ProcessFinishedCallback cb);
     void SetJobFinishedCallback(JobFinishedCallback cb);
@@ -834,12 +839,13 @@ public:
 
     TaskQueueCounts GetJobCounts() const;
 
-    // Suspend-after-job support (hancho-cli power suspend / MCP power_suspend).
-    // Arming a terminal job starts the countdown as soon as all other work is idle.
-    std::string SetJobSuspendWhenDone(const std::string& id, bool hibernate, int delaySec,
-                                      std::string& outError);
-    std::string ClearSuspendWhenDone(std::string& outError);
-    std::string SuspendStatusJson() const;
+    // Power-after-job support (hancho-cli power suspend|shutdown / MCP power_suspend, power_shutdown).
+    // action is "sleep", "hibernate" or "shutdown". Arming a terminal job starts the countdown
+    // as soon as all other work is idle; a shutdown request wins over a suspend request.
+    std::string SetJobPowerWhenDone(const std::string& id, const std::string& action, int delaySec,
+                                    std::string& outError);
+    std::string ClearPowerWhenDone(std::string& outError);
+    std::string PowerStatusJson() const;
 
     // Plain runs outside a taskqueue (doc/design-v3.md §7, card 072-1).
     static std::string IssuePlainJobId(int processId = 0, const std::string& name = "") {
@@ -943,11 +949,11 @@ private:
     std::condition_variable jobFinishedCbIdleCv_;
     BtRetryCallback btRetryCb_;
     SuspendCallback suspendCb_;
-    // Suspend monitor state, guarded by mutex_.
-    std::string suspendPhase_; // empty/idle, waiting_target, waiting_others, countdown
-    int64_t suspendDueMs_ = 0;
-    int suspendDelaySec_ = 0;
-    bool suspendHibernate_ = false;
+    // Power monitor state, guarded by mutex_.
+    std::string powerPhase_; // empty/idle, waiting_target, waiting_others, countdown
+    int64_t powerDueMs_ = 0;
+    int powerDelaySec_ = 0;
+    std::string powerAction_; // sleep, hibernate, shutdown
     std::vector<std::pair<TaskQueueJob, std::string>> pendingFinished_;
     mutable std::mutex mutex_;
     std::condition_variable cv_;

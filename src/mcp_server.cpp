@@ -882,14 +882,24 @@ int RunMcpServer() {
                 << "}"
                 << ","
                 << "{"
+                << "\"name\":\"power_shutdown\","
+                << "\"description\":\"Shut the PC down after a task queue job finishes and all other jobs / managed processes are idle. Pass jobId to arm an existing job; omit jobId to shut down immediately after delaySec. A shutdown wins over a suspend when both are armed. Requires the shutdown privilege (run Hancho elevated if it is refused). Use dryRun=true to verify without shutting down. Local host only.\","
+                << "\"inputSchema\":{\"type\":\"object\",\"properties\":{"
+                << "\"jobId\":{\"type\":\"string\",\"description\":\"Task queue job id to arm. Omit to shut down immediately.\"},"
+                << "\"delaySec\":{\"type\":\"integer\",\"description\":\"Grace period in seconds (default 3 for immediate; job-triggered uses shutdownDelaySec or 10).\"},"
+                << "\"dryRun\":{\"type\":\"boolean\",\"description\":\"Report what would happen without arming or shutting down.\"}"
+                << "}}"
+                << "}"
+                << ","
+                << "{"
                 << "\"name\":\"power_cancel\","
-                << "\"description\":\"Clear every armed suspend-after-job flag and cancel the countdown.\","
+                << "\"description\":\"Clear every armed suspend/shutdown-after-job flag and cancel the countdown.\","
                 << "\"inputSchema\":{\"type\":\"object\",\"properties\":{}}"
                 << "}"
                 << ","
                 << "{"
                 << "\"name\":\"power_status\","
-                << "\"description\":\"Show armed suspend jobs, the current phase (waiting_target, waiting_others, countdown), other jobs/processes still running, and seconds until suspend.\","
+                << "\"description\":\"Show armed suspend/shutdown jobs, the current action, the current phase (waiting_target, waiting_others, countdown), other jobs/processes still running, and seconds until the power action.\","
                 << "\"inputSchema\":{\"type\":\"object\",\"properties\":{}}"
                 << "}"
                 << ","
@@ -1374,13 +1384,13 @@ int RunMcpServer() {
                        << ",\"taskqueue\":\"" << JsonEscape(JsonGetString(argsJson, "taskqueue", "")) << "\""
                        << ",\"root\":\"" << JsonEscape(JsonGetString(argsJson, "root", "")) << "\"}";
             }
-            else if (toolName == "power_suspend" || toolName == "power_cancel" ||
-                     toolName == "power_status") {
+            else if (toolName == "power_suspend" || toolName == "power_shutdown" ||
+                     toolName == "power_cancel" || toolName == "power_status") {
                 auto p = nlohmann::json::parse(argsJson, nullptr, false);
                 if (p.is_discarded() || !p.is_object()) p = nlohmann::json::object();
                 nlohmann::json powerReq;
                 powerReq["action"] = toolName;
-                if (toolName == "power_suspend") {
+                if (toolName == "power_suspend" || toolName == "power_shutdown") {
                     powerReq["job_id"] = p.value("jobId", p.value("job_id", std::string()));
                     powerReq["delay_sec"] = p.value("delaySec", p.value("delay_sec", 3));
                     powerReq["hibernate"] = p.value("hibernate", false);

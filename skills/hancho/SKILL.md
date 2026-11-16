@@ -112,12 +112,15 @@ hancho-cli.exe bt start --file plan.json
 hancho-cli.exe bt wait --id <btid> --timeout-ms 600000
 ```
 
-### 5. 夜間に終わったらスリープ
+### 5. 夜間に終わったらサスペンド / シャットダウン
 
 ```powershell
-hancho-cli.exe power suspend --after-job final-build --delay-sec 30
+hancho-cli.exe power suspend  --after-job final-build --delay-sec 30   # スリープ
+hancho-cli.exe power shutdown --after-job final-build --delay-sec 30   # 電源オフ
 hancho-cli.exe power status
 ```
+
+ジョブ登録時に `"suspendWhenDone": true` / `"shutdownWhenDone": true`（`suspendDelaySec` / `shutdownDelaySec`）を付けてもよい。両方 armed のときは shutdown が優先。
 
 ## どれを使うか（迷ったら上から）
 
@@ -128,7 +131,7 @@ hancho-cli.exe power status
 | 前の結果で次が変わる（分岐、修正ループ、if/else） | `bt start` + `bt wait` / `bt resume` |
 | worker LLM に1件任せて最終結果だけ欲しい | MCP `run_worker` |
 | 対話 TUI（opencode / claude を `run` なしで） | `start --pty` |
-| 夜間バッチの後に PC をスリープ | `power suspend --after-job <id>` |
+| 夜間バッチの後に PC をスリープ / シャットダウン | `power suspend` / `power shutdown --after-job <id>` |
 
 **迷ったら**: まず `start` で1コマンド。順番が必要になったらキュー。結果で分岐するなら BT。手でジョブを1個ずつ足して様子を見るのはやめる（BT に向いている）。
 
@@ -199,6 +202,21 @@ hancho-cli.exe taskqueue retry --failed --since 6h
 状態: `waiting`（実行可能・空き待ち）、`pending`（依存未達）、`blocked`（依存失敗）、`running`、`planned`（BT の暫定行）、`succeeded`、`failed`、`cancelled`。
 
 `taskqueue add` の応答には `data_dir` が入ります。登録したジョブ ID と `data_dir` をセットで報告してください。ダッシュボードにジョブが見えない場合は、まずダッシュボードのタイトルに表示されたデータディレクトリと照合します（LLM が別のコア／データディレクトリに登録した場合は、そのダッシュボードには出ません）。`hidden: true` は尊重され、既定では一覧に出ません。ただし `hidden` は Hancho 内部のジョブ用なので、外部（CLI / MCP / LLM）から登録するジョブには付けないでください。見えないときは設定の「hidden タスクも表示」を有効にするか、`hidden` を付けずに登録し直します。
+
+### 電源（タスク終了後にサスペンド / シャットダウン）
+
+```powershell
+hancho-cli.exe power suspend  --after-job <id> [--delay-sec 30] [--hibernate] [--dry-run]
+hancho-cli.exe power shutdown --after-job <id> [--delay-sec 30] [--dry-run]
+hancho-cli.exe power cancel
+hancho-cli.exe power status
+```
+
+- `--after-job <id>` を省くと、指定秒後にすぐ実行（既定 3 秒）。
+- 対象ジョブと、他の全ジョブ（running / waiting / pending）・Hancho 管理プロセスがアイドルになってから猶予（既定 10 秒）が始まる。新しい仕事が始まるとカウントダウンは取り消される。
+- `--dry-run` で実行内容だけ確認できる。
+- ジョブ登録時の `"suspendWhenDone"` / `"shutdownWhenDone"` でも同じ。両方 armed なら shutdown が勝つ。`--hibernate` は suspend のみ。
+- シャットダウンには OS のシャットダウン権限が要る。拒否されたら Hancho を管理者として起動する。
 
 ### ビヘイビアツリー（結果で分岐）
 
@@ -316,7 +334,7 @@ hancho-cli.exe mcp install --client opencode   # claude なら --client claude
 hancho-cli.exe mcp install --data-dir .hancho --dry-run --json
 ```
 
-主なツール: `start_process`、`list_processes`、`get_process_output`、`wait_process`、`send_process_input`、`kill_process`、`taskqueue_*`、`bt_*`、`run_worker` / `wait_worker`、`triage_list/get/decide`、`power_suspend/cancel/status`、`memory_*`、`usage_*`、`chat_*`。
+主なツール: `start_process`、`list_processes`、`get_process_output`、`wait_process`、`send_process_input`、`kill_process`、`taskqueue_*`、`bt_*`、`run_worker` / `wait_worker`、`triage_list/get/decide`、`power_suspend/shutdown/cancel/status`、`memory_*`、`usage_*`、`chat_*`。
 
 ## よくある失敗
 

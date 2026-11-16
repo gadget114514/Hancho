@@ -8,6 +8,7 @@
 #include "llm_stream.h"
 #include "memory_record.h"
 #include "memory_search.h"
+#include "power.h"
 #include "remote_hosts.h"
 #include "triage_manager.h"
 #include "webui_server.h"
@@ -710,10 +711,12 @@ std::string IpcServer::HandleRequestJson(const std::string& reqJson) {
         }).detach();
         return "{\"ok\":true,\"stopping\":true}";
     }
-    else if (action == "power_suspend") {
+    else if (action == "power_suspend" || action == "power_shutdown") {
+        const bool shutdown = action == "power_shutdown";
+        const std::string powerAction = shutdown ? "shutdown"
+            : (JsonGetBool(reqJson, "hibernate", false) ? "hibernate" : "sleep");
         const std::string jobId = JsonGetString(reqJson, "job_id", JsonGetString(reqJson, "jobId", ""));
         const bool dryRun = JsonGetBool(reqJson, "dry_run", JsonGetBool(reqJson, "dryRun", false));
-        const bool hibernate = JsonGetBool(reqJson, "hibernate", false);
         int delaySec = static_cast<int>(JsonGetInt(reqJson, "delay_sec", JsonGetInt(reqJson, "delaySec", 3)));
         if (delaySec < 0) delaySec = 0;
         if (delaySec > 86400) delaySec = 86400;
@@ -734,11 +737,13 @@ std::string IpcServer::HandleRequestJson(const std::string& reqJson) {
                 out["terminal"] = (job.state == "succeeded" || job.state == "failed" ||
                                    job.state == "cancelled" || job.state == "blocked");
                 out["delay_sec"] = delaySec;
-                out["hibernate"] = hibernate;
+                out["action"] = powerAction;
+                out["hibernate"] = powerAction == "hibernate";
+                out["shutdown"] = shutdown;
                 return out.dump();
             }
             std::string err;
-            return tqm_.SetJobSuspendWhenDone(jobId, hibernate, delaySec, err);
+            return tqm_.SetJobPowerWhenDone(jobId, powerAction, delaySec, err);
         }
 
         if (dryRun) {
@@ -746,8 +751,11 @@ std::string IpcServer::HandleRequestJson(const std::string& reqJson) {
             out["ok"] = true;
             out["dry_run"] = true;
             out["suspending"] = false;
+            out["shutting_down"] = false;
             out["delay_sec"] = delaySec;
-            out["hibernate"] = hibernate;
+            out["action"] = powerAction;
+            out["hibernate"] = powerAction == "hibernate";
+            out["shutdown"] = shutdown;
             return out.dump();
         }
 
@@ -758,28 +766,38 @@ std::string IpcServer::HandleRequestJson(const std::string& reqJson) {
             cb = powerCb_;
         }
         if (!cb) {
-            return "{\"ok\":false,\"error\":\"suspend is not available\"}";
+            return std::string("{\"ok\":false,\"error\":\"") + (shutdown ? "shutdown" : "suspend") +
+                   " is not available\"}";
         }
-        WriteAuditLog("POWER_SUSPEND", std::string("immediate delay=") + std::to_string(delaySec) +
-                                           (hibernate ? " hibernate" : " sleep"));
-        std::thread([cb, delaySec, hibernate] {
+        WriteAuditLog(shutdown ? "POWER_SHUTDOWN" : "POWER_SUSPEND",
+                      std::string("immediate delay=") + std::to_string(delaySec) + " action=" + powerAction);
+        std::thread([cb, delaySec, powerAction] {
             if (delaySec > 0) SleepMs(static_cast<uint32_t>(delaySec) * 1000);
             std::string err;
-            if (!cb(hibernate, err)) WriteAuditLog("POWER_FAILED", err);
+            if (!cb(powerAction, err)) WriteAuditLog("POWER_FAILED", err);
         }).detach();
         nlohmann::json out;
         out["ok"] = true;
-        out["suspending"] = true;
+        out["suspending"] = !shutdown;
+        out["shutting_down"] = shutdown;
         out["delay_sec"] = delaySec;
-        out["hibernate"] = hibernate;
+        out["action"] = powerAction;
+        out["hibernate"] = powerAction == "hibernate";
+        out["shutdown"] = shutdown;
         return out.dump();
     }
     else if (action == "power_cancel") {
         std::string err;
-        return tqm_.ClearSuspendWhenDone(err);
+        return tqm_.ClearPowerWhenDone(err);
     }
     else if (action == "power_status") {
-        return tqm_.SuspendStatusJson();
+        nlohmann::json out = nlohmann::json::parse(tqm_.PowerStatusJson(), nullptr, false);
+        if (!out.is_object()) out = nlohmann::json::object();
+        std::string privilegeError;
+        const bool canPower = pc::HasPowerPrivilege(privilegeError);
+        out["can_power"] = canPower;
+        out["power_privilege_error"] = privilegeError;
+        return out.dump();
     }
     else if (action == "start") {
         StartProcessRequest req;

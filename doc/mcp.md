@@ -75,8 +75,9 @@ The `triage_ack` action is available through IPC and `hancho-cli triage ack` to 
 | Tool | Description |
 | :--- | :--- |
 | `power_suspend` | Suspend the PC. With `jobId`, wait until that job finishes and every other job / managed process is idle, then suspend. Without it, suspend after `delaySec` (default 3). `hibernate` selects hibernation; `dryRun` only reports. Local host only. |
-| `power_cancel` | Clear every armed `suspendWhenDone` and cancel the countdown. |
-| `power_status` | Return armed jobs, the phase (`waiting_target` / `waiting_others` / `countdown`), other running jobs/processes, and seconds until suspend. |
+| `power_shutdown` | Shut the PC down. With `jobId`, wait until that job finishes and every other job / managed process is idle, then power off. Without it, power off after `delaySec` (default 3). `dryRun` only reports. A shutdown wins over a suspend when both are armed. Requires the shutdown privilege (run Hancho elevated if refused). Local host only. |
+| `power_cancel` | Clear every armed `suspendWhenDone` / `shutdownWhenDone` and cancel the countdown. |
+| `power_status` | Return armed jobs, the current action, the phase (`waiting_target` / `waiting_others` / `countdown`), other running jobs/processes, and seconds until the power action. |
 
 **Chat (LAN messaging) tools**
 

@@ -68,6 +68,28 @@ bool SuspendSystem(bool hibernate, std::string& outError) {
     return true;
 }
 
+bool HasPowerPrivilege(std::string& outError) {
+    outError.clear();
+    return EnableShutdownPrivilege(outError);
+}
+
+bool ShutdownSystem(std::string& outError) {
+    outError.clear();
+    if (!EnableShutdownPrivilege(outError)) return false;
+
+    if (!ExitWindowsEx(EWX_POWEROFF | EWX_FORCEIFHUNG,
+                       SHTDN_REASON_MAJOR_OTHER | SHTDN_REASON_MINOR_OTHER |
+                           SHTDN_REASON_FLAG_PLANNED)) {
+        DWORD err = GetLastError();
+        outError = "ExitWindowsEx(EWX_POWEROFF) failed (error " + std::to_string(err) + ")";
+        if (err == ERROR_PRIVILEGE_NOT_HELD) {
+            outError += "; SE_SHUTDOWN_NAME is not held by this process";
+        }
+        return false;
+    }
+    return true;
+}
+
 } // namespace pc
 
 #else
@@ -79,6 +101,22 @@ namespace pc {
 bool SuspendSystem(bool hibernate, std::string& outError) {
     outError.clear();
     const char* command = hibernate ? "systemctl hibernate" : "systemctl suspend";
+    int rc = std::system(command);
+    if (rc != 0) {
+        outError = std::string("command failed: ") + command;
+        return false;
+    }
+    return true;
+}
+
+bool HasPowerPrivilege(std::string& outError) {
+    outError.clear();
+    return true;
+}
+
+bool ShutdownSystem(std::string& outError) {
+    outError.clear();
+    const char* command = "systemctl poweroff";
     int rc = std::system(command);
     if (rc != 0) {
         outError = std::string("command failed: ") + command;
