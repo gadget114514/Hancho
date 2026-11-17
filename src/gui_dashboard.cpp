@@ -850,6 +850,7 @@ struct DashboardState {
     std::wstring currentHintPrompt;
     int hintDismissCountdown = 0;
     HWND hwndUsagePanel = nullptr;
+    HWND hwndUsageTip = nullptr;
     bool showUsagePanel = true;
     int usagePanelHeight = 170;
     int usageRangeIndex = 1; // 0: 4h, 1: 24h (default), 2: 7d, 3: 30d, 4: 12m
@@ -14905,6 +14906,22 @@ static void DrawUsagePanel(HWND hwnd, HDC hdc, DashboardState* st) {
     SelectObject(hdc, oldFont);
 }
 
+static void UpdateUsageViewTipText(HWND panel, DashboardState* st) {
+    if (!st || !st->hwndUsageTip) return;
+    TOOLINFOW ti = {};
+    ti.cbSize = sizeof(ti);
+    ti.hwnd = panel;
+    ti.uId = 1;
+    ti.lpszText = const_cast<LPWSTR>(st->usageGraphMode == 0
+        ? Tr(L"provider/model 別の積み上げに切り替えます",
+             L"Switch to usage stacked by provider/model",
+             L"Cambiar a uso apilado por proveedor/modelo")
+        : Tr(L"トークン種別（input / output / thinking / cache）の積み上げに切り替えます",
+             L"Switch to usage stacked by token kind (input / output / thinking / cache)",
+             L"Cambiar a uso apilado por tipo de token (input / output / thinking / cache)"));
+    SendMessageW(st->hwndUsageTip, TTM_UPDATETIPTEXTW, 0, reinterpret_cast<LPARAM>(&ti));
+}
+
 static LRESULT CALLBACK UsagePanelWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
     auto* st = reinterpret_cast<DashboardState*>(GetWindowLongPtrW(hwnd, GWLP_USERDATA));
     switch (msg) {
@@ -14914,6 +14931,23 @@ static LRESULT CALLBACK UsagePanelWndProc(HWND hwnd, UINT msg, WPARAM wParam, LP
             SetWindowLongPtrW(hwnd, GWLP_USERDATA, reinterpret_cast<LONG_PTR>(created));
             SetTimer(hwnd, 1, static_cast<UINT>(created ? created->usageRefreshIntervalMs
                                                          : kDefaultUsageRefreshIntervalMs), nullptr);
+            if (created) {
+                created->hwndUsageTip = CreateWindowExW(WS_EX_TOPMOST, TOOLTIPS_CLASSW, nullptr,
+                    WS_POPUP | TTS_ALWAYSTIP | TTS_NOPREFIX, CW_USEDEFAULT, CW_USEDEFAULT,
+                    CW_USEDEFAULT, CW_USEDEFAULT, hwnd, nullptr, GetModuleHandleW(nullptr), nullptr);
+                if (created->hwndUsageTip) {
+                    TOOLINFOW ti = {};
+                    ti.cbSize = sizeof(ti);
+                    ti.uFlags = TTF_SUBCLASS;
+                    ti.hwnd = hwnd;
+                    ti.uId = 1;
+                    ti.rect = kUsageViewToggleRc;
+                    ti.lpszText = const_cast<LPWSTR>(L"");
+                    SendMessageW(created->hwndUsageTip, TTM_ADDTOOLW, 0, reinterpret_cast<LPARAM>(&ti));
+                    SendMessageW(created->hwndUsageTip, TTM_SETMAXTIPWIDTH, 0, 360);
+                    UpdateUsageViewTipText(hwnd, created);
+                }
+            }
             return 0;
         }
         case WM_TIMER:
@@ -14952,6 +14986,7 @@ static LRESULT CALLBACK UsagePanelWndProc(HWND hwnd, UINT msg, WPARAM wParam, LP
             RECT viewRc = kUsageViewToggleRc;
             if (PtInRect(&viewRc, pt)) {
                 st->usageGraphMode = (st->usageGraphMode == 0) ? 1 : 0;
+                UpdateUsageViewTipText(hwnd, st);
                 InvalidateRect(hwnd, nullptr, FALSE);
                 return 0;
             }
@@ -14988,6 +15023,10 @@ static LRESULT CALLBACK UsagePanelWndProc(HWND hwnd, UINT msg, WPARAM wParam, LP
         }
         case WM_NCDESTROY:
             KillTimer(hwnd, 1);
+            if (st && st->hwndUsageTip) {
+                DestroyWindow(st->hwndUsageTip);
+                st->hwndUsageTip = nullptr;
+            }
             SetWindowLongPtrW(hwnd, GWLP_USERDATA, 0);
             return 0;
     }

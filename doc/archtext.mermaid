@@ -1,0 +1,50 @@
+%% Hancho architecture: process and communication topology
+%% Diagram 1 of doc/archtext.md
+%% Note: Hancho.exe is the entry point and relaunches itself as
+%% HanchoCore.exe, HanchoDashboard.exe or HanchoChat.exe depending on the
+%% role. This diagram omits those role relaunches.
+
+flowchart TB
+  subgraph EXT["External clients"]
+    H["Human<br/>GUI / tray"]
+    L["Supervisor LLM<br/>Claude / opencode / ..."]
+    S["Scripts / agents"]
+    B["Browser<br/>SPA"]
+    T["HanchoTerm.exe<br/>wct.exe"]
+    R["Remote core<br/>(another machine)"]
+    C["Chat peers<br/>(LAN)"]
+  end
+
+  subgraph ENTRY["Entry processes"]
+    D["HanchoDashboard.exe<br/>Direct2D dashboard"]
+    M["Hancho.exe mcp<br/>MCP server"]
+    CLI["hancho-cli.exe<br/>CLI / top TUI"]
+  end
+
+  subgraph CORE["HanchoCore.exe<br/>(1 instance per --data-dir)"]
+    IPC["IpcServer<br/>Named Pipe Hancho_IPC_v1"]
+    WEB["WebUiServer<br/>:9138 HTTP + WebSocket"]
+    TERM["TermServer<br/>:9139 WCSP v1"]
+    REM["RemoteListener<br/>:9137 JSON over WebSocket"]
+    CHAT["IpmsgNode<br/>:2426 IPMsg"]
+    ENG["Engine<br/>ProcessManager | TaskQueueManager<br/>BtManager | Triage | Memory"]
+  end
+
+  H -->|"GUI"| D
+  L -->|"MCP / stdio"| M
+  S -->|"CLI"| CLI
+
+  D -->|"IPC client"| IPC
+  M -->|"IPC client"| IPC
+  CLI -->|"IPC client"| IPC
+
+  B -->|"HTTP + WebSocket :9138"| WEB
+  T -->|"WCSP :9139"| TERM
+  R -->|"JSON / WS :9137"| REM
+  C -->|"IPMsg :2426"| CHAT
+
+  IPC --> ENG
+  WEB --> ENG
+  TERM --> ENG
+  REM --> ENG
+  CHAT --> ENG

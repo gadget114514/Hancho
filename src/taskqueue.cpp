@@ -4981,7 +4981,8 @@ bool TaskQueueManager::EvaluateSuccess(const TaskQueueJob& job, TaskQueueAttempt
     }
     if (job.success.engineResult) {
         std::string engineDetail;
-        if (EngineResultReportedError(logText, engineDetail)) {
+        // The terminal result is at the end; a large stream file does not need re-reading whole.
+        if (EngineResultReportedError(GetTailLines(logText, 1000), engineDetail)) {
             detail = engineDetail;
             return false;
         }

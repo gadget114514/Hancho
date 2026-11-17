@@ -75,6 +75,9 @@ private:
     // Actions the triage advisor may take. Default is read-only; "run_commands",
     // "write_files" or "use_worker_permissions" opt into the engine's worker permission args.
     std::vector<std::string> llmPermissions_{"read_files"};
+    // The batch supervisor must act, so it defaults to the worker permissions. A person can
+    // restrict it to the read-only advice flags when they only want proposals.
+    std::vector<std::string> supervisorPermissions_{"use_worker_permissions"};
     // How many advice engines may run at once. The runs are independent processes, but
     // bounding them keeps a burst of new cards from starting one engine per card.
     int llmConcurrency_ = 2;
