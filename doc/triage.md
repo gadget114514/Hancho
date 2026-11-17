@@ -186,19 +186,31 @@ core は情報を **文ではなく、項目のキーと値** で持つ。表示
 
 エンジンとモデルは `triage_llm_engine`（既定は BT の既定エンジン）と `triage_llm_model` で指定する。設定はすべてデータディレクトリの `config.json` に置き、GUI の Settings → トリアージタブで変更できる。
 
+**権限 `triage_llm_permissions`**（既定 `["read_files"]`）は、助言エンジンに許可する操作のリスト。Settings → トリアージタブの「LLM 助言の権限」チェックボックスで変更できる（`read_files` は常に有効）。
+
+| 値 | 意味 |
+|---|---|
+| `read_files` | 指示ファイルとログの読み取り（既定） |
+| `run_commands` | コマンド実行を許可する（ワーカーの権限引数で起動。危険） |
+| `write_files` | 結果ファイル以外の書き込みを許可する（同上。危険） |
+| `network` | 外部通信（エンジン側の設定に依存） |
+| `use_worker_permissions` | `engines.json` の `permissionArgs` をそのまま使う（危険） |
+
+`run_commands` / `write_files` / `use_worker_permissions` のいずれかを含めない限り、Hancho はエンジン定義の `advicePermissionArgs`（読み取り専用の引数）で助言を起動する。組み込みの値は `agy`: `--mode plan`、`claude`: `--permission-mode plan`、`codex`: `--sandbox read-only`、`opencode`: 空（CLI に読み取り専用スイッチがない）。`engines.json` で上書きできる。
+
 ### 5.3 LLM 相談の実行方法
 
-BT ワーカーと同じ方法で、Hancho のジョブとして実行する（プロセス一覧と使用量に出るので、見えて止められる）。
+BT ワーカーと同じ方法でコマンドを組み立て、タスクキューのジョブにはせず **通常の worker プロセス** として直接起動する（プロセス一覧と使用量に出るので、見えて止められる）。
 
-- キュー `_triage` に、id `triage-<cardId>-<n>`、非表示、試行 1 回、タイムアウト 300 秒のジョブを追加する。
-- 指示ファイル（パケット `hancho.triage-advice/1`）に、カードの情報 7 区分（要約・目的・原因・背景・環境・条件・理由）、候補（id、表示名、効果、安全か）、Hancho の推奨、UI 言語、規則「コマンドを実行しない・ファイルを編集しない・必要なら挙げたログを読むだけ・候補 id を 1 つ選び 2〜4 文で理由を書き、人が気をつけることを書く」を入れる。要約は、何をしようとしていたか・何が起きたか・原因の見立て・判断すべきことを、ファイルを開かなくても分かる自己完結の文章で書かせる。
-- 結果は環境変数 `PC_TRIAGE_RESULT_FILE` のファイルに JSON で書かせる。
+- id は `triage-<cardId>-<n>`、タイムアウト 300 秒。同時に走らせる数は `triage_llm_concurrency`（既定 2、1〜8）で制限する。
+- LLM ワーカーの taskqueue ジョブは、`idle` を指定していなければ `llm_idle_timeout_sec`（既定 600 秒、0 で無効）で無出力・無 CPU のハングを打ち切る。CPU が動いている長時間処理は止めない。
+- 指示ファイル（パケット `hancho.triage-advice/1`）に、カードの情報 7 区分（要約・目的・原因・背景・環境・条件・理由）、候補（id、表示名、効果、安全か）、Hancho の推奨、UI 言語、許可された操作、規則「候補 id を 1 つ選び 2〜4 文で理由を書き、人が気をつけることを書く。ジョブ仕様・モデル・設定・credits・キュー状態は変更しない」を入れる。要約は、何をしようとしていたか・何が起きたか・原因の見立て・判断すべきことを、ファイルを開かなくても分かる自己完結の文章で書かせる。
+- 結果は最終メッセージの JSON を読む（読み取り専用モードではファイルに書けないため）。ファイルを書けるエンジンは環境変数 `PC_TRIAGE_RESULT_FILE` のファイルも使える。
   ```json
   {"summary": "...", "candidateId": "retry_raise_timeout", "confidence": "high|medium|low",
    "rationale": "...", "caution": "...", "infoNeeded": "..."}
   ```
 - `ValidateOutput` でスキーマを検証し、`candidateId` がカードの候補にない答えは捨てる（エラーとして表示）。`summary` はカードの `info.summary` に移し、情報ペインの先頭に表示する。
-- 同時に走らせる相談は 1 つまで。ほかは順番を待つ。
 
 ### 5.4 「解決させる」= バッチの Supervisor
 
@@ -210,7 +222,22 @@ BT ワーカーと同じ方法で、Hancho のジョブとして実行する（�
 - 指示: カードの情報・候補・推奨・LLM 助言と、この core に向けた `hancho-cli --data-dir <dir>` の正確なコマンドを渡す。各カードで候補を 1 つ選び `triage decide` で記録すること、仕様の修正が要るなら最小限直してから再実行の候補を選ぶこと、安全に決められないカードは判断待ちに残すこと、最後に結果ファイル（環境変数 `PC_TRIAGE_RESULT_FILE`）に `{"cards":[{"id","outcome":"decided|left_pending","note"}]}` を書くことを指示する。
 - **処置した印**: 渡したカードは判断待ちのまま、`handoff`（`jobId`、時刻、状態 `queued` → `running` → `done` / `done_undecided` / `failed`、Supervisor のメモ `note`）を持つ。一覧と詳細には「🤖 Supervisor 対応中」「完了・判断なし」などと出し、タスク一覧の「判断」列にも添える。ジョブのメモには `[triage] handed to supervisor job <id>` を残す。判断待ちの KPI からは外さない（判断を記録するまでは判断されていないため）。
 - 対応中のカードは重ねて渡さない。完了・判断なし、失敗のカードはもう一度渡せる。
+- **モデル / provider の変更は人の承認が必要。** Supervisor はモデルを変えず、必要ならカードを判断待ちに残す。`taskqueue update` で `--model` を変えると `approved_by` と `approval_reason` がない限り拒否され、`require_model_change_approval`（既定 true）で制御する。人が承認するときは `hancho-cli taskqueue update --id <id> --patch <json> --approve-model-change --reason "..."` を使う。変更はジョブの notes に `[model] old -> new approved by ...` として残る。
 - `_supervisor` のジョブ自体が失敗・タイムアウトしたら、それも普通の失敗としてトリアージのカードになる。
+
+### 5.5 判断の記録（人 / LLM）
+
+すべての判断は、誰の判断だったかをカードの `decision` に記録する。
+
+| フィールド | 意味 |
+|---|---|
+| `by` | `human` / `supervisor` / `hancho-auto` / `llm-auto` |
+| `actor` | `human` / `llm` / `hancho`（`by` を 3 分類したもの） |
+| `actorDetail` | 元の `by` |
+| `adviceCandidateId` / `adviceConfidence` | 判断時点の LLM 助言（あれば） |
+| `adviceFollowed` | 選んだ候補が LLM 助言と一致したか |
+
+`hancho-cli triage show` は `Judgment: human|llm|hancho` と「助言どおり / 助言とは別の判断」を表示する。GUI の判断ペインにも `[human]` / `[llm]` と助言への追従を表示する。バッチ Supervisor の判断は `actor: llm`、人が `fix_spec` で渡した場合は `handoff.requestedBy: human` として残る。
 
 ## 6. 自動処置の歯止め
 

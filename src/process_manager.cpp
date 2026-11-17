@@ -1708,9 +1708,15 @@ AgentExtractedResult ExtractAgentResult(ProcessManager& pm, int id, bool finishe
             out.source = it->type;
             out.isError = it->type == "error";
             // Claude's result line can carry a short "summary" as content; the report is in "result".
+            // agy wraps the final text in result.response instead of a plain string.
             auto raw = nlohmann::json::parse(it->rawJson, nullptr, false);
-            if (it->type != "message" && raw.is_object() && raw.contains("result") && raw["result"].is_string()) {
-                out.result = raw["result"].get<std::string>();
+            if (it->type != "message" && raw.is_object() && raw.contains("result")) {
+                const auto& result = raw["result"];
+                if (result.is_string()) {
+                    out.result = result.get<std::string>();
+                } else if (result.is_object() && result.contains("response") && result["response"].is_string()) {
+                    out.result = result["response"].get<std::string>();
+                }
             }
             break;
         }

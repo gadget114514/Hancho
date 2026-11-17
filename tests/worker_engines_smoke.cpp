@@ -79,6 +79,26 @@ int main() {
               "codex command with model: " + cmd);
     }
 
+    // 2b. Read-only advice permissions replace the worker permission flags
+    {
+        WorkerEngineRegistry reg;
+        std::string cmd, stream, err;
+        const WorkerEngineDef* agy = reg.Find("agy");
+        Check(agy && agy->advicePermissionArgs == "--mode plan", "agy has read-only advice args");
+        if (agy) {
+            Check(reg.BuildCommand("agy", "", "Read task.md", 1800, cmd, stream, err, nullptr,
+                                   &agy->advicePermissionArgs),
+                  "build agy advice command");
+            Check(cmd == "agy.exe -p \"Read task.md\" --output-format stream-json --model gemini-3.8-flash-medium --mode plan --print-timeout 30m",
+                  "agy advice command uses --mode plan: " + cmd);
+        }
+        std::string overrideArgs = "";
+        Check(reg.BuildCommand("claude", "", "Read task.md", 300, cmd, stream, err, nullptr, &overrideArgs),
+              "build claude with an empty advice override");
+        Check(cmd == "claude -p \"Read task.md\" --output-format stream-json --verbose",
+              "empty advice override drops --dangerously-skip-permissions: " + cmd);
+    }
+
     // 3. Prompt quoting with spaces, quotes, backslashes, and '&'
     {
         WorkerEngineRegistry reg;

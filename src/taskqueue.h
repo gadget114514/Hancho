@@ -77,6 +77,16 @@ struct TaskQueueSuccess {
     // JUnit or NUnit XML written by the job (relative to cwd). It must be newer than the
     // attempt start, contain at least one test case, and have no failed ones.
     std::string testReport;
+    // Optional content check on one produced file (usually a report). The file must exist and
+    // be newer than the attempt start, be at least minBytes bytes, and match contentRegex.
+    // A worker that only wrote headings and stopped therefore fails even though the mtime moved.
+    std::string contentFile;
+    long long minBytes = 0;
+    std::string contentRegex;
+    // When true, the LLM engine's own terminal result must be a success. An engine that
+    // reports an error (e.g. an auth/API failure in its JSON stream) fails the job even if
+    // the process still exited 0.
+    bool engineResult = false;
 };
 
 // Result of reading a test report (JUnit <testcase>, NUnit 2/3 <test-case>).

@@ -33,6 +33,9 @@ struct WorkerEngineDef {
     std::string defaultModel;
     std::string stream;
     std::string permissionArgs;
+    // Permission flags used when the engine runs as the read-only triage advisor. Empty means
+    // no bypass flags at all. Never use the worker permissionArgs here.
+    std::string advicePermissionArgs;
     std::vector<std::string> models; // optional allowlist; empty accepts any valid model name
     std::string adapter;             // Tier 1/3 adapter name (doc/design-v3.md 1.5)
     WorkerEngineCapabilities capabilities;
@@ -57,7 +60,8 @@ public:
     bool Knows(const std::string& engine, const std::string& model, std::string& err) const override;
 
     // Fills {prompt} (quoted as one argument), {model} (dropping "--model {model}" when no model
-    // resolves), {permissionArgs}, and {timeoutMin}.
+    // resolves), {permissionArgs}, and {timeoutMin}. permissionArgsOverride replaces the engine's
+    // worker permissionArgs (used to run the triage advisor read-only); nullptr keeps the engine's.
     bool BuildCommand(const std::string& engine,
                       const std::string& model,
                       const std::string& launchPrompt,
@@ -65,7 +69,8 @@ public:
                       std::string& outCommand,
                       std::string& outStreamType,
                       std::string& err,
-                      std::string* outAdapter = nullptr) const;
+                      std::string* outAdapter = nullptr,
+                      const std::string* permissionArgsOverride = nullptr) const;
 
 private:
     std::string defaultEngine_;

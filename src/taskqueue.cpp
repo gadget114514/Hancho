@@ -29,6 +29,9 @@ namespace pc {
 static std::wstring GetTaskQueueLogDirWide();
 static std::wstring GetAttemptLogPathWide(const std::string& jobId, int n);
 static std::wstring GetAttemptDonePathWide(const std::string& jobId, int n);
+// Defined with the launch helpers; TaskQueueUpdate gates model changes before them.
+static std::string ExtractCommandModel(const std::string& command);
+static bool ModelChangeRequiresApproval();
 static void AppendRunRecordForAttempt(const TaskQueue& tq, const TaskQueueJob& job,
                                       const TaskQueueAttempt& attempt,
                                       const TaskQueueFailureInput& fin,
@@ -316,6 +319,10 @@ static std::string NormalizeJobJsonKeys(const std::string& in) {
         {"filesNewer", "files_newer"},
         {"outputRegex", "output_regex"},
         {"testReport", "test_report"},
+        {"contentFile", "content_file"},
+        {"minBytes", "min_bytes"},
+        {"contentRegex", "content_regex"},
+        {"engineResult", "engine_result"},
         {"budgetChars", "budget_chars"},
         {"includeAgentNotes", "include_agent_notes"},
         {"waitForRateLimit", "wait_for_rate_limit"},
@@ -830,6 +837,10 @@ static std::string SuccessConditionOf(const std::string& detail) {
     }
     if (detail.find("output_regex") != std::string::npos) return "outputRegex";
     if (detail.rfind("test report", 0) == 0) return "testReport";
+    if (detail.rfind("content file", 0) == 0 || detail.rfind("content_regex", 0) == 0) {
+        return "content";
+    }
+    if (detail.rfind("engine result", 0) == 0) return "engineResult";
     if (detail.rfind("exit code ", 0) == 0) return "exitCode";
     return "";
 }
@@ -1585,6 +1596,10 @@ static std::string SuccessToJson(const TaskQueueSuccess& s) {
     if (s.outputRegex.empty()) oss << "null";
     else oss << "\"" << JsonEscape(s.outputRegex) << "\"";
     if (!s.testReport.empty()) oss << ",\"test_report\":\"" << JsonEscape(s.testReport) << "\"";
+    if (!s.contentFile.empty()) oss << ",\"content_file\":\"" << JsonEscape(s.contentFile) << "\"";
+    if (s.minBytes > 0) oss << ",\"min_bytes\":" << s.minBytes;
+    if (!s.contentRegex.empty()) oss << ",\"content_regex\":\"" << JsonEscape(s.contentRegex) << "\"";
+    if (s.engineResult) oss << ",\"engine_result\":true";
     oss << "}";
     return oss.str();
 }
@@ -1858,6 +1873,10 @@ static TaskQueueJob ParseJob(const std::string& j) {
     job.success.filesNewer = JsonFieldStrArray(successObj, "files_newer");
     job.success.outputRegex = JsonFieldStr(successObj, "output_regex", "");
     job.success.testReport = JsonFieldStr(successObj, "test_report", "");
+    job.success.contentFile = JsonFieldStr(successObj, "content_file", "");
+    job.success.minBytes = JsonFieldInt(successObj, "min_bytes", 0);
+    job.success.contentRegex = JsonFieldStr(successObj, "content_regex", "");
+    job.success.engineResult = JsonFieldBool(successObj, "engine_result", false);
     std::string deferErr;
     if (!ParseDeferChecked(j, job.success.exitCode, job.defer, deferErr)) job.defer = TaskQueueDefer();
     job.killExclude = JsonFieldStrArray(j, "kill_exclude");
@@ -3550,6 +3569,10 @@ static bool ParseNewJob(const std::string& rawJson, const std::string& taskqueue
     job.success.filesNewer = JsonFieldStrArray(successObj, "files_newer");
     job.success.outputRegex = JsonFieldStr(successObj, "output_regex", "");
     job.success.testReport = JsonFieldStr(successObj, "test_report", "");
+    job.success.contentFile = JsonFieldStr(successObj, "content_file", "");
+    job.success.minBytes = JsonFieldInt(successObj, "min_bytes", 0);
+    job.success.contentRegex = JsonFieldStr(successObj, "content_regex", "");
+    job.success.engineResult = JsonFieldBool(successObj, "engine_result", false);
     job.killExclude = JsonFieldStrArray(j, "kill_exclude");
     std::string resErr;
     if (!ParseResourcesChecked(j, job.resources, resErr)) {
@@ -4061,6 +4084,9 @@ std::string TaskQueueManager::TaskQueueRetryFailed(const std::string& taskqueue,
 
 namespace pc {
 
+static std::string ExtractCommandModel(const std::string& command);
+static bool ModelChangeRequiresApproval();
+
 std::string TaskQueueManager::TaskQueueUpdate(const std::string& id, const std::string& rawPatchJson, std::string& outError) {
     return TaskQueueUpdate(id, rawPatchJson, TaskQueueCaller::Gui, outError);
 }
@@ -4114,6 +4140,23 @@ std::string TaskQueueManager::TaskQueueUpdate(const std::string& id, const std::
         if (!CheckChainGuard(c, chainErr)) {
             outError = chainErr;
             return BuildError(outError);
+        }
+        const std::string oldModel = ExtractCommandModel(job->command);
+        const std::string newModel = ExtractCommandModel(c);
+        if (oldModel != newModel && ModelChangeRequiresApproval()) {
+            std::string approvedBy = JsonFieldStr(patchJson, "approved_by", "");
+            if (approvedBy.empty()) approvedBy = JsonFieldStr(patchJson, "approvedBy", "");
+            std::string approvalReason = JsonFieldStr(patchJson, "approval_reason", "");
+            if (approvalReason.empty()) approvalReason = JsonFieldStr(patchJson, "approvalReason", "");
+            if (approvedBy.empty() || approvalReason.empty()) {
+                outError = "changing the model requires human approval: add approved_by and approval_reason "
+                           "(hancho-cli taskqueue update --approve-model-change --reason \"...\")";
+                return BuildError(outError);
+            }
+            const std::string line = "[model] " + (oldModel.empty() ? std::string("(none)") : oldModel) +
+                                     " -> " + (newModel.empty() ? std::string("(none)") : newModel) +
+                                     " approved by " + approvedBy + ": " + approvalReason;
+            job->notes = job->notes.empty() ? line : job->notes + "\n" + line;
         }
         job->command = c;
     }
@@ -4183,6 +4226,10 @@ std::string TaskQueueManager::TaskQueueUpdate(const std::string& id, const std::
         job->success.filesNewer = JsonFieldStrArray(successObj, "files_newer");
         job->success.outputRegex = JsonFieldStr(successObj, "output_regex", "");
         job->success.testReport = JsonFieldStr(successObj, "test_report", "");
+        job->success.contentFile = JsonFieldStr(successObj, "content_file", "");
+        job->success.minBytes = JsonFieldInt(successObj, "min_bytes", 0);
+        job->success.contentRegex = JsonFieldStr(successObj, "content_regex", "");
+        job->success.engineResult = JsonFieldBool(successObj, "engine_result", false);
     }
     if (HasJsonKey(patchJson, "defer")) {
         TaskQueueDefer d;
@@ -4726,6 +4773,95 @@ void SetRemoteFilesCheckCallback(RemoteFilesCheckCallback cb) {
     g_remoteFilesCheckCb = std::move(cb);
 }
 
+// True when the job log's last LLM result line reports an error. Handles the
+// claude/opencode {"type":"result",...} line, the agy {"event":"result",...} line and codex
+// turn.failed. Only the final terminal line counts, so an error the engine recovered from is
+// ignored. The engine can exit 0 after such a line, so this is checked separately.
+static bool EngineResultReportedError(const std::string& text, std::string& detail) {
+    bool sawTerminal = false;
+    bool failed = false;
+    std::string reason;
+    size_t pos = 0;
+    while (pos <= text.size()) {
+        size_t nl = text.find('\n', pos);
+        std::string line = text.substr(pos, nl == std::string::npos ? std::string::npos : nl - pos);
+        pos = (nl == std::string::npos) ? text.size() + 1 : nl + 1;
+        size_t first = line.find_first_not_of(" \t\r");
+        if (first == std::string::npos || line[first] != '{') continue;
+        auto j = nlohmann::json::parse(line.substr(first), nullptr, false);
+        if (!j.is_object()) continue;
+
+        const std::string type = j.value("type", std::string());
+        const std::string event = j.value("event", std::string());
+        bool terminal = false;
+        bool err = false;
+        std::string lineReason;
+        if (type == "result") {
+            terminal = true;
+            if (j.contains("is_error") && j["is_error"].is_boolean()) err = j["is_error"].get<bool>();
+            if (j.contains("subtype") && j["subtype"].is_string()) {
+                const std::string sub = j["subtype"].get<std::string>();
+                if (sub != "success" && sub != "completed") err = true;
+                lineReason = sub;
+            }
+            if (j.contains("api_error_status") && !j["api_error_status"].is_null()) err = true;
+            if (j.contains("error") && j["error"].is_string()) {
+                err = true;
+                const std::string e = j["error"].get<std::string>();
+                if (!e.empty()) lineReason = e;
+            }
+            if (err && j.contains("result") && j["result"].is_string()) {
+                const std::string r = j["result"].get<std::string>();
+                if (!r.empty()) lineReason = r;
+            }
+        } else if (event == "result") {
+            terminal = true;
+            if (j.contains("result") && j["result"].is_object()) {
+                const auto& r = j["result"];
+                if (r.contains("status") && r["status"].is_string()) {
+                    const std::string st = r["status"].get<std::string>();
+                    const std::string lst = LowerAscii(st);
+                    err = lst != "success" && lst != "completed" && lst != "ok";
+                    lineReason = st;
+                }
+                if (err && r.contains("response") && r["response"].is_string()) {
+                    const std::string resp = r["response"].get<std::string>();
+                    if (!resp.empty()) lineReason = resp;
+                }
+            }
+        } else if (type == "turn.completed") {
+            terminal = true;
+        } else if (type == "turn.failed") {
+            terminal = true;
+            err = true;
+            lineReason = "turn failed";
+            if (j.contains("error") && j["error"].is_object() && j["error"].contains("message") &&
+                j["error"]["message"].is_string()) {
+                lineReason = j["error"]["message"].get<std::string>();
+            }
+        } else if (type == "error") {
+            terminal = true;
+            err = true;
+            for (const char* k : {"message", "content", "error"}) {
+                if (j.contains(k) && j[k].is_string()) {
+                    lineReason = j[k].get<std::string>();
+                    break;
+                }
+            }
+        }
+        if (!terminal) continue;
+        sawTerminal = true;
+        failed = err;
+        reason = err ? lineReason : std::string();
+    }
+    if (sawTerminal && failed) {
+        detail = "engine result reported an error";
+        if (!reason.empty()) detail += ": " + reason;
+        return true;
+    }
+    return false;
+}
+
 bool TaskQueueManager::EvaluateSuccess(const TaskQueueJob& job, TaskQueueAttempt& attempt,
                                        const std::string& endKind, int exitCode,
                                        const std::string& logFile, std::string& detail) {
@@ -4786,10 +4922,52 @@ bool TaskQueueManager::EvaluateSuccess(const TaskQueueJob& job, TaskQueueAttempt
             }
         }
     }
+    // A report can be touched early (just the headings) and then the worker dies. The content
+    // check makes the file have to carry what the job promised, not only a new mtime.
+    if (!job.success.contentFile.empty()) {
+        if (!job.host.empty()) {
+            detail = "content check is not available for remote jobs: " + job.success.contentFile;
+            return false;
+        }
+        const std::string& rel = job.success.contentFile;
+        std::wstring pathW = ResolveJobPathWide(job, rel);
+        if (!PathExistsWide(pathW)) {
+            detail = "content file missing: " + rel;
+            return false;
+        }
+        uint64_t fileTime = 0;
+        if (!GetFileMtimeWide(pathW, fileTime)) {
+            detail = "cannot read mtime: " + rel;
+            return false;
+        }
+        if (attempt.startFiletime > 0 && fileTime <= attempt.startFiletime) {
+            detail = "content file not newer than attempt start: " + rel;
+            return false;
+        }
+        const std::string content = ReadFileUtf8Wide(pathW);
+        if (job.success.minBytes > 0 && static_cast<long long>(content.size()) < job.success.minBytes) {
+            detail = "content file too small: " + rel + " (" + std::to_string(content.size()) + " < " +
+                     std::to_string(job.success.minBytes) + " bytes)";
+            return false;
+        }
+        if (!job.success.contentRegex.empty()) {
+            std::regex re;
+            if (!PrepareRegex(job.success.contentRegex, false, re)) {
+                detail = "invalid content_regex";
+                return false;
+            }
+            if (!std::regex_search(content, re)) {
+                detail = "content_regex did not match: " + rel;
+                return false;
+            }
+        }
+    }
+    std::string logText;
+    if (!job.success.outputRegex.empty() || job.success.engineResult) {
+        if (!logFile.empty()) logText = ReadFileUtf8Wide(Utf8ToWide(logFile));
+    }
     if (!job.success.outputRegex.empty()) {
-        std::string text;
-        if (!logFile.empty()) text = ReadFileUtf8Wide(Utf8ToWide(logFile));
-        text = GetTailLines(text, 200);
+        const std::string text = GetTailLines(logText, 200);
         try {
             std::regex re(job.success.outputRegex);
             if (!std::regex_search(text, re)) {
@@ -4798,6 +4976,13 @@ bool TaskQueueManager::EvaluateSuccess(const TaskQueueJob& job, TaskQueueAttempt
             }
         } catch (const std::regex_error&) {
             detail = "invalid output_regex";
+            return false;
+        }
+    }
+    if (job.success.engineResult) {
+        std::string engineDetail;
+        if (EngineResultReportedError(logText, engineDetail)) {
+            detail = engineDetail;
             return false;
         }
     }
@@ -5012,6 +5197,61 @@ static std::string QuoteCommandArgLocal(const std::string& s) {
     return platform::QuoteCommandArg(s);
 }
 
+// The model argument of a worker command ("--model X", "--model=X", "-m X").
+static std::string ExtractCommandModel(const std::string& command) {
+    std::vector<std::string> tokens;
+    std::string current;
+    bool quoted = false;
+    for (size_t i = 0; i < command.size(); ++i) {
+        const char c = command[i];
+        if (c == '"') {
+            quoted = !quoted;
+            continue;
+        }
+        if (!quoted && (c == ' ' || c == '\t')) {
+            if (!current.empty()) { tokens.push_back(current); current.clear(); }
+            continue;
+        }
+        current.push_back(c);
+    }
+    if (!current.empty()) tokens.push_back(current);
+    for (size_t i = 0; i < tokens.size(); ++i) {
+        const std::string& t = tokens[i];
+        if ((t == "--model" || t == "-m") && i + 1 < tokens.size()) return tokens[i + 1];
+        if (t.rfind("--model=", 0) == 0) return t.substr(8);
+        if (t.rfind("-m=", 0) == 0) return t.substr(3);
+    }
+    return "";
+}
+
+// Model changes are expensive and were the 2026-11-17 incident; require an explicit approval.
+// require_model_change_approval in config.json (default true) can disable the gate.
+static bool ModelChangeRequiresApproval() {
+    std::string content = ReadFileUtf8Wide(PathJoinWide(GetEffectiveDataDirectoryWide(), L"config.json"));
+    if (!content.empty()) {
+        nlohmann::json cfg = nlohmann::json::parse(content, nullptr, false);
+        if (cfg.is_object() && cfg.contains("require_model_change_approval") &&
+            cfg["require_model_change_approval"].is_boolean()) {
+            return cfg["require_model_change_approval"].get<bool>();
+        }
+    }
+    return true;
+}
+
+// Default idle/hang timeout for LLM workers when the job does not set one.
+// llm_idle_timeout_sec in config.json overrides it; 0 disables the default.
+static int LlmJobIdleTimeoutSec() {
+    std::string content = ReadFileUtf8Wide(PathJoinWide(GetEffectiveDataDirectoryWide(), L"config.json"));
+    if (!content.empty()) {
+        nlohmann::json cfg = nlohmann::json::parse(content, nullptr, false);
+        if (cfg.is_object() && cfg.contains("llm_idle_timeout_sec") && cfg["llm_idle_timeout_sec"].is_number()) {
+            const int v = cfg["llm_idle_timeout_sec"].get<int>();
+            if (v >= 0) return v;
+        }
+    }
+    return 600;
+}
+
 bool TaskQueueManager::BuildLaunchRequest(TaskQueue& tq, TaskQueueJob& job, int attemptN, LaunchItem& out) {
     out.taskqueue = tq.name;
     out.jobId = job.id;
@@ -5124,6 +5364,13 @@ bool TaskQueueManager::BuildLaunchRequest(TaskQueue& tq, TaskQueueJob& job, int 
         req.env["PC_PREV_REASON"] = prev.reason;
         req.env["PC_PREV_EXIT"] = std::to_string(prev.exitCode);
         if (job.host.empty() && !prev.lastLinesFile.empty()) req.env["PC_PREV_TAIL"] = prev.lastLinesFile;
+    }
+
+    // LLM workers can hang on a silent tool call for hours (the 2026-11-17 incident:
+    // 04-navigation ran 8.5 h after "Calling grep"). Default to a 10-minute idle/hang
+    // timeout unless the job sets one explicitly. CPU activity keeps a busy job alive.
+    if (req.idleTimeoutSec == 0 && !req.agentType.empty()) {
+        req.idleTimeoutSec = LlmJobIdleTimeoutSec();
     }
 
     out.req = std::move(req);
@@ -5558,6 +5805,11 @@ static std::vector<AutoNoteRun> LoadRunsForJob(const std::string& jobName) {
                 } else if (r.failureSummary.find("test report") != std::string::npos ||
                            r.failureSummary.find("testReport") != std::string::npos) {
                     r.condition = "testReport";
+                } else if (r.failureSummary.find("content file") != std::string::npos ||
+                           r.failureSummary.find("content_regex") != std::string::npos) {
+                    r.condition = "content";
+                } else if (r.failureSummary.find("engine result") != std::string::npos) {
+                    r.condition = "engineResult";
                 } else if (r.failureSummary.find("exit code") != std::string::npos ||
                            r.failureSummary.find("exitCode") != std::string::npos) {
                     r.condition = "exitCode";

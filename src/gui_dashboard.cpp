@@ -693,6 +693,7 @@ enum ControlId {
     IDC_SET_TRIAGE_MODE = 6064,
     IDC_SET_TRIAGE_LLM_MODE = 6065,
     IDC_SET_TRIAGE_KIND_BASE = 6066, // 6066..6070
+    IDC_SET_TRIAGE_LLM_PERMISSIONS = 6085, // 6085..6089: read_files, run_commands, write_files, network, use_worker_permissions
     IDC_SET_TERM_LOCAL = 6071,
     IDC_SET_TERM_REMOTE = 6072,
     IDC_SET_TERM_TOKEN = 6076,
@@ -836,6 +837,7 @@ struct DashboardState {
     std::unordered_map<std::string, nlohmann::json> triageJobs;
     std::string triageMode = "semi";
     std::string triageLlmMode = "uncertain";
+    std::string triageLlmPermissions = "read_files";
     std::string currentTriageCardId;
     int chatUnread = 0;      // unread Chat messages (badge on the Chat toolbar button)
     uint64_t lastChatPollTickMs = 0;
@@ -4977,6 +4979,7 @@ static bool ProcSnapshotMatchesSearch(const ProcessSnapshot& s, const std::wstri
 
 static std::wstring TriageHandoffLabel(const std::string& handoffState);
 static std::wstring TriageLifecycleLabel(const std::string& lifecycle);
+static std::wstring TriageCardStatusLabel(const nlohmann::json& card);
 
 static std::wstring FormatCompactTokens(uint64_t v);  // defined with the usage panel
 
@@ -5359,16 +5362,10 @@ static void RefreshTaskQueueData(DashboardState* st, bool force = false, bool us
             const std::string lifecycle = triage.value("lifecycle", std::string());
             const std::string cardId = triage.value("cardId", std::string());
             if (!cardId.empty()) row.id = jobId;
-            if (!lifecycle.empty()) {
-                triageStr = TriageLifecycleLabel(lifecycle);
-            } else if (triageState == "pending") {
-                triageStr = Tr(L"判断待ち", L"Awaiting decision", L"Pendiente de decisión");
-                const std::wstring mark = TriageHandoffLabel(triage.value("handoff", std::string()));
-                if (!mark.empty()) triageStr += L" " + mark;
-            } else if (triageState == "acted") {
+            const nlohmann::json& cards = st->triageResponse.value("cards", nlohmann::json::array());
+            auto candidateLabel = [&]() -> std::wstring {
                 const std::string candidateId = triage.value("candidateId", std::string());
                 std::wstring label = Utf8ToWide(candidateId);
-                const nlohmann::json& cards = st->triageResponse.value("cards", nlohmann::json::array());
                 if (cards.is_array()) {
                     for (const auto& card : cards) {
                         if (card.value("id", std::string()) != cardId || !card.contains("candidates") ||
@@ -5382,24 +5379,46 @@ static void RefreshTaskQueueData(DashboardState* st, bool force = false, bool us
                         break;
                     }
                 }
-                triageStr = label;
+                return label;
+            };
+            auto autoMark = [&]() -> std::wstring {
                 const std::string by = triage.value("by", std::string());
-                if (by == "hancho-auto" || by == "llm-auto") {
-                    triageStr += Tr(L" (自動)", L" (auto)", L" (auto)");
-                    const bool reviewed = cards.empty() ? false : [&]() {
-                        for (const auto& card : cards) {
-                            if (card.value("id", std::string()) != cardId || !card.contains("decision") ||
-                                !card["decision"].is_object()) continue;
-                            return card["decision"].value("reviewed", false);
-                        }
-                        return false;
-                    }();
-                    if (!reviewed) triageStr += Tr(L" 未確認", L" unreviewed", L" sin revisar");
+                if (by != "hancho-auto" && by != "llm-auto") return std::wstring();
+                std::wstring mark = Tr(L" (自動)", L" (auto)", L" (auto)");
+                bool reviewed = false;
+                if (cards.is_array()) {
+                    for (const auto& card : cards) {
+                        if (card.value("id", std::string()) != cardId || !card.contains("decision") ||
+                            !card["decision"].is_object()) continue;
+                        reviewed = card["decision"].value("reviewed", false);
+                        break;
+                    }
                 }
-            } else if (triageState == "ignored") {
+                if (!reviewed) mark += Tr(L" 未確認", L" unreviewed", L" sin revisar");
+                return mark;
+            };
+            // The state alone hid the result: a retried job that succeeded already looked "failed"
+            // (or "pending") while it was actually handled. Show the pair of state and decision.
+            if (triageState == "ignored") {
                 triageStr = Tr(L"無視: ", L"Ignored: ", L"Ignorado: ") + Utf8ToWide(triage.value("reason", std::string()));
             } else if (triageState == "resolved") {
-                triageStr = Tr(L"自然解消", L"Naturally resolved", L"Resuelto naturalmente");
+                triageStr = state == "succeeded" ? Tr(L"処置済", L"Handled", L"Tratado")
+                                                 : Tr(L"自然解消", L"Naturally resolved", L"Resuelto naturalmente");
+            } else if (state == "succeeded") {
+                triageStr = Tr(L"処置済", L"Handled", L"Tratado") + autoMark();
+            } else if (triageState == "pending") {
+                triageStr = Tr(L"判断待ち", L"Awaiting decision", L"Pendiente de decisión");
+                const std::wstring mark = TriageHandoffLabel(triage.value("handoff", std::string()));
+                if (!mark.empty()) triageStr += L" " + mark;
+            } else if (triageState == "acted") {
+                if (state == "running" || state == "pending" || state == "waiting" || state == "blocked" ||
+                    state == "planned") {
+                    triageStr = Tr(L"再実行中", L"Rerunning", L"Reintentando");
+                } else {
+                    triageStr = Tr(L"処置済: ", L"Handled: ", L"Tratado: ") + candidateLabel() + autoMark();
+                }
+            } else if (!lifecycle.empty()) {
+                triageStr = TriageLifecycleLabel(lifecycle);
             }
         }
 
@@ -8843,6 +8862,11 @@ static void ReloadMonitorPane(HWND hwnd, LlmStreamDlgState* ds) {
                 if (re != succ->end() && re->is_string()) ss << Tr(L" + 出力に /", L" + output /", L" + salida /") << Utf8ToWide(re->get<std::string>()) << L"/";
                 auto tr = succ->find("test_report");
                 if (tr != succ->end() && tr->is_string()) ss << Tr(L" + テスト結果: ", L" + test report: ", L" + informe de pruebas: ") << Utf8ToWide(tr->get<std::string>());
+                auto cf = succ->find("content_file");
+                if (cf != succ->end() && cf->is_string()) ss << Tr(L" + 内容: ", L" + content: ", L" + contenido: ") << Utf8ToWide(cf->get<std::string>());
+                auto er = succ->find("engine_result");
+                if (er != succ->end() && er->is_boolean() && er->get<bool>()) ss << Tr(L" + エンジン結果", L" + engine result", L" + resultado del motor");
+                if (succ->value("min_bytes", 0LL) > 0) ss << L" (min " << succ->value("min_bytes", 0LL) << L"B)";
                 ds->goalJobSuccess = ss.str();
             }
             auto attempts = job.find("attempts");
@@ -10344,6 +10368,19 @@ static void LoadShellConfig(DashboardState* st) {
     st->triageLlmMode = JsonGetString(content, "triage_llm_mode", "uncertain");
     if (st->triageLlmMode != "uncertain" && st->triageLlmMode != "manual" && st->triageLlmMode != "always")
         st->triageLlmMode = "uncertain";
+    st->triageLlmPermissions = "read_files";
+    {
+        nlohmann::json cfg = nlohmann::json::parse(content, nullptr, false);
+        if (cfg.is_object() && cfg.contains("triage_llm_permissions") && cfg["triage_llm_permissions"].is_array()) {
+            std::string joined;
+            for (const auto& item : cfg["triage_llm_permissions"]) {
+                if (!item.is_string()) continue;
+                if (!joined.empty()) joined += ",";
+                joined += item.get<std::string>();
+            }
+            st->triageLlmPermissions = joined.empty() ? "read_files" : joined;
+        }
+    }
     {
         nlohmann::json cfg = nlohmann::json::parse(content, nullptr, false);
         if (cfg.is_object() && cfg.contains("triage_hidden_cards") && cfg["triage_hidden_cards"].is_array()) {
@@ -10361,6 +10398,32 @@ static void LoadShellConfig(DashboardState* st) {
         }
     }
     ApplyTheme();
+}
+
+// Comma-separated list of triage advisor permissions; unknown values are dropped and an
+// empty list falls back to read-only.
+static std::vector<std::string> ParseTriageLlmPermissions(const std::string& text) {
+    static const char* kKnown[] = {"read_files", "run_commands", "write_files", "network",
+                                   "use_worker_permissions"};
+    std::vector<std::string> out;
+    size_t start = 0;
+    while (start <= text.size()) {
+        const size_t comma = text.find(',', start);
+        std::string item = text.substr(start, comma == std::string::npos ? std::string::npos : comma - start);
+        const size_t first = item.find_first_not_of(" \t\r\n");
+        const size_t last = item.find_last_not_of(" \t\r\n");
+        item = first == std::string::npos ? "" : item.substr(first, last - first + 1);
+        for (const char* known : kKnown) {
+            if (item == known) {
+                if (std::find(out.begin(), out.end(), item) == out.end()) out.push_back(item);
+                break;
+            }
+        }
+        if (comma == std::string::npos) break;
+        start = comma + 1;
+    }
+    if (out.empty()) out.push_back("read_files");
+    return out;
 }
 
 static void SaveShellConfig(const DashboardState* st) {
@@ -10411,6 +10474,15 @@ static void SaveShellConfig(const DashboardState* st) {
        << "  \"hint_auto_dismiss_sec\": " << st->hintAutoDismissSec << ",\n"
        << "  \"triage_mode\": \"" << JsonEscape(st->triageMode) << "\",\n"
        << "  \"triage_llm_mode\": \"" << JsonEscape(st->triageLlmMode) << "\",\n"
+       << "  \"triage_llm_permissions\": [";
+    {
+        size_t n = 0;
+        for (const auto& permission : ParseTriageLlmPermissions(st->triageLlmPermissions)) {
+            if (n++) ss << ", ";
+            ss << "\"" << JsonEscape(permission) << "\"";
+        }
+    }
+    ss << "],\n"
        << "  \"triage_hidden_cards\": [";
     {
         size_t n = 0;
@@ -11251,9 +11323,11 @@ struct SettingsDlgState {
        HWND cmbTriageMode = nullptr;
        HWND lblTriageLlmMode = nullptr;
         HWND cmbTriageLlmMode = nullptr;
-        HWND lblTriageKinds = nullptr;
-        HWND chkTriageKinds[5] = {};
-        nlohmann::json triageKinds = nlohmann::json::object();
+         HWND lblTriageKinds = nullptr;
+         HWND chkTriageKinds[5] = {};
+         HWND lblTriageLlmPermissions = nullptr;
+         HWND chkTriageLlmPermissions[5] = {};
+         nlohmann::json triageKinds = nlohmann::json::object();
       HWND lblTermTitle = nullptr;
       HWND chkTermLocal = nullptr;
       HWND chkTermRemote = nullptr;
@@ -11399,9 +11473,13 @@ static void CommitEndBlinkSettings(SettingsDlgState* ds, bool persist = true) {
 // them in config.json, so this is only the live IPC patch.
 static void SendSupervisorSettings(SettingsDlgState* ds) {
     if (!ds || !ds->dash) return;
+    nlohmann::json permissions = nlohmann::json::array();
+    for (const auto& permission : ParseTriageLlmPermissions(ds->dash->triageLlmPermissions))
+        permissions.push_back(permission);
     nlohmann::json req = {{"action", "config_set"},
                           {"patch", {{"triage_mode", ds->dash->triageMode},
                                      {"triage_llm_mode", ds->dash->triageLlmMode},
+                                     {"triage_llm_permissions", permissions},
                                      {"triage_supervisor_engine", ds->dash->supervisorCommand},
                                      {"triage_kinds", ds->triageKinds}}}};
     nlohmann::json resp;
@@ -11445,6 +11523,19 @@ static void CommitSupervisorSettings(SettingsDlgState* ds, bool persist = true) 
             static const char* values[] = {"uncertain", "manual", "always"};
             ds->dash->triageLlmMode = values[sel];
         }
+    }
+    {
+        const char* permissionKeys[] = {"read_files", "run_commands", "write_files", "network",
+                                        "use_worker_permissions"};
+        std::string permissions;
+        for (int i = 0; i < 5; ++i) {
+            if (!ds->chkTriageLlmPermissions[i]) continue;
+            if (SendMessageW(ds->chkTriageLlmPermissions[i], BM_GETCHECK, 0, 0) != BST_CHECKED) continue;
+            if (!permissions.empty()) permissions += ",";
+            permissions += permissionKeys[i];
+        }
+        if (permissions.empty()) permissions = "read_files";
+        ds->dash->triageLlmPermissions = permissions;
     }
     const char* kindKeys[] = {"job_failure", "bt_escalation_failure", "process_failure", "timing_divergence", "resource_wait"};
     for (int i = 0; i < 5; ++i) {
@@ -12398,6 +12489,20 @@ static void UpdateSettingsDialogTexts(HWND hwnd) {
         Tr(L"LLM 相談 Ask the LLM:", L"Ask the LLM:", L"Consultar al LLM:"));
     if (ds->lblTriageKinds) SetWindowTextW(ds->lblTriageKinds,
         Tr(L"トリアージで扱う種別", L"Kinds handled by triage", L"Tipos gestionados por triaje"));
+    if (ds->lblTriageLlmPermissions) SetWindowTextW(ds->lblTriageLlmPermissions, Tr(
+        L"LLM 助言の権限（既定はファイル読み取りのみ）:",
+        L"LLM advice permissions (default: read files only):",
+        L"Permisos del consejo LLM (predeterminado: solo leer archivos):"));
+    {
+        const wchar_t* permissionLabels[] = {
+            Tr(L"ファイルを読む (read_files)", L"Read files (read_files)", L"Leer archivos (read_files)"),
+            Tr(L"コマンド実行 (run_commands)", L"Run commands (run_commands)", L"Ejecutar comandos (run_commands)"),
+            Tr(L"ファイル書込 (write_files)", L"Write files (write_files)", L"Escribir archivos (write_files)"),
+            Tr(L"ネットワーク (network)", L"Network (network)", L"Red (network)"),
+            Tr(L"ワーカー権限をそのまま使う (use_worker_permissions)", L"Use worker permissions (use_worker_permissions)", L"Usar permisos del worker (use_worker_permissions)")};
+        for (int i = 0; i < 5; ++i)
+            if (ds->chkTriageLlmPermissions[i]) SetWindowTextW(ds->chkTriageLlmPermissions[i], permissionLabels[i]);
+    }
     {
         const wchar_t* labels[] = {
             Tr(L"ジョブの失敗", L"Job failure", L"Fallo de tarea"),
@@ -12894,6 +12999,31 @@ static LRESULT CALLBACK SettingsWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPAR
                     SendMessageW(ds->chkTriageKinds[i], BM_SETCHECK, enabled ? BST_CHECKED : BST_UNCHECKED, 0);
                 }
             }
+            ds->lblTriageLlmPermissions = CreateWindowExW(0, L"STATIC", L"", WS_CHILD | WS_VISIBLE,
+                18, 282, 700, 20, hwnd, nullptr, hInst, nullptr);
+            {
+                const char* permissionKeys[] = {"read_files", "run_commands", "write_files", "network",
+                                                "use_worker_permissions"};
+                const wchar_t* permissionLabels[] = {
+                    Tr(L"ファイルを読む (read_files)", L"Read files (read_files)", L"Leer archivos (read_files)"),
+                    Tr(L"コマンド実行 (run_commands)", L"Run commands (run_commands)", L"Ejecutar comandos (run_commands)"),
+                    Tr(L"ファイル書込 (write_files)", L"Write files (write_files)", L"Escribir archivos (write_files)"),
+                    Tr(L"ネットワーク (network)", L"Network (network)", L"Red (network)"),
+                    Tr(L"ワーカー権限をそのまま使う (use_worker_permissions)", L"Use worker permissions (use_worker_permissions)", L"Usar permisos del worker (use_worker_permissions)")};
+                const std::vector<std::string> enabled = ParseTriageLlmPermissions(ds->dash->triageLlmPermissions);
+                for (int i = 0; i < 5; ++i) {
+                    ds->chkTriageLlmPermissions[i] = CreateWindowExW(0, L"BUTTON", permissionLabels[i],
+                        WS_CHILD | WS_VISIBLE | WS_TABSTOP | BS_AUTOCHECKBOX |
+                            (i == 0 ? WS_DISABLED : 0),
+                        18, 306 + i * 24, 700, 22, hwnd,
+                        reinterpret_cast<HMENU>(static_cast<INT_PTR>(IDC_SET_TRIAGE_LLM_PERMISSIONS + i)),
+                        hInst, nullptr);
+                    const bool checked = i == 0 ||
+                        std::find(enabled.begin(), enabled.end(), permissionKeys[i]) != enabled.end();
+                    SendMessageW(ds->chkTriageLlmPermissions[i], BM_SETCHECK,
+                        checked ? BST_CHECKED : BST_UNCHECKED, 0);
+                }
+            }
 
             ds->lblTermTitle = CreateWindowExW(0, L"STATIC", L"", WS_CHILD | WS_VISIBLE,
                 18, 48, 640, 20, hwnd, nullptr, hInst, nullptr);
@@ -13187,6 +13317,24 @@ static LRESULT CALLBACK SettingsWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPAR
                 Tr(L"新しいランダムなトークンを生成します。\n実行中の Web UI は新しいトークンで再起動します。",
                    L"Generates a new random token.\nThe running WebUI restarts with the new token.",
                    L"Genera un token aleatorio nuevo.\nLa interfaz web se reinicia con el nuevo token."));
+            for (int p = 0; p < 5; ++p) {
+                helpId(IDC_SET_TRIAGE_LLM_PERMISSIONS + p,
+                    p == 0 ? Tr(L"指示ファイルとログの読み取り。常に有効です。",
+                                L"Read the instructions and log files. Always on.",
+                                L"Leer las instrucciones y los registros. Siempre activo.")
+                  : p == 1 ? Tr(L"助言エンジンにコマンド実行を許可します。ワーカーの権限引数で起動するため危険です。",
+                                L"Allow the advisor to run commands. It starts with the worker's permission flags, which is dangerous.",
+                                L"Permite al consejero ejecutar comandos. Se inicia con los permisos del worker; es peligroso.")
+                  : p == 2 ? Tr(L"結果ファイル以外の書き込みを許可します。ワーカーの権限引数で起動するため危険です。",
+                                L"Allow writing files other than the result. It starts with the worker's permission flags, which is dangerous.",
+                                L"Permite escribir archivos además del resultado. Se inicia con los permisos del worker; es peligroso.")
+                  : p == 3 ? Tr(L"外部通信を許可します（エンジン側の設定に依存）。",
+                                L"Allow network access (depends on the engine settings).",
+                                L"Permite el acceso a la red (depende de la configuración del motor).")
+                           : Tr(L"engines.json の permissionArgs をそのまま使います。最も危険です。",
+                                L"Use the permissionArgs from engines.json as-is. This is the most dangerous option.",
+                                L"Usa permissionArgs de engines.json tal cual. Es la opción más peligrosa."));
+            }
             for (int h = 0; h < 5; ++h) {
                 helpId(IDC_SET_TRIAGE_KIND_BASE + h,
                     Tr(L"この種別の失敗をトリアージの対象に含めます。\n外すと、その失敗は自動でカード化されません。",
@@ -13220,7 +13368,7 @@ static LRESULT CALLBACK SettingsWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPAR
                               ds->chkSupervisorHints, ds->lblHintAutoDismissSec, ds->editHintAutoDismissSec,
                                ds->lblSupervisorCommand, ds->editSupervisorCommand,
                                ds->lblTriageMode, ds->cmbTriageMode, ds->lblTriageLlmMode, ds->cmbTriageLlmMode,
-                               ds->lblTriageKinds,
+                               ds->lblTriageKinds, ds->lblTriageLlmPermissions,
                                ds->lblTermTitle, ds->chkTermLocal, ds->chkTermRemote, ds->lblTermHint,
                                ds->btnTermSessionsOpen,
                              ds->lblWebUiTitle, ds->chkWebUi, ds->lblWebUiScope, ds->cmbWebUiScope,
@@ -13230,6 +13378,7 @@ static LRESULT CALLBACK SettingsWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPAR
                              ds->lblProcFont, ds->cmbProcFont, ds->lblTaskFont, ds->cmbTaskFont };
              for (HWND h : ctrls) SendMessageW(h, WM_SETFONT, (WPARAM)ds->dash->hFontUi, TRUE);
              for (HWND h : ds->chkTriageKinds) if (h) SendMessageW(h, WM_SETFONT, (WPARAM)ds->dash->hFontUi, TRUE);
+             for (HWND h : ds->chkTriageLlmPermissions) if (h) SendMessageW(h, WM_SETFONT, (WPARAM)ds->dash->hFontUi, TRUE);
             for (HWND h : ds->btnListBg) SendMessageW(h, WM_SETFONT, (WPARAM)ds->dash->hFontUi, TRUE);
             SendMessageW(ds->lblListBg, WM_SETFONT, (WPARAM)ds->dash->hFontUiBold, TRUE);
             SendMessageW(ds->lblTermTitle, WM_SETFONT, (WPARAM)ds->dash->hFontUiBold, TRUE);
@@ -13279,8 +13428,9 @@ static LRESULT CALLBACK SettingsWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPAR
                     ds->btnTermSessionsOpen });
                 triage.insert(triage.end(), {
                     ds->lblTriageMode, ds->cmbTriageMode, ds->lblTriageLlmMode, ds->cmbTriageLlmMode,
-                    ds->lblTriageKinds });
+                    ds->lblTriageKinds, ds->lblTriageLlmPermissions });
                 triage.insert(triage.end(), ds->chkTriageKinds, ds->chkTriageKinds + 5);
+                triage.insert(triage.end(), ds->chkTriageLlmPermissions, ds->chkTriageLlmPermissions + 5);
                 maintenance.insert(maintenance.end(), { ds->btnShell, ds->btnReset, ds->btnClear,
                                                          ds->hwndPowerPrivilege });
                 webui.insert(webui.end(), {
@@ -13339,6 +13489,10 @@ static LRESULT CALLBACK SettingsWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPAR
             }
             if (id == IDC_SET_HINT_AUTO_DISMISS_SEC || id == IDC_SET_SUPERVISOR_COMMAND) {
                 if (HIWORD(wParam) == EN_KILLFOCUS) CommitSupervisorSettings(ds);
+                return 0;
+            }
+            if (id >= IDC_SET_TRIAGE_LLM_PERMISSIONS && id < IDC_SET_TRIAGE_LLM_PERMISSIONS + 5) {
+                CommitSupervisorSettings(ds);
                 return 0;
             }
             if ((id == IDC_SET_TRIAGE_MODE || id == IDC_SET_TRIAGE_LLM_MODE) &&
@@ -14890,6 +15044,7 @@ struct TriageDlgState {
     HWND btnLog = nullptr;
     HWND btnSupervisor = nullptr;
     HWND btnAllSupervisor = nullptr;
+    HWND btnIgnore = nullptr;
     HWND btnAck = nullptr;
     HWND btnAckAll = nullptr;
     HWND btnClear = nullptr;
@@ -15134,6 +15289,39 @@ static std::wstring TriageLifecycleLabel(const std::string& lifecycle) {
     return lifecycle.empty() ? L"—" : Utf8ToWide(TriageLabel(TriageDisplayLanguage(), "lifecycle", lifecycle));
 }
 
+// The status a person reads is the pair of the card state (pending / acted / ignored / resolved)
+// and what that action led to (outcome). The raw lifecycle alone hid the result: a retried job that
+// succeeded still looked like "done" (or, with no outcome yet, "pending").
+static std::wstring TriageCardStatusLabel(const nlohmann::json& card) {
+    const std::string state = card.value("state", std::string());
+    const std::string lifecycle = card.value("lifecycle", std::string());
+    const auto outcome = card.value("outcome", nlohmann::json::object());
+    const std::string outcomeState = outcome.is_object() ? outcome.value("state", std::string()) : std::string();
+    const auto decision = card.value("decision", nlohmann::json::object());
+    const std::string candidateId = decision.is_object() ? decision.value("candidateId", std::string()) : std::string();
+    if (state == "ignored" || candidateId == "ignore")
+        return Tr(L"無視", L"Ignored", L"Ignorado");
+    if (outcomeState == "rerunning") return Tr(L"再実行中", L"Rerunning", L"Reintentando");
+    if (outcomeState == "succeeded") return Tr(L"処置済", L"Handled", L"Tratado");
+    if (outcomeState == "failed_again")
+        return Tr(L"判断待ち", L"Awaiting decision", L"Pendiente de decisión");
+    if (outcomeState == "not_rerun") return Tr(L"要フォロー", L"Follow-up needed", L"Requiere seguimiento");
+    if (outcomeState == "cancelled") return Tr(L"キャンセル", L"Cancelled", L"Cancelado");
+    if (outcomeState == "gone") return Tr(L"対象なし", L"Gone", L"Desaparecido");
+    if (state == "resolved") return Tr(L"自然解消", L"Naturally resolved", L"Resuelto naturalmente");
+    if (state == "pending") {
+        const auto handoff = card.value("handoff", nlohmann::json::object());
+        const auto manual = card.value("manual", nlohmann::json::object());
+        const std::string handoffState = handoff.is_object() ? handoff.value("state", std::string()) : std::string();
+        const std::string manualState = manual.is_object() ? manual.value("state", std::string()) : std::string();
+        if (handoffState == "queued" || handoffState == "running" || manualState == "working")
+            return Tr(L"対応中", L"Handling", L"En curso");
+        return Tr(L"判断待ち", L"Awaiting decision", L"Pendiente de decisión");
+    }
+    if (state == "acted") return Tr(L"処置済", L"Handled", L"Tratado");
+    return TriageLifecycleLabel(lifecycle);
+}
+
 static int TriageLifecycleRank(const std::string& lifecycle) {
     if (lifecycle == "pending") return 0;
     if (lifecycle == "follow_up") return 1;
@@ -15210,7 +15398,7 @@ static std::wstring TriageOutcomeText(const nlohmann::json& card) {
 
 static std::wstring TriageColumnText(const nlohmann::json& card, int column) {
     switch (column) {
-    case 0: return TriageLifecycleLabel(card.value("lifecycle", std::string()));
+    case 0: return TriageCardStatusLabel(card);
     case 1: return TriageKindLabel(card);
     case 2: return TriageTargetText(card);
     case 3: return TriageRecommendation(card);
@@ -15444,11 +15632,18 @@ static void TriageUpdateSelection(TriageDlgState* ds) {
         const auto decision = card.value("decision", nlohmann::json());
         if (decision.is_object()) {
             const std::string candidateId = decision.value("candidateId", std::string());
-            text += L"  " + Utf8ToWide(decision.value("by", std::string())) + L" — " +
+            const std::string actor = decision.value("actor", std::string());
+            text += L"  " + Utf8ToWide(decision.value("by", std::string())) +
+                (actor.empty() ? L"" : L" [" + Utf8ToWide(actor) + L"]") + L" — " +
                 TriageCandidateLabel(card, candidateId) + L"\r\n  " +
                 Utf8ToWide(decision.value("reason", std::string())) + L"\r\n  " +
                 Utf8ToWide(decision.value("at", std::string())) + L"\r\n  " +
                 Utf8ToWide(decision.value("result", std::string()));
+            if (decision.contains("adviceCandidateId")) {
+                text += decision.value("adviceFollowed", false)
+                    ? Tr(L"\r\n  助言どおり", L"\r\n  Followed the LLM advice", L"\r\n  Siguió el consejo del LLM")
+                    : Tr(L"\r\n  助言とは別の判断", L"\r\n  Different from the LLM advice", L"\r\n  Distinto del consejo del LLM");
+            }
         } else {
             text += Tr(L"  未判断", L"  No decision yet", L"  Sin decisión");
             const auto handoff = card.value("handoff", nlohmann::json::object());
@@ -15463,7 +15658,7 @@ static void TriageUpdateSelection(TriageDlgState* ds) {
             }
         }
         text += L"\r\n\r\n■ " + std::wstring(Tr(L"ライフサイクル", L"Lifecycle", L"Ciclo de vida")) +
-            L"\r\n  " + TriageLifecycleLabel(card.value("lifecycle", std::string("pending")));
+            L"\r\n  " + TriageCardStatusLabel(card);
         text += L"\r\n\r\n■ " + std::wstring(Tr(L"結果", L"Outcome", L"Resultado")) + L"\r\n  " + TriageOutcomeText(card);
     } else {
         text = Tr(L"カードを選択してください。", L"Select a card.", L"Selecciona una tarjeta.");
@@ -15541,8 +15736,17 @@ static void TriageUpdateSelection(TriageDlgState* ds) {
         for (const auto& candidate : ds->selectedCard["candidates"])
             if (candidate.is_object() && candidate.value("id", std::string()) == "retry_raise_timeout") hasTimeoutChoice = true;
     }
+    bool hasIgnoreChoice = false;
+    if (has && ds->selectedCard.contains("candidates") && ds->selectedCard["candidates"].is_array()) {
+        for (const auto& candidate : ds->selectedCard["candidates"]) {
+            if (!candidate.is_object()) continue;
+            const std::string id = candidate.value("id", std::string());
+            if (id == "ignore" || id == "ack") { hasIgnoreChoice = true; break; }
+        }
+    }
     if (ds->multiplier) ShowWindow(ds->multiplier, pending && hasTimeoutChoice ? SW_SHOW : SW_HIDE);
     if (ds->btnRun) EnableWindow(ds->btnRun, pending && !ds->radios.empty());
+    if (ds->btnIgnore) EnableWindow(ds->btnIgnore, pending && hasIgnoreChoice);
     if (ds->btnAdvise) EnableWindow(ds->btnAdvise, pending);
     if (ds->btnManual) EnableWindow(ds->btnManual, pending);
     if (ds->btnSupervisor) EnableWindow(ds->btnSupervisor, pending);
@@ -15723,7 +15927,7 @@ static void TriageReload(TriageDlgState* ds, const nlohmann::json* response = nu
     auto buildCells = [](const nlohmann::json& card) {
         std::vector<std::wstring> cells;
         cells.reserve(11);
-        cells.push_back(TriageLifecycleLabel(card.value("lifecycle", std::string())));
+        cells.push_back(TriageCardStatusLabel(card));
         cells.push_back(TriageKindLabel(card));
         cells.push_back(TriageTargetText(card));
         cells.push_back(TriageRecommendation(card));
@@ -16032,7 +16236,11 @@ static void TriageLayout(HWND hwnd, TriageDlgState* ds) {
     const int rw = (std::max)(minPaneW, w - pad - rx);
     move(ds->actionLabel, rx, lowerTop, rw, labelH - 2);
     const int reasonH = 24, actionButtonH = 27, actionGap = 4;
-    const int actionRows = 3;
+    HWND actionButtons[] = {ds->btnRun, ds->btnAdvise, ds->btnSupervisor, ds->btnManual,
+                            ds->btnLog, ds->btnIgnore, ds->btnAck};
+    std::vector<HWND> visibleActions;
+    for (HWND button : actionButtons) if (button && IsWindowVisible(button)) visibleActions.push_back(button);
+    const int actionRows = (std::max)(1, (static_cast<int>(visibleActions.size()) + 1) / 2);
     const int actionsTop = contentBottom - actionRows * actionButtonH - (actionRows - 1) * actionGap;
     const int reasonY = actionsTop - reasonH - 5;
     const int candidateRows = static_cast<int>(ds->radios.size());
@@ -16051,10 +16259,8 @@ static void TriageLayout(HWND hwnd, TriageDlgState* ds) {
          rw - reasonLabelW - (multiplierVisible ? 96 : 0), reasonH);
 
     const int buttonW = (rw - 6) / 2;
-    HWND actionButtons[] = {ds->btnRun, ds->btnAdvise, ds->btnSupervisor, ds->btnManual, ds->btnLog, ds->btnAck};
     int visibleIndex = 0;
-    for (HWND button : actionButtons) {
-        if (!button || !IsWindowVisible(button)) continue;
+    for (HWND button : visibleActions) {
         const int col = visibleIndex % 2, row = visibleIndex / 2;
         move(button, rx + col * (buttonW + 6), actionsTop + row * (actionButtonH + actionGap), buttonW, actionButtonH);
         ++visibleIndex;
@@ -16133,7 +16339,7 @@ static LRESULT CALLBACK TriageWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM
             {L"running", Tr(L"再実行中", L"Rerunning", L"Reintentando")},
             {L"waiting", Tr(L"完了待ち", L"Waiting for completion", L"Esperando finalización")},
             {L"follow_up", Tr(L"要フォロー", L"Follow-up", L"Seguimiento")},
-            {L"done", Tr(L"完了", L"Done", L"Completado")},
+            {L"done", Tr(L"処置済", L"Handled", L"Tratado")},
             {L"open", Tr(L"未完了", L"Open", L"Abierto")},
             {L"all", Tr(L"すべて", L"All", L"Todos")},
             {L"acted", Tr(L"処置済み", L"Acted", L"Tratados")},
@@ -16213,6 +16419,7 @@ static LRESULT CALLBACK TriageWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM
         ds->btnManual = button(Tr(L"📋 プロンプトをコピー（手動で処置）", L"📋 Copy prompt (manual handling)", L"📋 Copiar prompt (gestión manual)"), 2922);
         ds->btnAllSupervisor = button(Tr(L"🤖 全部解決させる（バッチ）", L"🤖 Resolve all (batch)", L"🤖 Resolver todo (lote)"), 2914);
         ds->btnAck = button(Tr(L"✓ 確認した", L"✓ Mark reviewed", L"✓ Revisado"), 2915);
+        ds->btnIgnore = button(Tr(L"🚫 無視", L"🚫 Ignore", L"🚫 Ignorar"), 2923);
         ds->btnAckAll = button(Tr(L"自動処置をすべて確認済みにする", L"Mark all auto reviewed", L"Revisar todas las acciones auto"), 2916);
         ds->btnClear = button(Tr(L"🧹 クリア", L"🧹 Clear", L"🧹 Limpiar"), 2917);
         ds->btnShowPending = button(Tr(L"👁 判断待ちを再表示", L"👁 Show pending again", L"👁 Mostrar pendientes"), 2918);
@@ -16246,6 +16453,10 @@ static LRESULT CALLBACK TriageWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM
             Tr(L"この自動処置カードを確認済みにします。\n一覧からは消えません。",
                L"Marks this automatic-action card as reviewed.\nIt stays in the list.",
                L"Marca esta tarjeta de acción automática como revisada.\nSigue en la lista."));
+        AddControlHelp(hwnd, ds->btnIgnore,
+            Tr(L"このカードを「無視」として記録し、判断待ちから外します。\n理由を入力してから押してください。プロセスのカードでは「確認済み」として記録します。",
+               L"Records this card as ignored and removes it from pending.\nEnter a reason first; process cards are recorded as acknowledged.",
+               L"Registra esta tarjeta como ignorada y la quita de pendientes.\nEscribe un motivo antes; las tarjetas de proceso se registran como confirmadas."));
         AddControlHelp(hwnd, ds->btnAckAll,
             Tr(L"自動処置のカードをすべて確認済みにします。\n未確認の自動処置がまとめて消えます。",
                L"Marks every automatic-action card as reviewed.\nAll unreviewed automatic actions are cleared at once.",
@@ -16271,7 +16482,7 @@ static LRESULT CALLBACK TriageWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM
         HWND controls[] = {ds->filter, ds->search, ds->btnSearch, ds->modeLabel, ds->emptyState, ds->list, ds->infoLabel, ds->infoTable,
             ds->actionLabel, ds->detail, ds->reasonLabel, ds->multiplier, ds->reason,
             ds->btnRun, ds->btnAdvise, ds->btnLog, ds->btnSupervisor, ds->btnManual, ds->btnAllSupervisor, ds->btnAck,
-            ds->btnAckAll, ds->btnClear, ds->btnShowPending, ds->btnMarkAll, ds->btnReload, ds->listWideLabel};
+            ds->btnIgnore, ds->btnAckAll, ds->btnClear, ds->btnShowPending, ds->btnMarkAll, ds->btnReload, ds->listWideLabel};
         for (HWND control : controls) if (control && ds->fontUi) SendMessageW(control, WM_SETFONT, reinterpret_cast<WPARAM>(ds->fontUi), TRUE);
         if (ds->dash && ds->dash->hFontUiBold) {
             for (HWND label : {ds->infoLabel, ds->actionLabel})
@@ -16298,8 +16509,8 @@ static LRESULT CALLBACK TriageWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM
         ApplyThemedListHeader(ds->infoTable);
         for (HWND child : {ds->filter, ds->search, ds->btnSearch, ds->list, ds->infoTable, ds->detail, ds->reason,
                            ds->btnRun, ds->btnAdvise, ds->btnLog, ds->btnSupervisor, ds->btnManual,
-                           ds->btnAllSupervisor, ds->btnAck, ds->btnAckAll, ds->btnClear, ds->btnShowPending,
-                           ds->btnMarkAll, ds->btnReload}) {
+                           ds->btnAllSupervisor, ds->btnAck, ds->btnIgnore, ds->btnAckAll, ds->btnClear,
+                           ds->btnShowPending, ds->btnMarkAll, ds->btnReload}) {
             if (child) SetWindowSubclass(child, TriageChildSubclassProc, 1, 0);
         }
         TriageReload(ds);
@@ -16553,6 +16764,41 @@ static LRESULT CALLBACK TriageWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM
                 {"candidateId", candidateId}, {"reason", reason}, {"params", params}, {"by", "human"}});
             return 0;
         }
+        if (id == 2923 && has) {
+            wchar_t reasonBuf[2048] = {};
+            GetWindowTextW(ds->reason, reasonBuf, static_cast<int>(std::size(reasonBuf)));
+            const std::string reason = WideToUtf8(std::wstring(reasonBuf));
+            if (reason.empty()) {
+                gui_platform::GetGuiPlatform()->ShowMessageBox(hwnd,
+                    Tr(L"理由が必要です", L"A reason is required", L"Se requiere un motivo"),
+                    Tr(L"無視する理由を入力してください。", L"Enter a reason before ignoring this card.",
+                       L"Escribe un motivo antes de ignorar esta tarjeta."),
+                    gui_platform::MessageBoxType::Warning);
+                if (ds->reason) SetFocus(ds->reason);
+                return 0;
+            }
+            // Process cards have no "ignore" candidate; acknowledging is their equivalent.
+            std::string candidateId;
+            if (ds->selectedCard.contains("candidates") && ds->selectedCard["candidates"].is_array()) {
+                for (const auto& candidate : ds->selectedCard["candidates"]) {
+                    if (!candidate.is_object()) continue;
+                    const std::string candidateValue = candidate.value("id", std::string());
+                    if (candidateValue == "ignore") { candidateId = "ignore"; break; }
+                    if (candidateValue == "ack") candidateId = "ack";
+                }
+            }
+            if (candidateId.empty()) {
+                gui_platform::GetGuiPlatform()->ShowMessageBox(hwnd,
+                    Tr(L"無視できません", L"Cannot ignore this card", L"No se puede ignorar esta tarjeta"),
+                    Tr(L"このカードには無視できる処置がありません。", L"This card has no ignore action.",
+                       L"Esta tarjeta no tiene una acción de ignorar."),
+                    gui_platform::MessageBoxType::Warning);
+                return 0;
+            }
+            TriageRunIpc(ds, {{"action", "triage_decide"}, {"id", ds->selectedId},
+                {"candidateId", candidateId}, {"reason", reason}, {"by", "human"}});
+            return 0;
+        }
         if (id == 2911 && has) { TriageRunIpc(ds, {{"action", "triage_advise"}, {"id", ds->selectedId}}); return 0; }
         if (id == 2922 && has) {
             nlohmann::json response;
@@ -16727,7 +16973,7 @@ static LRESULT CALLBACK TriageWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM
                 Tr(L"完了待ち", L"WAITING", L"EN ESPERA"),
                 Tr(L"要フォロー", L"FOLLOW-UP", L"SEGUIMIENTO"),
                 Tr(L"自動・未確認", L"AUTO UNREVIEWED", L"AUTO SIN REVISAR"),
-                Tr(L"完了", L"DONE", L"COMPLETADO")};
+                Tr(L"処置済", L"HANDLED", L"TRATADO")};
             for (int i = 0; i < 8; ++i) {
                 if (!RectsOverlap(ps.rcPaint, ds->tileRects[i])) continue;
                 const bool urgent = (i == 0 || i == 1 || i == 5 || i == 6) && ds->tileValues[i] > 0;

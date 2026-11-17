@@ -190,6 +190,7 @@ void WorkerEngineRegistry::ResetToBuiltins() {
     agy.defaultModel = "gemini-3.8-flash-medium";
     agy.stream = "agy";
     agy.permissionArgs = "--dangerously-skip-permissions";
+    agy.advicePermissionArgs = "--mode plan";
     engines_["agy"] = std::move(agy);
 
     WorkerEngineDef claude;
@@ -197,6 +198,7 @@ void WorkerEngineRegistry::ResetToBuiltins() {
     claude.defaultModel = "";
     claude.stream = "claude";
     claude.permissionArgs = "--dangerously-skip-permissions";
+    claude.advicePermissionArgs = "--permission-mode plan";
     engines_["claude"] = std::move(claude);
 
     WorkerEngineDef opencode;
@@ -204,6 +206,8 @@ void WorkerEngineRegistry::ResetToBuiltins() {
     opencode.defaultModel = "";
     opencode.stream = "opencode";
     opencode.permissionArgs = "";
+    // OpenCode has no CLI read-only switch; without --auto it asks (and a headless run denies).
+    opencode.advicePermissionArgs = "";
     engines_["opencode"] = std::move(opencode);
 
     WorkerEngineDef codex;
@@ -211,6 +215,7 @@ void WorkerEngineRegistry::ResetToBuiltins() {
     codex.defaultModel = "";
     codex.stream = "codex";
     codex.permissionArgs = "--dangerously-bypass-approvals-and-sandbox";
+    codex.advicePermissionArgs = "--sandbox read-only";
     engines_["codex"] = std::move(codex);
 }
 
@@ -247,6 +252,7 @@ bool WorkerEngineRegistry::LoadFromJson(const std::string& jsonText, std::string
                 def.command = obj["command"].get<std::string>();
                 if (!obj.contains("defaultModel")) def.defaultModel.clear();
                 if (!obj.contains("permissionArgs")) def.permissionArgs.clear();
+                if (!obj.contains("advicePermissionArgs")) def.advicePermissionArgs.clear();
                 if (!obj.contains("models")) def.models.clear();
                 if (!obj.contains("adapter")) def.adapter.clear();
                 if (!obj.contains("capabilities")) def.capabilities = WorkerEngineCapabilities{};
@@ -275,6 +281,13 @@ bool WorkerEngineRegistry::LoadFromJson(const std::string& jsonText, std::string
                     return false;
                 }
                 def.permissionArgs = obj["permissionArgs"].get<std::string>();
+            }
+            if (obj.contains("advicePermissionArgs")) {
+                if (!obj["advicePermissionArgs"].is_string()) {
+                    err = "engine '" + name + "': 'advicePermissionArgs' must be a string";
+                    return false;
+                }
+                def.advicePermissionArgs = obj["advicePermissionArgs"].get<std::string>();
             }
             if (obj.contains("models")) {
                 if (!obj["models"].is_array()) {
@@ -399,7 +412,8 @@ bool WorkerEngineRegistry::BuildCommand(const std::string& engine,
                                         std::string& outCommand,
                                         std::string& outStreamType,
                                         std::string& err,
-                                        std::string* outAdapter) const {
+                                        std::string* outAdapter,
+                                        const std::string* permissionArgsOverride) const {
     outCommand.clear();
     outStreamType.clear();
     if (outAdapter) outAdapter->clear();
@@ -421,7 +435,7 @@ bool WorkerEngineRegistry::BuildCommand(const std::string& engine,
         ReplaceAll(cmd, "{model}", modelArg);
     }
 
-    ReplaceAll(cmd, "{permissionArgs}", def.permissionArgs);
+    ReplaceAll(cmd, "{permissionArgs}", permissionArgsOverride ? *permissionArgsOverride : def.permissionArgs);
 
     int timeoutMin = timeoutSec > 0 ? (timeoutSec + 59) / 60 : 30;
     if (timeoutMin < 1) timeoutMin = 1;

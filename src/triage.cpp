@@ -436,6 +436,16 @@ json BuildJobFailureCard(const json& job, const TriageInputs& in) {
             "success outputRegex: " + String(conditions, "output_regex"));
     AddItem(info["conditions"], "successTestReport", String(conditions, "test_report"),
             "success testReport: " + String(conditions, "test_report"));
+    AddItem(info["conditions"], "successContentFile", String(conditions, "content_file"),
+            "success content file: " + String(conditions, "content_file"));
+    const long long minBytes = Number(conditions, "min_bytes");
+    if (minBytes > 0) AddItem(info["conditions"], "successMinBytes", minBytes,
+                              "success min bytes: " + std::to_string(minBytes));
+    AddItem(info["conditions"], "successContentRegex", String(conditions, "content_regex"),
+            "success content regex: " + String(conditions, "content_regex"));
+    if (Bool(conditions, "engine_result"))
+        AddItem(info["conditions"], "successEngineResult", true,
+                "success requires a successful engine result");
     const long long maxAttempts = Number(job, "max_attempts");
     if (maxAttempts > 0) AddItem(info["conditions"], "maxAttempts", maxAttempts,
                                  "max attempts: " + std::to_string(maxAttempts));

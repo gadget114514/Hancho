@@ -40,6 +40,25 @@ json Error(const std::string& message) {
     return {{"ok", false}, {"error", message}};
 }
 
+// Advice engines in a read-only mode cannot write the result file, so they reply with the JSON.
+// Take the object out of the final message, tolerating prose and markdown code fences.
+std::string ExtractAdviceJsonText(const std::string& text) {
+    std::string body = text;
+    const size_t fence = body.find("```");
+    if (fence != std::string::npos) {
+        const size_t lineStart = body.find('\n', fence);
+        if (lineStart != std::string::npos) {
+            const size_t fenceEnd = body.find("```", lineStart + 1);
+            if (fenceEnd != std::string::npos)
+                body = body.substr(lineStart + 1, fenceEnd - lineStart - 1);
+        }
+    }
+    const size_t first = body.find('{');
+    const size_t last = body.rfind('}');
+    if (first == std::string::npos || last == std::string::npos || last < first) return "";
+    return body.substr(first, last - first + 1);
+}
+
 bool ResponseOk(const std::string& response, std::string& error) {
     json parsed = json::parse(response, nullptr, false);
     if (parsed.is_discarded() || !parsed.is_object()) {
@@ -329,6 +348,22 @@ void TriageManager::Refresh() {
         llmModel_ = model;
         llmConcurrency_ = static_cast<int>(std::clamp<long long>(
             GetNumber(config, "triage_llm_concurrency", llmConcurrency_), 1, 8));
+        {
+            std::vector<std::string> permissions;
+            const json configured = config.value("triage_llm_permissions", json::array());
+            if (configured.is_array()) {
+                for (const auto& item : configured) {
+                    if (!item.is_string()) continue;
+                    const std::string value = item.get<std::string>();
+                    if (value == "read_files" || value == "run_commands" || value == "write_files" ||
+                        value == "network" || value == "use_worker_permissions")
+                        permissions.push_back(value);
+                }
+            }
+            if (std::find(permissions.begin(), permissions.end(), "read_files") == permissions.end())
+                permissions.insert(permissions.begin(), "read_files");
+            llmPermissions_ = std::move(permissions);
+        }
         supervisorEngine_ = supervisorEngine;
         supervisorModel_ = supervisorModel;
         supervisorTimeoutSec_ = static_cast<int>(std::clamp<long long>(supervisorTimeout, 60, 7200));
@@ -403,10 +438,16 @@ void TriageManager::PumpAdvice() {
         FinishedAdvice done;
         done.run = run;
         if (!run.adviceId.empty()) done.resultText = ReadFileUtf8Wide(AdviceResultPath(run.adviceId));
+        if (done.resultText.empty() && run.processId > 0) {
+            // Read-only advice engines reply with the JSON instead of writing the result file.
+            const AgentExtractedResult extracted = ExtractAgentResult(pm_, run.processId, true, 0);
+            if (!extracted.result.empty()) done.resultText = ExtractAdviceJsonText(extracted.result);
+        }
         if (done.resultText.empty()) {
             if (run.processId <= 0) done.error = "the advice run was interrupted";
             else if (!tracked) done.error = "the advice run ended without a result file";
-            else done.error = "the advice run ended in state " + ProcStateToString(snapshot.state);
+            else done.error = "the advice run ended in state " + ProcStateToString(snapshot.state) +
+                              " without a JSON reply";
         }
         finished.push_back(std::move(done));
     }
@@ -518,6 +559,25 @@ void TriageManager::StartAdviceProcess(const json& cardToStart, const std::strin
         fail("no worker engine is configured");
         return;
     }
+    const WorkerEngineDef* engineDef = engines->Find(selectedEngine);
+    if (!engineDef) {
+        fail("unknown worker engine: " + selectedEngine);
+        return;
+    }
+    std::vector<std::string> permissions;
+    {
+        std::lock_guard<std::mutex> lock(mutex_);
+        permissions = llmPermissions_;
+    }
+    auto allows = [&](const char* action) {
+        return std::find(permissions.begin(), permissions.end(), action) != permissions.end();
+    };
+    // Only an explicit opt-in gives the advisor the worker's permission bypass. Everything else
+    // uses the engine's read-only advice flags (plan / read-only sandbox), so it can inspect the
+    // logs but cannot run commands, edit files or change jobs.
+    const bool workerPermissions = allows("run_commands") || allows("write_files") ||
+                                   allows("use_worker_permissions");
+    const std::string* permissionOverride = workerPermissions ? nullptr : &engineDef->advicePermissionArgs;
 
     const std::wstring resultPath = AdviceResultPath(adviceId);
     EnsureDirectoryWide(PathJoinWide(TriageDirectory(), L"results"));
@@ -529,14 +589,27 @@ void TriageManager::StartAdviceProcess(const json& cardToStart, const std::strin
     json uiConfig = json::parse(ReadConfig(), nullptr, false);
     std::string language = uiConfig.is_object() ? GetString(uiConfig, "language", "en") : "en";
     if (language.empty()) language = "en";
+    std::string permissionText = "Permissions: ";
+    permissionText += allows("read_files") ? "read the instruction and listed log files" : "no file reads";
+    permissionText += "; reply with the JSON object as your final message. ";
+    permissionText += "You must not change job specifications, models, configuration, credits or queue state, "
+                      "and you must not start or retry jobs. Advice is a recommendation only; a person decides. ";
+    permissionText += workerPermissions ? "Command execution is allowed by configuration; still do not change anything."
+                                        : "Do not run commands or write files.";
     const std::string instruction = BuildTriageAdvicePacket(cardToStart, language) +
-        "\nRequired result JSON Schema:\n```json\n" + TriageAdviceOutputSchema() + "\n```\n";
+        "\n" + permissionText + "\n\nRequired result JSON Schema:\n```json\n" +
+        TriageAdviceOutputSchema() + "\n```\n";
     WriteFileAtomicWide(instructionPath, instruction);
+    // Read-only modes (agy --mode plan, claude --permission-mode plan, codex --sandbox read-only)
+    // cannot write the result file, so the answer is taken from the final message. Engines that
+    // can still write the file keep working through the same path.
     const std::string launchPrompt = "Read the instructions file " + WideToUtf8(instructionPath) +
-        " and write the required JSON result to the file named by PC_TRIAGE_RESULT_FILE.";
+        ". This is a read-only advisory task: do not create a plan or ask for approval. Reply with the "
+        "required JSON object as your final message. If you can write files, also write it to the file "
+        "named by PC_TRIAGE_RESULT_FILE.";
     std::string command, streamType, commandError, adapter;
     if (!engines->BuildCommand(selectedEngine, modelName, launchPrompt, 300,
-                               command, streamType, commandError, &adapter)) {
+                               command, streamType, commandError, &adapter, permissionOverride)) {
         fail(commandError);
         return;
     }
@@ -647,7 +720,10 @@ std::string TriageManager::List(const std::string& requestedState) {
             if (!decision.is_null() && decision.is_object()) {
                 summary["candidateId"] = GetString(decision, "candidateId");
                 summary["by"] = GetString(decision, "by");
+                summary["actor"] = GetString(decision, "actor");
                 summary["reason"] = GetString(decision, "reason");
+                if (decision.contains("adviceFollowed") && decision["adviceFollowed"].is_boolean())
+                    summary["adviceFollowed"] = decision["adviceFollowed"];
             }
             jobs[jobId] = std::move(summary);
         }
@@ -868,7 +944,8 @@ std::string TriageManager::DecideInternal(const std::string& id, const std::stri
     if (!jobId.empty()) {
         TaskQueueJob jobSnapshot;
         if (tqm_.GetJobSnapshot(jobId, jobSnapshot)) {
-            const std::string line = "[triage] " + by + " chose " + candidateId + ": " + reason;
+            const std::string actor = by == "human" ? "human" : by == "hancho-auto" ? "hancho" : "llm";
+            const std::string line = "[triage] " + actor + " (" + by + ") chose " + candidateId + ": " + reason;
             const std::string notes = jobSnapshot.notes.empty() ? line : jobSnapshot.notes + "\n" + line;
             const std::string noteResponse = tqm_.TaskQueueUpdate(jobId, json{{"notes", notes}}.dump(),
                                                                   TaskQueueCaller::External, actionError);
@@ -884,10 +961,20 @@ std::string TriageManager::DecideInternal(const std::string& id, const std::stri
         });
         if (found == store_["cards"].end()) return Error("triage card disappeared while deciding").dump();
         const std::string state = candidateId == "ignore" ? "ignored" : "acted";
+        const std::string actor = by == "human" ? "human" : by == "hancho-auto" ? "hancho" : "llm";
+        const json advice = GetObject(card, "advice");
+        const std::string adviceCandidateId = GetString(advice, "candidateId");
+        json decision = {{"candidateId", candidateId}, {"by", by}, {"actor", actor},
+                         {"actorDetail", by}, {"reason", reason},
+                         {"at", GetCurrentTimestampStr()}, {"result", result}, {"ok", true}};
+        if (!adviceCandidateId.empty()) {
+            decision["adviceCandidateId"] = adviceCandidateId;
+            decision["adviceConfidence"] = GetString(advice, "confidence");
+            decision["adviceFollowed"] = adviceCandidateId == candidateId;
+        }
         (*found)["state"] = state;
         (*found)["updatedAt"] = GetCurrentTimestampStr();
-        (*found)["decision"] = {{"candidateId", candidateId}, {"by", by}, {"reason", reason},
-                                  {"at", GetCurrentTimestampStr()}, {"result", result}, {"ok", true}};
+        (*found)["decision"] = std::move(decision);
         json manual = GetObject(*found, "manual");
         if (by == "human" && !manual.empty()) {
             (*found)["decision"]["route"] = "manual";
@@ -1059,7 +1146,8 @@ std::string TriageManager::MarkManual(const std::string& id) {
         });
         if (found == store_["cards"].end()) return Error("triage card not found: " + id).dump();
         if (GetString(*found, "state") != "pending") return Error("only a pending card can be taken over by hand").dump();
-        (*found)["manual"] = {{"state", "working"}, {"at", GetCurrentTimestampStr()}};
+        (*found)["manual"] = {{"state", "working"}, {"at", GetCurrentTimestampStr()},
+                              {"by", "human"}};
         (*found)["lifecycle"] = "handling";
         (*found)["updatedAt"] = GetCurrentTimestampStr();
         card = *found;
@@ -1220,7 +1308,8 @@ std::string TriageManager::Handoff(const std::vector<std::string>& ids, bool all
             bool selected = false;
             for (const auto& c : cards) if (GetString(c, "id") == id) { selected = true; break; }
             if (!selected) continue;
-            card["handoff"] = {{"jobId", jobId}, {"at", now}, {"state", "queued"}, {"engine", engineName}};
+            card["handoff"] = {{"jobId", jobId}, {"at", now}, {"state", "queued"}, {"engine", engineName},
+                               {"requestedBy", "human"}};
             card["updatedAt"] = now;
             handedIds.push_back(id);
         }

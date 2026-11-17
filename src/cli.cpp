@@ -2784,7 +2784,9 @@ SETUP FOR LLM AGENTS:
 "        `opencode run`), roles can blur and cause confusion; prefer a\n"
 "        different worker engine for workers, or give workers a clearly\n"
 "        distinct role/prompt and avoid nested supervision.\n"
-"      - Verify success with exit code + filesNewer/outputRegex; observe with\n"
+"      - Verify success with exit code + filesNewer/outputRegex; for reports also\n"
+"        use contentFile + contentRegex (and engineResult) so a file that only\n"
+"        got its headings written does not count as success. Observe with\n"
 "        taskqueue_wait / taskqueue_list / taskqueue_graph and logs; retry with\n"
 "        taskqueue_retry. Blocked dependents resume automatically.\n"
 "      - A failed job carries a diagnosis (failure class, summary, lastActivity,\n"
@@ -3040,7 +3042,7 @@ void PrintCliUsageJson() {
     {
       "name": "taskqueue",
       "description": "Manage the persistent task queue: ordered jobs, dependencies, per-job timeouts, success checks and automatic retries.",
-      "usage": "hancho-cli taskqueue <add|list|get|why|retry|cancel|pause|resume|graph|wait|purge> ...",
+      "usage": "hancho-cli taskqueue <add|list|get|why|retry|cancel|pause|resume|graph|wait|purge|update> ...",
       "subcommands": [
         {"name": "add", "usage": "hancho-cli taskqueue add --file <jobs.json> [--taskqueue <name>] [--concurrency <n>] [--notify-file <path>] [--origin-label <text>]", "description": "Register jobs. Each job needs id, command, summary and timeoutSec; dependsOn replaces shell chaining. The caller's session id, working folder and --origin-label are recorded as the job's origin. suspendWhenDone/suspendDelaySec/suspendHibernate arm the PC to suspend, and shutdownWhenDone/shutdownDelaySec arm it to shut down, after that job and all other work is idle. Do not set hidden on jobs you register: it is reserved for Hancho's internal jobs and hides the row unless Show hidden tasks is on."},
         {"name": "list", "usage": "hancho-cli taskqueue list [<name>] [--state <state>] [--since <period>] [--origin <self|label|session>] [--bt <id>]", "description": "List jobs with state, queue, summary and blockedBy. --since keeps only jobs updated within the period (e.g. 30m, 6h, 2d). --origin self keeps only the jobs this session added. --bt <id> lists every job of a behavior tree across its parallel branch queues. Each job also carries resource_wait and, once succeeded with estimateSec, timing_feedback (see audit). The dashboard adds provisional 'planned' rows for idle BT leaves; taskqueue_list returns them only with include_planned: true."},
@@ -3053,7 +3055,8 @@ void PrintCliUsageJson() {
         {"name": "resume", "usage": "hancho-cli taskqueue resume <name>", "description": "Resume starting jobs in the queue."},
         {"name": "graph", "usage": "hancho-cli taskqueue graph [<name>] [--root <id>]", "description": "Dependency graph with ready, waiting_for, resource_wait, retry_in_sec, blocked and dependents."},
         {"name": "wait", "usage": "hancho-cli taskqueue wait <name> [--since <version>] [--timeout-ms <ms>]", "description": "Long-poll until the queue version changes."},
-        {"name": "purge", "usage": "hancho-cli taskqueue purge <name> [--states succeeded,failed,cancelled]", "description": "Remove finished jobs."}
+        {"name": "purge", "usage": "hancho-cli taskqueue purge <name> [--states succeeded,failed,cancelled]", "description": "Remove finished jobs."},
+        {"name": "update", "usage": "hancho-cli taskqueue update --id <id> --patch <json> [--approve-model-change --reason <text>]", "description": "Update a pending/failed/blocked job. Changing --model in the command requires human approval: pass --approve-model-change --reason. The change is recorded in the job notes."}
       ],
       "options": []
     },)";
@@ -3341,7 +3344,7 @@ void PrintCliUsageJson() {
       "rules": [
         "One job = one command; never use &&, ||, &, PowerShell ';', newlines or wait loops.",
         "Give each job its own timeoutSec; never sum timeouts.",
-        "Prefer filesNewer/outputRegex when exit code 0 does not prove the work was done.",
+        "Prefer filesNewer/outputRegex when exit code 0 does not prove the work was done; for reports add contentFile/contentRegex/engineResult so a headings-only file is not success.",
         "Keep the supervisor context small: pass detailed instructions to workers and read artifacts, not raw transcripts.",
         "Use taskqueue_wait instead of polling .done files.",
         "To delegate one task to a worker LLM, use run_worker: it blocks until the worker exits and returns only the final result; the raw stream stays in stream_file.",
@@ -3388,7 +3391,7 @@ void PrintCliUsageJson() {
       "optional": ["cwd", "env", "dependsOn", "idle", "maxAttempts", "retryDelaySec", "defer", "success", "killExclude", "resources", "priority", "suspendWhenDone", "suspendDelaySec", "suspendHibernate", "shutdownWhenDone", "shutdownDelaySec", "instructionsFile", "instructionsText"],
       "summary": "One line, max 200 chars; exported as PC_JOB_SUMMARY and substituted for {summary}.",
       "timeoutSec": "Per job; > 0 and <= queue maxTimeoutSec (default 7200). Never summed.",
-      "success": "exitCode (default 0) AND filesNewer (exist and newer than the attempt start) AND outputRegex (last 200 log lines) AND testReport (JUnit/NUnit XML: newer than the attempt start, at least one test, none failed; failed test names go into the failure detail).",
+      "success": "exitCode (default 0) AND filesNewer (exist and newer than the attempt start) AND outputRegex (last 200 log lines) AND testReport (JUnit/NUnit XML: newer than the attempt start, at least one test, none failed; failed test names go into the failure detail) AND contentFile (exist and newer than the attempt start, at least minBytes, matching contentRegex; use it for reports) AND engineResult (the LLM engine's final result must not report an error, even when the process exits 0).",
       "idle": "outputSec and cpuSec must both be set; kill only when output AND CPU are idle.",
       "defer": "{exitCodes (default [75]), delaySec (60), limit (60, 0 = no limit)}: exit codes meaning nothing ran; the job is re-run after delaySec without using up maxAttempts. {\"exitCodes\": []} turns it off."
     },
@@ -3485,7 +3488,7 @@ void PrintCliUsageJson() {
     }
   },
     "notes": [
-      "Use filesNewer when exit code 0 does not prove the work was done.",
+      "Use filesNewer when exit code 0 does not prove the work was done; for a report add contentFile + contentRegex (and engineResult) so writing only the headings does not count as success.",
       "Use dependsOn instead of waiting for .done files or polling.",
       "taskqueue_wait is a long poll; it returns when the queue version changes.",
       "kill_process on a task-queue attempt means 'killed attempt' and is retried (use taskqueue_cancel to stop it).",
@@ -3926,9 +3929,11 @@ int PrintResponse(const std::string& action, const std::string& respJson, bool j
                 std::string choice;
                 if (decision.is_object() && !decision.value("candidateId", std::string()).empty()) {
                     // A decided card shows what was chosen and by whom, so nothing looks unhandled.
+                    const std::string actor = decision.value("actor", std::string());
                     choice = (language == "ja" ? "選択: " : language == "es" ? "eligió: " : "chose ") +
                              TriageCandidateLabel(language, decision.value("candidateId", std::string())) + " (" +
-                             decision.value("by", std::string()) +
+                             (actor.empty() ? decision.value("by", std::string())
+                                            : actor + ": " + decision.value("by", std::string())) +
                              (decision.contains("reviewed") && decision["reviewed"].is_boolean() &&
                               !decision["reviewed"].get<bool>() ? (language == "ja" ? ", 未確認" : language == "es" ? ", sin revisar" : ", unreviewed") : "") + ")";
                 } else if (cardState == "resolved") {
@@ -4032,9 +4037,19 @@ int PrintResponse(const std::string& action, const std::string& respJson, bool j
                           << " [safe=" << (candidate.value("safe", false) ? "yes" : "no") << "]\n";
             }
             const json decision = card.value("decision", json());
-            if (decision.is_object()) std::cout << "\nDecision: " << decision.value("by", std::string())
-                << " chose " << decision.value("candidateId", std::string()) << ": "
-                << decision.value("reason", std::string()) << "\n";
+            if (decision.is_object()) {
+                std::cout << "\nDecision: " << decision.value("by", std::string())
+                    << " chose " << decision.value("candidateId", std::string()) << ": "
+                    << decision.value("reason", std::string()) << "\n";
+                const std::string actor = decision.value("actor", std::string());
+                if (!actor.empty())
+                    std::cout << "  Judgment: " << actor
+                              << (decision.contains("adviceCandidateId")
+                                      ? (decision.value("adviceFollowed", false)
+                                             ? " (followed the LLM advice)"
+                                             : " (did not follow the LLM advice)")
+                                      : "") << "\n";
+            }
             const json manual = card.value("manual", json::object());
             if (manual.is_object() && !manual.empty())
                 std::cout << "Manual route: " << manual.value("state", std::string())
@@ -6500,6 +6515,24 @@ if (subcmd == "start" || subcmd == "run") {
             reqJson << "{\"action\":\"taskqueue_wait\",\"taskqueue\":\"" << JsonEscape(tqName)
                     << "\",\"since_version\":" << since << ",\"timeout_ms\":" << timeoutMs << "}";
             subcmd = "taskqueue_wait";
+        } else if (op == "update") {
+            std::string id = argVal("--id", "");
+            std::string patch = argVal("--patch", "");
+            if (id.empty()) return failWith("--id is required.");
+            if (patch.empty()) return failWith("--patch <json> is required.");
+            nlohmann::json p = nlohmann::json::parse(patch, nullptr, false);
+            if (p.is_discarded() || !p.is_object()) return failWith("--patch must be a JSON object.");
+            // Model changes are costly: require an explicit human approval flag and a reason.
+            std::string approvedBy = argVal("--approved-by", "");
+            for (size_t i = 3; i < args.size(); ++i) {
+                if (args[i] == "--approve-model-change") approvedBy = "human";
+            }
+            const std::string reason = argVal("--reason", "");
+            if (!approvedBy.empty()) p["approved_by"] = approvedBy;
+            if (!reason.empty()) p["approval_reason"] = reason;
+            reqJson << "{\"action\":\"taskqueue_update\",\"id\":\"" << JsonEscape(id)
+                    << "\",\"patch\":" << p.dump() << "}";
+            subcmd = "taskqueue_update";
         } else if (op == "purge" && !argVal("--older-than-days", "").empty()) {
             // Age-based purge: finished jobs not updated for N days (all queues unless a name is given).
             std::string daysStr = argVal("--older-than-days", "");
@@ -6539,7 +6572,7 @@ if (subcmd == "start" || subcmd == "run") {
             subcmd = "taskqueue_purge";
         } else {
             return failWith("unknown taskqueue command: " + op +
-                            " (add, list, get, why, retry, cancel, pause, resume, graph, wait, purge)");
+                            " (add, list, get, why, retry, cancel, pause, resume, graph, wait, purge, update)");
         }
     }
     else if (subcmd == "bt") {

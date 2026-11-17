@@ -126,7 +126,17 @@ function New-CardJob {
         summary    = "ww-run ${CardId}: $title (est $estimate min, $Engine)"
         timeoutSec = $estimate * 60
         maxAttempts = 1
-        success    = [ordered]@{ exitCode = 0; filesNewer = @($report) }
+        # Success is not "the report file changed": ww-run tells the worker to finish the report
+        # with the completion marker, and engineResult fails the job when the engine itself
+        # reported an error while still exiting 0.
+        success    = [ordered]@{
+            exitCode     = 0
+            filesNewer   = @($report)
+            contentFile  = $report
+            # (?![\\s\\S]) is a true end-of-file: std::regex treats "$" as end-of-line.
+            contentRegex = '<!--\s*hancho:report-complete\s*-->\s*(?![\s\S])'
+            engineResult = $true
+        }
         resources  = [ordered]@{ write = @($write); read = @($read) }
     }
     return $job

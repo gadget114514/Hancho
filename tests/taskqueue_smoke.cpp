@@ -750,6 +750,95 @@ int main() {
               "TRF diagnosis lists the failed test: " + detail);
     }
 
+    // success.contentFile/contentRegex/minBytes: a report that only got its headings is not
+    // success, and success.engineResult catches an engine that reported an error while
+    // still exiting 0.
+    WriteFileAtomicWide(workDir + L"/ct-headings.src", "# Report\r\n\r\n## Result\r\n\r\n## Notes\r\n");
+    WriteFileAtomicWide(workDir + L"/ct-complete.src",
+                        "# Report\r\n\r\n## Result\r\nAll done.\r\n\r\n<!-- hancho:report-complete -->\r\n");
+    WriteFileAtomicWide(workDir + L"/ct-after.src", "<!-- hancho:report-complete -->\r\ntrailing text\r\n");
+    WriteFileAtomicWide(workDir + L"/ct-small.src", "ok\r\n");
+    WriteFileAtomicWide(workDir + L"/ct-engine-error.src",
+                        "{\"type\":\"result\",\"subtype\":\"success\",\"is_error\":true,"
+                        "\"result\":\"Failed to authenticate\"}\r\n");
+    WriteFileAtomicWide(workDir + L"/ct-engine-ok.src",
+                        "{\"type\":\"result\",\"subtype\":\"success\",\"is_error\":false,\"result\":\"ok\"}\r\n");
+    {
+        // std::regex treats "$" as end-of-line, so the end of file is written as a lookahead.
+        const std::string markerRegex = "<!--\\s*hancho:report-complete\\s*-->\\s*(?![\\s\\S])";
+        auto makeFileJob = [&](const std::string& id, const std::string& src, const std::string& out,
+                               nlohmann::json success) {
+            return nlohmann::json{
+                {"id", id},
+                {"command", "cmd /c type " + src + ">" + out},
+                {"summary", id},
+                {"timeoutSec", 30},
+                {"maxAttempts", 1},
+                {"cwd", workUtf8},
+                {"success", std::move(success)}};
+        };
+        auto makeStdoutJob = [&](const std::string& id, const std::string& src,
+                                 nlohmann::json success) {
+            return nlohmann::json{
+                {"id", id},
+                {"command", "cmd /c type " + src},
+                {"summary", id},
+                {"timeoutSec", 30},
+                {"maxAttempts", 1},
+                {"cwd", workUtf8},
+                {"success", std::move(success)}};
+        };
+        nlohmann::json ctJobs = nlohmann::json::array();
+        ctJobs.push_back(makeFileJob("CT1", "ct-headings.src", "ct1.md",
+                                     {{"exitCode", 0}, {"contentFile", "ct1.md"}, {"contentRegex", markerRegex}}));
+        ctJobs.push_back(makeFileJob("CT2", "ct-complete.src", "ct2.md",
+                                     {{"exitCode", 0}, {"contentFile", "ct2.md"}, {"contentRegex", markerRegex}}));
+        ctJobs.push_back(makeFileJob("CT3", "ct-after.src", "ct3.md",
+                                     {{"exitCode", 0}, {"contentFile", "ct3.md"}, {"contentRegex", markerRegex}}));
+        ctJobs.push_back(makeStdoutJob("CT4", "ct-engine-error.src", {{"exitCode", 0}, {"engineResult", true}}));
+        ctJobs.push_back(makeStdoutJob("CT5", "ct-engine-error.src", {{"exitCode", 0}, {"engineResult", false}}));
+        ctJobs.push_back(makeStdoutJob("CT6", "ct-engine-ok.src", {{"exitCode", 0}, {"engineResult", true}}));
+        ctJobs.push_back(makeFileJob("CT7", "ct-small.src", "ct7.md",
+                                     {{"exitCode", 0}, {"contentFile", "ct7.md"}, {"minBytes", 1000}}));
+        std::string addCt = tqm.TaskQueueAdd("ctq", ctJobs.dump(), 0, "", err);
+        Check(JsonGetBool(addCt, "ok", false), "content-check jobs added: " + err);
+        Check(WaitForState(tqm, "CT1", "failed", 20000), "CT1 failed: headings only");
+        Check(WaitForState(tqm, "CT2", "succeeded", 20000), "CT2 succeeded: report ends with the marker");
+        Check(WaitForState(tqm, "CT3", "failed", 20000), "CT3 failed: marker is not the last line");
+        Check(WaitForState(tqm, "CT4", "failed", 20000), "CT4 failed: engine reported an error");
+        Check(WaitForState(tqm, "CT5", "succeeded", 20000), "CT5 succeeded without engineResult");
+        Check(WaitForState(tqm, "CT6", "succeeded", 20000), "CT6 succeeded with a good engine result");
+        Check(WaitForState(tqm, "CT7", "failed", 20000), "CT7 failed: content file below minBytes");
+
+        auto failureOf = [&](const std::string& id) {
+            auto j = ParseJobJson(tqm.TaskQueueGet(id, false, 0, err));
+            if (j.contains("attempts") && j["attempts"].is_array() && !j["attempts"].empty()) {
+                const auto& a = j["attempts"][0];
+                if (a.contains("failure") && a["failure"].is_object()) {
+                    return a["failure"];
+                }
+            }
+            return nlohmann::json::object();
+        };
+        auto conditionOf = [&](const std::string& id) {
+            auto f = failureOf(id);
+            if (f.contains("detail") && f["detail"].is_object()) {
+                return f["detail"].value("condition", std::string());
+            }
+            return std::string();
+        };
+        Check(conditionOf("CT1") == "content", "CT1 diagnosis names content: " + conditionOf("CT1"));
+        Check(conditionOf("CT3") == "content", "CT3 diagnosis names content: " + conditionOf("CT3"));
+        Check(conditionOf("CT7") == "content", "CT7 diagnosis names content: " + conditionOf("CT7"));
+        Check(conditionOf("CT4") == "engineResult",
+              "CT4 diagnosis names engineResult: " + conditionOf("CT4"));
+        auto ct4Detail = failureOf("CT4");
+        Check(ct4Detail.contains("detail") && ct4Detail["detail"].is_object() &&
+                  ct4Detail["detail"].value("detail", std::string()).find("Failed to authenticate") !=
+                      std::string::npos,
+              "CT4 detail carries the engine error");
+    }
+
     // Instructions versioning: H fails, source changed, retry refreshes to rev 2.
     std::wstring instrPath = workDir + L"\\instr.md";
     WriteFileAtomicWide(instrPath, "# Task H\nDo the thing\n");
@@ -1061,6 +1150,34 @@ int main() {
 
         std::string badDefer = R"([{"id":"D3","command":"cmd /c exit 0","summary":"bad","timeoutSec":10,"defer":{"exitCodes":[0]}}])";
         Check(!JsonGetBool(tqm.TaskQueueAdd("deferq", badDefer, 0, "", err), "ok", false), "defer.exitCodes may not contain the success code");
+    }
+
+    // --- Model changes require an explicit human approval (2026-11-17 incident) ------------
+    {
+        std::string addErr;
+        const std::string modelJobs =
+            R"([{"id":"MG1","command":"cmd /c exit 1","summary":"model gate","timeoutSec":30}])";
+        Check(JsonGetBool(tqm.TaskQueueAdd("modelq", modelJobs, 0, "", addErr), "ok", false),
+              "model gate job added: " + addErr);
+        std::string gateState;
+        for (int i = 0; i < 200; ++i) {
+            gateState = GetState(tqm, "MG1");
+            if (gateState == "failed" || gateState == "succeeded") break;
+            Sleep(100);
+        }
+        Check(gateState == "failed", "model gate job failed (state=" + gateState + ")");
+        std::string err1;
+        const std::string noApproval = tqm.TaskQueueUpdate(
+            "MG1", R"({"command":"cmd /c exit 1 --model opencode-go/kimi-k3.1-pro"})", err1);
+        Check(!JsonGetBool(noApproval, "ok", false), "model change without approval is rejected");
+        std::string err2;
+        const std::string approved = tqm.TaskQueueUpdate(
+            "MG1",
+            R"({"command":"cmd /c exit 1 --model opencode-go/kimi-k3.1-pro","approved_by":"human","approval_reason":"test"})",
+            err2);
+        Check(JsonGetBool(approved, "ok", false), "model change with approval is accepted: " + err2);
+        Check(tqm.TaskQueueGet("MG1", false, 0, err2).find("[model]") != std::string::npos,
+              "model approval is recorded in notes");
     }
 
     pm.SetProcessFinishedCallback(nullptr);

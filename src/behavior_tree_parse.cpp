@@ -104,6 +104,20 @@ void ParseJobCommonFields(const json& j, const std::string& path, BtNode& node, 
             if (s.contains("testReport") && s["testReport"].is_string()) {
                 node.success.testReport = s["testReport"].get<std::string>();
             }
+            if (s.contains("contentFile") && s["contentFile"].is_string()) {
+                node.success.contentFile = s["contentFile"].get<std::string>();
+            }
+            if (s.contains("minBytes")) {
+                if (s["minBytes"].is_number_integer()) node.success.minBytes = s["minBytes"].get<long long>();
+                else ctx.AddError(path + ".success.minBytes", "must be an integer");
+            }
+            if (s.contains("contentRegex") && s["contentRegex"].is_string()) {
+                node.success.contentRegex = s["contentRegex"].get<std::string>();
+            }
+            if (s.contains("engineResult")) {
+                if (s["engineResult"].is_boolean()) node.success.engineResult = s["engineResult"].get<bool>();
+                else ctx.AddError(path + ".success.engineResult", "must be a boolean");
+            }
             if (s.contains("filesNewer") && s["filesNewer"].is_array()) {
                 for (const auto& f : s["filesNewer"]) {
                     if (f.is_string()) node.success.filesNewer.push_back(f.get<std::string>());

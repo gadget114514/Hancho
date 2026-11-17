@@ -199,6 +199,10 @@ std::string InfoPrefix(Lang lang, const std::string& key) {
     if (key == "successFilesNewer") return Pick(lang, "更新を確認するファイル: ", "Files required to be newer: ", "Archivos que deben actualizarse: ");
     if (key == "successOutputRegex") return Pick(lang, "成功出力の正規表現: ", "Success output regex: ", "Expresión regular de salida correcta: ");
     if (key == "successTestReport") return Pick(lang, "テストレポート: ", "Test report: ", "Informe de pruebas: ");
+    if (key == "successContentFile") return Pick(lang, "内容を確認するファイル: ", "File to check content: ", "Archivo cuyo contenido se comprueba: ");
+    if (key == "successMinBytes") return Pick(lang, "最小バイト数: ", "Minimum bytes: ", "Bytes mínimos: ");
+    if (key == "successContentRegex") return Pick(lang, "内容の正規表現: ", "Content regex: ", "Expresión regular del contenido: ");
+    if (key == "successEngineResult") return Pick(lang, "エンジンの結果が成功であること: ", "Engine result must be success: ", "El resultado del motor debe ser correcto: ");
     if (key == "maxAttempts") return Pick(lang, "最大試行回数: ", "Maximum attempts: ", "Intentos máximos: ");
     if (key == "retryDelaySec") return Pick(lang, "再試行間隔: ", "Retry delay: ", "Espera para reintentar: ");
     if (key == "attemptReason") return Pick(lang, "試行の終了理由: ", "Attempt ended because: ", "Motivo de fin del intento: ");

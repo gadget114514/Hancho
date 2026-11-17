@@ -25,6 +25,10 @@ what is different.
 
 - **`-QueueLocked`** (`ww-run`): for hancho-cli task-queue jobs whose `resources` already keep
   overlapping jobs apart. Only the same card blocks the run.
+- **`ww-enqueue` success check**: the job is successful only when the report ends with the
+  completion marker `<!-- hancho:report-complete -->` (checked as `contentFile` +
+  `contentRegex`) and the engine's final result did not report an error (`engineResult`).
+  A worker that wrote only the headings is a failure, not a success.
 - **`ww-enqueue`**: registers cards as hancho-cli jobs, locking `@unity-editor` for Unity cards.
   Card `Mode:` lines `static` and `tools` skip the Unity lock. The card path prefixes it accepts
   (`Assets/`, `Tools/`, `data/`) are fixed in `Get-CardPaths`; change them for another project.

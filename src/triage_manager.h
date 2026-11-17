@@ -72,6 +72,9 @@ private:
     std::string llmMode_ = "uncertain";
     std::string llmEngine_;
     std::string llmModel_;
+    // Actions the triage advisor may take. Default is read-only; "run_commands",
+    // "write_files" or "use_worker_permissions" opt into the engine's worker permission args.
+    std::vector<std::string> llmPermissions_{"read_files"};
     // How many advice engines may run at once. The runs are independent processes, but
     // bounding them keeps a burst of new cards from starting one engine per card.
     int llmConcurrency_ = 2;

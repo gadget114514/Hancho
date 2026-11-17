@@ -31,6 +31,10 @@ struct BtJobSuccess {
     std::vector<std::string> filesNewer;
     std::string outputRegex;
     std::string testReport;
+    std::string contentFile;
+    long long minBytes = 0;
+    std::string contentRegex;
+    bool engineResult = false;
 };
 
 struct BtJobResources {
