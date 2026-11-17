@@ -30,6 +30,7 @@
 #include <commdlg.h>
 #include <mmsystem.h>
 #include <map>
+#include <fstream>
 #include <sstream>
 #include <iomanip>
 #include <climits>
@@ -770,6 +771,22 @@ constexpr size_t kSupervisorHintHistoryMax = 200;
 constexpr int kHintWndWidth = 560;
 constexpr int kHintWndHeight = 210;
 
+// Token usage parsed so far from one task attempt's .events.jsonl. The file is appended
+// to while the attempt runs, so only the lines past `offset` are read on the next refresh.
+struct TaskUsageFileCache {
+    uint64_t offset = 0;
+    std::string engine;
+    std::string model;
+    uint64_t inputTokens = 0;
+    uint64_t outputTokens = 0;
+    uint64_t thinkingTokens = 0;
+    uint64_t cacheReadTokens = 0;
+    uint64_t cacheWriteTokens = 0;
+    uint64_t totalTokens = 0;
+    double costUsd = 0.0;
+    bool hasUsage = false;
+};
+
 struct DashboardState {
     ProcessManager* pm = nullptr;
     IpcServer* ipc = nullptr;
@@ -780,7 +797,7 @@ struct DashboardState {
     bool hasWindowPlacement = false;
     WINDOWPLACEMENT windowPlacement = {sizeof(WINDOWPLACEMENT)};
     int processListColumnWidths[14] = {52, 78, 100, 100, 120, 140, 85, 65, 72, 78, 70, 185, 175, 80};
-    int taskListColumnWidths[11] = {90, 350, 100, 150, 105, 115, 190, 110, 82, 150, 200};
+    int taskListColumnWidths[12] = {90, 350, 100, 150, 105, 115, 190, 110, 82, 150, 140, 200};
     HWND hwndBtnSettings = nullptr;
     HWND hwndBtnKillSel = nullptr;
     HWND hwndBtnKillAll = nullptr;
@@ -871,6 +888,10 @@ struct DashboardState {
     std::vector<std::string> taskJobStates;
     std::vector<std::wstring> taskOriginTips;  // per task row: full origin details for the hover tip
     std::vector<int> taskJobProcIds;     // latest attempt's process per task row (0 = none)
+    std::vector<std::wstring> taskUsageTips;  // per task row: full engine / token details for the hover tip
+    std::map<std::wstring, TaskUsageFileCache> taskUsageFileCache; // attempt events file -> parsed usage
+    std::map<std::wstring, std::wstring> taskAttemptEventsPath;    // jobId:attempt -> resolved events file
+    ULONGLONG taskUsagePollUntilMs = 0;  // keep polling a task's events file briefly after it ends
     int lastFollowedProcId = -1;         // process the monitor pane last auto-followed
     // What the lists and KPI cards showed last time, so an idle refresh tick can skip redrawing them.
     std::vector<std::vector<std::wstring>> procListCells;  // per row: lParam id, then 14 column texts
@@ -2568,18 +2589,19 @@ static void UpdateListHeaderSortIndicator(DashboardState* st) {
     }
 }
 
-// Task list columns: ID, Summary, State, Triage, Start, End, Running, Depends, Queue, Origin, Resources.
-static constexpr int kTaskListColumns = 11;
+// Task list columns: ID, Summary, State, Triage, Start, End, Running, Depends, Queue, Origin,
+// Owner / Cost, Resources.
+static constexpr int kTaskListColumns = 12;
 
 static const wchar_t* TaskColumnTitle(int index) {
     static const wchar_t* const ja[kTaskListColumns] = {
-        L"ID", L"サマリ", L"状態", L"判断", L"開始時刻", L"終了 / 残り時間", L"実行中", L"依存 / 理由", L"キュー", L"発行元", L"リソース"
+        L"ID", L"サマリ", L"状態", L"判断", L"開始時刻", L"終了 / 残り時間", L"実行中", L"依存 / 理由", L"キュー", L"発行元", L"担当 / コスト", L"リソース"
     };
     static const wchar_t* const en[kTaskListColumns] = {
-        L"ID", L"Summary", L"State", L"Triage", L"Start", L"End / Left", L"Running", L"Depends / Reason", L"Queue", L"Origin", L"Resources"
+        L"ID", L"Summary", L"State", L"Triage", L"Start", L"End / Left", L"Running", L"Depends / Reason", L"Queue", L"Origin", L"Owner / Cost", L"Resources"
     };
     static const wchar_t* const es[kTaskListColumns] = {
-        L"ID", L"Resumen", L"Estado", L"Triaje", L"Inicio", L"Fin / Restante", L"En curso", L"Dependencias", L"Cola", L"Origen", L"Recursos"
+        L"ID", L"Resumen", L"Estado", L"Triaje", L"Inicio", L"Fin / Restante", L"En curso", L"Dependencias", L"Cola", L"Origen", L"Responsable / Coste", L"Recursos"
     };
     if (g_uiLanguage == UiLanguage::Spanish) return es[index];
     if (g_uiLanguage == UiLanguage::English) return en[index];
@@ -2626,6 +2648,7 @@ struct TaskListRow {
     int64_t startKey = 0;  // epoch seconds of the last attempt start (0: not started yet)
     int64_t endKey = 0;    // epoch seconds of the end, or of the estimated end (0: unknown)
     std::wstring originTip;
+    std::wstring usageTip; // full engine / token / cost details, for the Owner / Cost hover tip
     std::string kind;      // running / timeout / failed / other, for the row colour
     int procId = 0;
 };
@@ -2679,7 +2702,8 @@ static int CompareTaskRows(const TaskListRow& a, const TaskListRow& b, int col) 
         case 7:  // Depends / Reason
         case 8:  // Queue
         case 9:  // Origin
-        case 10: // Resources
+        case 10: // Owner / Cost
+        case 11: // Resources
             cmp = CompareCellText(a.cells[col], b.cells[col]);
             break;
         case 4:  // Start: the full date and time of the last attempt
@@ -4725,8 +4749,9 @@ static void DisplaySupervisorHint(DashboardState* st, const std::wstring& catego
                                   const std::wstring& summary, const std::wstring& prompt,
                                   int autoDismissSec);
 
-// Column index of "Origin" in the task list (see UpdateTaskListColumnWidths).
+// Column indexes in the task list (see UpdateTaskListColumnWidths).
 static const int kTaskListOriginCol = 9;
+static const int kTaskListOwnerCol = 10;
 
 // Full text of one task-list cell. The control keeps the whole string even when the column is
 // too narrow to draw it, so this is the text that hover and "copy cell" should use.
@@ -4953,6 +4978,134 @@ static bool ProcSnapshotMatchesSearch(const ProcessSnapshot& s, const std::wstri
 static std::wstring TriageHandoffLabel(const std::string& handoffState);
 static std::wstring TriageLifecycleLabel(const std::string& lifecycle);
 
+static std::wstring FormatCompactTokens(uint64_t v);  // defined with the usage panel
+
+// Owner engine and token usage summed over a job's attempts, from their .events.jsonl files.
+struct TaskOwnerUsage {
+    std::string engine;
+    std::string model;
+    uint64_t inputTokens = 0;
+    uint64_t outputTokens = 0;
+    uint64_t thinkingTokens = 0;
+    uint64_t cacheReadTokens = 0;
+    uint64_t cacheWriteTokens = 0;
+    uint64_t totalTokens = 0;
+    double costUsd = 0.0;
+    bool hasUsage = false;
+};
+
+// Reads the lines appended to one events file since the last refresh and folds the usage
+// events into its cache entry. A missing or shortened file resets the entry.
+static void TaskUsageAccumulateFile(DashboardState* st, const std::wstring& path, TaskOwnerUsage& out) {
+    TaskUsageFileCache& entry = st->taskUsageFileCache[path];
+    WIN32_FILE_ATTRIBUTE_DATA fad = {};
+    if (!GetFileAttributesExW(path.c_str(), GetFileExInfoStandard, &fad)) {
+        entry = TaskUsageFileCache();
+    } else {
+        const uint64_t size = (static_cast<uint64_t>(fad.nFileSizeHigh) << 32) | fad.nFileSizeLow;
+        if (size < entry.offset) entry = TaskUsageFileCache();
+        if (size > entry.offset) {
+            std::ifstream in(path, std::ios::binary);
+            if (in) {
+                in.seekg(static_cast<std::streamoff>(entry.offset), std::ios::beg);
+                std::string chunk((std::istreambuf_iterator<char>(in)), std::istreambuf_iterator<char>());
+                size_t lineStart = 0;
+                while (lineStart < chunk.size()) {
+                    const size_t lineEnd = chunk.find('\n', lineStart);
+                    if (lineEnd == std::string::npos) break;  // a partial line waits for the next refresh
+                    std::string line = chunk.substr(lineStart, lineEnd - lineStart);
+                    lineStart = lineEnd + 1;
+                    if (!line.empty() && line.back() == '\r') line.pop_back();
+                    if (line.empty()) continue;
+                    nlohmann::json ev = nlohmann::json::parse(line, nullptr, false);
+                    if (ev.is_discarded() || !ev.is_object()) continue;
+                    if (ev.value("schema", std::string()) != "hancho.event/1") continue;
+                    if (ev.contains("agent") && ev["agent"].is_object()) {
+                        const auto& agent = ev["agent"];
+                        if (entry.engine.empty()) entry.engine = agent.value("type", std::string());
+                        if (entry.model.empty()) entry.model = agent.value("model", std::string());
+                    }
+                    if (ev.value("kind", std::string()) != "usage") continue;
+                    auto dataIt = ev.find("data");
+                    if (dataIt == ev.end() || !dataIt->is_object()) continue;
+                    const auto& data = *dataIt;
+                    const uint64_t inTok = data.value("inputTokens", uint64_t{0});
+                    const uint64_t outTok = data.value("outputTokens", uint64_t{0});
+                    const uint64_t thinkTok = data.value("thinkingTokens", uint64_t{0});
+                    const uint64_t cacheRead = data.value("cacheReadTokens", uint64_t{0});
+                    const uint64_t cacheWrite = data.value("cacheWriteTokens", uint64_t{0});
+                    uint64_t total = data.value("totalTokens", uint64_t{0});
+                    if (total == 0) total = inTok + outTok + thinkTok + cacheRead + cacheWrite;
+                    const double cost = data.value("costUsd", 0.0);
+                    entry.inputTokens += inTok;
+                    entry.outputTokens += outTok;
+                    entry.thinkingTokens += thinkTok;
+                    entry.cacheReadTokens += cacheRead;
+                    entry.cacheWriteTokens += cacheWrite;
+                    entry.totalTokens += total;
+                    entry.costUsd += cost;
+                    if (total > 0 || cost > 0.0) entry.hasUsage = true;
+                }
+                entry.offset += lineStart;
+            }
+        }
+    }
+    if (out.engine.empty()) out.engine = entry.engine;
+    if (out.model.empty()) out.model = entry.model;
+    out.inputTokens += entry.inputTokens;
+    out.outputTokens += entry.outputTokens;
+    out.thinkingTokens += entry.thinkingTokens;
+    out.cacheReadTokens += entry.cacheReadTokens;
+    out.cacheWriteTokens += entry.cacheWriteTokens;
+    out.totalTokens += entry.totalTokens;
+    out.costUsd += entry.costUsd;
+    if (entry.hasUsage) out.hasUsage = true;
+}
+
+static TaskOwnerUsage TaskOwnerUsageForJob(DashboardState* st, const std::string& jobId,
+                                           const std::string& jobJson, const std::string& command) {
+    TaskOwnerUsage out;
+    // Shows the worker engine before its first usage event arrives, and for plain commands
+    // (empty when the command is not one of the known agent CLIs).
+    out.engine = DetectAgentType(command, "");
+    const std::wstring logsDir = GetLogsDirectoryWide();
+    const std::wstring tqDir = PathJoinWide(logsDir, L"taskqueue");
+    for (const auto& attemptJson : SplitJsonObjectArray(jobJson, "attempts")) {
+        const int n = static_cast<int>(JsonGetInt(attemptJson, "n", 1));
+        const std::wstring cacheKey = Utf8ToWide(jobId) + L":" + std::to_wstring(n);
+        std::wstring eventsPath;
+        auto cached = st->taskAttemptEventsPath.find(cacheKey);
+        if (cached != st->taskAttemptEventsPath.end()) eventsPath = cached->second;
+        if (eventsPath.empty()) {
+            const std::wstring jobEvents = PathJoinWide(
+                tqDir, Utf8ToWide(SanitizeFileNameComponent(jobId)) + L"." + std::to_wstring(n) + L".events.jsonl");
+            // Remote attempts keep their events in the job's own file; local ones are written by
+            // the worker process as logs/proc_<pid>_<name>.events.jsonl (same source memory uses).
+            const bool remote = !JsonGetString(attemptJson, "remote_host", "").empty();
+            const int64_t pid = JsonGetInt(attemptJson, "process_id", 0);
+            if (!remote && pid > 0) {
+                auto procFiles = ListDirectoryWide(
+                    logsDir, L"proc_" + std::to_wstring(pid) + L"_*.events.jsonl");
+                if (!procFiles.empty()) eventsPath = procFiles.front();
+            }
+            if (eventsPath.empty()) {
+                WIN32_FILE_ATTRIBUTE_DATA fad = {};
+                if (GetFileAttributesExW(jobEvents.c_str(), GetFileExInfoStandard, &fad)) eventsPath = jobEvents;
+            }
+            if (!eventsPath.empty()) st->taskAttemptEventsPath[cacheKey] = eventsPath;
+        }
+        if (!eventsPath.empty()) TaskUsageAccumulateFile(st, eventsPath, out);
+    }
+    return out;
+}
+
+static std::wstring FormatTaskCost(double costUsd) {
+    wchar_t buf[32] = {};
+    if (costUsd > 0.0 && costUsd < 0.01) swprintf_s(buf, L"$%.4f", costUsd);
+    else swprintf_s(buf, L"$%.2f", costUsd);
+    return buf;
+}
+
 static void RefreshTaskQueueData(DashboardState* st, bool force = false, bool useCachedList = false) {
     if (!st || !st->hwndTaskList) return;
     if (st->listDisplayMode == ListDisplayMode::ProcessOnly) return;
@@ -4961,9 +5114,12 @@ static void RefreshTaskQueueData(DashboardState* st, bool force = false, bool us
     // this tick instead of asking the core for the same JSON a second time.
     std::string resp = useCachedList ? st->lastTaskListJson
                                      : TaskQueueListIpc(st, "", "", 0, err);
-    // Nothing to do when the queue is unchanged and no job is running (only running rows show a countdown).
+    // Nothing to do when the queue is unchanged and no job is running (only running rows show a
+    // countdown). Just after a job ends, keep polling its events file for a moment: the final
+    // usage / cost line can land slightly after the job's state changes.
     int lang = static_cast<int>(g_uiLanguage);
-    if (!force && resp == st->lastTaskListJson && lang == st->lastTaskListLang &&
+    const bool settling = GetTickCount64() < st->taskUsagePollUntilMs;
+    if (!force && !settling && resp == st->lastTaskListJson && lang == st->lastTaskListLang &&
         resp.find("\"state\":\"running\"") == std::string::npos) {
         return;
     }
@@ -5162,6 +5318,39 @@ static void RefreshTaskQueueData(DashboardState* st, bool force = false, bool us
         row.originTip = std::move(originTip);
         std::wstring resourcesStr = TaskQueueResourcesDisplay(j);
 
+        // Who runs the job (the worker CLI) and the tokens / cost its attempts used.
+        TaskOwnerUsage ownerUsage = TaskOwnerUsageForJob(st, jobId, j, JsonGetString(j, "command", ""));
+        std::wstring ownerUsageStr;
+        if (!ownerUsage.engine.empty()) ownerUsageStr = Utf8ToWide(ownerUsage.engine);
+        // Cost first: it is what the column is for, and it stays visible when the cell is narrow.
+        if (ownerUsage.hasUsage && ownerUsage.costUsd > 0.0) {
+            if (!ownerUsageStr.empty()) ownerUsageStr += L"  ";
+            ownerUsageStr += FormatTaskCost(ownerUsage.costUsd);
+        }
+        if (ownerUsage.hasUsage) {
+            if (!ownerUsageStr.empty()) ownerUsageStr += L"  ";
+            ownerUsageStr += FormatCompactTokens(ownerUsage.totalTokens) + L" tok";
+        }
+        if (ownerUsageStr.empty()) ownerUsageStr = L"-";
+        if (!ownerUsage.model.empty() || ownerUsage.hasUsage) {
+            std::wostringstream tip;
+            tip << Tr(L"担当: ", L"Owner: ", L"Responsable: ")
+                << (ownerUsage.engine.empty() ? std::wstring(L"-") : Utf8ToWide(ownerUsage.engine));
+            if (!ownerUsage.model.empty()) {
+                tip << L"\r\n" << Tr(L"モデル: ", L"Model: ", L"Modelo: ") << Utf8ToWide(ownerUsage.model);
+            }
+            if (ownerUsage.hasUsage) {
+                tip << L"\r\n" << Tr(L"トークン: ", L"Tokens: ", L"Tokens: ") << ownerUsage.totalTokens
+                    << L" (in " << ownerUsage.inputTokens << L" / out " << ownerUsage.outputTokens
+                    << L" / think " << ownerUsage.thinkingTokens
+                    << L" / cache " << (ownerUsage.cacheReadTokens + ownerUsage.cacheWriteTokens) << L")";
+                if (ownerUsage.costUsd > 0.0) {
+                    tip << L"\r\n" << Tr(L"コスト: ", L"Cost: ", L"Costo: ") << FormatTaskCost(ownerUsage.costUsd);
+                }
+            }
+            row.usageTip = tip.str();
+        }
+
         std::wstring triageStr = L"—";
         auto triageIt = st->triageJobs.find(jobId);
         if (triageIt != st->triageJobs.end()) {
@@ -5224,7 +5413,8 @@ static void RefreshTaskQueueData(DashboardState* st, bool force = false, bool us
         row.cells[7] = std::move(depsStr);
         row.cells[8] = std::move(queueStr);
         row.cells[9] = std::move(originStr);
-        row.cells[10] = std::move(resourcesStr);
+        row.cells[10] = std::move(ownerUsageStr);
+        row.cells[11] = std::move(resourcesStr);
         if (!st->taskSearchText.empty()) {
             bool matches = false;
             for (const auto& cell : row.cells) {
@@ -5246,28 +5436,38 @@ static void RefreshTaskQueueData(DashboardState* st, bool force = false, bool us
     std::vector<int> newJobProcIds;
     std::vector<std::wstring> newRows;  // kTaskListColumns cells per row, flattened
     std::vector<std::wstring> newOriginTips;  // full origin details per row, for the Origin hover tip
+    std::vector<std::wstring> newUsageTips;   // full engine / token details per row
     newJobIds.reserve(rows.size());
     newJobStates.reserve(rows.size());
     newJobProcIds.reserve(rows.size());
     newRows.reserve(rows.size() * kTaskListColumns);
     newOriginTips.reserve(rows.size());
+    newUsageTips.reserve(rows.size());
     for (const auto& r : rows) {
         newJobIds.push_back(r.id);
         newJobStates.push_back(r.kind);
         newJobProcIds.push_back(r.procId);
         newOriginTips.push_back(r.originTip);
+        newUsageTips.push_back(r.usageTip);
         for (int col = 0; col < kTaskListColumns; ++col) {
             newRows.push_back(r.cells[col]);
         }
     }
 
+    bool justEnded = false;
     for (const auto& id : st->runningTaskJobs) {
-        if (!nowRunning.count(id)) StartTaskEndBlink(st, id);
+        if (!nowRunning.count(id)) {
+            StartTaskEndBlink(st, id);
+            justEnded = true;
+        }
     }
+    // Poll a little longer so a final usage / cost event written after the end is picked up.
+    if (justEnded) st->taskUsagePollUntilMs = GetTickCount64() + 5000;
     st->runningTaskJobs = std::move(nowRunning);
     st->taskJobStates = std::move(newJobStates);
     st->taskJobProcIds = std::move(newJobProcIds);
     st->taskOriginTips = std::move(newOriginTips);
+    st->taskUsageTips = std::move(newUsageTips);
     std::wstring failureSummary = FailureClassSummary(failureCounts);
     if (!failureSummary.empty()) {
         failureSummary = Tr(L"失敗: ", L"failed: ", L"fallos: ") + failureSummary;
@@ -5822,17 +6022,17 @@ static void UpdateTaskListColumnWidths(DashboardState* st) {
     // (Resources) takes the rounding remainder.
     widths[1] = rest * 45 / 100;
     int other = rest - widths[1];
-    // Triage, Running, Depends, Queue, Origin, Resources.
-    constexpr int kFlex[6] = {3, 6, 7, 8, 9, 10};
-    const int base[6] = {150, 190, 110, 62, 150, 200};
+    // Triage, Running, Depends, Queue, Origin, Owner / Cost, Resources.
+    constexpr int kFlex[7] = {3, 6, 7, 8, 9, 10, 11};
+    const int base[7] = {150, 190, 110, 62, 150, 140, 200};
     int baseSum = 0;
     for (int b : base) baseSum += b;
     int assigned = 0;
-    for (int k = 0; k < 5; ++k) {
+    for (int k = 0; k < 6; ++k) {
         widths[kFlex[k]] = static_cast<int>(static_cast<int64_t>(other) * base[k] / baseSum);
         assigned += widths[kFlex[k]];
     }
-    widths[kFlex[5]] = other - assigned;
+    widths[kFlex[6]] = other - assigned;
 
     for (int i = 0; i < kTaskListColumns; ++i) ListView_SetColumnWidth(st->hwndTaskList, i, widths[i]);
 }
@@ -17503,7 +17703,7 @@ static LRESULT CALLBACK DashboardWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPA
             ListView_SetTextBkColor(st->hwndTaskList, g_theme.panel);
             ListView_SetTextColor(st->hwndTaskList, g_theme.listText);
             {
-                const int taskDefaultWidths[kTaskListColumns] = {90, 350, 100, 150, 105, 115, 190, 110, 82, 150, 200};
+                const int taskDefaultWidths[kTaskListColumns] = {90, 350, 100, 150, 105, 115, 190, 110, 82, 150, 140, 200};
                 for (int i = 0; i < kTaskListColumns; ++i) {
                     LVCOLUMNW lvc = {};
                     lvc.mask = LVCF_TEXT | LVCF_WIDTH | LVCF_SUBITEM;
@@ -18272,6 +18472,10 @@ static LRESULT CALLBACK DashboardWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPA
                     if (tip->iSubItem == kTaskListOriginCol && tip->iItem >= 0 &&
                         tip->iItem < static_cast<int>(st->taskOriginTips.size())) {
                         SetListInfoTip(tip, st->taskOriginTips[tip->iItem]);
+                    } else if (tip->iSubItem == kTaskListOwnerCol && tip->iItem >= 0 &&
+                               tip->iItem < static_cast<int>(st->taskUsageTips.size()) &&
+                               !st->taskUsageTips[tip->iItem].empty()) {
+                        SetListInfoTip(tip, st->taskUsageTips[tip->iItem]);
                     } else if (tip->iSubItem >= 0 && tip->iSubItem < kTaskListColumns &&
                                tip->iItem >= 0 &&
                                tip->iItem < static_cast<int>(st->lastTaskRows.size() / kTaskListColumns)) {
