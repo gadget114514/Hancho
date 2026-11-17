@@ -3032,6 +3032,7 @@ static void SyncTermSessionNotifications(DashboardState* st);
 static void SyncStreamPane(DashboardState* st);
 static void EnsureStreamPane(DashboardState* st);
 static void SaveShellConfig(const DashboardState* st);
+static void UpdateUsageViewTipText(HWND panel, DashboardState* st);
 static void EvaluateSupervisorHint(DashboardState* st, bool forceShow);
 
 static std::vector<std::string> SplitJsonObjectArray(const std::string& json, const std::string& key) {
@@ -13525,6 +13526,7 @@ static LRESULT CALLBACK SettingsWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPAR
                 ds->dash->usageGraphMode =
                     (SendMessageW(ds->chkUsageGraph, BM_GETCHECK, 0, 0) == BST_CHECKED) ? 1 : 0;
                 SaveShellConfig(ds->dash);
+                UpdateUsageViewTipText(ds->dash->hwndUsagePanel, ds->dash);
                 InvalidateRect(ds->dash->hwndUsagePanel, nullptr, FALSE);
                 return 0;
             }

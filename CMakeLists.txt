@@ -811,6 +811,7 @@ add_executable(bt_ipc_smoke
     tests/bt_ipc_smoke.cpp
     src/ipc_server.cpp
     src/ipc_server_remote.cpp
+    src/power.cpp
     src/webui_server.cpp
     src/ipmsg.cpp
     src/ipmsg_handler.cpp
@@ -882,6 +883,7 @@ target_link_libraries(bt_ipc_smoke PRIVATE
     windowscodecs
     crypt32
     ws2_32
+    powrprof
     "${CMAKE_CURRENT_SOURCE_DIR}/lib/libsixel.lib"
 )
 
