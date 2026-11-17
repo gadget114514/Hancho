@@ -145,6 +145,25 @@ hancho-cli.exe taskqueue retry --failed
 hancho-cli.exe taskqueue retry --failed main --since 6h
 ```
 
+**Quick fix (tiny deterministic edits):**
+
+A one-character fix does not need a coding agent. `quickfix` applies one exact
+replacement as a normal task-queue job with `maxAttempts=1` and a short timeout.
+
+```powershell
+# Replace the first occurrence in one file; the job fails if the text is absent.
+hancho-cli.exe quickfix --file src/Foo.cs --find "Retun" --replace "Return"
+
+# Replace every occurrence and require the result to match a regex.
+hancho-cli.exe quickfix --file src/Foo.cs --find "oldName" --replace "newName" --all --check "newName"
+
+# A narrower timeout and a custom queue/id
+hancho-cli.exe quickfix --file src/Foo.cs --find "x" --replace "y" --timeout-sec 120 --queue quickfix
+```
+
+The job runs PowerShell locally (no LLM). Use `--check-literal` to treat
+`--check` as plain text. For a larger change, register a worker job instead.
+
 **Triage (reviewing failures and other attention cards):**
 
 ```powershell

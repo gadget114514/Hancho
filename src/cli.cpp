@@ -2611,6 +2611,14 @@ TASK QUEUE:
       JUnit report, then exit 0 (all succeeded), 1 (failure/blocked) or 2 (cancelled/
       interrupted). --report implies waiting.
 
+  quickfix --file <path> --find <text> --replace <text> [--all] [--check <regex>]
+           [--check-literal] [--cwd <dir>] [--timeout-sec <n>] [--id <id>]
+           [--summary <text>] [--queue <name>]
+      Deterministic one-file edit as a task-queue job (no LLM, no full test suite).
+      Use this for tiny fixes instead of starting a coding agent. The job has
+      maxAttempts=1 and a short timeout; a missing find text or a failed check
+      fails the job. --all replaces every occurrence.
+
   taskqueue add --file <jobs.json> [--taskqueue <name>] [--concurrency <n>] [--notify-file <path>]
                 [--origin-label <text>]
       Register jobs (array, or an object with "jobs"/"taskqueue"/"concurrency").
@@ -2639,15 +2647,16 @@ TASK QUEUE:
       overlapping card) goes back to pending after delaySec without using up
       maxAttempts; after limit deferrals (0 = no limit) it is an ordinary failure.
 
-  taskqueue list [<name>] [--state <state>] [--since <period>] [--origin <self|label|session>] [--bt <id>]
+  taskqueue list [<name>] [--state <state>] [--since <period>] [--origin <self|label|session>] [--bt <id>] [--no-planned]
       List jobs with state, queue, summary and blockedBy. --since keeps only
       jobs updated within the period (30m, 6h, 2d), e.g. --since 6h.
       Each job also carries resource_wait ("holder: resource" while a pending
       job waits for a resource lock, otherwise null) and timing_feedback.
       --bt <id> lists every job of a behavior tree across its parallel branch queues.
       --origin self keeps only the jobs this session added.
-      The dashboard also shows idle BT leaves as provisional "planned" rows and
-      counts their estimates in the remaining time; they are not stored jobs.
+      Idle BT leaves appear as provisional "planned" rows so the queue shows the
+      work a running tree may start; --no-planned leaves them out. They are not
+      stored jobs and disappear when the tree moves on.
 
   taskqueue record-plain --cmd <cmd> [--name <name>] [--exit-code <n>] [--log <path>] [--summary <text>]
       Record a plain execution outside a queue into logs/taskqueues/plain.json.
@@ -3045,7 +3054,7 @@ void PrintCliUsageJson() {
       "usage": "hancho-cli taskqueue <add|list|get|why|retry|cancel|pause|resume|graph|wait|purge|update> ...",
       "subcommands": [
         {"name": "add", "usage": "hancho-cli taskqueue add --file <jobs.json> [--taskqueue <name>] [--concurrency <n>] [--notify-file <path>] [--origin-label <text>]", "description": "Register jobs. Each job needs id, command, summary and timeoutSec; dependsOn replaces shell chaining. The caller's session id, working folder and --origin-label are recorded as the job's origin. suspendWhenDone/suspendDelaySec/suspendHibernate arm the PC to suspend, and shutdownWhenDone/shutdownDelaySec arm it to shut down, after that job and all other work is idle. Do not set hidden on jobs you register: it is reserved for Hancho's internal jobs and hides the row unless Show hidden tasks is on."},
-        {"name": "list", "usage": "hancho-cli taskqueue list [<name>] [--state <state>] [--since <period>] [--origin <self|label|session>] [--bt <id>]", "description": "List jobs with state, queue, summary and blockedBy. --since keeps only jobs updated within the period (e.g. 30m, 6h, 2d). --origin self keeps only the jobs this session added. --bt <id> lists every job of a behavior tree across its parallel branch queues. Each job also carries resource_wait and, once succeeded with estimateSec, timing_feedback (see audit). The dashboard adds provisional 'planned' rows for idle BT leaves; taskqueue_list returns them only with include_planned: true."},
+        {"name": "list", "usage": "hancho-cli taskqueue list [<name>] [--state <state>] [--since <period>] [--origin <self|label|session>] [--bt <id>] [--no-planned]", "description": "List jobs with state, queue, summary and blockedBy. --since keeps only jobs updated within the period (e.g. 30m, 6h, 2d). --origin self keeps only the jobs this session added. --bt <id> lists every job of a behavior tree across its parallel branch queues. Provisional 'planned' rows for idle BT leaves are included by default; --no-planned hides them. Each job also carries resource_wait and, once succeeded with estimateSec, timing_feedback (see audit)."},
         {"name": "record-plain", "usage": "hancho-cli taskqueue record-plain --cmd <cmd> [--name <name>] [--exit-code <n>] [--log <path>] [--summary <text>]", "description": "Record a plain execution outside a queue into logs/taskqueues/plain.json."},
         {"name": "get", "usage": "hancho-cli taskqueue get <id> [--rev <n>] [--no-instructions]", "description": "Show one job with attempts and instructions."},
         {"name": "why", "usage": "hancho-cli taskqueue why <id>", "description": "Explain why the last attempt failed: failure class, confidence, summary, suggested action, last activity and evidence (event seq / log line), plus the class of every attempt. Reads the job without instructions."},
@@ -3077,6 +3086,21 @@ void PrintCliUsageJson() {
       "options": [{"name": "--json", "description": "Print the raw IPC response."}]
     },)";
     std::cout << R"(
+    {
+      "name": "quickfix",
+      "description": "Apply one exact file edit as a deterministic task-queue job (no LLM, no full test suite). Use it for tiny fixes instead of starting a coding agent. The job runs with maxAttempts=1 and a short timeout; a missing find text or a failed check fails the job.",
+      "usage": "hancho-cli quickfix --file <path> --find <text> --replace <text> [--all] [--check <regex>] [--check-literal] [--cwd <dir>] [--timeout-sec <n>] [--id <id>] [--summary <text>] [--queue <name>]",
+      "options": [
+        {"name": "--file", "value": "<path>", "description": "File to edit (absolute or relative to the current directory)."},
+        {"name": "--find", "value": "<text>", "description": "Exact text to find (ordinal match)."},
+        {"name": "--replace", "value": "<text>", "description": "Replacement text."},
+        {"name": "--all", "description": "Replace every occurrence instead of the first."},
+        {"name": "--check", "value": "<regex>", "description": "After the edit, the file must match this regex."},
+        {"name": "--check-literal", "description": "Treat --check as a literal string."},
+        {"name": "--timeout-sec", "value": "<n>", "description": "Job timeout (default 300, 10..3600)."},
+        {"name": "--queue", "value": "<name>", "description": "Task queue name (default quickfix)."}
+      ]
+    },
     {
       "name": "bt",
       "description": "Behavior trees: submit a whole multi-step workflow (branches, fix loops, checks, worker LLM steps, escalations) as one JSON document; Hancho runs it and each leaf becomes an ordinary task-queue job. See agent.behavior_tree and doc/behavior-tree.md.",
@@ -6446,11 +6470,17 @@ if (subcmd == "start" || subcmd == "run") {
             std::string originFilter = argVal("--origin", "");
             std::string btFilter = argVal("--bt", "");
             if (originFilter == "self") originFilter = CallerSelfOriginFilter();
+            // Planned BT rows are part of the queue the user sees; --no-planned hides them.
+            bool includePlanned = true;
+            for (size_t i = 3; i < args.size(); ++i) {
+                if (args[i] == "--no-planned") includePlanned = false;
+            }
             reqJson << "{\"action\":\"taskqueue_list\",\"taskqueue\":\"" << JsonEscape(tqName)
                     << "\",\"state\":\"" << JsonEscape(state) << "\""
                     << ",\"since\":\"" << JsonEscape(since) << "\""
                     << ",\"origin\":\"" << JsonEscape(originFilter) << "\""
-                    << ",\"bt\":\"" << JsonEscape(btFilter) << "\"}";
+                    << ",\"bt\":\"" << JsonEscape(btFilter) << "\""
+                    << ",\"include_planned\":" << (includePlanned ? "true" : "false") << "}";
             subcmd = "taskqueue_list";
         } else if (op == "get") {
             std::string id = firstPositional(3);
@@ -6574,6 +6604,77 @@ if (subcmd == "start" || subcmd == "run") {
             return failWith("unknown taskqueue command: " + op +
                             " (add, list, get, why, retry, cancel, pause, resume, graph, wait, purge, update)");
         }
+    }
+    else if (subcmd == "quickfix") {
+        auto argVal = [&args](const std::string& flag, const std::string& def) -> std::string {
+            for (size_t i = 2; i + 1 < args.size(); ++i) {
+                if (args[i] == flag) return args[i + 1];
+            }
+            return def;
+        };
+        const std::string file = argVal("--file", "");
+        const std::string find = argVal("--find", "");
+        std::string replace;
+        bool hasReplace = false;
+        bool all = false;
+        bool checkLiteral = false;
+        for (size_t i = 2; i < args.size(); ++i) {
+            if (args[i] == "--replace" && i + 1 < args.size()) { replace = args[++i]; hasReplace = true; }
+            else if (args[i] == "--all") all = true;
+            else if (args[i] == "--check-literal") checkLiteral = true;
+        }
+        if (file.empty() || find.empty() || !hasReplace) {
+            if (jsonOutput) {
+                std::cout << "{\"ok\":false,\"error\":\"quickfix requires --file <path> --find <text> --replace <text>\"}\n";
+            } else {
+                std::cerr << "Error: quickfix requires --file <path> --find <text> --replace <text>\n";
+            }
+            return 1;
+        }
+        const std::string id = argVal("--id", "quickfix-" + std::to_string(static_cast<long long>(time(nullptr))));
+        const std::string queue = argVal("--queue", "quickfix");
+        const std::string summary = argVal("--summary", "quickfix: " + file);
+        const std::string check = argVal("--check", "");
+        int timeoutSec = 300;
+        const std::string timeoutStr = argVal("--timeout-sec", "");
+        if (!timeoutStr.empty()) {
+            try { timeoutSec = std::stoi(timeoutStr); } catch (...) { timeoutSec = 300; }
+        }
+        if (timeoutSec < 10) timeoutSec = 10;
+        if (timeoutSec > 3600) timeoutSec = 3600;
+
+        const std::wstring absFile = ResolveAbsolutePathWide(Utf8ToWide(file));
+        std::wstring cwd = std::filesystem::path(absFile).parent_path().wstring();
+        const std::string cwdArg = argVal("--cwd", "");
+        if (!cwdArg.empty()) cwd = ResolveAbsolutePathWide(Utf8ToWide(cwdArg));
+
+        QuickFixSpec spec;
+        spec.file = WideToUtf8(absFile);
+        spec.find = find;
+        spec.replace = replace;
+        spec.check = check;
+        spec.all = all;
+        spec.checkLiteral = checkLiteral;
+
+        const std::wstring scriptDir = PathJoinWide(GetLogsDirectoryWide(), L"quickfix");
+        EnsureDirectoryWide(scriptDir);
+        const std::wstring scriptPath = PathJoinWide(scriptDir,
+            Utf8ToWide(SanitizeFileNameComponent(id)) + L".ps1");
+        WriteFileAtomicWide(scriptPath, "\xEF\xBB\xBF" + BuildQuickFixPowerShell(spec));
+
+        nlohmann::json job = {
+            {"id", id},
+            {"summary", summary},
+            {"command", BuildQuickFixCommandLine(scriptPath)},
+            {"cwd", WideToUtf8(cwd)},
+            {"timeoutSec", timeoutSec},
+            {"maxAttempts", 1}
+        };
+        nlohmann::json jobs = nlohmann::json::array({job});
+        reqJson << "{\"action\":\"taskqueue_add\",\"taskqueue\":\"" << JsonEscape(queue)
+                << "\",\"jobs\":" << jobs.dump()
+                << ",\"concurrency\":1,\"origin\":" << BuildCallerOriginJson("hancho-cli-cli", "") << "}";
+        subcmd = "taskqueue_add";
     }
     else if (subcmd == "bt") {
         auto printBtHelp = []() {
@@ -6710,6 +6811,7 @@ if (subcmd == "start" || subcmd == "run") {
             if (id.empty()) return failWith("tasks requires --id <id>");
             jReq["action"] = "taskqueue_list";
             jReq["bt"] = id;
+            jReq["include_planned"] = true;
             subcmd = "taskqueue_list";
         } else if (op == "get") {
             if (id.empty()) return failWith("get requires --id <id>");

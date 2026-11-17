@@ -5,6 +5,7 @@
 #include "llm_stream.h"
 #include "nlohmann/json.hpp"
 #include <fstream>
+#include <filesystem>
 #include <iostream>
 #include <sstream>
 #include <io.h>
@@ -529,15 +530,32 @@ int RunMcpServer() {
                 << "},\"required\":[\"taskqueue\",\"jobs\"]}"
                 << "},"
                 << "{"
+                << "\"name\":\"quickfix\","
+                << "\"description\":\"Apply one exact file edit as a deterministic task-queue job (no LLM, no full test suite). Use this for tiny fixes instead of starting a coding agent. The job runs with maxAttempts=1 and a short timeout; a missing find text or a failed check fails the job.\","
+                << "\"inputSchema\":{\"type\":\"object\",\"properties\":{"
+                << "\"file\":{\"type\":\"string\",\"description\":\"File to edit\"},"
+                << "\"find\":{\"type\":\"string\",\"description\":\"Exact text to find (ordinal match)\"},"
+                << "\"replace\":{\"type\":\"string\",\"description\":\"Replacement text\"},"
+                << "\"all\":{\"type\":\"boolean\",\"description\":\"Replace every occurrence instead of the first\"},"
+                << "\"check\":{\"type\":\"string\",\"description\":\"After the edit, the file must match this regex\"},"
+                << "\"checkLiteral\":{\"type\":\"boolean\",\"description\":\"Treat check as a literal string\"},"
+                << "\"cwd\":{\"type\":\"string\",\"description\":\"Working directory (default: the file's directory)\"},"
+                << "\"timeoutSec\":{\"type\":\"integer\",\"description\":\"Job timeout in seconds (default 300, 10..3600)\"},"
+                << "\"id\":{\"type\":\"string\",\"description\":\"Job id (default quickfix-<epoch>)\"},"
+                << "\"summary\":{\"type\":\"string\",\"description\":\"One-line summary\"},"
+                << "\"queue\":{\"type\":\"string\",\"description\":\"Task queue name (default quickfix)\"}"
+                << "},\"required\":[\"file\",\"find\",\"replace\"]}"
+                << "},"
+                << "{"
                  << "\"name\":\"taskqueue_list\","
-                 << "\"description\":\"List task queue jobs with state, attempts, last reason and blockedBy. Failed jobs carry the same top-level failure record (class, summary, suggestedAction, evidence) as taskqueue_get. Set includePlanned=true to add provisional 'planned' rows for idle job/worker leaves of running behavior trees; they are not stored jobs.\","
+                 << "\"description\":\"List task queue jobs with state, attempts, last reason and blockedBy. Failed jobs carry the same top-level failure record (class, summary, suggestedAction, evidence) as taskqueue_get. Provisional 'planned' rows for idle job/worker leaves of running behavior trees are included by default; set includePlanned=false to omit them. They are not stored jobs.\","
                 << "\"inputSchema\":{\"type\":\"object\",\"properties\":{"
                 << "\"taskqueue\":{\"type\":\"string\",\"description\":\"Optional task queue name (all queues when omitted)\"},"
                 << "\"state\":{\"type\":\"string\",\"description\":\"Optional state filter: pending, planned, running, succeeded, failed, blocked, cancelled\"},"
                 << "\"since\":{\"type\":\"string\",\"description\":\"Optional time window: only jobs updated within this period, e.g. 30m, 6h, 2d\"},"
                 << "\"origin\":{\"type\":\"string\",\"description\":\"Optional: 'self' for only the jobs your session added, or an origin label or session id (prefix)\"},"
                 << "\"bt\":{\"type\":\"string\",\"description\":\"Optional behavior-tree id: list every job of that tree across its parallel branch queues\"},"
-                << "\"includePlanned\":{\"type\":\"boolean\",\"description\":\"Include provisional planned rows for idle job/worker leaves of running behavior trees (default false)\"}"
+                << "\"includePlanned\":{\"type\":\"boolean\",\"description\":\"Include provisional planned rows for idle job/worker leaves of running behavior trees (default true; set false to omit)\"}"
                 << "}}"
                 << "},"
                 << "{"
@@ -1261,6 +1279,61 @@ int RunMcpServer() {
                 int64_t waitMs = JsonGetInt(argsJson, "wait_ms", 30000);
                 ipcReq << "{\"action\":\"wait\",\"id\":" << id << ",\"wait_ms\":" << waitMs << "}";
             }
+            else if (toolName == "quickfix") {
+                nlohmann::json qa = nlohmann::json::parse(argsJson, nullptr, false);
+                const std::string file = JsonGetString(argsJson, "file", "");
+                const std::string find = JsonGetString(argsJson, "find", "");
+                if (file.empty() || find.empty() || !qa.is_object() || !qa.contains("replace")) {
+                    EmitLine(BuildMcpToolResult(rpcId,
+                        "quickfix requires file, find and replace", true));
+                    continue;
+                }
+                const std::string replace = qa["replace"].is_string() ? qa["replace"].get<std::string>() : "";
+                const std::string check = JsonGetString(argsJson, "check", "");
+                const bool all = JsonGetBool(argsJson, "all", false);
+                const bool checkLiteral = JsonGetBool(argsJson, "checkLiteral", false) ||
+                                          JsonGetBool(argsJson, "check_literal", false);
+                int timeoutSec = static_cast<int>(JsonGetInt(argsJson, "timeoutSec",
+                    JsonGetInt(argsJson, "timeout_sec", 300)));
+                if (timeoutSec < 10) timeoutSec = 10;
+                if (timeoutSec > 3600) timeoutSec = 3600;
+                const std::string queue = JsonGetString(argsJson, "queue", "quickfix");
+                const std::string id = JsonGetString(argsJson, "id",
+                    "quickfix-" + std::to_string(static_cast<long long>(time(nullptr))));
+                const std::string summary = JsonGetString(argsJson, "summary", "quickfix: " + file);
+
+                const std::wstring absFile = ResolveAbsolutePathWide(Utf8ToWide(file));
+                std::wstring cwd = std::filesystem::path(absFile).parent_path().wstring();
+                const std::string cwdArg = JsonGetString(argsJson, "cwd", "");
+                if (!cwdArg.empty()) cwd = ResolveAbsolutePathWide(Utf8ToWide(cwdArg));
+
+                QuickFixSpec spec;
+                spec.file = WideToUtf8(absFile);
+                spec.find = find;
+                spec.replace = replace;
+                spec.check = check;
+                spec.all = all;
+                spec.checkLiteral = checkLiteral;
+                const std::wstring scriptDir = PathJoinWide(GetLogsDirectoryWide(), L"quickfix");
+                EnsureDirectoryWide(scriptDir);
+                const std::wstring scriptPath = PathJoinWide(scriptDir,
+                    Utf8ToWide(SanitizeFileNameComponent(id)) + L".ps1");
+                WriteFileAtomicWide(scriptPath, "\xEF\xBB\xBF" + BuildQuickFixPowerShell(spec));
+
+                nlohmann::json job = {
+                    {"id", id},
+                    {"summary", summary},
+                    {"command", BuildQuickFixCommandLine(scriptPath)},
+                    {"cwd", WideToUtf8(cwd)},
+                    {"timeoutSec", timeoutSec},
+                    {"maxAttempts", 1}
+                };
+                nlohmann::json jobs = nlohmann::json::array({job});
+                ipcReq << "{\"action\":\"taskqueue_add\",\"taskqueue\":\"" << JsonEscape(queue)
+                       << "\",\"jobs\":" << jobs.dump()
+                       << ",\"concurrency\":1,\"origin\":"
+                       << BuildCallerOriginJson(mcpClient, "") << "}";
+            }
             else if (toolName == "taskqueue_add") {
                 std::string tqName = JsonGetString(argsJson, "taskqueue", "");
                 std::string jobsRaw = ExtractRawJsonValue(argsJson, "jobs");
@@ -1280,7 +1353,7 @@ int RunMcpServer() {
                 std::string originFilter = JsonGetString(argsJson, "origin", "");
                 if (originFilter == "self") originFilter = CallerSelfOriginFilter();
                 const bool includePlanned = JsonGetBool(argsJson, "includePlanned",
-                                                         JsonGetBool(argsJson, "include_planned", false));
+                                                         JsonGetBool(argsJson, "include_planned", true));
                 ipcReq << ",\"origin\":\"" << JsonEscape(originFilter) << "\""
                        << ",\"bt\":\"" << JsonEscape(JsonGetString(argsJson, "bt", "")) << "\""
                        << ",\"include_planned\":" << (includePlanned ? "true" : "false") << "}";

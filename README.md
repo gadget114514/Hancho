@@ -6,7 +6,7 @@
 
 Built around that one idea: a ConPTY multi-terminal dashboard, a task queue with dependencies, timeouts and retries, behavior trees for multi-step plans, and control from both **MCP** and the **CLI**. It treats `claude`, `opencode`, `codex`, build scripts and interactive shells alike.
 
-Check the version with `hancho-cli.exe --version` (current: 0.9.23).
+Check the version with `hancho-cli.exe --version` (current: 0.9.26).
 
 ### Who is this for?
 
@@ -119,6 +119,15 @@ The application icons are modeled on the character "Telephone Cat" (電話猫, D
 ## Release Notes
 
 
+
+### v0.9.26
+- **Quick fix**: `hancho-cli quickfix --file <path> --find <text> --replace <text> [--all] [--check <regex>]` and the MCP `quickfix` tool apply a tiny deterministic edit as a short task-queue job (no LLM, `maxAttempts=1`). The job fails when the text is absent or the check does not match.
+- **Triage actions and status**: the action pane has a "🚫 Ignore" button (a reason is required; process cards are recorded as acknowledged). The status column now combines the card state with the decision/result and shows Rerunning, Handled, Awaiting decision, Ignored and so on, so a retried job that succeeded no longer looks pending.
+- **Planned rows everywhere**: `taskqueue_list` includes provisional `planned` rows for idle behavior-tree leaves by default in the desktop dashboard, CLI, Web UI and MCP. The CLI has `--no-planned` and MCP `includePlanned: false` to omit them.
+- **Task list owner and cost**: the new Owner / Cost column shows the owning engine and sums token usage and USD cost over a job's attempts; hover for the full breakdown.
+- **Runaway-worker guard**: LLM jobs without an explicit timeout get a 10-minute idle/hang timeout (`llm_idle_timeout_sec`), and changing a job's model in `taskqueue update` requires human approval (`--approve-model-change --reason "..."`, `require_model_change_approval`).
+- **Supervisor permissions**: `triage_supervisor_permissions` controls what the batch triage supervisor may do (read files, run commands, write files, or the worker permissions); the default keeps the previous worker behaviour.
+- **Docs and assets**: updated CLI, MCP, task-queue, triage and skill docs, the 2026-11-17 incident notes, and new icon source images.
 
 ### v0.9.25
 - **Shut down when tasks finish**: `hancho-cli power shutdown --after-job <id>` (or a job's `shutdownWhenDone` / `shutdownDelaySec`) powers the PC off after that job and every other job and Hancho-managed process is idle. `power suspend` is unchanged; when both are armed, a shutdown wins. Power actions need the shutdown privilege, so run Hancho elevated if Windows refuses.

@@ -201,6 +201,24 @@ int main() {
         Check(!ValidateOutput("[]", schema, err), "array when object expected fails");
     }
 
+    // 8. Quick-fix script generation (deterministic one-file edit, no LLM)
+    {
+        QuickFixSpec spec;
+        spec.file = "C:\\work\\a'b.cs";
+        spec.find = "Retun";
+        spec.replace = "Return";
+        spec.check = "Return";
+        spec.all = true;
+        const std::string ps = BuildQuickFixPowerShell(spec);
+        Check(ps.find("find text not found") != std::string::npos, "quickfix script fails when find is absent");
+        Check(ps.find("check did not match") != std::string::npos, "quickfix script fails when check does not match");
+        Check(ps.find("a''b.cs") != std::string::npos, "quickfix escapes single quotes for PowerShell");
+        Check(ps.find("$text.Replace($find, $replace)") != std::string::npos, "quickfix --all replaces every occurrence");
+        const std::string cmd = BuildQuickFixCommandLine(L"C:\\work\\quickfix.ps1");
+        Check(cmd.find("-File \"C:\\work\\quickfix.ps1\"") != std::string::npos,
+              "quickfix command runs the script file: " + cmd);
+    }
+
     std::printf("%s (%d failures)\n", g_failures ? "FAILED" : "ALL PASSED", g_failures);
     return g_failures ? 1 : 0;
 }

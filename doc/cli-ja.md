@@ -99,6 +99,25 @@ hancho-cli.exe taskqueue wait main --since 0 --timeout-ms 30000
 hancho-cli.exe taskqueue retry A
 ```
 
+**クイック修正（小さな決定的編集）:**
+
+1 文字修正にコーディングエージェントは不要です。`quickfix` は 1 箇所の置換を
+`maxAttempts=1`・短いタイムアウトの通常のタスクキュー ジョブとして適用します。
+
+```powershell
+# 最初の 1 箇所を置換。文字列がなければジョブは失敗します。
+hancho-cli.exe quickfix --file src/Foo.cs --find "Retun" --replace "Return"
+
+# 全箇所を置換し、結果が正規表現に一致することを確認
+hancho-cli.exe quickfix --file src/Foo.cs --find "oldName" --replace "newName" --all --check "newName"
+
+# タイムアウトとキュー/id を指定
+hancho-cli.exe quickfix --file src/Foo.cs --find "x" --replace "y" --timeout-sec 120 --queue quickfix
+```
+
+ジョブはローカルで PowerShell を実行します（LLM なし）。`--check` をリテラル扱い
+にするには `--check-literal` を付けます。大きな変更は worker ジョブにしてください。
+
 **トリアージ（失敗など、対応が必要なカードの確認）:**
 
 ```powershell

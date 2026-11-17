@@ -1163,6 +1163,7 @@ body {
 
 .badge-running { background-color: var(--running-bg); color: var(--running); }
 .badge-pending { background-color: var(--pending-bg); color: var(--pending); }
+.badge-planned { background-color: var(--pending-bg); color: var(--pending); border: 1px dashed var(--pending); opacity: 0.8; }
 .badge-blocked { background-color: var(--blocked-bg); color: var(--blocked); }
 .badge-completed, .badge-succeeded { background-color: var(--success-bg); color: var(--success); }
 .badge-failed { background-color: var(--error-bg); color: var(--error); }
@@ -2086,7 +2087,7 @@ const char kAppJs_1[] = R"JS_1(    if (data.events && Array.isArray(data.events)
     if (state.activeTab === 'processes') {
       sendWsRequest({ action: 'list' });
     } else if (state.activeTab === 'taskqueue') {
-      sendWsRequest({ action: 'taskqueue_list' });
+      sendWsRequest({ action: 'taskqueue_list', include_planned: true });
       sendWsRequest({ action: 'taskqueue_resource_locks' });
     } else if (state.activeTab === 'monitor') {
       sendWsRequest({ action: 'list' });
@@ -2098,7 +2099,7 @@ const char kAppJs_1[] = R"JS_1(    if (data.events && Array.isArray(data.events)
       }
     } else if (state.activeTab === 'diagnosis') {
       sendWsRequest({ action: 'taskqueue_diagnose', breakdown: true });
-      sendWsRequest({ action: 'taskqueue_list', state: 'failed' });
+      sendWsRequest({ action: 'taskqueue_list', state: 'failed', include_planned: true });
     } else if (state.activeTab === 'memory') {
       sendWsRequest({ action: 'memory_storage_stats' });
       searchMemory();
@@ -2193,7 +2194,7 @@ const char kAppJs_1[] = R"JS_1(    if (data.events && Array.isArray(data.events)
   function getBadgeClass(stateStr) {
     const s = (stateStr || '').toLowerCase();
     if (s === 'running') return 'badge badge-running';
-    if (s === 'pending' || s === 'queued' || s === 'waiting') return 'badge badge-pending';
+    if (s === 'pending' || s === 'queued' || s === 'waiting' || s === 'planned') return 'badge badge-planned';
     if (s === 'blocked') return 'badge badge-blocked';
     if (s === 'completed' || s === 'succeeded') return 'badge badge-completed';
     if (s === 'failed' || s === 'timed_out' || s === 'idle_timed_out') return 'badge badge-failed';
@@ -2354,7 +2355,7 @@ const char kAppJs_1[] = R"JS_1(    if (data.events && Array.isArray(data.events)
       if (filter !== 'all') {
         if (filter === 'succeeded' && st !== 'succeeded' && st !== 'completed') return false;
         if (filter === 'failed' && st !== 'failed' && st !== 'timed_out' && st !== 'idle_timed_out') return false;
-        if (filter === 'pending' && st !== 'pending' && st !== 'queued' && st !== 'waiting') return false;
+        if (filter === 'pending' && st !== 'pending' && st !== 'queued' && st !== 'waiting' && st !== 'planned') return false;
         if (filter === 'running' && st !== 'running') return false;
         if (filter === 'cancelled' && st !== 'cancelled' && st !== 'killed') return false;
       }
@@ -2444,7 +2445,7 @@ const char kAppJs_2[] = R"JS_2(    if (filtered.length === 0) {
         e.stopPropagation();
         const key = this.getAttribute('data-key');
         sendWsRequest({ action: 'taskqueue_retry', id: key });
-        setTimeout(() => sendWsRequest({ action: 'taskqueue_list' }), 200);
+        setTimeout(() => sendWsRequest({ action: 'taskqueue_list', include_planned: true }), 200);
       });
     });
 
@@ -2453,7 +2454,7 @@ const char kAppJs_2[] = R"JS_2(    if (filtered.length === 0) {
         e.stopPropagation();
         const key = this.getAttribute('data-key');
         sendWsRequest({ action: 'taskqueue_cancel', id: key });
-        setTimeout(() => sendWsRequest({ action: 'taskqueue_list' }), 200);
+        setTimeout(() => sendWsRequest({ action: 'taskqueue_list', include_planned: true }), 200);
       });
     });
   }
@@ -3053,7 +3054,7 @@ const char kAppJs_4[] = R"JS_4(        if (p.getAttribute('data-filter') === st)
   elBtnTqPurge.addEventListener('click', () => {
     if (confirm('Purge completed, failed, and cancelled jobs from queue?')) {
       sendWsRequest({ action: 'taskqueue_purge', taskqueue: '', states: ['completed', 'failed', 'cancelled'] });
-      setTimeout(() => sendWsRequest({ action: 'taskqueue_list' }), 300);
+      setTimeout(() => sendWsRequest({ action: 'taskqueue_list', include_planned: true }), 300);
     }
   });
 
@@ -3065,7 +3066,7 @@ const char kAppJs_4[] = R"JS_4(        if (p.getAttribute('data-filter') === st)
     if (state.selectedJob) {
       sendWsRequest({ action: 'taskqueue_retry', id: state.selectedJob.key || state.selectedJob.id });
       elModalJobDetails.classList.add('hidden');
-      setTimeout(() => sendWsRequest({ action: 'taskqueue_list' }), 300);
+      setTimeout(() => sendWsRequest({ action: 'taskqueue_list', include_planned: true }), 300);
     }
   });
 
@@ -3073,7 +3074,7 @@ const char kAppJs_4[] = R"JS_4(        if (p.getAttribute('data-filter') === st)
     if (state.selectedJob) {
       sendWsRequest({ action: 'taskqueue_cancel', id: state.selectedJob.key || state.selectedJob.id });
       elModalJobDetails.classList.add('hidden');
-      setTimeout(() => sendWsRequest({ action: 'taskqueue_list' }), 300);
+      setTimeout(() => sendWsRequest({ action: 'taskqueue_list', include_planned: true }), 300);
     }
   });
 
@@ -3109,7 +3110,7 @@ const char kAppJs_4[] = R"JS_4(        if (p.getAttribute('data-filter') === st)
   // Failure Diagnosis Actions
   elBtnRefreshDiag.addEventListener('click', () => {
     sendWsRequest({ action: 'taskqueue_diagnose', breakdown: true });
-    sendWsRequest({ action: 'taskqueue_list', state: 'failed' });
+    sendWsRequest({ action: 'taskqueue_list', state: 'failed', include_planned: true });
   });
 
   elInputDiagSearch.addEventListener('input', (e) => {

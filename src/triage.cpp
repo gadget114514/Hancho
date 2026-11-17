@@ -1319,7 +1319,10 @@ std::string BuildTriageHandoffInstructions(const nlohmann::json& cards, const st
         << "2. Choose exactly one candidate id from that card.\n"
         << "3. If the job's command, configuration or source has to change first (candidate `fix_spec`), make the "
            "smallest fix in the job's working directory, then choose the candidate that reruns it (usually `retry` "
-           "or `retry_raise_timeout`).\n"
+           "or `retry_raise_timeout`). For a tiny one-file edit (a literal replacement), use `" << cli
+        << " quickfix --file <path> --find <text> --replace <text> [--check <regex>]` or the MCP `quickfix` tool "
+           "instead of starting a coding agent: it runs as a short task-queue job and verifies the edit. Do not "
+           "change the model or provider; if that seems necessary, leave the card pending for a person.\n"
         << "4. Record the decision with `" << cli << " triage decide <id> <candidateId> --reason \"<one or two "
            "sentences>\"` (add `--multiplier <1.5-4>` for retry_raise_timeout). The decide command performs the "
            "action (retry, cancel, ...); do not run it a second way.\n"

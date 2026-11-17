@@ -484,6 +484,7 @@ body {
 
 .badge-running { background-color: var(--running-bg); color: var(--running); }
 .badge-pending { background-color: var(--pending-bg); color: var(--pending); }
+.badge-planned { background-color: var(--pending-bg); color: var(--pending); border: 1px dashed var(--pending); opacity: 0.8; }
 .badge-blocked { background-color: var(--blocked-bg); color: var(--blocked); }
 .badge-completed, .badge-succeeded { background-color: var(--success-bg); color: var(--success); }
 .badge-failed { background-color: var(--error-bg); color: var(--error); }

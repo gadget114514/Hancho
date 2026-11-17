@@ -364,6 +364,21 @@ void TriageManager::Refresh() {
                 permissions.insert(permissions.begin(), "read_files");
             llmPermissions_ = std::move(permissions);
         }
+        {
+            std::vector<std::string> permissions;
+            const json configured = config.value("triage_supervisor_permissions", json::array());
+            if (configured.is_array()) {
+                for (const auto& item : configured) {
+                    if (!item.is_string()) continue;
+                    const std::string value = item.get<std::string>();
+                    if (value == "read_files" || value == "run_commands" || value == "write_files" ||
+                        value == "network" || value == "use_worker_permissions")
+                        permissions.push_back(value);
+                }
+            }
+            if (permissions.empty()) permissions.push_back("use_worker_permissions");
+            supervisorPermissions_ = std::move(permissions);
+        }
         supervisorEngine_ = supervisorEngine;
         supervisorModel_ = supervisorModel;
         supervisorTimeoutSec_ = static_cast<int>(std::clamp<long long>(supervisorTimeout, 60, 7200));
@@ -1253,7 +1268,26 @@ std::string TriageManager::Handoff(const std::vector<std::string>& ids, bool all
         return next;
     }();
     const std::string jobId = "supervisor-triage-" + std::to_string(sequence);
-    const std::string instruction = BuildTriageHandoffInstructions(cards, cli, language);
+    std::string instruction = BuildTriageHandoffInstructions(cards, cli, language);
+    {
+        std::vector<std::string> permissions;
+        {
+            std::lock_guard<std::mutex> lock(mutex_);
+            permissions = supervisorPermissions_;
+        }
+        auto allows = [&](const char* action) {
+            return std::find(permissions.begin(), permissions.end(), action) != permissions.end();
+        };
+        instruction += "\nPermissions: ";
+        if (allows("use_worker_permissions")) {
+            instruction += "worker permissions are enabled";
+        } else {
+            instruction += allows("read_files") ? "read files" : "no file reads";
+            instruction += allows("run_commands") ? "; run commands" : "; do not run commands";
+            instruction += allows("write_files") ? "; write files" : "; do not write files";
+        }
+        instruction += ". Do not change models or providers; if that is needed, leave the card pending for a person.\n";
+    }
     const std::wstring instructionDir = PathJoinWide(TriageDirectory(), L"instructions");
     EnsureDirectoryWide(instructionDir);
     const std::wstring instructionPath = PathJoinWide(instructionDir, Utf8ToWide(jobId) + L".md");
@@ -1264,9 +1298,23 @@ std::string TriageManager::Handoff(const std::vector<std::string>& ids, bool all
     const WorkerEngineRegistry* engines = btm_ ? &btm_->Engines() : nullptr;
     WorkerEngineRegistry localEngines;
     if (!engines) engines = &localEngines;
+    const WorkerEngineDef* engineDef = engines->Find(engineName);
+    if (!engineDef) return Error("unknown supervisor engine: " + engineName).dump();
+    bool supervisorWorkerPermissions = false;
+    {
+        std::lock_guard<std::mutex> lock(mutex_);
+        supervisorWorkerPermissions =
+            std::find(supervisorPermissions_.begin(), supervisorPermissions_.end(), "use_worker_permissions") !=
+                supervisorPermissions_.end() ||
+            std::find(supervisorPermissions_.begin(), supervisorPermissions_.end(), "run_commands") !=
+                supervisorPermissions_.end() ||
+            std::find(supervisorPermissions_.begin(), supervisorPermissions_.end(), "write_files") !=
+                supervisorPermissions_.end();
+    }
+    const std::string* permissionOverride = supervisorWorkerPermissions ? nullptr : &engineDef->advicePermissionArgs;
     std::string command, streamType, commandError, adapter;
     if (!engines->BuildCommand(engineName, modelName, launchPrompt, timeoutSec, command, streamType,
-                               commandError, &adapter)) {
+                               commandError, &adapter, permissionOverride)) {
         return Error("cannot build the supervisor command for engine '" + engineName + "': " + commandError).dump();
     }
 

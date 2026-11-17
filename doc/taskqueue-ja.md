@@ -65,7 +65,7 @@ hancho-cli.exe taskqueue wait main --since 0 --timeout-ms 30000
 | `pending` | まだ実行キューに入っていない（依存が未達）。 |
 | `blocked` | success 依存が失敗/キャンセル。依存を直して `taskqueue_retry` すると blocked の後続も自動で戻る。 |
 | `running` | 試行（1 つの managed process）が実行中。 |
-| `planned` | 実行中のビヘイビアツリーが後で起動する job/worker 葉の仮行。実際にはキューに保存されていない。`taskqueue_list` は `include_planned: true` のときだけ返し（ダッシュボードは指定する）、ツリーが別の枝に進むか終了すると消える。 |
+| `planned` | 実行中のビヘイビアツリーが後で起動する job/worker 葉の仮行。実際にはキューには保存されていない。`taskqueue_list` は `include_planned` が true のとき返す（デスクトップのダッシュボード・CLI・Web UI・MCP は既定で指定する。CLI は `--no-planned`、MCP は `includePlanned: false` で外せる）。ツリーが別の枝に進むか終了すると消える。 |
 | `succeeded` / `failed` / `cancelled` | 終了状態。failed は `maxAttempts` まで自動再実行。 |
 
 `taskqueue add` の応答には、登録先の `data_dir` が入ります。追加した ID と一緒に報告してください。ダッシュボードにジョブが出ない場合は、ダッシュボードのタイトルに表示されたデータディレクトリと照合します（別のコア／データディレクトリに登録すると、そのダッシュボードには出ません）。`hidden` は尊重され、hidden ジョブは既定では一覧に出ません。設定の **hidden タスクも表示** で含められます。外部から登録するジョブには `hidden` を付けないでください（Hancho 内部のジョブ用です）。

@@ -222,6 +222,7 @@ BT ワーカーと同じ方法でコマンドを組み立て、タスクキュ�
 - 指示: カードの情報・候補・推奨・LLM 助言と、この core に向けた `hancho-cli --data-dir <dir>` の正確なコマンドを渡す。各カードで候補を 1 つ選び `triage decide` で記録すること、仕様の修正が要るなら最小限直してから再実行の候補を選ぶこと、安全に決められないカードは判断待ちに残すこと、最後に結果ファイル（環境変数 `PC_TRIAGE_RESULT_FILE`）に `{"cards":[{"id","outcome":"decided|left_pending","note"}]}` を書くことを指示する。
 - **処置した印**: 渡したカードは判断待ちのまま、`handoff`（`jobId`、時刻、状態 `queued` → `running` → `done` / `done_undecided` / `failed`、Supervisor のメモ `note`）を持つ。一覧と詳細には「🤖 Supervisor 対応中」「完了・判断なし」などと出し、タスク一覧の「判断」列にも添える。ジョブのメモには `[triage] handed to supervisor job <id>` を残す。判断待ちの KPI からは外さない（判断を記録するまでは判断されていないため）。
 - 対応中のカードは重ねて渡さない。完了・判断なし、失敗のカードはもう一度渡せる。
+- 権限は `triage_supervisor_permissions`（既定 `["use_worker_permissions"]`）で制御する。`read_files` だけにすると読み取り専用の Supervisor になり、提案だけを残す。`run_commands` / `write_files` / `use_worker_permissions` でワーカーの権限引数を使う。
 - **モデル / provider の変更は人の承認が必要。** Supervisor はモデルを変えず、必要ならカードを判断待ちに残す。`taskqueue update` で `--model` を変えると `approved_by` と `approval_reason` がない限り拒否され、`require_model_change_approval`（既定 true）で制御する。人が承認するときは `hancho-cli taskqueue update --id <id> --patch <json> --approve-model-change --reason "..."` を使う。変更はジョブの notes に `[model] old -> new approved by ...` として残る。
 - `_supervisor` のジョブ自体が失敗・タイムアウトしたら、それも普通の失敗としてトリアージのカードになる。
 

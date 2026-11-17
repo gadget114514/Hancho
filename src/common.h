@@ -185,4 +185,18 @@ std::string BuildCallerOriginJson(const std::string& client, const std::string& 
 // The filter that means "jobs this caller added": its session id, or "pid:<n>" without one.
 std::string CallerSelfOriginFilter();
 
+// A deterministic one-file edit for tiny fixes: no LLM, no full test suite. Hancho runs the
+// generated PowerShell script as a task-queue job with maxAttempts=1 and a short timeout.
+struct QuickFixSpec {
+    std::string file;
+    std::string find;
+    std::string replace;
+    std::string check;      // optional regex that must match after the edit
+    bool all = false;       // replace every occurrence instead of the first
+    bool checkLiteral = false; // treat `check` as a literal string, not a regex
+};
+std::string BuildQuickFixPowerShell(const QuickFixSpec& spec);
+// Command line for a written .ps1 (UTF-8 with BOM); the caller writes the script.
+std::string BuildQuickFixCommandLine(const std::wstring& scriptPath);
+
 } // namespace pc

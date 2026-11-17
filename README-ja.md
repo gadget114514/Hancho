@@ -6,7 +6,7 @@
 
 この考えを軸に、ConPTY マルチターミナルのダッシュボード、依存関係・タイムアウト・リトライ付きのタスクキュー、複数手順の計画を任せられるビヘイビアツリー、**MCP** と **CLI** の両方からの操作を備えています。`claude`、`opencode`、`codex`、ビルドスクリプト、対話シェル（PowerShell、cmd、Git Bash）を同じように扱えます。
 
-バージョンは `hancho-cli.exe --version` で確認できます（現在: 0.9.23）。
+バージョンは `hancho-cli.exe --version` で確認できます（現在: 0.9.26）。
 
 ### 対象ユーザー
 
@@ -116,6 +116,15 @@ New-Item -ItemType Junction -Path .claude\skills\hancho -Target (Resolve-Path sk
 ## リリースノート
 
 
+
+### v0.9.26
+- **クイック修正**: `hancho-cli quickfix --file <path> --find <text> --replace <text> [--all] [--check <regex>]` と MCP の `quickfix` ツールで、小さな決定的編集を短いタスクキュージョブとして適用します（LLM なし、`maxAttempts=1`）。文字列が見つからない、または `--check` に一致しないとジョブは失敗します。
+- **トリアージの処置と状態**: 処置ペインに「🚫 無視」ボタンを追加しました（理由が必須。プロセスのカードは「確認済み」として記録）。状態列はカードの状態と判断・結果の組みで表示し、再実行中・処置済・判断待ち・無視などと出します。再実行して成功したジョブが判断待ちに見えることはなくなりました。
+- **planned 行を既定で表示**: `taskqueue_list` は、実行中ビヘイビアツリーの未起動葉を仮の `planned` 行として既定で含めます（デスクトップのダッシュボード・CLI・Web UI・MCP）。CLI は `--no-planned`、MCP は `includePlanned: false` で外せます。
+- **タスク一覧の担当とコスト**: 「Owner / Cost」列を追加し、担当エンジンと、そのジョブの試行全体のトークン使用量・USD コストを合計して表示します。ホバーで内訳が見られます。
+- **暴走ワーカーの防止**: タイムアウト未指定の LLM ジョブには 10 分のアイドル／ハング タイムアウト（`llm_idle_timeout_sec`）を設定します。また `taskqueue update` でモデルを変更するには人の承認が必要です（`--approve-model-change --reason "..."`、`require_model_change_approval`）。
+- **Supervisor の権限**: `triage_supervisor_permissions` で、バッチトリアージ Supervisor ができること（ファイル読み取り・コマンド実行・ファイル書き込み・ワーカー権限の利用）を制御します。既定は従来どおりワーカー権限です。
+- **ドキュメントと素材**: CLI・MCP・タスクキュー・トリアージ・skill の各ドキュメント、2026-11-17 のインシデント記録、新しいアイコン素材を更新しました。
 
 ### v0.9.25
 - **タスク終了後にシャットダウン**: `hancho-cli power shutdown --after-job <id>`（またはジョブの `shutdownWhenDone` / `shutdownDelaySec`）で、そのジョブと他の全ジョブ・Hancho 管理プロセスがアイドルになった後に PC の電源を切ります。`power suspend` はそのまま。両方 armed のときは shutdown が優先です。電源操作にはシャットダウン権限が必要で、Windows に拒否されたら Hancho を管理者として起動してください。

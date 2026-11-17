@@ -891,6 +891,43 @@ std::string CallerSelfOriginFilter() {
     return "pid:" + std::to_string(CallerPid());
 }
 
+static std::string PowerShellSingleQuote(const std::string& s) {
+    std::string out;
+    out.reserve(s.size() + 8);
+    for (char c : s) {
+        if (c == '\'') out += "''";
+        else out.push_back(c);
+    }
+    return out;
+}
+
+std::string BuildQuickFixPowerShell(const QuickFixSpec& spec) {
+    std::ostringstream ps;
+    ps << "$ErrorActionPreference = 'Stop'\r\n";
+    ps << "$path = '" << PowerShellSingleQuote(spec.file) << "'\r\n";
+    ps << "$find = '" << PowerShellSingleQuote(spec.find) << "'\r\n";
+    ps << "$replace = '" << PowerShellSingleQuote(spec.replace) << "'\r\n";
+    ps << "$text = [IO.File]::ReadAllText($path)\r\n";
+    ps << "$index = $text.IndexOf($find, [StringComparison]::Ordinal)\r\n";
+    ps << "if ($index -lt 0) { [Console]::Error.WriteLine('quickfix: find text not found'); exit 3 }\r\n";
+    if (spec.all) ps << "$text = $text.Replace($find, $replace)\r\n";
+    else ps << "$text = $text.Remove($index, $find.Length).Insert($index, $replace)\r\n";
+    ps << "[IO.File]::WriteAllText($path, $text)\r\n";
+    if (!spec.check.empty()) {
+        ps << "if (-not (Select-String -Path $path -Pattern '" << PowerShellSingleQuote(spec.check)
+           << "' -SimpleMatch:" << (spec.checkLiteral ? "$true" : "$false") << " -Quiet)) {\r\n";
+        ps << "  [Console]::Error.WriteLine('quickfix: check did not match'); exit 4\r\n";
+        ps << "}\r\n";
+    }
+    ps << "exit 0\r\n";
+    return ps.str();
+}
+
+std::string BuildQuickFixCommandLine(const std::wstring& scriptPath) {
+    return "powershell.exe -NoProfile -NonInteractive -ExecutionPolicy Bypass -File \"" +
+           WideToUtf8(scriptPath) + "\"";
+}
+
 bool WriteHanchoEventLine(const std::string& endpoint, const std::string& line,
                           std::string& outError) {
     std::wstring fullPipe = Utf8ToWide(endpoint);

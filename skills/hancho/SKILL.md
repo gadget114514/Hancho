@@ -127,6 +127,7 @@ hancho-cli.exe power status
 | やりたいこと | 使うもの |
 | :--- | :--- |
 | 1コマンドだけ（ビルド、テスト、インストール、dev サーバー） | `start` / MCP `start_process` |
+| 1文字修正・単純な文字列置換 | `quickfix`（LLM を使わない） |
 | 複数ステップに順番・依存がある | `taskqueue add` + `taskqueue wait` |
 | 前の結果で次が変わる（分岐、修正ループ、if/else） | `bt start` + `bt wait` / `bt resume` |
 | worker LLM に1件任せて最終結果だけ欲しい | MCP `run_worker` |
@@ -142,6 +143,9 @@ hancho-cli.exe power status
 - **成功を偽装しない。** Hancho が `success.exitCode`（既定 0）と `filesNewer` / `outputRegex` / `testReport` で検証する。exit 0 だけでは成果物を保証できないときは `filesNewer` を足す。
 - **待つ。ポーリングしない。** `taskqueue wait` / `bt wait` / `wait_process` を使う。
 - **supervisor の文脈を小さく保つ。** 詳細な指示は worker に渡し、成果物とログの末尾だけ読む。
+- **1文字修正にコーディングエージェントを起動しない。** `quickfix --file <path> --find <text> --replace <text>` を使う。決定的で数秒〜数十秒で終わる。
+- **supervisor 自身にコードを書かせない。** 監督はパッチ/置換/ジョブを出す。適用は `quickfix` か worker ジョブにやらせる。
+- **モデル / provider を勝手に変えない。** `taskqueue update` で `--model` を変えるには `--approve-model-change --reason "..."` が必要。監督は変更せず、カードを判断待ちに残す。
 - **data-dir を1つに固定する。** 例: `<project>/.hancho`。毎回 `--data-dir` を付けるか、`hancho-cli.exe mcp install --data-dir .hancho` で埋め込む。
 
 ## supervisor 側のコツ
@@ -183,6 +187,15 @@ hancho-cli.exe kill --id 3
 ```
 
 `start` は**タスクではない**: 成功判定・リトライ・使用量集計はない。本気の仕事はキューに登録する。interactive TUI だけ `--pty`。
+
+### クイック修正（1文字・単純置換）
+
+```powershell
+hancho-cli.exe quickfix --file src/Foo.cs --find "Retun" --replace "Return"
+hancho-cli.exe quickfix --file src/Foo.cs --find "old" --replace "new" --all --check "new"
+```
+
+`--find` が見つからない、または `--check`（正規表現）に一致しないとジョブは失敗します。`--check-literal` でリテラル一致。ローカル PowerShell で実行し、LLM は使いません。大きな変更だけ worker ジョブにしてください。
 
 ### タスクキュー（順番・依存）
 
@@ -346,3 +359,6 @@ hancho-cli.exe mcp install --data-dir .hancho --dry-run --json
 - exit 0 だけで成果物があると決めつける → `success.filesNewer` を足す。
 - キュー実行を止めたいのに `kill_process` → `taskqueue_cancel` を使う。
 - `start` で `opencode run` が終わらない → `--close-stdin` を付ける。
+- 1文字修正なのにコーディングエージェントを起動して数十分待つ → `quickfix` を使う。
+- 監督に直接ファイルを編集させる → 置換・パッチ・ジョブを出させ、適用は Hancho に任せる。
+- モデルを勝手に切り替える → `taskqueue update --approve-model-change --reason "..."` で人の承認を記録する。
