@@ -46,7 +46,7 @@ hancho-cli.exe mcp uninstall --delete-data-dir           # データディレク
 | ツール | 説明 |
 | :--- | :--- |
 | `taskqueue_add` | ジョブ登録（`taskqueue`, `jobs[]`, `concurrency?`, `notifyFile?`）。各ジョブに `id`, `command`, `summary`, `timeoutSec` が必要。 |
-| `taskqueue_list` | ジョブ一覧（`taskqueue?`, `state?`, `includePlanned?`。既定 true で、BT の未起動葉を `planned` 行として含む）。 |
+| `taskqueue_list` | ジョブ一覧（`taskqueue?`, `state?`, `includePlanned?`。既定 true で、BT の未起動葉を `planned` 行として含む）。活動中のタスクグループ（BT のルート）も `group:<id>` の仮想行として `running` / `waitingForLlm` / `paused` の状態で返す。`includePlanned: false` は両方を隠す。読むときは `bt_get`、答えるときは `bt_resume` を使う。 |
 | `taskqueue_get` | ジョブ詳細・試行履歴・指示書（`id`, `includeInstructions?`, `rev?`）。 |
 | `taskqueue_retry` | failed/blocked/cancelled を再実行（`id`, `resetAttempts?`, `refreshInstructions?`）。blocked の後続も再キュー。一括: `id` を省いて `failed: true` にすると失敗ジョブをすべて再実行（`taskqueue`, `since`（例: `6h`）で絞り込み可）。 |
 | `taskqueue_update` | pending/failed/blocked のジョブを更新。 |

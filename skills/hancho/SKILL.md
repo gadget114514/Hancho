@@ -43,6 +43,7 @@ worker                      … 実際に手を動かす子プロセス
 - **behavior tree (BT)**: 「前の結果で次を変える」流れを1つの JSON で書いたもの
 - **escalate**: BT の途中で supervisor に判断を求める唯一のポイント
 - **triage**: 失敗などを1枚のカードにして、原因・候補・推奨を出す仕組み
+- **task group**: 実行中の BT ルート。タスク一覧では `group:<id>` の仮想行として出る（状態は `running` / `waitingForLlm` / `paused`）
 - **engine**: worker LLM の起動方法（`claude` / `opencode` / `codex` / `agy`、`engines.json` で追加可能）
 - **data-dir**: ログ・状態・キュー・設定の置き場所。プロジェクトごとに1つ決めて固定する
 
@@ -214,6 +215,8 @@ hancho-cli.exe taskqueue retry --failed --since 6h
 
 状態: `waiting`（実行可能・空き待ち）、`pending`（依存未達）、`blocked`（依存失敗）、`running`、`planned`（BT の暫定行）、`succeeded`、`failed`、`cancelled`。
 
+`taskqueue list` は既定で `planned` 行（実行中の BT が後で起動する未起動葉）と `group:<id>` のタスクグループ行を含み、`--no-planned` で両方外せます（MCP は `includePlanned: false`）。タスクグループの状態は `running` / `waitingForLlm` / `paused`。どちらも保存されたジョブではないので、`taskqueue get` せず `bt_get` / `bt_resume` を使います。待機中のグループはダッシュボードのタスク一覧で右クリック →「回答して進める」からも再開できます。
+
 `taskqueue add` の応答には `data_dir` が入ります。登録したジョブ ID と `data_dir` をセットで報告してください。ダッシュボードにジョブが見えない場合は、まずダッシュボードのタイトルに表示されたデータディレクトリと照合します（LLM が別のコア／データディレクトリに登録した場合は、そのダッシュボードには出ません）。`hidden: true` は尊重され、既定では一覧に出ません。ただし `hidden` は Hancho 内部のジョブ用なので、外部（CLI / MCP / LLM）から登録するジョブには付けないでください。見えないときは設定の「hidden タスクも表示」を有効にするか、`hidden` を付けずに登録し直します。
 
 ### 電源（タスク終了後にサスペンド / シャットダウン）
@@ -305,7 +308,11 @@ hancho-cli.exe triage handoff --all
 hancho-cli.exe triage manual <id>
 ```
 
-カードを読んで候補を1つ選び、必ず理由を付ける（`ignore` / `cancel` は特に必須）。候補は `retry`、`retry_raise_timeout`、`ignore`、`cancel` など。
+カードを読んで候補を1つ選び、必ず理由を付ける（`ignore` / `cancel` は特に必須）。候補は `retry`、`retry_raise_timeout`、`ignore`、`cancel` など。一覧の「状態」列はカードの状態と決定・結果を合わせて出し、再実行中・処置済み（Handled）・判断待ち・無視などを区別します。再実行して成功したカードが「判断待ち」に見えることはありません。
+
+- ダッシュボードの操作ペインには「🚫 Ignore」（理由必須。プロセスカードは確認済みとして記録）がある。CLI は `triage decide <id> ignore --reason "..."`。
+- バッチ Supervisor の権限は `triage_supervisor_permissions`（既定 `["use_worker_permissions"]`）。`read_files` だけにすると読み取り専用で提案だけを残す。
+- モデル / provider の変更は人の承認が必要。`taskqueue update --approve-model-change --reason "..."` なしでは拒否される。
 
 ### Chat（LAN メッセージ）
 

@@ -548,7 +548,7 @@ int RunMcpServer() {
                 << "},"
                 << "{"
                  << "\"name\":\"taskqueue_list\","
-                 << "\"description\":\"List task queue jobs with state, attempts, last reason and blockedBy. Failed jobs carry the same top-level failure record (class, summary, suggestedAction, evidence) as taskqueue_get. Provisional 'planned' rows for idle job/worker leaves of running behavior trees are included by default; set includePlanned=false to omit them. They are not stored jobs.\","
+                 << "\"description\":\"List task queue jobs with state, attempts, last reason and blockedBy. Failed jobs carry the same top-level failure record (class, summary, suggestedAction, evidence) as taskqueue_get. Provisional 'planned' rows for idle job/worker leaves of running behavior trees are included by default; set includePlanned=false to omit them and the task-group row. The active task group (the BT root) appears as a virtual row with id 'group:<id>' and state running, waitingForLlm or paused. Neither row is a stored job; read a task group with bt_get and answer it with bt_resume.\","
                 << "\"inputSchema\":{\"type\":\"object\",\"properties\":{"
                 << "\"taskqueue\":{\"type\":\"string\",\"description\":\"Optional task queue name (all queues when omitted)\"},"
                 << "\"state\":{\"type\":\"string\",\"description\":\"Optional state filter: pending, planned, running, succeeded, failed, blocked, cancelled\"},"

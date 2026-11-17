@@ -106,6 +106,7 @@ struct BtPlannedTask {
     std::string type;       // "job" or "worker"
     std::string summary;
     std::string queueName;
+    std::string proposedJobId;  // job id the leaf will get when it starts
     int estimateSec = 0;    // estimateSec when set, otherwise timeoutSec
 };
 

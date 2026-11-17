@@ -120,6 +120,11 @@ The application icons are modeled on the character "Telephone Cat" (電話猫, D
 
 
 
+### v0.9.28
+- **Answer a waiting task group from the task list**: right-click a `group:<id>` row in `waitingForLlm` and pick a choice under "Answer and resume"; the dashboard sends `bt_resume` with the selected `expect` value, so a waiting group no longer needs the CLI.
+- **Branch numbers in task IDs**: behavior-tree jobs now get IDs of the form `<btId>-<node>-<run>` (e.g. `idcheck-slow_one-1`) instead of a bare sequence, so each task is clearly a branch of its group. Provisional `planned` rows show the same job ID in advance (`btplan:<btId>-<node>-<run>`), and `bt_get` / `bt_list` `plannedTasks` include it as `jobId`.
+- **Docs**: behavior-tree, task-queue, CLI, MCP and skill docs describe the task-group row, answering it, and the new job-ID format.
+
 ### v0.9.27
 - **Task groups in the task list**: the active task group (the BT root) now appears as a virtual `group:<id>` row above its `planned` leaves, with its current state (`running`, `waiting for LLM`, `paused`). It is re-derived from the live state on every query and disappears together with its planned rows when the group finishes.
 - **Re-evaluate planned rows**: a `予定↻` toolbar button re-reads the task queue and task-group state from the core and re-renders the provisional rows immediately.

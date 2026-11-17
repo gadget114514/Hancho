@@ -143,7 +143,16 @@ hancho-cli.exe taskqueue list --origin self
 # Retry every failed job at once (optionally one queue, and only recent failures)
 hancho-cli.exe taskqueue retry --failed
 hancho-cli.exe taskqueue retry --failed main --since 6h
+
+# Provisional rows for idle behavior-tree leaves are included by default; hide them
+hancho-cli.exe taskqueue list main --no-planned
 ```
+
+The task list also shows the active task group (the behavior-tree root) as a
+virtual `group:<id>` row with state `running`, `waitingForLlm` or `paused`. It
+and the `planned` rows are re-derived on every query and are not stored jobs;
+`--no-planned` hides both. Read a task group with `bt get` and answer a waiting
+one with `bt resume`.
 
 **Quick fix (tiny deterministic edits):**
 

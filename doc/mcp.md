@@ -48,7 +48,7 @@ You can also run the server directly with `Hancho.exe mcp`. It connects to the d
 | :--- | :--- |
 | `taskqueue_add` | Register jobs (`taskqueue`, `jobs[]`, `concurrency?`, `notifyFile?`). Each job needs `id`, `command`, `summary`, `timeoutSec`. |
 | `quickfix` | Apply one exact file edit as a deterministic task-queue job (`file`, `find`, `replace`, optional `all`, `check`, `checkLiteral`, `cwd`, `timeoutSec`, `id`, `summary`, `queue`). No LLM; fails when `find` is absent or `check` does not match. Use it for tiny fixes instead of a coding agent. |
-| `taskqueue_list` | List jobs (`taskqueue?`, `state?`, `includePlanned?`, default true: provisional `planned` rows for idle BT leaves). |
+| `taskqueue_list` | List jobs (`taskqueue?`, `state?`, `includePlanned?`, default true: provisional `planned` rows for idle BT leaves). Also returns the active task group (the BT root) as a virtual `group:<id>` row with state `running`, `waitingForLlm` or `paused`; `includePlanned: false` hides both. Read it with `bt_get` and answer with `bt_resume`. |
 | `taskqueue_get` | Full job, attempts and instructions (`id`, `includeInstructions?`, `rev?`). |
 | `taskqueue_retry` | Retry failed/blocked/cancelled (`id`, `resetAttempts?`, `refreshInstructions?`); blocked dependents are requeued. Bulk: `failed: true` with no `id` retries all failed jobs, optionally limited by `taskqueue` and `since` (e.g. `6h`). |
 | `taskqueue_update` | Update a pending/failed/blocked job. |

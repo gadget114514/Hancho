@@ -97,7 +97,15 @@ hancho-cli.exe taskqueue list main
 hancho-cli.exe taskqueue graph main
 hancho-cli.exe taskqueue wait main --since 0 --timeout-ms 30000
 hancho-cli.exe taskqueue retry A
+
+# 実行中の BT の未起動葉は既定で planned 行として出る。外すには --no-planned
+hancho-cli.exe taskqueue list main --no-planned
 ```
+
+活動中のタスクグループ（BT のルート）は `group:<id>` の仮想行として
+`running` / `waitingForLlm` / `paused` の状態で出ます。`planned` 行と同様に
+保存されたジョブではないので、`taskqueue get` ではなく `bt get` で読み、
+待機中なら `bt resume` で答えます。`--no-planned` は両方を隠します。
 
 **クイック修正（小さな決定的編集）:**
 

@@ -2655,8 +2655,10 @@ TASK QUEUE:
       --bt <id> lists every job of a behavior tree across its parallel branch queues.
       --origin self keeps only the jobs this session added.
       Idle BT leaves appear as provisional "planned" rows so the queue shows the
-      work a running tree may start; --no-planned leaves them out. They are not
-      stored jobs and disappear when the tree moves on.
+      work a running tree may start; --no-planned hides them and the task-group
+      row. The active task group (the BT root) is also a virtual row with id
+      "group:<id>" and state running, waitingForLlm or paused. Neither row is a
+      stored job; both disappear when the tree moves on or finishes.
 
   taskqueue record-plain --cmd <cmd> [--name <name>] [--exit-code <n>] [--log <path>] [--summary <text>]
       Record a plain execution outside a queue into logs/taskqueues/plain.json.
@@ -3054,7 +3056,7 @@ void PrintCliUsageJson() {
       "usage": "hancho-cli taskqueue <add|list|get|why|retry|cancel|pause|resume|graph|wait|purge|update> ...",
       "subcommands": [
         {"name": "add", "usage": "hancho-cli taskqueue add --file <jobs.json> [--taskqueue <name>] [--concurrency <n>] [--notify-file <path>] [--origin-label <text>]", "description": "Register jobs. Each job needs id, command, summary and timeoutSec; dependsOn replaces shell chaining. The caller's session id, working folder and --origin-label are recorded as the job's origin. suspendWhenDone/suspendDelaySec/suspendHibernate arm the PC to suspend, and shutdownWhenDone/shutdownDelaySec arm it to shut down, after that job and all other work is idle. Do not set hidden on jobs you register: it is reserved for Hancho's internal jobs and hides the row unless Show hidden tasks is on."},
-        {"name": "list", "usage": "hancho-cli taskqueue list [<name>] [--state <state>] [--since <period>] [--origin <self|label|session>] [--bt <id>] [--no-planned]", "description": "List jobs with state, queue, summary and blockedBy. --since keeps only jobs updated within the period (e.g. 30m, 6h, 2d). --origin self keeps only the jobs this session added. --bt <id> lists every job of a behavior tree across its parallel branch queues. Provisional 'planned' rows for idle BT leaves are included by default; --no-planned hides them. Each job also carries resource_wait and, once succeeded with estimateSec, timing_feedback (see audit)."},
+        {"name": "list", "usage": "hancho-cli taskqueue list [<name>] [--state <state>] [--since <period>] [--origin <self|label|session>] [--bt <id>] [--no-planned]", "description": "List jobs with state, queue, summary and blockedBy. --since keeps only jobs updated within the period (e.g. 30m, 6h, 2d). --origin self keeps only the jobs this session added. --bt <id> lists every job of a behavior tree across its parallel branch queues. Provisional 'planned' rows for idle BT leaves are included by default; --no-planned hides them and the task-group row. The active task group (the BT root) is a virtual row with id 'group:<id>' and state running, waitingForLlm or paused. Neither row is a stored job. Each job also carries resource_wait and, once succeeded with estimateSec, timing_feedback (see audit)."},
         {"name": "record-plain", "usage": "hancho-cli taskqueue record-plain --cmd <cmd> [--name <name>] [--exit-code <n>] [--log <path>] [--summary <text>]", "description": "Record a plain execution outside a queue into logs/taskqueues/plain.json."},
         {"name": "get", "usage": "hancho-cli taskqueue get <id> [--rev <n>] [--no-instructions]", "description": "Show one job with attempts and instructions."},
         {"name": "why", "usage": "hancho-cli taskqueue why <id>", "description": "Explain why the last attempt failed: failure class, confidence, summary, suggested action, last activity and evidence (event seq / log line), plus the class of every attempt. Reads the job without instructions."},
@@ -3436,7 +3438,7 @@ void PrintCliUsageJson() {
         "conditions": "fileExists, fileNewer, outputMatches, exitCode, jsonValue, var, nodeState"
       },
       "variables": "${name} expands BT vars; in command it is quoted as one argument. Node variables: ${<id>.state|exitCode|logFile|jobId|runs}, ${<worker>.result} (final response), ${<worker>.output.<path>} (JSON the worker wrote to PC_BT_RESULT_FILE), ${<escalate>.answer}.",
-      "remaining": "bt_get/bt_list return pendingEstimateSec (estimated work in job/worker leaves that have not started on the current branch) and plannedTasks (node, type, summary, taskqueue, estimateSec). The dashboard lists them as provisional planned rows and adds their estimates to the task remaining time; they are re-derived on every query, so retry/fallback/if branch changes and completion drop stale rows.",
+      "remaining": "bt_get/bt_list return pendingEstimateSec (estimated work in job/worker leaves that have not started on the current branch) and plannedTasks (node, type, summary, taskqueue, estimateSec). The desktop dashboard, CLI, Web UI and MCP list them as provisional planned rows and add their estimates to the task remaining time, under a virtual task-group row (id 'group:<id>') for the BT root. They are re-derived on every query, so retry/fallback/if branch changes and completion drop stale rows.",
       "engines": "Workers name an engine (claude, agy, opencode, codex, or ones in <data dir>/engines.json) and optionally a model; permission flags live only in the engine definition. An engine may also set adapter (a Tier 1/3 file in <data dir>/adapters/) and capabilities (jsonStream, resume, reportsUsage, reportsSubagents, permissionModes).",
       "limits": "retry/repeat max <= 100 (required); limits.maxNodeRuns default 200; limits.maxWallSec default 86400; depth 32; 1000 nodes.",
       "rules": [
@@ -3456,7 +3458,8 @@ void PrintCliUsageJson() {
       "waiting": "Queued and ready; waiting for a free slot or the retry delay.",
       "pending": "Not in the run queue yet; dependencies are not satisfied.",
       "blocked": "A success-dependency failed/cancelled; fix and retry the dependency.",
-      "planned": "Provisional row for an idle job/worker leaf of a running behavior tree. It is not a stored queue job and disappears when the tree changes branch or finishes; taskqueue_list returns it only with include_planned: true.",
+      "planned": "Provisional row for an idle job/worker leaf of a running behavior tree. It is not a stored queue job and disappears when the tree changes branch or finishes. taskqueue_list includes it by default; set include_planned: false (CLI --no-planned) to omit it and the task-group row.",
+      "taskGroup": "The active task group (the BT root) is a virtual row with id 'group:<id>' and state running, waitingForLlm or paused. It is re-derived on every query and disappears together with its planned rows when the group finishes. It is not a queue job; read it with bt_get and answer a waitingForLlm group with bt_resume. include_planned: false (CLI --no-planned) hides it too.",
       "running": "An attempt is executing.",
       "succeeded": "Success conditions met.",
       "failed": "Attempts exhausted or launch failed.",

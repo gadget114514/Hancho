@@ -268,6 +268,7 @@ json BuildTreeResponseJson(const BehaviorTree& tree, TreeView view) {
         item["type"] = task.type;
         item["summary"] = task.summary;
         item["taskqueue"] = task.queueName;
+        item["jobId"] = task.proposedJobId;
         item["estimateSec"] = task.estimateSec;
         planned.push_back(std::move(item));
     }

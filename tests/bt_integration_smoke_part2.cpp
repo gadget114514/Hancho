@@ -30,7 +30,7 @@ void RunPart2IntegrationTests(const std::wstring& tempDirW, const std::string& t
             Check(waitFail.value("state", "") == "failed",
                   "bt-tq-guard failed initially");
 
-            std::string jobId = "bt-tq-guard-1";
+            std::string jobId = "bt-tq-guard-guarded_job-1";
             TaskQueueJob snap;
             Check(h.tqm.GetJobSnapshot(jobId, snap) && snap.bt.id == "bt-tq-guard" &&
                   snap.bt.node == "guarded_job" && snap.bt.run == 1,
@@ -121,7 +121,7 @@ void RunPart2IntegrationTests(const std::wstring& tempDirW, const std::string& t
                   "Cancel(id) marks tree state cancelled");
 
             TaskQueueJob cancelledSnap;
-            Check(h.tqm.GetJobSnapshot("bt-cancel-job-1", cancelledSnap) &&
+            Check(h.tqm.GetJobSnapshot("bt-cancel-job-long_ping-1", cancelledSnap) &&
                   cancelledSnap.state == "cancelled",
                   "Cancel(id) cancelled the underlying TaskQueueJob");
         }

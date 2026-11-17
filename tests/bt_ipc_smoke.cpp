@@ -193,7 +193,7 @@ int main() {
             bool foundPlanned = false, plannedIsVirtual = false;
             if (rPlanned["jobs"].is_array()) {
                 for (const auto& job : rPlanned["jobs"]) {
-                    if (job.value("id", "") == "btplan:ipc-two-jobs:job_b") {
+                    if (job.value("id", "") == "btplan:ipc-two-jobs-job_b-1") {
                         foundPlanned = true;
                         plannedIsVirtual = job.value("virtual", false) && job.value("state", "") == "planned";
                     }
@@ -336,10 +336,10 @@ int main() {
             Check(rFail.value("ok", false) && rFail.value("state", "") == "failed",
                   "ipc-fail-update-retry fails on step_broken");
 
-            // External taskqueue_retry on BT job ipc-fail-update-retry-2 must be rejected
+            // External taskqueue_retry on BT job ipc-fail-update-retry-step_broken-1 must be rejected
             json rTqRetry = h.Call({
                 {"action", "taskqueue_retry"},
-                {"id", "ipc-fail-update-retry-2"}
+                {"id", "ipc-fail-update-retry-step_broken-1"}
             });
             Check(!rTqRetry.value("ok", true) &&
                   rTqRetry.value("error", "") == "this job is managed by a behavior tree; use bt_retry",
@@ -460,11 +460,11 @@ int main() {
             Check(!vars1.contains("only.result"), "a plain job does not set ${only.result}: " + vars1.dump());
 
             Check(runToEnd("second run") == "succeeded",
-                  "second run of ipc-reuse succeeds even though job ipc-reuse-1 is still queued");
+                  "second run of ipc-reuse succeeds even though job ipc-reuse-only-1 is still queued");
             TaskQueueJob reused;
-            Check(h.tqm.GetJobSnapshot("ipc-reuse-1-r2", reused) && reused.bt.id == "ipc-reuse" &&
+            Check(h.tqm.GetJobSnapshot("ipc-reuse-only-1-r2", reused) && reused.bt.id == "ipc-reuse" &&
                       reused.state == "succeeded",
-                  "second run's job got the id ipc-reuse-1-r2");
+                  "second run's job got the id ipc-reuse-only-1-r2");
         }
 
         // 12. get_agent_stream returns hancho.event/1 for schema=v1 (the MCP default) and the legacy

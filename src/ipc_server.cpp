@@ -1349,7 +1349,7 @@ std::string IpcServer::HandleRequestJson(const std::string& reqJson) {
                                 if (!tqFilter.empty() && t.queueName != tqFilter) continue;
                                 if (!btFilter.empty() && t.btId != btFilter) continue;
                                 nlohmann::json job;
-                                job["id"] = "btplan:" + t.btId + ":" + t.nodeKey;
+                                job["id"] = "btplan:" + t.proposedJobId;
                                 job["summary"] = t.summary.empty() ? t.nodeKey : t.summary;
                                 job["state"] = "planned";
                                 job["virtual"] = true;
