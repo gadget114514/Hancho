@@ -322,6 +322,13 @@ BtRemainingInfo BtManager::GetRemainingInfo() const {
         if (!entry || !entry->tree) continue;
         const std::string& state = entry->tree->State();
         if (state != "running" && state != "waitingForLlm" && state != "paused") continue;
+        TaskGroupInfo group;
+        group.id = entry->tree->Id();
+        group.state = state;
+        group.summary = entry->tree->Summary();
+        group.detail = entry->tree->Detail();
+        group.taskqueue = entry->tree->TaskQueueName();
+        out.groups.push_back(std::move(group));
         out.pendingSec += entry->tree->PendingEstimateSec();
         std::vector<BtPlannedTask> planned = entry->tree->PlannedTasks();
         out.planned.insert(out.planned.end(), planned.begin(), planned.end());

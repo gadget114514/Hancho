@@ -631,6 +631,7 @@ enum ControlId {
     IDC_EDIT_SEARCH_TASK = 1050,
     IDC_BTN_IPMSG = 1051,
     IDC_BTN_TERM_SESSIONS = 1052,  // active WCSP terminal connections
+    IDC_BTN_REEVAL_PLANNED = 1053,
     IDC_SET_LANG_JA = 6001,
     IDC_SET_LANG_EN = 6002,
     IDC_SET_LANG_ES = 6003,
@@ -909,6 +910,7 @@ struct DashboardState {
     HWND hwndBtnStreamPane = nullptr;
     HWND hwndBtnBtView = nullptr;
     HWND hwndBtnRefresh = nullptr;
+    HWND hwndBtnReevalPlanned = nullptr;
     // Inline search bars in the process / task list captions.
     HWND hwndSearchProcBtn = nullptr;
     HWND hwndSearchTaskBtn = nullptr;
@@ -2841,6 +2843,12 @@ static void UpdatePanelToggleLabels(DashboardState* st) {
                    L"Refreshes the process list, task queue, terminals and monitor pane now.\nThey otherwise update automatically at the configured interval.",
                    L"Actualiza ahora las listas, las terminales y el panel de monitor.\nNormalmente se actualizan solos según el intervalo configurado."));
         }
+        if (st->hwndBtnReevalPlanned) {
+            UpdateControlTooltip(st->hwndToolbarTip, st->hwndMain, st->hwndBtnReevalPlanned,
+                Tr(L"タスク一覧の「予定 (未登録)」行を再評価します。\nコアからタスクキューとタスクグループの現在の状態を取得し直し、実行されない枝の行を消します。\nタスクグループが一時停止中か LLM の応答待ちの場合は、その間は行が残ります。",
+                   L"Re-evaluates the \"planned\" rows in the task list.\nIt re-reads the task queue and current task group state from the core and drops rows for branches that will not run.\nRows remain while a task group is paused or waiting for an LLM reply.",
+                   L"Vuelve a evaluar las filas «previstas» de la lista de tareas.\nVuelve a leer la cola y el estado actual de los grupos de tareas del núcleo y quita las ramas que no se ejecutarán.\nLas filas permanecen mientras un grupo esté en pausa o esperando una respuesta del LLM."));
+        }
         if (st->hwndBtnSettings) {
             UpdateControlTooltip(st->hwndToolbarTip, st->hwndMain, st->hwndBtnSettings,
                 Tr(L"表示・動作・通知・トリアージ・Web UI などの設定を開きます。\n変更はダイアログを閉じると保存され、次回起動時にも引き継がれます。",
@@ -3506,6 +3514,12 @@ static std::wstring TaskQueueStateLabel(const std::string& state, const std::str
     if (state == "planned") {
         return Tr(L"予定 (未登録)", L"planned", L"previsto");
     }
+    if (state == "waitingForLlm") {
+        return Tr(L"LLM 応答待ち", L"Waiting for LLM", L"Esperando LLM");
+    }
+    if (state == "paused") {
+        return Tr(L"一時停止", L"Paused", L"En pausa");
+    }
     if (state != "pending") return Utf8ToWide(state);
     bool waitingForDeps = false;
     for (const auto& dep : TaskQueueDepList(jobJson)) {
@@ -4105,6 +4119,17 @@ static LRESULT CALLBACK PastRunsWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPAR
 
 static void ShowTaskQueueJobDetails(DashboardState* st, const std::string& jobId, int initialTab = 0) {
     if (!st || jobId.empty()) return;
+    if (jobId.rfind("group:", 0) == 0) {
+        gui_platform::GetGuiPlatform()->ShowMessageBox(
+            st->hwndMain,
+            Tr(L"タスクグループ", L"Task Group", L"Grupo de tareas"),
+            Tr(L"これは活動中のタスクグループです。「予定 (未登録)」行はこのグループに属します。\nグループの状態や進み具合はタスクグループ表示で確認できます。",
+               L"This is an active task group. The \"planned\" rows belong to it.\nOpen the task group view to see its state and progress.",
+               L"Este es un grupo de tareas activo. Las filas «previstas» le pertenecen.\nAbre la vista del grupo para ver su estado y progreso."),
+            gui_platform::MessageBoxType::Info,
+            false);
+        return;
+    }
     if (jobId.rfind("btplan:", 0) == 0) {
         gui_platform::GetGuiPlatform()->ShowMessageBox(
             st->hwndMain,
@@ -4843,7 +4868,7 @@ static std::wstring BuildTaskQueueInvestigationPrompt(DashboardState* st, const 
 
 static void ShowTaskQueueContextMenu(DashboardState* st, const std::string& jobId, POINT ptScreen, const std::wstring& cellText) {
     if (!st || jobId.empty()) return;
-    const bool virtualJob = jobId.rfind("btplan:", 0) == 0;
+    const bool virtualJob = jobId.rfind("btplan:", 0) == 0 || jobId.rfind("group:", 0) == 0;
     std::string err;
     std::string resp = virtualJob ? std::string() : TaskQueueGetIpc(st, jobId, false, 0, err);
     std::string jobState = JsonGetString(resp, "state", "");
@@ -4852,8 +4877,8 @@ static void ShowTaskQueueContextMenu(DashboardState* st, const std::string& jobI
     AppendMenuW(hMenu, MF_STRING | (cellText.empty() ? MF_GRAYED : 0), 3110, Tr(L"セルをコピー", L"Copy cell", L"Copiar celda"));
     AppendMenuW(hMenu, MF_SEPARATOR, 0, nullptr);
     if (virtualJob) {
-        // Provisional BT rows are not queue jobs yet; retry/cancel would have nothing to act on.
-        AppendMenuW(hMenu, MF_STRING, 3111, Tr(L"ビヘイビアツリーで表示", L"Show in Behavior Tree", L"Ver en el árbol de comportamiento"));
+        // Virtual task-group / planned rows are not queue jobs; retry/cancel have nothing to act on.
+        AppendMenuW(hMenu, MF_STRING, 3111, Tr(L"タスクグループで表示", L"Show Task Group", L"Ver el grupo de tareas"));
         int cmd = TrackPopupMenu(hMenu, TPM_RETURNCMD | TPM_RIGHTBUTTON, ptScreen.x, ptScreen.y, 0, st->hwndMain, nullptr);
         DestroyMenu(hMenu);
         if (cmd == 3110) {
@@ -4882,7 +4907,7 @@ static void ShowTaskQueueContextMenu(DashboardState* st, const std::string& jobI
     if (triageIt != st->triageJobs.end() && !triageIt->second.value("cardId", std::string()).empty())
         AppendMenuW(hMenu, MF_STRING, 3115, Tr(L"トリアージで開く", L"Open in Triage", L"Abrir en Triaje"));
     if (resp.find("\"bt\":{") != std::string::npos) {
-        AppendMenuW(hMenu, MF_STRING, 3111, Tr(L"ビヘイビアツリーで表示", L"Show in Behavior Tree", L"Ver en el árbol de comportamiento"));
+        AppendMenuW(hMenu, MF_STRING, 3111, Tr(L"タスクグループで表示", L"Show Task Group", L"Ver el grupo de tareas"));
     }
     AppendMenuW(hMenu, MF_SEPARATOR, 0, nullptr);
     AppendMenuW(hMenu, MF_STRING, 3120, Tr(L"LLM 調査用プロンプトをコピー", L"Copy LLM Investigation Prompt", L"Copiar prompt de investigación para LLM"));
@@ -5157,7 +5182,7 @@ static void RefreshTaskQueueData(DashboardState* st, bool force = false, bool us
     };
     auto jobRank = [&](const std::string& jobJson) {
         std::string st = JsonGetString(jobJson, "state", "");
-        if (st == "running") return 0;
+        if (st == "running" || st == "waitingForLlm" || st == "paused") return 0;
         if (st == "planned") return 1;
         if (st == "pending") return depsSatisfied(jobJson) ? 2 : 3;
         return 4;
@@ -5213,6 +5238,9 @@ static void RefreshTaskQueueData(DashboardState* st, bool force = false, bool us
 
         std::wstring idStr = Utf8ToWide(jobId);
         std::wstring summaryStr = Utf8ToWide(JsonGetString(j, "summary", ""));
+        if (jobId.rfind("group:", 0) == 0) {
+            summaryStr = Tr(L"[タスクグループ] ", L"[Task Group] ", L"[Grupo de tareas] ") + summaryStr;
+        }
         std::string notes = JsonGetString(j, "notes", "");
         if (!notes.empty()) summaryStr += L"  [notes: " + Utf8ToWide(notes) + L"]";
         std::wstring taskDoingStr;
@@ -6282,6 +6310,7 @@ static void LayoutControls(DashboardState* st, int width, int height) {
         {st->hwndBtnUsage, 28},
         {st->hwndBtnHideTray, 28},
         {st->hwndBtnRefresh, 28},
+        {st->hwndBtnReevalPlanned, 56},
         {st->hwndBtnHint, 28},
         {st->hwndBtnHistory, 28},
         {st->hwndBtnIpmsg, 28},
@@ -10613,6 +10642,8 @@ static void UpdateToolbarLabels(DashboardState* st) {
         SetWindowTextW(st->hwndBtnHistory, L"🩺");
     if (st->hwndBtnIpmsg)
         SetWindowTextW(st->hwndBtnIpmsg, L"💬");
+    if (st->hwndBtnReevalPlanned)
+        SetWindowTextW(st->hwndBtnReevalPlanned, Tr(L"予定↻", L"Plan↻", L"Prev↻"));
 
     if (st->hwndToolbarTip) {
         if (st->hwndBtnGridView)
@@ -17866,6 +17897,8 @@ static LRESULT CALLBACK DashboardWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPA
                 WS_CHILD | WS_VISIBLE | BS_OWNERDRAW, 0, 0, 150, 24, hwnd, (HMENU)IDC_BTN_VIEW_TASKS, nullptr, nullptr);
             st->hwndBtnRefresh = CreateWindowExW(0, L"BUTTON", L"↻",
                 WS_CHILD | WS_VISIBLE | BS_OWNERDRAW, 0, 0, 28, 24, hwnd, (HMENU)IDC_BTN_REFRESH, nullptr, nullptr);
+            st->hwndBtnReevalPlanned = CreateWindowExW(0, L"BUTTON", L"予定↻",
+                WS_CHILD | WS_VISIBLE | BS_OWNERDRAW, 0, 0, 56, 24, hwnd, (HMENU)IDC_BTN_REEVAL_PLANNED, nullptr, nullptr);
             st->hwndBtnHint = CreateWindowExW(0, L"BUTTON", L"💡",
                 WS_CHILD | WS_VISIBLE | BS_OWNERDRAW, 0, 0, 28, 24, hwnd, (HMENU)IDC_BTN_HINT, nullptr, nullptr);
             st->hwndBtnHistory = CreateWindowExW(0, L"BUTTON", L"🕘",
@@ -17934,6 +17967,7 @@ static LRESULT CALLBACK DashboardWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPA
                 addTool(st->hwndBtnBtView);
                 addTool(st->hwndBtnHideTray);
                 addTool(st->hwndBtnRefresh);
+                addTool(st->hwndBtnReevalPlanned);
                 addTool(st->hwndBtnHint);
                 addTool(st->hwndBtnHistory);
                 addTool(st->hwndBtnIpmsg);
@@ -18024,7 +18058,7 @@ static LRESULT CALLBACK DashboardWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPA
                 st->hwndBtnSettings, st->hwndBtnKillAll,
                 st->hwndBtnGridView,
                 st->hwndBtnToggleList, st->hwndBtnToggleTerm, st->hwndBtnTermSessions, st->hwndBtnStreamPane, st->hwndBtnBtView, st->hwndBtnHideTray, st->hwndBtnRefresh,
-                st->hwndBtnHint, st->hwndBtnHistory, st->hwndBtnIpmsg, st->hwndClock,
+                st->hwndBtnReevalPlanned, st->hwndBtnHint, st->hwndBtnHistory, st->hwndBtnIpmsg, st->hwndClock,
                 st->hwndBtnViewTasks, st->hwndList, st->hwndTaskList, st->hwndTab
             };
             for (HWND h : uiCtrls) {
@@ -18597,6 +18631,8 @@ static LRESULT CALLBACK DashboardWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPA
                 if (st->streamPane && st->hwndStreamPane && IsWindowVisible(st->hwndStreamPane)) {
                     ReloadStreamDialogData(st->hwndStreamPane, st->streamPane);
                 }
+            } else if (id == IDC_BTN_REEVAL_PLANNED) {
+                RefreshTaskQueueData(st, true);
             } else if (id == IDC_BTN_STREAM_PANE) {
                 st->showStreamPane = !st->showStreamPane;
                 if (st->showStreamPane && st->hideProcessList) st->hideProcessList = false;

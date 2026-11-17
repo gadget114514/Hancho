@@ -1324,27 +1324,42 @@ std::string IpcServer::HandleRequestJson(const std::string& reqJson) {
                 resp = tqm_.TaskQueueList(tqFilter, stateFilter, sinceSec, err,
                                           JsonGetString(reqJson, "origin", ""), btFilter,
                                           JsonGetBool(reqJson, "include_hidden", false));
-                // Provisional BT rows: idle job/worker leaves of the current branch. They are
-                // not stored anywhere, so a branch change on the next query drops them.
-                if (err.empty() && btm_ && JsonGetBool(reqJson, "include_planned", false) &&
-                    (stateFilter.empty() || stateFilter == "pending" || stateFilter == "planned")) {
+                // Virtual task-group rows and their provisional leaves, derived from the live
+                // state on every query. Nothing is stored, so a finished group drops both rows.
+                if (err.empty() && btm_ && JsonGetBool(reqJson, "include_planned", false)) {
                     nlohmann::json doc = nlohmann::json::parse(resp, nullptr, false);
                     if (doc.is_object() && doc.contains("jobs") && doc["jobs"].is_array()) {
                         BtRemainingInfo info = btm_->GetRemainingInfo();
-                        for (const auto& t : info.planned) {
-                            if (!tqFilter.empty() && t.queueName != tqFilter) continue;
-                            if (!btFilter.empty() && t.btId != btFilter) continue;
+                        for (const auto& g : info.groups) {
+                            if (!tqFilter.empty() && g.taskqueue != tqFilter) continue;
+                            if (!btFilter.empty() && g.id != btFilter) continue;
+                            if (!stateFilter.empty() && stateFilter != g.state) continue;
                             nlohmann::json job;
-                            job["id"] = "btplan:" + t.btId + ":" + t.nodeKey;
-                            job["summary"] = t.summary.empty() ? t.nodeKey : t.summary;
-                            job["state"] = "planned";
+                            job["id"] = "group:" + g.id;
+                            job["summary"] = g.summary.empty() ? g.id : g.summary;
+                            job["state"] = g.state;
                             job["virtual"] = true;
-                            job["taskqueue"] = t.queueName;
-                            job["timeout_sec"] = t.estimateSec;
-                            job["estimate_sec"] = t.estimateSec;
+                            job["taskqueue"] = g.taskqueue;
                             job["created_at"] = "";
-                            job["bt"] = {{"id", t.btId}, {"node", t.nodeKey}, {"planned", true}};
+                            job["group"] = {{"id", g.id}, {"detail", g.detail}};
                             doc["jobs"].push_back(std::move(job));
+                        }
+                        if (stateFilter.empty() || stateFilter == "pending" || stateFilter == "planned") {
+                            for (const auto& t : info.planned) {
+                                if (!tqFilter.empty() && t.queueName != tqFilter) continue;
+                                if (!btFilter.empty() && t.btId != btFilter) continue;
+                                nlohmann::json job;
+                                job["id"] = "btplan:" + t.btId + ":" + t.nodeKey;
+                                job["summary"] = t.summary.empty() ? t.nodeKey : t.summary;
+                                job["state"] = "planned";
+                                job["virtual"] = true;
+                                job["taskqueue"] = t.queueName;
+                                job["timeout_sec"] = t.estimateSec;
+                                job["estimate_sec"] = t.estimateSec;
+                                job["created_at"] = "";
+                                job["bt"] = {{"id", t.btId}, {"node", t.nodeKey}, {"planned", true}};
+                                doc["jobs"].push_back(std::move(job));
+                            }
                         }
                         resp = doc.dump();
                     }

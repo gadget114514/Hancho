@@ -2194,7 +2194,7 @@ const char kAppJs_1[] = R"JS_1(    if (data.events && Array.isArray(data.events)
   function getBadgeClass(stateStr) {
     const s = (stateStr || '').toLowerCase();
     if (s === 'running') return 'badge badge-running';
-    if (s === 'pending' || s === 'queued' || s === 'waiting' || s === 'planned') return 'badge badge-planned';
+    if (s === 'pending' || s === 'queued' || s === 'waiting' || s === 'planned' || s === 'waitingforllm' || s === 'paused') return 'badge badge-planned';
     if (s === 'blocked') return 'badge badge-blocked';
     if (s === 'completed' || s === 'succeeded') return 'badge badge-completed';
     if (s === 'failed' || s === 'timed_out' || s === 'idle_timed_out') return 'badge badge-failed';

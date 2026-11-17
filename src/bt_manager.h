@@ -17,9 +17,18 @@
 
 namespace pc {
 
+struct TaskGroupInfo {
+    std::string id;
+    std::string state;
+    std::string summary;
+    std::string detail;
+    std::string taskqueue;
+};
+
 struct BtRemainingInfo {
     int64_t pendingSec = 0;
     std::vector<BtPlannedTask> planned;  // provisional rows, derived from the current tree state
+    std::vector<TaskGroupInfo> groups;   // active task groups, shown as virtual rows in the task list
 };
 
 class BtManager : public IBtJobRunner, public IBtEngineCatalog {

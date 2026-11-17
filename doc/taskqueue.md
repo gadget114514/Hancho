@@ -66,6 +66,7 @@ Jobs that a behavior tree adds carry the origin of the `bt_start` call. The dash
 | `blocked` | A success-dependency failed/cancelled. Fix it and `taskqueue_retry` the dependency; blocked dependents are requeued automatically. |
 | `running` | An attempt (one managed process) is executing. |
 | `planned` | A provisional row for an idle job/worker leaf of a running behavior tree. It is not a stored queue job; `taskqueue_list` emits it when `include_planned` is true (the desktop dashboard, the CLI, the web UI and MCP all ask for it by default; the CLI has `--no-planned`, MCP `includePlanned: false`), and it disappears when the tree moves to another branch or finishes. |
+| `running` / `waitingForLlm` / `paused` (task group) | The active task group (the BT root) is also a virtual row with id `group:<id>` and the group's current state. It is re-derived on every query and disappears together with its planned rows when the group finishes. |
 | `succeeded` / `failed` / `cancelled` | Terminal states. Failed jobs auto-retry up to `maxAttempts`. |
 
 `taskqueue add` reports the `data_dir` that received the jobs. Report it with the added IDs; if the dashboard does not show a job, compare it with the data directory in the dashboard title. `hidden` is respected: a hidden job stays hidden by default, and **Show hidden tasks** in Settings includes it. Do not set `hidden` on jobs you register yourself: it is reserved for Hancho's internal jobs.

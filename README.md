@@ -120,6 +120,12 @@ The application icons are modeled on the character "Telephone Cat" (電話猫, D
 
 
 
+### v0.9.27
+- **Task groups in the task list**: the active task group (the BT root) now appears as a virtual `group:<id>` row above its `planned` leaves, with its current state (`running`, `waiting for LLM`, `paused`). It is re-derived from the live state on every query and disappears together with its planned rows when the group finishes.
+- **Re-evaluate planned rows**: a `予定↻` toolbar button re-reads the task queue and task-group state from the core and re-renders the provisional rows immediately.
+- **Task group wording**: user-facing labels now say "task group"; the group's state has a readable label, and its detail and context menu are handled without trying to fetch a queue job that does not exist.
+- **Docs**: the task queue documentation describes the task-group row.
+
 ### v0.9.26
 - **Quick fix**: `hancho-cli quickfix --file <path> --find <text> --replace <text> [--all] [--check <regex>]` and the MCP `quickfix` tool apply a tiny deterministic edit as a short task-queue job (no LLM, `maxAttempts=1`). The job fails when the text is absent or the check does not match.
 - **Triage actions and status**: the action pane has a "🚫 Ignore" button (a reason is required; process cards are recorded as acknowledged). The status column now combines the card state with the decision/result and shows Rerunning, Handled, Awaiting decision, Ignored and so on, so a retried job that succeeded no longer looks pending.
