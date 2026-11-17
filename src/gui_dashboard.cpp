@@ -4869,6 +4869,24 @@ static std::wstring BuildTaskQueueInvestigationPrompt(DashboardState* st, const 
 static void ShowTaskQueueContextMenu(DashboardState* st, const std::string& jobId, POINT ptScreen, const std::wstring& cellText) {
     if (!st || jobId.empty()) return;
     const bool virtualJob = jobId.rfind("btplan:", 0) == 0 || jobId.rfind("group:", 0) == 0;
+    const bool groupRow = jobId.rfind("group:", 0) == 0;
+    const std::string groupId = groupRow ? jobId.substr(6) : std::string();
+    std::string btNode;
+    std::vector<std::string> btChoices;
+    if (groupRow) {
+        nlohmann::json req = {{"action", "bt_get"}, {"id", groupId}, {"compact", true}};
+        nlohmann::json btResp;
+        if (GuiIpcCall(st, req, btResp, nullptr, 5000) && btResp.value("ok", false) &&
+            btResp.value("state", "") == "waitingForLlm" && btResp.contains("escalation")) {
+            const auto& esc = btResp["escalation"];
+            btNode = esc.value("node", std::string());
+            if (esc.contains("expect") && esc["expect"].is_array()) {
+                for (const auto& e : esc["expect"]) {
+                    if (e.is_string()) btChoices.push_back(e.get<std::string>());
+                }
+            }
+        }
+    }
     std::string err;
     std::string resp = virtualJob ? std::string() : TaskQueueGetIpc(st, jobId, false, 0, err);
     std::string jobState = JsonGetString(resp, "state", "");
@@ -4877,11 +4895,42 @@ static void ShowTaskQueueContextMenu(DashboardState* st, const std::string& jobI
     AppendMenuW(hMenu, MF_STRING | (cellText.empty() ? MF_GRAYED : 0), 3110, Tr(L"セルをコピー", L"Copy cell", L"Copiar celda"));
     AppendMenuW(hMenu, MF_SEPARATOR, 0, nullptr);
     if (virtualJob) {
+        HMENU hAnswerMenu = nullptr;
+        if (!btChoices.empty()) {
+            hAnswerMenu = CreatePopupMenu();
+            for (size_t i = 0; i < btChoices.size() && i < 32; ++i) {
+                AppendMenuW(hAnswerMenu, MF_STRING, 3200 + static_cast<UINT_PTR>(i),
+                            Utf8ToWide(btChoices[i]).c_str());
+            }
+            AppendMenuW(hMenu, MF_STRING | MF_POPUP, reinterpret_cast<UINT_PTR>(hAnswerMenu),
+                        Tr(L"回答して進める", L"Answer and resume", L"Responder y continuar"));
+        }
         // Virtual task-group / planned rows are not queue jobs; retry/cancel have nothing to act on.
         AppendMenuW(hMenu, MF_STRING, 3111, Tr(L"タスクグループで表示", L"Show Task Group", L"Ver el grupo de tareas"));
         int cmd = TrackPopupMenu(hMenu, TPM_RETURNCMD | TPM_RIGHTBUTTON, ptScreen.x, ptScreen.y, 0, st->hwndMain, nullptr);
+        if (hAnswerMenu) DestroyMenu(hAnswerMenu);
         DestroyMenu(hMenu);
-        if (cmd == 3110) {
+        if (cmd >= 3200 && cmd < 3200 + static_cast<int>(btChoices.size())) {
+            std::string answer = btChoices[static_cast<size_t>(cmd - 3200)];
+            std::string rationale = WideToUtf8(Tr(L"右クリックメニューで手動選択",
+                                                  L"Selected manually from the context menu",
+                                                  L"Seleccionado manualmente desde el menú contextual"));
+            nlohmann::json resumeReq = {
+                {"action", "bt_resume"}, {"id", groupId}, {"node", btNode},
+                {"answer", answer}, {"rationale", rationale}
+            };
+            nlohmann::json resumeResp;
+            std::string resumeErr;
+            if (!GuiIpcCall(st, resumeReq, resumeResp, &resumeErr) || !resumeResp.value("ok", false)) {
+                gui_platform::GetGuiPlatform()->ShowMessageBox(
+                    st->hwndMain,
+                    Tr(L"再開に失敗", L"Resume failed", L"Error al reanudar"),
+                    Utf8ToWide(resumeErr.empty() ? resumeResp.value("error", std::string("IPC request failed")) : resumeErr),
+                    gui_platform::MessageBoxType::Error,
+                    false);
+            }
+            RefreshDashboardData(st);
+        } else if (cmd == 3110) {
             CopyTextToClipboard(st->hwndMain, cellText);
         } else if (cmd == 3111) {
             SendMessageW(st->hwndMain, WM_COMMAND, IDC_BT_DEBUG, 0);
