@@ -834,6 +834,9 @@ public:
     std::string TaskQueuePause(const std::string& taskqueue, bool paused, std::string& outError);
     std::string TaskQueueWait(const std::string& taskqueue, int sinceVersion, int timeoutMs, std::string& outError);
     std::string TaskQueuePurge(const std::string& taskqueue, const std::string& statesJson, std::string& outError);
+    // Removes one finished job (succeeded/failed/cancelled) from its queue. Active jobs must be
+    // cancelled first so a running process is never orphaned.
+    std::string TaskQueueRemove(const std::string& id, std::string& outError);
     // Removes finished jobs (succeeded/failed/cancelled) whose updatedAt is older than maxAgeSec.
     // Empty taskqueue applies to all queues.
     std::string TaskQueuePurgeOlderThan(const std::string& taskqueue, int64_t maxAgeSec, std::string& outError);

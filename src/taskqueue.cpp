@@ -4489,6 +4489,35 @@ std::string TaskQueueManager::TaskQueuePurge(const std::string& taskqueue, const
     return "{\"ok\":true,\"taskqueue\":\"" + JsonEscape(taskqueue) + "\",\"purged\":" + std::to_string(purged) + "}";
 }
 
+std::string TaskQueueManager::TaskQueueRemove(const std::string& id, std::string& outError) {
+    outError.clear();
+    if (id.empty()) {
+        outError = "id is required";
+        return BuildError(outError);
+    }
+    std::lock_guard<std::mutex> lock(mutex_);
+    TaskQueue* tq = nullptr;
+    TaskQueueJob* job = FindJob(id, &tq);
+    if (!job || !tq) {
+        outError = "job not found: " + id;
+        return BuildError(outError);
+    }
+    if (job->state != "succeeded" && job->state != "failed" && job->state != "cancelled") {
+        outError = "cannot remove a " + job->state + " job; cancel it first";
+        return BuildError(outError);
+    }
+    const std::string queueName = tq->name;
+    auto& jobs = tq->jobs;
+    jobs.erase(std::remove_if(jobs.begin(), jobs.end(),
+                              [&](const TaskQueueJob& j) { return j.id == id; }), jobs.end());
+    jobIndexDirty_ = true;
+    tq->version++;
+    SaveQueue(*tq);
+    cv_.notify_all();
+    WriteAuditLog("TASKQUEUE_REMOVE", "id=" + id + " queue=" + queueName);
+    return "{\"ok\":true,\"id\":\"" + JsonEscape(id) + "\",\"taskqueue\":\"" + JsonEscape(queueName) + "\"}";
+}
+
 std::string TaskQueueManager::TaskQueuePurgeOlderThan(const std::string& taskqueue, int64_t maxAgeSec, std::string& outError) {
     outError.clear();
     if (maxAgeSec < 0) {

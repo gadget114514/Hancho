@@ -1428,6 +1428,8 @@ std::string IpcServer::HandleRequestJson(const std::string& reqJson) {
                 resp = tqm_.TaskQueuePurge(JsonGetString(reqJson, "taskqueue", ""),
                                            ExtractRawJsonValue(reqJson, "states"), err);
             }
+        } else if (action == "taskqueue_remove") {
+            resp = tqm_.TaskQueueRemove(JsonGetString(reqJson, "id", ""), err);
         } else if (action == "taskqueue_link") {
             resp = tqm_.TaskQueueLink(JsonGetString(reqJson, "job", ""),
                                       JsonGetString(reqJson, "depends_on", ""),

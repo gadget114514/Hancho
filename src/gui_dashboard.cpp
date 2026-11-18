@@ -1426,6 +1426,18 @@ static std::string TaskQueuePurgeIpc(DashboardState* st, const std::string& queu
     return "";
 }
 
+static std::string TaskQueueRemoveIpc(DashboardState* st, const std::string& id, std::string& outErr) {
+    nlohmann::json req = {{"action", "taskqueue_remove"}, {"id", id}};
+    nlohmann::json resp;
+    if (GuiIpcCall(st, req, resp, &outErr)) {
+        return resp.dump();
+    }
+    if (st && st->tqm) {
+        return st->tqm->TaskQueueRemove(id, outErr);
+    }
+    return "";
+}
+
 static void SetResourceLocksEnabledIpc(DashboardState* st, bool enabled) {
     nlohmann::json req = {{"action", "taskqueue_resource_locks"}, {"enabled", enabled}};
     nlohmann::json resp;
@@ -5653,6 +5665,9 @@ static void ShowTaskQueueContextMenu(DashboardState* st, const std::string& jobI
                               : Tr(L"一時停止 (Pause)", L"Pause", L"Pausar"));
     }
     AppendMenuW(hMenu, MF_STRING, 3102, Tr(L"停止 (キャンセル)", L"Stop (Cancel)", L"Detener (Cancelar)"));
+    if (jobFinished) {
+        AppendMenuW(hMenu, MF_STRING, 3132, Tr(L"タスクリストから削除", L"Remove from task list", L"Quitar de la lista de tareas"));
+    }
     AppendMenuW(hMenu, MF_SEPARATOR, 0, nullptr);
     AppendMenuW(hMenu, MF_STRING, 3103, Tr(L"キューを一時停止", L"Pause queue", L"Pausar cola"));
     AppendMenuW(hMenu, MF_STRING, 3104, Tr(L"キューを再開", L"Resume queue", L"Reanudar cola"));
@@ -5765,6 +5780,28 @@ static void ShowTaskQueueContextMenu(DashboardState* st, const std::string& jobI
                 st, pause ? Tr(L"一時停止できませんでした", L"Could not pause", L"No se pudo pausar")
                           : Tr(L"再開できませんでした", L"Could not resume", L"No se pudo reanudar"),
                 pauseErr, false);
+        }
+    } else if (cmd == 3132) {
+        if (gui_platform::GetGuiPlatform()->ShowMessageBox(
+                st->hwndMain,
+                Tr(L"タスクリストから削除", L"Remove from task list", L"Quitar de la lista de tareas"),
+                Tr(L"この終了済みタスクをタスクリストから削除しますか？\nキューからも削除され、元に戻せません。",
+                   L"Remove this finished task from the task list?\nIt is also deleted from the queue and cannot be undone.",
+                   L"¿Quitar esta tarea finalizada de la lista?\nTambién se elimina de la cola y no se puede deshacer."),
+                gui_platform::MessageBoxType::QuestionYesNo,
+                true) == gui_platform::MessageBoxResult::Yes) {
+            std::wstring removeErr;
+            if (CheckIpcResponse(TaskQueueRemoveIpc(st, jobId, err), err, removeErr)) {
+                ShowTaskQueueResult(st, Tr(L"削除", L"Removed", L"Eliminado"),
+                                    Tr(L"タスクをタスクリストから削除しました。",
+                                       L"Removed the task from the task list.",
+                                       L"Se quitó la tarea de la lista."),
+                                    true);
+            } else {
+                ShowTaskQueueResult(st, Tr(L"削除できませんでした", L"Could not remove",
+                                           L"No se pudo quitar"),
+                                    removeErr, false);
+            }
         }
     } else if (cmd == 3103 || cmd == 3104) {
         resp = TaskQueueGetIpc(st, jobId, false, 0, err);
