@@ -117,6 +117,9 @@ New-Item -ItemType Junction -Path .claude\skills\hancho -Target (Resolve-Path sk
 
 
 
+### v0.9.33
+- **taskqueue コマンドでタスクグループ ID を受け付け**: `taskqueue get|close|cancel|remove|retry|pause|resume <id>` が、ジョブ ID だけでなくタスクグループ（BT）の ID も受け付けます。ID が保存済みジョブでない（または BT 所有のジョブである）場合はツリーに振り分けます（`get` → `bt_get`、`close`/`remove` → `bt_remove`、`cancel` → `bt_cancel`、`pause`/`resume` → `bt_pause`、`retry` → `bt_retry`）。これで `delcheck` のようなタスクグループに `taskqueue close <btId>` しても「job not found」になりません。
+
 ### v0.9.32
 - **仮想のタスクグループ行を操作可能に**: タスクグループ/予定行の右クリックで、所有ツリーに対する後片付け操作を選べます。「タスクリストから削除」(`bt_remove`)、「状態を closed にする」「停止 (キャンセル)」(`bt_cancel`)、「タスクグループを再実行」(`bt_retry`)。これで「job not found」で行き止まりになりません。保存済みジョブは従来どおり `taskqueue_remove` / `taskqueue_close` / `taskqueue_cancel` / `taskqueue_retry` です。
 

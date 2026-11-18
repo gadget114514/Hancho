@@ -305,7 +305,7 @@ int main() {
                   "ipc-escalate completes with state=succeeded after bt_resume");
         }
 
-        // 4, 7, & 8. Failure -> taskqueue_retry rejected -> bt_update of non-running node -> bt_retry succeeds
+        // 4, 7, & 8. Failure -> taskqueue_retry routes to bt_retry -> bt_update of non-running node -> bt_retry succeeds
         {
             json failUpdateBt = {
                 {"id", "ipc-fail-update-retry"},
@@ -336,14 +336,22 @@ int main() {
             Check(rFail.value("ok", false) && rFail.value("state", "") == "failed",
                   "ipc-fail-update-retry fails on step_broken");
 
-            // External taskqueue_retry on BT job ipc-fail-update-retry-step_broken-1 must be rejected
+            // External taskqueue_retry on a BT job now routes to the tree (bt_retry) instead of
+            // rejecting it, so the caller does not have to know it is tree-owned.
             json rTqRetry = h.Call({
                 {"action", "taskqueue_retry"},
                 {"id", "ipc-fail-update-retry-step_broken-1"}
             });
-            Check(!rTqRetry.value("ok", true) &&
-                  rTqRetry.value("error", "") == "this job is managed by a behavior tree; use bt_retry",
-                  "taskqueue_retry of a BT job is rejected via IPC");
+            Check(rTqRetry.value("ok", false),
+                  "taskqueue_retry of a BT job routes to bt_retry");
+            std::string retryState;
+            for (int i = 0; i < 200; ++i) {
+                json g = h.Call({{"action", "bt_get"}, {"id", "ipc-fail-update-retry"}, {"compact", true}});
+                retryState = g.value("state", "");
+                if (retryState == "succeeded" || retryState == "failed" || retryState == "cancelled") break;
+                Sleep(50);
+            }
+            Check(retryState == "failed", "the auto-routed retry fails again on the broken step");
 
             // Shape-changing bt_update (changing type) must be rejected
             json rBadShape = h.Call({
@@ -1235,6 +1243,29 @@ int main() {
             Check(closeJob.value("state", "") == "closed", "taskqueue_close sets state=closed");
             json rCounts = h.Call({{"action", "taskqueue_counts"}});
             Check(rCounts.value("closed", 0) >= 1, "taskqueue_counts reports closed jobs");
+        }
+
+        // 18. A task-group id is accepted by taskqueue_close and routed to the tree.
+        {
+            json tgBt = {
+                {"id", "ipc-tg-fallback"},
+                {"cwd", tempDirUtf8},
+                {"root", {{"type", "job"}, {"id", "only"}, {"summary", "Fallback"},
+                          {"command", "cmd /c exit 0"}, {"timeoutSec", 30}}}
+            };
+            h.Call({{"action", "bt_start"}, {"bt", tgBt}});
+            for (int i = 0; i < 100; ++i) {
+                json w = h.Call({{"action", "bt_wait"}, {"id", "ipc-tg-fallback"}, {"sinceVersion", 0}, {"timeoutMs", 500}});
+                std::string s = w.value("state", "");
+                if (s == "succeeded" || s == "failed" || s == "cancelled") break;
+            }
+            json rGetTg = h.Call({{"action", "taskqueue_get"}, {"id", "ipc-tg-fallback"}});
+            Check(rGetTg.value("ok", false) && rGetTg.value("kind", "") == "taskGroup",
+                  "taskqueue_get falls back to bt_get for a task-group id");
+            json rCloseTg = h.Call({{"action", "taskqueue_close"}, {"id", "ipc-tg-fallback"}});
+            Check(rCloseTg.value("ok", false), "taskqueue_close accepts a task-group id");
+            json rBtGone = h.Call({{"action", "bt_get"}, {"id", "ipc-tg-fallback"}});
+            Check(!rBtGone.value("ok", true), "taskqueue_close on a task-group id removed the tree");
         }
     }
 

@@ -120,6 +120,9 @@ The application icons are modeled on the character "Telephone Cat" (電話猫, D
 
 
 
+### v0.9.33
+- **Task-group ids in taskqueue commands**: `taskqueue get|close|cancel|remove|retry|pause|resume <id>` now accept a task-group (behavior-tree) id, not only a job id. When the id is not a stored job (or is a tree-owned job), the command routes to the tree: `get` → `bt_get`, `close`/`remove` → `bt_remove`, `cancel` → `bt_cancel`, `pause`/`resume` → `bt_pause`, `retry` → `bt_retry`. This fixes `taskqueue close <btId>` returning "job not found" for a task group such as `delcheck`.
+
 ### v0.9.32
 - **Act on virtual task-group rows**: right-clicking a task-group or planned row now offers the same cleanup actions as a job, routed to the owning tree: "Remove from task list" (`bt_remove`), "Force state to closed" and "Stop (cancel)" (`bt_cancel`), and "Retry task group" (`bt_retry`). This replaces the previous "job not found" dead end. Stored jobs still use `taskqueue_remove` / `taskqueue_close` / `taskqueue_cancel` / `taskqueue_retry`.
 

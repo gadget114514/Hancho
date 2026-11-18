@@ -1383,9 +1383,19 @@ std::string IpcServer::HandleRequestJson(const std::string& reqJson) {
                 }
             }
         } else if (action == "taskqueue_get") {
-            resp = tqm_.TaskQueueGet(JsonGetString(reqJson, "id", ""),
+            const std::string id = JsonGetString(reqJson, "id", "");
+            resp = tqm_.TaskQueueGet(id,
                                      JsonGetBool(reqJson, "include_instructions", true),
                                      static_cast<int>(JsonGetInt(reqJson, "rev", 0)), err);
+            // The id may be a task group rather than a job; return the tree instead.
+            if (!err.empty() && btm_ && err.find("job not found") != std::string::npos) {
+                nlohmann::json btDoc = nlohmann::json::parse(btm_->Get(id, false), nullptr, false);
+                if (btDoc.is_object() && btDoc.value("ok", false)) {
+                    btDoc["kind"] = "taskGroup";
+                    resp = btDoc.dump();
+                    err.clear();
+                }
+            }
         } else if (action == "taskqueue_retry") {
             const std::string retryId = JsonGetString(reqJson, "id", "");
             const bool resetAttempts = JsonGetBool(reqJson, "reset_attempts", true);
@@ -1396,6 +1406,20 @@ std::string IpcServer::HandleRequestJson(const std::string& reqJson) {
                 err = "invalid since '" + sinceStr + "' (use a number followed by m, h or d, e.g. 6h)";
             } else if (!retryId.empty()) {
                 resp = tqm_.TaskQueueRetry(retryId, resetAttempts, refreshInstr, TaskQueueCaller::External, err);
+                if (!err.empty() && btm_) {
+                    if (err.find("managed by a behavior tree") != std::string::npos) {
+                        // A tree-owned job: retry the tree's branch instead.
+                        TaskQueueJob job;
+                        if (tqm_.GetJobSnapshot(retryId, job) && !job.bt.id.empty()) {
+                            resp = btm_->Retry(job.bt.id, job.bt.node, resetAttempts);
+                            err.clear();
+                        }
+                    } else if (err.find("job not found") != std::string::npos) {
+                        // The id may be a task group rather than a job.
+                        resp = btm_->Retry(retryId, "", resetAttempts);
+                        err.clear();
+                    }
+                }
             } else if (JsonGetBool(reqJson, "failed", false)) {
                 // Bulk retry: every failed job, optionally limited to one queue and a time window.
                 resp = tqm_.TaskQueueRetryFailed(JsonGetString(reqJson, "taskqueue", ""),
@@ -1407,13 +1431,33 @@ std::string IpcServer::HandleRequestJson(const std::string& reqJson) {
             resp = tqm_.TaskQueueUpdate(JsonGetString(reqJson, "id", ""),
                                         ExtractRawJsonValue(reqJson, "patch"), TaskQueueCaller::External, err);
         } else if (action == "taskqueue_cancel") {
-            resp = tqm_.TaskQueueCancel(JsonGetString(reqJson, "id", ""), err);
+            const std::string id = JsonGetString(reqJson, "id", "");
+            resp = tqm_.TaskQueueCancel(id, err);
+            // The id may be a task group rather than a job; cancel the tree instead.
+            if (!err.empty() && btm_ && err.find("job not found") != std::string::npos) {
+                resp = btm_->Cancel(id);
+                err.clear();
+            }
         } else if (action == "taskqueue_close") {
-            resp = tqm_.TaskQueueClose(JsonGetString(reqJson, "id", ""), err);
-        } else if (action == "taskqueue_pause") {
-            resp = tqm_.TaskQueuePause(JsonGetString(reqJson, "taskqueue", ""), true, err);
-        } else if (action == "taskqueue_resume") {
-            resp = tqm_.TaskQueuePause(JsonGetString(reqJson, "taskqueue", ""), false, err);
+            const std::string id = JsonGetString(reqJson, "id", "");
+            resp = tqm_.TaskQueueClose(id, err);
+            // A task group has no job to close; dismiss the tree so it leaves the list.
+            if (!err.empty() && btm_ && err.find("job not found") != std::string::npos) {
+                resp = btm_->Remove(id);
+                err.clear();
+            }
+        } else if (action == "taskqueue_pause" || action == "taskqueue_resume") {
+            const bool paused = (action == "taskqueue_pause");
+            const std::string name = JsonGetString(reqJson, "taskqueue", "");
+            resp = tqm_.TaskQueuePause(name, paused, err);
+            // The name may be a task group rather than a queue.
+            if (!err.empty() && btm_ && err.find("task queue not found") != std::string::npos) {
+                std::string btResp = btm_->Pause(name, paused);
+                if (btResp.find("\"ok\":true") != std::string::npos) {
+                    resp = btResp;
+                    err.clear();
+                }
+            }
         } else if (action == "taskqueue_pause_job") {
             resp = tqm_.TaskQueuePauseJob(JsonGetString(reqJson, "id", ""), true, err);
         } else if (action == "taskqueue_resume_job") {
@@ -1431,8 +1475,13 @@ std::string IpcServer::HandleRequestJson(const std::string& reqJson) {
                                            ExtractRawJsonValue(reqJson, "states"), err);
             }
         } else if (action == "taskqueue_remove") {
-            resp = tqm_.TaskQueueRemove(JsonGetString(reqJson, "id", ""),
-                                        JsonGetBool(reqJson, "force", false), err);
+            const std::string id = JsonGetString(reqJson, "id", "");
+            resp = tqm_.TaskQueueRemove(id, JsonGetBool(reqJson, "force", false), err);
+            // The id may be a task group rather than a job; remove the tree instead.
+            if (!err.empty() && btm_ && err.find("job not found") != std::string::npos) {
+                resp = btm_->Remove(id);
+                err.clear();
+            }
         } else if (action == "taskqueue_link") {
             resp = tqm_.TaskQueueLink(JsonGetString(reqJson, "job", ""),
                                       JsonGetString(reqJson, "depends_on", ""),
