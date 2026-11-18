@@ -4558,32 +4558,88 @@ std::string TaskQueueManager::TaskQueueRemove(const std::string& id, bool force,
         outError = "this is a virtual task-group row, not a queue job; stop the task group instead";
         return BuildError(outError);
     }
+    ProcessManager* pm = nullptr;
+    int pid = 0;
+    std::string remoteHost;
+    int remotePid = 0;
+    RemoteKillCallback remoteKill;
+    std::string resp;
+    {
+        std::lock_guard<std::mutex> lock(mutex_);
+        TaskQueue* tq = nullptr;
+        TaskQueueJob* job = FindJob(id, &tq);
+        if (!job || !tq) {
+            outError = "job not found: " + id;
+            return BuildError(outError);
+        }
+        const bool finished = job->state == "succeeded" || job->state == "failed" ||
+                              job->state == "cancelled" || job->state == "closed";
+        if (!finished && !force) {
+            outError = "cannot remove a " + job->state + " job; use force or cancel it first";
+            return BuildError(outError);
+        }
+        if (job->state == "running" && !job->attempts.empty()) {
+            pid = job->attempts.back().processId;
+            remoteHost = job->attempts.back().remoteHost;
+            remotePid = job->attempts.back().remoteProcessId;
+        }
+        const std::string queueName = tq->name;
+        const std::string removedState = job->state;
+        auto& jobs = tq->jobs;
+        jobs.erase(std::remove_if(jobs.begin(), jobs.end(),
+                                  [&](const TaskQueueJob& j) { return j.id == id; }), jobs.end());
+        jobIndexDirty_ = true;
+        tq->version++;
+        SaveQueue(*tq);
+        cv_.notify_all();
+        WriteAuditLog("TASKQUEUE_REMOVE", "id=" + id + " queue=" + queueName + " state=" + removedState +
+                                              (force ? " force=1" : ""));
+        resp = "{\"ok\":true,\"id\":\"" + JsonEscape(id) + "\",\"taskqueue\":\"" + JsonEscape(queueName) +
+               "\",\"state\":\"" + JsonEscape(removedState) + "\"}";
+        pm = pm_;
+        remoteKill = remoteKillCb_;
+    }
+    // A force-removed running job must not keep its process alive: otherwise the process
+    // finishes later and is recorded again as a plain run, so the row reappears.
+    if (!remoteHost.empty() && remotePid > 0) {
+        if (remoteKill) {
+            std::string err;
+            remoteKill(remoteHost, remotePid, err);
+        }
+    } else if (pm && pid > 0) {
+        std::string err;
+        pm->KillProcess(pid, err);
+    }
+    return resp;
+}
+
+std::string TaskQueueManager::RemoveJobsForTree(const std::string& btId, std::string& outError) {
+    outError.clear();
+    if (btId.empty()) {
+        outError = "bt id is required";
+        return BuildError(outError);
+    }
     std::lock_guard<std::mutex> lock(mutex_);
-    TaskQueue* tq = nullptr;
-    TaskQueueJob* job = FindJob(id, &tq);
-    if (!job || !tq) {
-        outError = "job not found: " + id;
-        return BuildError(outError);
+    size_t removed = 0;
+    for (auto& [name, tq] : queues_) {
+        (void)name;
+        const size_t before = tq.jobs.size();
+        tq.jobs.erase(std::remove_if(tq.jobs.begin(), tq.jobs.end(),
+                                     [&](const TaskQueueJob& j) { return j.bt.id == btId; }),
+                      tq.jobs.end());
+        const size_t n = before - tq.jobs.size();
+        if (n > 0) {
+            removed += n;
+            tq.version++;
+            SaveQueue(tq);
+        }
     }
-    const bool finished = job->state == "succeeded" || job->state == "failed" ||
-                          job->state == "cancelled" || job->state == "closed";
-    if (!finished && !force) {
-        outError = "cannot remove a " + job->state + " job; use force or cancel it first";
-        return BuildError(outError);
+    if (removed > 0) {
+        jobIndexDirty_ = true;
+        cv_.notify_all();
+        WriteAuditLog("TASKQUEUE_REMOVE_TREE", "bt=" + btId + " removed=" + std::to_string(removed));
     }
-    const std::string queueName = tq->name;
-    const std::string removedState = job->state;
-    auto& jobs = tq->jobs;
-    jobs.erase(std::remove_if(jobs.begin(), jobs.end(),
-                              [&](const TaskQueueJob& j) { return j.id == id; }), jobs.end());
-    jobIndexDirty_ = true;
-    tq->version++;
-    SaveQueue(*tq);
-    cv_.notify_all();
-    WriteAuditLog("TASKQUEUE_REMOVE", "id=" + id + " queue=" + queueName + " state=" + removedState +
-                                          (force ? " force=1" : ""));
-    return "{\"ok\":true,\"id\":\"" + JsonEscape(id) + "\",\"taskqueue\":\"" + JsonEscape(queueName) +
-           "\",\"state\":\"" + JsonEscape(removedState) + "\"}";
+    return "{\"ok\":true,\"bt\":\"" + JsonEscape(btId) + "\",\"removed\":" + std::to_string(removed) + "}";
 }
 
 std::string TaskQueueManager::TaskQueuePurgeOlderThan(const std::string& taskqueue, int64_t maxAgeSec, std::string& outError) {

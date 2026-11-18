@@ -117,6 +117,10 @@ New-Item -ItemType Junction -Path .claude\skills\hancho -Target (Resolve-Path sk
 
 
 
+### v0.9.34
+- **タスクグループ削除時に配下のタスクも削除**: `bt_remove`（および `taskqueue remove <btId>`）がツリーのタスクキュージョブも削除するようになり、グループの行が一覧から消えます（復活しません）。`taskqueue close <btId>` は停止して残し、`taskqueue remove <btId>` はツリーとジョブを削除します。
+- **実行中ジョブの強制削除でプロセスも kill**: 強制削除した実行中ジョブのプロセスが残らなくなり、後から終了して plain の実行記録として復活することがなくなります。
+
 ### v0.9.33
 - **taskqueue コマンドでタスクグループ ID を受け付け**: `taskqueue get|close|cancel|remove|retry|pause|resume <id>` が、ジョブ ID だけでなくタスクグループ（BT）の ID も受け付けます。ID が保存済みジョブでない（または BT 所有のジョブである）場合はツリーに振り分けます（`get` → `bt_get`、`close`/`remove` → `bt_remove`、`cancel` → `bt_cancel`、`pause`/`resume` → `bt_pause`、`retry` → `bt_retry`）。これで `delcheck` のようなタスクグループに `taskqueue close <btId>` しても「job not found」になりません。
 

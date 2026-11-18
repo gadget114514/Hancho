@@ -843,6 +843,8 @@ public:
     // removes a job whose state looks active (for example a stuck "running" row with no live
     // process), which is meant for manual cleanup behind a user confirmation.
     std::string TaskQueueRemove(const std::string& id, bool force, std::string& outError);
+    // Removes every job that belongs to a behavior tree (job.bt.id == btId) from its queue.
+    std::string RemoveJobsForTree(const std::string& btId, std::string& outError);
     // Removes finished jobs (succeeded/failed/cancelled) whose updatedAt is older than maxAgeSec.
     // Empty taskqueue applies to all queues.
     std::string TaskQueuePurgeOlderThan(const std::string& taskqueue, int64_t maxAgeSec, std::string& outError);

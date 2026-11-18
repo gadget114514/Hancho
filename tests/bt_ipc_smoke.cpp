@@ -1245,7 +1245,7 @@ int main() {
             Check(rCounts.value("closed", 0) >= 1, "taskqueue_counts reports closed jobs");
         }
 
-        // 18. A task-group id is accepted by taskqueue_close and routed to the tree.
+        // 18. taskqueue commands accept a task-group id and route to the tree.
         {
             json tgBt = {
                 {"id", "ipc-tg-fallback"},
@@ -1255,17 +1255,24 @@ int main() {
             };
             h.Call({{"action", "bt_start"}, {"bt", tgBt}});
             for (int i = 0; i < 100; ++i) {
-                json w = h.Call({{"action", "bt_wait"}, {"id", "ipc-tg-fallback"}, {"sinceVersion", 0}, {"timeoutMs", 500}});
-                std::string s = w.value("state", "");
+                json g = h.Call({{"action", "bt_get"}, {"id", "ipc-tg-fallback"}, {"compact", true}});
+                std::string s = g.value("state", "");
                 if (s == "succeeded" || s == "failed" || s == "cancelled") break;
+                Sleep(50);
             }
             json rGetTg = h.Call({{"action", "taskqueue_get"}, {"id", "ipc-tg-fallback"}});
             Check(rGetTg.value("ok", false) && rGetTg.value("kind", "") == "taskGroup",
                   "taskqueue_get falls back to bt_get for a task-group id");
             json rCloseTg = h.Call({{"action", "taskqueue_close"}, {"id", "ipc-tg-fallback"}});
             Check(rCloseTg.value("ok", false), "taskqueue_close accepts a task-group id");
+            json rBtStill = h.Call({{"action", "bt_get"}, {"id", "ipc-tg-fallback"}});
+            Check(rBtStill.value("ok", false), "taskqueue_close keeps the tree (stops it)");
+            json rRemoveTg = h.Call({{"action", "taskqueue_remove"}, {"id", "ipc-tg-fallback"}, {"force", true}});
+            Check(rRemoveTg.value("ok", false), "taskqueue_remove accepts a task-group id");
             json rBtGone = h.Call({{"action", "bt_get"}, {"id", "ipc-tg-fallback"}});
-            Check(!rBtGone.value("ok", true), "taskqueue_close on a task-group id removed the tree");
+            Check(!rBtGone.value("ok", true), "taskqueue_remove removed the tree");
+            json rJobGone = h.Call({{"action", "taskqueue_get"}, {"id", "ipc-tg-fallback-only-1"}});
+            Check(!rJobGone.value("ok", true), "taskqueue_remove removed the tree's jobs");
         }
     }
 

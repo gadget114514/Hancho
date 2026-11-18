@@ -528,6 +528,12 @@ std::string BtManager::Remove(const std::string& id) {
     // Stop any running work first so no process is left untracked.
     it->second->tree->Cancel(NowEpochMs());
     CancelQueuedJobsForTree(btId);
+    // Drop the tree's jobs from the queues too, so its rows leave the task list.
+    std::string tqErr;
+    tqm_.RemoveJobsForTree(btId, tqErr);
+    if (!tqErr.empty()) {
+        WriteAuditLog("BT_REMOVE_ERR", "remove jobs for '" + btId + "' failed: " + tqErr);
+    }
     trees_.erase(it);
     RemoveFileWide(GetBtStateFileWide(btId));
     RemoveFileWide(GetBtEventsFileWide(btId));

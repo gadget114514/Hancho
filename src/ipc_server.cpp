@@ -1441,9 +1441,9 @@ std::string IpcServer::HandleRequestJson(const std::string& reqJson) {
         } else if (action == "taskqueue_close") {
             const std::string id = JsonGetString(reqJson, "id", "");
             resp = tqm_.TaskQueueClose(id, err);
-            // A task group has no job to close; dismiss the tree so it leaves the list.
+            // A task group has no job to close; stop the tree but keep it (use remove to delete).
             if (!err.empty() && btm_ && err.find("job not found") != std::string::npos) {
-                resp = btm_->Remove(id);
+                resp = btm_->Cancel(id);
                 err.clear();
             }
         } else if (action == "taskqueue_pause" || action == "taskqueue_resume") {

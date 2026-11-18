@@ -120,6 +120,10 @@ The application icons are modeled on the character "Telephone Cat" (電話猫, D
 
 
 
+### v0.9.34
+- **Deleting a task group removes its tasks**: `bt_remove` (and `taskqueue remove <btId>`) now also deletes the tree's task-queue jobs, so the group's rows leave the task list instead of reappearing. `taskqueue close <btId>` stops the group but keeps it; `taskqueue remove <btId>` deletes the tree and its jobs.
+- **Force-removing a running job kills its process**: a force-removed running job no longer keeps its process alive, so it does not finish later and reappear as a plain run.
+
 ### v0.9.33
 - **Task-group ids in taskqueue commands**: `taskqueue get|close|cancel|remove|retry|pause|resume <id>` now accept a task-group (behavior-tree) id, not only a job id. When the id is not a stored job (or is a tree-owned job), the command routes to the tree: `get` → `bt_get`, `close`/`remove` → `bt_remove`, `cancel` → `bt_cancel`, `pause`/`resume` → `bt_pause`, `retry` → `bt_retry`. This fixes `taskqueue close <btId>` returning "job not found" for a task group such as `delcheck`.
 
