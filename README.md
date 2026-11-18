@@ -120,6 +120,9 @@ The application icons are modeled on the character "Telephone Cat" (電話猫, D
 
 
 
+### v0.9.32
+- **Act on virtual task-group rows**: right-clicking a task-group or planned row now offers the same cleanup actions as a job, routed to the owning tree: "Remove from task list" (`bt_remove`), "Force state to closed" and "Stop (cancel)" (`bt_cancel`), and "Retry task group" (`bt_retry`). This replaces the previous "job not found" dead end. Stored jobs still use `taskqueue_remove` / `taskqueue_close` / `taskqueue_cancel` / `taskqueue_retry`.
+
 ### v0.9.31
 - **Force a task to `closed`**: right-click a task row and choose "Force state to closed". A running process is stopped and the row becomes a terminal `closed` state (the same level as succeeded/failed/cancelled): the scheduler never picks it up, it is purged with finished jobs, and it is not triaged but can be retried. Use it for stale or invalid rows. CLI: `taskqueue close <id>`; IPC: `taskqueue_close`. A behavior-tree job is reported to the tree as failed with detail `closed`.
 - **Delete task-group rows**: right-click a task-group or planned row and choose "Delete task group (stop and remove its rows)"; the tree is stopped and its state/events files are deleted, so the `group:` and `btplan:` rows disappear. This also fixes the "job not found" error when trying to remove those virtual rows. CLI: `bt remove --id <id>`; IPC: `bt_remove`. Per-job removal is `taskqueue remove <id> [--force]`.

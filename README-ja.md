@@ -117,6 +117,9 @@ New-Item -ItemType Junction -Path .claude\skills\hancho -Target (Resolve-Path sk
 
 
 
+### v0.9.32
+- **仮想のタスクグループ行を操作可能に**: タスクグループ/予定行の右クリックで、所有ツリーに対する後片付け操作を選べます。「タスクリストから削除」(`bt_remove`)、「状態を closed にする」「停止 (キャンセル)」(`bt_cancel`)、「タスクグループを再実行」(`bt_retry`)。これで「job not found」で行き止まりになりません。保存済みジョブは従来どおり `taskqueue_remove` / `taskqueue_close` / `taskqueue_cancel` / `taskqueue_retry` です。
+
 ### v0.9.31
 - **タスクを `closed` にする（強制）**: タスク行を右クリックし「状態を closed にする（強制）」を選ぶと、実行中のプロセスを停止して `closed`（succeeded/failed/cancelled と同じ終了状態）にします。スケジューラは拾わず、終了済みとして purge 対象、トリアージの対象外（再実行は可）です。無効・陳腐化した行の片付け用。CLI は `taskqueue close <id>`、IPC は `taskqueue_close`。ビヘイビアツリーのタスクは失敗（detail=`closed`）としてツリーに通知します。
 - **タスクグループの行を削除**: タスクグループ/予定行を右クリックし「タスクグループを削除（停止して一覧から消す）」を選ぶと、ツリーを停止して状態・イベントファイルを削除し、`group:` / `btplan:` 行が消えます。これらの仮想行を消そうとしたときの「job not found」も解消します。CLI は `bt remove --id <id>`、IPC は `bt_remove`。個別ジョブの削除は `taskqueue remove <id> [--force]` です。

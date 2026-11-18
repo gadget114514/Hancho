@@ -5665,12 +5665,10 @@ static void ShowTaskQueueContextMenu(DashboardState* st, const std::string& jobI
                             Tr(L"選べる回答で進める", L"Pick an allowed answer",
                                L"Elegir una respuesta permitida"));
             }
-            if (btWait.hasRetryTarget) {
-                AppendMenuW(hMenu, MF_STRING, 3211,
-                            Tr(L"枝を再実行 (LLM 側の理由から復帰)",
-                               L"Retry the branch (recover from the LLM-side cause)",
-                               L"Reintentar la rama (recuperar del motivo del LLM)"));
-            }
+            AppendMenuW(hMenu, MF_STRING, 3211,
+                        Tr(L"枝を再実行 (LLM 側の理由から復帰)",
+                           L"Retry the branch (recover from the LLM-side cause)",
+                           L"Reintentar la rama (recuperar del motivo del LLM)"));
             const bool groupPaused = btWait.state == "paused";
             AppendMenuW(hMenu, MF_STRING, 3213,
                         groupPaused
@@ -5686,10 +5684,23 @@ static void ShowTaskQueueContextMenu(DashboardState* st, const std::string& jobI
                            L"Detener grupo de tareas (cancelar)"));
         }
         if (!virtualBtId.empty()) {
+            if (!groupRow) {
+                AppendMenuW(hMenu, MF_STRING, 3211,
+                            Tr(L"タスクグループを再実行", L"Retry task group",
+                               L"Reintentar grupo de tareas"));
+                AppendMenuW(hMenu, MF_STRING, 3212,
+                            Tr(L"タスクグループを停止 (キャンセル)",
+                               L"Stop task group (cancel)",
+                               L"Detener grupo de tareas (cancelar)"));
+            }
             AppendMenuW(hMenu, MF_STRING, 3214,
-                        Tr(L"タスクグループを削除（停止して一覧から消す）",
-                           L"Delete task group (stop and remove its rows)",
-                           L"Eliminar grupo de tareas (detener y quitar sus filas)"));
+                        Tr(L"タスクリストから削除（グループを停止して消す）",
+                           L"Remove from task list (stop and delete the group)",
+                           L"Quitar de la lista (detener y eliminar el grupo)"));
+            AppendMenuW(hMenu, MF_STRING, 3215,
+                        Tr(L"状態を closed にする（グループを停止）",
+                           L"Force state to closed (stop the group)",
+                           L"Forzar estado a cerrado (detener el grupo)"));
         }
         // Virtual task-group / planned rows are not queue jobs; retry/cancel have nothing to act on.
         AppendMenuW(hMenu, MF_STRING, 3111, Tr(L"タスクグループで表示", L"Show Task Group", L"Ver el grupo de tareas"));
@@ -5732,11 +5743,36 @@ static void ShowTaskQueueContextMenu(DashboardState* st, const std::string& jobI
                         removeErr, false);
                 }
             }
+        } else if (cmd == 3215) {
+            if (gui_platform::GetGuiPlatform()->ShowMessageBox(
+                    st->hwndMain,
+                    Tr(L"状態を closed にする", L"Force state to closed", L"Forzar estado a cerrado"),
+                    Tr(L"このタスクグループを停止して closed（終了）にしますか？\n"
+                       L"グループと未起動の予定行は一覧から消えます（ツリーは cancelled として残ります）。",
+                       L"Stop this task group and mark it closed?\n"
+                       L"The group and its planned rows leave the list (the tree stays as cancelled).",
+                       L"¿Detener este grupo y marcarlo como cerrado?\n"
+                       L"El grupo y sus filas previstas salen de la lista (el árbol queda cancelado)."),
+                    gui_platform::MessageBoxType::QuestionYesNo,
+                    true) == gui_platform::MessageBoxResult::Yes) {
+                std::wstring cancelErr;
+                if (SubmitBtCancel(st, virtualBtId, cancelErr)) {
+                    ShowTaskQueueResult(st, Tr(L"closed", L"closed", L"cerrado"),
+                                        Tr(L"グループを停止し、行を一覧から消しました。",
+                                           L"Stopped the group and removed its rows from the list.",
+                                           L"Se detuvo el grupo y se quitaron sus filas de la lista."),
+                                        true);
+                } else {
+                    ShowTaskQueueResult(st, Tr(L"closed にできませんでした", L"Could not close",
+                                               L"No se pudo cerrar"),
+                                        cancelErr, false);
+                }
+            }
         } else if (cmd == 3210) {
             ShowBtAnswerDialog(st, btWait, groupId);
         } else if (cmd == 3211) {
             std::wstring retryErr;
-            if (SubmitBtRetry(st, groupId, btWait.retryNode, retryErr)) {
+            if (SubmitBtRetry(st, virtualBtId, btWait.retryNode, retryErr)) {
                 ShowTaskQueueResult(
                     st, Tr(L"枝を再実行", L"Branch retry", L"Reintento de rama"),
                     Tr(L"止まっていた枝を再実行しました。結果はタスク一覧に反映されます。",
@@ -5764,7 +5800,7 @@ static void ShowTaskQueueContextMenu(DashboardState* st, const std::string& jobI
                     gui_platform::MessageBoxType::QuestionYesNo,
                     true) == gui_platform::MessageBoxResult::Yes) {
                 std::wstring cancelErr;
-                if (SubmitBtCancel(st, groupId, cancelErr)) {
+                if (SubmitBtCancel(st, virtualBtId, cancelErr)) {
                     ShowTaskQueueResult(
                         st, Tr(L"タスクグループをキャンセル", L"Task group cancelled",
                                L"Grupo de tareas cancelado"),
