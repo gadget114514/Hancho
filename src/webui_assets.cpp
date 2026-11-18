@@ -2198,7 +2198,7 @@ const char kAppJs_1[] = R"JS_1(    if (data.events && Array.isArray(data.events)
     if (s === 'blocked') return 'badge badge-blocked';
     if (s === 'completed' || s === 'succeeded') return 'badge badge-completed';
     if (s === 'failed' || s === 'timed_out' || s === 'idle_timed_out') return 'badge badge-failed';
-    if (s === 'cancelled' || s === 'killed') return 'badge badge-cancelled';
+    if (s === 'cancelled' || s === 'killed' || s === 'closed') return 'badge badge-cancelled';
     return 'badge';
   }
 

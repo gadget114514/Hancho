@@ -120,6 +120,11 @@ The application icons are modeled on the character "Telephone Cat" (電話猫, D
 
 
 
+### v0.9.31
+- **Force a task to `closed`**: right-click a task row and choose "Force state to closed". A running process is stopped and the row becomes a terminal `closed` state (the same level as succeeded/failed/cancelled): the scheduler never picks it up, it is purged with finished jobs, and it is not triaged but can be retried. Use it for stale or invalid rows. CLI: `taskqueue close <id>`; IPC: `taskqueue_close`. A behavior-tree job is reported to the tree as failed with detail `closed`.
+- **Delete task-group rows**: right-click a task-group or planned row and choose "Delete task group (stop and remove its rows)"; the tree is stopped and its state/events files are deleted, so the `group:` and `btplan:` rows disappear. This also fixes the "job not found" error when trying to remove those virtual rows. CLI: `bt remove --id <id>`; IPC: `bt_remove`. Per-job removal is `taskqueue remove <id> [--force]`.
+- **Docs**: the task-queue state table describes `closed`.
+
 ### v0.9.30
 - **Remove tasks from the list (multi-select)**: the task list now supports Ctrl+click and Shift+click. Select one or several rows and right-click → "Remove from task list"; a confirmation appears and the jobs are deleted from their queues. A row that still looks running but is actually dead shows "Remove from task list (force)" with a stronger warning (if it is genuinely running, its process is no longer tracked; cancel first). Backend: `TaskQueueManager::TaskQueueRemove(id, force)` and the `taskqueue_remove` IPC action.
 

@@ -45,6 +45,7 @@ std::string TaskQueueStateToString(TaskQueueState state) {
         case TaskQueueState::Failed:    return "failed";
         case TaskQueueState::Blocked:   return "blocked";
         case TaskQueueState::Cancelled: return "cancelled";
+        case TaskQueueState::Closed:    return "closed";
     }
     return "pending";
 }
@@ -55,6 +56,7 @@ TaskQueueState TaskQueueStateFromString(const std::string& s) {
     if (s == "failed") return TaskQueueState::Failed;
     if (s == "blocked") return TaskQueueState::Blocked;
     if (s == "cancelled") return TaskQueueState::Cancelled;
+    if (s == "closed") return TaskQueueState::Closed;
     return TaskQueueState::Pending;
 }
 
@@ -2219,6 +2221,8 @@ TaskQueueCounts TaskQueueManager::GetJobCounts() const {
                 counts.failed++;
             } else if (job.state == "cancelled") {
                 counts.cancelled++;
+            } else if (job.state == "closed") {
+                counts.closed++;
             }
         }
     }
@@ -2232,7 +2236,7 @@ constexpr int kDefaultSuspendDelaySec = 10;
 
 bool IsTerminalJobState(const std::string& state) {
     return state == "succeeded" || state == "failed" || state == "cancelled" ||
-           state == "blocked";
+           state == "closed" || state == "blocked";
 }
 
 } // namespace
@@ -2923,7 +2927,8 @@ const TaskQueueJob* TaskQueueManager::FindJobConst(const std::string& id) const 
 
 bool TaskQueueManager::IsDepSatisfied(const TaskQueueJob& dep, const std::string& on) {
     if (on == "done") {
-        return dep.state == "succeeded" || dep.state == "failed" || dep.state == "cancelled";
+        return dep.state == "succeeded" || dep.state == "failed" || dep.state == "cancelled" ||
+               dep.state == "closed";
     }
     return dep.state == "succeeded";
 }
@@ -4044,7 +4049,7 @@ std::string TaskQueueManager::TaskQueueRetryFailed(const std::string& taskqueue,
             if (taskqueue.empty() && name == "plain") continue;
             bool changed = false;
             for (auto& job : tq.jobs) {
-                if (job.state != "failed") continue;
+                if (job.state != "failed" && job.state != "closed") continue;
                 if (sinceSec > 0) {
                     const int64_t ts = ParseTimestampStrToEpoch(job.updatedAt);
                     if (ts <= 0 || ts < cutoff) continue;
@@ -4121,7 +4126,8 @@ std::string TaskQueueManager::TaskQueueUpdate(const std::string& id, const std::
             if (HasJsonKey(patchJson, k)) { onlyNotes = false; break; }
         }
     }
-    if ((job->state == "running" || job->state == "succeeded" || job->state == "cancelled") && !onlyNotes) {
+    if ((job->state == "running" || job->state == "succeeded" || job->state == "cancelled" ||
+         job->state == "closed") && !onlyNotes) {
         outError = "job '" + id + "' can only be updated when pending, failed or blocked (except notes)";
         return BuildError(outError);
     }
@@ -4324,7 +4330,8 @@ std::string TaskQueueManager::TaskQueuePauseJob(const std::string& id, bool paus
     if (job->paused == paused) {
         return "{\"ok\":true,\"job\":" + JobToJson(*job, true) + "}";
     }
-    if (job->state == "succeeded" || job->state == "cancelled" || job->state == "failed") {
+    if (job->state == "succeeded" || job->state == "cancelled" || job->state == "failed" ||
+        job->state == "closed") {
         outError = "job '" + id + "' has already finished (" + job->state + ")";
         return BuildError(outError);
     }
@@ -4414,6 +4421,58 @@ std::string TaskQueueManager::TaskQueueCancel(const std::string& id, std::string
     return resp;
 }
 
+std::string TaskQueueManager::TaskQueueClose(const std::string& id, std::string& outError) {
+    outError.clear();
+    std::string resp;
+    ProcessManager* pm = nullptr;
+    int pid = 0;
+    std::string remoteHost;
+    int remotePid = 0;
+    RemoteKillCallback remoteKill;
+    {
+        std::lock_guard<std::mutex> lock(mutex_);
+        TaskQueue* tq = nullptr;
+        TaskQueueJob* job = FindJob(id, &tq);
+        if (!job) {
+            outError = "job not found: " + id;
+            return BuildError(outError);
+        }
+        if (job->state == "closed") {
+            return "{\"ok\":true,\"job\":" + JobToJson(*job, true) + "}";
+        }
+        if (job->state == "running" && !job->attempts.empty()) {
+            pid = job->attempts.back().processId;
+            remoteHost = job->attempts.back().remoteHost;
+            remotePid = job->attempts.back().remoteProcessId;
+        }
+        job->state = "closed";
+        job->paused = false;
+        job->blockedBy.clear();
+        job->retryAtMs = 0;
+        job->updatedAt = GetCurrentTimestampStr();
+        EmitEventLocked(*tq, "jobClosed", id, job->attempts.empty() ? 0 : job->attempts.back().n);
+        ReevaluateAll();
+        SaveQueue(*tq);
+        if (schedulerRunning_.load()) {
+            pendingFinished_.push_back({*job, "closed"});
+        }
+        resp = "{\"ok\":true,\"job\":" + JobToJson(*job, true) + "}";
+        pm = pm_;
+        remoteKill = remoteKillCb_;
+    }
+    if (!remoteHost.empty() && remotePid > 0) {
+        if (remoteKill) {
+            std::string err;
+            remoteKill(remoteHost, remotePid, err);
+        }
+    } else if (pm && pid > 0) {
+        std::string err;
+        pm->KillProcess(pid, err);
+    }
+    FlushFinishedCallbacks();
+    return resp;
+}
+
 std::string TaskQueueManager::TaskQueuePause(const std::string& taskqueue, bool paused, std::string& outError) {
     outError.clear();
     std::lock_guard<std::mutex> lock(mutex_);
@@ -4475,7 +4534,7 @@ std::string TaskQueueManager::TaskQueuePurge(const std::string& taskqueue, const
         states = JsonFieldStrArray("{\"states\":" + statesJson + "}", "states");
         if (states.empty()) states = JsonFieldStrArray(statesJson, "states");
     }
-    if (states.empty()) states = {"succeeded", "failed", "cancelled"};
+    if (states.empty()) states = {"succeeded", "failed", "cancelled", "closed"};
 
     size_t before = it->second.jobs.size();
     auto& jobs = it->second.jobs;
@@ -4495,6 +4554,10 @@ std::string TaskQueueManager::TaskQueueRemove(const std::string& id, bool force,
         outError = "id is required";
         return BuildError(outError);
     }
+    if (id.rfind("btplan:", 0) == 0 || id.rfind("group:", 0) == 0) {
+        outError = "this is a virtual task-group row, not a queue job; stop the task group instead";
+        return BuildError(outError);
+    }
     std::lock_guard<std::mutex> lock(mutex_);
     TaskQueue* tq = nullptr;
     TaskQueueJob* job = FindJob(id, &tq);
@@ -4503,7 +4566,7 @@ std::string TaskQueueManager::TaskQueueRemove(const std::string& id, bool force,
         return BuildError(outError);
     }
     const bool finished = job->state == "succeeded" || job->state == "failed" ||
-                          job->state == "cancelled";
+                          job->state == "cancelled" || job->state == "closed";
     if (!finished && !force) {
         outError = "cannot remove a " + job->state + " job; use force or cancel it first";
         return BuildError(outError);
@@ -4535,7 +4598,7 @@ std::string TaskQueueManager::TaskQueuePurgeOlderThan(const std::string& taskque
         return BuildError(outError);
     }
     const int64_t cutoff = static_cast<int64_t>(time(nullptr)) - maxAgeSec;
-    const std::vector<std::string> finished = {"succeeded", "failed", "cancelled"};
+    const std::vector<std::string> finished = {"succeeded", "failed", "cancelled", "closed"};
     size_t purged = 0;
     for (auto& [name, tq] : queues_) {
         if (!taskqueue.empty() && name != taskqueue) continue;

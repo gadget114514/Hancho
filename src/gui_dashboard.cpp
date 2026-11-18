@@ -1278,6 +1278,7 @@ static TaskQueueCounts FetchTaskQueueCountsIpc(DashboardState* st) {
             c.succeeded = cnt.value("succeeded", 0);
             c.failed = cnt.value("failed", 0);
             c.cancelled = cnt.value("cancelled", 0);
+            c.closed = cnt.value("closed", 0);
             c.total = cnt.value("total", 0);
             c.minRemainingSec = cnt.value("min_remaining_sec", static_cast<int64_t>(-1));
             c.sumRemainingSec = cnt.value("sum_remaining_sec", static_cast<int64_t>(-1));
@@ -1289,6 +1290,7 @@ static TaskQueueCounts FetchTaskQueueCountsIpc(DashboardState* st) {
             c.succeeded = resp.value("succeeded", 0);
             c.failed = resp.value("failed", 0);
             c.cancelled = resp.value("cancelled", 0);
+            c.closed = resp.value("closed", 0);
             c.total = resp.value("total", 0);
             c.minRemainingSec = resp.value("min_remaining_sec", static_cast<int64_t>(-1));
             c.sumRemainingSec = resp.value("sum_remaining_sec", static_cast<int64_t>(-1));
@@ -1434,6 +1436,18 @@ static std::string TaskQueueRemoveIpc(DashboardState* st, const std::string& id,
     }
     if (st && st->tqm) {
         return st->tqm->TaskQueueRemove(id, force, outErr);
+    }
+    return "";
+}
+
+static std::string TaskQueueCloseIpc(DashboardState* st, const std::string& id, std::string& outErr) {
+    nlohmann::json req = {{"action", "taskqueue_close"}, {"id", id}};
+    nlohmann::json resp;
+    if (GuiIpcCall(st, req, resp, &outErr)) {
+        return resp.dump();
+    }
+    if (st && st->tqm) {
+        return st->tqm->TaskQueueClose(id, outErr);
     }
     return "";
 }
@@ -3574,6 +3588,9 @@ static std::wstring TaskQueueStateLabel(const std::string& state, const std::str
     if (state == "paused") {
         return Tr(L"一時停止", L"Paused", L"En pausa");
     }
+    if (state == "closed") {
+        return Tr(L"クローズ (無効)", L"closed", L"cerrado");
+    }
     if (jobPaused) {
         return state == "running"
             ? Tr(L"一時停止 (実行中)", L"Paused (running)", L"En pausa (en ejecución)")
@@ -3585,7 +3602,8 @@ static std::wstring TaskQueueStateLabel(const std::string& state, const std::str
         auto it = stateById.find(dep.first);
         std::string depState = (it == stateById.end()) ? "" : it->second;
         bool satisfied = (dep.second == "done")
-            ? (depState == "succeeded" || depState == "failed" || depState == "cancelled")
+            ? (depState == "succeeded" || depState == "failed" || depState == "cancelled" ||
+               depState == "closed")
             : (depState == "succeeded");
         if (!satisfied) {
             waitingForDeps = true;
@@ -5269,6 +5287,21 @@ static bool SubmitBtCancel(DashboardState* st, const std::string& btId, std::wst
     return true;
 }
 
+static bool SubmitBtRemove(DashboardState* st, const std::string& btId, std::wstring& outError) {
+    nlohmann::json req = {{"action", "bt_remove"}, {"id", btId}};
+    nlohmann::json resp;
+    std::string err;
+    if (!GuiIpcCall(st, req, resp, &err)) {
+        outError = Utf8ToWide(err.empty() ? "IPC request failed" : err);
+        return false;
+    }
+    if (!resp.value("ok", false)) {
+        outError = Utf8ToWide(resp.value("error", std::string("bt_remove failed")));
+        return false;
+    }
+    return true;
+}
+
 // Pulls the owning behavior-tree id/node out of a taskqueue_get response.
 static bool ExtractBtTarget(const std::string& getResp, std::string& btId, std::string& btNode) {
     nlohmann::json root = nlohmann::json::parse(getResp, nullptr, false);
@@ -5520,6 +5553,19 @@ static std::vector<SelectedTaskRow> SelectedTaskRows(DashboardState* st) {
     return rows;
 }
 
+// Resolves the owning behavior-tree id of a virtual task-list row (group or planned).
+static std::string TaskRowBtId(DashboardState* st, const std::string& jobId) {
+    if (!st || st->lastTaskListJson.empty()) return "";
+    nlohmann::json doc = nlohmann::json::parse(st->lastTaskListJson, nullptr, false);
+    if (!doc.is_object() || !doc.contains("jobs") || !doc["jobs"].is_array()) return "";
+    for (const auto& j : doc["jobs"]) {
+        if (!j.is_object() || j.value("id", std::string()) != jobId) continue;
+        if (j.contains("bt") && j["bt"].is_object()) return j["bt"].value("id", std::string());
+        if (j.contains("group") && j["group"].is_object()) return j["group"].value("id", std::string());
+    }
+    return "";
+}
+
 static void RemoveTaskRows(DashboardState* st, const std::vector<std::string>& ids, bool force) {
     if (!st || ids.empty()) return;
     const bool batch = ids.size() > 1;
@@ -5586,6 +5632,7 @@ static void ShowTaskQueueContextMenu(DashboardState* st, const std::string& jobI
     }
     const bool groupRow = jobId.rfind("group:", 0) == 0;
     const std::string groupId = groupRow ? jobId.substr(6) : std::string();
+    const std::string virtualBtId = groupRow ? groupId : TaskRowBtId(st, jobId);
     BtWaitDetails btWait;
     if (groupRow) btWait = FetchBtWaitDetails(st, groupId);
     const std::string btNode = btWait.node;
@@ -5638,6 +5685,12 @@ static void ShowTaskQueueContextMenu(DashboardState* st, const std::string& jobI
                            L"Stop task group (cancel)",
                            L"Detener grupo de tareas (cancelar)"));
         }
+        if (!virtualBtId.empty()) {
+            AppendMenuW(hMenu, MF_STRING, 3214,
+                        Tr(L"タスクグループを削除（停止して一覧から消す）",
+                           L"Delete task group (stop and remove its rows)",
+                           L"Eliminar grupo de tareas (detener y quitar sus filas)"));
+        }
         // Virtual task-group / planned rows are not queue jobs; retry/cancel have nothing to act on.
         AppendMenuW(hMenu, MF_STRING, 3111, Tr(L"タスクグループで表示", L"Show Task Group", L"Ver el grupo de tareas"));
         if (selectedReal.size() > 1) {
@@ -5653,6 +5706,32 @@ static void ShowTaskQueueContextMenu(DashboardState* st, const std::string& jobI
         DestroyMenu(hMenu);
         if (cmd == 3133) {
             RemoveTaskRows(st, selectedReal, true);
+        } else if (cmd == 3214) {
+            if (gui_platform::GetGuiPlatform()->ShowMessageBox(
+                    st->hwndMain,
+                    Tr(L"タスクグループを削除", L"Delete task group", L"Eliminar grupo de tareas"),
+                    Tr(L"このタスクグループを停止し、一覧から削除しますか？\n"
+                       L"実行中・待機中のタスクはキャンセルされ、グループの状態ファイルも削除されます。",
+                       L"Stop this task group and remove it from the list?\n"
+                       L"Running and queued tasks are cancelled, and the group's state file is deleted.",
+                       L"¿Detener este grupo de tareas y quitarlo de la lista?\n"
+                       L"Las tareas en ejecución y en espera se cancelan, y se elimina el archivo de estado."),
+                    gui_platform::MessageBoxType::QuestionYesNo,
+                    true) == gui_platform::MessageBoxResult::Yes) {
+                std::wstring removeErr;
+                if (SubmitBtRemove(st, virtualBtId, removeErr)) {
+                    ShowTaskQueueResult(
+                        st, Tr(L"タスクグループを削除", L"Task group deleted", L"Grupo de tareas eliminado"),
+                        Tr(L"グループを停止し、一覧から削除しました。",
+                           L"Stopped the group and removed it from the list.",
+                           L"Se detuvo el grupo y se quitó de la lista."),
+                        true);
+                } else {
+                    ShowTaskQueueResult(
+                        st, Tr(L"削除できませんでした", L"Could not delete", L"No se pudo eliminar"),
+                        removeErr, false);
+                }
+            }
         } else if (cmd == 3210) {
             ShowBtAnswerDialog(st, btWait, groupId);
         } else if (cmd == 3211) {
@@ -5748,7 +5827,8 @@ static void ShowTaskQueueContextMenu(DashboardState* st, const std::string& jobI
         AppendMenuW(hMenu, MF_SEPARATOR, 0, nullptr);
     }
     AppendMenuW(hMenu, MF_STRING, 3101, Tr(L"再実行 (Retry)", L"Retry", L"Reintentar"));
-    const bool jobFinished = jobState == "succeeded" || jobState == "failed" || jobState == "cancelled";
+    const bool jobFinished = jobState == "succeeded" || jobState == "failed" ||
+                             jobState == "cancelled" || jobState == "closed";
     if (!jobFinished) {
         AppendMenuW(hMenu, MF_STRING, jobPaused ? 3131 : 3130,
                     jobPaused ? Tr(L"再開 (Resume)", L"Resume", L"Reanudar")
@@ -5767,6 +5847,8 @@ static void ShowTaskQueueContextMenu(DashboardState* st, const std::string& jobI
                     jobFinished ? Tr(L"タスクリストから削除", L"Remove from task list", L"Quitar de la lista de tareas")
                                 : Tr(L"タスクリストから削除（強制）", L"Remove from task list (force)", L"Quitar de la lista (forzar)"));
     }
+    AppendMenuW(hMenu, MF_STRING, 3134,
+                Tr(L"状態を closed にする（強制）", L"Force state to closed", L"Forzar estado a cerrado"));
     AppendMenuW(hMenu, MF_SEPARATOR, 0, nullptr);
     AppendMenuW(hMenu, MF_STRING, 3103, Tr(L"キューを一時停止", L"Pause queue", L"Pausar cola"));
     AppendMenuW(hMenu, MF_STRING, 3104, Tr(L"キューを再開", L"Resume queue", L"Reanudar cola"));
@@ -5884,6 +5966,31 @@ static void ShowTaskQueueContextMenu(DashboardState* st, const std::string& jobI
         RemoveTaskRows(st, {jobId}, !jobFinished);
     } else if (cmd == 3133) {
         RemoveTaskRows(st, selectedReal, true);
+    } else if (cmd == 3134) {
+        if (gui_platform::GetGuiPlatform()->ShowMessageBox(
+                st->hwndMain,
+                Tr(L"状態を closed にする", L"Force state to closed", L"Forzar estado a cerrado"),
+                Tr(L"このタスクを強制的に closed（終端）にしますか？\n"
+                   L"実行中のプロセスは停止します。closed は再実行・トリアージの対象外です。",
+                   L"Force this task to the terminal 'closed' state?\n"
+                   L"A running process is stopped. A closed task is not retried or triaged.",
+                   L"¿Forzar esta tarea al estado terminal 'cerrado'?\n"
+                   L"Se detiene el proceso en ejecución. Una tarea cerrada no se reintenta ni se triaja."),
+                gui_platform::MessageBoxType::QuestionYesNo,
+                true) == gui_platform::MessageBoxResult::Yes) {
+            std::wstring closeErr;
+            if (CheckIpcResponse(TaskQueueCloseIpc(st, jobId, err), err, closeErr)) {
+                ShowTaskQueueResult(st, Tr(L"closed", L"closed", L"cerrado"),
+                                    Tr(L"タスクを closed にしました。",
+                                       L"Set the task to closed.",
+                                       L"Se estableció la tarea como cerrada."),
+                                    true);
+            } else {
+                ShowTaskQueueResult(st, Tr(L"closed にできませんでした", L"Could not close",
+                                           L"No se pudo cerrar"),
+                                    closeErr, false);
+            }
+        }
     } else if (cmd == 3103 || cmd == 3104) {
         resp = TaskQueueGetIpc(st, jobId, false, 0, err);
         std::string tqName = JsonGetString(resp, "taskqueue", "");
@@ -6174,7 +6281,8 @@ static void RefreshTaskQueueData(DashboardState* st, bool force = false, bool us
             auto it = stateById.find(dep.first);
             std::string depState = (it == stateById.end()) ? "" : it->second;
             bool satisfied = (dep.second == "done")
-                ? (depState == "succeeded" || depState == "failed" || depState == "cancelled")
+                ? (depState == "succeeded" || depState == "failed" || depState == "cancelled" ||
+                   depState == "closed")
                 : (depState == "succeeded");
             if (!satisfied) return false;
         }
@@ -7193,14 +7301,14 @@ static std::vector<TaskGanttRow> BuildTaskGanttRows(const std::string& listJson,
                 row.segments.push_back(seg);
                 plannedCursor = seg.end;
                 row.planned = true;
-            } else if (row.state == "cancelled") {
+            } else if (row.state == "cancelled" || row.state == "closed") {
                 int64_t ts = ParseTimestampStrToEpoch(JsonGetString(j, "updated_at", ""));
                 if (ts <= 0) ts = ParseTimestampStrToEpoch(JsonGetString(j, "created_at", ""));
                 if (ts <= 0) ts = now;
                 TaskGanttSegment seg;
                 seg.start = ts;
                 seg.end = ts;
-                seg.reason = "cancelled";
+                seg.reason = row.state;
                 row.segments.push_back(seg);
             } else {
                 int64_t ts = ParseTimestampStrToEpoch(JsonGetString(j, "created_at", ""));
@@ -8322,7 +8430,7 @@ static void BtDebugSaveExpanded(BtDebugDlgState* ds, HTREEITEM h, std::unordered
 }
 
 static bool BtDebugIsFinished(const std::string& state) {
-    return state == "succeeded" || state == "failed" || state == "cancelled";
+    return state == "succeeded" || state == "failed" || state == "cancelled" || state == "closed";
 }
 
 // UTC "YYYY-MM-DDTHH:MM:SS" (the format of the state files' updatedAt) for now - ageSec.

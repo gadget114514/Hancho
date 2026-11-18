@@ -1408,6 +1408,8 @@ std::string IpcServer::HandleRequestJson(const std::string& reqJson) {
                                         ExtractRawJsonValue(reqJson, "patch"), TaskQueueCaller::External, err);
         } else if (action == "taskqueue_cancel") {
             resp = tqm_.TaskQueueCancel(JsonGetString(reqJson, "id", ""), err);
+        } else if (action == "taskqueue_close") {
+            resp = tqm_.TaskQueueClose(JsonGetString(reqJson, "id", ""), err);
         } else if (action == "taskqueue_pause") {
             resp = tqm_.TaskQueuePause(JsonGetString(reqJson, "taskqueue", ""), true, err);
         } else if (action == "taskqueue_resume") {
@@ -1464,6 +1466,7 @@ std::string IpcServer::HandleRequestJson(const std::string& reqJson) {
             counts["succeeded"] = c.succeeded;
             counts["failed"] = c.failed;
             counts["cancelled"] = c.cancelled;
+            counts["closed"] = c.closed;
             counts["total"] = totalWithPlanned;
             counts["bt_planned"] = btPlanned;
             counts["bt_remaining_sec"] = btPendingSec;
@@ -1479,6 +1482,7 @@ std::string IpcServer::HandleRequestJson(const std::string& reqJson) {
             out["succeeded"] = c.succeeded;
             out["failed"] = c.failed;
             out["cancelled"] = c.cancelled;
+            out["closed"] = c.closed;
             out["total"] = totalWithPlanned;
             out["bt_planned"] = btPlanned;
             out["bt_remaining_sec"] = btPendingSec;
@@ -1748,6 +1752,9 @@ std::string IpcServer::HandleRequestJson(const std::string& reqJson) {
         } else if (action == "bt_cancel") {
             std::string id = req.value("id", std::string());
             resp = btm_->Cancel(id);
+        } else if (action == "bt_remove") {
+            std::string id = req.value("id", std::string());
+            resp = btm_->Remove(id);
         } else if (action == "bt_pause") {
             std::string id = req.value("id", std::string());
             bool paused = true;

@@ -1206,6 +1206,36 @@ int main() {
             SetDataDirectoryOverride(tempDirW);
             RemoveDirRecursive(guiIpcDirW);
         }
+
+        // 17. taskqueue_close forces a terminal "closed" state.
+        {
+            json closeBt = {
+                {"id", "ipc-close"},
+                {"cwd", tempDirUtf8},
+                {"root", {{"type", "job"}, {"id", "only"}, {"summary", "Close me"},
+                          {"command", "cmd /c exit 0"}, {"timeoutSec", 30}}}
+            };
+            h.Call({{"action", "bt_start"}, {"bt", closeBt}});
+            const std::string closeJobId = "ipc-close-only-1";
+            bool closeFound = false;
+            for (int i = 0; i < 100 && !closeFound; ++i) {
+                json l = h.Call({{"action", "taskqueue_list"}, {"bt", "ipc-close"}, {"include_planned", true}});
+                if (l["jobs"].is_array()) {
+                    for (const auto& j : l["jobs"]) {
+                        if (j.value("id", "") == closeJobId) { closeFound = true; break; }
+                    }
+                }
+                if (!closeFound) Sleep(50);
+            }
+            Check(closeFound, "ipc-close job appears in the task queue");
+            json rClose = h.Call({{"action", "taskqueue_close"}, {"id", closeJobId}});
+            Check(rClose.value("ok", false), "taskqueue_close ok");
+            json rGet = h.Call({{"action", "taskqueue_get"}, {"id", closeJobId}});
+            json closeJob = rGet.contains("job") ? rGet["job"] : rGet;
+            Check(closeJob.value("state", "") == "closed", "taskqueue_close sets state=closed");
+            json rCounts = h.Call({{"action", "taskqueue_counts"}});
+            Check(rCounts.value("closed", 0) >= 1, "taskqueue_counts reports closed jobs");
+        }
     }
 
     RemoveDirRecursive(tempDirW);

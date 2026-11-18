@@ -518,6 +518,22 @@ std::string BtManager::Cancel(const std::string& id) {
     return BuildTreeResponseJson(*entry.tree, TreeView::Summary).dump();
 }
 
+std::string BtManager::Remove(const std::string& id) {
+    std::lock_guard<std::mutex> lock(mutex_);
+    auto it = trees_.find(id);
+    if (it == trees_.end() || !it->second || !it->second->tree) {
+        return MakeErrorJson("behavior tree not found: " + id);
+    }
+    const std::string btId = it->second->tree->Id();
+    // Stop any running work first so no process is left untracked.
+    it->second->tree->Cancel(NowEpochMs());
+    CancelQueuedJobsForTree(btId);
+    trees_.erase(it);
+    RemoveFileWide(GetBtStateFileWide(btId));
+    RemoveFileWide(GetBtEventsFileWide(btId));
+    return "{\"ok\":true,\"id\":\"" + JsonEscape(btId) + "\"}";
+}
+
 std::string BtManager::Pause(const std::string& id, bool paused) {
     std::lock_guard<std::mutex> lock(mutex_);
     auto it = trees_.find(id);

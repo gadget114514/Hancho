@@ -68,6 +68,7 @@ hancho-cli.exe taskqueue wait main --since 0 --timeout-ms 30000
 | `planned` | 実行中のビヘイビアツリーが後で起動する job/worker 葉の仮行。実際にはキューには保存されていない。`taskqueue_list` は `include_planned` が true のとき返す（デスクトップのダッシュボード・CLI・Web UI・MCP は既定で指定する。CLI は `--no-planned`、MCP は `includePlanned: false` で外せる）。ツリーが別の枝に進むか終了すると消える。 |
 | `running` / `waitingForLlm` / `paused`（タスクグループ） | 活動中のタスクグループ（BT のルート）も `id: group:<id>` の仮想行として出る。状態はグループの現在値で、問い合わせのたびに作り直され、グループが終わると予定行と一緒に消える。 |
 | `succeeded` / `failed` / `cancelled` | 終了状態。failed は `maxAttempts` まで自動再実行。 |
+| `closed` | 手動で付ける終了状態（右クリック→「状態を closed にする」、`taskqueue close <id>`）。無効・陳腐化した行を、仕事をキャンセルしたとは言わずに片付ける。スケジューラは拾わず、トリアージの対象外ですが、再実行（単体・一括 `taskqueue retry`）はできます。 |
 
 `taskqueue add` の応答には、登録先の `data_dir` が入ります。追加した ID と一緒に報告してください。ダッシュボードにジョブが出ない場合は、ダッシュボードのタイトルに表示されたデータディレクトリと照合します（別のコア／データディレクトリに登録すると、そのダッシュボードには出ません）。`hidden` は尊重され、hidden ジョブは既定では一覧に出ません。設定の **hidden タスクも表示** で含められます。外部から登録するジョブには `hidden` を付けないでください（Hancho 内部のジョブ用です）。
 

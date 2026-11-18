@@ -77,6 +77,9 @@ public:
     std::string Update(const std::string& id,
                        const std::string& jsonText);
     std::string Cancel(const std::string& id);
+    // Stops the tree, then drops it from the manager and deletes its state/events files so
+    // its virtual rows (task group and planned leaves) disappear for good.
+    std::string Remove(const std::string& id);
     std::string Pause(const std::string& id, bool paused);
 
     static int64_t NowEpochMs();

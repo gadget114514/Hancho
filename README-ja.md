@@ -117,6 +117,11 @@ New-Item -ItemType Junction -Path .claude\skills\hancho -Target (Resolve-Path sk
 
 
 
+### v0.9.31
+- **タスクを `closed` にする（強制）**: タスク行を右クリックし「状態を closed にする（強制）」を選ぶと、実行中のプロセスを停止して `closed`（succeeded/failed/cancelled と同じ終了状態）にします。スケジューラは拾わず、終了済みとして purge 対象、トリアージの対象外（再実行は可）です。無効・陳腐化した行の片付け用。CLI は `taskqueue close <id>`、IPC は `taskqueue_close`。ビヘイビアツリーのタスクは失敗（detail=`closed`）としてツリーに通知します。
+- **タスクグループの行を削除**: タスクグループ/予定行を右クリックし「タスクグループを削除（停止して一覧から消す）」を選ぶと、ツリーを停止して状態・イベントファイルを削除し、`group:` / `btplan:` 行が消えます。これらの仮想行を消そうとしたときの「job not found」も解消します。CLI は `bt remove --id <id>`、IPC は `bt_remove`。個別ジョブの削除は `taskqueue remove <id> [--force]` です。
+- **ドキュメント**: タスクキューの状態表に `closed` を追記しました。
+
 ### v0.9.30
 - **タスクを一覧から削除（複数選択対応）**: タスク一覧が Ctrl+クリックと Shift+クリックに対応しました。1 行または複数行を選んで右クリック→「タスクリストから削除」で、確認のあとキューから削除します。実行中に見えるが実際には無効な行は「タスクリストから削除（強制）」になり、より強い警告を出します（本当に実行中の場合はプロセスの追跡が失われるので、先にキャンセルしてください）。バックエンドは `TaskQueueManager::TaskQueueRemove(id, force)` と IPC の `taskqueue_remove` です。
 

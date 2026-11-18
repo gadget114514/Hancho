@@ -34,6 +34,7 @@ enum class TaskQueueState {
     Failed = 3,
     Blocked = 4,
     Cancelled = 5,
+    Closed = 6,
 };
 
 std::string TaskQueueStateToString(TaskQueueState state);
@@ -48,6 +49,7 @@ struct TaskQueueCounts {
     int succeeded = 0;
     int failed = 0;
     int cancelled = 0;
+    int closed = 0;
     int total = 0;
     int64_t minRemainingSec = -1;
     int64_t sumRemainingSec = -1;
@@ -828,6 +830,9 @@ public:
     std::string TaskQueueUpdate(const std::string& id, const std::string& patchJson, std::string& outError);
     std::string TaskQueueUpdate(const std::string& id, const std::string& patchJson, TaskQueueCaller caller, std::string& outError);
     std::string TaskQueueCancel(const std::string& id, std::string& outError);
+    // Force-closes a job: stops any running process and sets the state to "closed", a terminal
+    // state (like succeeded/failed/cancelled) that the scheduler never picks up again.
+    std::string TaskQueueClose(const std::string& id, std::string& outError);
     // Per-job pause. A pending job stops being scheduled; a running local job has
     // its process tree suspended and its timeout/idle clocks frozen.
     std::string TaskQueuePauseJob(const std::string& id, bool paused, std::string& outError);

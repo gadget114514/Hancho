@@ -3465,7 +3465,8 @@ void PrintCliUsageJson() {
       "running": "An attempt is executing.",
       "succeeded": "Success conditions met.",
       "failed": "Attempts exhausted or launch failed.",
-      "cancelled": "Cancelled; not retried."
+      "cancelled": "Cancelled; not retried.",
+      "closed": "Force-closed by hand: a terminal state for a stale or invalid row. The scheduler never picks it up and it is not triaged, but it can be retried (single or bulk)."
     },
     "audit": {
       "status": "preview; rule-based, no LLM call yet",
@@ -6611,9 +6612,26 @@ if (subcmd == "start" || subcmd == "run") {
             reqJson << "{\"action\":\"taskqueue_purge\",\"taskqueue\":\"" << JsonEscape(tqName)
                     << "\",\"states\":" << ja.str() << "}";
             subcmd = "taskqueue_purge";
+        } else if (op == "remove" || op == "rm") {
+            std::string id = argVal("--id", "");
+            if (id.empty()) id = firstPositional(3);
+            if (id.empty()) return failWith("remove requires a job id (or --id).");
+            bool force = false;
+            for (size_t i = 3; i < args.size(); ++i) {
+                if (args[i] == "--force") force = true;
+            }
+            reqJson << "{\"action\":\"taskqueue_remove\",\"id\":\"" << JsonEscape(id)
+                    << "\",\"force\":" << (force ? "true" : "false") << "}";
+            subcmd = "taskqueue_remove";
+        } else if (op == "close") {
+            std::string id = argVal("--id", "");
+            if (id.empty()) id = firstPositional(3);
+            if (id.empty()) return failWith("close requires a job id (or --id).");
+            reqJson << "{\"action\":\"taskqueue_close\",\"id\":\"" << JsonEscape(id) << "\"}";
+            subcmd = "taskqueue_close";
         } else {
             return failWith("unknown taskqueue command: " + op +
-                            " (add, list, get, why, retry, cancel, pause, resume, pause-job, resume-job, graph, wait, purge, update)");
+                            " (add, list, get, why, retry, cancel, close, pause, resume, pause-job, resume-job, graph, wait, purge, remove, update)");
         }
     }
     else if (subcmd == "quickfix") {
@@ -6883,6 +6901,11 @@ if (subcmd == "start" || subcmd == "run") {
             jReq["action"] = "bt_cancel";
             jReq["id"] = id;
             subcmd = "bt_cancel";
+        } else if (op == "remove" || op == "rm") {
+            if (id.empty()) return failWith("remove requires --id <id>");
+            jReq["action"] = "bt_remove";
+            jReq["id"] = id;
+            subcmd = "bt_remove";
         } else if (op == "pause") {
             if (id.empty()) return failWith("pause requires --id <id>");
             jReq["action"] = "bt_pause";
@@ -6891,7 +6914,7 @@ if (subcmd == "start" || subcmd == "run") {
             subcmd = "bt_pause";
         } else {
             return failWith("unknown bt command: " + op +
-                            " (validate, start, get, list, wait, resume, retry, update, cancel, pause)");
+                            " (validate, start, get, list, wait, resume, retry, update, cancel, remove, pause)");
         }
         reqJson << jReq.dump();
     }

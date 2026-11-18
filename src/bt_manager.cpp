@@ -437,6 +437,8 @@ void BtManager::DeliverJobOutcomeLocked(TreeEntry& entry,
     std::string failDetail;
     if (finalState == "cancelled") {
         failDetail = "cancelled";
+    } else if (finalState == "closed") {
+        failDetail = "closed";
     } else if (!succeeded && !job.attempts.empty() && !job.attempts.back().checkDetail.empty()) {
         failDetail = job.attempts.back().checkDetail;
     }
