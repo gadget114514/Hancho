@@ -117,6 +117,9 @@ New-Item -ItemType Junction -Path .claude\skills\hancho -Target (Resolve-Path sk
 
 
 
+### v0.9.30
+- **タスクを一覧から削除（複数選択対応）**: タスク一覧が Ctrl+クリックと Shift+クリックに対応しました。1 行または複数行を選んで右クリック→「タスクリストから削除」で、確認のあとキューから削除します。実行中に見えるが実際には無効な行は「タスクリストから削除（強制）」になり、より強い警告を出します（本当に実行中の場合はプロセスの追跡が失われるので、先にキャンセルしてください）。バックエンドは `TaskQueueManager::TaskQueueRemove(id, force)` と IPC の `taskqueue_remove` です。
+
 ### v0.9.29
 - **タスクの一時停止・再開・停止**: タスク一覧でジョブ行を右クリックし「一時停止」「再開」「停止 (キャンセル)」を選べます。待機中のジョブは起動を保留し、ローカルの実行中ジョブはプロセスツリーを suspend して timeout / idle の時計を凍結します。CLI は `taskqueue pause-job|resume-job`、MCP は `taskqueue_pause_job` / `taskqueue_resume_job` です。
 - **タスクグループの一時停止・停止**: グループ行の右クリックから、新規タスクの開始を止める `bt_pause` と、グループと配下の未完了・仮登録タスクをまとめて止める `bt_cancel` を選べます。

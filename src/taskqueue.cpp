@@ -4489,7 +4489,7 @@ std::string TaskQueueManager::TaskQueuePurge(const std::string& taskqueue, const
     return "{\"ok\":true,\"taskqueue\":\"" + JsonEscape(taskqueue) + "\",\"purged\":" + std::to_string(purged) + "}";
 }
 
-std::string TaskQueueManager::TaskQueueRemove(const std::string& id, std::string& outError) {
+std::string TaskQueueManager::TaskQueueRemove(const std::string& id, bool force, std::string& outError) {
     outError.clear();
     if (id.empty()) {
         outError = "id is required";
@@ -4502,11 +4502,14 @@ std::string TaskQueueManager::TaskQueueRemove(const std::string& id, std::string
         outError = "job not found: " + id;
         return BuildError(outError);
     }
-    if (job->state != "succeeded" && job->state != "failed" && job->state != "cancelled") {
-        outError = "cannot remove a " + job->state + " job; cancel it first";
+    const bool finished = job->state == "succeeded" || job->state == "failed" ||
+                          job->state == "cancelled";
+    if (!finished && !force) {
+        outError = "cannot remove a " + job->state + " job; use force or cancel it first";
         return BuildError(outError);
     }
     const std::string queueName = tq->name;
+    const std::string removedState = job->state;
     auto& jobs = tq->jobs;
     jobs.erase(std::remove_if(jobs.begin(), jobs.end(),
                               [&](const TaskQueueJob& j) { return j.id == id; }), jobs.end());
@@ -4514,8 +4517,10 @@ std::string TaskQueueManager::TaskQueueRemove(const std::string& id, std::string
     tq->version++;
     SaveQueue(*tq);
     cv_.notify_all();
-    WriteAuditLog("TASKQUEUE_REMOVE", "id=" + id + " queue=" + queueName);
-    return "{\"ok\":true,\"id\":\"" + JsonEscape(id) + "\",\"taskqueue\":\"" + JsonEscape(queueName) + "\"}";
+    WriteAuditLog("TASKQUEUE_REMOVE", "id=" + id + " queue=" + queueName + " state=" + removedState +
+                                          (force ? " force=1" : ""));
+    return "{\"ok\":true,\"id\":\"" + JsonEscape(id) + "\",\"taskqueue\":\"" + JsonEscape(queueName) +
+           "\",\"state\":\"" + JsonEscape(removedState) + "\"}";
 }
 
 std::string TaskQueueManager::TaskQueuePurgeOlderThan(const std::string& taskqueue, int64_t maxAgeSec, std::string& outError) {

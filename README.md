@@ -120,6 +120,9 @@ The application icons are modeled on the character "Telephone Cat" (電話猫, D
 
 
 
+### v0.9.30
+- **Remove tasks from the list (multi-select)**: the task list now supports Ctrl+click and Shift+click. Select one or several rows and right-click → "Remove from task list"; a confirmation appears and the jobs are deleted from their queues. A row that still looks running but is actually dead shows "Remove from task list (force)" with a stronger warning (if it is genuinely running, its process is no longer tracked; cancel first). Backend: `TaskQueueManager::TaskQueueRemove(id, force)` and the `taskqueue_remove` IPC action.
+
 ### v0.9.29
 - **Pause / resume / stop a task**: right-click a job row in the task list and choose Pause, Resume or Stop (Cancel). A queued job is held; a running local job has its process tree suspended and its timeout/idle clocks frozen. CLI: `taskqueue pause-job|resume-job`; MCP: `taskqueue_pause_job` / `taskqueue_resume_job`.
 - **Pause / stop a task group**: right-click a group row to stop starting new tasks (`bt_pause`) or to stop the group together with its unfinished and provisionally registered jobs (`bt_cancel`).

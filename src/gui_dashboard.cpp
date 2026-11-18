@@ -1426,14 +1426,14 @@ static std::string TaskQueuePurgeIpc(DashboardState* st, const std::string& queu
     return "";
 }
 
-static std::string TaskQueueRemoveIpc(DashboardState* st, const std::string& id, std::string& outErr) {
-    nlohmann::json req = {{"action", "taskqueue_remove"}, {"id", id}};
+static std::string TaskQueueRemoveIpc(DashboardState* st, const std::string& id, bool force, std::string& outErr) {
+    nlohmann::json req = {{"action", "taskqueue_remove"}, {"id", id}, {"force", force}};
     nlohmann::json resp;
     if (GuiIpcCall(st, req, resp, &outErr)) {
         return resp.dump();
     }
     if (st && st->tqm) {
-        return st->tqm->TaskQueueRemove(id, outErr);
+        return st->tqm->TaskQueueRemove(id, force, outErr);
     }
     return "";
 }
@@ -5501,9 +5501,89 @@ static bool CheckIpcResponse(const std::string& resp, const std::string& ipcErr,
     return false;
 }
 
+struct SelectedTaskRow {
+    std::string id;
+    std::string kind;
+};
+
+static std::vector<SelectedTaskRow> SelectedTaskRows(DashboardState* st) {
+    std::vector<SelectedTaskRow> rows;
+    if (!st || !st->hwndTaskList) return rows;
+    int idx = -1;
+    while ((idx = ListView_GetNextItem(st->hwndTaskList, idx, LVNI_SELECTED)) >= 0) {
+        if (idx < 0 || idx >= static_cast<int>(st->taskJobIds.size())) continue;
+        SelectedTaskRow row;
+        row.id = st->taskJobIds[idx];
+        if (idx < static_cast<int>(st->taskJobStates.size())) row.kind = st->taskJobStates[idx];
+        rows.push_back(std::move(row));
+    }
+    return rows;
+}
+
+static void RemoveTaskRows(DashboardState* st, const std::vector<std::string>& ids, bool force) {
+    if (!st || ids.empty()) return;
+    const bool batch = ids.size() > 1;
+    const std::wstring title = force
+        ? (batch ? Tr(L"選択したタスクを強制削除", L"Force remove selected tasks", L"Quitar tareas seleccionadas (forzar)")
+                 : Tr(L"タスクリストから強制削除", L"Force remove from task list", L"Quitar de la lista (forzar)"))
+        : (batch ? Tr(L"選択したタスクを削除", L"Remove selected tasks", L"Quitar tareas seleccionadas")
+                 : Tr(L"タスクリストから削除", L"Remove from task list", L"Quitar de la lista de tareas"));
+    wchar_t message[768] = {};
+    if (force) {
+        swprintf_s(message,
+            Tr(L"選択した %zu 件を削除します。実行中のように見えるものは強制削除され、本当に実行中の場合はプロセスの追跡が失われます。止めるには先にキャンセルしてください。\n\n削除しますか？",
+               L"Remove the %zu selected task(s)? Rows that look running are force-removed; if genuinely running, their processes are no longer tracked. Cancel first to stop them.\n\nRemove?",
+               L"¿Quitar las %zu tareas seleccionadas? Las que parecen en ejecución se quitan a la fuerza; si de verdad se ejecutan, sus procesos dejan de rastrearse. Cancela primero para detenerlas.\n\n¿Quitarlas?"),
+            ids.size());
+    } else {
+        swprintf_s(message,
+            Tr(L"選択した %zu 件をタスクリストから削除しますか？\nキューからも削除され、元に戻せません。",
+               L"Remove the %zu selected task(s) from the task list?\nThey are also deleted from the queue and cannot be undone.",
+               L"¿Quitar las %zu tareas seleccionadas de la lista?\nTambién se eliminan de la cola y no se puede deshacer."),
+            ids.size());
+    }
+    if (gui_platform::GetGuiPlatform()->ShowMessageBox(
+            st->hwndMain, title, message,
+            gui_platform::MessageBoxType::QuestionYesNo,
+            true) != gui_platform::MessageBoxResult::Yes) {
+        return;
+    }
+    int removed = 0;
+    int failed = 0;
+    std::wstring lastErr;
+    for (const auto& id : ids) {
+        std::string ipcErr;
+        std::wstring errW;
+        if (CheckIpcResponse(TaskQueueRemoveIpc(st, id, force, ipcErr), ipcErr, errW)) {
+            ++removed;
+        } else {
+            ++failed;
+            lastErr = errW;
+        }
+    }
+    wchar_t result[768] = {};
+    if (failed == 0) {
+        swprintf_s(result, Tr(L"%zu 件のタスクを削除しました。", L"Removed %zu task(s).", L"Se quitaron %zu tareas."),
+                   static_cast<size_t>(removed));
+        ShowTaskQueueResult(st, Tr(L"削除", L"Removed", L"Eliminado"), result, true);
+    } else {
+        swprintf_s(result,
+                   Tr(L"%zu 件を削除、%zu 件は削除できませんでした。\n%ls",
+                      L"Removed %zu, failed to remove %zu.\n%ls",
+                      L"Se quitaron %zu; no se pudieron quitar %zu.\n%ls"),
+                   static_cast<size_t>(removed), static_cast<size_t>(failed), lastErr.c_str());
+        ShowTaskQueueResult(st, Tr(L"削除できませんでした", L"Could not remove", L"No se pudo quitar"), result, false);
+    }
+}
+
 static void ShowTaskQueueContextMenu(DashboardState* st, const std::string& jobId, POINT ptScreen, const std::wstring& cellText) {
     if (!st || jobId.empty()) return;
     const bool virtualJob = jobId.rfind("btplan:", 0) == 0 || jobId.rfind("group:", 0) == 0;
+    std::vector<std::string> selectedReal;
+    for (const auto& row : SelectedTaskRows(st)) {
+        if (row.id.rfind("btplan:", 0) == 0 || row.id.rfind("group:", 0) == 0) continue;
+        selectedReal.push_back(row.id);
+    }
     const bool groupRow = jobId.rfind("group:", 0) == 0;
     const std::string groupId = groupRow ? jobId.substr(6) : std::string();
     BtWaitDetails btWait;
@@ -5560,10 +5640,20 @@ static void ShowTaskQueueContextMenu(DashboardState* st, const std::string& jobI
         }
         // Virtual task-group / planned rows are not queue jobs; retry/cancel have nothing to act on.
         AppendMenuW(hMenu, MF_STRING, 3111, Tr(L"タスクグループで表示", L"Show Task Group", L"Ver el grupo de tareas"));
+        if (selectedReal.size() > 1) {
+            wchar_t batchLabel[128] = {};
+            swprintf_s(batchLabel,
+                       Tr(L"選択したタスクを削除（%zu 件）", L"Remove selected tasks (%zu)",
+                          L"Quitar tareas seleccionadas (%zu)"),
+                       selectedReal.size());
+            AppendMenuW(hMenu, MF_STRING, 3133, batchLabel);
+        }
         int cmd = TrackPopupMenu(hMenu, TPM_RETURNCMD | TPM_RIGHTBUTTON, ptScreen.x, ptScreen.y, 0, st->hwndMain, nullptr);
         if (hAnswerMenu) DestroyMenu(hAnswerMenu);
         DestroyMenu(hMenu);
-        if (cmd == 3210) {
+        if (cmd == 3133) {
+            RemoveTaskRows(st, selectedReal, true);
+        } else if (cmd == 3210) {
             ShowBtAnswerDialog(st, btWait, groupId);
         } else if (cmd == 3211) {
             std::wstring retryErr;
@@ -5665,8 +5755,17 @@ static void ShowTaskQueueContextMenu(DashboardState* st, const std::string& jobI
                               : Tr(L"一時停止 (Pause)", L"Pause", L"Pausar"));
     }
     AppendMenuW(hMenu, MF_STRING, 3102, Tr(L"停止 (キャンセル)", L"Stop (Cancel)", L"Detener (Cancelar)"));
-    if (jobFinished) {
-        AppendMenuW(hMenu, MF_STRING, 3132, Tr(L"タスクリストから削除", L"Remove from task list", L"Quitar de la lista de tareas"));
+    if (selectedReal.size() > 1) {
+        wchar_t batchLabel[128] = {};
+        swprintf_s(batchLabel,
+                   Tr(L"選択したタスクを削除（%zu 件）", L"Remove selected tasks (%zu)",
+                      L"Quitar tareas seleccionadas (%zu)"),
+                   selectedReal.size());
+        AppendMenuW(hMenu, MF_STRING, 3133, batchLabel);
+    } else {
+        AppendMenuW(hMenu, MF_STRING, 3132,
+                    jobFinished ? Tr(L"タスクリストから削除", L"Remove from task list", L"Quitar de la lista de tareas")
+                                : Tr(L"タスクリストから削除（強制）", L"Remove from task list (force)", L"Quitar de la lista (forzar)"));
     }
     AppendMenuW(hMenu, MF_SEPARATOR, 0, nullptr);
     AppendMenuW(hMenu, MF_STRING, 3103, Tr(L"キューを一時停止", L"Pause queue", L"Pausar cola"));
@@ -5782,27 +5881,9 @@ static void ShowTaskQueueContextMenu(DashboardState* st, const std::string& jobI
                 pauseErr, false);
         }
     } else if (cmd == 3132) {
-        if (gui_platform::GetGuiPlatform()->ShowMessageBox(
-                st->hwndMain,
-                Tr(L"タスクリストから削除", L"Remove from task list", L"Quitar de la lista de tareas"),
-                Tr(L"この終了済みタスクをタスクリストから削除しますか？\nキューからも削除され、元に戻せません。",
-                   L"Remove this finished task from the task list?\nIt is also deleted from the queue and cannot be undone.",
-                   L"¿Quitar esta tarea finalizada de la lista?\nTambién se elimina de la cola y no se puede deshacer."),
-                gui_platform::MessageBoxType::QuestionYesNo,
-                true) == gui_platform::MessageBoxResult::Yes) {
-            std::wstring removeErr;
-            if (CheckIpcResponse(TaskQueueRemoveIpc(st, jobId, err), err, removeErr)) {
-                ShowTaskQueueResult(st, Tr(L"削除", L"Removed", L"Eliminado"),
-                                    Tr(L"タスクをタスクリストから削除しました。",
-                                       L"Removed the task from the task list.",
-                                       L"Se quitó la tarea de la lista."),
-                                    true);
-            } else {
-                ShowTaskQueueResult(st, Tr(L"削除できませんでした", L"Could not remove",
-                                           L"No se pudo quitar"),
-                                    removeErr, false);
-            }
-        }
+        RemoveTaskRows(st, {jobId}, !jobFinished);
+    } else if (cmd == 3133) {
+        RemoveTaskRows(st, selectedReal, true);
     } else if (cmd == 3103 || cmd == 3104) {
         resp = TaskQueueGetIpc(st, jobId, false, 0, err);
         std::string tqName = JsonGetString(resp, "taskqueue", "");
@@ -6456,10 +6537,16 @@ static void RefreshTaskQueueData(DashboardState* st, bool force = false, bool us
     }
     st->taskFailureSummary = std::move(failureSummary);
 
-    // Rebuilding the list drops the highlight, so remember which job was selected and select it again.
-    std::string keepSelectedJob;
-    int prevSel = ListView_GetNextItem(st->hwndTaskList, -1, LVNI_SELECTED);
-    if (prevSel >= 0 && prevSel < static_cast<int>(st->taskJobIds.size())) keepSelectedJob = st->taskJobIds[prevSel];
+    // Rebuilding the list drops the highlight, so remember every selected job and select them again.
+    std::vector<std::string> keepSelectedJobs;
+    {
+        int sel = -1;
+        while ((sel = ListView_GetNextItem(st->hwndTaskList, sel, LVNI_SELECTED)) >= 0) {
+            if (sel >= 0 && sel < static_cast<int>(st->taskJobIds.size())) {
+                keepSelectedJobs.push_back(st->taskJobIds[sel]);
+            }
+        }
+    }
     // It also resets the scroll position, so put that back afterwards too.
     int keepTopIndex = ListView_GetTopIndex(st->hwndTaskList);
     int keepScrollX = GetScrollPos(st->hwndTaskList, SB_HORZ);
@@ -6481,11 +6568,14 @@ static void RefreshTaskQueueData(DashboardState* st, bool force = false, bool us
             ListView_SetItemText(st->hwndTaskList, row, col, cells[col].data());
         }
     }
-    if (!keepSelectedJob.empty()) {
+    if (!keepSelectedJobs.empty()) {
+        bool focused = false;
         for (int r = 0; r < static_cast<int>(st->taskJobIds.size()); ++r) {
-            if (st->taskJobIds[r] != keepSelectedJob) continue;
-            ListView_SetItemState(st->hwndTaskList, r, LVIS_SELECTED | LVIS_FOCUSED, LVIS_SELECTED | LVIS_FOCUSED);
-            break;
+            if (std::find(keepSelectedJobs.begin(), keepSelectedJobs.end(), st->taskJobIds[r]) ==
+                keepSelectedJobs.end()) continue;
+            UINT state = LVIS_SELECTED | (focused ? 0 : LVIS_FOCUSED);
+            ListView_SetItemState(st->hwndTaskList, r, state, LVIS_SELECTED | LVIS_FOCUSED);
+            focused = true;
         }
     }
     RECT firstRow = {};
@@ -18941,7 +19031,7 @@ static LRESULT CALLBACK DashboardWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPA
             SetWindowSubclass(st->hwndList, ListViewSubclassProc, 1, 0);
 
             st->hwndTaskList = CreateWindowExW(WS_EX_CLIENTEDGE, WC_LISTVIEWW, L"",
-                WS_CHILD | LVS_REPORT | LVS_SINGLESEL | LVS_SHOWSELALWAYS,
+                WS_CHILD | LVS_REPORT | LVS_SHOWSELALWAYS,
                 0, 0, 600, 160, hwnd, (HMENU)IDC_LIST_TASKS, nullptr, nullptr);
             ListView_SetExtendedListViewStyle(st->hwndTaskList, LVS_EX_FULLROWSELECT | LVS_EX_DOUBLEBUFFER | LVS_EX_INFOTIP);
             ListView_SetBkColor(st->hwndTaskList, g_theme.panel);
@@ -19695,6 +19785,13 @@ static LRESULT CALLBACK DashboardWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPA
                     auto* nmia = reinterpret_cast<NMITEMACTIVATE*>(lParam);
                     int idx = nmia->iItem;
                     if (idx >= 0 && idx < static_cast<int>(st->taskJobIds.size())) {
+                        // Keep a multi-selection when the clicked row is already selected;
+                        // otherwise make the clicked row the only selection.
+                        if (!(ListView_GetItemState(st->hwndTaskList, idx, LVIS_SELECTED) & LVIS_SELECTED)) {
+                            ListView_SetItemState(st->hwndTaskList, -1, 0, LVIS_SELECTED);
+                            ListView_SetItemState(st->hwndTaskList, idx, LVIS_SELECTED | LVIS_FOCUSED,
+                                                  LVIS_SELECTED | LVIS_FOCUSED);
+                        }
                         POINT ptScreen = {};
                         GetCursorPos(&ptScreen);
                         std::wstring cell = TaskListCellText(st->hwndTaskList, idx, nmia->iSubItem);
