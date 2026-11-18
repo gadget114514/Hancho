@@ -1884,6 +1884,7 @@ static TaskQueueJob ParseJob(const std::string& j) {
     job.memory = ParseMemory(JsonFieldObj(j, "memory", ""));
     job.priority = static_cast<int>(JsonFieldInt(j, "priority", 0));
     job.hidden = JsonFieldBool(j, "hidden", false);
+    job.paused = JsonFieldBool(j, "paused", false);
     job.suspendWhenDone = JsonFieldBool(j, "suspend_when_done", false);
     job.suspendDelaySec = static_cast<int>(JsonFieldInt(j, "suspend_delay_sec", 0));
     job.shutdownWhenDone = JsonFieldBool(j, "shutdown_when_done", false);
@@ -2795,6 +2796,7 @@ std::string TaskQueueManager::JobToJson(const TaskQueueJob& job, bool includeIns
         << ",\"memory\":" << MemoryToJson(job.memory)
         << ",\"priority\":" << job.priority
         << ",\"hidden\":" << (job.hidden ? "true" : "false")
+        << ",\"paused\":" << (job.paused ? "true" : "false")
         << ",\"suspend_when_done\":" << (job.suspendWhenDone ? "true" : "false")
         << ",\"suspend_delay_sec\":" << job.suspendDelaySec
         << ",\"suspend_hibernate\":" << (job.suspendHibernate ? "true" : "false")
@@ -3270,6 +3272,7 @@ void TaskQueueManager::SetResourceLocksEnabled(bool enabled) {
 }
 
 bool TaskQueueManager::IsReadyLocked(const TaskQueueJob& job, int64_t nowMs) const {
+    if (job.paused) return false;
     if (job.state != "pending" || job.retryAtMs > nowMs) return false;
     for (const auto& d : job.dependsOn) {
         const TaskQueueJob* dep = FindJobConst(d.id);
@@ -3962,6 +3965,7 @@ void TaskQueueManager::RequeueJobLocked(TaskQueue& tq, TaskQueueJob& job, bool r
 
     if (resetAttempts) job.attempts.clear();
     job.state = "pending";
+    job.paused = false;
     job.blockedBy.clear();
     job.retryAtMs = 0;
     job.updatedAt = GetCurrentTimestampStr();
@@ -4308,6 +4312,52 @@ std::string TaskQueueManager::TaskQueueUpdate(const std::string& id, const std::
 
 namespace pc {
 
+std::string TaskQueueManager::TaskQueuePauseJob(const std::string& id, bool paused, std::string& outError) {
+    outError.clear();
+    std::lock_guard<std::mutex> lock(mutex_);
+    TaskQueue* tq = nullptr;
+    TaskQueueJob* job = FindJob(id, &tq);
+    if (!job) {
+        outError = "job not found: " + id;
+        return BuildError(outError);
+    }
+    if (job->paused == paused) {
+        return "{\"ok\":true,\"job\":" + JobToJson(*job, true) + "}";
+    }
+    if (job->state == "succeeded" || job->state == "cancelled" || job->state == "failed") {
+        outError = "job '" + id + "' has already finished (" + job->state + ")";
+        return BuildError(outError);
+    }
+
+    const int attemptN = job->attempts.empty() ? 0 : job->attempts.back().n;
+    if (job->state == "running" && !job->attempts.empty()) {
+        const TaskQueueAttempt& attempt = job->attempts.back();
+        if (!attempt.remoteHost.empty() || attempt.remoteProcessId > 0) {
+            outError = "pausing a remote job is not supported yet";
+            return BuildError(outError);
+        }
+        if (attempt.processId > 0) {
+            if (!pm_) {
+                outError = "process manager is not available";
+                return BuildError(outError);
+            }
+            std::string pmErr;
+            if (!pm_->SuspendProcess(attempt.processId, paused, pmErr)) {
+                outError = pmErr;
+                return BuildError(outError);
+            }
+        }
+    }
+
+    job->paused = paused;
+    job->updatedAt = GetCurrentTimestampStr();
+    EmitEventLocked(*tq, paused ? "jobPaused" : "jobResumed", id, attemptN);
+    if (!paused) ReevaluateAll();
+    SaveQueue(*tq);
+    if (schedulerRunning_.load()) cv_.notify_all();
+    return "{\"ok\":true,\"job\":" + JobToJson(*job, true) + "}";
+}
+
 std::string TaskQueueManager::TaskQueueCancel(const std::string& id, std::string& outError) {
     outError.clear();
     std::string resp;
@@ -4337,6 +4387,7 @@ std::string TaskQueueManager::TaskQueueCancel(const std::string& id, std::string
             remotePid = job->attempts.back().remoteProcessId;
         }
         job->state = "cancelled";
+        job->paused = false;
         job->blockedBy.clear();
         job->retryAtMs = 0;
         job->updatedAt = GetCurrentTimestampStr();

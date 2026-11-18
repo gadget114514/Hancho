@@ -54,6 +54,7 @@ You can also run the server directly with `Hancho.exe mcp`. It connects to the d
 | `taskqueue_update` | Update a pending/failed/blocked job. |
 | `taskqueue_cancel` | Cancel a job (kills a running attempt, no retry). |
 | `taskqueue_pause` / `taskqueue_resume` | Stop/restart starting new jobs in a queue. |
+| `taskqueue_pause_job` / `taskqueue_resume_job` | Pause/resume one job (`id`). A queued job is not scheduled; a running local job is suspended and its timeout/idle clocks freeze. Use `taskqueue_cancel` to stop. |
 | `taskqueue_wait` | Long-poll for a queue version change (`taskqueue`, `sinceVersion`, `timeoutMs`). |
 | `taskqueue_purge` | Remove finished jobs (`taskqueue`, `states[]`). |
 | `taskqueue_link` / `taskqueue_unlink` | Add/remove one dependency (`job`, `dependsOn`, `on` = `success`\|`done`). |

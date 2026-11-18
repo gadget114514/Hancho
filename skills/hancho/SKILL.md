@@ -131,6 +131,7 @@ hancho-cli.exe power status
 | 1文字修正・単純な文字列置換 | `quickfix`（LLM を使わない） |
 | 複数ステップに順番・依存がある | `taskqueue add` + `taskqueue wait` |
 | 前の結果で次が変わる（分岐、修正ループ、if/else） | `bt start` + `bt wait` / `bt resume` |
+| 実行を一時的に止めたい（原因は直さない） | `taskqueue pause-job <id>` / `taskqueue pause <name>` / `bt pause --id <id>`（再開は resume） |
 | worker LLM に1件任せて最終結果だけ欲しい | MCP `run_worker` |
 | 対話 TUI（opencode / claude を `run` なしで） | `start --pty` |
 | 夜間バッチの後に PC をスリープ / シャットダウン | `power suspend` / `power shutdown --after-job <id>` |
@@ -143,6 +144,7 @@ hancho-cli.exe power status
 - **`id` / `command` / `summary`（200文字以内）/ `timeoutSec` は必須。** タイムアウトはジョブごと。合算しない。
 - **成功を偽装しない。** Hancho が `success.exitCode`（既定 0）と `filesNewer` / `outputRegex` / `testReport` で検証する。exit 0 だけでは成果物を保証できないときは `filesNewer` を足す。
 - **待つ。ポーリングしない。** `taskqueue wait` / `bt wait` / `wait_process` を使う。
+- **一時停止は原因を直さない。** `taskqueue pause-job` / `taskqueue pause` / `bt pause` は実行（とローカル実行中ジョブの時計）を止めるだけ。LLM 応答待ち（`waitingForLlm`、rate limit、auth、provider 障害、ハング）は pause では解消しない。escalate は `bt resume` で回答するか `bt retry`、LLM 側の失敗は原因を直して `taskqueue retry`、無理なら `taskqueue cancel` / `bt cancel`。pause した実行中ジョブを resume しても同じリクエストが続く。
 - **supervisor の文脈を小さく保つ。** 詳細な指示は worker に渡し、成果物とログの末尾だけ読む。
 - **1文字修正にコーディングエージェントを起動しない。** `quickfix --file <path> --find <text> --replace <text>` を使う。決定的で数秒〜数十秒で終わる。
 - **supervisor 自身にコードを書かせない。** 監督はパッチ/置換/ジョブを出す。適用は `quickfix` か worker ジョブにやらせる。
@@ -209,11 +211,16 @@ hancho-cli.exe taskqueue get build --json
 hancho-cli.exe taskqueue why build
 hancho-cli.exe taskqueue retry build
 hancho-cli.exe taskqueue retry --failed --since 6h
+
+# 実行を止める: pause は再開できる。停止（取り消し）は cancel。
+hancho-cli.exe taskqueue pause-job build
+hancho-cli.exe taskqueue resume-job build
+hancho-cli.exe taskqueue cancel build
 ```
 
 便利なジョブ項目: `dependsOn`、`maxAttempts`、`retryDelaySec`、`idle`、`resources`（write/read ロック）、`defer`（exit 75 =「何も実行できず後で再試行」）、`priority`、`instructionsFile`、`memory`。
 
-状態: `waiting`（実行可能・空き待ち）、`pending`（依存未達）、`blocked`（依存失敗）、`running`、`planned`（BT の暫定行）、`succeeded`、`failed`、`cancelled`。
+状態: `waiting`（実行可能・空き待ち）、`pending`（依存未達）、`blocked`（依存失敗）、`running`、`planned`（BT の暫定行）、`succeeded`、`failed`、`cancelled`。ジョブの `paused: true` は待機中なら起動しない、実行中ならプロセスツリーを suspend して timeout / idle の時計を凍結する（`taskqueue pause-job` / `resume-job`）。タスクグループは `bt pause --id <id> [--paused true|false]`（実行中の葉は止まらない）、停止は `bt cancel --id <id>`。
 
 `taskqueue list` は既定で `planned` 行（実行中の BT が後で起動する未起動葉）と `group:<id>` のタスクグループ行を含み、`--no-planned` で両方外せます（MCP は `includePlanned: false`）。タスクグループの状態は `running` / `waitingForLlm` / `paused`。どちらも保存されたジョブではないので、`taskqueue get` せず `bt_get` / `bt_resume` を使います。待機中のグループはダッシュボードのタスク一覧で右クリック →「回答して進める」からも再開できます。
 
@@ -365,6 +372,7 @@ hancho-cli.exe mcp install --data-dir .hancho --dry-run --json
 - 呼び出しごとに data-dir が違う → 毎回同じ `--data-dir` を付ける。
 - exit 0 だけで成果物があると決めつける → `success.filesNewer` を足す。
 - キュー実行を止めたいのに `kill_process` → `taskqueue_cancel` を使う。
+- LLM 応答待ちを pause で直そうとする → pause は実行を止めるだけ。escalate は回答か `bt retry`、LLM 側の失敗は原因を直して `taskqueue retry`、無理なら cancel。resume しても同じリクエストが続く。
 - `start` で `opencode run` が終わらない → `--close-stdin` を付ける。
 - 1文字修正なのにコーディングエージェントを起動して数十分待つ → `quickfix` を使う。
 - 監督に直接ファイルを編集させる → 置換・パッチ・ジョブを出させ、適用は Hancho に任せる。

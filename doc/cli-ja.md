@@ -98,6 +98,10 @@ hancho-cli.exe taskqueue graph main
 hancho-cli.exe taskqueue wait main --since 0 --timeout-ms 30000
 hancho-cli.exe taskqueue retry A
 
+# 1 つのジョブを一時停止 / 再開（完全に止めるなら cancel）
+hancho-cli.exe taskqueue pause-job A
+hancho-cli.exe taskqueue resume-job A
+
 # 実行中の BT の未起動葉は既定で planned 行として出る。外すには --no-planned
 hancho-cli.exe taskqueue list main --no-planned
 ```

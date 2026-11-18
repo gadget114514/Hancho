@@ -2824,8 +2824,8 @@ SETUP FOR LLM AGENTS:
 "                  update_worker_info\n"
 "      Task queue: taskqueue_add, taskqueue_list, taskqueue_get, taskqueue_retry,\n"
 "                  taskqueue_update, taskqueue_cancel, taskqueue_pause, taskqueue_resume,\n"
-"                  taskqueue_wait, taskqueue_purge, taskqueue_link, taskqueue_unlink,\n"
-"                  taskqueue_graph\n"
+"                  taskqueue_pause_job, taskqueue_resume_job, taskqueue_wait,\n"
+"                  taskqueue_purge, taskqueue_link, taskqueue_unlink, taskqueue_graph\n"
 "      Behavior tree: bt_validate, bt_start, bt_get, bt_list, bt_wait, bt_resume,\n"
 "                  bt_retry, bt_update, bt_cancel, bt_pause\n"
 "      Power:      power_suspend, power_shutdown, power_cancel, power_status\n"
@@ -3053,7 +3053,7 @@ void PrintCliUsageJson() {
     {
       "name": "taskqueue",
       "description": "Manage the persistent task queue: ordered jobs, dependencies, per-job timeouts, success checks and automatic retries.",
-      "usage": "hancho-cli taskqueue <add|list|get|why|retry|cancel|pause|resume|graph|wait|purge|update> ...",
+      "usage": "hancho-cli taskqueue <add|list|get|why|retry|cancel|pause|resume|pause-job|resume-job|graph|wait|purge|update> ...",
       "subcommands": [
         {"name": "add", "usage": "hancho-cli taskqueue add --file <jobs.json> [--taskqueue <name>] [--concurrency <n>] [--notify-file <path>] [--origin-label <text>]", "description": "Register jobs. Each job needs id, command, summary and timeoutSec; dependsOn replaces shell chaining. The caller's session id, working folder and --origin-label are recorded as the job's origin. suspendWhenDone/suspendDelaySec/suspendHibernate arm the PC to suspend, and shutdownWhenDone/shutdownDelaySec arm it to shut down, after that job and all other work is idle. Do not set hidden on jobs you register: it is reserved for Hancho's internal jobs and hides the row unless Show hidden tasks is on."},
         {"name": "list", "usage": "hancho-cli taskqueue list [<name>] [--state <state>] [--since <period>] [--origin <self|label|session>] [--bt <id>] [--no-planned]", "description": "List jobs with state, queue, summary and blockedBy. --since keeps only jobs updated within the period (e.g. 30m, 6h, 2d). --origin self keeps only the jobs this session added. --bt <id> lists every job of a behavior tree across its parallel branch queues. Provisional 'planned' rows for idle BT leaves are included by default; --no-planned hides them and the task-group row. The active task group (the BT root) is a virtual row with id 'group:<id>' and state running, waitingForLlm or paused. Neither row is a stored job. Each job also carries resource_wait and, once succeeded with estimateSec, timing_feedback (see audit)."},
@@ -3064,6 +3064,8 @@ void PrintCliUsageJson() {
         {"name": "cancel", "usage": "hancho-cli taskqueue cancel <id>", "description": "Cancel a job; a running attempt is killed and is not retried."},
         {"name": "pause", "usage": "hancho-cli taskqueue pause <name>", "description": "Stop starting new jobs in the queue; running jobs continue."},
         {"name": "resume", "usage": "hancho-cli taskqueue resume <name>", "description": "Resume starting jobs in the queue."},
+        {"name": "pause-job", "usage": "hancho-cli taskqueue pause-job <id>", "description": "Pause one job. A queued job is not scheduled; a running local job is suspended and its timeout/idle clocks freeze."},
+        {"name": "resume-job", "usage": "hancho-cli taskqueue resume-job <id>", "description": "Resume a paused job."},
         {"name": "graph", "usage": "hancho-cli taskqueue graph [<name>] [--root <id>]", "description": "Dependency graph with ready, waiting_for, resource_wait, retry_in_sec, blocked and dependents."},
         {"name": "wait", "usage": "hancho-cli taskqueue wait <name> [--since <version>] [--timeout-ms <ms>]", "description": "Long-poll until the queue version changes."},
         {"name": "purge", "usage": "hancho-cli taskqueue purge <name> [--states succeeded,failed,cancelled]", "description": "Remove finished jobs."},
@@ -3326,7 +3328,7 @@ void PrintCliUsageJson() {
           }
         }
       },
-      "tools": ["start_process", "list_processes", "get_process_output", "send_process_input", "wait_process", "kill_process", "run_worker", "wait_worker", "get_worker_stream", "get_worker_state", "update_worker_info", "taskqueue_add", "taskqueue_list", "taskqueue_get", "taskqueue_retry", "taskqueue_update", "taskqueue_cancel", "taskqueue_pause", "taskqueue_resume", "taskqueue_wait", "taskqueue_purge", "taskqueue_link", "taskqueue_unlink", "taskqueue_graph", "bt_validate", "bt_start", "bt_get", "bt_list", "bt_wait", "bt_resume", "bt_retry", "bt_update", "bt_cancel", "bt_pause", "power_suspend", "power_shutdown", "power_cancel", "power_status", "chat_status", "chat_peers", "chat_refresh", "chat_send", "chat_get", "chat_inbox", "chat_wait", "chat_read", "chat_download", "chat_log", "chat_handler", "memory_search", "memory_get", "memory_brief", "memory_stats", "memory_note", "memory_retract", "memory_approve", "usage_stats", "usage_export"]
+      "tools": ["start_process", "list_processes", "get_process_output", "send_process_input", "wait_process", "kill_process", "run_worker", "wait_worker", "get_worker_stream", "get_worker_state", "update_worker_info", "taskqueue_add", "taskqueue_list", "taskqueue_get", "taskqueue_retry", "taskqueue_update", "taskqueue_cancel", "taskqueue_pause", "taskqueue_resume", "taskqueue_pause_job", "taskqueue_resume_job", "taskqueue_wait", "taskqueue_purge", "taskqueue_link", "taskqueue_unlink", "taskqueue_graph", "bt_validate", "bt_start", "bt_get", "bt_list", "bt_wait", "bt_resume", "bt_retry", "bt_update", "bt_cancel", "bt_pause", "power_suspend", "power_shutdown", "power_cancel", "power_status", "chat_status", "chat_peers", "chat_refresh", "chat_send", "chat_get", "chat_inbox", "chat_wait", "chat_read", "chat_download", "chat_log", "chat_handler", "memory_search", "memory_get", "memory_brief", "memory_stats", "memory_note", "memory_retract", "memory_approve", "usage_stats", "usage_export"]
     }
   },
   "leaving": {
@@ -6531,6 +6533,12 @@ if (subcmd == "start" || subcmd == "run") {
             std::string tqName = firstPositional(3);
             reqJson << "{\"action\":\"taskqueue_" << op << "\",\"taskqueue\":\"" << JsonEscape(tqName) << "\"}";
             subcmd = "taskqueue_" + op;
+        } else if (op == "pause-job" || op == "resume-job") {
+            std::string id = firstPositional(3);
+            const bool pause = op == "pause-job";
+            reqJson << "{\"action\":\"taskqueue_" << (pause ? "pause_job" : "resume_job")
+                    << "\",\"id\":\"" << JsonEscape(id) << "\"}";
+            subcmd = pause ? "taskqueue_pause_job" : "taskqueue_resume_job";
         } else if (op == "graph") {
             std::string tqName = firstPositional(3);
             std::string root = argVal("--root", "");
@@ -6605,7 +6613,7 @@ if (subcmd == "start" || subcmd == "run") {
             subcmd = "taskqueue_purge";
         } else {
             return failWith("unknown taskqueue command: " + op +
-                            " (add, list, get, why, retry, cancel, pause, resume, graph, wait, purge, update)");
+                            " (add, list, get, why, retry, cancel, pause, resume, pause-job, resume-job, graph, wait, purge, update)");
         }
     }
     else if (subcmd == "quickfix") {

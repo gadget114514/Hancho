@@ -52,6 +52,7 @@ struct ProcessSnapshot {
     std::string workingDir;
     ExecMode mode = ExecMode::Pipe;
     ProcState state = ProcState::Running;
+    bool suspended = false;
     DWORD rootPid = 0;
     DWORD exitCode = STILL_ACTIVE;
     std::string startTimeStr;
@@ -154,6 +155,10 @@ public:
 
     // Terminate process tree via Job Object
     bool KillProcess(int id, std::string& outError);
+
+    // Stop/resume the process tree without killing it. Timeout and idle clocks
+    // are frozen while suspended, so a paused job can be resumed later.
+    bool SuspendProcess(int id, bool suspend, std::string& outError);
 
     // Terminate all running processes
     int KillAllRunning();
@@ -266,6 +271,9 @@ private:
         std::atomic<uint64_t> cpuTime100ns{0};
         std::atomic<uint64_t> lastCpuActivityTickMs{0};
         uint64_t lastMetricsTickMs = 0;
+        std::atomic<bool> suspended{false};
+        std::atomic<uint64_t> suspendStartTickMs{0};
+        std::atomic<uint64_t> suspendedTotalMs{0};
         int timeoutSec = 0;
         int idleTimeoutSec = 0;
         int idleCpuSec = 0;

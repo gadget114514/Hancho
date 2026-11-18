@@ -24,6 +24,7 @@
 #include <algorithm>
 #include <atomic>
 #include <cctype>
+#include <functional>
 #include <chrono>
 #include <cstdio>
 #include <cstring>
@@ -282,6 +283,14 @@ public:
         return ok;
     }
 
+    bool Suspend(std::string& outError) override {
+        return ApplyNtProcessCall("NtSuspendProcess", "suspend", outError);
+    }
+
+    bool Resume(std::string& outError) override {
+        return ApplyNtProcessCall("NtResumeProcess", "resume", outError);
+    }
+
     void Release() override {
         if (job_) {
             // Release must not kill: clear KILL_ON_JOB_CLOSE before closing.
@@ -301,6 +310,68 @@ public:
     }
 
 private:
+    std::vector<DWORD> ProcessIds() const {
+        std::vector<DWORD> pids;
+        auto push = [&pids](DWORD pid) {
+            if (pid == 0) return;
+            if (std::find(pids.begin(), pids.end(), pid) == pids.end()) pids.push_back(pid);
+        };
+        push(static_cast<DWORD>(rootPid_));
+        alignas(JOBOBJECT_BASIC_PROCESS_ID_LIST)
+        BYTE buffer[sizeof(JOBOBJECT_BASIC_PROCESS_ID_LIST) + sizeof(ULONG_PTR) * 1024] = {};
+        auto* pidList = reinterpret_cast<PJOBOBJECT_BASIC_PROCESS_ID_LIST>(buffer);
+        if (job_ && assigned_ &&
+            QueryInformationJobObject(job_, JobObjectBasicProcessIdList, pidList,
+                                      sizeof(buffer), nullptr)) {
+            for (DWORD i = 0; i < pidList->NumberOfProcessIdsInList; ++i) {
+                push(static_cast<DWORD>(pidList->ProcessIdList[i]));
+            }
+        }
+        return pids;
+    }
+
+    bool ApplyNtProcessCall(const char* procName, const char* action, std::string& outError) {
+        outError.clear();
+        if (!attached_ || rootPid_ == 0) {
+            outError = "process tree is not attached";
+            return false;
+        }
+        using NtProcessCall = LONG(NTAPI*)(HANDLE);
+        HMODULE ntdll = GetModuleHandleW(L"ntdll.dll");
+        auto call = ntdll ? reinterpret_cast<NtProcessCall>(GetProcAddress(ntdll, procName)) : nullptr;
+        if (!call) {
+            outError = std::string(procName) + " is not available";
+            return false;
+        }
+
+        constexpr DWORD kProcessSuspendResume = 0x0800;
+        bool any = false;
+        DWORD lastError = 0;
+        LONG lastStatus = 0;
+        for (DWORD pid : ProcessIds()) {
+            HANDLE process = OpenProcess(kProcessSuspendResume, FALSE, pid);
+            if (!process) {
+                lastError = GetLastError();
+                continue;
+            }
+            lastStatus = call(process);
+            CloseHandle(process);
+            if (lastStatus >= 0) {
+                any = true;
+            }
+        }
+        if (!any) {
+            outError = std::string("failed to ") + action + " the process tree";
+            if (lastStatus < 0) {
+                outError += " (NTSTATUS " + std::to_string(lastStatus) + ")";
+            } else if (lastError != 0) {
+                outError += ": " + Win32ErrorMessage(lastError);
+            }
+            return false;
+        }
+        return true;
+    }
+
     HANDLE job_ = nullptr;
     HANDLE rootProcess_ = nullptr;
     uint64_t rootPid_ = 0;

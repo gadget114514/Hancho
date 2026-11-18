@@ -119,11 +119,11 @@ MCP SERVER SETUP:
       wait_process, kill_process
     Worker (5):
       run_worker, wait_worker, get_worker_stream, get_worker_state, update_worker_info
-    Task queue (13):
+    Task queue (15):
       taskqueue_add, taskqueue_list, taskqueue_get, taskqueue_retry,
       taskqueue_update, taskqueue_cancel, taskqueue_pause, taskqueue_resume,
-      taskqueue_wait, taskqueue_purge, taskqueue_link, taskqueue_unlink,
-      taskqueue_graph
+      taskqueue_pause_job, taskqueue_resume_job, taskqueue_wait,
+      taskqueue_purge, taskqueue_link, taskqueue_unlink, taskqueue_graph
     Behavior tree (10):
       bt_validate, bt_start, bt_get, bt_list, bt_wait, bt_resume, bt_retry,
       bt_update, bt_cancel, bt_pause
@@ -411,6 +411,8 @@ TASK QUEUE:
       retries the failures of the last 6 hours. Blocked dependents resume.
   taskqueue cancel <id>
   taskqueue pause|resume <name>
+  taskqueue pause-job <id>                   (実行中の 1 ジョブを停止、待機中は起動を保留)
+  taskqueue resume-job <id>
   taskqueue graph [<name>] [--root <id>]     (ready, waiting_for, resource_wait, retry_in_sec, blocked)
   taskqueue wait <name> [--since <version>] [--timeout-ms <ms>]
   taskqueue purge <name> [--states succeeded,failed,cancelled]
@@ -519,8 +521,8 @@ SETUP FOR LLM AGENTS:
                   update_worker_info
       Task queue: taskqueue_add, taskqueue_list, taskqueue_get, taskqueue_retry,
                   taskqueue_update, taskqueue_cancel, taskqueue_pause, taskqueue_resume,
-                  taskqueue_wait, taskqueue_purge, taskqueue_link, taskqueue_unlink,
-                  taskqueue_graph
+                  taskqueue_pause_job, taskqueue_resume_job, taskqueue_wait,
+                  taskqueue_purge, taskqueue_link, taskqueue_unlink, taskqueue_graph
       Behavior tree: bt_validate, bt_start, bt_get, bt_list, bt_wait, bt_resume,
                   bt_retry, bt_update, bt_cancel, bt_pause
 

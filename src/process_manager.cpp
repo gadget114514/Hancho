@@ -751,6 +751,12 @@ void ProcessManager::TerminateJobInternal(ManagedProcess& proc, ProcState finalS
     proc.treeMemoryBytes = 0;
 
     uint64_t elapsedMs = (endNow >= proc.startTickMs) ? (endNow - proc.startTickMs) : 0;
+    uint64_t pausedMs = proc.suspendedTotalMs.load();
+    if (proc.suspended.load()) {
+        const uint64_t suspendStart = proc.suspendStartTickMs.load();
+        if (suspendStart > 0 && endNow > suspendStart) pausedMs += endNow - suspendStart;
+    }
+    if (elapsedMs > pausedMs) elapsedMs -= pausedMs; else elapsedMs = 0;
     std::string endTimeStr = GetCurrentTimestampStr();
      proc.endTimeStr = endTimeStr;
      proc.endEpochSec = static_cast<int64_t>(time(nullptr));
@@ -849,6 +855,12 @@ void ProcessManager::MonitorThreadFunc() {
                     }
 
                     uint64_t elapsedMs = (now >= proc->startTickMs) ? (now - proc->startTickMs) : 0;
+                    uint64_t pausedMs = proc->suspendedTotalMs.load();
+                    if (proc->suspended.load()) {
+                        const uint64_t suspendStart = proc->suspendStartTickMs.load();
+                        if (suspendStart > 0 && now > suspendStart) pausedMs += now - suspendStart;
+                    }
+                    if (elapsedMs > pausedMs) elapsedMs -= pausedMs; else elapsedMs = 0;
                     std::string endTimeStr = GetCurrentTimestampStr();
                     proc->endTimeStr = endTimeStr;
      proc->endEpochSec = static_cast<int64_t>(time(nullptr));
@@ -891,8 +903,15 @@ void ProcessManager::MonitorThreadFunc() {
                 UpdateJobMetrics(*proc);
             }
 
+            // A suspended tree cannot make progress; freeze both timeout clocks
+            // until ProcessManager::SuspendProcess(..., false) resumes it.
+            if (proc->suspended.load()) continue;
+
             if (proc->timeoutSec > 0) {
-                uint64_t elapsedSec = (now - proc->startTickMs) / 1000;
+                uint64_t activeMs = (now >= proc->startTickMs) ? (now - proc->startTickMs) : 0;
+                const uint64_t pausedMs = proc->suspendedTotalMs.load();
+                if (activeMs > pausedMs) activeMs -= pausedMs; else activeMs = 0;
+                uint64_t elapsedSec = activeMs / 1000;
                 if (elapsedSec >= static_cast<uint64_t>(proc->timeoutSec)) {
                     TerminateJobInternal(*proc, ProcState::TimedOut,
                         "Process tree terminated: Exceeded runtime timeout (" + std::to_string(proc->timeoutSec) + "s)");
@@ -945,6 +964,10 @@ bool ProcessManager::SendInput(int id, const std::string& text, bool appendNewli
     }
     if (proc->state != ProcState::Running) {
         outError = "Process ID " + std::to_string(id) + " is not running.";
+        return false;
+    }
+    if (proc->suspended.load()) {
+        outError = "Process ID " + std::to_string(id) + " is paused.";
         return false;
     }
 
@@ -1023,6 +1046,55 @@ bool ProcessManager::KillProcess(int id, std::string& outError) {
     }
     TerminateJobInternal(*proc, ProcState::Killed, "Process tree killed via Job Object.");
     SaveState();
+    return true;
+}
+
+bool ProcessManager::SuspendProcess(int id, bool suspend, std::string& outError) {
+    outError.clear();
+    std::shared_ptr<ManagedProcess> proc;
+    {
+        std::lock_guard<std::mutex> lock(mutex_);
+        for (auto& p : processes_) {
+            if (p->id == id) {
+                proc = p;
+                break;
+            }
+        }
+    }
+    if (!proc) {
+        outError = "Process ID " + std::to_string(id) + " not found.";
+        return false;
+    }
+    if (proc->state != ProcState::Running) {
+        outError = "Process ID " + std::to_string(id) + " is not running.";
+        return false;
+    }
+    if (proc->suspended.load() == suspend) return true;
+    if (!proc->tree) {
+        outError = "Process ID " + std::to_string(id) + " has no process tree.";
+        return false;
+    }
+
+    const uint64_t now = GetNowTickMs();
+    if (suspend) {
+        if (!proc->tree->Suspend(outError)) return false;
+        proc->suspendStartTickMs = now;
+        proc->suspended = true;
+        proc->lastOutputTickMs = now;
+        proc->lastCpuActivityTickMs = now;
+        WriteAuditLog("PROCESS_SUSPENDED", "Process #" + std::to_string(id) + " [" + proc->name + "] suspended");
+    } else {
+        if (!proc->tree->Resume(outError)) return false;
+        const uint64_t start = proc->suspendStartTickMs.load();
+        if (start > 0 && now > start) {
+            proc->suspendedTotalMs = proc->suspendedTotalMs.load() + (now - start);
+        }
+        proc->suspendStartTickMs = 0;
+        proc->suspended = false;
+        proc->lastOutputTickMs = now;
+        proc->lastCpuActivityTickMs = now;
+        WriteAuditLog("PROCESS_RESUMED", "Process #" + std::to_string(id) + " [" + proc->name + "] resumed");
+    }
     return true;
 }
 
@@ -1290,6 +1362,7 @@ ProcessSnapshot ProcessManager::BuildSnapshot(ProcessManager::ManagedProcess& p,
     snap.workingDir = p.workingDir;
     snap.mode = p.mode;
     snap.state = p.state.load();
+    snap.suspended = p.suspended.load();
     snap.rootPid = p.rootPid;
     snap.exitCode = p.exitCode.load();
      snap.startTimeStr = p.startTimeStr;
@@ -1303,9 +1376,25 @@ ProcessSnapshot ProcessManager::BuildSnapshot(ProcessManager::ManagedProcess& p,
     snap.lastCpuActivityTickMs = p.lastCpuActivityTickMs.load();
     snap.cpuTimeMs = p.cpuTime100ns.load() / 10000;
     if (snap.state == ProcState::Running) {
-        snap.elapsedMs = (p.startTickMs > 0 && now >= p.startTickMs) ? (now - p.startTickMs) : p.restoredElapsedMs;
+        uint64_t effectiveNow = now;
+        const uint64_t pausedMs = p.suspendedTotalMs.load();
+        if (snap.suspended) {
+            const uint64_t suspendStart = p.suspendStartTickMs.load();
+            if (suspendStart > 0 && now > suspendStart) effectiveNow = suspendStart;
+        }
+        if (p.startTickMs > 0 && effectiveNow >= p.startTickMs) {
+            const uint64_t ran = effectiveNow - p.startTickMs;
+            snap.elapsedMs = ran > pausedMs ? ran - pausedMs : 0;
+        } else {
+            snap.elapsedMs = p.restoredElapsedMs;
+        }
         uint64_t lastActivity = (std::max)(snap.lastOutputTickMs, snap.lastCpuActivityTickMs);
-        snap.idleMs = (lastActivity > 0 && now >= lastActivity) ? (now - lastActivity) : 0;
+        if (lastActivity > 0 && effectiveNow >= lastActivity) {
+            const uint64_t idle = effectiveNow - lastActivity;
+            snap.idleMs = idle > pausedMs ? idle - pausedMs : 0;
+        } else {
+            snap.idleMs = 0;
+        }
     } else {
         if (p.startTickMs > 0 && snap.endTickMs >= p.startTickMs) {
             snap.elapsedMs = snap.endTickMs - p.startTickMs;

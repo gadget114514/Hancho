@@ -559,6 +559,9 @@ struct TaskQueueJob {
     int priority = 0;
     // Internal jobs (for example the Chat handler) stay in the queue but are hidden from lists.
     bool hidden = false;
+    // User pause. A paused pending job is not scheduled; a paused running job has
+    // its process tree suspended and its timeout/idle clocks frozen.
+    bool paused = false;
     // Armed by `hancho-cli power suspend --after-job <id>` or a job's suspendWhenDone.
     // The core suspends after this job finishes and all other work becomes idle.
     bool suspendWhenDone = false;
@@ -825,6 +828,9 @@ public:
     std::string TaskQueueUpdate(const std::string& id, const std::string& patchJson, std::string& outError);
     std::string TaskQueueUpdate(const std::string& id, const std::string& patchJson, TaskQueueCaller caller, std::string& outError);
     std::string TaskQueueCancel(const std::string& id, std::string& outError);
+    // Per-job pause. A pending job stops being scheduled; a running local job has
+    // its process tree suspended and its timeout/idle clocks frozen.
+    std::string TaskQueuePauseJob(const std::string& id, bool paused, std::string& outError);
     std::string TaskQueuePause(const std::string& taskqueue, bool paused, std::string& outError);
     std::string TaskQueueWait(const std::string& taskqueue, int sinceVersion, int timeoutMs, std::string& outError);
     std::string TaskQueuePurge(const std::string& taskqueue, const std::string& statesJson, std::string& outError);

@@ -1132,6 +1132,9 @@ std::string IpcServer::HandleRequestJson(const std::string& reqJson) {
                 st.currentToolAction = snap.currentToolAction;
                 st.lastThought = snap.lastThought;
                 st.lastMessage = snap.lastMessage;
+                st.activity = snap.activity;
+                st.activityTarget = snap.activityTarget;
+                st.activitySinceEpochMs = snap.activitySinceEpochMs;
                 st.stepCount = snap.stepCount;
                 st.eventCount = snap.streamEventCount;
                 st.streamFilePath = snap.streamFilePath;
@@ -1148,6 +1151,14 @@ std::string IpcServer::HandleRequestJson(const std::string& reqJson) {
             << ",\"current_tool_action\":\"" << JsonEscape(st.currentToolAction) << "\""
             << ",\"last_thought\":\"" << JsonEscape(st.lastThought) << "\""
             << ",\"last_message\":\"" << JsonEscape(st.lastMessage) << "\""
+            << ",\"last_error\":\"" << JsonEscape(st.lastError) << "\""
+            << ",\"stop_reason\":\"" << JsonEscape(st.stopReason) << "\""
+            << ",\"model\":\"" << JsonEscape(st.model) << "\""
+            << ",\"activity\":\"" << JsonEscape(st.activity) << "\""
+            << ",\"activity_target\":\"" << JsonEscape(st.activityTarget) << "\""
+            << ",\"activity_since_epoch_ms\":" << st.activitySinceEpochMs
+            << ",\"permission_denials\":" << st.permissionDenials
+            << ",\"tool_errors\":" << st.toolErrors
             << ",\"step_count\":" << st.stepCount
             << ",\"event_count\":" << st.eventCount
             << ",\"total_tokens\":" << st.totalTokens
@@ -1155,6 +1166,12 @@ std::string IpcServer::HandleRequestJson(const std::string& reqJson) {
             << ",\"stream_file\":\"" << JsonEscape(st.streamFilePath) << "\""
             << ",\"supervisor_notes\":\"" << JsonEscape(st.supervisorNotes) << "\""
             << ",\"supervisor_goal\":\"" << JsonEscape(st.supervisorGoal) << "\"";
+        if (!st.rateLimitType.empty()) {
+            oss << ",\"rate_limit\":{\"type\":\"" << JsonEscape(st.rateLimitType)
+                << "\",\"status\":\"" << JsonEscape(st.rateLimitStatus)
+                << "\",\"utilization\":" << st.rateLimitUtilization
+                << ",\"resets_at_epoch_sec\":" << st.rateLimitResetsAtSec << "}";
+        }
         if (!st.subagents.empty()) oss << ",\"subagents\":" << LlmSubagentsToJson(st.subagents);
         oss << ",\"updated_at\":\"" << JsonEscape(st.updatedAt) << "\"}";
         return oss.str();
@@ -1395,6 +1412,10 @@ std::string IpcServer::HandleRequestJson(const std::string& reqJson) {
             resp = tqm_.TaskQueuePause(JsonGetString(reqJson, "taskqueue", ""), true, err);
         } else if (action == "taskqueue_resume") {
             resp = tqm_.TaskQueuePause(JsonGetString(reqJson, "taskqueue", ""), false, err);
+        } else if (action == "taskqueue_pause_job") {
+            resp = tqm_.TaskQueuePauseJob(JsonGetString(reqJson, "id", ""), true, err);
+        } else if (action == "taskqueue_resume_job") {
+            resp = tqm_.TaskQueuePauseJob(JsonGetString(reqJson, "id", ""), false, err);
         } else if (action == "taskqueue_wait") {
             resp = tqm_.TaskQueueWait(JsonGetString(reqJson, "taskqueue", ""),
                                       static_cast<int>(JsonGetInt(reqJson, "since_version", 0)),

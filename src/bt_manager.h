@@ -100,6 +100,9 @@ private:
     void TimerLoop();
     void OnTaskQueueJobFinished(const TaskQueueJob& job, const std::string& finalState);
     bool OnTaskQueueBtRetry(const TaskQueueBtRef& ref, bool resetCounters, std::string& outError);
+    // Cancels queue jobs that still belong to a BT after the tree itself was cancelled.
+    // Pending/waiting leaves would otherwise stay registered and never run.
+    void CancelQueuedJobsForTree(const std::string& btId);
     void DeliverJobOutcomeLocked(TreeEntry& entry,
                                  const TaskQueueJob& job,
                                  const std::string& finalState,

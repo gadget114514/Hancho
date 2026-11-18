@@ -787,6 +787,11 @@ struct TaskUsageFileCache {
     uint64_t totalTokens = 0;
     double costUsd = 0.0;
     bool hasUsage = false;
+    bool hasRateLimit = false;
+    std::string rateLimitWindow;
+    std::string rateLimitStatus;
+    double rateLimitUtilization = -1.0;
+    int64_t rateLimitResetsAtSec = 0;
 };
 
 struct DashboardState {
@@ -799,7 +804,7 @@ struct DashboardState {
     bool hasWindowPlacement = false;
     WINDOWPLACEMENT windowPlacement = {sizeof(WINDOWPLACEMENT)};
     int processListColumnWidths[14] = {52, 78, 100, 100, 120, 140, 85, 65, 72, 78, 70, 185, 175, 80};
-    int taskListColumnWidths[12] = {90, 350, 100, 150, 105, 115, 190, 110, 82, 150, 140, 200};
+    int taskListColumnWidths[13] = {90, 350, 104, 100, 150, 105, 115, 190, 110, 82, 150, 140, 200};
     HWND hwndBtnSettings = nullptr;
     HWND hwndBtnKillSel = nullptr;
     HWND hwndBtnKillAll = nullptr;
@@ -1219,6 +1224,14 @@ static bool GetAgentStateIpc(DashboardState* st, int procId, LlmAgentState& outS
         outState.currentToolAction = resp.value("current_tool_action", "");
         outState.lastThought = resp.value("last_thought", "");
         outState.lastMessage = resp.value("last_message", "");
+        outState.lastError = resp.value("last_error", "");
+        outState.stopReason = resp.value("stop_reason", "");
+        outState.model = resp.value("model", "");
+        outState.activity = resp.value("activity", "");
+        outState.activityTarget = resp.value("activity_target", "");
+        outState.activitySinceEpochMs = resp.value("activity_since_epoch_ms", int64_t{0});
+        outState.permissionDenials = resp.value("permission_denials", uint64_t{0});
+        outState.toolErrors = resp.value("tool_errors", 0);
         outState.stepCount = resp.value("step_count", 0);
         outState.eventCount = resp.value("event_count", 0);
         outState.totalTokens = resp.value("total_tokens", 0ULL);
@@ -1227,6 +1240,15 @@ static bool GetAgentStateIpc(DashboardState* st, int procId, LlmAgentState& outS
         outState.supervisorNotes = resp.value("supervisor_notes", "");
         outState.supervisorGoal = resp.value("supervisor_goal", "");
         outState.updatedAt = resp.value("updated_at", "");
+        if (resp.contains("rate_limit") && resp["rate_limit"].is_object()) {
+            const auto& rl = resp["rate_limit"];
+            outState.rateLimitType = rl.value("type", "");
+            outState.rateLimitStatus = rl.value("status", "");
+            outState.rateLimitUtilization = rl.contains("utilization")
+                                                ? rl.value("utilization", -1.0)
+                                                : -1.0;
+            outState.rateLimitResetsAtSec = rl.value("resets_at_epoch_sec", int64_t{0});
+        }
         return true;
     }
     if (st && st->pm) {
@@ -1365,6 +1387,22 @@ static std::string TaskQueuePauseIpc(DashboardState* st, const std::string& queu
     }
     if (st && st->tqm) {
         return st->tqm->TaskQueuePause(queue, pause, outErr);
+    }
+    return "";
+}
+
+static std::string TaskQueuePauseJobIpc(DashboardState* st, const std::string& id, bool pause,
+                                       std::string& outErr) {
+    nlohmann::json req = {
+        {"action", pause ? "taskqueue_pause_job" : "taskqueue_resume_job"},
+        {"id", id}
+    };
+    nlohmann::json resp;
+    if (GuiIpcCall(st, req, resp, &outErr)) {
+        return resp.dump();
+    }
+    if (st && st->tqm) {
+        return st->tqm->TaskQueuePauseJob(id, pause, outErr);
     }
     return "";
 }
@@ -2594,19 +2632,20 @@ static void UpdateListHeaderSortIndicator(DashboardState* st) {
     }
 }
 
-// Task list columns: ID, Summary, State, Triage, Start, End, Running, Depends, Queue, Origin,
-// Owner / Cost, Resources.
-static constexpr int kTaskListColumns = 12;
+// Task list columns: ID, Summary, Kind, State, Triage, Start, End, Running, Depends, Queue,
+// Origin, Owner / Cost, Resources. The Kind column says whether the row is a task group,
+// one of its provisional (planned) tasks, or a normal task.
+static constexpr int kTaskListColumns = 13;
 
 static const wchar_t* TaskColumnTitle(int index) {
     static const wchar_t* const ja[kTaskListColumns] = {
-        L"ID", L"サマリ", L"状態", L"判断", L"開始時刻", L"終了 / 残り時間", L"実行中", L"依存 / 理由", L"キュー", L"発行元", L"担当 / コスト", L"リソース"
+        L"ID", L"サマリ", L"種別", L"状態", L"判断", L"開始時刻", L"終了 / 残り時間", L"実行中", L"依存 / 理由", L"キュー", L"発行元", L"担当 / コスト", L"リソース"
     };
     static const wchar_t* const en[kTaskListColumns] = {
-        L"ID", L"Summary", L"State", L"Triage", L"Start", L"End / Left", L"Running", L"Depends / Reason", L"Queue", L"Origin", L"Owner / Cost", L"Resources"
+        L"ID", L"Summary", L"Kind", L"State", L"Triage", L"Start", L"End / Left", L"Running", L"Depends / Reason", L"Queue", L"Origin", L"Owner / Cost", L"Resources"
     };
     static const wchar_t* const es[kTaskListColumns] = {
-        L"ID", L"Resumen", L"Estado", L"Triaje", L"Inicio", L"Fin / Restante", L"En curso", L"Dependencias", L"Cola", L"Origen", L"Responsable / Coste", L"Recursos"
+        L"ID", L"Resumen", L"Tipo", L"Estado", L"Triaje", L"Inicio", L"Fin / Restante", L"En curso", L"Dependencias", L"Cola", L"Origen", L"Responsable / Coste", L"Recursos"
     };
     if (g_uiLanguage == UiLanguage::Spanish) return es[index];
     if (g_uiLanguage == UiLanguage::English) return en[index];
@@ -2701,21 +2740,22 @@ static int CompareTaskRows(const TaskListRow& a, const TaskListRow& b, int col) 
             cmp = CompareJobIds(a.id, b.id);
             break;
         case 1:  // Summary
-        case 2:  // State
-        case 3:  // Triage
-        case 6:  // Running
-        case 7:  // Depends / Reason
-        case 8:  // Queue
-        case 9:  // Origin
-        case 10: // Owner / Cost
-        case 11: // Resources
+        case 2:  // Kind
+        case 3:  // State
+        case 4:  // Triage
+        case 7:  // Running
+        case 8:  // Depends / Reason
+        case 9:  // Queue
+        case 10: // Origin
+        case 11: // Owner / Cost
+        case 12: // Resources
             cmp = CompareCellText(a.cells[col], b.cells[col]);
             break;
-        case 4:  // Start: the full date and time of the last attempt
-        case 5:  // End: the full date and time of the end, or of the estimated end
+        case 5:  // Start: the full date and time of the last attempt
+        case 6:  // End: the full date and time of the end, or of the estimated end
         {
-            const int64_t ka = (col == 4) ? a.startKey : a.endKey;
-            const int64_t kb = (col == 4) ? b.startKey : b.endKey;
+            const int64_t ka = (col == 5) ? a.startKey : a.endKey;
+            const int64_t kb = (col == 5) ? b.startKey : b.endKey;
             if (ka == 0 && kb == 0) cmp = 0;
             else if (ka == 0) cmp = 1;
             else if (kb == 0) cmp = -1;
@@ -3510,15 +3550,22 @@ static std::vector<std::pair<std::string, std::string>> TaskQueueDepList(const s
 }
 
 static std::wstring TaskQueueStateLabel(const std::string& state, const std::string& jobJson,
-                                        const std::unordered_map<std::string, std::string>& stateById) {
+                                        const std::unordered_map<std::string, std::string>& stateById,
+                                        bool jobPaused = false) {
     if (state == "planned") {
         return Tr(L"予定 (未登録)", L"planned", L"previsto");
     }
     if (state == "waitingForLlm") {
-        return Tr(L"LLM 応答待ち", L"Waiting for LLM", L"Esperando LLM");
+        return Tr(L"LLM 応答待ち (右クリックで回答)", L"Waiting for LLM (right-click to answer)",
+                  L"Esperando LLM (clic derecho para responder)");
     }
     if (state == "paused") {
         return Tr(L"一時停止", L"Paused", L"En pausa");
+    }
+    if (jobPaused) {
+        return state == "running"
+            ? Tr(L"一時停止 (実行中)", L"Paused (running)", L"En pausa (en ejecución)")
+            : Tr(L"一時停止 (待機)", L"Paused (queued)", L"En pausa (en espera)");
     }
     if (state != "pending") return Utf8ToWide(state);
     bool waitingForDeps = false;
@@ -4618,7 +4665,7 @@ static LRESULT CALLBACK MemoryListWndProc(HWND hwnd, UINT msg, WPARAM wParam, LP
             }
             if (id == 2810) {
                 nlohmann::json c = nlohmann::json::parse(MemoryInjectCompareIpc(ds->dash, "", "", ""), nullptr, false);
-                std::wstringstream msg;
+                std::wstringstream compareText;
                 if (c.is_object() && c.value("ok", false)) {
                     auto lineOf = [](const nlohmann::json& b) {
                         std::wstringstream line;
@@ -4633,27 +4680,27 @@ static LRESULT CALLBACK MemoryListWndProc(HWND hwnd, UINT msg, WPARAM wParam, LP
                              << std::setprecision(0) << b.value("avgTokensPerRun", 0.0);
                         return line.str();
                     };
-                    msg << Tr(L"注入あり: ", L"With memory:    ", L"Con memoria:    ") << lineOf(c["injected"]) << L"\r\n"
+                    compareText << Tr(L"注入あり: ", L"With memory:    ", L"Con memoria:    ") << lineOf(c["injected"]) << L"\r\n"
                         << Tr(L"注入なし: ", L"Without memory: ", L"Sin memoria:    ") << lineOf(c["notInjected"]) << L"\r\n\r\n";
-                    msg << Tr(L"差分 (1回あたり): トークン ", L"Delta per run: tokens ", L"Delta por ejecución: tokens ")
+                    compareText << Tr(L"差分 (1回あたり): トークン ", L"Delta per run: tokens ", L"Delta por ejecución: tokens ")
                         << std::fixed << std::setprecision(0) << c.value("tokenDeltaPerRun", 0.0)
                         << Tr(L" / 費用 $", L" / cost $", L" / coste $")
                         << std::setprecision(4) << c.value("costDeltaPerRun", 0.0)
                         << Tr(L" / 成功率 ", L" / success ", L" / éxito ")
                         << std::setprecision(1) << c.value("successRateDelta", 0.0) * 100.0 << L"%";
                     if (c.value("insufficientData", false)) {
-                        msg << L"\r\n" << Tr(L"両方の実行がまだ足りません。注入は既定で無効のままです。",
+                        compareText << L"\r\n" << Tr(L"両方の実行がまだ足りません。注入は既定で無効のままです。",
                                              L"Not enough runs on both sides yet; injection stays off by default.",
                                              L"Aún no hay suficientes ejecuciones; la inyección sigue desactivada.");
                     }
                 } else {
-                    msg << Tr(L"比較できませんでした: ", L"Could not compare: ", L"No se pudo comparar: ")
+                    compareText << Tr(L"比較できませんでした: ", L"Could not compare: ", L"No se pudo comparar: ")
                         << Utf8ToWide(c.is_object() ? c.value("error", std::string()) : std::string("invalid response"));
                 }
                 gui_platform::GetGuiPlatform()->ShowMessageBox(
                     hwnd,
                     Tr(L"注入の効果", L"Memory injection effect", L"Efecto de la inyección"),
-                    msg.str(),
+                    compareText.str(),
                     gui_platform::MessageBoxType::Info);
                 return 0;
             }
@@ -4866,75 +4913,732 @@ static std::wstring BuildTaskQueueInvestigationPrompt(DashboardState* st, const 
     return oss.str();
 }
 
+// ---------------------------------------------------------------------------
+// Answering a waiting task group (an `escalate` node). The answer route has to be
+// obvious and explain why the LLM is waiting: a usage/token limit is common and the
+// user must know whether to answer by hand, wait for the reset, or change the model.
+// ---------------------------------------------------------------------------
+static std::wstring TrimWideText(const std::wstring& text) {
+    size_t first = 0;
+    while (first < text.size() && iswspace(text[first])) ++first;
+    size_t last = text.size();
+    while (last > first && iswspace(text[last - 1])) --last;
+    return text.substr(first, last - first);
+}
+
+static std::wstring LocalClockFromEpochSec(int64_t sec) {
+    if (sec <= 0) return L"-";
+    time_t t = static_cast<time_t>(sec);
+    struct tm lt = {};
+    localtime_s(&lt, &t);
+    wchar_t buf[16] = {};
+    swprintf_s(buf, L"%02d:%02d", lt.tm_hour, lt.tm_min);
+    return buf;
+}
+
+static std::wstring PercentText(double ratio) {
+    wchar_t buf[16] = {};
+    swprintf_s(buf, L"%.0f%%", ratio * 100.0);
+    return buf;
+}
+
+static int LastAttemptProcessId(const nlohmann::json& job) {
+    if (!job.is_object() || !job.contains("attempts") || !job["attempts"].is_array() ||
+        job["attempts"].empty()) {
+        return 0;
+    }
+    const nlohmann::json& a = job["attempts"].back();
+    if (!a.is_object()) return 0;
+    int64_t pid = a.value("process_id", 0);
+    if (pid <= 0) pid = a.value("remote_process_id", 0);
+    return static_cast<int>(pid);
+}
+
+struct BtWaitDetails {
+    std::string state;
+    std::string detail;
+    std::string node;
+    std::string question;
+    std::string guidance;
+    std::vector<std::string> expect;
+    std::wstring diagnosis;
+    // The branch to retry when the LLM (not the user) is the reason the group is stuck.
+    std::string retryNode;
+    bool hasRetryTarget = false;
+    bool llmSideCause = false;
+};
+
+// "LLM 側の都合" covers more than rate limits: authentication, provider outages,
+// an unavailable model, a hung request, or a turn/context limit. Keep the classifier
+// names and evidence intact; the user needs to know which of them happened.
+static bool LooksLikeLlmSideFailure(const std::string& cls, const std::string& summary) {
+    if (cls == "rate_limited" || cls == "auth_error" || cls == "turn_or_context_limit" ||
+        cls == "permission_denied" || cls == "incomplete" || cls == "tool_error_loop") {
+        return true;
+    }
+    std::string s = summary;
+    for (auto& c : s) c = static_cast<char>(tolower(static_cast<unsigned char>(c)));
+    static const char* words[] = {"model", "provider", "overloaded", "unavailable",
+                                  "connection", "network", "api", "quota", "credit",
+                                  "token", "context", "timeout", "timed out", "stalled"};
+    for (const char* word : words) {
+        if (s.find(word) != std::string::npos) return true;
+    }
+    return false;
+}
+
+static std::wstring ElapsedWords(int64_t sinceEpochMs) {
+    if (sinceEpochMs <= 0) return L"";
+    const int64_t nowMs = std::chrono::duration_cast<std::chrono::milliseconds>(
+        std::chrono::system_clock::now().time_since_epoch()).count();
+    const int64_t sec = (nowMs - sinceEpochMs) / 1000;
+    if (sec <= 0) return L"";
+    if (sec < 60) return std::to_wstring(sec) + L"s";
+    if (sec < 3600) return std::to_wstring(sec / 60) + L"m " + std::to_wstring(sec % 60) + L"s";
+    return std::to_wstring(sec / 3600) + L"h " + std::to_wstring((sec % 3600) / 60) + L"m";
+}
+
+static BtWaitDetails FetchBtWaitDetails(DashboardState* st, const std::string& groupId) {
+    BtWaitDetails d;
+    nlohmann::json req = {{"action", "bt_get"}, {"id", groupId}, {"compact", true}};
+    nlohmann::json resp;
+    if (!GuiIpcCall(st, req, resp) || !resp.value("ok", false)) return d;
+
+    d.state = resp.value("state", "");
+    d.detail = resp.value("detail", "");
+    if (resp.contains("escalation") && resp["escalation"].is_object()) {
+        const auto& esc = resp["escalation"];
+        d.node = esc.value("node", "");
+        d.question = esc.value("question", "");
+        d.guidance = esc.value("guidance", "");
+        if (esc.contains("expect") && esc["expect"].is_array()) {
+            for (const auto& e : esc["expect"]) {
+                if (e.is_string()) d.expect.push_back(e.get<std::string>());
+            }
+        }
+    }
+
+    std::wstringstream out;
+    out << Tr(L"グループ: ", L"Group: ", L"Grupo: ") << Utf8ToWide(groupId) << L"\r\n";
+    if (!d.state.empty()) {
+        out << Tr(L"状態: ", L"State: ", L"Estado: ") << Utf8ToWide(d.state);
+        if (!d.detail.empty()) out << L" - " << Utf8ToWide(d.detail);
+        out << L"\r\n";
+    }
+    if (!d.node.empty()) out << Tr(L"ノード: ", L"Node: ", L"Nodo: ") << Utf8ToWide(d.node) << L"\r\n";
+    if (!d.question.empty()) {
+        out << L"\r\n" << Tr(L"質問:\r\n", L"Question:\r\n", L"Pregunta:\r\n")
+            << Utf8ToWide(d.question) << L"\r\n";
+    }
+    if (!d.guidance.empty()) {
+        out << L"\r\n" << Tr(L"判断の手引き:\r\n", L"Guidance:\r\n", L"Guía:\r\n")
+            << Utf8ToWide(d.guidance) << L"\r\n";
+    }
+    if (!d.expect.empty()) {
+        out << L"\r\n" << Tr(L"選べる回答: ", L"Allowed answers: ", L"Respuestas permitidas: ");
+        for (size_t i = 0; i < d.expect.size(); ++i) {
+            if (i) out << L", ";
+            out << Utf8ToWide(d.expect[i]);
+        }
+        out << L"\r\n";
+    }
+
+    // Look at the branches of this group for why the LLM stopped. The group row only
+    // says waitingForLlm; the reason (limit, auth, provider trouble, hang, ...) lives
+    // on the worker attempts and on the running agent's stream.
+    std::string listErr;
+    nlohmann::json listRoot = nlohmann::json::parse(
+        TaskQueueListIpc(st, "", "", 0, listErr, "", groupId), nullptr, false);
+    bool anyFailure = false;
+    if (listRoot.is_object() && listRoot.contains("jobs") && listRoot["jobs"].is_array()) {
+        for (const auto& job : listRoot["jobs"]) {
+            if (!job.is_object()) continue;
+            const std::string jid = job.value("id", "");
+            const std::string jstate = job.value("state", "");
+            if (jid.empty()) continue;
+
+            nlohmann::json failure;
+            if (job.contains("attempts") && job["attempts"].is_array() && !job["attempts"].empty()) {
+                const auto& attempt = job["attempts"].back();
+                if (attempt.is_object() && attempt.contains("failure") &&
+                    attempt["failure"].is_object()) {
+                    failure = attempt["failure"];
+                }
+            }
+            if (!failure.empty()) {
+                anyFailure = true;
+                const std::string cls = failure.value("class", "");
+                const std::string summary = failure.value("summary", cls);
+                if (LooksLikeLlmSideFailure(cls, summary)) d.llmSideCause = true;
+                out << L"\r\n" << Tr(L"・枝 ", L"- branch ", L"- rama ") << Utf8ToWide(jid)
+                    << L" (" << Utf8ToWide(jstate) << L"): ";
+                if (!cls.empty()) out << Utf8ToWide(cls) << L" / ";
+                out << Utf8ToWide(summary);
+                const std::string action = failure.value("suggestedAction", "");
+                const std::string retryAt = failure.value("retryAt", "");
+                if (!action.empty()) {
+                    out << Tr(L" / 次の手: ", L" / next: ", L" / siguiente: ") << Utf8ToWide(action);
+                }
+                if (!retryAt.empty()) {
+                    out << Tr(L" / 再試行 ", L" / retry ", L" / reintentar ") << Utf8ToWide(retryAt);
+                }
+                int64_t resets = 0;
+                if (failure.contains("detail") && failure["detail"].is_object()) {
+                    resets = failure["detail"].value("resetsAtEpochSec", int64_t{0});
+                }
+                if (resets > 0) out << L" (" << LocalClockFromEpochSec(resets) << L")";
+                out << L"\r\n";
+                if (!d.hasRetryTarget && job.contains("bt") && job["bt"].is_object()) {
+                    d.retryNode = job["bt"].value("node", "");
+                    d.hasRetryTarget = !d.retryNode.empty();
+                }
+            }
+
+            const int pid = LastAttemptProcessId(job);
+            if (pid <= 0) continue;
+            LlmAgentState as;
+            if (!GetAgentStateIpc(st, pid, as)) continue;
+
+            if (!as.rateLimitType.empty()) {
+                d.llmSideCause = true;
+                out << L"\r\n" << Tr(L"・枝 ", L"- branch ", L"- rama ") << Utf8ToWide(jid)
+                    << Tr(L" の LLM 上限: ", L" LLM limit: ", L" límite de LLM: ")
+                    << Utf8ToWide(as.rateLimitType);
+                if (as.rateLimitUtilization >= 0.0) out << L" " << PercentText(as.rateLimitUtilization);
+                if (as.rateLimitStatus == "rejected") {
+                    out << Tr(L" (拒否中)", L" (rejected)", L" (rechazado)");
+                }
+                if (as.rateLimitResetsAtSec > 0) {
+                    out << Tr(L" / リセット ", L" / resets ", L" / se reinicia ")
+                        << LocalClockFromEpochSec(as.rateLimitResetsAtSec);
+                }
+                out << L"\r\n";
+            }
+            if (!as.lastError.empty()) {
+                d.llmSideCause = true;
+                out << L"\r\n" << Tr(L"・枝 ", L"- branch ", L"- rama ") << Utf8ToWide(jid)
+                    << Tr(L" のエラー: ", L" error: ", L" error: ") << Utf8ToWide(as.lastError)
+                    << L"\r\n";
+            }
+            if (!as.stopReason.empty()) {
+                out << L"\r\n" << Tr(L"・枝 ", L"- branch ", L"- rama ") << Utf8ToWide(jid)
+                    << Tr(L" の停止理由: ", L" stop reason: ", L" motivo de parada: ")
+                    << Utf8ToWide(as.stopReason) << L"\r\n";
+            }
+            if (as.activity == "waiting_model") {
+                d.llmSideCause = true;
+                out << L"\r\n" << Tr(L"・枝 ", L"- branch ", L"- rama ") << Utf8ToWide(jid)
+                    << Tr(L" はモデルの応答を待っています",
+                           L" is waiting for the model",
+                           L" espera la respuesta del modelo");
+                std::wstring elapsed = ElapsedWords(as.activitySinceEpochMs);
+                if (!elapsed.empty()) out << L" (" << elapsed << L")";
+                out << L"\r\n";
+            } else if (!as.activity.empty()) {
+                out << L"\r\n" << Tr(L"・枝 ", L"- branch ", L"- rama ") << Utf8ToWide(jid)
+                    << Tr(L" の現在の動作: ", L" now: ", L" ahora: ") << Utf8ToWide(as.activity);
+                if (!as.activityTarget.empty()) out << L" " << Utf8ToWide(as.activityTarget);
+                out << L"\r\n";
+            }
+            if (as.permissionDenials > 0) {
+                d.llmSideCause = true;
+                out << L"\r\n" << Tr(L"・枝 ", L"- branch ", L"- rama ") << Utf8ToWide(jid)
+                    << Tr(L" の権限拒否: ", L" permission denials: ", L" denegaciones: ")
+                    << as.permissionDenials << L"\r\n";
+            }
+        }
+    }
+
+    if (d.state == "waitingForLlm") {
+        out << L"\r\n"
+            << Tr(L"LLM が LLM 側の都合（利用上限・残高不足・認証切れ・提供元の障害・モデルの不調・"
+                  L"応答停止・コンテキスト上限など）で進まないことがあります。\r\n"
+                  L"上の理由を確認して、次のどれかを選んでください:\r\n"
+                  L"  1. 一時的なものなら、リセットや復旧を待つ\r\n"
+                  L"  2. 枝を再実行する（下の「枝を再実行」またはタスク一覧の右クリック→再実行）\r\n"
+                  L"  3. 使えないモデル/エンジンなら、設定やタスク定義を変える\r\n"
+                  L"  4. 人が判断できる内容なら、下の回答欄に直接答えて「回答して再開」\r\n",
+                  L"The LLM may stop for reasons on its own side (usage limit, no credits, "
+                  L"expired login, provider outage, model trouble, a hung request, context "
+                  L"limits, and so on).\r\nCheck the reasons above, then choose one:\r\n"
+                  L"  1. Wait for a reset or recovery if it is temporary\r\n"
+                  L"  2. Retry the branch (the button below, or right-click the row and Retry)\r\n"
+                  L"  3. Change the model/engine in the settings or the task definition if it "
+                  L"cannot be used\r\n"
+                  L"  4. If you can decide, type an answer below and press ‘Answer and resume’\r\n",
+                  L"El LLM puede detenerse por motivos de su lado (límite de uso, sin créditos, "
+                  L"sesión caducada, caída del proveedor, problema del modelo, petición colgada, "
+                  L"límite de contexto, etc.).\r\nRevisa los motivos y elige una opción:\r\n"
+                  L"  1. Esperar un reinicio o la recuperación si es temporal\r\n"
+                  L"  2. Reintentar la rama (botón de abajo, o clic derecho en la fila)\r\n"
+                  L"  3. Cambiar el modelo/motor si no se puede usar\r\n"
+                  L"  4. Si puedes decidir, escribe una respuesta abajo y pulsa "
+                  L"‘Responder y continuar’\r\n");
+    } else if (anyFailure) {
+        out << L"\r\n"
+            << Tr(L"このグループは LLM 応答待ちではありませんが、いずれかの枝が失敗しています。\r\n"
+                  L"タスク一覧の該当行を右クリックして再実行するか、詳細を確認してください。\r\n",
+                  L"This group is not waiting for an LLM decision, but one of its branches failed.\r\n"
+                  L"Right-click the failed row to retry it or open its details.\r\n",
+                  L"Este grupo no espera una decisión del LLM, pero una de sus ramas falló.\r\n"
+                  L"Haz clic derecho en la fila fallida para reintentarla o ver detalles.\r\n");
+    }
+    d.diagnosis = out.str();
+    return d;
+}
+
+static bool SubmitBtAnswer(DashboardState* st, const std::string& groupId, const std::string& node,
+                           const std::string& answer, std::wstring& outError) {
+    nlohmann::json req = {
+        {"action", "bt_resume"}, {"id", groupId}, {"node", node}, {"answer", answer},
+        {"rationale", WideToUtf8(Tr(L"ダッシュボードのタスク一覧から手動で回答",
+                                    L"Answered manually from the dashboard task list",
+                                    L"Respondido manualmente desde la lista de tareas"))}
+    };
+    nlohmann::json resp;
+    std::string err;
+    if (!GuiIpcCall(st, req, resp, &err)) {
+        outError = Utf8ToWide(err.empty() ? "IPC request failed" : err);
+        return false;
+    }
+    if (!resp.value("ok", false)) {
+        outError = Utf8ToWide(resp.value("error", std::string("bt_resume failed")));
+        return false;
+    }
+    return true;
+}
+
+static bool SubmitBtRetry(DashboardState* st, const std::string& btId, const std::string& from,
+                          std::wstring& outError) {
+    nlohmann::json req = {
+        {"action", "bt_retry"}, {"id", btId}, {"from", from}, {"resetCounters", true}
+    };
+    nlohmann::json resp;
+    std::string err;
+    if (!GuiIpcCall(st, req, resp, &err)) {
+        outError = Utf8ToWide(err.empty() ? "IPC request failed" : err);
+        return false;
+    }
+    if (!resp.value("ok", false)) {
+        outError = Utf8ToWide(resp.value("error", std::string("bt_retry failed")));
+        return false;
+    }
+    return true;
+}
+
+static bool SubmitBtPause(DashboardState* st, const std::string& btId, bool paused,
+                          std::wstring& outError) {
+    nlohmann::json req = {{"action", "bt_pause"}, {"id", btId}, {"paused", paused}};
+    nlohmann::json resp;
+    std::string err;
+    if (!GuiIpcCall(st, req, resp, &err)) {
+        outError = Utf8ToWide(err.empty() ? "IPC request failed" : err);
+        return false;
+    }
+    if (!resp.value("ok", false)) {
+        outError = Utf8ToWide(resp.value("error", std::string("bt_pause failed")));
+        return false;
+    }
+    return true;
+}
+
+static bool SubmitBtCancel(DashboardState* st, const std::string& btId, std::wstring& outError) {
+    nlohmann::json req = {{"action", "bt_cancel"}, {"id", btId}};
+    nlohmann::json resp;
+    std::string err;
+    if (!GuiIpcCall(st, req, resp, &err)) {
+        outError = Utf8ToWide(err.empty() ? "IPC request failed" : err);
+        return false;
+    }
+    if (!resp.value("ok", false)) {
+        outError = Utf8ToWide(resp.value("error", std::string("bt_cancel failed")));
+        return false;
+    }
+    return true;
+}
+
+// Pulls the owning behavior-tree id/node out of a taskqueue_get response.
+static bool ExtractBtTarget(const std::string& getResp, std::string& btId, std::string& btNode) {
+    nlohmann::json root = nlohmann::json::parse(getResp, nullptr, false);
+    if (root.is_discarded() || !root.is_object()) return false;
+    const nlohmann::json* job = &root;
+    if (root.contains("job") && root["job"].is_object()) job = &root["job"];
+    if (!job->contains("bt") || !(*job)["bt"].is_object()) return false;
+    btId = (*job)["bt"].value("id", "");
+    btNode = (*job)["bt"].value("node", "");
+    return !btId.empty();
+}
+
+static void ShowTaskQueueResult(DashboardState* st, const std::wstring& title,
+                                const std::wstring& detail, bool ok) {
+    if (!st) return;
+    if (ok) {
+        DisplaySupervisorHint(st, title, detail, L"", st->hintAutoDismissSec);
+    } else {
+        gui_platform::GetGuiPlatform()->ShowMessageBox(
+            st->hwndMain, title, detail, gui_platform::MessageBoxType::Error, false);
+    }
+}
+
+struct BtAnswerDlgState {
+    DashboardState* dash = nullptr;
+    std::wstring groupId;
+    std::string node;
+    std::string retryNode;
+    bool hasRetryTarget = false;
+    std::wstring diagnosis;
+    std::vector<std::wstring> choices;
+    HWND info = nullptr;
+    HWND answer = nullptr;
+    bool done = false;
+};
+
+static LRESULT CALLBACK BtAnswerWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
+    auto* state = reinterpret_cast<BtAnswerDlgState*>(GetWindowLongPtrW(hwnd, GWLP_USERDATA));
+    if (msg == WM_CREATE) {
+        auto* cs = reinterpret_cast<CREATESTRUCTW*>(lParam);
+        state = static_cast<BtAnswerDlgState*>(cs->lpCreateParams);
+        SetWindowLongPtrW(hwnd, GWLP_USERDATA, reinterpret_cast<LONG_PTR>(state));
+        HWND intro = CreateWindowExW(0, L"STATIC",
+            Tr(L"LLM の応答待ちです。理由を確認して、回答するか枝を再実行してください。",
+               L"The group is waiting for the LLM. Check the reason, then answer or retry the branch.",
+               L"El grupo espera al LLM. Revisa el motivo y responde o reintenta la rama."),
+            WS_CHILD | WS_VISIBLE, 16, 12, 728, 22, hwnd, nullptr, cs->hInstance, nullptr);
+        (void)intro;
+        state->info = CreateWindowExW(WS_EX_CLIENTEDGE, L"EDIT", state->diagnosis.c_str(),
+            WS_CHILD | WS_VISIBLE | WS_VSCROLL | ES_MULTILINE | ES_READONLY | ES_AUTOVSCROLL,
+            16, 42, 728, 356, hwnd, reinterpret_cast<HMENU>(4104), cs->hInstance, nullptr);
+        CreateWindowExW(0, L"STATIC",
+            Tr(L"回答 (選べる回答があれば選び、なければ直接入力):",
+               L"Answer (pick an allowed answer or type one):",
+               L"Respuesta (elige una permitida o escribe una):"),
+            WS_CHILD | WS_VISIBLE, 16, 410, 728, 20, hwnd, nullptr, cs->hInstance, nullptr);
+        state->answer = CreateWindowExW(WS_EX_CLIENTEDGE, L"COMBOBOX", L"",
+            WS_CHILD | WS_VISIBLE | WS_TABSTOP | WS_VSCROLL | CBS_DROPDOWN | CBS_AUTOHSCROLL,
+            16, 434, 728, 220, hwnd, reinterpret_cast<HMENU>(4103), cs->hInstance, nullptr);
+        for (const auto& choice : state->choices) {
+            SendMessageW(state->answer, CB_ADDSTRING, 0, reinterpret_cast<LPARAM>(choice.c_str()));
+        }
+        if (!state->choices.empty()) SendMessageW(state->answer, CB_SETCURSEL, 0, 0);
+        CreateWindowExW(0, L"BUTTON",
+            Tr(L"枝を再実行", L"Retry branch", L"Reintentar rama"),
+            WS_CHILD | WS_VISIBLE | WS_TABSTOP | (state->hasRetryTarget ? 0 : WS_DISABLED) |
+                BS_PUSHBUTTON,
+            348, 486, 128, 30, hwnd, reinterpret_cast<HMENU>(4105), cs->hInstance, nullptr);
+        CreateWindowExW(0, L"BUTTON", Tr(L"回答して再開", L"Answer and resume", L"Responder y continuar"),
+            WS_CHILD | WS_VISIBLE | WS_TABSTOP | BS_DEFPUSHBUTTON,
+            484, 486, 128, 30, hwnd, reinterpret_cast<HMENU>(4101), cs->hInstance, nullptr);
+        CreateWindowExW(0, L"BUTTON", Tr(L"キャンセル", L"Cancel", L"Cancelar"),
+            WS_CHILD | WS_VISIBLE | WS_TABSTOP | BS_PUSHBUTTON,
+            620, 486, 124, 30, hwnd, reinterpret_cast<HMENU>(4102), cs->hInstance, nullptr);
+        SendMessageW(hwnd, DM_SETDEFID, 4101, 0);
+        AddControlHelp(hwnd, GetDlgItem(hwnd, 4105),
+            Tr(L"LLM 側の理由（上限・認証・障害・応答停止など）で止まった枝を bt_retry で再実行します。",
+               L"Retries the stuck branch with bt_retry (usage limit, auth, outage, hang, ...).",
+               L"Reintenta la rama atascada con bt_retry."));
+        AddControlHelp(hwnd, GetDlgItem(hwnd, 4101),
+            Tr(L"上の回答をこのグループに送り、待機中の枝を再開します。",
+               L"Sends the answer above and resumes the waiting branch.",
+               L"Envía la respuesta y reanuda la rama en espera."));
+        AddControlHelp(hwnd, GetDlgItem(hwnd, 4102),
+            Tr(L"回答を送らずに閉じます。", L"Closes without sending an answer.",
+               L"Cierra sin enviar una respuesta."));
+        return 0;
+    }
+    if (msg == WM_COMMAND && state) {
+        int id = LOWORD(wParam);
+        if (id == IDCANCEL) id = 4102;
+        if (id == 4105) {
+            if (!state->hasRetryTarget) return 0;
+            std::wstring error;
+            if (!SubmitBtRetry(state->dash, WideToUtf8(state->groupId), state->retryNode, error)) {
+                gui_platform::GetGuiPlatform()->ShowMessageBox(
+                    hwnd, Tr(L"再実行できませんでした", L"Could not retry the branch",
+                             L"No se pudo reintentar la rama"),
+                    error, gui_platform::MessageBoxType::Error);
+                return 0;
+            }
+            ShowTaskQueueResult(
+                state->dash, Tr(L"枝を再実行", L"Branch retry", L"Reintento de rama"),
+                Tr(L"止まっていた枝を再実行しました。結果はタスク一覧に反映されます。",
+                   L"Retried the stuck branch. The task list will show the new result.",
+                   L"Se reintentó la rama atascada. La lista de tareas mostrará el resultado."),
+                true);
+            state->done = true;
+            DestroyWindow(hwnd);
+            return 0;
+        }
+        if (id == 4101) {
+            wchar_t buf[4096] = {};
+            GetWindowTextW(state->answer, buf, static_cast<int>(std::size(buf)));
+            std::wstring answer = TrimWideText(buf);
+            if (answer.empty()) {
+                gui_platform::GetGuiPlatform()->ShowMessageBox(
+                    hwnd, Tr(L"回答が必要です", L"An answer is required", L"Se requiere una respuesta"),
+                    Tr(L"回答を入力するか、選べる回答を選んでください。",
+                       L"Type an answer, or pick one of the allowed answers.",
+                       L"Escribe una respuesta o elige una de las permitidas."),
+                    gui_platform::MessageBoxType::Warning);
+                return 0;
+            }
+            std::wstring error;
+            if (!SubmitBtAnswer(state->dash, WideToUtf8(state->groupId), state->node,
+                                WideToUtf8(answer), error)) {
+                gui_platform::GetGuiPlatform()->ShowMessageBox(
+                    hwnd, Tr(L"回答を送れませんでした", L"Could not send the answer",
+                             L"No se pudo enviar la respuesta"),
+                    error, gui_platform::MessageBoxType::Error);
+                return 0;
+            }
+            state->done = true;
+            DestroyWindow(hwnd);
+            return 0;
+        }
+        if (id == 4102) {
+            state->done = true;
+            DestroyWindow(hwnd);
+            return 0;
+        }
+    }
+    if (msg == WM_CLOSE && state) {
+        state->done = true;
+        DestroyWindow(hwnd);
+        return 0;
+    }
+    if (msg == WM_CTLCOLORSTATIC) {
+        HDC hdc = reinterpret_cast<HDC>(wParam);
+        SetTextColor(hdc, g_theme.text);
+        SetBkColor(hdc, g_theme.panel);
+        return reinterpret_cast<LRESULT>(g_dialogBgBrush);
+    }
+    if (msg == WM_ERASEBKGND) {
+        HDC hdc = reinterpret_cast<HDC>(wParam);
+        RECT rc = {};
+        GetClientRect(hwnd, &rc);
+        FillRect(hdc, &rc, g_dialogBgBrush);
+        return 1;
+    }
+    return DefWindowProcW(hwnd, msg, wParam, lParam);
+}
+
+static bool ShowBtAnswerDialog(DashboardState* st, const BtWaitDetails& details,
+                               const std::string& groupId) {
+    if (!st || !st->hwndMain) return false;
+    HINSTANCE instance = GetModuleHandleW(nullptr);
+    static bool registered = false;
+    if (!registered) {
+        WNDCLASSEXW wc = {};
+        wc.cbSize = sizeof(wc);
+        wc.lpfnWndProc = BtAnswerWndProc;
+        wc.hInstance = instance;
+        wc.hCursor = LoadCursorW(nullptr, IDC_ARROW);
+        wc.hbrBackground = g_dialogBgBrush;
+        wc.lpszClassName = L"HanchoBtAnswerWnd";
+        RegisterClassExW(&wc);
+        registered = true;
+    }
+    BtAnswerDlgState state;
+    state.dash = st;
+    state.groupId = Utf8ToWide(groupId);
+    state.node = details.node;
+    state.retryNode = details.retryNode;
+    state.hasRetryTarget = details.hasRetryTarget;
+    state.diagnosis = details.diagnosis;
+    for (const auto& choice : details.expect) state.choices.push_back(Utf8ToWide(choice));
+
+    RECT owner = {};
+    GetWindowRect(st->hwndMain, &owner);
+    const int dlgW = 776;
+    const int dlgH = 566;
+    const int x = owner.left + ((owner.right - owner.left) - dlgW) / 2;
+    const int y = owner.top + ((owner.bottom - owner.top) - dlgH) / 2;
+    HWND dialog = CreateWindowExW(WS_EX_DLGMODALFRAME, L"HanchoBtAnswerWnd",
+        Tr(L"LLM 応答待ちに回答", L"Answer a waiting LLM", L"Responder al LLM en espera"),
+        WS_CAPTION | WS_SYSMENU | WS_POPUP, x, y, dlgW, dlgH,
+        st->hwndMain, nullptr, instance, &state);
+    if (!dialog) return false;
+    ApplyNativeThemeToWindow(dialog);
+    EnableWindow(st->hwndMain, FALSE);
+    ShowWindow(dialog, SW_SHOW);
+    SetForegroundWindow(dialog);
+    if (state.answer) SetFocus(state.answer);
+    MSG msg;
+    while (!state.done && GetMessageW(&msg, nullptr, 0, 0) > 0) {
+        if (!IsDialogMessageW(dialog, &msg)) {
+            TranslateMessage(&msg);
+            DispatchMessageW(&msg);
+        }
+    }
+    EnableWindow(st->hwndMain, TRUE);
+    SetForegroundWindow(st->hwndMain);
+    return state.done;
+}
+
+static bool CheckIpcResponse(const std::string& resp, const std::string& ipcErr,
+                             std::wstring& outError) {
+    nlohmann::json j = nlohmann::json::parse(resp, nullptr, false);
+    if (j.is_discarded() || !j.is_object()) {
+        outError = Utf8ToWide(ipcErr.empty() ? std::string("empty IPC response") : ipcErr);
+        return false;
+    }
+    if (j.value("ok", false)) return true;
+    std::string error = j.value("error", std::string());
+    if (error.empty()) error = j.value("err", std::string());
+    if (error.empty()) error = ipcErr.empty() ? std::string("request failed") : ipcErr;
+    outError = Utf8ToWide(error);
+    return false;
+}
+
 static void ShowTaskQueueContextMenu(DashboardState* st, const std::string& jobId, POINT ptScreen, const std::wstring& cellText) {
     if (!st || jobId.empty()) return;
     const bool virtualJob = jobId.rfind("btplan:", 0) == 0 || jobId.rfind("group:", 0) == 0;
     const bool groupRow = jobId.rfind("group:", 0) == 0;
     const std::string groupId = groupRow ? jobId.substr(6) : std::string();
-    std::string btNode;
-    std::vector<std::string> btChoices;
-    if (groupRow) {
-        nlohmann::json req = {{"action", "bt_get"}, {"id", groupId}, {"compact", true}};
-        nlohmann::json btResp;
-        if (GuiIpcCall(st, req, btResp, nullptr, 5000) && btResp.value("ok", false) &&
-            btResp.value("state", "") == "waitingForLlm" && btResp.contains("escalation")) {
-            const auto& esc = btResp["escalation"];
-            btNode = esc.value("node", std::string());
-            if (esc.contains("expect") && esc["expect"].is_array()) {
-                for (const auto& e : esc["expect"]) {
-                    if (e.is_string()) btChoices.push_back(e.get<std::string>());
-                }
-            }
-        }
-    }
+    BtWaitDetails btWait;
+    if (groupRow) btWait = FetchBtWaitDetails(st, groupId);
+    const std::string btNode = btWait.node;
+    const std::vector<std::string>& btChoices = btWait.expect;
     std::string err;
     std::string resp = virtualJob ? std::string() : TaskQueueGetIpc(st, jobId, false, 0, err);
     std::string jobState = JsonGetString(resp, "state", "");
+    const bool jobPaused = JsonGetBool(resp, "paused", false);
 
     HMENU hMenu = CreatePopupMenu();
     AppendMenuW(hMenu, MF_STRING | (cellText.empty() ? MF_GRAYED : 0), 3110, Tr(L"セルをコピー", L"Copy cell", L"Copiar celda"));
     AppendMenuW(hMenu, MF_SEPARATOR, 0, nullptr);
     if (virtualJob) {
         HMENU hAnswerMenu = nullptr;
-        if (!btChoices.empty()) {
-            hAnswerMenu = CreatePopupMenu();
-            for (size_t i = 0; i < btChoices.size() && i < 32; ++i) {
-                AppendMenuW(hAnswerMenu, MF_STRING, 3200 + static_cast<UINT_PTR>(i),
-                            Utf8ToWide(btChoices[i]).c_str());
+        if (groupRow) {
+            // Always available: the cause may be a rate limit, auth, a provider outage, a
+            // hung request, a context limit, or something else on the LLM side. The dialog
+            // shows what was found and offers answer / retry / wait.
+            AppendMenuW(hMenu, MF_STRING, 3210,
+                        Tr(L"回答して進める...（理由を確認）",
+                           L"Answer and resume... (check the cause)",
+                           L"Responder y continuar... (ver el motivo)"));
+            if (!btChoices.empty()) {
+                hAnswerMenu = CreatePopupMenu();
+                for (size_t i = 0; i < btChoices.size() && i < 32; ++i) {
+                    AppendMenuW(hAnswerMenu, MF_STRING, 3200 + static_cast<UINT_PTR>(i),
+                                Utf8ToWide(btChoices[i]).c_str());
+                }
+                AppendMenuW(hMenu, MF_STRING | MF_POPUP, reinterpret_cast<UINT_PTR>(hAnswerMenu),
+                            Tr(L"選べる回答で進める", L"Pick an allowed answer",
+                               L"Elegir una respuesta permitida"));
             }
-            AppendMenuW(hMenu, MF_STRING | MF_POPUP, reinterpret_cast<UINT_PTR>(hAnswerMenu),
-                        Tr(L"回答して進める", L"Answer and resume", L"Responder y continuar"));
+            if (btWait.hasRetryTarget) {
+                AppendMenuW(hMenu, MF_STRING, 3211,
+                            Tr(L"枝を再実行 (LLM 側の理由から復帰)",
+                               L"Retry the branch (recover from the LLM-side cause)",
+                               L"Reintentar la rama (recuperar del motivo del LLM)"));
+            }
+            const bool groupPaused = btWait.state == "paused";
+            AppendMenuW(hMenu, MF_STRING, 3213,
+                        groupPaused
+                            ? Tr(L"タスクグループを再開 (新規タスクを開始)",
+                                 L"Resume task group (start new tasks)",
+                                 L"Reanudar grupo de tareas (iniciar tareas)")
+                            : Tr(L"タスクグループを一時停止 (新規タスクを止める)",
+                                 L"Pause task group (stop starting new tasks)",
+                                 L"Pausar grupo de tareas (no iniciar tareas)"));
+            AppendMenuW(hMenu, MF_STRING, 3212,
+                        Tr(L"タスクグループを停止 (キャンセル)",
+                           L"Stop task group (cancel)",
+                           L"Detener grupo de tareas (cancelar)"));
         }
         // Virtual task-group / planned rows are not queue jobs; retry/cancel have nothing to act on.
         AppendMenuW(hMenu, MF_STRING, 3111, Tr(L"タスクグループで表示", L"Show Task Group", L"Ver el grupo de tareas"));
         int cmd = TrackPopupMenu(hMenu, TPM_RETURNCMD | TPM_RIGHTBUTTON, ptScreen.x, ptScreen.y, 0, st->hwndMain, nullptr);
         if (hAnswerMenu) DestroyMenu(hAnswerMenu);
         DestroyMenu(hMenu);
-        if (cmd >= 3200 && cmd < 3200 + static_cast<int>(btChoices.size())) {
-            std::string answer = btChoices[static_cast<size_t>(cmd - 3200)];
-            std::string rationale = WideToUtf8(Tr(L"右クリックメニューで手動選択",
-                                                  L"Selected manually from the context menu",
-                                                  L"Seleccionado manualmente desde el menú contextual"));
-            nlohmann::json resumeReq = {
-                {"action", "bt_resume"}, {"id", groupId}, {"node", btNode},
-                {"answer", answer}, {"rationale", rationale}
-            };
-            nlohmann::json resumeResp;
-            std::string resumeErr;
-            if (!GuiIpcCall(st, resumeReq, resumeResp, &resumeErr) || !resumeResp.value("ok", false)) {
-                gui_platform::GetGuiPlatform()->ShowMessageBox(
-                    st->hwndMain,
-                    Tr(L"再開に失敗", L"Resume failed", L"Error al reanudar"),
-                    Utf8ToWide(resumeErr.empty() ? resumeResp.value("error", std::string("IPC request failed")) : resumeErr),
-                    gui_platform::MessageBoxType::Error,
-                    false);
+        if (cmd == 3210) {
+            ShowBtAnswerDialog(st, btWait, groupId);
+        } else if (cmd == 3211) {
+            std::wstring retryErr;
+            if (SubmitBtRetry(st, groupId, btWait.retryNode, retryErr)) {
+                ShowTaskQueueResult(
+                    st, Tr(L"枝を再実行", L"Branch retry", L"Reintento de rama"),
+                    Tr(L"止まっていた枝を再実行しました。結果はタスク一覧に反映されます。",
+                       L"Retried the stuck branch. The task list will show the new result.",
+                       L"Se reintentó la rama atascada. La lista de tareas mostrará el resultado."),
+                    true);
+            } else {
+                ShowTaskQueueResult(
+                    st, Tr(L"再実行できませんでした", L"Could not retry the branch",
+                           L"No se pudo reintentar la rama"),
+                    retryErr, false);
             }
-            RefreshDashboardData(st);
+        } else if (cmd == 3212) {
+            if (gui_platform::GetGuiPlatform()->ShowMessageBox(
+                    st->hwndMain,
+                    Tr(L"タスクグループのキャンセル", L"Cancel task group",
+                       L"Cancelar grupo de tareas"),
+                    Tr(L"このタスクグループをキャンセルしますか？\n"
+                       L"グループに属する実行中・待機中・仮登録のタスクもすべてキャンセルされます。",
+                       L"Cancel this task group?\n"
+                       L"Tasks that belong to it (running, waiting and provisionally registered) "
+                       L"will be cancelled too.",
+                       L"¿Cancelar este grupo de tareas?\n"
+                       L"También se cancelarán sus tareas en ejecución, en espera y provisionales."),
+                    gui_platform::MessageBoxType::QuestionYesNo,
+                    true) == gui_platform::MessageBoxResult::Yes) {
+                std::wstring cancelErr;
+                if (SubmitBtCancel(st, groupId, cancelErr)) {
+                    ShowTaskQueueResult(
+                        st, Tr(L"タスクグループをキャンセル", L"Task group cancelled",
+                               L"Grupo de tareas cancelado"),
+                        Tr(L"グループと、それに属する未完了のタスクをキャンセルしました。",
+                           L"Cancelled the group and its unfinished tasks.",
+                           L"Se canceló el grupo y sus tareas sin terminar."),
+                        true);
+                } else {
+                    ShowTaskQueueResult(
+                        st, Tr(L"キャンセルできませんでした", L"Could not cancel the group",
+                               L"No se pudo cancelar el grupo"),
+                        cancelErr, false);
+                }
+            }
+        } else if (cmd == 3213) {
+            const bool groupPaused = btWait.state == "paused";
+            std::wstring pauseErr;
+            if (SubmitBtPause(st, groupId, !groupPaused, pauseErr)) {
+                ShowTaskQueueResult(
+                    st, Tr(L"タスクグループ", L"Task group", L"Grupo de tareas"),
+                    groupPaused
+                        ? Tr(L"タスクグループを再開しました。",
+                             L"Resumed the task group.",
+                             L"Se reanudó el grupo de tareas.")
+                        : Tr(L"タスクグループを一時停止しました。実行中のタスクは続きます。",
+                             L"Paused the task group. Running tasks continue.",
+                             L"Se pausó el grupo. Las tareas en ejecución continúan."),
+                    true);
+            } else {
+                ShowTaskQueueResult(
+                    st, Tr(L"タスクグループを操作できませんでした",
+                           L"Could not change the task group",
+                           L"No se pudo cambiar el grupo de tareas"),
+                    pauseErr, false);
+            }
+        } else if (cmd >= 3200 && cmd < 3200 + static_cast<int>(btChoices.size())) {
+            std::wstring answerErr;
+            if (SubmitBtAnswer(st, groupId, btNode, btChoices[static_cast<size_t>(cmd - 3200)],
+                               answerErr)) {
+                ShowTaskQueueResult(
+                    st, Tr(L"回答して再開", L"Answer and resume", L"Responder y continuar"),
+                    Tr(L"回答を送り、待機中の枝を再開しました。",
+                       L"Sent the answer and resumed the waiting branch.",
+                       L"Se envió la respuesta y se reanudó la rama."),
+                    true);
+            } else {
+                ShowTaskQueueResult(
+                    st, Tr(L"再開に失敗", L"Resume failed", L"Error al reanudar"), answerErr, false);
+            }
         } else if (cmd == 3110) {
             CopyTextToClipboard(st->hwndMain, cellText);
         } else if (cmd == 3111) {
             SendMessageW(st->hwndMain, WM_COMMAND, IDC_BT_DEBUG, 0);
         }
+        RefreshDashboardData(st);
         return;
     }
     if (jobState == "running") {
@@ -4942,7 +5646,13 @@ static void ShowTaskQueueContextMenu(DashboardState* st, const std::string& jobI
         AppendMenuW(hMenu, MF_SEPARATOR, 0, nullptr);
     }
     AppendMenuW(hMenu, MF_STRING, 3101, Tr(L"再実行 (Retry)", L"Retry", L"Reintentar"));
-    AppendMenuW(hMenu, MF_STRING, 3102, Tr(L"キャンセル (Cancel)", L"Cancel", L"Cancelar"));
+    const bool jobFinished = jobState == "succeeded" || jobState == "failed" || jobState == "cancelled";
+    if (!jobFinished) {
+        AppendMenuW(hMenu, MF_STRING, jobPaused ? 3131 : 3130,
+                    jobPaused ? Tr(L"再開 (Resume)", L"Resume", L"Reanudar")
+                              : Tr(L"一時停止 (Pause)", L"Pause", L"Pausar"));
+    }
+    AppendMenuW(hMenu, MF_STRING, 3102, Tr(L"停止 (キャンセル)", L"Stop (Cancel)", L"Detener (Cancelar)"));
     AppendMenuW(hMenu, MF_SEPARATOR, 0, nullptr);
     AppendMenuW(hMenu, MF_STRING, 3103, Tr(L"キューを一時停止", L"Pause queue", L"Pausar cola"));
     AppendMenuW(hMenu, MF_STRING, 3104, Tr(L"キューを再開", L"Resume queue", L"Reanudar cola"));
@@ -4959,8 +5669,7 @@ static void ShowTaskQueueContextMenu(DashboardState* st, const std::string& jobI
         AppendMenuW(hMenu, MF_STRING, 3111, Tr(L"タスクグループで表示", L"Show Task Group", L"Ver el grupo de tareas"));
     }
     AppendMenuW(hMenu, MF_SEPARATOR, 0, nullptr);
-    AppendMenuW(hMenu, MF_STRING, 3120, Tr(L"LLM 調査用プロンプトをコピー", L"Copy LLM Investigation Prompt", L"Copiar prompt de investigación para LLM"));
-    AppendMenuW(hMenu, MF_STRING, 3121, Tr(L"Hancho Chat に調査を依頼 (入力欄にコピー)", L"Send to Hancho Chat (Compose)", L"Enviar al chat de Hancho"));
+    AppendMenuW(hMenu, MF_STRING, 3120, Tr(L"相談をクリップボードにコピー", L"Copy consultation to clipboard", L"Copiar consulta al portapapeles"));
 
     int cmd = TrackPopupMenu(hMenu, TPM_RETURNCMD | TPM_RIGHTBUTTON, ptScreen.x, ptScreen.y, 0, st->hwndMain, nullptr);
     DestroyMenu(hMenu);
@@ -4979,16 +5688,112 @@ static void ShowTaskQueueContextMenu(DashboardState* st, const std::string& jobI
                    L"¿Seguro que desea terminar el árbol de procesos de esta tarea?"),
                 gui_platform::MessageBoxType::QuestionYesNo,
                 true) == gui_platform::MessageBoxResult::Yes) {
-            TaskQueueCancelIpc(st, jobId, err);
+            std::wstring cancelErr;
+            if (CheckIpcResponse(TaskQueueCancelIpc(st, jobId, err), err, cancelErr)) {
+                ShowTaskQueueResult(st, Tr(L"キャンセル", L"Cancel", L"Cancelar"),
+                                    Tr(L"タスクをキャンセルしました。",
+                                       L"Cancelled the task.",
+                                       L"Se canceló la tarea."),
+                                    true);
+            } else {
+                ShowTaskQueueResult(st, Tr(L"キャンセルできませんでした", L"Could not cancel",
+                                           L"No se pudo cancelar"),
+                                    cancelErr, false);
+            }
         }
     } else if (cmd == 3101) {
-        TaskQueueRetryIpc(st, jobId, true, true, err);
+        // BT-managed jobs must be retried through the behavior tree; the queue rejects
+        // an external retry with "use bt_retry". Route it there instead.
+        std::string jobBtId, jobBtNode;
+        if (ExtractBtTarget(resp, jobBtId, jobBtNode)) {
+            std::wstring retryErr;
+            if (SubmitBtRetry(st, jobBtId, jobBtNode, retryErr)) {
+                ShowTaskQueueResult(
+                    st, Tr(L"再実行", L"Retry", L"Reintentar"),
+                    Tr(L"ビヘイビアツリー経由で再実行しました (bt_retry)。",
+                       L"Retried through the behavior tree (bt_retry).",
+                       L"Se reintentó mediante el árbol de comportamiento (bt_retry)."),
+                    true);
+            } else {
+                ShowTaskQueueResult(st, Tr(L"再実行できませんでした", L"Retry failed",
+                                           L"Error al reintentar"),
+                                    retryErr, false);
+            }
+        } else {
+            std::wstring retryErr;
+            if (CheckIpcResponse(TaskQueueRetryIpc(st, jobId, true, true, err), err, retryErr)) {
+                ShowTaskQueueResult(st, Tr(L"再実行", L"Retry", L"Reintentar"),
+                                    Tr(L"タスクを再実行キューに入れました。",
+                                       L"Queued the task for another run.",
+                                       L"La tarea se puso en cola para reintentarse."),
+                                    true);
+            } else {
+                ShowTaskQueueResult(st, Tr(L"再実行できませんでした", L"Retry failed",
+                                           L"Error al reintentar"),
+                                    retryErr, false);
+            }
+        }
     } else if (cmd == 3102) {
-        TaskQueueCancelIpc(st, jobId, err);
+        std::wstring cancelErr;
+        if (CheckIpcResponse(TaskQueueCancelIpc(st, jobId, err), err, cancelErr)) {
+            ShowTaskQueueResult(st, Tr(L"キャンセル", L"Cancel", L"Cancelar"),
+                                Tr(L"タスクをキャンセルしました。",
+                                   L"Cancelled the task.",
+                                   L"Se canceló la tarea."),
+                                true);
+        } else {
+            ShowTaskQueueResult(st, Tr(L"キャンセルできませんでした", L"Could not cancel",
+                                       L"No se pudo cancelar"),
+                                cancelErr, false);
+        }
+    } else if (cmd == 3130 || cmd == 3131) {
+        const bool pause = cmd == 3130;
+        std::wstring pauseErr;
+        if (CheckIpcResponse(TaskQueuePauseJobIpc(st, jobId, pause, err), err, pauseErr)) {
+            ShowTaskQueueResult(
+                st, pause ? Tr(L"一時停止", L"Pause", L"Pausar")
+                          : Tr(L"再開", L"Resume", L"Reanudar"),
+                pause ? Tr(L"タスクを一時停止しました。再開するまで実行は進みません。",
+                           L"Paused the task. It will not progress until resumed.",
+                           L"Se pausó la tarea. No avanzará hasta reanudarla.")
+                      : Tr(L"タスクを再開しました。",
+                           L"Resumed the task.",
+                           L"Se reanudó la tarea."),
+                true);
+        } else {
+            ShowTaskQueueResult(
+                st, pause ? Tr(L"一時停止できませんでした", L"Could not pause", L"No se pudo pausar")
+                          : Tr(L"再開できませんでした", L"Could not resume", L"No se pudo reanudar"),
+                pauseErr, false);
+        }
     } else if (cmd == 3103 || cmd == 3104) {
         resp = TaskQueueGetIpc(st, jobId, false, 0, err);
         std::string tqName = JsonGetString(resp, "taskqueue", "");
-        if (!tqName.empty()) TaskQueuePauseIpc(st, tqName, cmd == 3103, err);
+        if (tqName.empty()) {
+            ShowTaskQueueResult(st, Tr(L"キュー操作", L"Queue action", L"Acción de cola"),
+                                Tr(L"このタスクのタスクキュー名を取得できませんでした。",
+                                   L"Could not find this task's queue name.",
+                                   L"No se pudo obtener el nombre de la cola."),
+                                false);
+        } else {
+            std::wstring pauseErr;
+            if (CheckIpcResponse(TaskQueuePauseIpc(st, tqName, cmd == 3103, err), err, pauseErr)) {
+                ShowTaskQueueResult(
+                    st, Tr(L"キュー操作", L"Queue action", L"Acción de cola"),
+                    cmd == 3103
+                        ? Tr(L"タスクキューを一時停止しました。",
+                             L"Paused the task queue.",
+                             L"Se pausó la cola de tareas.")
+                        : Tr(L"タスクキューを再開しました。",
+                             L"Resumed the task queue.",
+                             L"Se reanudó la cola de tareas."),
+                    true);
+            } else {
+                ShowTaskQueueResult(st, Tr(L"キュー操作に失敗", L"Queue action failed",
+                                           L"Error en la acción de cola"),
+                                    pauseErr, false);
+            }
+        }
     } else if (cmd == 3105) {
         resp = TaskQueueListIpc(st, "", "", 0, err);
         auto jobs = SplitJsonObjectArray(resp, "jobs");
@@ -4998,8 +5803,18 @@ static void ShowTaskQueueContextMenu(DashboardState* st, const std::string& jobI
             if (tqName.empty()) continue;
             if (std::find(queuesDone.begin(), queuesDone.end(), tqName) != queuesDone.end()) continue;
             queuesDone.push_back(tqName);
-            TaskQueuePurgeIpc(st, tqName, "[\"succeeded\",\"failed\",\"cancelled\"]", err);
+            std::string purgeIpcErr;
+            std::wstring purgeErr;
+            CheckIpcResponse(
+                TaskQueuePurgeIpc(st, tqName, "[\"succeeded\",\"failed\",\"cancelled\"]",
+                                  purgeIpcErr),
+                purgeIpcErr, purgeErr);
         }
+        ShowTaskQueueResult(
+            st, Tr(L"終了済みを消去", L"Purge finished", L"Purgar finalizados"),
+            Tr(L"終了済みジョブを消去しました。", L"Purged finished jobs.",
+               L"Se purgaron los trabajos finalizados."),
+            true);
     } else if (cmd == 3106) {
         ShowTaskQueueJobDetails(st, jobId);
     } else if (cmd == 3112) {
@@ -5016,17 +5831,11 @@ static void ShowTaskQueueContextMenu(DashboardState* st, const std::string& jobI
         std::wstring prompt = BuildTaskQueueInvestigationPrompt(st, jobId);
         if (!prompt.empty()) {
             CopyTextToClipboard(st->hwndMain, prompt);
-            DisplaySupervisorHint(st, Tr(L"LLM 調査", L"LLM Investigation", L"Investigación LLM"),
-                                  Tr(L"タスク調査用プロンプトをクリップボードにコピーしました。",
-                                     L"Copied task investigation prompt to clipboard.",
-                                     L"Prompt de investigación copiado al portapapeles."),
+            DisplaySupervisorHint(st, Tr(L"相談", L"Consultation", L"Consulta"),
+                                  Tr(L"タスクの相談内容をクリップボードにコピーしました。ローカル LLM に貼り付けてください。",
+                                     L"Copied the task consultation to the clipboard. Paste it into a local LLM.",
+                                     L"Consulta de la tarea copiada al portapapeles. Pégala en un LLM local."),
                                   L"", 3);
-        }
-    } else if (cmd == 3121) {
-        std::wstring prompt = BuildTaskQueueInvestigationPrompt(st, jobId);
-        if (!prompt.empty()) {
-            CopyTextToClipboard(st->hwndMain, prompt);
-            pc::SendDraftToIpmsgDialog(prompt);
         }
     }
     RefreshDashboardData(st);
@@ -5071,6 +5880,11 @@ struct TaskOwnerUsage {
     uint64_t totalTokens = 0;
     double costUsd = 0.0;
     bool hasUsage = false;
+    bool hasRateLimit = false;
+    std::string rateLimitWindow;
+    std::string rateLimitStatus;
+    double rateLimitUtilization = -1.0;
+    int64_t rateLimitResetsAtSec = 0;
 };
 
 // Reads the lines appended to one events file since the last refresh and folds the usage
@@ -5104,8 +5918,20 @@ static void TaskUsageAccumulateFile(DashboardState* st, const std::wstring& path
                         if (entry.engine.empty()) entry.engine = agent.value("type", std::string());
                         if (entry.model.empty()) entry.model = agent.value("model", std::string());
                     }
-                    if (ev.value("kind", std::string()) != "usage") continue;
+                    const std::string kind = ev.value("kind", std::string());
                     auto dataIt = ev.find("data");
+                    if (kind == "rate_limit" && dataIt != ev.end() && dataIt->is_object()) {
+                        const auto& data = *dataIt;
+                        entry.hasRateLimit = true;
+                        entry.rateLimitStatus = data.value("status", std::string());
+                        entry.rateLimitWindow = data.value("window", std::string());
+                        entry.rateLimitUtilization = data.contains("utilization")
+                                                         ? data.value("utilization", -1.0)
+                                                         : -1.0;
+                        entry.rateLimitResetsAtSec = data.value("resetsAt", int64_t{0});
+                        continue;
+                    }
+                    if (kind != "usage") continue;
                     if (dataIt == ev.end() || !dataIt->is_object()) continue;
                     const auto& data = *dataIt;
                     const uint64_t inTok = data.value("inputTokens", uint64_t{0});
@@ -5139,6 +5965,13 @@ static void TaskUsageAccumulateFile(DashboardState* st, const std::wstring& path
     out.totalTokens += entry.totalTokens;
     out.costUsd += entry.costUsd;
     if (entry.hasUsage) out.hasUsage = true;
+    if (entry.hasRateLimit) {
+        out.hasRateLimit = true;
+        out.rateLimitWindow = entry.rateLimitWindow;
+        out.rateLimitStatus = entry.rateLimitStatus;
+        out.rateLimitUtilization = entry.rateLimitUtilization;
+        out.rateLimitResetsAtSec = entry.rateLimitResetsAtSec;
+    }
 }
 
 static TaskOwnerUsage TaskOwnerUsageForJob(DashboardState* st, const std::string& jobId,
@@ -5287,8 +6120,15 @@ static void RefreshTaskQueueData(DashboardState* st, bool force = false, bool us
 
         std::wstring idStr = Utf8ToWide(jobId);
         std::wstring summaryStr = Utf8ToWide(JsonGetString(j, "summary", ""));
+        std::wstring kindStr;
         if (jobId.rfind("group:", 0) == 0) {
             summaryStr = Tr(L"[タスクグループ] ", L"[Task Group] ", L"[Grupo de tareas] ") + summaryStr;
+            kindStr = Tr(L"グループ", L"Group", L"Grupo");
+        } else if (jobId.rfind("btplan:", 0) == 0) {
+            summaryStr = Tr(L"[グループの予定] ", L"[Group plan] ", L"[Plan del grupo] ") + summaryStr;
+            kindStr = Tr(L"予定 (グループ)", L"Planned (group)", L"Previsto (grupo)");
+        } else {
+            kindStr = Tr(L"タスク", L"Task", L"Tarea");
         }
         std::string notes = JsonGetString(j, "notes", "");
         if (!notes.empty()) summaryStr += L"  [notes: " + Utf8ToWide(notes) + L"]";
@@ -5306,7 +6146,8 @@ static void RefreshTaskQueueData(DashboardState* st, bool force = false, bool us
                 }
             }
         }
-        std::wstring stateStr = TaskQueueStateLabel(state, j, stateById);
+        const bool jobPaused = JsonGetBool(j, "paused", false);
+        std::wstring stateStr = TaskQueueStateLabel(state, j, stateById, jobPaused);
         if (!failureClass.empty()) stateStr += L" \u00B7 " + Utf8ToWide(failureClass);
         if (!notes.empty()) stateStr += L" \U0001F4DD";
         std::string attemptStart = LastAttemptField(j, "start");
@@ -5503,16 +6344,17 @@ static void RefreshTaskQueueData(DashboardState* st, bool force = false, bool us
 
         row.cells[0] = std::move(idStr);
         row.cells[1] = std::move(summaryStr);
-        row.cells[2] = std::move(stateStr);
-        row.cells[3] = std::move(triageStr);
-        row.cells[4] = std::move(startStr);
-        row.cells[5] = std::move(endStr);
-        row.cells[6] = std::move(taskDoingStr);
-        row.cells[7] = std::move(depsStr);
-        row.cells[8] = std::move(queueStr);
-        row.cells[9] = std::move(originStr);
-        row.cells[10] = std::move(ownerUsageStr);
-        row.cells[11] = std::move(resourcesStr);
+        row.cells[2] = std::move(kindStr);
+        row.cells[3] = std::move(stateStr);
+        row.cells[4] = std::move(triageStr);
+        row.cells[5] = std::move(startStr);
+        row.cells[6] = std::move(endStr);
+        row.cells[7] = std::move(taskDoingStr);
+        row.cells[8] = std::move(depsStr);
+        row.cells[9] = std::move(queueStr);
+        row.cells[10] = std::move(originStr);
+        row.cells[11] = std::move(ownerUsageStr);
+        row.cells[12] = std::move(resourcesStr);
         if (!st->taskSearchText.empty()) {
             bool matches = false;
             for (const auto& cell : row.cells) {
@@ -6064,7 +6906,7 @@ static void RefreshDashboardData(DashboardState* st) {
 }
 
 // Columns of the task list sized to their text: ID, State, Start, End.
-static constexpr int kTaskFitCols[4] = {0, 2, 4, 5};
+static constexpr int kTaskFitCols[4] = {0, 3, 5, 6};
 static constexpr int kTaskFitColMax[4] = {220, 200, 110, 280};
 
 // Measures the widest text (header included) of each fit column. Returns true when a width
@@ -6115,13 +6957,16 @@ static void UpdateTaskListColumnWidths(DashboardState* st) {
     int rest = total;
     for (int k = 0; k < 4; ++k) rest -= widths[kTaskFitCols[k]];
 
+    // The Kind column is fixed: it only has to hold "Group" / "Task" / "Planned".
+    widths[2] = 104;
+    rest -= widths[2];
     // Summary takes ~45% of what is left; the remaining columns share the rest in proportion.
     // Shares have no minimum, so the widths always add up to the list width; the last column
     // (Resources) takes the rounding remainder.
     widths[1] = rest * 45 / 100;
     int other = rest - widths[1];
     // Triage, Running, Depends, Queue, Origin, Owner / Cost, Resources.
-    constexpr int kFlex[7] = {3, 6, 7, 8, 9, 10, 11};
+    constexpr int kFlex[7] = {4, 7, 8, 9, 10, 11, 12};
     const int base[7] = {150, 190, 110, 62, 150, 140, 200};
     int baseSum = 0;
     for (int b : base) baseSum += b;
@@ -10136,8 +10981,7 @@ static void ShowTaskContextMenu(DashboardState* st, int procId, POINT ptScreen) 
         AppendMenuW(hMenu, MF_STRING, 3008, Tr(L"ストリームファイル (jsonl) を開く", L"Open Stream File (jsonl)", L"Abrir archivo de flujo (jsonl)"));
     }
     AppendMenuW(hMenu, MF_SEPARATOR, 0, nullptr);
-    AppendMenuW(hMenu, MF_STRING, 3020, Tr(L"LLM 調査用プロンプトをコピー", L"Copy LLM Investigation Prompt", L"Copiar prompt de investigación para LLM"));
-    AppendMenuW(hMenu, MF_STRING, 3021, Tr(L"Hancho Chat に調査を依頼 (入力欄にコピー)", L"Send to Hancho Chat (Compose)", L"Enviar al chat de Hancho"));
+    AppendMenuW(hMenu, MF_STRING, 3020, Tr(L"相談をクリップボードにコピー", L"Copy consultation to clipboard", L"Copiar consulta al portapapeles"));
     AppendMenuW(hMenu, MF_SEPARATOR, 0, nullptr);
     if (snap.state == ProcState::Running) {
         AppendMenuW(hMenu, MF_STRING, 3004, Tr(L"プロセスを終了 (子プロセスごと)", L"Kill Process (with child processes)", L"Terminar proceso (con procesos hijos)"));
@@ -10178,17 +11022,11 @@ static void ShowTaskContextMenu(DashboardState* st, int procId, POINT ptScreen) 
         std::wstring prompt = BuildProcessInvestigationPrompt(st, procId);
         if (!prompt.empty()) {
             CopyTextToClipboard(st->hwndMain, prompt);
-            DisplaySupervisorHint(st, Tr(L"LLM 調査", L"LLM Investigation", L"Investigación LLM"),
-                                  Tr(L"プロセス調査用プロンプトをクリップボードにコピーしました。",
-                                     L"Copied process investigation prompt to clipboard.",
-                                     L"Prompt de investigación copiado al portapapeles."),
+            DisplaySupervisorHint(st, Tr(L"相談", L"Consultation", L"Consulta"),
+                                  Tr(L"プロセスの相談内容をクリップボードにコピーしました。ローカル LLM に貼り付けてください。",
+                                     L"Copied the process consultation to the clipboard. Paste it into a local LLM.",
+                                     L"Consulta del proceso copiada al portapapeles. Pégala en un LLM local."),
                                   L"", 3);
-        }
-    } else if (cmd == 3021) {
-        std::wstring prompt = BuildProcessInvestigationPrompt(st, procId);
-        if (!prompt.empty()) {
-            CopyTextToClipboard(st->hwndMain, prompt);
-            pc::SendDraftToIpmsgDialog(prompt);
         }
     } else if (cmd == 3004) {
         if (gui_platform::GetGuiPlatform()->ShowMessageBox(
@@ -18073,7 +18911,7 @@ static LRESULT CALLBACK DashboardWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPA
             ListView_SetTextBkColor(st->hwndTaskList, g_theme.panel);
             ListView_SetTextColor(st->hwndTaskList, g_theme.listText);
             {
-                const int taskDefaultWidths[kTaskListColumns] = {90, 350, 100, 150, 105, 115, 190, 110, 82, 150, 140, 200};
+                const int taskDefaultWidths[kTaskListColumns] = {90, 350, 104, 100, 150, 105, 115, 190, 110, 82, 150, 140, 200};
                 for (int i = 0; i < kTaskListColumns; ++i) {
                     LVCOLUMNW lvc = {};
                     lvc.mask = LVCF_TEXT | LVCF_WIDTH | LVCF_SUBITEM;

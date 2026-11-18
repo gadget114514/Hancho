@@ -52,6 +52,7 @@ hancho-cli.exe mcp uninstall --delete-data-dir           # データディレク
 | `taskqueue_update` | pending/failed/blocked のジョブを更新。 |
 | `taskqueue_cancel` | ジョブをキャンセル（実行中は kill、再実行しない）。 |
 | `taskqueue_pause` / `taskqueue_resume` | キューの新規開始を停止 / 再開。 |
+| `taskqueue_pause_job` / `taskqueue_resume_job` | 1 つのジョブを一時停止 / 再開（`id`）。待機中は起動せず、ローカルの実行中ジョブはプロセスツリーを停止してタイムアウトとアイドルの時計を止める。停止は `taskqueue_cancel`。 |
 | `taskqueue_wait` | キューの version 変化をロングポーリング（`taskqueue`, `sinceVersion`, `timeoutMs`）。 |
 | `taskqueue_purge` | 終了済みジョブを削除（`taskqueue`, `states[]`）。 |
 | `taskqueue_link` / `taskqueue_unlink` | 依存を 1 本追加 / 削除（`job`, `dependsOn`, `on` = `success`\|`done`）。 |

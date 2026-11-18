@@ -132,6 +132,10 @@ hancho-cli.exe taskqueue graph main
 hancho-cli.exe taskqueue wait main --since 0 --timeout-ms 30000
 hancho-cli.exe taskqueue retry A
 
+# Pause/resume one job (stop it permanently with cancel)
+hancho-cli.exe taskqueue pause-job A
+hancho-cli.exe taskqueue resume-job A
+
 # Only jobs updated within the last 6 hours (--since takes 30m, 6h, 2d)
 hancho-cli.exe taskqueue list main --state failed --since 6h
 
@@ -375,7 +379,7 @@ hancho-cli.exe export list
 | `cli_exit_codes`, `environment_variables` | Exit codes and `HANCHO_LOG_DIR` |
 | `data_dir_option`, `effective_data_dir` | Per-invocation `--data-dir`, its resolved absolute path for this call, and project consistency rules |
 | `common_examples` | Ready-to-run `hancho-cli.exe` commands |
-| `commands` | Every command and option, including `taskqueue add/list/get/retry/cancel/pause/resume/graph/wait/purge`, `mcp install/uninstall` and `agent uninstall-template` |
+| `commands` | Every command and option, including `taskqueue add/list/get/retry/cancel/pause/resume/pause-job/resume-job/graph/wait/purge`, `mcp install/uninstall` and `agent uninstall-template` |
 | `setup.mcp` | MCP registration, a ready-to-use config, and `auto_install` / `uninstall` (`argv` + `command`) |
 | `agent` | `working_model` (supervisor → Hancho → worker LLM), `data_dir_consistency`, `decision`, `states`, `quick_start` |
 | `leaving` | Graduation steps, JSON / JSONL data formats, keep-or-delete-data behavior, and the release checklist |

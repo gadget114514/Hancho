@@ -124,6 +124,52 @@ void RunPart2IntegrationTests(const std::wstring& tempDirW, const std::string& t
             Check(h.tqm.GetJobSnapshot("bt-cancel-job-long_ping-1", cancelledSnap) &&
                   cancelledSnap.state == "cancelled",
                   "Cancel(id) cancelled the underlying TaskQueueJob");
+
+            // Two parallel leaves in a concurrency-1 queue: the first runs, the second stays
+            // queued. Cancelling the tree must cancel that provisionally registered job too.
+            json queuedBt = {
+                {"id", "bt-cancel-queued"},
+                {"cwd", tempDirUtf8},
+                {"root", {
+                    {"type", "parallel"},
+                    {"children", json::array({
+                        {
+                            {"type", "job"},
+                            {"id", "first_ping"},
+                            {"summary", "First ping"},
+                            {"command", "ping -n 30 127.0.0.1"},
+                            {"timeoutSec", 60}
+                        },
+                        {
+                            {"type", "job"},
+                            {"id", "queued_ping"},
+                            {"summary", "Queued ping"},
+                            {"command", "ping -n 30 127.0.0.1"},
+                            {"timeoutSec", 60}
+                        }
+                    })}
+                }}
+            };
+            h.btm->Start(queuedBt.dump());
+            TaskQueueJob queuedSnap;
+            bool sawQueued = false;
+            for (int i = 0; i < 100; ++i) {
+                if (h.tqm.GetJobSnapshot("bt-cancel-queued-queued_ping-1", queuedSnap) &&
+                    (queuedSnap.state == "pending" || queuedSnap.state == "waiting")) {
+                    sawQueued = true;
+                    break;
+                }
+                Sleep(20);
+            }
+            Check(sawQueued, "the second parallel leaf is registered while the first runs");
+            json queuedCancelResp = json::parse(h.btm->Cancel("bt-cancel-queued"), nullptr, false);
+            Check(queuedCancelResp.value("ok", false) &&
+                      queuedCancelResp.value("state", "") == "cancelled",
+                  "Cancel(id) marks a tree with queued leaves cancelled");
+            TaskQueueJob queuedAfter;
+            Check(h.tqm.GetJobSnapshot("bt-cancel-queued-queued_ping-1", queuedAfter) &&
+                      queuedAfter.state == "cancelled",
+                  "Cancel(id) also cancels provisionally registered queued jobs");
         }
     }
 

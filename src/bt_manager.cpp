@@ -472,6 +472,43 @@ void BtManager::OnTaskQueueJobFinished(const TaskQueueJob& job, const std::strin
     PersistEntryLocked(*it->second);
 }
 
+void BtManager::CancelQueuedJobsForTree(const std::string& btId) {
+    if (btId.empty()) return;
+    // Called while the tree mutex is held. The cancel callbacks must not re-enter the
+    // manager, so suppress them exactly like CancelJob does for the active processes.
+    ScopedCancelGuard guard;
+    std::string err;
+    std::string listJson = tqm_.TaskQueueList("", "", 0, err, "", btId, true);
+    if (!err.empty()) {
+        WriteAuditLog("BT_CANCEL_ERR", "list jobs for '" + btId + "' failed: " + err);
+        return;
+    }
+    nlohmann::json doc = nlohmann::json::parse(listJson, nullptr, false);
+    if (doc.is_discarded() || !doc.is_object() || !doc.contains("jobs") ||
+        !doc["jobs"].is_array()) {
+        return;
+    }
+    int cancelled = 0;
+    for (const auto& j : doc["jobs"]) {
+        if (!j.is_object()) continue;
+        const std::string id = j.value("id", "");
+        const std::string state = j.value("state", "");
+        if (id.empty()) continue;
+        if (state == "succeeded" || state == "failed" || state == "cancelled") continue;
+        std::string cancelErr;
+        tqm_.TaskQueueCancel(id, cancelErr);
+        if (cancelErr.empty()) {
+            ++cancelled;
+        } else {
+            WriteAuditLog("BT_CANCEL_ERR", id + ": " + cancelErr);
+        }
+    }
+    if (cancelled > 0) {
+        WriteAuditLog("BT_CANCEL", "cancelled " + std::to_string(cancelled) +
+                                       " queued job(s) for '" + btId + "'");
+    }
+}
+
 bool BtManager::OnTaskQueueBtRetry(const TaskQueueBtRef& ref, bool resetCounters, std::string& outError) {
     outError.clear();
     if (ref.id.empty()) {

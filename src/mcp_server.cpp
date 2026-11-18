@@ -626,7 +626,21 @@ int RunMcpServer() {
                 << "},\"required\":[\"taskqueue\"]}"
                 << "},"
                 << "{"
-                 << "\"name\":\"taskqueue_wait\","
+                << "\"name\":\"taskqueue_pause_job\","
+                << "\"description\":\"Pause one job. A queued job is not scheduled; a running local job is suspended (timeout and idle clocks freeze) until resumed.\","
+                << "\"inputSchema\":{\"type\":\"object\",\"properties\":{"
+                << "\"id\":{\"type\":\"string\",\"description\":\"Job id\"}"
+                << "},\"required\":[\"id\"]}"
+                << "},"
+                << "{"
+                << "\"name\":\"taskqueue_resume_job\","
+                << "\"description\":\"Resume one paused job.\","
+                << "\"inputSchema\":{\"type\":\"object\",\"properties\":{"
+                << "\"id\":{\"type\":\"string\",\"description\":\"Job id\"}"
+                << "},\"required\":[\"id\"]}"
+                << "},"
+                << "{"
+                << "\"name\":\"taskqueue_wait\","
                  << "\"description\":\"Wait until a task queue version changes (long poll) and return its jobs. Each failed job carries a top-level failure record (class, summary, lastActivity, evidence, suggestedAction, retryAt) so the next step can be chosen without reading logs.\","
                 << "\"inputSchema\":{\"type\":\"object\",\"properties\":{"
                 << "\"taskqueue\":{\"type\":\"string\"},"
@@ -1422,6 +1436,10 @@ int RunMcpServer() {
             else if (toolName == "taskqueue_pause" || toolName == "taskqueue_resume") {
                 ipcReq << "{\"action\":\"" << toolName << "\",\"taskqueue\":\""
                        << JsonEscape(JsonGetString(argsJson, "taskqueue", "")) << "\"}";
+            }
+            else if (toolName == "taskqueue_pause_job" || toolName == "taskqueue_resume_job") {
+                ipcReq << "{\"action\":\"" << toolName << "\",\"id\":\""
+                       << JsonEscape(JsonGetString(argsJson, "id", "")) << "\"}";
             }
             else if (toolName == "taskqueue_wait") {
                 int64_t sinceVersion = JsonGetInt(argsJson, "sinceVersion",

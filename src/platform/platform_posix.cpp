@@ -328,6 +328,32 @@ public:
         return ok;
     }
 
+    bool Suspend(std::string& outError) override {
+        outError.clear();
+        if (!attached_ || rootPid_ == 0) {
+            outError = "process tree is not attached";
+            return false;
+        }
+        bool ok = false;
+        if (::kill(-static_cast<pid_t>(rootPid_), SIGSTOP) == 0) ok = true;
+        if (::kill(static_cast<pid_t>(rootPid_), SIGSTOP) == 0) ok = true;
+        if (!ok) outError = "failed to suspend the process tree: " + std::string(std::strerror(errno));
+        return ok;
+    }
+
+    bool Resume(std::string& outError) override {
+        outError.clear();
+        if (!attached_ || rootPid_ == 0) {
+            outError = "process tree is not attached";
+            return false;
+        }
+        bool ok = false;
+        if (::kill(-static_cast<pid_t>(rootPid_), SIGCONT) == 0) ok = true;
+        if (::kill(static_cast<pid_t>(rootPid_), SIGCONT) == 0) ok = true;
+        if (!ok) outError = "failed to resume the process tree: " + std::string(std::strerror(errno));
+        return ok;
+    }
+
     void Release() override {
 #if defined(__linux__)
         if (!cgroupPath_.empty()) {

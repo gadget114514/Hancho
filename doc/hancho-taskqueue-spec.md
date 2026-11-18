@@ -353,6 +353,7 @@ failed / blocked / cancelled ──(taskqueue_retry)──> pending
 | `taskqueue_update` | `id`, 変更可能フィールド (summary, instructionsFile, instructionsText, command, timeoutSec, idle, maxAttempts, success, env)。依存は 11.1 で変更する | pending/failed/blocked のときだけ。同じ検証 (連鎖・上限) を行う |
 | `taskqueue_cancel` | `id` | running ならツリー kill して cancelled |
 | `taskqueue_pause` / `taskqueue_resume` | `taskqueue` | 新しいジョブの開始を止める / 再開する (実行中は止めない) |
+| `taskqueue_pause_job` / `taskqueue_resume_job` | `id` | 1 つのジョブを一時停止 / 再開する。待機中は起動しない。ローカルの実行中はプロセスツリーを suspend し、timeout と idle の時計を凍結する。停止は `taskqueue_cancel` |
 | `taskqueue_wait` | `taskqueue`, `sinceVersion`, `timeoutMs` | version が変わるまで待ち、変化したジョブと新しい version を返す |
 | `taskqueue_purge` | `taskqueue`, `states[]` | 終了済みジョブを削除 |
 

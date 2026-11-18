@@ -509,8 +509,12 @@ std::string BtManager::Cancel(const std::string& id) {
     }
 
     TreeEntry& entry = *it->second;
+    const std::string btId = entry.tree->Id();
     entry.tree->Cancel(NowEpochMs());
     PersistEntryLocked(entry);
+    // The tree drops its active jobs itself; any other queued/provisional jobs that still
+    // point at this tree have to be cancelled here or they would stay pending forever.
+    CancelQueuedJobsForTree(btId);
     return BuildTreeResponseJson(*entry.tree, TreeView::Summary).dump();
 }
 

@@ -114,6 +114,12 @@ WORKING MODEL (LLM orchestration):
        taskqueue_graph and reads logs; it never polls .done files.
     5. On failure, fix the cause and call taskqueue_retry. Blocked dependents
        resume automatically.
+    5b. To stop work temporarily use taskqueue_pause_job / taskqueue_pause /
+       bt_pause; resume with the matching resume. A paused running local job is
+       suspended and its timeout/idle clocks freeze. Pause does not fix an LLM
+       wait: answer an escalate (bt_resume), retry the LLM-side failure after
+       fixing the cause, or cancel it. Resuming the same stuck request does not
+       make the LLM respond.
     6. Keep the supervisor context small: read artifacts, not raw transcripts.
     7. When the next step depends on results (build -> fix -> rebuild loops,
        test -> fix -> retest, "if this file says X then ..."), do not watch and
@@ -160,11 +166,11 @@ MCP SERVER SETUP:
       wait_process, kill_process
     Worker (5):
       run_worker, wait_worker, get_worker_stream, get_worker_state, update_worker_info
-    Task queue (13):
+    Task queue (15):
       taskqueue_add, taskqueue_list, taskqueue_get, taskqueue_retry,
       taskqueue_update, taskqueue_cancel, taskqueue_pause, taskqueue_resume,
-      taskqueue_wait, taskqueue_purge, taskqueue_link, taskqueue_unlink,
-      taskqueue_graph
+      taskqueue_pause_job, taskqueue_resume_job, taskqueue_wait,
+      taskqueue_purge, taskqueue_link, taskqueue_unlink, taskqueue_graph
     Behavior tree (10):
       bt_validate, bt_start, bt_get, bt_list, bt_wait, bt_resume, bt_retry,
       bt_update, bt_cancel, bt_pause

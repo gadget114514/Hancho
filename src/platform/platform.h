@@ -64,6 +64,10 @@ public:
     virtual bool Attach(uint64_t rootPid, std::string& outError) = 0;
     virtual bool Query(ProcessMetrics& outMetrics) = 0;
     virtual bool Kill(int exitCode) = 0;
+    // Stop/resume every process in the tree without killing it. Used by
+    // task-level pause; unsupported members fail with an error message.
+    virtual bool Suspend(std::string& outError) = 0;
+    virtual bool Resume(std::string& outError) = 0;
     virtual void Release() = 0;
 };
 

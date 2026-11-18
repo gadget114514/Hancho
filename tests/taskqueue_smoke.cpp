@@ -1047,6 +1047,68 @@ int main() {
     }
 
     {
+        // Per-job pause: a queued job is not scheduled; a running job is suspended
+        // and its elapsed clock freezes until it is resumed.
+        std::string pauseJobs = "["
+            "{\"id\":\"PJ1\",\"command\":\"ping -n 5 127.0.0.1\",\"summary\":\"PJ1 blocker\",\"timeoutSec\":30},"
+            "{\"id\":\"PJ2\",\"command\":\"ping -n 20 127.0.0.1\",\"summary\":\"PJ2 paused\",\"timeoutSec\":60}"
+            "]";
+        Check(JsonGetBool(tqm.TaskQueueAdd("pauseq", pauseJobs, 1, "", err), "ok", false),
+              "pauseq jobs added: " + err);
+        Check(WaitForState(tqm, "PJ1", "running", 5000), "PJ1 starts");
+        Check(GetState(tqm, "PJ2") != "running", "PJ2 waits behind PJ1");
+
+        std::string pauseResp = tqm.TaskQueuePauseJob("PJ2", true, err);
+        Check(JsonGetBool(pauseResp, "ok", false) && JsonGetBool(pauseResp, "paused", false),
+              "TaskQueuePauseJob pauses the queued job: " + err);
+
+        Check(WaitForState(tqm, "PJ1", "succeeded", 20000), "PJ1 succeeded");
+        Sleep(600);
+        Check(GetState(tqm, "PJ2") == "pending", "paused queued job is not started");
+
+        std::string resumeResp = tqm.TaskQueuePauseJob("PJ2", false, err);
+        Check(JsonGetBool(resumeResp, "ok", false) && !JsonGetBool(resumeResp, "paused", true),
+              "TaskQueuePauseJob resumes the queued job: " + err);
+        Check(WaitForState(tqm, "PJ2", "running", 5000), "PJ2 starts after resume");
+        Sleep(300);
+
+        auto jobJson = ParseJobJson(tqm.TaskQueueGet("PJ2", false, 0, err));
+        int pid = 0;
+        if (jobJson.contains("attempts") && jobJson["attempts"].is_array() &&
+            !jobJson["attempts"].empty()) {
+            pid = static_cast<int>(jobJson["attempts"].back().value("process_id", 0));
+        }
+        Check(pid > 0, "PJ2 has a process id");
+        Check(JsonGetBool(tqm.TaskQueuePauseJob("PJ2", true, err), "ok", false),
+              "TaskQueuePauseJob pauses the running job: " + err);
+
+        ProcessSnapshot snapPaused;
+        Check(pid > 0 && pm.GetSnapshot(pid, snapPaused) && snapPaused.suspended,
+              "paused running job has a suspended process tree");
+        const uint64_t elapsedAtPause = snapPaused.elapsedMs;
+        const uint64_t idleAtPause = snapPaused.idleMs;
+        Sleep(900);
+        ProcessSnapshot snapStill;
+        Check(pm.GetSnapshot(pid, snapStill), "paused process snapshot is available");
+        Check(snapStill.elapsedMs <= elapsedAtPause + 50,
+              "elapsed time is frozen while paused");
+        Check(snapStill.idleMs <= idleAtPause + 50,
+              "idle time is frozen while paused");
+
+        Check(JsonGetBool(tqm.TaskQueuePauseJob("PJ2", false, err), "ok", false),
+              "TaskQueuePauseJob resumes the running job: " + err);
+        Sleep(700);
+        ProcessSnapshot snapResumed;
+        Check(pm.GetSnapshot(pid, snapResumed) && !snapResumed.suspended,
+              "resumed job is no longer suspended");
+        Check(snapResumed.elapsedMs > elapsedAtPause + 300,
+              "elapsed time advances again after resume");
+
+        Check(JsonGetBool(tqm.TaskQueueCancel("PJ2", err), "ok", false), "PJ2 cancelled");
+        Check(WaitForState(tqm, "PJ2", "cancelled", 5000), "PJ2 is cancelled");
+    }
+
+    {
         // Scheduler: W1/W2 write the same file -> serialized; R1/R2 only read it -> parallel.
         std::wstring resDir = dir + L"\\res";
         CreateDirectoryW(resDir.c_str(), nullptr);

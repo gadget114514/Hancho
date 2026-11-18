@@ -120,6 +120,14 @@ The application icons are modeled on the character "Telephone Cat" (電話猫, D
 
 
 
+### v0.9.29
+- **Pause / resume / stop a task**: right-click a job row in the task list and choose Pause, Resume or Stop (Cancel). A queued job is held; a running local job has its process tree suspended and its timeout/idle clocks frozen. CLI: `taskqueue pause-job|resume-job`; MCP: `taskqueue_pause_job` / `taskqueue_resume_job`.
+- **Pause / stop a task group**: right-click a group row to stop starting new tasks (`bt_pause`) or to stop the group together with its unfinished and provisionally registered jobs (`bt_cancel`).
+- **Kind column**: the task list now has a Kind column that distinguishes task group, planned (group) and task.
+- **Diagnose an LLM wait**: right-click a waiting group → "Answer and resume... (check the cause)" to see the actual reason (rate limit, auth, provider outage, context/turn limit, permissions, tool loop, hung request, elapsed wait). Answer, retry the stuck branch (`bt_retry`), wait, or cancel. Pausing does not fix an LLM wait, so handle the cause with answer/retry/stop.
+- **Consult a local LLM**: the incorrect "Send to Hancho Chat" action was removed; "Copy consultation to clipboard" prepares the investigation prompt for a local LLM.
+- **Docs and help**: CLI, MCP, the task-queue spec, the Hancho skill and `--help` now cover pause and how to handle an LLM wait.
+
 ### v0.9.28
 - **Answer a waiting task group from the task list**: right-click a `group:<id>` row in `waitingForLlm` and pick a choice under "Answer and resume"; the dashboard sends `bt_resume` with the selected `expect` value, so a waiting group no longer needs the CLI.
 - **Branch numbers in task IDs**: behavior-tree jobs now get IDs of the form `<btId>-<node>-<run>` (e.g. `idcheck-slow_one-1`) instead of a bare sequence, so each task is clearly a branch of its group. Provisional `planned` rows show the same job ID in advance (`btplan:<btId>-<node>-<run>`), and `bt_get` / `bt_list` `plannedTasks` include it as `jobId`.
@@ -214,7 +222,7 @@ The application icons are modeled on the character "Telephone Cat" (電話猫, D
 - **Terminal client controls**: follows the dashboard theme, Copy/Paste in the Edit and right-click menus, always-on-top, window-position memory, and a byte-based scrollback budget (64-2048 MB per tab, default 1024 MB). `terminal.history_bytes` (default 32 MiB) controls the server-side replay budget; replays are split into frames, so a 6 MB (~100k-line) history attaches correctly.
 - **Dashboard**: remembers the window layout and shows status-aware tooltips; the standalone dashboard no longer draws embedded terminal tabs.
 - **Performance**: the usage graph and monitor pane have configurable refresh intervals, task-queue lookups use a job index, and idle polling does less work.
-- **Chat**: "Send to Hancho Chat (Compose)" fills the compose box, answers are extracted from worker result events, and hidden Chat starts keep the window hidden.
+- **Chat**: Answers are extracted from worker result events, and hidden Chat starts keep the window hidden.
 - **Auto-start**: clients hide their console and keep working when the hidden WMI launch fails.
 - **Docs**: new Overview, WCSP protocol and CLI help pages, the `skills/hancho` agent skill, and a rewritten README.
 - **Parsing**: replaced `sscanf`/`sscanf_s` with `src/parse_util.h` helpers (no MSVC C4996 warnings).
