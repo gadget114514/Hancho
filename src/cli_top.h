@@ -671,7 +671,7 @@ inline std::string RenderScreen(const TopState& state, int width, int height, bo
         std::transform(lower.begin(), lower.end(), lower.begin(), [](unsigned char c){ return static_cast<char>(std::tolower(c)); });
         if (lower == "running") return "\x1b[32;1m" + st + "\x1b[0m";
         if (lower == "completed" || lower == "succeeded") return "\x1b[36m" + st + "\x1b[0m";
-        if (lower == "failed" || lower == "timed_out" || lower == "idle_timed_out" || lower == "killed") return "\x1b[31;1m" + st + "\x1b[0m";
+        if (lower == "failed" || lower == "timed_out" || lower == "idle_timed_out" || lower == "startup_timed_out" || lower == "killed") return "\x1b[31;1m" + st + "\x1b[0m";
         if (lower == "waiting" || lower == "pending" || lower == "queued") return "\x1b[33m" + st + "\x1b[0m";
         if (lower == "blocked") return "\x1b[35m" + st + "\x1b[0m";
         return st;
@@ -719,7 +719,7 @@ inline std::string RenderScreen(const TopState& state, int width, int height, bo
                 std::string st = p.value("state", "");
                 if (st == "running") runningCount++;
                 else if (st == "completed" || st == "succeeded") completedCount++;
-                else if (st == "failed" || st == "timed_out" || st == "killed") failedCount++;
+                else if (st == "failed" || st == "timed_out" || st == "idle_timed_out" || st == "startup_timed_out" || st == "killed") failedCount++;
             }
         }
 

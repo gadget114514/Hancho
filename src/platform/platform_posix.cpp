@@ -328,6 +328,51 @@ public:
         return ok;
     }
 
+    std::vector<ProcessTreeItem> SnapshotProcesses() override {
+        std::vector<ProcessTreeItem> result;
+        if (!attached_ || rootPid_ == 0) return result;
+#if defined(__linux__)
+        long ticksPerSec = ::sysconf(_SC_CLK_TCK);
+        if (ticksPerSec <= 0) ticksPerSec = 100;
+        const std::string procDir = "/proc";
+        if (DIR* dir = ::opendir(procDir.c_str())) {
+            while (struct dirent* ent = ::readdir(dir)) {
+                if (ent->d_name[0] < '0' || ent->d_name[0] > '9') continue;
+                uint64_t pid = std::strtoull(ent->d_name, nullptr, 10);
+                const std::string statPath = procDir + "/" + ent->d_name + "/stat";
+                std::ifstream in(statPath);
+                std::string line;
+                if (!std::getline(in, line)) continue;
+                const size_t lparen = line.find('(');
+                const size_t rparen = line.rfind(')');
+                if (lparen == std::string::npos || rparen == std::string::npos || rparen <= lparen) continue;
+                std::string comm = line.substr(lparen + 1, rparen - lparen - 1);
+                std::istringstream fields(line.substr(rparen + 2));
+                std::string state;
+                long ppid = 0, pgrp = 0;
+                fields >> state >> ppid >> pgrp;
+                if (pgrp != static_cast<long>(rootPid_) && pid != rootPid_) continue;
+                long session = 0, ttyNr = 0, tpgid = 0;
+                unsigned long flags = 0, minflt = 0, cminflt = 0, majflt = 0, cmajflt = 0;
+                unsigned long utime = 0, stime = 0;
+                fields >> session >> ttyNr >> tpgid >> flags >> minflt >> cminflt >> majflt >> cmajflt >> utime >> stime;
+                ProcessTreeItem item;
+                item.name = comm;
+                item.pid = pid;
+                item.cpuSec = static_cast<double>(utime + stime) / static_cast<double>(ticksPerSec);
+                result.push_back(std::move(item));
+            }
+            ::closedir(dir);
+        }
+#endif
+        if (result.empty() && rootPid_ != 0) {
+            ProcessTreeItem item;
+            item.pid = rootPid_;
+            result.push_back(std::move(item));
+        }
+        return result;
+    }
+
     bool Suspend(std::string& outError) override {
         outError.clear();
         if (!attached_ || rootPid_ == 0) {

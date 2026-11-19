@@ -9,6 +9,11 @@
 #include "remote_hosts.h"
 #include "taskqueue.h"
 #include "cli_top.h"
+#include "llm_config.h"
+#include "permit_config.h"
+#include "worker_probe.h"
+#include "engine_health.h"
+#include "bt_templates.h"
 #include "power.h"
 #include "triage_text.h"
 #include "nlohmann/json.hpp"
@@ -2419,6 +2424,12 @@ COMMANDS:
   worker info <id> [--notes "<notes>"] [--goal "<goal>"]
       Update supervisor notes or goal for an ongoing worker.
 
+  worker probe --engine <e> [--model <m>] [--timeout <sec>] [--no-cache]
+      Health-check an engine with a minimal prompt (result cached in <data-dir>/probes.json).
+
+  worker health [--json] | worker health --reset <engine/model>
+      Show the shared engine-health registry; --reset marks an engine healthy again.
+
   agent install-template [--path <dir>] [--dry-run]
       Write the hancho-runner subagent to <dir>\.claude\agents\hancho-runner.md (default: the current
       directory). It runs long commands through Hancho and returns a short summary.
@@ -2676,6 +2687,9 @@ TASK QUEUE:
       that failed within the period, e.g. `taskqueue retry --failed --since 6h`
       retries the failures of the last 6 hours. Blocked dependents resume.
   taskqueue cancel <id>
+  taskqueue takeover --id <id> --reason "..."    (supervisor takes the job over; record why)
+  taskqueue complete --id <id> --reason "..." [--report <path>] [--result succeeded|failed]
+       Finish a taken-over job. succeeded (default) lets dependent jobs advance; failed blocks them.
   taskqueue pause|resume <name>
   taskqueue graph [<name>] [--root <id>]     (ready, waiting_for, resource_wait, retry_in_sec, blocked)
   taskqueue wait <name> [--since <version>] [--timeout-ms <ms>]
@@ -3055,7 +3069,7 @@ void PrintCliUsageJson() {
     {
       "name": "taskqueue",
       "description": "Manage the persistent task queue: ordered jobs, dependencies, per-job timeouts, success checks and automatic retries.",
-      "usage": "hancho-cli taskqueue <add|list|get|why|retry|cancel|pause|resume|pause-job|resume-job|graph|wait|purge|update> ...",
+      "usage": "hancho-cli taskqueue <add|list|get|why|retry|cancel|takeover|complete|pause|resume|pause-job|resume-job|graph|wait|purge|update> ...",
       "subcommands": [
         {"name": "add", "usage": "hancho-cli taskqueue add --file <jobs.json> [--taskqueue <name>] [--concurrency <n>] [--notify-file <path>] [--origin-label <text>]", "description": "Register jobs. Each job needs id, command, summary and timeoutSec; dependsOn replaces shell chaining. The caller's session id, working folder and --origin-label are recorded as the job's origin. suspendWhenDone/suspendDelaySec/suspendHibernate arm the PC to suspend, and shutdownWhenDone/shutdownDelaySec arm it to shut down, after that job and all other work is idle. Do not set hidden on jobs you register: it is reserved for Hancho's internal jobs and hides the row unless Show hidden tasks is on."},
         {"name": "list", "usage": "hancho-cli taskqueue list [<name>] [--state <state>] [--since <period>] [--origin <self|label|session>] [--bt <id>] [--no-planned]", "description": "List jobs with state, queue, summary and blockedBy. --since keeps only jobs updated within the period (e.g. 30m, 6h, 2d). --origin self keeps only the jobs this session added. --bt <id> lists every job of a behavior tree across its parallel branch queues. Provisional 'planned' rows for idle BT leaves are included by default; --no-planned hides them and the task-group row. The active task group (the BT root) is a virtual row with id 'group:<id>' and state running, waitingForLlm or paused. Neither row is a stored job. Each job also carries resource_wait and, once succeeded with estimateSec, timing_feedback (see audit)."},
@@ -3064,6 +3078,8 @@ void PrintCliUsageJson() {
         {"name": "why", "usage": "hancho-cli taskqueue why <id>", "description": "Explain why the last attempt failed: failure class, confidence, summary, suggested action, last activity and evidence (event seq / log line), plus the class of every attempt. Reads the job without instructions."},
         {"name": "retry", "usage": "hancho-cli taskqueue retry <id> | hancho-cli taskqueue retry --failed [<name>] [--since <period>]", "description": "Requeue a failed/blocked/cancelled job; blocked dependents resume automatically. --failed retries every failed job instead, optionally limited to one queue and to jobs that failed within --since (e.g. --since 6h = last 6 hours)."},
         {"name": "cancel", "usage": "hancho-cli taskqueue cancel <id>", "description": "Cancel a job; a running attempt is killed and is not retried."},
+        {"name": "takeover", "usage": "hancho-cli taskqueue takeover --id <id> --reason <text>", "description": "Record that the supervisor takes a failed/blocked/waiting/pending/running job over instead of delegating again. The job becomes the terminal state takenOver with a takeover record {by, reason, at}, its process tree is stopped, and dependents stay pending until complete."},
+        {"name": "complete", "usage": "hancho-cli taskqueue complete --id <id> --reason <text> [--report <path>] [--result succeeded|failed]", "description": "Finish a taken-over job and record {completedAt, report, result, completionReason}. With succeeded (default), dependents advance as if the dependency succeeded; with failed, dependents are blocked. --reason is required."},
         {"name": "pause", "usage": "hancho-cli taskqueue pause <name>", "description": "Stop starting new jobs in the queue; running jobs continue."},
         {"name": "resume", "usage": "hancho-cli taskqueue resume <name>", "description": "Resume starting jobs in the queue."},
         {"name": "pause-job", "usage": "hancho-cli taskqueue pause-job <id>", "description": "Pause one job. A queued job is not scheduled; a running local job is suspended and its timeout/idle clocks freeze."},
@@ -3159,7 +3175,9 @@ void PrintCliUsageJson() {
         {"name": "stream", "usage": "hancho-cli worker stream <id> [--tail <n>] [--type <kind>] [--since <seq>] [--summary] [--schema <v1>]", "description": "View captured JSON streaming events from <log>.events.jsonl (hancho.event/1). --schema legacy is not supported (removed in v0.11.0)."},
         {"name": "info", "usage": "hancho-cli worker info <id> [--notes <notes>] [--goal <goal>]", "description": "Update supervisor instructions, notes, or goals."},
         {"name": "install-template", "usage": "hancho-cli worker install-template [--path <dir>] [--dry-run] [--json]", "description": "Write .claude/agents/hancho-runner.md (a Claude Code subagent that runs long commands through Hancho) under <dir>. Default: the current directory. An existing file is not overwritten."},
-        {"name": "uninstall-template", "usage": "hancho-cli worker uninstall-template [--path <dir>] [--delete-data-dir] [--dry-run] [--json]", "description": "Remove .claude/agents/hancho-runner.md (the inverse of install-template); empty .claude/agents and .claude directories are removed too. Add --delete-data-dir to also delete the data directory."}
+        {"name": "uninstall-template", "usage": "hancho-cli worker uninstall-template [--path <dir>] [--delete-data-dir] [--dry-run] [--json]", "description": "Remove .claude/agents/hancho-runner.md (the inverse of install-template); empty .claude/agents and .claude directories are removed too. Add --delete-data-dir to also delete the data directory."},
+        {"name": "probe", "usage": "hancho-cli worker probe --engine <e> [--model <m>] [--timeout <sec>] [--no-cache] [--json]", "description": "Health-check an engine with a minimal prompt. Returns {ok, engine, model, elapsedMs, failureClass?, detail?, cached}. Result is cached in <data-dir>/probes.json (success 10 min, failure 2 min by default)."},
+        {"name": "health", "usage": "hancho-cli worker health [--json] | worker health --reset <engine/model>", "description": "List the shared engine-health registry (<data-dir>/engine-health.json): status, reason, since, nextProbeAt, probeCount, retryAt. --reset marks an engine healthy again. Down engines hold their jobs until a core probe succeeds."}
       ],
       "options": [
         {"name": "--tail", "value": "<n>", "description": "For stream: number of recent events."},
@@ -3171,7 +3189,57 @@ void PrintCliUsageJson() {
         {"name": "--dry-run", "description": "For install-template/uninstall-template: print the target without writing or deleting it."},
         {"name": "--delete-data-dir", "description": "For uninstall-template: also delete the data directory (kept by default)."},
         {"name": "--notes", "value": "<text>", "description": "For info: supervisor notes."},
-        {"name": "--goal", "value": "<text>", "description": "For info: supervisor goal."}
+        {"name": "--goal", "value": "<text>", "description": "For info: supervisor goal."},
+        {"name": "--engine", "value": "<e>", "description": "For probe: engine from engines.json (required)."},
+        {"name": "--model", "value": "<m>", "description": "For probe: model override."},
+        {"name": "--timeout", "value": "<sec>", "description": "For probe: timeout in seconds (default 60)."},
+        {"name": "--no-cache", "description": "For probe: ignore and overwrite the cached result."},
+        {"name": "--reset", "value": "<engine/model>", "description": "For health: mark an engine healthy again."}
+      ]
+    },
+    {
+      "name": "llm",
+      "description": "Edit the three per-role LLM candidate lists in <data-dir>/llms.json (worker, consult, supervisor). Rows added by an LLM are proposed and unused until approved; dashboard-added rows are approved. Every change is recorded in history.",
+      "usage": "hancho-cli llm <list|add|remove|enable|disable|approve|edit> --list <worker|consult|supervisor> [options]",
+      "subcommands": [
+        {"name": "list", "usage": "hancho-cli llm list [--list <l>] [--json]", "description": "Show rows with status; proposed rows are highlighted. Requires nothing else."},
+        {"name": "add", "usage": "hancho-cli llm add --list <l> --engine <e> --model <m> [--provider <p>] [--rank <n>] [--note <t>] --reason \"...\"", "description": "Add a proposed row (approved when called from the dashboard)."},
+        {"name": "remove", "usage": "hancho-cli llm remove --list <l> --engine <e> --model <m> --reason \"...\"", "description": "Remove a row."},
+        {"name": "enable", "usage": "hancho-cli llm enable --list <l> --engine <e> --model <m> --reason \"...\"", "description": "Enable a row."},
+        {"name": "disable", "usage": "hancho-cli llm disable --list <l> --engine <e> --model <m> --reason \"...\"", "description": "Disable a row without deleting it."},
+        {"name": "approve", "usage": "hancho-cli llm approve --list <l> --engine <e> --model <m> --user-said \"<user's words>\"", "description": "Approve a proposed row, quoting the user's words (approvedVia=chat)."},
+        {"name": "edit", "usage": "hancho-cli llm edit --list <l> --engine <e> --model <m> [--new-engine <e>] [--new-model <m>] [--new-provider <p>] --reason \"...\"", "description": "Edit a row. Changing engine/model/provider returns it to proposed."}
+      ],
+      "options": [
+        {"name": "--list", "value": "<worker|consult|supervisor>", "description": "Required for every subcommand except list."},
+        {"name": "--engine", "value": "<e>", "description": "Engine name from engines.json."},
+        {"name": "--model", "value": "<m>", "description": "Model identifier (optionally provider/model)."},
+        {"name": "--provider", "value": "<p>", "description": "Provider; inferred from model when omitted."},
+        {"name": "--rank", "value": "<n>", "description": "Switch priority (default: append)."},
+        {"name": "--note", "value": "<text>", "description": "Free-form note."},
+        {"name": "--reason", "value": "<text>", "description": "Required for add/remove/enable/disable/edit; recorded in history."},
+        {"name": "--user-said", "value": "<text>", "description": "Required for approve; the user's quoted words."}
+      ]
+    },)";
+    std::cout << R"(
+    {
+      "name": "permit",
+      "description": "Manage worker permissions in <data-dir>/permits.json. Proposed rows are not used until approved by a human (dashboard button or `permit approve --user-said`). Approved rows are converted to engine config at worker launch; the user's global config files are never written. Every change is recorded in history.",
+      "usage": "hancho-cli permit <list|request|approve|reject|revoke> [options]",
+      "subcommands": [
+        {"name": "list", "usage": "hancho-cli permit list [--scope <s>] [--json]", "description": "Show permits with status; proposed rows are highlighted."},
+        {"name": "request", "usage": "hancho-cli permit request --kind <read_path|write_path|command|network> --target <glob> [--engine <e>] [--scope <global|taskqueue:name|bt:id>] --reason \"...\"", "description": "Propose a permit (status proposed). Re-requesting an existing target merges it instead of duplicating."},
+        {"name": "approve", "usage": "hancho-cli permit approve <id> --user-said \"<user's words>\"", "description": "Approve a proposal, quoting the user's words (approvedVia=chat)."},
+        {"name": "reject", "usage": "hancho-cli permit reject <id> [--reason \"...\"]", "description": "Reject a proposal (status rejected)."},
+        {"name": "revoke", "usage": "hancho-cli permit revoke <id> --reason \"...\"", "description": "Revoke an approved permit (status revoked)."}
+      ],
+      "options": [
+        {"name": "--kind", "value": "<kind>", "description": "read_path, write_path, command or network."},
+        {"name": "--target", "value": "<glob>", "description": "Path glob (%TEMP% and ~ are expanded at worker launch) or command pattern."},
+        {"name": "--engine", "value": "<e>", "description": "Limit the permit to one engine; omit for all engines."},
+        {"name": "--scope", "value": "<s>", "description": "global (default), taskqueue:<name> or bt:<id>."},
+        {"name": "--reason", "value": "<text>", "description": "Why the permit is needed; recorded in history."},
+        {"name": "--user-said", "value": "<text>", "description": "Required for approve; the user's quoted words."}
       ]
     },
     {
@@ -3330,7 +3398,7 @@ void PrintCliUsageJson() {
           }
         }
       },
-      "tools": ["start_process", "list_processes", "get_process_output", "send_process_input", "wait_process", "kill_process", "run_worker", "wait_worker", "get_worker_stream", "get_worker_state", "update_worker_info", "taskqueue_add", "taskqueue_list", "taskqueue_get", "taskqueue_retry", "taskqueue_update", "taskqueue_cancel", "taskqueue_pause", "taskqueue_resume", "taskqueue_pause_job", "taskqueue_resume_job", "taskqueue_wait", "taskqueue_purge", "taskqueue_link", "taskqueue_unlink", "taskqueue_graph", "bt_validate", "bt_start", "bt_get", "bt_list", "bt_wait", "bt_resume", "bt_retry", "bt_update", "bt_cancel", "bt_pause", "power_suspend", "power_shutdown", "power_cancel", "power_status", "chat_status", "chat_peers", "chat_refresh", "chat_send", "chat_get", "chat_inbox", "chat_wait", "chat_read", "chat_download", "chat_log", "chat_handler", "memory_search", "memory_get", "memory_brief", "memory_stats", "memory_note", "memory_retract", "memory_approve", "usage_stats", "usage_export"]
+      "tools": ["start_process", "list_processes", "get_process_output", "send_process_input", "wait_process", "kill_process", "run_worker", "wait_worker", "get_worker_stream", "get_worker_state", "update_worker_info", "taskqueue_add", "taskqueue_list", "taskqueue_get", "taskqueue_retry", "taskqueue_update", "taskqueue_cancel", "taskqueue_takeover", "taskqueue_complete", "taskqueue_pause", "taskqueue_resume", "taskqueue_pause_job", "taskqueue_resume_job", "taskqueue_wait", "taskqueue_purge", "taskqueue_link", "taskqueue_unlink", "taskqueue_graph", "bt_validate", "bt_start", "bt_get", "bt_list", "bt_wait", "bt_resume", "bt_retry", "bt_update", "bt_cancel", "bt_pause", "bt_template", "power_suspend", "power_shutdown", "power_cancel", "power_status", "chat_status", "chat_peers", "chat_refresh", "chat_send", "chat_get", "chat_inbox", "chat_wait", "chat_read", "chat_download", "chat_log", "chat_handler", "memory_search", "memory_get", "memory_brief", "memory_stats", "memory_note", "memory_retract", "memory_approve", "usage_stats", "usage_export", "worker_health"]
     }
   },
   "leaving": {
@@ -3466,10 +3534,12 @@ void PrintCliUsageJson() {
       "taskGroup": "The task group (the BT root) is a virtual row with id 'group:<id>' and state running, waitingForLlm, paused or failed. It is re-derived on every query and stays until the group succeeds or is closed; a failed group waits for bt_retry, bt_cancel or bt_remove. It is not a queue job; read it with bt_get and answer a waitingForLlm group with bt_resume. include_planned: false (CLI --no-planned) hides it too.",
       "running": "An attempt is executing.",
       "succeeded": "Success conditions met.",
-      "failed": "Attempts exhausted or launch failed.",
+       "failed": "Attempts exhausted or launch failed.",
+       "waitingForPermit": "Stopped after a permission denial: the denied target was auto-requested as a proposed permit. The job is re-run when a human approves it (failed if the request is rejected).",
       "cancelled": "Cancelled; not retried.",
-      "closed": "Force-closed by hand: a terminal state for a stale or invalid row. The scheduler never picks it up and it is not triaged, but it can be retried (single or bulk)."
-    },
+       "closed": "Force-closed by hand: a terminal state for a stale or invalid row. The scheduler never picks it up and it is not triaged, but it can be retried (single or bulk).",
+       "takenOver": "Terminal state recorded by taskqueue takeover (or an escalate answer of takeover): the supervisor owns the work and the job carries a takeover record {by, reason, at, completedAt?, report?, result?}. Dependents stay pending until taskqueue complete records a result."
+     },
     "audit": {
       "status": "preview; rule-based, no LLM call yet",
       "timing_feedback": {
@@ -3819,6 +3889,47 @@ int PrintTaskQueueWhy(const std::string& respJson, bool jsonOutput, const std::s
     if (!retryAt.empty()) std::cout << " (retry at " << retryAt << ")";
     std::cout << "\n";
 
+    auto causes = lastFailure.find("likelyCauses");
+    if (causes != lastFailure.end() && causes->is_array() && !causes->empty()) {
+        std::cout << "Likely causes:\n";
+        for (const auto& c : *causes) {
+            if (!c.is_object()) continue;
+            std::string id = c.value("id", std::string());
+            std::string why = c.value("why", std::string());
+            std::cout << "  - " << id;
+            if (!why.empty()) std::cout << ": " << why;
+            std::cout << "\n";
+        }
+    }
+
+    auto steps = lastFailure.find("nextSteps");
+    if (steps != lastFailure.end() && steps->is_array() && !steps->empty()) {
+        std::cout << "Next steps:\n";
+        for (size_t i = 0; i < steps->size(); ++i) {
+            const auto& s = (*steps)[i];
+            if (!s.is_object()) continue;
+            std::string stepAction = s.value("action", std::string());
+            std::cout << "  " << (i + 1) << ". " << stepAction;
+            if (s.contains("change") && s["change"].is_object() && !s["change"].empty()) {
+                std::cout << " " << s["change"].dump();
+            }
+            if (s.value("needsApproval", false)) {
+                std::cout << " [needs approval]";
+            }
+            if (s.contains("question") && s["question"].is_string() && !s["question"].get<std::string>().empty()) {
+                std::cout << " (" << s["question"].get<std::string>() << ")";
+            }
+            std::cout << "\n";
+        }
+    }
+
+    if (lastFailure.contains("supervisorNote") && lastFailure["supervisorNote"].is_string()) {
+        std::string note = lastFailure["supervisorNote"].get<std::string>();
+        if (!note.empty()) {
+            std::cout << "Supervisor note: " << note << "\n";
+        }
+    }
+
     auto llmGuess = lastFailure.find("llmGuess");
     if (llmGuess != lastFailure.end() && llmGuess->is_object()) {
         std::string guessClass = llmGuess->value("class", std::string());
@@ -4159,9 +4270,34 @@ int PrintResponse(const std::string& action, const std::string& respJson, bool j
     }
 
     if (action.rfind("bt_", 0) == 0) {
+        auto collectBtWarnings = [](const std::string& resp, std::string& text) {
+            nlohmann::json j = nlohmann::json::parse(resp, nullptr, false);
+            if (j.is_discarded() || !j.is_object() || !j.contains("warnings") ||
+                !j["warnings"].is_array()) return size_t(0);
+            const auto& arr = j["warnings"];
+            std::ostringstream oss;
+            for (const auto& w : arr) {
+                if (!w.is_object()) continue;
+                oss << "  warning " << w.value("path", std::string()) << ": "
+                    << w.value("code", std::string()) << ": "
+                    << w.value("message", std::string()) << "\n"
+                    << "    " << w.value("suggestion", std::string()) << "\n";
+            }
+            text = oss.str();
+            return arr.size();
+        };
+        std::string warningText;
         if (action == "bt_validate") {
-            std::cout << "Behavior tree definition is valid.\n";
+            size_t count = collectBtWarnings(respJson, warningText);
+            if (count == 0) std::cout << "Behavior tree definition is valid.\n";
+            else std::cout << "Behavior tree definition is valid with " << count << " warning(s):\n"
+                           << warningText;
             return 0;
+        }
+        if (action == "bt_start") {
+            size_t count = collectBtWarnings(respJson, warningText);
+            if (count > 0) std::cout << "Behavior tree started with " << count << " warning(s):\n"
+                                     << warningText;
         }
         if (action == "bt_list") {
             auto trees = ExtractJsonObjectArray(respJson, "trees");
@@ -5909,6 +6045,290 @@ static int RunIpmsgCommand(const std::vector<std::string>& args, bool jsonOutput
                 "handler, clear)");
 }
 
+int RunLlmCommand(const std::vector<std::string>& args, bool jsonOutput) {
+    const std::string op = args.size() > 2 ? args[2] : "list";
+    auto argVal = [&args](const std::string& flag) -> std::string {
+        for (size_t i = 3; i + 1 < args.size(); ++i) {
+            if (args[i] == flag) return args[i + 1];
+        }
+        return "";
+    };
+    auto hasFlag = [&args](const char* flag) {
+        return std::find(args.begin() + 3, args.end(), flag) != args.end();
+    };
+    auto failWith = [&](const std::string& msg) {
+        if (jsonOutput) std::cout << "{\"ok\":false,\"error\":\"" << JsonEscape(msg) << "\"}\n";
+        else std::cerr << "Error: " << msg << "\n";
+        return 1;
+    };
+    auto printResult = [&](const llm::Result& r) {
+        if (jsonOutput) {
+            std::cout << (r.ok ? r.data : nlohmann::json{{"ok", false}, {"error", r.error}}).dump(2) << "\n";
+        } else if (!r.ok) {
+            std::cerr << "Error: " << r.error << "\n";
+        } else {
+            std::cout << "ok " << r.data.value("list", "") << " " << r.data.value("entry", nlohmann::json()).dump() << "\n";
+        }
+        return r.ok ? 0 : 1;
+    };
+
+    const std::wstring path = llm::DefaultPath();
+    if (op == "list") {
+        llm::Result r = llm::List(path, argVal("--list"));
+        if (!r.ok) return failWith(r.error);
+        if (jsonOutput) {
+            std::cout << r.data.dump(2) << "\n";
+            return 0;
+        }
+        for (const char* name : {llm::kWorker, llm::kConsult, llm::kSupervisor}) {
+            std::cout << "[" << name << "]\n";
+            for (const auto& row : r.data.value(name, nlohmann::json::array())) {
+                bool approved = row.value("status", std::string()) == "approved";
+                bool enabled = row.value("enabled", true);
+                std::cout << "  " << (approved ? (enabled ? "[ok] " : "[disabled] ") : "[PROPOSED] ")
+                          << row.value("rank", 0) << ". " << row.value("engine", "")
+                          << "/" << row.value("model", "")
+                          << " (provider " << row.value("provider", "") << ")";
+                if (!row.value("note", std::string()).empty())
+                    std::cout << " - " << row.value("note", std::string());
+                std::cout << "\n";
+            }
+        }
+        const auto pending = r.data.value("proposed", nlohmann::json::array());
+        if (!pending.empty()) {
+            std::cout << "NOTE: " << pending.size()
+                      << " proposed row(s) are not used until approved (dashboard or `llm approve --user-said`).\n";
+        }
+        return 0;
+    }
+
+    const std::string list = argVal("--list");
+    if (!llm::IsValidList(list)) return failWith("--list worker|consult|supervisor is required");
+    const std::string engine = argVal("--engine");
+    const std::string model = argVal("--model");
+    const std::string reason = argVal("--reason");
+    const std::string by = "cli";
+
+    if (op == "add") {
+        int rank = 0;
+        bool hasRank = false;
+        std::string rankStr = argVal("--rank");
+        if (!rankStr.empty()) {
+            try { rank = std::stoi(rankStr); hasRank = true; }
+            catch (...) { return failWith("--rank must be an integer"); }
+        }
+        return printResult(llm::Add(path, list, engine, model, argVal("--provider"), rank, hasRank,
+                                    argVal("--note"), by, reason));
+    }
+    if (op == "remove") {
+        if (reason.empty()) return failWith("remove requires --reason \"...\"");
+        return printResult(llm::Remove(path, list, engine, model, by, reason));
+    }
+    if (op == "enable" || op == "disable") {
+        if (reason.empty()) return failWith(op + " requires --reason \"...\"");
+        return printResult(llm::SetEnabled(path, list, engine, model, op == "enable", by, reason));
+    }
+    if (op == "approve") {
+        return printResult(llm::Approve(path, list, engine, model, argVal("--user-said"), by));
+    }
+    if (op == "edit") {
+        if (reason.empty()) return failWith("edit requires --reason \"...\"");
+        return printResult(llm::Edit(path, list, engine, model, argVal("--new-engine"),
+                                     argVal("--new-model"), argVal("--new-provider"), by, reason));
+    }
+    (void)hasFlag;
+    return failWith("unknown llm command: " + op + " (list, add, remove, enable, disable, approve, edit)");
+}
+
+int RunPermitCommand(const std::vector<std::string>& args, bool jsonOutput) {
+    const std::string op = args.size() > 2 ? args[2] : "list";
+    auto argVal = [&args](const std::string& flag) -> std::string {
+        for (size_t i = 3; i + 1 < args.size(); ++i) {
+            if (args[i] == flag) return args[i + 1];
+        }
+        return "";
+    };
+    auto failWith = [&](const std::string& msg) {
+        if (jsonOutput) std::cout << "{\"ok\":false,\"error\":\"" << JsonEscape(msg) << "\"}\n";
+        else std::cerr << "Error: " << msg << "\n";
+        return 1;
+    };
+    auto printResult = [&](const permit::Result& r) {
+        if (jsonOutput) {
+            std::cout << (r.ok ? r.data : nlohmann::json{{"ok", false}, {"error", r.error}}).dump(2) << "\n";
+        } else if (!r.ok) {
+            std::cerr << "Error: " << r.error << "\n";
+        } else {
+            std::cout << "ok " << r.data.value("action", std::string())
+                      << " " << r.data.value("entry", nlohmann::json()).dump() << "\n";
+        }
+        return r.ok ? 0 : 1;
+    };
+
+    const std::wstring path = permit::DefaultPath();
+    if (op == "list") {
+        permit::Result r = permit::List(path, argVal("--scope"));
+        if (!r.ok) return failWith(r.error);
+        if (jsonOutput) {
+            std::cout << r.data.dump(2) << "\n";
+            return 0;
+        }
+        for (const auto& row : r.data.value("permits", nlohmann::json::array())) {
+            const bool approved = row.value("status", std::string()) == "approved";
+            std::string status = row.value("status", std::string());
+            for (char& c : status) c = static_cast<char>(std::toupper(static_cast<unsigned char>(c)));
+            std::cout << (approved ? "[ok] " : "[" + status + "] ")
+                      << row.value("kind", "") << " " << row.value("target", "")
+                      << " (scope " << row.value("scope", "") << ", engines ";
+            const auto engines = row.value("engines", nlohmann::json::array());
+            if (engines.empty()) std::cout << "all";
+            else {
+                for (size_t i = 0; i < engines.size(); ++i) {
+                    if (i) std::cout << ",";
+                    std::cout << engines[i].get<std::string>();
+                }
+            }
+            std::cout << ")\n";
+        }
+        const auto pending = r.data.value("proposed", nlohmann::json::array());
+        if (!pending.empty()) {
+            std::cout << "NOTE: " << pending.size()
+                      << " proposed permit(s) are not used until approved (dashboard or `permit approve --user-said`).\n";
+        }
+        return 0;
+    }
+    const std::string id = op == "request" ? "" : args.size() > 3 ? args[3] : "";
+    const std::string by = "cli";
+    if (op == "request") {
+        std::vector<std::string> engines;
+        const std::string engine = argVal("--engine");
+        if (!engine.empty()) engines.push_back(engine);
+        return printResult(permit::Request(path, argVal("--kind"), argVal("--target"), engines,
+                                           argVal("--scope"), argVal("--reason"), by));
+    }
+    if (id.empty()) return failWith("permit " + op + " requires an <id> (see `permit list`)");
+    if (op == "approve") {
+        return printResult(permit::Approve(path, id, argVal("--user-said"), by));
+    }
+    if (op == "revoke") {
+        if (argVal("--reason").empty()) return failWith("revoke requires --reason \"...\"");
+        return printResult(permit::Revoke(path, id, argVal("--reason"), by));
+    }
+    if (op == "reject") {
+        return printResult(permit::Reject(path, id, argVal("--reason"), by));
+    }
+    return failWith("unknown permit command: " + op + " (list, request, approve, reject, revoke)");
+}
+
+int RunWorkerProbeCommand(const std::vector<std::string>& args, bool jsonOutput) {
+    std::string engine, model;
+    int timeoutSec = 60;
+    bool noCache = false;
+    for (size_t i = 3; i < args.size(); ++i) {
+        const std::string& a = args[i];
+        if ((a == "--engine" || a == "-e") && i + 1 < args.size()) engine = args[++i];
+        else if ((a == "--model" || a == "-m") && i + 1 < args.size()) model = args[++i];
+        else if ((a == "--timeout" || a == "-t") && i + 1 < args.size()) {
+            try { timeoutSec = std::stoi(args[++i]); }
+            catch (...) { timeoutSec = 60; }
+        }
+        else if (a == "--no-cache") noCache = true;
+    }
+    if (engine.empty()) {
+        if (jsonOutput) std::cout << "{\"ok\":false,\"error\":\"--engine is required\"}\n";
+        else std::cerr << "Error: --engine is required\n";
+        return 1;
+    }
+    WorkerEngineRegistry registry;
+    const std::wstring enginesPath = PathJoinWide(GetEffectiveDataDirectoryWide(), L"engines.json");
+    std::string engErr;
+    if (PathExistsWide(enginesPath)) {
+        registry.LoadFromJson(ReadFileUtf8Wide(enginesPath), engErr);
+    }
+    ProbeOptions opts;
+    opts.timeoutSec = timeoutSec > 0 ? timeoutSec : 60;
+    opts.noCache = noCache;
+    ProbeOutcome out = ProbeEngine(registry, engine, model, opts);
+    if (jsonOutput) {
+        std::cout << out.ToJson().dump(2) << "\n";
+    } else {
+        std::cout << (out.ok ? "OK " : "FAIL ") << out.engine << "/" << out.model
+                  << " " << out.elapsedMs << "ms" << (out.cached ? " (cached)" : "");
+        if (!out.failureClass.empty()) std::cout << " " << out.failureClass;
+        if (!out.detail.empty()) std::cout << " - " << out.detail;
+        std::cout << "\n";
+    }
+    return out.ok ? 0 : 1;
+}
+
+static int RunWorkerHealthCommand(const std::vector<std::string>& args, bool jsonOutput) {
+    namespace eh = engine_health;
+    std::string resetKey;
+    for (size_t i = 3; i < args.size(); ++i) {
+        const std::string& a = args[i];
+        if (a == "--reset" && i + 1 < args.size()) resetKey = args[++i];
+        else if (a.rfind("--reset=", 0) == 0) resetKey = a.substr(8);
+    }
+    const std::wstring path = eh::DefaultPath();
+    auto fail = [&](const std::string& msg) {
+        if (jsonOutput) std::cout << "{\"ok\":false,\"error\":\"" << JsonEscape(msg) << "\"}\n";
+        else std::cerr << "Error: " << msg << "\n";
+        return 1;
+    };
+    if (!resetKey.empty()) {
+        const size_t slash = resetKey.find('/');
+        if (slash == std::string::npos || slash == 0 || slash + 1 == resetKey.size()) {
+            return fail("--reset expects <engine/model>");
+        }
+        const std::string engine = resetKey.substr(0, slash);
+        const std::string model = resetKey.substr(slash + 1);
+        if (!eh::Reset(path, engine, model, eh::NowEpochMs())) {
+            return fail("could not reset " + resetKey);
+        }
+        if (jsonOutput) {
+            std::cout << "{\"ok\":true,\"reset\":\"" << JsonEscape(resetKey)
+                      << "\",\"status\":\"healthy\"}\n";
+        } else {
+            std::cout << "OK " << resetKey << " -> healthy\n";
+        }
+        return 0;
+    }
+
+    eh::Store store;
+    std::string err;
+    if (!eh::Load(path, store, err)) return fail(err.empty() ? "could not read engine health" : err);
+    nlohmann::json out = {
+        {"ok", true},
+        {"file", WideToUtf8(path)},
+        {"engines", nlohmann::json::object()},
+    };
+    int down = 0;
+    for (const auto& kv : store.entries) {
+        out["engines"][kv.first] = kv.second.ToJson();
+        if (kv.second.status == "down") down++;
+    }
+    out["downCount"] = down;
+    if (jsonOutput) {
+        std::cout << out.dump(2) << "\n";
+    } else {
+        if (store.entries.empty()) {
+            std::cout << "No engine health records.\n";
+        } else {
+            for (const auto& kv : store.entries) {
+                const auto& e = kv.second;
+                std::cout << (e.status == "down" ? "DOWN " : "OK   ") << kv.first;
+                if (e.status == "down") {
+                    std::cout << " since " << e.sinceMs << " reason=" << e.reason
+                              << " probeCount=" << e.probeCount;
+                    if (e.retryAtMs > 0) std::cout << " retryAt=" << e.retryAtMs;
+                }
+                std::cout << "\n";
+            }
+        }
+    }
+    return 0;
+}
+
 int RunCli(const std::vector<std::string>& rawArgs) {
     std::vector<std::string> args;
     args.push_back(rawArgs.empty() ? "hancho-cli" : rawArgs[0]);
@@ -5959,6 +6379,8 @@ int RunCli(const std::vector<std::string>& rawArgs) {
     if (subcmd == "export") return RunExportCommand(args, 2, jsonOutput);
     if (subcmd == "reset") return RunProjectReset(args, jsonOutput);
     if (subcmd == "top") return RunTopCommand(args, jsonOutput);
+    if (subcmd == "llm") return RunLlmCommand(args, jsonOutput);
+    if (subcmd == "permit") return RunPermitCommand(args, jsonOutput);
     if (subcmd == "web" || subcmd == "ui") return RunWebCommand(args, jsonOutput);
     if (subcmd == "hosts") return RunHostsCommand(args, jsonOutput);
     if (subcmd == "usage") return RunUsageCommand(args, 2, jsonOutput);
@@ -6385,7 +6807,7 @@ if (subcmd == "start" || subcmd == "run") {
         };
         // First non-flag argument, skipping the values of flags that take one (e.g. "--since 6h").
         auto positionalSkippingValues = [&args](size_t startIdx) -> std::string {
-            static const char* const valueFlags[] = {"--state", "--since", "--origin", "--rev", "--root", "--states", "--older-than-days", "--bt"};
+            static const char* const valueFlags[] = {"--state", "--since", "--origin", "--rev", "--root", "--states", "--older-than-days", "--bt", "--reason", "--report", "--result"};
             for (size_t i = startIdx; i < args.size(); ++i) {
                 bool isValueFlag = false;
                 for (const char* f : valueFlags) {
@@ -6625,6 +7047,29 @@ if (subcmd == "start" || subcmd == "run") {
             reqJson << "{\"action\":\"taskqueue_remove\",\"id\":\"" << JsonEscape(id)
                     << "\",\"force\":" << (force ? "true" : "false") << "}";
             subcmd = "taskqueue_remove";
+        } else if (op == "takeover") {
+            std::string id = argVal("--id", "");
+            if (id.empty()) id = positionalSkippingValues(3);
+            if (id.empty()) return failWith("takeover requires a job id (or --id).");
+            const std::string reason = argVal("--reason", "");
+            if (reason.empty()) return failWith("takeover requires --reason \"...\".");
+            reqJson << "{\"action\":\"taskqueue_takeover\",\"id\":\"" << JsonEscape(id)
+                    << "\",\"by\":\"cli\",\"reason\":\"" << JsonEscape(reason) << "\"}";
+            subcmd = "taskqueue_takeover";
+        } else if (op == "complete") {
+            std::string id = argVal("--id", "");
+            if (id.empty()) id = positionalSkippingValues(3);
+            if (id.empty()) return failWith("complete requires a job id (or --id).");
+            const std::string reason = argVal("--reason", "");
+            if (reason.empty()) return failWith("complete requires --reason \"...\".");
+            const std::string result = argVal("--result", "succeeded");
+            if (result != "succeeded" && result != "failed")
+                return failWith("--result must be succeeded or failed.");
+            reqJson << "{\"action\":\"taskqueue_complete\",\"id\":\"" << JsonEscape(id)
+                    << "\",\"reason\":\"" << JsonEscape(reason)
+                    << "\",\"report\":\"" << JsonEscape(argVal("--report", ""))
+                    << "\",\"result\":\"" << JsonEscape(result) << "\"}";
+            subcmd = "taskqueue_complete";
         } else if (op == "close") {
             std::string id = argVal("--id", "");
             if (id.empty()) id = firstPositional(3);
@@ -6633,7 +7078,7 @@ if (subcmd == "start" || subcmd == "run") {
             subcmd = "taskqueue_close";
         } else {
             return failWith("unknown taskqueue command: " + op +
-                            " (add, list, get, why, retry, cancel, close, pause, resume, pause-job, resume-job, graph, wait, purge, remove, update)");
+                            " (add, list, get, why, retry, cancel, takeover, complete, close, pause, resume, pause-job, resume-job, graph, wait, purge, remove, update)");
         }
     }
     else if (subcmd == "quickfix") {
@@ -6712,7 +7157,9 @@ if (subcmd == "start" || subcmd == "run") {
             std::cout
                 << "Usage: hancho-cli bt <subcommand> [options] [--json]\n\n"
                 << "Subcommands:\n"
-                << "  validate  --file <path> | --bt <json>              Validate a behavior tree JSON definition\n"
+                << "  validate  --file <path> | --bt <json> [--strict]\n"
+                << "                                                     Validate a BT (--strict: warnings are errors)\n"
+                << "  template  [<name>] [--json]                        Show a hang-safe BT template (list when no name)\n"
                 << "  start     --file <path> | --bt <json> [--paused true|false]\n"
                 << "                                                     Register and start (--paused true: register only)\n"
                 << "  get       --id <id> [--compact]                    Get behavior tree state and node status\n"
@@ -6758,6 +7205,7 @@ if (subcmd == "start" || subcmd == "run") {
         std::string fromNode;
         bool resetCounters = false;
         bool compact = false;
+        bool strict = false;
         bool paused = true;
         bool startPaused = false;
         uint64_t sinceVersion = 0;
@@ -6784,6 +7232,11 @@ if (subcmd == "start" || subcmd == "run") {
                 if (i + 1 < args.size() && (args[i + 1] == "true" || args[i + 1] == "false")) {
                     compact = (args[++i] == "true");
                 }
+            } else if (a == "--strict") {
+                strict = true;
+                if (i + 1 < args.size() && (args[i + 1] == "true" || args[i + 1] == "false")) {
+                    strict = (args[++i] == "true");
+                }
             } else if (a == "--paused") {
                 if (i + 1 < args.size() && args[i + 1][0] != '-') {
                     std::string pv = args[++i];
@@ -6802,6 +7255,8 @@ if (subcmd == "start" || subcmd == "run") {
                 else if (id.empty()) id = a;
             }
         }
+
+        if (op == "template") return RunBtTemplateCommand(args, jsonOutput);
 
         auto loadBtText = [&](std::string& outText) -> bool {
             if (!btRaw.empty()) {
@@ -6833,6 +7288,7 @@ if (subcmd == "start" || subcmd == "run") {
             }
             jReq["action"] = "bt_" + op;
             jReq["bt"] = text;
+            if (op == "validate") jReq["strict"] = strict;
             if (op == "start") {
                 jReq["paused"] = startPaused;
                 jReq["origin"] = nlohmann::json::parse(BuildCallerOriginJson("hancho-cli-cli", ""), nullptr, false);
@@ -6932,6 +7388,8 @@ if (subcmd == "start" || subcmd == "run") {
         // Local file write only: no process ID and no IPC.
         if (op == "install-template") return RunAgentInstallTemplate(args, startIdx, jsonOutput);
         if (op == "uninstall-template") return RunAgentUninstallTemplate(args, startIdx, jsonOutput);
+        if (op == "probe") return RunWorkerProbeCommand(args, jsonOutput);
+    if (op == "health") return RunWorkerHealthCommand(args, jsonOutput);
         int id = 0;
         int tail = 50;
         std::string typeFilter;

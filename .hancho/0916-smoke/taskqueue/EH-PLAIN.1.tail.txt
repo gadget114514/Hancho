@@ -1,0 +1,50 @@
+[Hancho] Process Exited (completed)
+Exit Code   : 0
+End Time    : 2026-11-20 06:26:41
+Uptime      : 00:00:00 (0.0s)
+Done File   : D:\wsgit\Hancho\.hancho\0916-smoke\proc_64.done
+================================================================================
+================================================================================
+Hancho Process Log
+ID          : #69
+Name        : EH-PLAIN
+Command     : cmd /c echo OK
+Working Dir : D:\wsgit\Hancho
+Mode        : pipe
+Root PID    : 11084
+Start Time  : 2026-11-20 06:31:52
+Log File    : D:\wsgit\Hancho\.hancho\0916-smoke\taskqueue\EH-PLAIN.1.log
+Done File   : D:\wsgit\Hancho\.hancho\0916-smoke\proc_69.done
+================================================================================
+
+OK
+
+================================================================================
+[Hancho] Process Exited (completed)
+Exit Code   : 0
+End Time    : 2026-11-20 06:31:52
+Uptime      : 00:00:00 (0.2s)
+Done File   : D:\wsgit\Hancho\.hancho\0916-smoke\proc_69.done
+================================================================================
+================================================================================
+Hancho Process Log
+ID          : #74
+Name        : EH-PLAIN
+Command     : cmd /c echo OK
+Working Dir : D:\wsgit\Hancho
+Mode        : pipe
+Root PID    : 6484
+Start Time  : 2026-11-20 06:36:11
+Log File    : D:\wsgit\Hancho\.hancho\0916-smoke\taskqueue\EH-PLAIN.1.log
+Done File   : D:\wsgit\Hancho\.hancho\0916-smoke\proc_74.done
+================================================================================
+
+OK
+
+================================================================================
+[Hancho] Process Exited (completed)
+Exit Code   : 0
+End Time    : 2026-11-20 06:36:11
+Uptime      : 00:00:00 (0.2s)
+Done File   : D:\wsgit\Hancho\.hancho\0916-smoke\proc_74.done
+================================================================================

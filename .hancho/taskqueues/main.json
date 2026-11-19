@@ -1,0 +1,12 @@
+{
+  "name": "main",
+  "concurrency": 1,
+  "paused": false,
+  "version": 2,
+  "notify_file": "",
+  "max_timeout_sec": 7200,
+  "default_max_attempts": 2,
+  "jobs": [
+    {"id":"fix-bt-smoke-wt","taskqueue":"main","name":"fix-bt-smoke-wt","summary":"Fix behavior_tree_smoke failures (worker, piped prompt)","instructions":{"source":"","rev":1,"sha256":"","text":"","captured_at":"2026-11-19 16:39:56"},"command":"powershell -NoProfile -Command \"Get-Content -Raw 'C:/Users/bluen/AppData/Local/Temp/claude/e0df2482ede3c0cf/87ee4905-adb3-476d-803a-b68e15ba6173/scratchpad/worker_prompt.md' | claude -p --output-format text\"","cwd":"D:/wsgit/Hancho/.claude/worktrees/strange-zhukovsky-318173","host":"","env":{},"depends_on":[],"timeout_sec":3600,"estimate_sec":0,"idle":{"output_sec":0,"cpu_sec":0},"max_attempts":2,"retry_delay_sec":0,"defer":{"exit_codes":[75],"delay_sec":60,"limit":60},"success":{"exit_code":0,"files_newer":[],"output_regex":null},"kill_exclude":[],"resources":{"write":[],"read":[]},"memory":{"inject":false,"budget_chars":1500,"scopes":[],"include_agent_notes":true},"priority":0,"hidden":false,"paused":false,"suspend_when_done":false,"suspend_delay_sec":0,"suspend_hibernate":false,"shutdown_when_done":false,"shutdown_delay_sec":0,"state":"succeeded","attempts":[{"n":1,"process_id":1,"start":"2026-11-19 16:39:56","end":"2026-11-19 16:41:34","reason":"ok","exit_code":0,"instructions_rev":1,"last_lines_file":"D:\\wsgit\\Hancho\\.hancho\\taskqueue\\fix-bt-smoke-wt.1.tail.txt","check_detail":"ok"}],"blocked_by":null,"created_at":"2026-11-19 16:39:56","updated_at":"2026-11-19 16:41:34","notes":"","origin":{"label":"","client":"hancho-cli-cli","session":"5042942d-ce4f-4f6e-9f9d-ff269f5c3f4f","host_session":"local_f7a2ef0f-3a01-4eee-b954-c4d972666730","cwd":"D:\\wsgit\\Hancho\\.claude\\worktrees\\strange-zhukovsky-318173","pid":23268}}
+  ]
+}

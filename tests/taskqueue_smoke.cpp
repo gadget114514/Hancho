@@ -2,6 +2,7 @@
 #include "../src/chain_guard.h"
 #include "../src/common.h"
 #include "../src/llm_stream.h"
+#include "../src/llm_config.h"
 #include "../src/memory_search.h"
 #include <windows.h>
 #include <ctime>
@@ -148,15 +149,105 @@ int main() {
             in.endKind = "timed_out";
             in.timeoutSec = 90;
             in.elapsedSec = 91;
+            in.events.push_back(event("tool.call", 1, R"({"activity":"build","target":"app"})"));
+            in.lastActivity = "build";
+            in.lastActivitySinceSec = 5;
             auto d = classified(in, "timeout", "raise_timeout");
             Check(d.evidence[0].IsLog() && d.evidence[0].line == 102, "timeout evidence is the last log line");
+        }
+        {
+            // timeout stalled mid-run (sinceSec 50 > threshold 30) -> timeout with retry and nextSteps
+            TaskQueueFailureInput in = makeBase();
+            in.endKind = "timed_out";
+            in.timeoutSec = 90;
+            in.elapsedSec = 91;
+            in.events.push_back(event("tool.call", 1, R"({"activity":"build","target":"app","tool":"compiler"})"));
+            in.lastActivity = "build";
+            in.lastActivitySinceSec = 50;
+            auto d = classified(in, "timeout", "retry");
+            Check(d.detail.value("stalled", false), "timeout stalled mid-run sets stalled detail");
+            Check(d.detail.value("lastTool", "") == "compiler", "timeout stalled detail has lastTool");
+            Check(!d.nextSteps.empty(), "timeout stalled has nextSteps");
+            Check(d.evidence[0].IsEvent() && d.evidence[0].seq == 1, "timeout stalled evidence is the last event");
         }
         {
             TaskQueueFailureInput in = makeBase();
             in.endKind = "idle_timed_out";
             in.idleOutputSec = 60;
             in.idleCpuSec = 30;
+            in.events.push_back(event("tool.call", 1, R"({"activity":"build","target":"app"})"));
             classified(in, "idle_stall", "retry");
+        }
+        // 090-1 hang diagnosis tests
+        {
+            // 0 events timeout -> startup_hang and NOT raise_timeout
+            TaskQueueFailureInput in = makeBase();
+            in.endKind = "timed_out";
+            in.timeoutSec = 3600;
+            in.elapsedSec = 3600;
+            auto d = classified(in, "startup_hang", "retry_with_change");
+            Check(d.suggestedAction != "raise_timeout", "0-event timeout does not suggest raise_timeout");
+            Check(d.summary.find("3600 s") != std::string::npos, "startup_hang summary includes elapsed time");
+            Check(d.confidence == "high", "startup_hang has high confidence");
+            Check(!d.supervisorNote.empty(), "startup_hang carries supervisorNote");
+            Check(d.supervisorNote.find("takeover") != std::string::npos, "supervisorNote mentions takeover");
+        }
+        {
+            // opencode without --model -> no_model in likelyCauses
+            TaskQueueFailureInput in = makeBase();
+            in.endKind = "timed_out";
+            in.timeoutSec = 60;
+            in.command = "opencode run \"Execute card.md\"";
+            auto d = classified(in, "startup_hang", "retry_with_change");
+            bool foundNoModel = false;
+            for (const auto& c : d.likelyCauses) {
+                if (c.id == "no_model") foundNoModel = true;
+            }
+            Check(foundNoModel, "opencode without --model reports no_model likelyCause");
+        }
+        {
+            // nextSteps head changes with attempt count:
+            // 1st attempt: retry
+            TaskQueueFailureInput in1 = makeBase();
+            in1.endKind = "timed_out";
+            in1.attempt = 1;
+            auto d1 = classified(in1, "startup_hang", "retry_with_change");
+            Check(!d1.nextSteps.empty() && d1.nextSteps[0].action == "retry" && d1.nextSteps[0].change.is_null(),
+                  "attempt 1 nextSteps head is retry unchanged");
+
+            // 2nd attempt: retry with change and needsApproval
+            TaskQueueFailureInput in2 = makeBase();
+            in2.endKind = "timed_out";
+            in2.attempt = 2;
+            in2.command = "opencode run \"card\"";
+            auto d2 = classified(in2, "startup_hang", "retry_with_change");
+            Check(!d2.nextSteps.empty() && d2.nextSteps[0].action == "retry" &&
+                  d2.nextSteps[0].change.is_object() && d2.nextSteps[0].needsApproval,
+                  "attempt 2 nextSteps head is retry with change and needsApproval");
+
+            // 3rd attempt: escalate
+            TaskQueueFailureInput in3 = makeBase();
+            in3.endKind = "timed_out";
+            in3.attempt = 3;
+            auto d3 = classified(in3, "startup_hang", "retry_with_change");
+            Check(!d3.nextSteps.empty() && d3.nextSteps[0].action == "escalate" && !d3.nextSteps[0].question.empty(),
+                  "attempt 3 nextSteps head is escalate with question");
+        }
+        {
+            // 090-2: startup_timed_out classified as startup_hang with detail.idleFirstEventSec and processTree
+            TaskQueueFailureInput in = makeBase();
+            in.endKind = "startup_timed_out";
+            in.idleFirstEventSec = 180;
+            in.processTree = nlohmann::json::array({
+                {{"name", "claude.exe"}, {"pid", 1234}, {"cpuSec", 0.5}}
+            });
+            auto d = classified(in, "startup_hang", "retry_with_change");
+            Check(d.summary.find("180 s") != std::string::npos, "startup_timed_out summary mentions 180 s");
+            Check(d.detail.value("endKind", "") == "startup_timed_out", "diagnostic detail carries endKind");
+            Check(d.detail.value("idleFirstEventSec", 0) == 180, "diagnostic detail carries idleFirstEventSec");
+            Check(d.detail.contains("processTree") && d.detail["processTree"].is_array() && d.detail["processTree"].size() == 1,
+                  "diagnostic detail carries processTree snapshot");
+            Check(d.detail["processTree"][0]["name"] == "claude.exe", "processTree snapshot item preserved");
         }
         {
             TaskQueueFailureInput in = makeBase();
@@ -383,6 +474,89 @@ int main() {
     }
 
     {
+        // 091-7 (1): a denied tool call outranks a rate-limit log line (the 090-2/090-3
+        // misdiagnosis), and its evidence names the tool, target and engine.
+        auto base = []() {
+            TaskQueueFailureInput in;
+            in.jobId = "0917";
+            in.jobName = "worker";
+            in.taskqueue = "q";
+            in.attempt = 1;
+            in.maxAttempts = 2;
+            in.expectedExitCode = 0;
+            in.eventsFile = "C:/logs/proc_0917.events.jsonl";
+            in.logFile = "C:/logs/0917.1.log";
+            in.logText = "usage limit reached; too many requests (429)\n";
+            in.logFirstLine = 10;
+            in.logLastLine = 10;
+            in.fallbackEventsFile = "C:/logs/taskqueue-q.events.jsonl";
+            in.fallbackEventSeq = 9;
+            in.nowEpochSec = 1794288000;
+            return in;
+        };
+        auto ev = [](const std::string& kind, uint64_t seq, const std::string& data,
+                     const std::string& agent = "") {
+            std::string s = "{\"schema\":\"hancho.event/1\",\"seq\":" + std::to_string(seq) +
+                            ",\"ts\":\"2026-11-19T09:00:00Z\",\"kind\":\"" + kind +
+                            "\",\"data\":" + data;
+            if (!agent.empty()) s += ",\"agent\":{\"sessionId\":\"" + agent + "\"}";
+            return nlohmann::json::parse(s + "}", nullptr, false);
+        };
+        TaskQueueFailureInput in = base();
+        in.engine = "opencode";
+        in.events.push_back(ev("tool.call", 1,
+            R"({"tool":"read","toolUseId":"u1","activity":"read","target":"C:/Users/x/.config/opencode/AGENTS.md"})",
+            "sess-1"));
+        in.events.push_back(ev("tool.result", 2,
+            R"({"toolUseId":"u1","ok":false,"error":"Error: The user has specified a rule which prevents you from using this specific tool call."})"));
+        auto d = ClassifyTaskQueueFailure(in);
+        Check(d.failureClass == "permission_denied",
+              "opencode denial beats the rate-limit log line (got " + d.failureClass + ")");
+        Check(d.detail.value("source", std::string()) == "event", "denial source is the tool result");
+        Check(d.detail["permission"].value("tool", std::string()) == "read", "evidence tool recorded");
+        Check(d.detail["permission"].value("target", std::string()).find("AGENTS.md") != std::string::npos,
+              "evidence target recorded");
+        Check(d.detail["permission"].value("engine", std::string()) == "opencode", "evidence engine recorded");
+        Check(!d.evidence.empty() && d.evidence[0].tool == "read" &&
+                  d.evidence[0].target.find("AGENTS.md") != std::string::npos &&
+                  d.evidence[0].engine == "opencode",
+              "evidence carries {tool, target, engine}");
+        bool hasFix = false, hasPermit = false, hasEscalate = false;
+        for (const auto& s : d.nextSteps) {
+            if (s.action == "fix_spec") hasFix = true;
+            if (s.action == "permit_request") hasPermit = true;
+            if (s.action == "escalate") hasEscalate = true;
+        }
+        Check(hasFix && hasPermit && hasEscalate, "three nextSteps: fix / permit request / escalate");
+        Check(TaskQueueFailureDiagnosticToJson(d).find("permit_request") != std::string::npos,
+              "nextSteps are serialized for BT / triage");
+
+        // The 2026-11-19 literal wording from the design is recognized too.
+        TaskQueueFailureInput other = base();
+        other.events.push_back(ev("tool.result", 3,
+            R"({"toolUseId":"u2","ok":false,"error":"The user rejected permission to use this specific tool call."})"));
+        Check(ClassifyTaskQueueFailure(other).failureClass == "permission_denied",
+              "design's rejection wording is recognized");
+
+        // 091-7 (5)/(6): the pure hold/resume decision.
+        Check(PlanPermissionHandling(d, "sess-1", 0, 2, "q", "").resume,
+              "first denial resumes the same session");
+        PermissionHoldPlan held = PlanPermissionHandling(d, "sess-1", 2, 2, "q", "");
+        Check(held.wait && held.kind == "read_path" && held.scope == "taskqueue:q" &&
+                  !held.permitId.empty(),
+              "after the resume limit the denial waits for a permit");
+        Check(!PlanPermissionHandling(d, "sess-1", 0, 2, "q", "fail").resume &&
+                  !PlanPermissionHandling(d, "sess-1", 0, 2, "q", "fail").wait,
+              "onPermissionDenied=fail neither resumes nor holds");
+        Check(TaskQueueStateFromString("waitingForPermit") == TaskQueueState::WaitingForPermit &&
+                  TaskQueueStateToString(TaskQueueState::WaitingForPermit) == "waitingForPermit",
+              "waitingForPermit round-trips through the state enum");
+        TaskQueueRunJob runJob;
+        runJob.id = "0917"; runJob.state = "waitingForPermit";
+        Check(runJob.Unfinished(), "waitingForPermit is not a terminal run state");
+    }
+
+    {
         // Retry policy by failure class (doc/design-v3.md 4.5).
         auto decide = [](const TaskQueueJob& job, const std::string& cls, int counted,
                          bool allowWait = true) {
@@ -422,6 +596,15 @@ int main() {
               "after defer.limit rate_limited follows retry.on");
         Check(decide(job, "exit_nonzero", 3).action == TaskQueueRetryAction::GiveUp,
               "retry.on still stops at maxAttempts");
+        Check(decide(job, "startup_hang", 1).action == TaskQueueRetryAction::Retry,
+              "startup_hang retries like idle_stall when retry.on lists idle_stall");
+        {
+            TaskQueueJob neverHang = job;
+            neverHang.retry.on.clear();
+            neverHang.retry.never = {"idle_stall"};
+            Check(decide(neverHang, "startup_hang", 1).action == TaskQueueRetryAction::GiveUp,
+                  "retry.never on idle_stall also blocks startup_hang");
+        }
         {
             TaskQueueJob onlyNever;
             onlyNever.maxAttempts = 2;
@@ -563,6 +746,10 @@ int main() {
           "retry":{"on":["not_a_class"]}}])";
         Check(!JsonGetBool(tqm.TaskQueueAdd("retryq", badRetry, 0, "", err), "ok", false),
               "an unknown retry.on class is rejected");
+        std::string hangRetry = R"([{"id":"RTH","command":"cmd /c exit 0","summary":"hang retry","timeoutSec":10,
+          "retry":{"on":["startup_hang"]}}])";
+        Check(JsonGetBool(tqm.TaskQueueAdd("retryq", hangRetry, 0, "", err), "ok", false),
+              "startup_hang is a valid retry.on class: " + err);
         std::string badRetryType =
             R"([{"id":"RT4","command":"cmd /c exit 0","summary":"bad retry","timeoutSec":10,"retry":["x"]}])";
         Check(!JsonGetBool(tqm.TaskQueueAdd("retryq", badRetryType, 0, "", err), "ok", false),
@@ -2293,6 +2480,382 @@ int main() {
 
         powerTqm.SetSuspendCallback(nullptr);
         powerTqm.ShutdownTaskQueueManager();
+        SetDataDirectoryOverride(dir);
+    }
+
+    // --- 090-2 Hang Detection tests ------------------------------------------
+    {
+        ProcessManager hangPm;
+        TaskQueueManager hangTqm;
+        hangTqm.SetProcessManager(&hangPm);
+        hangPm.SetProcessFinishedCallback([&hangTqm](int pid, int ec, const std::string& kind) {
+            hangTqm.OnProcessFinished(pid, ec, kind);
+        });
+
+        // Test 3: Worker idle defaults: dummy worker without explicit idle receives default 180s/600s
+        std::string defWorkerJson =
+            R"([{"id":"DW_DEF","command":"cmd /c exit 0","summary":"default idle worker","agent":"claude","timeoutSec":30}])";
+        Check(JsonGetBool(hangTqm.TaskQueueAdd("defq", defWorkerJson, 0, "", err), "ok", false),
+              "default worker added: " + err);
+        std::string dwGet = hangTqm.TaskQueueGet("DW_DEF", false, 0, err);
+        Check(dwGet.find("\"first_event_sec\":180") != std::string::npos,
+              "worker without idle receives default first_event_sec 180: " + dwGet);
+        Check(dwGet.find("\"output_sec\":600") != std::string::npos,
+              "worker without idle receives default output_sec 600: " + dwGet);
+
+        // Dummy worker with idle: 0 explicitly set does NOT inherit defaults (remains 0)
+        std::string zeroWorkerJson =
+            R"([{"id":"DW_ZERO","command":"cmd /c exit 0","summary":"disabled idle worker","agent":"claude","idle":0,"timeoutSec":30}])";
+        Check(JsonGetBool(hangTqm.TaskQueueAdd("defq", zeroWorkerJson, 0, "", err), "ok", false),
+              "zero worker added: " + err);
+        std::string zwGet = hangTqm.TaskQueueGet("DW_ZERO", false, 0, err);
+        Check(zwGet.find("\"first_event_sec\":0") != std::string::npos,
+              "worker with idle: 0 keeps first_event_sec 0: " + zwGet);
+        Check(zwGet.find("\"output_sec\":0") != std::string::npos,
+              "worker with idle: 0 keeps output_sec 0: " + zwGet);
+
+        // Test 4: Legacy job JSON compatibility: non-worker or job without first_event_sec parses with firstEventSec == 0
+        std::string legJson =
+            R"([{"id":"DW_LEG","command":"cmake --build .","summary":"cmake build","timeoutSec":30}])";
+        Check(JsonGetBool(hangTqm.TaskQueueAdd("defq", legJson, 0, "", err), "ok", false),
+              "legacy non-worker added: " + err);
+        std::string legGet = hangTqm.TaskQueueGet("DW_LEG", false, 0, err);
+        Check(legGet.find("\"first_event_sec\":0") != std::string::npos,
+              "non-worker keeps first_event_sec 0: " + legGet);
+
+        // Test with config.json override for worker_idle_defaults
+        {
+            std::wstring cfgFile = PathJoinWide(GetEffectiveDataDirectoryWide(), L"config.json");
+            std::string oldCfg = ReadFileUtf8Wide(cfgFile);
+            WriteFileAtomicWide(cfgFile,
+                R"({"taskqueue":{"worker_idle_defaults":{"first_event_sec":75,"output_sec":350}}})");
+            std::string cfgWorkerJson =
+                R"([{"id":"DW_CFG","command":"cmd /c exit 0","summary":"cfg idle worker","agent":"claude","timeoutSec":30}])";
+            Check(JsonGetBool(hangTqm.TaskQueueAdd("defq", cfgWorkerJson, 0, "", err), "ok", false),
+                  "cfg worker added: " + err);
+            std::string cfgGet = hangTqm.TaskQueueGet("DW_CFG", false, 0, err);
+            Check(cfgGet.find("\"first_event_sec\":75") != std::string::npos,
+                  "worker idle defaults honored from config.json first_event_sec: " + cfgGet);
+            Check(cfgGet.find("\"output_sec\":350") != std::string::npos,
+                  "worker idle defaults honored from config.json output_sec: " + cfgGet);
+            if (!oldCfg.empty()) {
+                WriteFileAtomicWide(cfgFile, oldCfg);
+            } else {
+                DeleteFileW(cfgFile.c_str());
+            }
+        }
+
+        // Test 1: Startup hang triggers: sleep dummy worker without emitting JSON terminates via firstEventSec as startup_timed_out
+        std::string hang1Json =
+            R"JSON([{"id":"HANG1","name":"claude","command":"cmd /c ping -n 10 127.0.0.1 >nul","summary":"hang worker","idle":{"first_event_sec":2},"timeoutSec":30,"maxAttempts":1}])JSON";
+        Check(JsonGetBool(hangTqm.TaskQueueAdd("hangq", hang1Json, 0, "", err), "ok", false),
+              "hang1 added: " + err);
+        Check(WaitForState(hangTqm, "HANG1", "failed", 10000), "hang1 failed via startup_timed_out");
+        std::string h1Resp = hangTqm.TaskQueueGet("HANG1", false, 0, err);
+        auto h1Json = ParseJobJson(h1Resp);
+        Check(h1Json.is_object() && !h1Json["attempts"].empty(), "hang1 has attempt record");
+        if (h1Json.is_object() && !h1Json["attempts"].empty()) {
+            const auto& att = h1Json["attempts"][0];
+            Check(att.value("reason", "") == "startup_timed_out",
+                  "hang1 attempt reason is startup_timed_out (got " + att.value("reason", "") + ")");
+            Check(att.contains("failure") && att["failure"].is_object(), "hang1 has failure diagnostic");
+            if (att.contains("failure") && att["failure"].is_object()) {
+                Check(att["failure"].value("class", "") == "startup_hang",
+                      "hang1 failure class is startup_hang (got " + att["failure"].value("class", "") + ")");
+                const auto& detail = att["failure"].value("detail", nlohmann::json::object());
+                Check(detail.value("endKind", "") == "startup_timed_out",
+                      "hang1 failure detail endKind is startup_timed_out");
+                Check(detail.value("idleFirstEventSec", 0) == 2,
+                      "hang1 failure detail idleFirstEventSec is 2");
+                Check(detail.contains("processTree") && detail["processTree"].is_array(),
+                      "hang1 failure detail contains processTree snapshot");
+                if (detail.contains("processTree") && detail["processTree"].is_array()) {
+                    Check(!detail["processTree"].empty(),
+                          "hang1 processTree snapshot captured running processes");
+                }
+            }
+        }
+
+        // Test 2: Raw output does not prevent startup hang: emitting raw non-JSON text still terminates via firstEventSec
+        std::wstring chatterBat = dir + L"\\chatter.bat";
+        WriteFileAtomicWide(chatterBat, "@echo off\r\n:loop\r\necho chatter\r\nping -n 2 127.0.0.1 >nul\r\ngoto loop\r\n");
+        std::string chatterCmd = "cmd /c \"" + WideToUtf8(chatterBat) + "\"";
+        std::string hang2Json =
+            R"JSON([{"id":"HANG2","name":"claude","command":")JSON" + JsonEscape(chatterCmd) +
+            R"JSON( --json-stream","summary":"raw chatter worker","idle":{"first_event_sec":2},"timeoutSec":30,"maxAttempts":1}])JSON";
+        Check(JsonGetBool(hangTqm.TaskQueueAdd("hangq", hang2Json, 0, "", err), "ok", false),
+              "hang2 added: " + err);
+        Check(WaitForState(hangTqm, "HANG2", "failed", 10000), "hang2 failed despite raw non-JSON output");
+        std::string h2Resp = hangTqm.TaskQueueGet("HANG2", false, 0, err);
+        auto h2Json = ParseJobJson(h2Resp);
+        if (h2Json.is_object() && !h2Json["attempts"].empty()) {
+            const auto& att = h2Json["attempts"][0];
+            Check(att.value("reason", "") == "startup_timed_out",
+                  "hang2 attempt reason is startup_timed_out with raw output");
+            if (att.contains("failure") && att["failure"].is_object()) {
+                Check(att["failure"].value("class", "") == "startup_hang",
+                      "hang2 failure class is startup_hang");
+            }
+        }
+
+        hangTqm.ShutdownTaskQueueManager();
+    }
+
+    // 090-3: takeover / complete with recorded decision and dependent propagation.
+    {
+        ProcessManager toPm;
+        TaskQueueManager toTqm;
+        toTqm.SetProcessManager(&toPm);
+        toPm.SetProcessFinishedCallback([&toTqm](int pid, int ec, const std::string& kind) {
+            toTqm.OnProcessFinished(pid, ec, kind);
+        });
+        // A separate queue lets us hold jobs pending while the takeover record is made.
+        Check(JsonGetBool(toTqm.TaskQueueAdd("tkq",
+              R"([{"id":"TK-INIT","command":"cmd /c exit 0","summary":"init","timeoutSec":30,"maxAttempts":1}])",
+              0, "", err), "ok", false), "tkq init job added: " + err);
+        Check(JsonGetBool(toTqm.TaskQueuePause("tkq", true, err), "ok", false), "tkq paused: " + err);
+        std::string tkJobs = R"([
+            {"id":"TK-A","command":"cmd /c exit 0","summary":"taken over A","timeoutSec":30,"maxAttempts":1},
+            {"id":"TK-B","command":"cmd /c exit 0","summary":"dependent B","timeoutSec":30,"maxAttempts":1,"depends_on":["TK-A"]},
+            {"id":"TK-C","command":"cmd /c exit 0","summary":"taken over C","timeoutSec":30,"maxAttempts":1},
+            {"id":"TK-D","command":"cmd /c exit 0","summary":"dependent D","timeoutSec":30,"maxAttempts":1,"depends_on":["TK-C"]}
+        ])";
+        Check(JsonGetBool(toTqm.TaskQueueAdd("tkq", tkJobs, 0, "", err), "ok", false),
+              "takeover jobs added: " + err);
+        Check(GetState(toTqm, "TK-A") == "pending", "TK-A starts pending");
+        Check(GetState(toTqm, "TK-B") == "pending", "TK-B starts pending");
+
+        // A succeeded job cannot be taken over.
+        Check(JsonGetBool(toTqm.TaskQueueAdd("tkokq",
+              R"([{"id":"TK-OK","command":"cmd /c exit 0","summary":"ok","timeoutSec":30,"maxAttempts":1}])",
+              0, "", err), "ok", false), "TK-OK added: " + err);
+        Check(WaitForState(toTqm, "TK-OK", "succeeded", 10000), "TK-OK succeeded");
+        std::string errSucceeded;
+        std::string respSucceeded = toTqm.TaskQueueTakeover("TK-OK", "cli", "because", errSucceeded);
+        Check(!JsonGetBool(respSucceeded, "ok", false) && !errSucceeded.empty(),
+              "takeover rejects a succeeded job: " + errSucceeded);
+
+        // reason is mandatory.
+        std::string errNoReason;
+        std::string respNoReason = toTqm.TaskQueueTakeover("TK-A", "cli", "", errNoReason);
+        Check(!JsonGetBool(respNoReason, "ok", false) && !errNoReason.empty(),
+              "takeover rejects a missing reason: " + errNoReason);
+
+        // Take over TK-A and inspect the recorded decision.
+        std::string errTake;
+        std::string respTake = toTqm.TaskQueueTakeover("TK-A", "cli", "supervisor handles this", errTake);
+        Check(JsonGetBool(respTake, "ok", false) && errTake.empty(), "takeover TK-A: " + errTake);
+        Check(GetState(toTqm, "TK-A") == "takenOver", "TK-A is takenOver");
+        auto tkA = ParseJobJson(toTqm.TaskQueueGet("TK-A", false, 0, err));
+        Check(tkA.contains("takeover") && tkA["takeover"].value("by", "") == "cli" &&
+              tkA["takeover"].value("reason", "") == "supervisor handles this" &&
+              !tkA["takeover"].value("at", "").empty(),
+              "takeover record has by/reason/at");
+
+        // Complete is required with a reason; dependents must not advance before it.
+        std::string errNoCompleteReason;
+        std::string respNoCompleteReason =
+            toTqm.TaskQueueComplete("TK-A", "", "succeeded", "", errNoCompleteReason);
+        Check(!JsonGetBool(respNoCompleteReason, "ok", false) && !errNoCompleteReason.empty(),
+              "complete rejects a missing reason: " + errNoCompleteReason);
+        Sleep(300);
+        Check(GetState(toTqm, "TK-B") == "pending", "TK-B stays pending before complete");
+
+        std::string errComplete;
+        std::string respComplete = toTqm.TaskQueueComplete(
+            "TK-A", "reports/tk-a.md", "succeeded", "done by supervisor", errComplete);
+        Check(JsonGetBool(respComplete, "ok", false) && errComplete.empty(), "complete TK-A: " + errComplete);
+        tkA = ParseJobJson(toTqm.TaskQueueGet("TK-A", false, 0, err));
+        Check(GetState(toTqm, "TK-A") == "takenOver", "TK-A stays takenOver after complete");
+        Check(tkA["takeover"].value("result", "") == "succeeded" &&
+              !tkA["takeover"].value("completed_at", "").empty() &&
+              tkA["takeover"].value("report", "") == "reports/tk-a.md" &&
+              tkA["takeover"].value("completion_reason", "") == "done by supervisor",
+              "complete record has result/completed_at/report/completion_reason");
+
+        // A failed takeover result blocks its dependent.
+        Check(JsonGetBool(toTqm.TaskQueueTakeover("TK-C", "cli", "supervisor stops delegation", errTake),
+                          "ok", false), "takeover TK-C: " + errTake);
+        Check(JsonGetBool(toTqm.TaskQueueComplete("TK-C", "", "failed", "unresolved", errComplete),
+                          "ok", false), "complete TK-C failed: " + errComplete);
+
+        // Resume the queue: B advances on the succeeded takeover, D is blocked by the failed one.
+        Check(JsonGetBool(toTqm.TaskQueuePause("tkq", false, err), "ok", false), "tkq resumed: " + err);
+        Check(WaitForState(toTqm, "TK-B", "succeeded", 10000),
+              "TK-B succeeded after takeover completed with succeeded result");
+        Check(WaitForState(toTqm, "TK-D", "blocked", 10000),
+              "TK-D blocked after takeover completed with failed result");
+
+        TaskQueueCounts counts = toTqm.GetJobCounts();
+        Check(counts.takenOver >= 2, "counts include takenOver jobs");
+        toTqm.ShutdownTaskQueueManager();
+    }
+
+    // ------------------------------------------------------------------
+    // 091-6: shared engine health / circuit breaker
+    // ------------------------------------------------------------------
+    {
+        namespace eh = engine_health;
+        const std::wstring dataDir = PathJoinWide(GetCurrentDirectoryWide(), L".hancho\\0916-smoke");
+        EnsureDirectoryWide(dataDir);
+        SetDataDirectoryOverride(dataDir);
+        WriteFileAtomicWide(PathJoinWide(dataDir, L"config.json"),
+            R"({"engine_health":{"probe_initial_sec":1,"probe_max_sec":2,"probe_timeout_sec":3}})");
+        WriteFileAtomicWide(PathJoinWide(dataDir, L"engines.json"),
+            R"({"engines":{"okdummy":{"command":"cmd /c echo OK","stream":"dummy","models":["m1","m2","m4","m9"]},)"
+            R"("hangdummy":{"command":"cmd /c ping -n 5 127.0.0.1 >nul","stream":"dummy","models":["m1"]}},)"
+            R"("default":"okdummy"})");
+        const std::wstring healthPath = eh::DefaultPath();
+        RemoveFileWide(healthPath);
+        RemoveFileWide(eh::EventsPath());
+        RemoveFileWide(PathJoinWide(dataDir, L"probes.json"));
+        RemoveFileWide(PathJoinWide(PathJoinWide(dataDir, L"taskqueues"), L"eh.json"));
+        const eh::Settings settings = eh::LoadSettings();
+        Check(settings.probeInitialSec == 1 && settings.probeMaxSec == 2 &&
+              settings.probeTimeoutSec == 3, "0916: shortened config keys are read");
+        const int64_t t0 = eh::NowEpochMs();
+
+        // (1) startup_hang marks an engine down and writes engineDown.
+        Check(eh::MarkDown(healthPath, "hangdummy", "m1", "startup_hang", "no events", t0, 0, settings),
+              "0916: startup_hang marks engine down");
+        eh::Store store;
+        std::string errH;
+        Check(eh::Load(healthPath, store, errH), "0916: state file loads: " + errH);
+        Check(eh::IsDown(store, "hangdummy", "m1"), "0916: engine is down");
+        const eh::Entry* downEntry = eh::Find(store, "hangdummy", "m1");
+        Check(downEntry && downEntry->reason == "startup_hang" && downEntry->probeCount == 0 &&
+              downEntry->nextProbeAtMs >= t0 + 900, "0916: down fields since/reason/nextProbeAt");
+        Check(!eh::ProbeDue(*downEntry, t0) && eh::ProbeDue(*downEntry, t0 + 1100),
+              "0916: nextProbeAt gates the first probe");
+        Check(ReadFileUtf8Wide(eh::EventsPath()).find("\"engineDown\"") != std::string::npos,
+              "0916: engineDown event is written");
+
+        // (4) backoff doubles from 1s to 2s after a failed probe.
+        Check(eh::RecordFailedProbe(healthPath, "hangdummy", "m1", "startup_hang", "still silent",
+                                    t0 + 1100, settings), "0916: failed probe recorded");
+        Check(eh::Load(healthPath, store, errH), "0916: state reloads after probe");
+        downEntry = eh::Find(store, "hangdummy", "m1");
+        Check(downEntry && downEntry->probeCount == 1 &&
+              downEntry->nextProbeAtMs >= t0 + 1100 + 1900, "0916: backoff interval doubles");
+
+        // (5) explicit retryAt holds probing even after nextProbeAt.
+        Check(eh::MarkDown(healthPath, "okdummy", "m2", "rate_limited", "quota exhausted",
+                           t0, t0 + 60000, settings), "0916: rate_limited marks engine down");
+        Check(eh::Load(healthPath, store, errH), "0916: state reloads for retryAt");
+        const eh::Entry* quotaEntry = eh::Find(store, "okdummy", "m2");
+        Check(quotaEntry && quotaEntry->retryAtMs == t0 + 60000 &&
+              !eh::ProbeDue(*quotaEntry, t0 + 5000), "0916: no probe before retryAt");
+
+        // (7) a fresh Load sees the persisted state.
+        eh::Store restored;
+        Check(eh::Load(healthPath, restored, errH) && eh::IsDown(restored, "hangdummy", "m1") &&
+              eh::IsDown(restored, "okdummy", "m2"), "0916: state survives a fresh load");
+        Check(ReadFileUtf8Wide(healthPath).find("\"nextProbeAt\"") != std::string::npos,
+              "0916: state file has the documented fields");
+
+        // (6) manual --reset equivalent.
+        Check(eh::Reset(healthPath, "okdummy", "m2", eh::NowEpochMs()), "0916: reset succeeds");
+        Check(eh::Load(healthPath, store, errH) && !eh::IsDown(store, "okdummy", "m2"),
+              "0916: reset returns the engine to healthy");
+        Check(ReadFileUtf8Wide(eh::EventsPath()).find("\"engineRecovered\"") != std::string::npos,
+              "0916: engineRecovered event is written");
+
+        // Diagnosis context: recent success + another 0-event failure => quota_suspected.
+        TaskQueueFailureInput diagIn;
+        diagIn.engine = "opencode";
+        diagIn.model = "opencode-go/deepseek-v4.1-flash";
+        diagIn.endKind = "startup_timed_out";
+        diagIn.recentSuccess = true;
+        diagIn.otherZeroEventFailure = true;
+        diagIn.engineDown = true;
+        TaskQueueFailureDiagnostic diag = ClassifyTaskQueueFailure(diagIn);
+        bool hasQuota = false, hasEngineDown = false;
+        for (const auto& c : diag.likelyCauses) if (c.id == "quota_suspected") hasQuota = true;
+        for (const auto& s : diag.nextSteps) if (s.action == "engine_down") hasEngineDown = true;
+        Check(diag.failureClass == "startup_hang" && hasQuota,
+              "0916: quota_suspected added to likelyCauses");
+        Check(hasEngineDown, "0916: engine_down added to nextSteps");
+
+        // (1/2) held job does not start; a different engine is unaffected.
+        ProcessManager ehPm;
+        TaskQueueManager ehTqm;
+        ehTqm.SetProcessManager(&ehPm);
+        ehPm.SetProcessFinishedCallback([&ehTqm](int pid, int ec, const std::string& kind) {
+            ehTqm.OnProcessFinished(pid, ec, kind);
+        });
+        eh::MarkDown(healthPath, "hangdummy", "m1", "startup_hang", "no events",
+                     eh::NowEpochMs(), 0, settings);
+        std::string errAdd;
+        const std::string addHeld = ehTqm.TaskQueueAdd("eh",
+            R"([{"id":"EH-HELD","summary":"held","command":"cmd /c echo OK -Engine hangdummy -Model m1","timeout_sec":10,"max_attempts":2}])",
+            1, "", errAdd);
+        Check(JsonGetBool(addHeld, "ok", false), "0916: held job added: " + errAdd + " " + addHeld);
+        const std::string addOther = ehTqm.TaskQueueAdd("eh",
+            R"([{"id":"EH-OTHER","summary":"other","command":"cmd /c echo OK -Engine okdummy -Model m9","timeout_sec":10,"max_attempts":1}])",
+            1, "", errAdd);
+        Check(JsonGetBool(addOther, "ok", false), "0916: other-engine job added: " + errAdd + " " + addOther);
+        Sleep(700);
+        Check(GetState(ehTqm, "EH-HELD") == "pending", "0916: down engine's job stays pending");
+        std::string heldJson = ehTqm.TaskQueueGet("EH-HELD", false, 0, errAdd);
+        Check(heldJson.find("engine down: hangdummy/m1") != std::string::npos,
+              "0916: list shows the hold reason");
+        Check(WaitForState(ehTqm, "EH-OTHER", "succeeded", 8000),
+              "0916: other engine's job succeeds");
+        Check(eh::Reset(healthPath, "hangdummy", "m1", eh::NowEpochMs()),
+              "0916: manual recovery of hangdummy");
+        Check(WaitForState(ehTqm, "EH-HELD", "succeeded", 8000),
+              "0916: held job starts after recovery");
+
+        // (3) core auto-probe: down engine recovers and the waiting job is released.
+        eh::MarkDown(healthPath, "okdummy", "m4", "startup_hang", "no events",
+                     eh::NowEpochMs(), 0, settings);
+        const std::string addProbe = ehTqm.TaskQueueAdd("eh",
+            R"([{"id":"EH-PROBE","summary":"probe","command":"cmd /c echo OK -Engine okdummy -Model m4","timeout_sec":10,"max_attempts":1}])",
+            1, "", errAdd);
+        Check(JsonGetBool(addProbe, "ok", false), "0916: auto-probe job added: " + errAdd + " " + addProbe);
+        Check(WaitForState(ehTqm, "EH-PROBE", "succeeded", 12000),
+              "0916: core probe restores health and starts the waiting job");
+        Check(eh::Load(healthPath, store, errH) && !eh::IsDown(store, "okdummy", "m4"),
+              "0916: engine is healthy after the successful probe");
+
+        // (18) approved worker-list switch on a down engine, and engine_switch:false.
+        const std::wstring llmPath = llm::DefaultPath();
+        RemoveFileWide(llmPath);
+        llm::Add(llmPath, "worker", "swA", "mA", "", 1, true, "", "dashboard", "");
+        llm::Add(llmPath, "worker", "swB", "mB", "", 2, true, "", "dashboard", "");
+        llm::Add(llmPath, "worker", "swC", "mC", "", 3, true, "", "dashboard", "");
+        llm::Add(llmPath, "worker", "swD", "mD", "", 4, true, "", "dashboard", "");
+        eh::MarkDown(healthPath, "swA", "mA", "startup_hang", "no events",
+                     eh::NowEpochMs(), 0, settings);
+        const std::string addSwitch = ehTqm.TaskQueueAdd("eh",
+            R"([{"id":"EH-SWITCH","summary":"switch","command":"cmd /c echo OK -Engine swA -Model mA","timeout_sec":10,"max_attempts":1}])",
+            1, "", errAdd);
+        Check(JsonGetBool(addSwitch, "ok", false), "0916: switch job added: " + errAdd + " " + addSwitch);
+        Check(WaitForState(ehTqm, "EH-SWITCH", "succeeded", 10000),
+              "0916: job switches to the next approved worker-list candidate");
+        const nlohmann::json switched = ParseJobJson(ehTqm.TaskQueueGet("EH-SWITCH", false, 0, errAdd));
+        Check(switched.value("command", "").find("swB") != std::string::npos &&
+              switched.value("notes", "").find("worker list #2") != std::string::npos,
+              "0916: switch records the approving list row in job notes");
+
+        eh::MarkDown(healthPath, "swC", "mC", "startup_hang", "no events",
+                     eh::NowEpochMs(), 0, settings);
+        const std::string addNoSwitch = ehTqm.TaskQueueAdd("eh",
+            R"([{"id":"EH-NOSWITCH","summary":"no switch","command":"cmd /c echo OK -Engine swC -Model mC","timeout_sec":10,"max_attempts":1,"engine_switch":false}])",
+            1, "", errAdd);
+        Check(JsonGetBool(addNoSwitch, "ok", false), "0916: no-switch job added: " + errAdd + " " + addNoSwitch);
+        Sleep(700);
+        Check(GetState(ehTqm, "EH-NOSWITCH") == "pending",
+              "0916: engine_switch:false keeps the job held on its down engine");
+
+        // Plain commands with no engine/model are never held.
+        const std::string addPlain = ehTqm.TaskQueueAdd("eh",
+            R"([{"id":"EH-PLAIN","summary":"plain","command":"cmd /c echo OK","timeout_sec":10,"max_attempts":1}])",
+            1, "", errAdd);
+        Check(JsonGetBool(addPlain, "ok", false), "0916: plain job added: " + errAdd + " " + addPlain);
+        Check(WaitForState(ehTqm, "EH-PLAIN", "succeeded", 8000),
+              "0916: plain job without engine/model is unaffected");
+        ehTqm.ShutdownTaskQueueManager();
         SetDataDirectoryOverride(dir);
     }
 

@@ -1,0 +1,132 @@
+{
+  "consult": [],
+  "history": [
+    {
+      "action": "add",
+      "at": "2026-11-20 06:36:10",
+      "by": "dashboard",
+      "entry": {
+        "approvedAt": "2026-11-20 06:36:10",
+        "approvedVia": "dashboard",
+        "enabled": true,
+        "engine": "swA",
+        "model": "mA",
+        "note": "",
+        "provider": "",
+        "rank": 1,
+        "status": "approved",
+        "userSaid": ""
+      },
+      "list": "worker",
+      "reason": ""
+    },
+    {
+      "action": "add",
+      "at": "2026-11-20 06:36:10",
+      "by": "dashboard",
+      "entry": {
+        "approvedAt": "2026-11-20 06:36:10",
+        "approvedVia": "dashboard",
+        "enabled": true,
+        "engine": "swB",
+        "model": "mB",
+        "note": "",
+        "provider": "",
+        "rank": 2,
+        "status": "approved",
+        "userSaid": ""
+      },
+      "list": "worker",
+      "reason": ""
+    },
+    {
+      "action": "add",
+      "at": "2026-11-20 06:36:10",
+      "by": "dashboard",
+      "entry": {
+        "approvedAt": "2026-11-20 06:36:10",
+        "approvedVia": "dashboard",
+        "enabled": true,
+        "engine": "swC",
+        "model": "mC",
+        "note": "",
+        "provider": "",
+        "rank": 3,
+        "status": "approved",
+        "userSaid": ""
+      },
+      "list": "worker",
+      "reason": ""
+    },
+    {
+      "action": "add",
+      "at": "2026-11-20 06:36:10",
+      "by": "dashboard",
+      "entry": {
+        "approvedAt": "2026-11-20 06:36:10",
+        "approvedVia": "dashboard",
+        "enabled": true,
+        "engine": "swD",
+        "model": "mD",
+        "note": "",
+        "provider": "",
+        "rank": 4,
+        "status": "approved",
+        "userSaid": ""
+      },
+      "list": "worker",
+      "reason": ""
+    }
+  ],
+  "supervisor": [],
+  "worker": [
+    {
+      "approvedAt": "2026-11-20 06:36:10",
+      "approvedVia": "dashboard",
+      "enabled": true,
+      "engine": "swA",
+      "model": "mA",
+      "note": "",
+      "provider": "",
+      "rank": 1,
+      "status": "approved",
+      "userSaid": ""
+    },
+    {
+      "approvedAt": "2026-11-20 06:36:10",
+      "approvedVia": "dashboard",
+      "enabled": true,
+      "engine": "swB",
+      "model": "mB",
+      "note": "",
+      "provider": "",
+      "rank": 2,
+      "status": "approved",
+      "userSaid": ""
+    },
+    {
+      "approvedAt": "2026-11-20 06:36:10",
+      "approvedVia": "dashboard",
+      "enabled": true,
+      "engine": "swC",
+      "model": "mC",
+      "note": "",
+      "provider": "",
+      "rank": 3,
+      "status": "approved",
+      "userSaid": ""
+    },
+    {
+      "approvedAt": "2026-11-20 06:36:10",
+      "approvedVia": "dashboard",
+      "enabled": true,
+      "engine": "swD",
+      "model": "mD",
+      "note": "",
+      "provider": "",
+      "rank": 4,
+      "status": "approved",
+      "userSaid": ""
+    }
+  ]
+}

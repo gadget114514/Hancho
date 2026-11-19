@@ -24,6 +24,8 @@
   --blocked-bg: rgba(249, 115, 22, 0.12);
   --cancelled: #9ca3af;
   --cancelled-bg: rgba(156, 163, 175, 0.12);
+  --taken-over: #a78bfa;
+  --taken-over-bg: rgba(167, 139, 250, 0.12);
   --l1-color: #818cf8;
   --l1-bg: rgba(129, 140, 248, 0.12);
   --l2-color: #fbbf24;
@@ -489,6 +491,7 @@ body {
 .badge-completed, .badge-succeeded { background-color: var(--success-bg); color: var(--success); }
 .badge-failed { background-color: var(--error-bg); color: var(--error); }
 .badge-cancelled { background-color: var(--cancelled-bg); color: var(--cancelled); }
+.badge-taken-over { background-color: var(--taken-over-bg); color: var(--taken-over); border: 1px solid var(--taken-over); }
 .badge-l1 { background-color: var(--l1-bg); color: var(--l1-color); }
 .badge-l2 { background-color: var(--l2-bg); color: var(--l2-color); }
 .badge-l3 { background-color: var(--l3-bg); color: var(--l3-color); }

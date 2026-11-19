@@ -17,7 +17,7 @@ using nlohmann::json;
 namespace {
 
 // Child slots in the order they are shown. "children" is an array; the rest hold one node.
-const char* const kSingleChildSlots[] = {"cond", "then", "else", "child", "until"};
+const char* const kSingleChildSlots[] = {"cond", "then", "else", "child", "until", "otherwise"};
 
 std::string Str(const json& j, const char* key) {
     auto it = j.find(key);
@@ -42,7 +42,7 @@ std::string OneLine(std::string s, size_t maxLen = 80) {
 // Short text for a condition node: "jsonValue out/result.json status eq needs_review".
 std::string ConditionText(const json& n) {
     std::ostringstream ss;
-    for (const char* k : {"file", "path", "node", "name", "than", "regex"}) {
+    for (const char* k : {"file", "path", "node", "name", "than", "regex", "class", "cause"}) {
         std::string v = Str(n, k);
         if (!v.empty()) ss << ' ' << v;
     }
@@ -75,6 +75,16 @@ std::string BuildNodeLabel(const json& n, const std::string& type, const std::st
                 if (!model.empty()) ss << ' ' << model;
                 ss << ']';
             }
+            auto engines = n.find("engines");
+            if (engines != n.end() && engines->is_array() && !engines->empty()) {
+                ss << " engines=" << engines->size();
+                int idx = status.is_object() ? status.value("engineCandidateIndex", 0) : 0;
+                if (idx >= 0 && idx < static_cast<int>(engines->size())) {
+                    const json& cur = (*engines)[idx];
+                    if (cur.is_object()) ss << " -> " << Str(cur, "engine") << "/" << Str(cur, "model");
+                }
+            }
+            if (n.value("probe", false)) ss << " probe";
         }
         std::string summary = Str(n, "summary");
         if (!summary.empty()) ss << " \"" << OneLine(summary, 60) << '"';
@@ -92,6 +102,12 @@ std::string BuildNodeLabel(const json& n, const std::string& type, const std::st
     } else if (type == "parallel") {
         auto it = n.find("success");
         if (it != n.end()) ss << " success=" << (it->is_string() ? it->get<std::string>() : it->dump());
+    } else if (type == "catch") {
+        auto hs = n.find("handlers");
+        ss << " handlers=" << (hs != n.end() && hs->is_array() ? hs->size() : 0)
+           << " maxRetries=" << n.value("maxRetries", 1);
+        std::string handler = status.is_object() ? Str(status, "catchHandler") : "";
+        if (!handler.empty()) ss << " -> " << OneLine(handler, 50);
     } else if (type == "subtree") {
         std::string f = Str(n, "file");
         if (!f.empty()) ss << ' ' << f;
@@ -159,6 +175,19 @@ void BuildNode(const json& n, const std::string& btId, const std::string& role,
         BtDebugNode child;
         BuildNode(*it, btId, slot, pathKey + "." + slot, depth + 1, child);
         out.children.push_back(std::move(child));
+    }
+    auto hs = n.find("handlers");
+    if (hs != n.end() && hs->is_array()) {
+        size_t i = 0;
+        for (const auto& h : *hs) {
+            if (h.is_object() && h.contains("do") && h["do"].is_object() && h["do"].contains("type")) {
+                BtDebugNode child;
+                BuildNode(h["do"], btId, "do", pathKey + ".handlers[" + std::to_string(i) + "].do",
+                          depth + 1, child);
+                out.children.push_back(std::move(child));
+            }
+            ++i;
+        }
     }
     auto kids = n.find("children");
     if (kids != n.end() && kids->is_array()) {

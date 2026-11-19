@@ -1,8 +1,11 @@
 #include "behavior_tree_internal.h"
 #include "common.h"
+#include "permit_config.h"
 
+#include <cctype>
 #include <cstdint>
 #include <cstdio>
+#include <cstring>
 #include <set>
 #include <sstream>
 
@@ -12,10 +15,11 @@ namespace {
 
 struct ParseContext {
     const IBtEngineCatalog* catalog = nullptr;
-    BtWorkerDefaults workerDefaults;
+    BtDefaults defaults;
     std::string btCwd;
     std::string baseQueue;  // tree-level task queue; parallel children get "<baseQueue>.p<hash>"
     std::set<std::string> seenIds;
+    std::set<std::string> seenKeys; // ids and path keys, for validating node references
     int nodeCount = 0;
     std::vector<std::string> errors;
 
@@ -72,11 +76,22 @@ bool ReqPosInt(const json& j, const char* key, const std::string& path, const st
     return true;
 }
 
+void ApplyNodeDefaults(const json& j, BtNode& node, ParseContext& ctx);
+
 void ParseJobCommonFields(const json& j, const std::string& path, BtNode& node, ParseContext& ctx) {
     if (j.contains("cwd") && j["cwd"].is_string()) node.cwd = j["cwd"].get<std::string>();
     if (j.contains("maxAttempts") && j["maxAttempts"].is_number_integer()) {
         node.maxAttempts = j["maxAttempts"].get<int>();
+        node.maxAttemptsConfigured = true;
         if (node.maxAttempts < 1) ctx.AddError(path + ".maxAttempts", "must be >= 1");
+    }
+    if (j.contains("probe")) {
+        if (j["probe"].is_boolean()) {
+            node.probe = j["probe"].get<bool>();
+            node.probeConfigured = true;
+        } else {
+            ctx.AddError(path + ".probe", "must be a boolean");
+        }
     }
     if (j.contains("env")) {
         if (!j["env"].is_object()) ctx.AddError(path + ".env", "must be an object");
@@ -87,10 +102,20 @@ void ParseJobCommonFields(const json& j, const std::string& path, BtNode& node, 
         }
     }
     if (j.contains("idle")) {
-        if (!j["idle"].is_object()) ctx.AddError(path + ".idle", "must be an object");
-        else {
-            node.idle.outputSec = j["idle"].value("outputSec", 0);
-            node.idle.cpuSec = j["idle"].value("cpuSec", 0);
+        node.idle.configured = true;
+        if (!j["idle"].is_object()) {
+            if (j["idle"].is_number() && j["idle"].get<int>() == 0) {
+                node.idle.outputSec = 0;
+                node.idle.cpuSec = 0;
+                node.idle.firstEventSec = 0;
+            } else {
+                ctx.AddError(path + ".idle", "must be an object");
+            }
+        } else {
+            const auto& idl = j["idle"];
+            node.idle.outputSec = idl.value("outputSec", idl.value("output_sec", 0));
+            node.idle.cpuSec = idl.value("cpuSec", idl.value("cpu_sec", 0));
+            node.idle.firstEventSec = idl.value("firstEventSec", idl.value("first_event_sec", 0));
         }
     }
     if (j.contains("success")) {
@@ -159,6 +184,75 @@ void ParseJobCommonFields(const json& j, const std::string& path, BtNode& node, 
             }
         }
     }
+    ApplyNodeDefaults(j, node, ctx);
+}
+
+bool LooksLikeLlmJobCommand(const std::string& command) {
+    std::string lower;
+    lower.reserve(command.size());
+    for (unsigned char c : command) lower.push_back(static_cast<char>(std::tolower(c)));
+    if (lower.find("ww-run") != std::string::npos) return true;
+    static const char* const kClis[] = {"claude", "opencode", "codex", "agy", "gemini", "aider", "llama"};
+    for (const char* cli : kClis) {
+        size_t pos = 0;
+        while ((pos = lower.find(cli, pos)) != std::string::npos) {
+            bool leftOk = pos == 0 || !std::isalnum(static_cast<unsigned char>(lower[pos - 1]));
+            size_t after = pos + std::strlen(cli);
+            bool rightOk = after >= lower.size() || !std::isalnum(static_cast<unsigned char>(lower[after]));
+            if (leftOk && rightOk) return true;
+            pos = after;
+        }
+    }
+    return false;
+}
+
+bool IsLlmLikeNode(const json& j, const BtNode& node) {
+    return node.type == "worker" || j.contains("engine") || j.contains("agentType") ||
+           LooksLikeLlmJobCommand(node.command);
+}
+
+// Tree-level defaults fill only fields the node did not write itself; an explicit 0 wins.
+void ApplyNodeDefaults(const json& j, BtNode& node, ParseContext& ctx) {
+    const BtDefaults& d = ctx.defaults;
+    bool llmLike = IsLlmLikeNode(j, node);
+    if (!node.maxAttemptsConfigured && llmLike && d.workerMaxAttempts > 0) {
+        node.maxAttempts = d.workerMaxAttempts;
+    }
+    if (!j.contains("idle")) {
+        const BtJobIdle* src = nullptr;
+        if (llmLike) {
+            src = d.hasWorkerIdle() ? &d.workerIdle : (d.hasJobIdle() ? &d.jobIdle : nullptr);
+        } else {
+            src = d.hasJobIdle() ? &d.jobIdle : nullptr;
+        }
+        if (src) {
+            node.idle.outputSec = src->outputSec;
+            node.idle.cpuSec = src->cpuSec;
+            node.idle.firstEventSec = src->firstEventSec;
+            node.idle.configured = true;
+        }
+    }
+    if (!node.probeConfigured && llmLike && d.hasWorkerProbe) node.probe = d.workerProbe;
+}
+
+// Shared by node "idle" and defaults.<worker|job>.idle.
+void ParseIdleObject(const json& holder, const char* key, const std::string& path,
+                     BtJobIdle& out, ParseContext& ctx) {
+    if (!holder.contains(key)) return;
+    out.configured = true;
+    if (!holder[key].is_object()) {
+        if (holder[key].is_number() && holder[key].get<int>() == 0) {
+            out = BtJobIdle();
+            out.configured = true;
+        } else {
+            ctx.AddError(path, "must be an object");
+        }
+        return;
+    }
+    const auto& idl = holder[key];
+    out.outputSec = idl.value("outputSec", idl.value("output_sec", 0));
+    out.cpuSec = idl.value("cpuSec", idl.value("cpu_sec", 0));
+    out.firstEventSec = idl.value("firstEventSec", idl.value("first_event_sec", 0));
 }
 
 bool ParseComparisonOps(const json& j, BtNode& node) {
@@ -201,6 +295,8 @@ std::unique_ptr<BtNode> ParseNode(const json& j, const std::string& path, const 
         }
     }
     node->nodeKey = node->id.empty() ? node->pathKey : node->id;
+    if (!node->id.empty()) ctx.seenKeys.insert(node->id);
+    ctx.seenKeys.insert(node->pathKey);
 
     if (!j.contains("type") || !j["type"].is_string() || j["type"].get<std::string>().empty()) {
         ctx.AddError(path, "missing required string field 'type'");
@@ -270,6 +366,77 @@ std::unique_ptr<BtNode> ParseNode(const json& j, const std::string& path, const 
             if (!j["until"].is_object()) ctx.AddError(path + ".until", "must be a node object");
             else node->untilChild = ParseNode(j["until"], path + ".until", "until", depth + 1, ctx, queueScope);
         }
+    } else if (t == "catch") {
+        requireChildObj("child", "child", node->singleChild);
+        if (!j.contains("handlers") || !j["handlers"].is_array() || j["handlers"].empty()) {
+            ctx.AddError(path + ".handlers", "'catch' requires a non-empty 'handlers' array");
+        } else {
+            size_t handlerIdx = 0;
+            for (const auto& hj : j["handlers"]) {
+                const std::string hPath = path + ".handlers[" + std::to_string(handlerIdx) + "]";
+                BtCatchHandler h;
+                if (!hj.is_object()) {
+                    ctx.AddError(hPath, "handler must be an object");
+                    handlerIdx++;
+                    continue;
+                }
+                h.rawDef = hj;
+                if (hj.contains("class")) {
+                    const json& c = hj["class"];
+                    if (c.is_string()) {
+                        if (c.get<std::string>().empty()) ctx.AddError(hPath + ".class", "must be a non-empty string");
+                        else h.classes.push_back(c.get<std::string>());
+                    } else if (c.is_array()) {
+                        if (c.empty()) ctx.AddError(hPath + ".class", "must not be an empty array");
+                        for (const auto& item : c) {
+                            if (!item.is_string() || item.get<std::string>().empty())
+                                ctx.AddError(hPath + ".class", "elements must be non-empty strings");
+                            else
+                                h.classes.push_back(item.get<std::string>());
+                        }
+                    } else {
+                        ctx.AddError(hPath + ".class", "must be a string or an array of strings");
+                    }
+                }
+                if (hj.contains("cause")) {
+                    if (!hj["cause"].is_string() || hj["cause"].get<std::string>().empty())
+                        ctx.AddError(hPath + ".cause", "must be a non-empty string");
+                    else
+                        h.cause = hj["cause"].get<std::string>();
+                }
+                if (hj.contains("thenRetry")) {
+                    if (!hj["thenRetry"].is_boolean()) ctx.AddError(hPath + ".thenRetry", "must be a boolean");
+                    else h.thenRetry = hj["thenRetry"].get<bool>();
+                }
+                if (!hj.contains("do") || !hj["do"].is_object()) {
+                    ctx.AddError(hPath, "handler requires object 'do'");
+                } else {
+                    h.doNode = ParseNode(hj["do"], hPath + ".do", "do", depth + 1, ctx, queueScope);
+                }
+                node->catchHandlers.push_back(std::move(h));
+                handlerIdx++;
+            }
+        }
+        node->catchMaxRetries = 1;
+        if (j.contains("maxRetries")) {
+            if (!j["maxRetries"].is_number_integer()) ctx.AddError(path + ".maxRetries", "must be an integer between 1 and 10");
+            else {
+                node->catchMaxRetries = j["maxRetries"].get<int>();
+                if (node->catchMaxRetries < 1 || node->catchMaxRetries > 10)
+                    ctx.AddError(path + ".maxRetries", "must be between 1 and 10");
+            }
+        }
+        if (j.contains("otherwise")) {
+            const json& o = j["otherwise"];
+            if (o.is_string()) {
+                if (o.get<std::string>() != "fail")
+                    ctx.AddError(path + ".otherwise", "must be 'fail' or a node object");
+            } else if (o.is_object()) {
+                node->otherwiseChild = ParseNode(o, path + ".otherwise", "otherwise", depth + 1, ctx, queueScope);
+            } else {
+                ctx.AddError(path + ".otherwise", "must be 'fail' or a node object");
+            }
+        }
     } else if (t == "invert" || t == "forceSuccess" || t == "forceFailure") {
         requireChildObj("child", "child", node->singleChild);
     } else if (t == "timeout") {
@@ -282,6 +449,47 @@ std::unique_ptr<BtNode> ParseNode(const json& j, const std::string& path, const 
         if (j.contains("estimateSec")) ReqPosInt(j, "estimateSec", path, t, node->estimateSec, ctx);
         if (j.contains("instructionsText") && j["instructionsText"].is_string()) node->instructionsText = j["instructionsText"].get<std::string>();
         if (j.contains("instructionsFile") && j["instructionsFile"].is_string()) node->instructionsFile = j["instructionsFile"].get<std::string>();
+        if (j.contains("engine") && j["engine"].is_string()) node->engine = j["engine"].get<std::string>();
+        if (j.contains("model") && j["model"].is_string()) node->model = j["model"].get<std::string>();
+        if (j.contains("engines")) {
+            if (!j["engines"].is_array() || j["engines"].empty()) {
+                ctx.AddError(path + ".engines", "must be a non-empty array of {engine, model} objects");
+            } else {
+                if (!node->engine.empty() || !node->model.empty()) {
+                    ctx.AddError(path, "'engine'/'model' and 'engines' cannot both be specified");
+                }
+                for (size_t i = 0; i < j["engines"].size(); ++i) {
+                    const json& c = j["engines"][i];
+                    const std::string cpath = path + ".engines[" + std::to_string(i) + "]";
+                    if (!c.is_object() || !c.contains("engine") || !c["engine"].is_string() ||
+                        c["engine"].get<std::string>().empty()) {
+                        ctx.AddError(cpath, "requires a non-empty string 'engine'");
+                        continue;
+                    }
+                    BtEngineChoice choice;
+                    choice.engine = c["engine"].get<std::string>();
+                    if (c.contains("model") && c["model"].is_string()) choice.model = c["model"].get<std::string>();
+                    if (ctx.catalog && !ctx.catalog->IsApprovedForList("worker", choice.engine, choice.model)) {
+                        ctx.AddError(cpath, "candidate is not approved and enabled in the worker LLM list; "
+                                            "run 'hancho-cli llm add --list worker --engine " + choice.engine +
+                                            " --model " + choice.model + " --reason \"...\"' and approve it");
+                    } else if (ctx.catalog) {
+                        choice.list = "worker";
+                        choice.entry = choice.engine + "/" + choice.model;
+                    }
+                    node->engineCandidates.push_back(std::move(choice));
+                }
+            }
+        }
+        if (j.contains("switchEngineOn")) {
+            const json& sw = j["switchEngineOn"];
+            if (!sw.is_array()) ctx.AddError(path + ".switchEngineOn", "must be an array of failure class strings");
+            else for (const auto& item : sw) {
+                if (!item.is_string() || item.get<std::string>().empty())
+                    ctx.AddError(path + ".switchEngineOn", "entries must be non-empty strings");
+                else node->switchEngineOn.push_back(item.get<std::string>());
+            }
+        }
         ParseJobCommonFields(j, path, *node, ctx);
     } else if (t == "worker") {
         if (j.contains("prompt") && j["prompt"].is_string()) node->prompt = j["prompt"].get<std::string>();
@@ -298,13 +506,79 @@ std::unique_ptr<BtNode> ParseNode(const json& j, const std::string& path, const 
             else ctx.AddError(path + ".outputSchema", "must be a JSON object or string");
         }
         ParseJobCommonFields(j, path, *node, ctx);
-        if (ctx.catalog) {
-            std::string effEngine = !node->engine.empty() ? node->engine : ctx.workerDefaults.engine;
+
+        if (j.contains("engines")) {
+            if (!j["engines"].is_array() || j["engines"].empty()) {
+                ctx.AddError(path + ".engines", "must be a non-empty array of {engine, model} objects");
+            } else {
+                if (!node->engine.empty() || !node->model.empty()) {
+                    ctx.AddError(path, "'engine'/'model' and 'engines' cannot both be specified");
+                }
+                for (size_t i = 0; i < j["engines"].size(); ++i) {
+                    const json& c = j["engines"][i];
+                    const std::string cpath = path + ".engines[" + std::to_string(i) + "]";
+                    if (!c.is_object() || !c.contains("engine") || !c["engine"].is_string() ||
+                        c["engine"].get<std::string>().empty()) {
+                        ctx.AddError(cpath, "requires a non-empty string 'engine'");
+                        continue;
+                    }
+                    BtEngineChoice choice;
+                    choice.engine = c["engine"].get<std::string>();
+                    if (c.contains("model") && c["model"].is_string()) choice.model = c["model"].get<std::string>();
+                    if (c.contains("list") && c["list"].is_string()) choice.list = c["list"].get<std::string>();
+                    if (c.contains("entry") && c["entry"].is_string()) choice.entry = c["entry"].get<std::string>();
+                    if (ctx.catalog) {
+                        std::string engErr;
+                        if (!ctx.catalog->Knows(choice.engine, choice.model, engErr)) {
+                            ctx.AddError(cpath, engErr);
+                        } else if (!ctx.catalog->IsApprovedForList("worker", choice.engine, choice.model)) {
+                            ctx.AddError(cpath, "candidate is not approved and enabled in the worker LLM list; "
+                                                "run 'hancho-cli llm add --list worker --engine " +
+                                                choice.engine + " --model " + choice.model +
+                                                " --reason \"...\"' and approve it");
+                        } else {
+                            choice.list = "worker";
+                            choice.entry = choice.engine + "/" + choice.model;
+                        }
+                    }
+                    node->engineCandidates.push_back(std::move(choice));
+                }
+            }
+        }
+        if (j.contains("switchEngineOn")) {
+            const json& sw = j["switchEngineOn"];
+            if (!sw.is_array()) {
+                ctx.AddError(path + ".switchEngineOn", "must be an array of failure class strings");
+            } else {
+                for (const auto& item : sw) {
+                    if (!item.is_string() || item.get<std::string>().empty()) {
+                        ctx.AddError(path + ".switchEngineOn", "entries must be non-empty strings");
+                        continue;
+                    }
+                    node->switchEngineOn.push_back(item.get<std::string>());
+                }
+            }
+        }
+        if (ctx.catalog && node->engineCandidates.empty()) {
+            std::string effEngine = !node->engine.empty() ? node->engine : ctx.defaults.worker.engine;
             std::string effModel = !node->model.empty()
                 ? node->model
-                : ((node->engine.empty() || node->engine == ctx.workerDefaults.engine) ? ctx.workerDefaults.model : "");
+                : ((node->engine.empty() || node->engine == ctx.defaults.worker.engine) ? ctx.defaults.worker.model : "");
             std::string engErr;
             if (!ctx.catalog->Knows(effEngine, effModel, engErr)) ctx.AddError(path, engErr);
+        }
+    } else if (t == "probe") {
+        if (j.contains("engine") && j["engine"].is_string()) node->engine = j["engine"].get<std::string>();
+        if (j.contains("model") && j["model"].is_string()) node->model = j["model"].get<std::string>();
+        node->timeoutSec = 60;
+        if (j.contains("timeoutSec")) ReqPosInt(j, "timeoutSec", path, t, node->timeoutSec, ctx);
+        if (j.contains("probe") && (!j["probe"].is_boolean() || !j["probe"].get<bool>())) {
+            ctx.AddError(path + ".probe", "a probe node cannot be disabled");
+        }
+        if (ctx.catalog) {
+            std::string effEngine = !node->engine.empty() ? node->engine : ctx.defaults.worker.engine;
+            std::string engErr;
+            if (!ctx.catalog->Knows(effEngine, node->model, engErr)) ctx.AddError(path, engErr);
         }
     } else if (t == "wait") {
         if (!j.contains("sec") || !j["sec"].is_number_integer() || j["sec"].get<int>() < 0) {
@@ -369,11 +643,11 @@ std::unique_ptr<BtNode> ParseNode(const json& j, const std::string& path, const 
                 if (fb.contains("engine") && fb["engine"].is_string()) node->fallback.engine = fb["engine"].get<std::string>();
                 if (fb.contains("model") && fb["model"].is_string()) node->fallback.model = fb["model"].get<std::string>();
                 if (ctx.catalog) {
-                    std::string effEng = !node->fallback.engine.empty() ? node->fallback.engine : ctx.workerDefaults.engine;
+                    std::string effEng = !node->fallback.engine.empty() ? node->fallback.engine : ctx.defaults.worker.engine;
                     std::string effMod = !node->fallback.model.empty()
                         ? node->fallback.model
-                        : ((node->fallback.engine.empty() || node->fallback.engine == ctx.workerDefaults.engine)
-                               ? ctx.workerDefaults.model
+                        : ((node->fallback.engine.empty() || node->fallback.engine == ctx.defaults.worker.engine)
+                               ? ctx.defaults.worker.model
                                : "");
                     std::string engErr;
                     if (!ctx.catalog->Knows(effEng, effMod, engErr)) ctx.AddError(path + ".fallback", engErr);
@@ -422,14 +696,299 @@ std::unique_ptr<BtNode> ParseNode(const json& j, const std::string& path, const 
         }
         if (!node->hasEq && !node->hasNe && !node->hasIn)
             ctx.AddError(path, "'nodeState' requires 'eq' (or 'state' / 'in')");
+    } else if (t == "failure") {
+        ReqStr(j, "node", path, t, node->condNode, ctx);
+        if (j.contains("class")) {
+            const json& c = j["class"];
+            if (c.is_string()) {
+                if (!c.get<std::string>().empty()) node->condFailureClasses.push_back(c.get<std::string>());
+                else ctx.AddError(path + ".class", "must be a non-empty string");
+            } else if (c.is_array()) {
+                if (c.empty()) ctx.AddError(path + ".class", "must not be an empty array");
+                for (const auto& item : c) {
+                    if (!item.is_string() || item.get<std::string>().empty())
+                        ctx.AddError(path + ".class", "elements must be non-empty strings");
+                    else
+                        node->condFailureClasses.push_back(item.get<std::string>());
+                }
+            } else {
+                ctx.AddError(path + ".class", "must be a string or an array of strings");
+            }
+        }
+        if (j.contains("cause")) {
+            if (!j["cause"].is_string() || j["cause"].get<std::string>().empty())
+                ctx.AddError(path + ".cause", "must be a non-empty string");
+            else
+                node->condFailureCause = j["cause"].get<std::string>();
+        }
+        if (node->condFailureClasses.empty() && node->condFailureCause.empty())
+            ctx.AddError(path, "'failure' requires 'class' and/or 'cause'");
     } else {
         ctx.AddError(path, "unknown node type '" + rawType + "'");
     }
     return node;
 }
 
-bool ParseTreeDocument(const std::string& jsonText, const IBtEngineCatalog* catalog, std::vector<std::string>& outErrors) {
+// ---------------------------------------------------------------------------
+// 091-4: lint warnings. These never make a tree invalid; --strict promotes them
+// to errors in BehaviorTree::ValidateResponse.
+// ---------------------------------------------------------------------------
+
+void AddWarning(std::vector<BtWarning>& warnings, const std::string& path,
+                const std::string& code, const std::string& message,
+                const std::string& suggestion) {
+    BtWarning w;
+    w.path = path;
+    w.code = code;
+    w.message = message;
+    w.suggestion = suggestion;
+    warnings.push_back(std::move(w));
+}
+
+std::string LowerCopy(const std::string& s) {
+    std::string out;
+    out.reserve(s.size());
+    for (unsigned char c : s) out.push_back(static_cast<char>(std::tolower(c)));
+    return out;
+}
+
+bool HasWholeWord(const std::string& lower, const char* word) {
+    size_t pos = 0;
+    const std::string w(word);
+    while ((pos = lower.find(w, pos)) != std::string::npos) {
+        bool leftOk = pos == 0 || !std::isalnum(static_cast<unsigned char>(lower[pos - 1]));
+        size_t after = pos + w.size();
+        bool rightOk = after >= lower.size() || !std::isalnum(static_cast<unsigned char>(lower[after]));
+        if (leftOk && rightOk) return true;
+        pos = after;
+    }
+    return false;
+}
+
+bool CommandHasModelFlag(const std::string& command) {
+    const std::string lower = LowerCopy(command);
+    return lower.find("--model") != std::string::npos || lower.find("-model") != std::string::npos;
+}
+
+bool IsOpencodeLauncher(const BtNode& n, const ParseContext& ctx) {
+    if (n.engine == "opencode") return true;
+    const std::string defaultEngine = ctx.defaults.worker.engine;
+    if (n.type == "worker" && n.engine.empty() && defaultEngine == "opencode") return true;
+    for (const auto& c : n.engineCandidates) if (c.engine == "opencode") return true;
+    if (n.fallback.enabled && n.fallback.engine == "opencode") return true;
+    return HasWholeWord(LowerCopy(n.command), "opencode");
+}
+
+bool LaunchHasModel(const BtNode& n, const ParseContext& ctx) {
+    if (!n.model.empty()) return true;
+    if (!n.engineCandidates.empty()) {
+        for (const auto& c : n.engineCandidates) if (c.model.empty()) return false;
+        return true;
+    }
+    if (n.type == "worker" && ctx.defaults.worker.engine == "opencode" &&
+        !ctx.defaults.worker.model.empty()) return true;
+    if (n.fallback.enabled && !n.fallback.model.empty()) return true;
+    return CommandHasModelFlag(n.command);
+}
+
+bool IsLlmLaunchNode(const BtNode& n, const ParseContext& ctx) {
+    if (n.type == "worker") return true;
+    if (n.type != "job") return false;
+    return !n.engine.empty() || !n.model.empty() || !n.engineCandidates.empty() ||
+           n.rawDef.contains("agentType") || LooksLikeLlmJobCommand(n.command) ||
+           IsOpencodeLauncher(n, ctx);
+}
+
+void CheckNodeWarnings(const BtNode& n, ParseContext& ctx, bool guarded,
+                       std::vector<BtWarning>& warnings) {
+    const bool llmLauncher = IsLlmLaunchNode(n, ctx);
+    const bool hasWatch = n.idle.configured && (n.idle.firstEventSec > 0 || n.idle.outputSec > 0);
+
+    if (llmLauncher && !hasWatch) {
+        AddWarning(warnings, n.pathKey, "no_hang_watch",
+                   "An LLM worker/job has neither idle.firstEventSec nor idle.outputSec, and no defaults.",
+                   "Add \"idle\": {\"firstEventSec\": 180} or a \"defaults.worker.idle\" entry.");
+    }
+    if (llmLauncher && !guarded) {
+        AddWarning(warnings, n.pathKey, "unguarded_worker",
+                   "An LLM worker/job failure reaches the root without a catch, fallback or retry ancestor.",
+                   "Wrap the node in a \"catch\" with handlers, or place it under \"fallback\" / \"retry\".");
+    }
+
+    if ((n.type == "worker" || n.type == "job" || n.type == "probe") &&
+        IsOpencodeLauncher(n, ctx) && !LaunchHasModel(n, ctx)) {
+        AddWarning(warnings, n.pathKey, "opencode_without_model",
+                   "opencode is launched without a model (neither \"model\" nor --model/-Model).",
+                   "Set \"model\", add a models entry to \"engines\", or pass --model in the command.");
+    }
+
+    // 091-7: declared needs must be approved before the node is allowed to run.
+    if (n.rawDef.is_object() && n.rawDef.contains("needs") && n.rawDef["needs"].is_array()) {
+        permit::Config cfg;
+        std::string err;
+        permit::Load(permit::DefaultPath(), cfg, err);
+        const std::string scope = "bt:" + ctx.baseQueue;
+        for (const auto& need : n.rawDef["needs"]) {
+            if (!need.is_object()) continue;
+            const std::string kind = need.value("kind", std::string());
+            const std::string target = need.value("target", std::string());
+            if (!permit::IsValidKind(kind) || target.empty()) {
+                AddWarning(warnings, n.pathKey, "permit_invalid",
+                           "needs entry has an invalid kind or empty target.",
+                           "Use {\"kind\":\"read_path|write_path|command|network\",\"target\":\"...\"}.");
+                continue;
+            }
+            if (!permit::IsApproved(cfg, kind, target, n.engine, scope)) {
+                AddWarning(warnings, n.pathKey, "permit_not_approved",
+                           "Permission '" + kind + " " + target + "' is declared in needs but is not approved.",
+                           "Run `hancho-cli permit request --kind " + kind + " --target \"" + target +
+                           "\" --reason \"...\"` and approve it before running.");
+            }
+        }
+    }
+
+    const size_t engineCount = n.engineCandidates.size();
+    if (engineCount >= 2 && n.switchEngineOn.empty()) {
+        AddWarning(warnings, n.pathKey, "engines_without_switch",
+                   "Two or more engine candidates are listed but switchEngineOn is empty, so no switch can happen.",
+                   "Add \"switchEngineOn\": [\"startup_hang\", \"auth_error\", \"probe_failed\"].");
+    }
+    if (!n.switchEngineOn.empty() && engineCount < 2) {
+        AddWarning(warnings, n.pathKey, "switch_without_engines",
+                   "switchEngineOn is set but fewer than two engine candidates are listed.",
+                   "Add at least two approved entries to \"engines\", or remove \"switchEngineOn\".");
+    }
+
+    if (llmLauncher && n.type == "job" && !n.command.empty() &&
+        n.command.find("{engine}") == std::string::npos &&
+        n.command.find("{model}") == std::string::npos) {
+        AddWarning(warnings, n.pathKey, "unswitchable_command",
+                   "This LLM job command has no {engine}/{model} placeholder, so it cannot be switched on failure.",
+                   "Use {engine} and {model} in the command (for example -Engine {engine} -Model {model}).");
+    }
+
+    if (n.type == "escalate" && !n.expect.empty()) {
+        bool hasTakeover = false;
+        for (const auto& e : n.expect) if (e == "takeover") hasTakeover = true;
+        if (!hasTakeover) {
+            AddWarning(warnings, n.pathKey, "escalate_without_takeover",
+                       "escalate has \"expect\" but does not offer \"takeover\".",
+                       "Add \"takeover\" to \"expect\" so the supervisor can be handed control.");
+        }
+    }
+
+    if (!ctx.catalog) return;
+    auto checkPermitted = [&](const std::string& path, const std::string& list,
+                              const std::string& engine, const std::string& model) {
+        std::string err;
+        if (!ctx.catalog->Knows(engine, model, err)) {
+            AddWarning(warnings, path, "engine_not_permitted",
+                       "Engine/model is invalid or unknown: " + err,
+                       "Add a valid engine/model to the " + list + " LLM list with 'hancho-cli llm add --list " +
+                       list + "' and approve it.");
+        } else if (!ctx.catalog->IsApprovedForList(list, engine, model)) {
+            AddWarning(warnings, path, "engine_not_permitted",
+                       "Engine/model is missing, disabled or still proposed in the " + list + " LLM list.",
+                       "Run 'hancho-cli llm add --list " + list + " --engine " + engine +
+                       " --model " + model + " --reason \"...\"' and approve it.");
+        }
+    };
+    for (size_t i = 0; i < n.engineCandidates.size(); ++i) {
+        const auto& c = n.engineCandidates[i];
+        checkPermitted(n.pathKey + ".engines[" + std::to_string(i) + "]",
+                       "worker", c.engine, c.model);
+    }
+    if (!n.engineCandidates.empty()) return;
+    if (llmLauncher && (!n.engine.empty() || !n.model.empty())) {
+        std::string effEngine = !n.engine.empty() ? n.engine : ctx.defaults.worker.engine;
+        std::string effModel = !n.model.empty()
+            ? n.model
+            : ((n.engine.empty() || n.engine == ctx.defaults.worker.engine) ? ctx.defaults.worker.model : "");
+        checkPermitted(n.pathKey + ".engine", "worker", effEngine, effModel);
+    }
+    if (n.type == "escalate" && n.fallback.enabled &&
+        (!n.fallback.engine.empty() || !n.fallback.model.empty())) {
+        std::string effEngine = !n.fallback.engine.empty() ? n.fallback.engine : ctx.defaults.worker.engine;
+        std::string effModel = !n.fallback.model.empty()
+            ? n.fallback.model
+            : ((n.fallback.engine.empty() || n.fallback.engine == ctx.defaults.worker.engine)
+                   ? ctx.defaults.worker.model : "");
+        checkPermitted(n.pathKey + ".fallback", "consult", effEngine, effModel);
+    }
+}
+
+void CollectNodeWarnings(const BtNode& n, ParseContext& ctx, bool guarded,
+                         std::vector<BtWarning>& warnings) {
+    CheckNodeWarnings(n, ctx, guarded, warnings);
+    const bool childGuarded = guarded || n.type == "catch" || n.type == "fallback" || n.type == "retry";
+    for (const auto& c : n.children) CollectNodeWarnings(*c, ctx, childGuarded, warnings);
+    if (n.condChild) CollectNodeWarnings(*n.condChild, ctx, childGuarded, warnings);
+    if (n.thenChild) CollectNodeWarnings(*n.thenChild, ctx, childGuarded, warnings);
+    if (n.elseChild) CollectNodeWarnings(*n.elseChild, ctx, childGuarded, warnings);
+    if (n.singleChild) CollectNodeWarnings(*n.singleChild, ctx, childGuarded, warnings);
+    if (n.untilChild) CollectNodeWarnings(*n.untilChild, ctx, childGuarded, warnings);
+    if (n.otherwiseChild) CollectNodeWarnings(*n.otherwiseChild, ctx, childGuarded, warnings);
+    for (const auto& h : n.catchHandlers) {
+        if (h.doNode) CollectNodeWarnings(*h.doNode, ctx, childGuarded, warnings);
+    }
+}
+
+void ValidateFailureNodeReferences(const BtNode& node, ParseContext& ctx) {
+    if (node.type == "failure" && !node.condNode.empty() &&
+        ctx.seenKeys.find(node.condNode) == ctx.seenKeys.end()) {
+        ctx.AddError(node.pathKey + ".node", "unknown node id '" + node.condNode + "'");
+    }
+    for (const auto& c : node.children) ValidateFailureNodeReferences(*c, ctx);
+    if (node.condChild) ValidateFailureNodeReferences(*node.condChild, ctx);
+    if (node.thenChild) ValidateFailureNodeReferences(*node.thenChild, ctx);
+    if (node.elseChild) ValidateFailureNodeReferences(*node.elseChild, ctx);
+    if (node.singleChild) ValidateFailureNodeReferences(*node.singleChild, ctx);
+    if (node.untilChild) ValidateFailureNodeReferences(*node.untilChild, ctx);
+    for (const auto& h : node.catchHandlers) {
+        if (h.doNode) ValidateFailureNodeReferences(*h.doNode, ctx);
+    }
+    if (node.otherwiseChild) ValidateFailureNodeReferences(*node.otherwiseChild, ctx);
+}
+
+void ParseDefaultsBlock(const json& doc, ParseContext& ctx) {
+    if (!doc.contains("defaults")) return;
+    if (!doc["defaults"].is_object()) {
+        ctx.AddError("defaults", "must be an object");
+        return;
+    }
+    const json& d = doc["defaults"];
+    if (d.contains("worker")) {
+        if (!d["worker"].is_object()) {
+            ctx.AddError("defaults.worker", "must be an object");
+        } else {
+            const json& w = d["worker"];
+            ParseIdleObject(w, "idle", "defaults.worker.idle", ctx.defaults.workerIdle, ctx);
+            if (w.contains("maxAttempts")) {
+                if (!w["maxAttempts"].is_number_integer() || w["maxAttempts"].get<int>() < 1)
+                    ctx.AddError("defaults.worker.maxAttempts", "must be a positive integer");
+                else
+                    ctx.defaults.workerMaxAttempts = w["maxAttempts"].get<int>();
+            }
+            if (w.contains("probe")) {
+                if (!w["probe"].is_boolean()) ctx.AddError("defaults.worker.probe", "must be a boolean");
+                else {
+                    ctx.defaults.workerProbe = w["probe"].get<bool>();
+                    ctx.defaults.hasWorkerProbe = true;
+                }
+            }
+        }
+    }
+    if (d.contains("job")) {
+        if (!d["job"].is_object()) ctx.AddError("defaults.job", "must be an object");
+        else ParseIdleObject(d["job"], "idle", "defaults.job.idle", ctx.defaults.jobIdle, ctx);
+    }
+}
+
+bool ParseTreeDocument(const std::string& jsonText, const IBtEngineCatalog* catalog,
+                       std::vector<std::string>& outErrors,
+                       std::vector<BtWarning>* outWarnings = nullptr) {
     outErrors.clear();
+    if (outWarnings) outWarnings->clear();
     json doc = json::parse(jsonText, nullptr, false);
     if (doc.is_discarded() || !doc.is_object()) { outErrors.push_back("$: invalid JSON object"); return false; }
 
@@ -452,23 +1011,35 @@ bool ParseTreeDocument(const std::string& jsonText, const IBtEngineCatalog* cata
         if (!doc["worker"].is_object()) ctx.AddError("worker", "must be an object");
         else {
             const json& w = doc["worker"];
-            if (w.contains("engine") && w["engine"].is_string()) ctx.workerDefaults.engine = w["engine"].get<std::string>();
-            if (w.contains("model") && w["model"].is_string()) ctx.workerDefaults.model = w["model"].get<std::string>();
-            if (catalog && (!ctx.workerDefaults.engine.empty() || !ctx.workerDefaults.model.empty())) {
+            if (w.contains("engine") && w["engine"].is_string()) ctx.defaults.worker.engine = w["engine"].get<std::string>();
+            if (w.contains("model") && w["model"].is_string()) ctx.defaults.worker.model = w["model"].get<std::string>();
+            if (catalog && (!ctx.defaults.worker.engine.empty() || !ctx.defaults.worker.model.empty())) {
                 std::string engErr;
-                if (!catalog->Knows(ctx.workerDefaults.engine, ctx.workerDefaults.model, engErr)) ctx.AddError("worker", engErr);
+                if (!catalog->Knows(ctx.defaults.worker.engine, ctx.defaults.worker.model, engErr)) ctx.AddError("worker", engErr);
             }
         }
     }
+    ParseDefaultsBlock(doc, ctx);
     if (doc.contains("vars") && !doc["vars"].is_object()) ctx.AddError("vars", "must be an object");
+    std::unique_ptr<BtNode> parsedRoot;
     if (!doc.contains("root") || !doc["root"].is_object()) ctx.AddError("root", "missing required object 'root'");
-    else ParseNode(doc["root"], "root", "", 1, ctx, std::string());
+    else {
+        parsedRoot = ParseNode(doc["root"], "root", "", 1, ctx, std::string());
+        if (parsedRoot) ValidateFailureNodeReferences(*parsedRoot, ctx);
+    }
 
     if (!ctx.errors.empty()) { outErrors = std::move(ctx.errors); return false; }
+    if (outWarnings && parsedRoot) CollectNodeWarnings(*parsedRoot, ctx, false, *outWarnings);
     return true;
 }
 
 } // namespace
+
+bool BehaviorTree::ValidateJson(const std::string& jsonText, const IBtEngineCatalog* catalog,
+                                std::vector<std::string>& outErrors,
+                                std::vector<BtWarning>& outWarnings) {
+    return ParseTreeDocument(jsonText, catalog, outErrors, &outWarnings);
+}
 
 bool BehaviorTree::ValidateJson(const std::string& jsonText, const IBtEngineCatalog* catalog, std::vector<std::string>& outErrors) {
     return ParseTreeDocument(jsonText, catalog, outErrors);
@@ -481,6 +1052,58 @@ bool BehaviorTree::ValidateJson(const std::string& jsonText, const IBtEngineCata
     for (size_t i = 0; i < errors.size(); ++i) { if (i > 0) oss << "; "; oss << errors[i]; }
     outError = oss.str();
     return false;
+}
+
+std::string BehaviorTree::ValidateResponse(const std::string& jsonText,
+                                           const IBtEngineCatalog* catalog,
+                                           bool strict) {
+    std::vector<std::string> errors;
+    std::vector<BtWarning> warnings;
+    const bool valid = ValidateJson(jsonText, catalog, errors, warnings);
+
+    json warningArray = json::array();
+    for (const auto& w : warnings) {
+        warningArray.push_back(json{{"path", w.path}, {"code", w.code},
+                                    {"message", w.message}, {"suggestion", w.suggestion}});
+    }
+    json out;
+    out["warnings"] = std::move(warningArray);
+
+    if (!valid) {
+        std::ostringstream oss;
+        for (size_t i = 0; i < errors.size(); ++i) { if (i > 0) oss << "; "; oss << errors[i]; }
+        out["ok"] = false;
+        out["valid"] = false;
+        out["error"] = oss.str();
+        out["errors"] = errors;
+        return out.dump();
+    }
+    if (strict && !warnings.empty()) {
+        std::vector<std::string> asErrors;
+        std::ostringstream oss;
+        for (size_t i = 0; i < warnings.size(); ++i) {
+            const auto& w = warnings[i];
+            asErrors.push_back(w.path + ": " + w.code + ": " + w.message +
+                               " Suggestion: " + w.suggestion);
+            if (i > 0) oss << "; ";
+            oss << asErrors.back();
+        }
+        json codes = json::array();
+        for (const auto& w : warnings) {
+            if (w.code == "permit_not_approved" || w.code == "permit_invalid") {
+                codes.push_back(w.code);
+            }
+        }
+        out["ok"] = false;
+        out["valid"] = false;
+        out["error"] = oss.str();
+        out["errors"] = asErrors;
+        out["errorCodes"] = std::move(codes);
+        return out.dump();
+    }
+    out["ok"] = true;
+    out["valid"] = true;
+    return out.dump();
 }
 
 bool BehaviorTree::LoadDefinition(const std::string& jsonText,
@@ -510,12 +1133,17 @@ bool BehaviorTree::LoadDefinition(const std::string& jsonText,
         limits_.maxWallSec = doc["limits"].value("maxWallSec", 86400);
     }
 
+    defaults_ = BtDefaults();
     workerDefaults_ = BtWorkerDefaults();
     if (doc.contains("worker") && doc["worker"].is_object()) {
         workerDefaults_.engine = doc["worker"].value("engine", std::string());
         workerDefaults_.model = doc["worker"].value("model", std::string());
     }
-    ctx.workerDefaults = workerDefaults_;
+    defaults_.worker = workerDefaults_;
+    ctx.defaults = defaults_;
+    ParseDefaultsBlock(doc, ctx);
+    defaults_ = ctx.defaults;
+    workerDefaults_ = defaults_.worker;
     ctx.btCwd = cwd_;
 
     vars_.clear();
@@ -544,17 +1172,17 @@ std::unique_ptr<BtNode> ParseSingleNodeJson(const json& j,
                                             const std::string& path,
                                             const std::string& role,
                                             int depth,
-                                            const IBtEngineCatalog* catalog,
-                                            const BtWorkerDefaults& workerDefaults,
-                                            const std::string& btCwd,
-                                            const std::vector<std::string>& existingIdsOutsideTarget,
-                                            int existingNodesOutsideTarget,
-                                            const std::string& baseQueue,
-                                            const std::string& queueScope,
-                                            std::string& outError) {
+                                             const IBtEngineCatalog* catalog,
+                                             const BtDefaults& defaults,
+                                             const std::string& btCwd,
+                                             const std::vector<std::string>& existingIdsOutsideTarget,
+                                             int existingNodesOutsideTarget,
+                                             const std::string& baseQueue,
+                                             const std::string& queueScope,
+                                             std::string& outError) {
     ParseContext ctx;
     ctx.catalog = catalog;
-    ctx.workerDefaults = workerDefaults;
+    ctx.defaults = defaults;
     ctx.btCwd = btCwd;
     ctx.baseQueue = baseQueue;
     for (const auto& id : existingIdsOutsideTarget) {

@@ -38,7 +38,7 @@ std::string CompactOneLine(std::string s, size_t maxLen = 80) {
 
 std::string CompactConditionText(const json& n) {
     std::ostringstream ss;
-    for (const char* k : {"file", "path", "node", "name", "var", "than", "regex"}) {
+    for (const char* k : {"file", "path", "node", "name", "var", "than", "regex", "class", "cause"}) {
         std::string v = StrField(n, k);
         if (!v.empty()) ss << ' ' << v;
     }
@@ -85,11 +85,18 @@ std::string FormatCompactNodeLine(const json& n, const std::string& role) {
         if (!q.empty()) ss << " \"" << CompactOneLine(q, 60) << '"';
         std::string answer = status.is_object() ? StrField(status, "answer") : "";
         if (!answer.empty()) ss << " -> " << CompactOneLine(answer, 30);
+        if (status.is_object() && status.value("takenOver", false)) ss << " [takenOver]";
     } else if (type == "wait" || type == "timeout") {
         ss << ' ' << n.value("sec", 0) << 's';
     } else if (type == "parallel") {
         auto it = n.find("success");
         if (it != n.end()) ss << " success=" << (it->is_string() ? it->get<std::string>() : it->dump());
+    } else if (type == "catch") {
+        auto hs = n.find("handlers");
+        ss << " handlers=" << (hs != n.end() && hs->is_array() ? hs->size() : 0)
+           << " maxRetries=" << n.value("maxRetries", 1);
+        std::string handler = status.is_object() ? StrField(status, "catchHandler") : "";
+        if (!handler.empty()) ss << " -> " << CompactOneLine(handler, 50);
     } else if (type == "set") {
         std::string var = StrField(n, "var");
         if (var.empty()) var = StrField(n, "name");
@@ -113,10 +120,18 @@ std::string FormatCompactNodeLine(const json& n, const std::string& role) {
 void AppendCompactNodeLines(const json& n, const std::string& role, int depth, std::ostringstream& out) {
     if (!n.is_object() || depth > 64) return;
     out << std::string(static_cast<size_t>(depth) * 2, ' ') << FormatCompactNodeLine(n, role) << '\n';
-    for (const char* slot : {"cond", "then", "else", "child", "until"}) {
+    for (const char* slot : {"cond", "then", "else", "child", "until", "otherwise"}) {
         auto it = n.find(slot);
         if (it != n.end() && it->is_object() && it->contains("type")) {
             AppendCompactNodeLines(*it, slot, depth + 1, out);
+        }
+    }
+    auto hs = n.find("handlers");
+    if (hs != n.end() && hs->is_array()) {
+        for (const auto& h : *hs) {
+            if (h.is_object() && h.contains("do") && h["do"].is_object() && h["do"].contains("type")) {
+                AppendCompactNodeLines(h["do"], "do", depth + 1, out);
+            }
         }
     }
     auto kids = n.find("children");
@@ -171,10 +186,18 @@ void FindWaitingEscalationNodeKey(const json& node, const std::string& btId, std
             if (!outKey.empty()) return;
         }
     }
-    for (const char* k : {"cond", "then", "else", "child", "until"}) {
+    for (const char* k : {"cond", "then", "else", "child", "until", "otherwise"}) {
         if (node.contains(k) && node[k].is_object()) {
             FindWaitingEscalationNodeKey(node[k], btId, outKey);
             if (!outKey.empty()) return;
+        }
+    }
+    if (node.contains("handlers") && node["handlers"].is_array()) {
+        for (const auto& h : node["handlers"]) {
+            if (h.is_object() && h.contains("do") && h["do"].is_object()) {
+                FindWaitingEscalationNodeKey(h["do"], btId, outKey);
+                if (!outKey.empty()) return;
+            }
         }
     }
 }
@@ -187,10 +210,18 @@ void TrimNodeDefinition(json& n) {
             *it = BtVarPreview(it->get<std::string>());
         }
     }
-    for (const char* slot : {"cond", "then", "else", "child", "until"}) {
+    for (const char* slot : {"cond", "then", "else", "child", "until", "otherwise"}) {
         auto it = n.find(slot);
         if (it != n.end() && it->is_object()) {
             TrimNodeDefinition(*it);
+        }
+    }
+    auto hs = n.find("handlers");
+    if (hs != n.end() && hs->is_array()) {
+        for (auto& h : *hs) {
+            if (h.is_object() && h.contains("do") && h["do"].is_object()) {
+                TrimNodeDefinition(h["do"]);
+            }
         }
     }
     auto kids = n.find("children");
@@ -278,25 +309,18 @@ json BuildTreeResponseJson(const BehaviorTree& tree, TreeView view) {
 
 } // namespace
 
-std::string BtManager::Validate(const std::string& jsonText) {
-    std::string err;
+std::string BtManager::Validate(const std::string& jsonText, bool strict) {
     std::lock_guard<std::mutex> lock(mutex_);
-    if (!BehaviorTree::ValidateJson(jsonText, this, err)) {
-        json out;
-        out["ok"] = false;
-        out["valid"] = false;
-        out["error"] = err;
-        return out.dump();
-    }
-    json out;
-    out["ok"] = true;
-    out["valid"] = true;
-    return out.dump();
+    return BehaviorTree::ValidateResponse(jsonText, this, strict);
 }
 
 std::string BtManager::Start(const std::string& jsonText, bool paused) {
     std::string err;
     std::lock_guard<std::mutex> lock(mutex_);
+
+    std::vector<std::string> lintErrors;
+    std::vector<BtWarning> warnings;
+    BehaviorTree::ValidateJson(jsonText, this, lintErrors, warnings);
 
     auto tree = std::make_unique<BehaviorTree>();
     if (!tree->LoadDefinition(jsonText, this, err)) {
@@ -313,6 +337,8 @@ std::string BtManager::Start(const std::string& jsonText, bool paused) {
     }
 
     tree->SetJobRunner(this);
+    tree->SetProber(this);
+    tree->SetEngineHealth(this);
     auto entry = std::make_unique<TreeEntry>();
     entry->tree = std::move(tree);
     TreeEntry* entryPtr = entry.get();
@@ -329,7 +355,14 @@ std::string BtManager::Start(const std::string& jsonText, bool paused) {
     }
 
     PersistEntryLocked(*entryPtr);
-    return BuildTreeResponseJson(*entryPtr->tree, TreeView::Summary).dump();
+    json resp = BuildTreeResponseJson(*entryPtr->tree, TreeView::Summary);
+    json warningArray = json::array();
+    for (const auto& w : warnings) {
+        warningArray.push_back(json{{"path", w.path}, {"code", w.code},
+                                    {"message", w.message}, {"suggestion", w.suggestion}});
+    }
+    resp["warnings"] = std::move(warningArray);
+    return resp.dump();
 }
 
 std::string BtManager::Get(const std::string& id, bool compact) {

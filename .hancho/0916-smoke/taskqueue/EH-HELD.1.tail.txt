@@ -1,0 +1,50 @@
+[Hancho] Process Exited (completed)
+Exit Code   : 0
+End Time    : 2026-11-20 06:26:39
+Uptime      : 00:00:00 (0.2s)
+Done File   : D:\wsgit\Hancho\.hancho\0916-smoke\proc_61.done
+================================================================================
+================================================================================
+Hancho Process Log
+ID          : #66
+Name        : EH-HELD
+Command     : cmd /c echo OK -Engine hangdummy -Model m1
+Working Dir : D:\wsgit\Hancho
+Mode        : pipe
+Root PID    : 23264
+Start Time  : 2026-11-20 06:31:48
+Log File    : D:\wsgit\Hancho\.hancho\0916-smoke\taskqueue\EH-HELD.1.log
+Done File   : D:\wsgit\Hancho\.hancho\0916-smoke\proc_66.done
+================================================================================
+
+OK -Engine hangdummy -Model m1
+
+================================================================================
+[Hancho] Process Exited (completed)
+Exit Code   : 0
+End Time    : 2026-11-20 06:31:48
+Uptime      : 00:00:00 (0.2s)
+Done File   : D:\wsgit\Hancho\.hancho\0916-smoke\proc_66.done
+================================================================================
+================================================================================
+Hancho Process Log
+ID          : #71
+Name        : EH-HELD
+Command     : cmd /c echo OK -Engine hangdummy -Model m1
+Working Dir : D:\wsgit\Hancho
+Mode        : pipe
+Root PID    : 25868
+Start Time  : 2026-11-20 06:36:07
+Log File    : D:\wsgit\Hancho\.hancho\0916-smoke\taskqueue\EH-HELD.1.log
+Done File   : D:\wsgit\Hancho\.hancho\0916-smoke\proc_71.done
+================================================================================
+
+OK -Engine hangdummy -Model m1
+
+================================================================================
+[Hancho] Process Exited (completed)
+Exit Code   : 0
+End Time    : 2026-11-20 06:36:08
+Uptime      : 00:00:00 (0.2s)
+Done File   : D:\wsgit\Hancho\.hancho\0916-smoke\proc_71.done
+================================================================================

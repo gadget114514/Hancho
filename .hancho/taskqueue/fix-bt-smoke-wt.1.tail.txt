@@ -1,0 +1,50 @@
+
+- The source builds job ids as `<btId>-<nodeKey>-<runs>`. `nodeKey` is the node's `id` when it has one (`src/behavior_tree.cpp:418`, `src/behavior_tree_exec.cpp:153`, `src/behavior_tree_escalate.cpp:235`).
+- The tests use the old `<btId>-<n>` form. `OnJobFinished` looks up `runningJobs` by exact id (`src/behavior_tree_runtime.cpp:190`), so an unknown id is silently ignored. The job never finishes, so the test stays in `running`.
+- That single miss cascades. For example, `esc-test-1` is ignored, so the escalate node never runs and `waitingForLlm` never appears.
+- The uncommitted `worker-test-w1-1` rename is correct. The other ids were not updated.
+- One expectation also depends on the reset semantics. `Retry(..., resetCounters=true)` restarts `runs` at 1, so the new id is `feature-persist-build-1`, not `-3`. The `startedAt` change in `src/behavior_tree_state.cpp` relies on the same reset behavior.
+
+**(b) Edits needed (expectations only, no checks removed or weakened)**
+
+In `tests/behavior_tree_smoke.cpp`:
+- L123 `worker-test-2` → `worker-test-w2-1`
+- L180, 181, 182, 194–196 `comp-test-N` → `comp-test-flaky-N`
+- L229, 231 `par-any-1` / `par-any-2` → `par-any-j1-1` / `par-any-j2-1`
+- L251, 252 `par-all-1` / `par-all-2` → `par-all-j1-1` / `par-all-j2-1`
+- L324–325 `flow-test-1` → `flow-test-step-1`
+- L373 `rep-wait-to-1` → `rep-wait-to-step-1`; L373 `rep-wait-to-2` → `rep-wait-to-step-2`; L387 `rep-wait-to-3` → `rep-wait-to-hung-1`
+- L447, 456 `var-test-1` → `var-test-j1-1` (also the expanded text `job=var-test-1` → `job=var-test-j1-1`); L460 `var-test-2` → `var-test-j2-1`
+
+In `tests/behavior_tree_smoke_part2.cpp`:
+- L52 `cond-test-1` → `cond-test-j1-1`
+- L109, 152, 163 `esc-test-1` → `esc-test-prep-1`
+- L139, 165 `esc-test-2` (fallback worker) → `esc-test-ask-1`
+- L143 `esc-test-3` → `esc-test-deploy-1`
+- L273 `feature-persist-1` → `feature-persist-build-1`; L284, 295 `feature-persist-2` → `feature-persist-build-2`
+- L307 expected `feature-persist-3` → `feature-persist-build-1`; L310 `feature-persist-3` → `feature-persist-build-1`
+- L314 `feature-persist-4` → `feature-persist-test-1`
+
+I did not verify these by running them. Some ids are inferred from the formula, so a few may still be off. The escalate fallback id (`esc-test-ask-1`) and the post-reset retry id are the least certain.
+
+**(c) Before/after counts**
+
+- Before: not captured. Running `build\Release\behavior_tree_smoke.exe` requires approval in this session. The 46 figure is from your report.
+- After: not run. No edits were applied and the build was not run.
+
+**(d) Not done**
+
+- No files changed. The working tree is as it was at the start.
+- Edit to `tests/behavior_tree_smoke.cpp` and `tests/behavior_tree_smoke_part2.cpp`: denied (write permission not granted).
+- Rebuild and run: not done (execution needs approval).
+- Semble search also needs permission, so I used Grep and Read.
+
+If you grant write and run permission, I'll apply these edits, rebuild `behavior_tree_smoke`, and report the counts. I'd also confirm the `esc-test-ask-1` and retry ids against the run output.
+
+================================================================================
+[Hancho] Process Exited (completed)
+Exit Code   : 0
+End Time    : 2026-11-19 16:41:34
+Uptime      : 00:01:37 (1m 37s)
+Done File   : D:\wsgit\Hancho\.hancho\proc_1.done
+================================================================================

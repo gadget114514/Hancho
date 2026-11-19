@@ -7,6 +7,9 @@
 #include "term_server.h"
 #include "common.h"
 #include "llm_stream.h"
+#include "llm_config.h"
+#include "permit_config.h"
+#include "engine_health.h"
 #include "event_schema.h"
 #include "activity_tree.h"
 #include "bt_debug_view.h"
@@ -695,6 +698,30 @@ enum ControlId {
     IDC_SET_TRIAGE_LLM_MODE = 6065,
     IDC_SET_TRIAGE_KIND_BASE = 6066, // 6066..6070
     IDC_SET_TRIAGE_LLM_PERMISSIONS = 6085, // 6085..6089: read_files, run_commands, write_files, network, use_worker_permissions
+    IDC_SET_LLM_LIST = 6090,
+    IDC_SET_LLM_ROWS = 6091,
+    IDC_SET_LLM_ENGINE = 6092,
+    IDC_SET_LLM_MODEL = 6093,
+    IDC_SET_LLM_PROVIDER = 6094,
+    IDC_SET_LLM_RANK = 6095,
+    IDC_SET_LLM_NOTE = 6096,
+    IDC_SET_LLM_ADD = 6097,
+    IDC_SET_LLM_REMOVE = 6098,
+    IDC_SET_LLM_TOGGLE = 6099,
+    IDC_SET_LLM_APPROVE = 6100,
+    IDC_SET_LLM_REFRESH = 6101,
+    // 091-7: permits page
+    IDC_SET_PERMIT_ROWS = 6110,
+    IDC_SET_PERMIT_KIND = 6111,
+    IDC_SET_PERMIT_TARGET = 6112,
+    IDC_SET_PERMIT_ENGINE = 6113,
+    IDC_SET_PERMIT_SCOPE = 6114,
+    IDC_SET_PERMIT_NOTE = 6115,
+    IDC_SET_PERMIT_REQUEST = 6116,
+    IDC_SET_PERMIT_APPROVE = 6117,
+    IDC_SET_PERMIT_REJECT = 6118,
+    IDC_SET_PERMIT_REVOKE = 6119,
+    IDC_SET_PERMIT_REFRESH = 6120,
     IDC_SET_TERM_LOCAL = 6071,
     IDC_SET_TERM_REMOTE = 6072,
     IDC_SET_TERM_TOKEN = 6076,
@@ -830,6 +857,7 @@ struct DashboardState {
     int hintAutoDismissSec = 7;
     std::string supervisorCommand;  // batch supervisor engine name (triage_supervisor_engine); "" = default
     std::string lastHintSignature;
+    std::string lastEngineHealthHintSignature;
     int unreadHintCount = 0; // hints added since the hint history was last opened (badge on its button)
     int pendingTriageTask = 0;
     int pendingTriageProcess = 0;
@@ -1547,6 +1575,7 @@ static std::wstring StateLabelWide(ProcState state, bool idleWarning) {
         case ProcState::Failed:       return Tr(L"失敗", L"FAILED", L"FALLIDO");
         case ProcState::TimedOut:     return Tr(L"タイムアウト", L"TIMEOUT", L"TIEMPO AGOTADO");
         case ProcState::IdleTimedOut: return Tr(L"ハングタイムアウト", L"HANG TIMEOUT", L"TIEMPO DE INACTIVIDAD");
+        case ProcState::StartupTimedOut: return Tr(L"起動ハングタイムアウト", L"STARTUP TIMEOUT", L"TIEMPO AGOTADO DE INICIO");
         case ProcState::Killed:       return Tr(L"強制終了", L"KILLED", L"TERMINADO");
     }
     return Tr(L"不明", L"UNKNOWN", L"DESCONOCIDO");
@@ -1615,6 +1644,7 @@ static COLORREF GetStateBadgeColor(const ProcessSnapshot& s) {
             case ProcState::Failed:
             case ProcState::TimedOut:
             case ProcState::IdleTimedOut:
+            case ProcState::StartupTimedOut:
             case ProcState::Killed:
                 return RGB(255, 0, 0);
         }
@@ -1629,6 +1659,7 @@ static COLORREF GetStateBadgeColor(const ProcessSnapshot& s) {
             case ProcState::Failed:
             case ProcState::TimedOut:
             case ProcState::IdleTimedOut:
+            case ProcState::StartupTimedOut:
             case ProcState::Killed:
                 return RGB(190, 110, 120);
         }
@@ -1643,6 +1674,7 @@ static COLORREF GetStateBadgeColor(const ProcessSnapshot& s) {
             case ProcState::Failed:
             case ProcState::TimedOut:
             case ProcState::IdleTimedOut:
+            case ProcState::StartupTimedOut:
             case ProcState::Killed:
                 return RGB(122, 74, 74);
         }
@@ -1656,6 +1688,7 @@ static COLORREF GetStateBadgeColor(const ProcessSnapshot& s) {
         case ProcState::Failed:
         case ProcState::TimedOut:
         case ProcState::IdleTimedOut:
+        case ProcState::StartupTimedOut:
         case ProcState::Killed:
             return RGB(220, 38, 38);
     }
@@ -1733,6 +1766,7 @@ static bool ProcessRowKey(const ProcessSnapshot& s, ListRowKey& key) {
             return true;
         case ProcState::TimedOut:
         case ProcState::IdleTimedOut:
+        case ProcState::StartupTimedOut:
             key = ListRowKey::Timeout;
             return true;
         case ProcState::Failed:
@@ -1759,6 +1793,7 @@ static COLORREF GetStateRowBgColor(const ProcessSnapshot& s) {
         case ProcState::Failed:
         case ProcState::TimedOut:
         case ProcState::IdleTimedOut:
+        case ProcState::StartupTimedOut:
         case ProcState::Killed:
             return g_theme.rowFailed;
     }
@@ -3590,6 +3625,9 @@ static std::wstring TaskQueueStateLabel(const std::string& state, const std::str
     }
     if (state == "closed") {
         return Tr(L"クローズ (無効)", L"closed", L"cerrado");
+    }
+    if (state == "takenOver") {
+        return Tr(L"引き取り済み", L"Taken over", L"Tomado");
     }
     if (jobPaused) {
         return state == "running"
@@ -5958,7 +5996,7 @@ static void ShowTaskQueueContextMenu(DashboardState* st, const std::string& jobI
     }
     AppendMenuW(hMenu, MF_STRING, 3101, Tr(L"再実行 (Retry)", L"Retry", L"Reintentar"));
     const bool jobFinished = jobState == "succeeded" || jobState == "failed" ||
-                             jobState == "cancelled" || jobState == "closed";
+                             jobState == "cancelled" || jobState == "closed" || jobState == "takenOver";
     if (!jobFinished) {
         AppendMenuW(hMenu, MF_STRING, jobPaused ? 3131 : 3130,
                     jobPaused ? Tr(L"再開 (Resume)", L"Resume", L"Reanudar")
@@ -6458,7 +6496,9 @@ static void RefreshTaskQueueData(DashboardState* st, bool force = false, bool us
         } else if (state == "planned") {
             kind = "planned";
         } else if (state == "failed") {
-            kind = (lastReason == "timed_out" || lastReason == "idle_timed_out") ? "timeout" : "failed";
+            kind = (lastReason == "timed_out" || lastReason == "idle_timed_out" || lastReason == "startup_timed_out") ? "timeout" : "failed";
+        } else if (state == "takenOver") {
+            kind = "takenOver";
         }
         row.id = jobId;
         row.kind = kind;
@@ -6682,6 +6722,8 @@ static void RefreshTaskQueueData(DashboardState* st, bool force = false, bool us
                                                  : Tr(L"自然解消", L"Naturally resolved", L"Resuelto naturalmente");
             } else if (state == "succeeded") {
                 triageStr = Tr(L"処置済", L"Handled", L"Tratado") + autoMark();
+            } else if (state == "takenOver") {
+                triageStr = Tr(L"処置済 (引き取り)", L"Handled (taken over)", L"Tratado (tomado)");
             } else if (triageState == "pending") {
                 triageStr = Tr(L"判断待ち", L"Awaiting decision", L"Pendiente de decisión");
                 const std::wstring mark = TriageHandoffLabel(triage.value("handoff", std::string()));
@@ -7431,7 +7473,7 @@ static std::vector<TaskGanttRow> BuildTaskGanttRows(const std::string& listJson,
                 row.segments.push_back(seg);
                 plannedCursor = seg.end;
                 row.planned = true;
-            } else if (row.state == "cancelled" || row.state == "closed") {
+            } else if (row.state == "cancelled" || row.state == "closed" || row.state == "takenOver") {
                 int64_t ts = ParseTimestampStrToEpoch(JsonGetString(j, "updated_at", ""));
                 if (ts <= 0) ts = ParseTimestampStrToEpoch(JsonGetString(j, "created_at", ""));
                 if (ts <= 0) ts = now;
@@ -7515,7 +7557,7 @@ static COLORREF GanttSegmentColor(const TaskGanttSegment& seg, const std::string
         return kIdle;
     }
     if (seg.reason == "failed" || seg.reason == "checkFailed" ||
-        seg.reason == "timed_out" || seg.reason == "idle_timed_out" ||
+        seg.reason == "timed_out" || seg.reason == "idle_timed_out" || seg.reason == "startup_timed_out" ||
         seg.reason == "launchFailed") {
         return kFailed;
     }
@@ -8560,7 +8602,8 @@ static void BtDebugSaveExpanded(BtDebugDlgState* ds, HTREEITEM h, std::unordered
 }
 
 static bool BtDebugIsFinished(const std::string& state) {
-    return state == "succeeded" || state == "failed" || state == "cancelled" || state == "closed";
+    return state == "succeeded" || state == "failed" || state == "cancelled" || state == "closed" ||
+           state == "takenOver";
 }
 
 // UTC "YYYY-MM-DDTHH:MM:SS" (the format of the state files' updatedAt) for now - ageSec.
@@ -8676,6 +8719,7 @@ static COLORREF BtDebugStateColor(const std::string& state, bool& has) {
     if (state == "running") return g_theme.rowRunning;
     if (state == "failed" || state == "cancelled") return g_theme.rowFailed;
     if (state == "succeeded") return g_theme.rowCompleted;
+    if (state == "takenOver") return BlendColor(g_theme.rowIdle, g_theme.accent, 0.30f);
     if (state == "waitingForLlm" || state == "paused") return g_theme.rowIdle;
     has = false;
     return g_theme.panel;
@@ -12535,7 +12579,7 @@ static int ThemeButtonId(UiTheme theme) {
     }
 }
 
-static constexpr int kSettingsTabCount = 9;
+static constexpr int kSettingsTabCount = 11;
 
 struct SettingsDlgState {
     DashboardState* dash = nullptr;
@@ -12648,10 +12692,120 @@ struct SettingsDlgState {
        HWND hwndAboutDesc = nullptr;
        HWND hwndPowerPrivilege = nullptr;
        HWND tabCtrl = nullptr;
-        // controls shown under each tab: 0 appearance, 1 behavior, 2 WinConsole,
-        // 3 triage, 4 WebUI, 5 maintenance, 6 performance, 7 colors, 8 about
-       std::vector<HWND> tabPages[kSettingsTabCount];
+          // controls shown under each tab: 0 appearance, 1 behavior, 2 WinConsole,
+          // 3 triage, 4 WebUI, 5 maintenance, 6 performance, 7 colors, 8 about, 9 LLM, 10 permits
+        std::vector<HWND> tabPages[kSettingsTabCount];
+        HWND lblLlmTitle = nullptr;
+        HWND cmbLlmList = nullptr;
+        HWND lstLlmRows = nullptr;
+        HWND editLlmEngine = nullptr;
+        HWND editLlmModel = nullptr;
+        HWND editLlmProvider = nullptr;
+        HWND editLlmRank = nullptr;
+        HWND editLlmNote = nullptr;
+        HWND btnLlmAdd = nullptr;
+        HWND btnLlmRemove = nullptr;
+        HWND btnLlmToggle = nullptr;
+        HWND btnLlmApprove = nullptr;
+        HWND btnLlmRefresh = nullptr;
+        std::vector<llm::Entry> llmVisibleRows;
+        // 091-7 permits page
+        HWND lstPermitRows = nullptr;
+        HWND editPermitKind = nullptr;
+        HWND editPermitTarget = nullptr;
+        HWND editPermitEngine = nullptr;
+        HWND editPermitScope = nullptr;
+        HWND editPermitNote = nullptr;
+        HWND btnPermitRequest = nullptr;
+        HWND btnPermitApprove = nullptr;
+        HWND btnPermitReject = nullptr;
+        HWND btnPermitRevoke = nullptr;
+        HWND btnPermitRefresh = nullptr;
+        std::vector<permit::Entry> permitVisibleRows;
 };
+
+static std::string LlmSelectedList(SettingsDlgState* ds) {
+    if (!ds || !ds->cmbLlmList) return llm::kWorker;
+    int sel = static_cast<int>(SendMessageW(ds->cmbLlmList, CB_GETCURSEL, 0, 0));
+    if (sel == 1) return llm::kConsult;
+    if (sel == 2) return llm::kSupervisor;
+    return llm::kWorker;
+}
+
+static void RefreshLlmRows(SettingsDlgState* ds) {
+    if (!ds || !ds->lstLlmRows) return;
+    SendMessageW(ds->lstLlmRows, LB_RESETCONTENT, 0, 0);
+    ds->llmVisibleRows.clear();
+    llm::Result r = llm::List(llm::DefaultPath(), LlmSelectedList(ds));
+    if (!r.ok) return;
+    const std::string list = LlmSelectedList(ds);
+    for (const auto& row : r.data.value(list, nlohmann::json::array())) {
+        ds->llmVisibleRows.push_back(llm::Entry::FromJson(row));
+    }
+    for (const auto& e : ds->llmVisibleRows) {
+        std::wstring text = std::to_wstring(e.rank) + L". " +
+            Utf8ToWide(e.engine + "/" + e.model);
+        if (e.status != "approved") text += L"  [PROPOSED]";
+        else if (!e.enabled) text += L"  [disabled]";
+        if (!e.note.empty()) text += L"  - " + Utf8ToWide(e.note);
+        SendMessageW(ds->lstLlmRows, LB_ADDSTRING, 0, reinterpret_cast<LPARAM>(text.c_str()));
+    }
+}
+
+static std::wstring LlmEditUtf8(HWND edit) {
+    if (!edit) return std::wstring();
+    wchar_t buf[512] = {};
+    GetWindowTextW(edit, buf, 512);
+    return buf;
+}
+
+static void LlmFillSelectedRow(SettingsDlgState* ds) {
+    if (!ds || !ds->lstLlmRows) return;
+    int sel = static_cast<int>(SendMessageW(ds->lstLlmRows, LB_GETCURSEL, 0, 0));
+    if (sel < 0 || sel >= static_cast<int>(ds->llmVisibleRows.size())) return;
+    const llm::Entry& e = ds->llmVisibleRows[static_cast<size_t>(sel)];
+    SetWindowTextW(ds->editLlmEngine, Utf8ToWide(e.engine).c_str());
+    SetWindowTextW(ds->editLlmModel, Utf8ToWide(e.model).c_str());
+    SetWindowTextW(ds->editLlmProvider, Utf8ToWide(e.provider).c_str());
+    SetWindowTextW(ds->editLlmRank, std::to_wstring(e.rank).c_str());
+    SetWindowTextW(ds->editLlmNote, Utf8ToWide(e.note).c_str());
+}
+
+static void RefreshPermitRows(SettingsDlgState* ds) {
+    if (!ds || !ds->lstPermitRows) return;
+    SendMessageW(ds->lstPermitRows, LB_RESETCONTENT, 0, 0);
+    ds->permitVisibleRows.clear();
+    permit::Result r = permit::List(permit::DefaultPath(), "");
+    if (!r.ok) return;
+    for (const auto& row : r.data.value("permits", nlohmann::json::array())) {
+        ds->permitVisibleRows.push_back(permit::Entry::FromJson(row));
+    }
+    for (const auto& e : ds->permitVisibleRows) {
+        std::wstring status = Utf8ToWide(e.status);
+        for (wchar_t& c : status) c = static_cast<wchar_t>(std::towupper(c));
+        std::wstring text = L"[" + status + L"] " + Utf8ToWide(e.kind) + L" " +
+                            Utf8ToWide(e.target) + L"  (" + Utf8ToWide(e.scope) + L")";
+        if (!e.note.empty()) text += L"  - " + Utf8ToWide(e.note);
+        SendMessageW(ds->lstPermitRows, LB_ADDSTRING, 0, reinterpret_cast<LPARAM>(text.c_str()));
+    }
+}
+
+static void PermitFillSelectedRow(SettingsDlgState* ds) {
+    if (!ds || !ds->lstPermitRows) return;
+    int sel = static_cast<int>(SendMessageW(ds->lstPermitRows, LB_GETCURSEL, 0, 0));
+    if (sel < 0 || sel >= static_cast<int>(ds->permitVisibleRows.size())) return;
+    const permit::Entry& e = ds->permitVisibleRows[static_cast<size_t>(sel)];
+    SetWindowTextW(ds->editPermitKind, Utf8ToWide(e.kind).c_str());
+    SetWindowTextW(ds->editPermitTarget, Utf8ToWide(e.target).c_str());
+    std::wstring engines;
+    for (size_t i = 0; i < e.engines.size(); ++i) {
+        if (i) engines += L",";
+        engines += Utf8ToWide(e.engines[i]);
+    }
+    SetWindowTextW(ds->editPermitEngine, engines.c_str());
+    SetWindowTextW(ds->editPermitScope, Utf8ToWide(e.scope).c_str());
+    SetWindowTextW(ds->editPermitNote, Utf8ToWide(e.note).c_str());
+}
 
 static LRESULT CALLBACK SettingsTabSubclassProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam,
                                                 UINT_PTR, DWORD_PTR) {
@@ -13716,6 +13870,19 @@ static void UpdateSettingsDialogTexts(HWND hwnd) {
     SetWindowTextW(ds->chkActivityStyle, Tr(L"実行状態監視ペイン: 行を色分けし、アイコンを表示", L"Execution monitor pane: colour rows and show icons", L"Panel de ejecución: colorear filas y mostrar iconos"));
     SetWindowTextW(ds->chkShowHiddenTasks, Tr(L"hidden タスクも表示", L"Show hidden tasks", L"Mostrar tareas ocultas"));
     SetWindowTextW(ds->btnClose, Tr(L"閉じる", L"Close", L"Cerrar"));
+    SetWindowTextW(ds->lblLlmTitle, Tr(L"LLM リスト（worker / consult / supervisor は独立）",
+                                      L"LLM lists (worker / consult / supervisor are independent)",
+                                      L"Listas LLM (worker / consult / supervisor son independientes)"));
+    SetWindowTextW(ds->btnLlmAdd, Tr(L"追加", L"Add", L"Añadir"));
+    SetWindowTextW(ds->btnLlmRemove, Tr(L"削除", L"Remove", L"Quitar"));
+    SetWindowTextW(ds->btnLlmToggle, Tr(L"有効/無効", L"Enable/Disable", L"Activar/Desactivar"));
+    SetWindowTextW(ds->btnLlmApprove, Tr(L"承認", L"Approve", L"Aprobar"));
+    SetWindowTextW(ds->btnLlmRefresh, Tr(L"再読み込み", L"Refresh", L"Actualizar"));
+    SetWindowTextW(ds->btnPermitRequest, Tr(L"申請", L"Request", L"Solicitar"));
+    SetWindowTextW(ds->btnPermitApprove, Tr(L"承認", L"Approve", L"Aprobar"));
+    SetWindowTextW(ds->btnPermitReject, Tr(L"却下", L"Reject", L"Rechazar"));
+    SetWindowTextW(ds->btnPermitRevoke, Tr(L"失効", L"Revoke", L"Revocar"));
+    SetWindowTextW(ds->btnPermitRefresh, Tr(L"再読み込み", L"Refresh", L"Actualizar"));
     RefreshPowerPrivilegeText(ds);
     {
         const wchar_t* const tabNames[kSettingsTabCount] = {
@@ -13728,6 +13895,8 @@ static void UpdateSettingsDialogTexts(HWND hwnd) {
             Tr(L"パフォーマンス", L"Performance", L"Rendimiento"),
             Tr(L"色詳細", L"Color details", L"Detalles de color"),
             Tr(L"バージョン情報", L"About", L"Acerca de"),
+            Tr(L"LLM", L"LLM", L"LLM"),
+            Tr(L"権限", L"Permits", L"Permisos"),
         };
         for (int t = 0; t < kSettingsTabCount; ++t) {
             std::wstring name = tabNames[t];
@@ -14672,6 +14841,92 @@ static LRESULT CALLBACK SettingsWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPAR
             SendMessageW(ds->hwndAboutDesc, WM_SETFONT, (WPARAM)ds->dash->hFontUi, TRUE);
             SendMessageW(ds->hwndPowerPrivilege, WM_SETFONT, (WPARAM)ds->dash->hFontUi, TRUE);
 
+            // LLM lists page (091-3): three independent, pre-approved candidate lists.
+            ds->lblLlmTitle = CreateWindowExW(0, L"STATIC", L"", WS_CHILD | WS_VISIBLE,
+                18, 44, 700, 22, hwnd, nullptr, hInst, nullptr);
+            SendMessageW(ds->lblLlmTitle, WM_SETFONT, (WPARAM)ds->dash->hFontUiBold, TRUE);
+
+            ds->cmbLlmList = CreateWindowExW(0, L"COMBOBOX", L"", WS_CHILD | WS_VISIBLE | CBS_DROPDOWNLIST | WS_TABSTOP,
+                18, 72, 170, 200, hwnd, (HMENU)IDC_SET_LLM_LIST, hInst, nullptr);
+            SendMessageW(ds->cmbLlmList, CB_ADDSTRING, 0, reinterpret_cast<LPARAM>(L"worker"));
+            SendMessageW(ds->cmbLlmList, CB_ADDSTRING, 0, reinterpret_cast<LPARAM>(L"consult"));
+            SendMessageW(ds->cmbLlmList, CB_ADDSTRING, 0, reinterpret_cast<LPARAM>(L"supervisor"));
+            SendMessageW(ds->cmbLlmList, CB_SETCURSEL, 0, 0);
+            SendMessageW(ds->cmbLlmList, WM_SETFONT, (WPARAM)ds->dash->hFontUi, TRUE);
+
+            ds->lstLlmRows = CreateWindowExW(0, L"LISTBOX", L"",
+                WS_CHILD | WS_VISIBLE | WS_BORDER | WS_VSCROLL | LBS_NOTIFY | WS_TABSTOP,
+                18, 104, 500, 340, hwnd, (HMENU)IDC_SET_LLM_ROWS, hInst, nullptr);
+            SendMessageW(ds->lstLlmRows, WM_SETFONT, (WPARAM)ds->dash->hFontUi, TRUE);
+
+            ds->editLlmEngine = CreateWindowExW(WS_EX_CLIENTEDGE, L"EDIT", L"", WS_CHILD | WS_VISIBLE | WS_TABSTOP,
+                532, 104, 200, 24, hwnd, (HMENU)IDC_SET_LLM_ENGINE, hInst, nullptr);
+            ds->editLlmModel = CreateWindowExW(WS_EX_CLIENTEDGE, L"EDIT", L"", WS_CHILD | WS_VISIBLE | WS_TABSTOP,
+                532, 136, 200, 24, hwnd, (HMENU)IDC_SET_LLM_MODEL, hInst, nullptr);
+            ds->editLlmProvider = CreateWindowExW(WS_EX_CLIENTEDGE, L"EDIT", L"", WS_CHILD | WS_VISIBLE | WS_TABSTOP,
+                532, 168, 200, 24, hwnd, (HMENU)IDC_SET_LLM_PROVIDER, hInst, nullptr);
+            ds->editLlmRank = CreateWindowExW(WS_EX_CLIENTEDGE, L"EDIT", L"", WS_CHILD | WS_VISIBLE | WS_TABSTOP,
+                532, 200, 200, 24, hwnd, (HMENU)IDC_SET_LLM_RANK, hInst, nullptr);
+            ds->editLlmNote = CreateWindowExW(WS_EX_CLIENTEDGE, L"EDIT", L"", WS_CHILD | WS_VISIBLE | WS_TABSTOP,
+                532, 232, 200, 24, hwnd, (HMENU)IDC_SET_LLM_NOTE, hInst, nullptr);
+            SendMessageW(ds->editLlmEngine, WM_SETFONT, (WPARAM)ds->dash->hFontUi, TRUE);
+            SendMessageW(ds->editLlmModel, WM_SETFONT, (WPARAM)ds->dash->hFontUi, TRUE);
+            SendMessageW(ds->editLlmProvider, WM_SETFONT, (WPARAM)ds->dash->hFontUi, TRUE);
+            SendMessageW(ds->editLlmRank, WM_SETFONT, (WPARAM)ds->dash->hFontUi, TRUE);
+            SendMessageW(ds->editLlmNote, WM_SETFONT, (WPARAM)ds->dash->hFontUi, TRUE);
+
+            struct LlmBtn { HWND* slot; INT_PTR id; int x; };
+            LlmBtn llmBtns[] = {
+                { &ds->btnLlmAdd, IDC_SET_LLM_ADD, 532 },
+                { &ds->btnLlmRemove, IDC_SET_LLM_REMOVE, 638 },
+                { &ds->btnLlmToggle, IDC_SET_LLM_TOGGLE, 532 },
+                { &ds->btnLlmApprove, IDC_SET_LLM_APPROVE, 638 },
+                { &ds->btnLlmRefresh, IDC_SET_LLM_REFRESH, 532 },
+            };
+            int llmBtnY[] = { 268, 268, 304, 304, 340 };
+            for (size_t i = 0; i < sizeof(llmBtns) / sizeof(llmBtns[0]); ++i) {
+                *llmBtns[i].slot = CreateWindowExW(0, L"BUTTON", L"",
+                    WS_CHILD | WS_VISIBLE | BS_OWNERDRAW | WS_TABSTOP,
+                    llmBtns[i].x, llmBtnY[i], 100, 28, hwnd,
+                    (HMENU)llmBtns[i].id, hInst, nullptr);
+                SendMessageW(*llmBtns[i].slot, WM_SETFONT, (WPARAM)ds->dash->hFontUi, TRUE);
+            }
+
+            // 091-7: permits page (same shape as the LLM page).
+            ds->lstPermitRows = CreateWindowExW(0, L"LISTBOX", L"",
+                WS_CHILD | WS_VISIBLE | WS_BORDER | WS_VSCROLL | LBS_NOTIFY | WS_TABSTOP,
+                18, 104, 500, 340, hwnd, (HMENU)IDC_SET_PERMIT_ROWS, hInst, nullptr);
+            ds->editPermitKind = CreateWindowExW(WS_EX_CLIENTEDGE, L"EDIT", L"", WS_CHILD | WS_VISIBLE | WS_TABSTOP,
+                532, 104, 200, 24, hwnd, (HMENU)IDC_SET_PERMIT_KIND, hInst, nullptr);
+            ds->editPermitTarget = CreateWindowExW(WS_EX_CLIENTEDGE, L"EDIT", L"", WS_CHILD | WS_VISIBLE | WS_TABSTOP,
+                532, 136, 200, 24, hwnd, (HMENU)IDC_SET_PERMIT_TARGET, hInst, nullptr);
+            ds->editPermitEngine = CreateWindowExW(WS_EX_CLIENTEDGE, L"EDIT", L"", WS_CHILD | WS_VISIBLE | WS_TABSTOP,
+                532, 168, 200, 24, hwnd, (HMENU)IDC_SET_PERMIT_ENGINE, hInst, nullptr);
+            ds->editPermitScope = CreateWindowExW(WS_EX_CLIENTEDGE, L"EDIT", L"", WS_CHILD | WS_VISIBLE | WS_TABSTOP,
+                532, 200, 200, 24, hwnd, (HMENU)IDC_SET_PERMIT_SCOPE, hInst, nullptr);
+            ds->editPermitNote = CreateWindowExW(WS_EX_CLIENTEDGE, L"EDIT", L"", WS_CHILD | WS_VISIBLE | WS_TABSTOP,
+                532, 232, 200, 24, hwnd, (HMENU)IDC_SET_PERMIT_NOTE, hInst, nullptr);
+            struct PermitBtn { HWND* slot; INT_PTR id; int x; int y; };
+            PermitBtn permitBtns[] = {
+                { &ds->btnPermitRequest, IDC_SET_PERMIT_REQUEST, 532, 268 },
+                { &ds->btnPermitApprove, IDC_SET_PERMIT_APPROVE, 638, 268 },
+                { &ds->btnPermitReject, IDC_SET_PERMIT_REJECT, 532, 304 },
+                { &ds->btnPermitRevoke, IDC_SET_PERMIT_REVOKE, 638, 304 },
+                { &ds->btnPermitRefresh, IDC_SET_PERMIT_REFRESH, 532, 340 },
+            };
+            for (const auto& b : permitBtns) {
+                *b.slot = CreateWindowExW(0, L"BUTTON", L"",
+                    WS_CHILD | WS_VISIBLE | BS_OWNERDRAW | WS_TABSTOP,
+                    b.x, b.y, 100, 28, hwnd, (HMENU)b.id, hInst, nullptr);
+                SendMessageW(*b.slot, WM_SETFONT, (WPARAM)ds->dash->hFontUi, TRUE);
+            }
+            SendMessageW(ds->lstPermitRows, WM_SETFONT, (WPARAM)ds->dash->hFontUi, TRUE);
+            SendMessageW(ds->editPermitKind, WM_SETFONT, (WPARAM)ds->dash->hFontUi, TRUE);
+            SendMessageW(ds->editPermitTarget, WM_SETFONT, (WPARAM)ds->dash->hFontUi, TRUE);
+            SendMessageW(ds->editPermitEngine, WM_SETFONT, (WPARAM)ds->dash->hFontUi, TRUE);
+            SendMessageW(ds->editPermitScope, WM_SETFONT, (WPARAM)ds->dash->hFontUi, TRUE);
+            SendMessageW(ds->editPermitNote, WM_SETFONT, (WPARAM)ds->dash->hFontUi, TRUE);
+
             // Sort the controls into their tab pages.
             {
                 auto& appearance = ds->tabPages[0];
@@ -14725,6 +14980,19 @@ static LRESULT CALLBACK SettingsWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPAR
                     ds->lblWebUiToken, ds->editWebUiToken, ds->btnWebUiTokenRoll });
                 auto& about = ds->tabPages[8];
                 about.insert(about.end(), { ds->hwndAboutTitle, ds->hwndAboutVersion, ds->hwndAboutDesc });
+                auto& llmPage = ds->tabPages[9];
+                llmPage.insert(llmPage.end(), {
+                    ds->lblLlmTitle, ds->cmbLlmList, ds->lstLlmRows,
+                    ds->editLlmEngine, ds->editLlmModel, ds->editLlmProvider,
+                    ds->editLlmRank, ds->editLlmNote,
+                    ds->btnLlmAdd, ds->btnLlmRemove, ds->btnLlmToggle,
+                    ds->btnLlmApprove, ds->btnLlmRefresh });
+                auto& permitPage = ds->tabPages[10];
+                permitPage.insert(permitPage.end(), {
+                    ds->lstPermitRows, ds->editPermitKind, ds->editPermitTarget,
+                    ds->editPermitEngine, ds->editPermitScope, ds->editPermitNote,
+                    ds->btnPermitRequest, ds->btnPermitApprove, ds->btnPermitReject,
+                    ds->btnPermitRevoke, ds->btnPermitRefresh });
             }
             SelectSettingsTab(ds, 0);
             UpdateSettingsDialogTexts(hwnd);
@@ -14741,6 +15009,8 @@ static LRESULT CALLBACK SettingsWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPAR
             if (ds && nm->idFrom == IDC_SET_TAB && nm->code == TCN_SELCHANGE) {
                 SelectSettingsTab(ds, TabCtrl_GetCurSel(ds->tabCtrl));
                 if (TabCtrl_GetCurSel(ds->tabCtrl) == 5) RefreshPowerPrivilegeText(ds);
+                if (TabCtrl_GetCurSel(ds->tabCtrl) == 9) RefreshLlmRows(ds);
+                if (TabCtrl_GetCurSel(ds->tabCtrl) == 10) RefreshPermitRows(ds);
                 return 0;
             }
             break;
@@ -14764,6 +15034,94 @@ static LRESULT CALLBACK SettingsWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPAR
                 return 0;
             }
             if (!ds) return 0;
+            if (id == IDC_SET_LLM_LIST && HIWORD(wParam) == CBN_SELCHANGE) {
+                RefreshLlmRows(ds);
+                return 0;
+            }
+            if (id == IDC_SET_LLM_ROWS && HIWORD(wParam) == LBN_SELCHANGE) {
+                LlmFillSelectedRow(ds);
+                return 0;
+            }
+            if (id >= IDC_SET_LLM_ADD && id <= IDC_SET_LLM_REFRESH && HIWORD(wParam) == BN_CLICKED) {
+                const std::wstring path = llm::DefaultPath();
+                if (id == IDC_SET_LLM_REFRESH) {
+                    RefreshLlmRows(ds);
+                    return 0;
+                }
+                if (id == IDC_SET_LLM_ADD) {
+                    const std::string eng = WideToUtf8(LlmEditUtf8(ds->editLlmEngine));
+                    const std::string mdl = WideToUtf8(LlmEditUtf8(ds->editLlmModel));
+                    std::string rankText = WideToUtf8(LlmEditUtf8(ds->editLlmRank));
+                    int rank = 0;
+                    bool hasRank = !rankText.empty();
+                    if (hasRank) { try { rank = std::stoi(rankText); } catch (...) { hasRank = false; } }
+                    llm::Add(path, LlmSelectedList(ds), eng, mdl,
+                             WideToUtf8(LlmEditUtf8(ds->editLlmProvider)), rank, hasRank,
+                             WideToUtf8(LlmEditUtf8(ds->editLlmNote)), "dashboard",
+                             "added from dashboard");
+                } else {
+                    int sel = static_cast<int>(SendMessageW(ds->lstLlmRows, LB_GETCURSEL, 0, 0));
+                    if (sel >= 0 && sel < static_cast<int>(ds->llmVisibleRows.size())) {
+                        const llm::Entry& e = ds->llmVisibleRows[static_cast<size_t>(sel)];
+                        if (id == IDC_SET_LLM_REMOVE) {
+                            llm::Remove(path, LlmSelectedList(ds), e.engine, e.model,
+                                        "dashboard", "removed from dashboard");
+                        } else if (id == IDC_SET_LLM_TOGGLE) {
+                            llm::SetEnabled(path, LlmSelectedList(ds), e.engine, e.model,
+                                            !e.enabled, "dashboard", "toggled from dashboard");
+                        } else if (id == IDC_SET_LLM_APPROVE) {
+                            llm::ApproveViaDashboard(path, LlmSelectedList(ds), e.engine, e.model,
+                                                     "dashboard");
+                        }
+                    }
+                }
+                RefreshLlmRows(ds);
+                return 0;
+            }
+            if (id == IDC_SET_PERMIT_ROWS && HIWORD(wParam) == LBN_SELCHANGE) {
+                PermitFillSelectedRow(ds);
+                return 0;
+            }
+            if (id >= IDC_SET_PERMIT_REQUEST && id <= IDC_SET_PERMIT_REFRESH &&
+                HIWORD(wParam) == BN_CLICKED) {
+                const std::wstring path = permit::DefaultPath();
+                if (id == IDC_SET_PERMIT_REFRESH) {
+                    RefreshPermitRows(ds);
+                    return 0;
+                }
+                if (id == IDC_SET_PERMIT_REQUEST) {
+                    std::vector<std::string> engines;
+                    std::wstring engineText = LlmEditUtf8(ds->editPermitEngine);
+                    size_t start = 0;
+                    while (start <= engineText.size()) {
+                        size_t end = engineText.find(L',', start);
+                        std::wstring e = engineText.substr(start, end == std::wstring::npos ? std::wstring::npos : end - start);
+                        while (!e.empty() && e.front() == L' ') e.erase(e.begin());
+                        while (!e.empty() && e.back() == L' ') e.pop_back();
+                        if (!e.empty()) engines.push_back(WideToUtf8(e));
+                        if (end == std::wstring::npos) break;
+                        start = end + 1;
+                    }
+                    permit::Request(path, WideToUtf8(LlmEditUtf8(ds->editPermitKind)),
+                                    WideToUtf8(LlmEditUtf8(ds->editPermitTarget)), engines,
+                                    WideToUtf8(LlmEditUtf8(ds->editPermitScope)),
+                                    WideToUtf8(LlmEditUtf8(ds->editPermitNote)), "dashboard");
+                } else {
+                    int sel = static_cast<int>(SendMessageW(ds->lstPermitRows, LB_GETCURSEL, 0, 0));
+                    if (sel >= 0 && sel < static_cast<int>(ds->permitVisibleRows.size())) {
+                        const permit::Entry& e = ds->permitVisibleRows[static_cast<size_t>(sel)];
+                        if (id == IDC_SET_PERMIT_APPROVE) {
+                            permit::ApproveViaDashboard(path, e.id, "dashboard");
+                        } else if (id == IDC_SET_PERMIT_REJECT) {
+                            permit::Reject(path, e.id, "rejected from dashboard", "dashboard");
+                        } else if (id == IDC_SET_PERMIT_REVOKE) {
+                            permit::Revoke(path, e.id, "revoked from dashboard", "dashboard");
+                        }
+                    }
+                }
+                RefreshPermitRows(ds);
+                return 0;
+            }
             if (id == IDC_SET_SHOW_SUPERVISOR_HINTS) {
                 CommitSupervisorSettings(ds);
                 return 0;
@@ -15786,6 +16144,34 @@ static void DrawUsagePanel(HWND hwnd, HDC hdc, DashboardState* st) {
             valThink[bi][k] += p.thinkingTokens;
             valCache[bi][k] += p.cacheReadTokens + p.cacheWriteTokens;
             bucketTotal[bi] += pt;
+        }
+        // TEMP DEBUG (remove after use): dump live usage points and bucket totals for the 4h/24h view.
+        {
+            static size_t dbgLastPoints = static_cast<size_t>(-1);
+            if (points.size() != dbgLastPoints) {
+                dbgLastPoints = points.size();
+                FILE* df = nullptr;
+                if (fopen_s(&df, "C:\\Users\\bluen\\AppData\\Local\\Temp\\hancho_usage_debug.txt", "a") == 0 && df) {
+                    fprintf(df, "=== now=%lld since=%lld bucketSec=%.2f nBuckets=%d points=%zu\n",
+                            (long long)now, (long long)since, bucketSec, nBuckets, points.size());
+                    size_t shown = 0;
+                    for (const auto& p : points) {
+                        if (shown++ >= 500) break;
+                        fprintf(df, "pt epoch=%lld in=%llu out=%llu think=%llu cacheR=%llu cacheW=%llu total=%llu agent=%s model=%s\n",
+                                (long long)p.epochSec, (unsigned long long)p.inputTokens, (unsigned long long)p.outputTokens,
+                                (unsigned long long)p.thinkingTokens, (unsigned long long)p.cacheReadTokens,
+                                (unsigned long long)p.cacheWriteTokens, (unsigned long long)p.totalTokens,
+                                p.agentType.c_str(), p.model.c_str());
+                    }
+                    for (int bi = 0; bi < nBuckets; ++bi) {
+                        if (bucketTotal[bi] == 0) continue;
+                        fprintf(df, "bucket %d start=%lld total=%llu\n", bi,
+                                (long long)(since + static_cast<int64_t>(bi * bucketSec)),
+                                (unsigned long long)bucketTotal[bi]);
+                    }
+                    fclose(df);
+                }
+            }
         }
     } else if (rangeIdx == 2 || rangeIdx == 3) {
         // 7d or 30d: daily buckets from U1 daily rollups
@@ -19076,6 +19462,31 @@ static void UpdateTriageFromCore(DashboardState* st) {
 
 static void EvaluateSupervisorHint(DashboardState* st, bool forceShow) {
     if (!st || !st->hwndMain || !st->showSupervisorHints) return;
+
+    // 091-6: surface engine-down state through the existing supervisor-hint notification.
+    {
+        engine_health::Store health;
+        std::string healthErr;
+        if (engine_health::Load(engine_health::DefaultPath(), health, healthErr)) {
+            std::string signature;
+            std::string summary;
+            for (const auto& kv : health.entries) {
+                if (kv.second.status != "down") continue;
+                signature += kv.first + ";";
+                if (!summary.empty()) summary += "\n";
+                summary += kv.second.HoldReason();
+            }
+            if (!signature.empty() && signature != st->lastEngineHealthHintSignature) {
+                st->lastEngineHealthHintSignature = signature;
+                st->currentTriageCardId.clear();
+                DisplaySupervisorHint(st, L"Engine health", Utf8ToWide(summary),
+                    L"Hancho is probing for recovery. Held jobs resume automatically.",
+                    st->hintAutoDismissSec);
+                return;
+            }
+        }
+    }
+
     if (forceShow && st->triageResponse.contains("cards") && st->triageResponse["cards"].is_array()) {
         for (const auto& card : st->triageResponse["cards"]) {
             if (!card.is_object() || card.value("state", std::string()) != "pending") continue;
@@ -20119,6 +20530,9 @@ static LRESULT CALLBACK DashboardWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPA
                             lvcd->clrTextBk = MutedRowColor(g_theme.rowIdle);
                         } else if (kind == "failed") {
                             lvcd->clrTextBk = MutedRowColor(g_theme.rowFailed);
+                        } else if (kind == "takenOver") {
+                            // Close to cancelled/idle, but tinted so it is distinguishable.
+                            lvcd->clrTextBk = BlendColor(MutedRowColor(g_theme.rowIdle), g_theme.accent, 0.30f);
                         } else {
                             lvcd->clrTextBk = g_theme.panel;
                         }

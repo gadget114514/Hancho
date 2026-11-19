@@ -2381,6 +2381,9 @@ void LlmStreamTracker::ApplyEvent(LlmStreamEvent& ev, const std::string& line) {
     }
 
     ev.seq = nextSeq_++;
+    if (onNormalizedEvent_) {
+        onNormalizedEvent_();
+    }
     ev.timestamp = GetCurrentTimestampStr();
     ev.recvEpochMs = std::chrono::duration_cast<std::chrono::milliseconds>(
         std::chrono::system_clock::now().time_since_epoch()).count();
@@ -2709,6 +2712,11 @@ bool LlmStreamTracker::HasEvents() const {
 uint64_t LlmStreamTracker::EventCount() const {
     std::lock_guard<std::mutex> lock(mutex_);
     return static_cast<uint64_t>(events_.size());
+}
+
+void LlmStreamTracker::SetOnNormalizedEventCallback(OnNormalizedEventCallback cb) {
+    std::lock_guard<std::mutex> lock(mutex_);
+    onNormalizedEvent_ = std::move(cb);
 }
 
 } // namespace pc

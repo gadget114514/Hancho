@@ -150,6 +150,11 @@ hancho-cli.exe taskqueue retry --failed main --since 6h
 
 # Provisional rows for idle behavior-tree leaves are included by default; hide them
 hancho-cli.exe taskqueue list main --no-planned
+
+# Diagnose a failed job, then record taking it over and returning the result
+hancho-cli.exe taskqueue why A
+hancho-cli.exe taskqueue takeover --id A --reason "Worker hung three times; implementing it here"
+hancho-cli.exe taskqueue complete --id A --reason "Fixed and tested" --report reports/taken-over.md
 ```
 
 The task list also shows the active task group (the behavior-tree root) as a
@@ -157,6 +162,8 @@ virtual `group:<id>` row with state `running`, `waitingForLlm` or `paused`. It
 and the `planned` rows are re-derived on every query and are not stored jobs;
 `--no-planned` hides both. Read a task group with `bt get` and answer a waiting
 one with `bt resume`.
+
+**Failure diagnosis and takeover:** `taskqueue why <id>` explains the last failed attempt: `class` (for example `startup_hang` when a worker emitted no normalized events within `idle.firstEventSec`, default 180 s for worker jobs; the end reason is `startup_timed_out`), `confidence`, `summary`, `evidence`, `likelyCauses` (`[{id, why}]`, e.g. `no_model`, `same_engine_nesting`, `waiting_for_input`), `nextSteps` (`[{action, change?, needsApproval?, question?}]`) and `supervisorNote`. The same failure record is in `taskqueue get --json` under `failure`. Follow `nextSteps` in order: retry unchanged once, then retry with a change (`retry_with_change`; changing a model needs `taskqueue update --approve-model-change --reason "..."`), then escalate. If you take the job over yourself, record it first with `taskqueue takeover --id <id> --reason "..."` (the job becomes the terminal state `takenOver` with a `takeover` record) and return the result with `taskqueue complete --id <id> --reason "..." [--report <path>] [--result succeeded|failed]`; dependents advance on `succeeded`. In a BT, answer an escalate with `bt resume --answer takeover --rationale "..."`. The triage card also offers `retry_with_change` as a candidate.
 
 **Quick fix (tiny deterministic edits):**
 

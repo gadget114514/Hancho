@@ -104,12 +104,19 @@ hancho-cli.exe taskqueue resume-job A
 
 # 実行中の BT の未起動葉は既定で planned 行として出る。外すには --no-planned
 hancho-cli.exe taskqueue list main --no-planned
+
+# 失敗を診断し、引き取りと結果の戻しを記録する
+hancho-cli.exe taskqueue why A
+hancho-cli.exe taskqueue takeover --id A --reason "worker が 3 回ハングしたので引き取って実装する"
+hancho-cli.exe taskqueue complete --id A --reason "修正してテストも通した" --report reports/taken-over.md
 ```
 
 活動中のタスクグループ（BT のルート）は `group:<id>` の仮想行として
 `running` / `waitingForLlm` / `paused` の状態で出ます。`planned` 行と同様に
 保存されたジョブではないので、`taskqueue get` ではなく `bt get` で読み、
 待機中なら `bt resume` で答えます。`--no-planned` は両方を隠します。
+
+**失敗診断と引き取り:** `taskqueue why <id>` は直近の失敗を説明します。`class`（例: worker が `idle.firstEventSec`（worker ジョブの既定 180 秒）以内に正規化イベントを出さなかった場合は `startup_hang`。終了理由は `startup_timed_out`）、`confidence`、`summary`、`evidence`、`likelyCauses`（`[{id, why}]`。例: `no_model`、`same_engine_nesting`、`waiting_for_input`）、`nextSteps`（`[{action, change?, needsApproval?, question?}]`）、`supervisorNote` が入ります。同じ失敗レコードは `taskqueue get --json` の `failure` にもあります。`nextSteps` の順に試します。同じ設定で 1 回 → 設定変更（`retry_with_change`。モデルの変更は `taskqueue update --approve-model-change --reason "..."` が必要）→ escalate。自分で引き取るなら、先に `taskqueue takeover --id <id> --reason "..."` で終端状態 `takenOver` と `takeover` レコードを残し、`taskqueue complete --id <id> --reason "..." [--report <path>] [--result succeeded|failed]` で結果を戻します（`succeeded` で後続が進みます）。BT なら `bt resume --answer takeover --rationale "..."` で答えます。triage カードの候補にも `retry_with_change` が出ます。
 
 **クイック修正（小さな決定的編集）:**
 

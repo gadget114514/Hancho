@@ -5,6 +5,9 @@
 #include "event_schema.h"
 #include "memory_search.h"
 #include "memory_record.h"
+#include "llm_config.h"
+#include "permit_config.h"
+#include "worker_engines.h"
 #include "platform/platform.h"
 #include <sstream>
 #include <algorithm>
@@ -32,6 +35,7 @@ static std::wstring GetAttemptDonePathWide(const std::string& jobId, int n);
 // Defined with the launch helpers; TaskQueueUpdate gates model changes before them.
 static std::string ExtractCommandModel(const std::string& command);
 static bool ModelChangeRequiresApproval();
+static bool IsApprovedWorkerModel(const std::string& model);
 static void AppendRunRecordForAttempt(const TaskQueue& tq, const TaskQueueJob& job,
                                       const TaskQueueAttempt& attempt,
                                       const TaskQueueFailureInput& fin,
@@ -46,6 +50,8 @@ std::string TaskQueueStateToString(TaskQueueState state) {
         case TaskQueueState::Blocked:   return "blocked";
         case TaskQueueState::Cancelled: return "cancelled";
         case TaskQueueState::Closed:    return "closed";
+        case TaskQueueState::TakenOver: return "takenOver";
+        case TaskQueueState::WaitingForPermit: return "waitingForPermit";
     }
     return "pending";
 }
@@ -57,6 +63,8 @@ TaskQueueState TaskQueueStateFromString(const std::string& s) {
     if (s == "blocked") return TaskQueueState::Blocked;
     if (s == "cancelled") return TaskQueueState::Cancelled;
     if (s == "closed") return TaskQueueState::Closed;
+    if (s == "takenOver") return TaskQueueState::TakenOver;
+    if (s == "waitingForPermit") return TaskQueueState::WaitingForPermit;
     return TaskQueueState::Pending;
 }
 
@@ -317,6 +325,8 @@ static std::string NormalizeJobJsonKeys(const std::string& in) {
         {"instructionsText", "instructions_text"},
         {"outputSec", "output_sec"},
         {"cpuSec", "cpu_sec"},
+        {"firstEventSec", "first_event_sec"},
+        {"jsonStream", "json_stream"},
         {"exitCode", "exit_code"},
         {"filesNewer", "files_newer"},
         {"outputRegex", "output_regex"},
@@ -638,6 +648,45 @@ static int CountTextLines(const std::string& text) {
     return n;
 }
 
+// 091-6: wrapper commands such as ww-run carry the engine/model as -Engine/-Model options.
+// Only those two explicit forms are used; a plain build command yields an empty pair and is
+// never subject to engine-health handling.
+static bool ParseCommandNamedValue(const std::string& command, const std::string& flag,
+                                   std::string& out) {
+    std::vector<std::string> tokens;
+    std::string current;
+    bool quoted = false;
+    for (size_t i = 0; i < command.size(); ++i) {
+        const char c = command[i];
+        if (c == '"') { quoted = !quoted; continue; }
+        if (!quoted && (c == ' ' || c == '\t')) {
+            if (!current.empty()) { tokens.push_back(current); current.clear(); }
+            continue;
+        }
+        current.push_back(c);
+    }
+    if (!current.empty()) tokens.push_back(current);
+    for (size_t i = 0; i + 1 < tokens.size(); ++i) {
+        if (tokens[i] == flag) { out = tokens[i + 1]; return true; }
+        if (tokens[i].rfind(flag + "=", 0) == 0) { out = tokens[i].substr(flag.size() + 1); return true; }
+    }
+    return false;
+}
+
+static bool ParseCommandEngineModel(const std::string& command, const std::string& name,
+                                    std::string& engine, std::string& model) {
+    engine = DetectAgentType(command, name);
+    model = ExtractCommandModel(command);
+    std::string wrapperEngine, wrapperModel;
+    if (ParseCommandNamedValue(command, "-Engine", wrapperEngine) && !wrapperEngine.empty() &&
+        wrapperEngine != "{engine}") engine = wrapperEngine;
+    if (ParseCommandNamedValue(command, "-Model", wrapperModel) && !wrapperModel.empty() &&
+        wrapperModel != "{model}") model = wrapperModel;
+    if (engine == "{engine}") engine.clear();
+    if (model == "{model}") model.clear();
+    return !engine.empty() && !model.empty();
+}
+
 static void FillFailureInputBase(TaskQueueFailureInput& in, const TaskQueueJob& job,
                                  const TaskQueueAttempt& attempt) {
     in.jobId = job.id;
@@ -649,10 +698,29 @@ static void FillFailureInputBase(TaskQueueFailureInput& in, const TaskQueueJob& 
     in.timeoutSec = job.timeoutSec;
     in.idleOutputSec = job.idle.outputSec;
     in.idleCpuSec = job.idle.cpuSec;
+    in.idleFirstEventSec = job.idle.firstEventSec;
     in.filesNewerConfigured = !job.success.filesNewer.empty();
     in.outputRegexConfigured = !job.success.outputRegex.empty();
     in.nowEpochSec = static_cast<int64_t>(std::time(nullptr));
     in.externalRules = LoadTaskQueueFailureRules(TaskQueueFailureRulesPath());
+    in.command = job.command;
+    ParseCommandEngineModel(job.command, job.name, in.engine, in.model);
+    in.client = job.origin.client;
+    if (!in.engine.empty() && !in.model.empty()) {
+        using namespace engine_health;
+        Store store;
+        std::string healthErr;
+        if (Load(DefaultPath(), store, healthErr)) {
+            const Entry* e = Find(store, in.engine, in.model);
+            if (e) {
+                const int64_t now = NowEpochMs();
+                const int64_t windowMs = static_cast<int64_t>(LoadSettings().recentSuccessSec) * 1000;
+                in.recentSuccess = e->lastSuccessMs > 0 && now - e->lastSuccessMs <= windowMs;
+                in.otherZeroEventFailure = e->zeroEventFailures > 0;
+                in.engineDown = e->status == "down";
+            }
+        }
+    }
 }
 
 // Keeps the log tail for matching, but remembers where it started in the file so
@@ -863,6 +931,77 @@ static int CountUnfinishedPlanItems(const nlohmann::json& ev) {
     return remaining;
 }
 
+// 091-7: the exact tool-error wording opencode uses when a permission rule blocks a call,
+// plus claude's equivalent. The broader kPermissionPattern below handles generic log lines.
+static const char* kPermissionToolPattern =
+    "(rejected permission to use this specific tool call|"
+    "rule which prevents you from using this specific tool call|"
+    "blocked by a permission rule|blocked by configuration policy|"
+    "permission denied|request rejected by the user|permission_denied)";
+
+struct PermissionDenial {
+    const nlohmann::json* event = nullptr;
+    std::string tool;
+    std::string target;
+    int64_t count = 0;
+};
+
+static std::string TargetFromToolInput(const nlohmann::json& call) {
+    auto data = call.find("data");
+    if (data == call.end() || !data->is_object()) return "";
+    auto input = data->find("input");
+    if (input == data->end()) return "";
+    if (input->is_string()) return input->get<std::string>();
+    if (!input->is_object()) return "";
+    for (const char* key : {"filePath", "path", "command", "pattern", "url", "target", "resource"}) {
+        auto it = input->find(key);
+        if (it == input->end() || !it->is_string()) continue;
+        if (!it->get<std::string>().empty()) return it->get<std::string>();
+    }
+    return "";
+}
+
+static PermissionDenial FindPermissionDenial(const std::vector<nlohmann::json>& events) {
+    PermissionDenial out;
+    std::map<std::string, const nlohmann::json*> calls;
+    for (const auto& ev : events) {
+        if (!ev.is_object() || ev.value("kind", std::string()) != "tool.call") continue;
+        std::string id = EventDataString(ev, "toolUseId");
+        if (!id.empty()) calls[id] = &ev;
+    }
+    for (auto it = events.rbegin(); it != events.rend(); ++it) {
+        if (!it->is_object() || it->value("kind", std::string()) != "tool.result") continue;
+        if (EventDataBool(*it, "ok", true)) continue;
+        std::string err = EventDataString(*it, "error");
+        if (!MatchesNoCase(err, kPermissionToolPattern)) continue;
+        out.event = &(*it);
+        std::string id = EventDataString(*it, "toolUseId");
+        auto call = calls.find(id);
+        if (call != calls.end()) {
+            out.tool = EventDataString(*call->second, "tool");
+            out.target = EventDataString(*call->second, "target");
+            if (out.target.empty()) out.target = TargetFromToolInput(*call->second);
+        }
+        return out;
+    }
+    for (auto it = events.rbegin(); it != events.rend(); ++it) {
+        if (!it->is_object() || it->value("kind", std::string()) != "error") continue;
+        std::string msg = EventDataString(*it, "message");
+        if (!MatchesNoCase(msg, kPermissionToolPattern)) continue;
+        out.event = &(*it);
+        return out;
+    }
+    for (auto it = events.rbegin(); it != events.rend(); ++it) {
+        if (!it->is_object() || it->value("kind", std::string()) != "run.ended") continue;
+        int64_t n = EventDataInt(*it, "permissionDenials", 0);
+        if (n <= 0) continue;
+        out.event = &(*it);
+        out.count = n;
+        return out;
+    }
+    return out;
+}
+
 struct ToolErrorLoop {
     bool found = false;
     std::string tool;
@@ -909,13 +1048,181 @@ static void FillLastActivity(TaskQueueFailureDiagnostic& d, const TaskQueueFailu
         d.lastActivity.activity = activity;
         d.lastActivity.target = EventDataString(*it, "target");
         int64_t ts = ParseIsoUtcSec(it->value("ts", std::string()));
-        if (nowEpochSec > 0 && ts > 0 && nowEpochSec >= ts) d.lastActivity.sinceSec = nowEpochSec - ts;
+        if (nowEpochSec > 0 && ts > 0 && nowEpochSec >= ts) {
+            d.lastActivity.sinceSec = nowEpochSec - ts;
+        } else if (in.lastActivitySinceSec >= 0) {
+            d.lastActivity.sinceSec = in.lastActivitySinceSec;
+        }
         return;
     }
     if (in.lastActivity.empty() && in.lastActivityTarget.empty()) return;
     d.lastActivity.activity = in.lastActivity;
     d.lastActivity.target = in.lastActivityTarget;
     d.lastActivity.sinceSec = in.lastActivitySinceSec;
+}
+
+static bool HasWorkerActivityEvents(const std::vector<nlohmann::json>& events) {
+    for (const auto& ev : events) {
+        if (!ev.is_object()) continue;
+        std::string kind = ev.value("kind", std::string());
+        if (kind.empty()) continue;
+        if (kind != "run.started") {
+            return true;
+        }
+    }
+    return false;
+}
+
+static const char* kSupervisorNoteTakeover =
+    "Before implementing this task yourself, record the decision: "
+    "escalate with answer \"takeover\" and a rationale, or run taskqueue takeover "
+    "(see doc/HanchoExpectations.md 7.5).";
+
+static std::vector<TaskQueueFailureLikelyCause> DetectLikelyCauses(const TaskQueueFailureInput& in) {
+    std::vector<TaskQueueFailureLikelyCause> causes;
+
+    // 1. no_model: command launches opencode without --model, and job.model is empty
+    const std::string eng = !in.engine.empty() ? in.engine : DetectAgentType(in.command, in.jobName);
+    const bool isOpencode = (LowerAscii(eng) == "opencode") || (LowerAscii(in.command).find("opencode") != std::string::npos);
+    const std::string cmdModel = ExtractCommandModel(in.command);
+    const bool hasModelArg = !cmdModel.empty() || in.command.find("--model") != std::string::npos || in.command.find("-m") != std::string::npos;
+    if (isOpencode && in.model.empty() && !hasModelArg) {
+        causes.push_back({"no_model", "opencode was launched without --model"});
+    }
+
+    // 2. same_engine_nesting: job engine and client (origin.client) are the same
+    if (!eng.empty() && !in.client.empty()) {
+        if (LowerAscii(in.client).find(LowerAscii(eng)) != std::string::npos) {
+            causes.push_back({"same_engine_nesting", "supervisor and worker are both " + eng});
+        }
+    }
+
+    // 3. waiting_for_input: stderr is empty, no events emitted (CPU near 0 if present)
+    const bool stderrEmpty = TrimJsonStr(in.stderrText).empty();
+    const bool noEvents = !HasWorkerActivityEvents(in.events);
+    const bool cpuNearZero = (in.cpuSec < 0.0) || (in.cpuSec <= 1.0);
+    if (stderrEmpty && noEvents && cpuNearZero) {
+        causes.push_back({"waiting_for_input", "the process tree used almost no CPU; it may be waiting for a prompt or stdin"});
+    }
+
+    // 4. quota_suspected (091-6): recent success on this engine, then a sudden 0-event
+    // failure, and another job/probe on the same engine failed the same way recently.
+    if (in.recentSuccess && in.otherZeroEventFailure && noEvents && !eng.empty()) {
+        causes.push_back({"quota_suspected",
+                          eng + " worked recently but stopped emitting events across multiple jobs; "
+                          "the provider may have exhausted its token quota"});
+    }
+
+    // 5. stderr_present: stderr has content (last line in why)
+    if (!stderrEmpty) {
+        std::string text = in.stderrText;
+        while (!text.empty() && (text.back() == '\r' || text.back() == '\n' || text.back() == ' ')) text.pop_back();
+        size_t lastNl = text.find_last_of("\r\n");
+        std::string lastLine = (lastNl == std::string::npos) ? text : text.substr(lastNl + 1);
+        causes.push_back({"stderr_present", lastLine});
+    }
+
+    return causes;
+}
+
+static std::vector<TaskQueueFailureNextStep> BuildNextSteps(
+    const TaskQueueFailureInput& in, const std::string& failureClass,
+    const std::vector<TaskQueueFailureLikelyCause>& likelyCauses) {
+
+    std::vector<TaskQueueFailureNextStep> steps;
+    if (in.engineDown) {
+        steps.push_back({"engine_down", nullptr, false,
+                         "Hancho is probing the engine for recovery. Wait and it will resume automatically."});
+    }
+    const int attempt = in.attempt > 0 ? in.attempt : 1;
+    const std::string stall = failureClass == "startup_hang" ? "hung at startup"
+                            : failureClass == "idle_stall" ? "stalled without activity"
+                            : "stalled before the timeout";
+
+    bool hasNoModel = false;
+    for (const auto& c : likelyCauses) {
+        if (c.id == "no_model") {
+            hasNoModel = true;
+            break;
+        }
+    }
+
+    const std::string eng = !in.engine.empty() ? in.engine : DetectAgentType(in.command, in.jobName);
+    const std::string altEngine = (LowerAscii(eng) == "claude" ? "agy" : "claude");
+
+    nlohmann::json primaryChange = hasNoModel
+        ? nlohmann::json({{"model", "<explicit model>"}})
+        : nlohmann::json({{"engine", altEngine}});
+    nlohmann::json secondaryChange = hasNoModel
+        ? nlohmann::json({{"engine", altEngine}})
+        : nlohmann::json({{"model", "<explicit model>"}});
+
+    if (attempt <= 1) {
+        steps.push_back({"retry", nullptr, false, ""});
+        steps.push_back({"retry", primaryChange, true, ""});
+        steps.push_back({"escalate", nullptr, false,
+                         "Worker " + stall + ". Retry with another " +
+                         (hasNoModel ? std::string("model") : std::string("engine")) + ", or take over?"});
+    } else if (attempt == 2) {
+        steps.push_back({"retry", primaryChange, true, ""});
+        steps.push_back({"retry", secondaryChange, true, ""});
+        steps.push_back({"escalate", nullptr, false,
+                         "Worker " + stall + " twice. Retry with another engine, or take over?"});
+    } else {
+        steps.push_back({"escalate", nullptr, false,
+                         "Worker " + stall + " multiple times. Retry with another engine, or take over?"});
+        steps.push_back({"retry", primaryChange, true, ""});
+    }
+
+    return steps;
+}
+
+// 091-7: one shared writer for every permission-denial path, so the tool/target/engine
+// evidence and the three next steps are identical whether the denial came from a tool
+// result, an error event, an engine counter or a log line.
+static void FillPermissionDiagnostic(TaskQueueFailureDiagnostic& d, const TaskQueueFailureInput& in,
+                                     const PermissionDenial& denial, const std::string& message,
+                                     const std::string& confidence, const std::string& source) {
+    d.failureClass = "permission_denied";
+    d.confidence = confidence;
+    d.detail["rule"] = "builtin.permission_denied";
+    d.detail["source"] = source;
+    std::string tool = denial.tool;
+    std::string target = denial.target;
+    std::string engine = !in.engine.empty() ? in.engine
+                         : DetectAgentType(in.command, in.jobName);
+    if (!message.empty()) {
+        d.detail["message"] = message;
+        d.summary = "Permission denied: " + message;
+    } else if (denial.count > 0) {
+        d.detail["permissionDenials"] = denial.count;
+        d.summary = "The agent was denied permission " + std::to_string(denial.count) + " time(s).";
+    } else {
+        d.summary = "A tool call was denied by permissions.";
+    }
+    if (!tool.empty()) d.detail["tool"] = tool;
+    if (!target.empty()) d.detail["target"] = target;
+    if (!engine.empty()) d.detail["engine"] = engine;
+    d.detail["permission"] = nlohmann::json{{"tool", tool}, {"target", target}, {"engine", engine}};
+    d.suggestedAction = "fix_spec";
+    d.likelyCauses = DetectLikelyCauses(in);
+    d.nextSteps.clear();
+    d.nextSteps.push_back({"fix_spec", nullptr, false,
+                           "Rewrite the instructions so the work stays inside the project (cwd)."});
+    d.nextSteps.push_back({"permit_request", nlohmann::json{{"kind", tool == "bash" || tool == "Bash" ? "command" : "read_path"},
+                                                            {"target", target}},
+                           true, "Apply for this permission with `hancho-cli permit request` if it is genuinely needed."});
+    d.nextSteps.push_back({"escalate", nullptr, false,
+                           "Ask the user to approve the permit or change the instructions."});
+    if (denial.event) {
+        AddEventEvidence(d, in.eventsFile, EventSeqOf(*denial.event));
+        if (!d.evidence.empty()) {
+            d.evidence.back().tool = tool;
+            d.evidence.back().target = target;
+            d.evidence.back().engine = engine;
+        }
+    }
+    EnsureEvidence(d, in);
 }
 
 TaskQueueFailureDiagnostic ClassifyTaskQueueFailure(const TaskQueueFailureInput& in) {
@@ -966,6 +1273,7 @@ TaskQueueFailureDiagnostic ClassifyTaskQueueFailure(const TaskQueueFailureInput&
         return ev.value("kind", std::string()) == "error" &&
                MatchesNoCase(EventDataString(ev, "message"), kPermissionPattern);
     });
+    const PermissionDenial permissionDenial = FindPermissionDenial(in.events);
     const nlohmann::json* runEnded = LastEventOfKind(in.events, "run.ended");
     const nlohmann::json* turnEvent = FindLastEvent(in.events, [&](const nlohmann::json& ev) {
         return ev.value("kind", std::string()) == "error" &&
@@ -1007,15 +1315,78 @@ TaskQueueFailureDiagnostic ClassifyTaskQueueFailure(const TaskQueueFailureInput&
         return d;
     }
 
+    // 2.5 startup_hang: timed out or idle timed out with 0 worker events (or only run.started), or startup_timed_out
+    const bool noWorkerActivity = !HasWorkerActivityEvents(in.events);
+    if (in.endKind == "startup_timed_out" ||
+        ((in.endKind == "timed_out" || in.endKind == "idle_timed_out") && noWorkerActivity)) {
+        d.failureClass = "startup_hang";
+        d.confidence = "high";
+        int64_t sec = 0;
+        if (in.endKind == "startup_timed_out" && in.idleFirstEventSec > 0) {
+            sec = in.idleFirstEventSec;
+        } else if (in.elapsedSec > 0) {
+            sec = in.elapsedSec;
+        } else if (in.timeoutSec > 0) {
+            sec = in.timeoutSec;
+        } else if (in.idleFirstEventSec > 0) {
+            sec = in.idleFirstEventSec;
+        } else {
+            sec = in.idleOutputSec;
+        }
+        d.summary = "The worker started but emitted no events in " + std::to_string(sec) + " s.";
+        d.detail["rule"] = "builtin.startup_hang";
+        d.detail["endKind"] = in.endKind;
+        if (in.idleFirstEventSec > 0) d.detail["idleFirstEventSec"] = in.idleFirstEventSec;
+        if (in.timeoutSec > 0) d.detail["timeoutSec"] = in.timeoutSec;
+        if (in.elapsedSec > 0) d.detail["elapsedSec"] = in.elapsedSec;
+        if (in.idleOutputSec > 0) d.detail["idleOutputSec"] = in.idleOutputSec;
+        if (!in.processTree.is_null()) d.detail["processTree"] = in.processTree;
+        d.suggestedAction = "retry_with_change";
+        d.likelyCauses = DetectLikelyCauses(in);
+        d.nextSteps = BuildNextSteps(in, "startup_hang", d.likelyCauses);
+        d.supervisorNote = kSupervisorNoteTakeover;
+        AddLogEvidence(d, in.logFile, in.logLastLine);
+        EnsureEvidence(d, in);
+        return d;
+    }
+
     // 3. timeout: the attempt exceeded timeoutSec and was terminated.
     if (in.endKind == "timed_out") {
         d.failureClass = "timeout";
         d.confidence = "high";
-        d.summary = "The attempt did not finish within " + std::to_string(in.timeoutSec) + " s.";
-        d.detail["rule"] = "builtin.timeout";
         d.detail["timeoutSec"] = in.timeoutSec;
         if (in.elapsedSec > 0) d.detail["elapsedSec"] = in.elapsedSec;
-        d.suggestedAction = "raise_timeout";
+        if (!in.processTree.is_null()) d.detail["processTree"] = in.processTree;
+
+        const int64_t threshold = std::max<int64_t>(30, in.timeoutSec / 10);
+        const bool stalledMidRun = (d.lastActivity.sinceSec > threshold);
+        if (!stalledMidRun) {
+            d.summary = "The attempt did not finish within " + std::to_string(in.timeoutSec) + " s.";
+            d.detail["rule"] = "builtin.timeout";
+            d.suggestedAction = "raise_timeout";
+        } else {
+            d.summary = "The attempt stalled before the timeout (" + std::to_string(in.timeoutSec) + " s).";
+            d.detail["rule"] = "builtin.timeout_stalled";
+            d.detail["stalled"] = true;
+            d.suggestedAction = (in.attempt > 1 ? "retry_with_change" : "retry");
+            d.likelyCauses = DetectLikelyCauses(in);
+            d.nextSteps = BuildNextSteps(in, "timeout", d.likelyCauses);
+            d.supervisorNote = kSupervisorNoteTakeover;
+            const nlohmann::json* lastEv = nullptr;
+            for (auto it = in.events.rbegin(); it != in.events.rend(); ++it) {
+                if (it->is_object() && it->value("kind", "") != "run.started") {
+                    lastEv = &(*it);
+                    break;
+                }
+            }
+            if (lastEv) {
+                AddEventEvidence(d, in.eventsFile, EventSeqOf(*lastEv));
+                std::string tool = EventDataString(*lastEv, "tool");
+                if (!tool.empty()) d.detail["lastTool"] = tool;
+                std::string act = EventDataString(*lastEv, "activity");
+                if (!act.empty()) d.detail["lastActivity"] = act;
+            }
+        }
         AddLogEvidence(d, in.logFile, in.logLastLine);
         EnsureEvidence(d, in);
         return d;
@@ -1029,10 +1400,59 @@ TaskQueueFailureDiagnostic ClassifyTaskQueueFailure(const TaskQueueFailureInput&
         d.detail["rule"] = "builtin.idle_stall";
         d.detail["idleOutputSec"] = in.idleOutputSec;
         d.detail["idleCpuSec"] = in.idleCpuSec;
-        d.suggestedAction = "retry";
+        if (!in.processTree.is_null()) d.detail["processTree"] = in.processTree;
+        d.suggestedAction = (in.attempt > 1 ? "retry_with_change" : "retry");
+        d.likelyCauses = DetectLikelyCauses(in);
+        d.nextSteps = BuildNextSteps(in, "idle_stall", d.likelyCauses);
+        d.supervisorNote = kSupervisorNoteTakeover;
+        const nlohmann::json* lastEv = nullptr;
+        for (auto it = in.events.rbegin(); it != in.events.rend(); ++it) {
+            if (it->is_object() && it->value("kind", "") != "run.started") {
+                lastEv = &(*it);
+                break;
+            }
+        }
+        if (lastEv) {
+            AddEventEvidence(d, in.eventsFile, EventSeqOf(*lastEv));
+            std::string tool = EventDataString(*lastEv, "tool");
+            if (!tool.empty()) d.detail["lastTool"] = tool;
+        }
         AddLogEvidence(d, in.logFile, in.logLastLine);
         EnsureEvidence(d, in);
         return d;
+    }
+
+    // 4.5 permission_denied (091-7): a denied tool call outranks log-string rules such as
+    // rate_limited. The 2026-11-19 cards 090-2/090-3 were misdiagnosed because a quota line
+    // elsewhere in the log won before the denial was considered.
+    {
+        int64_t denials = runEnded ? EventDataInt(*runEnded, "permissionDenials", 0) : 0;
+        if (permissionDenial.event) {
+            std::string msg;
+            if (permissionDenial.event->value("kind", std::string()) == "tool.result") {
+                msg = EventDataString(*permissionDenial.event, "error");
+            } else if (permissionDenial.event->value("kind", std::string()) == "error") {
+                msg = EventDataString(*permissionDenial.event, "message");
+            }
+            FillPermissionDiagnostic(d, in, permissionDenial, msg, "high", "event");
+            return d;
+        }
+        if (permissionEvent || denials > 0 || permissionDenial.count > 0) {
+            PermissionDenial fallback;
+            fallback.count = denials > 0 ? denials : permissionDenial.count;
+            std::string msg = permissionEvent ? EventDataString(*permissionEvent, "message") : "";
+            FillPermissionDiagnostic(d, in, fallback, msg, permissionEvent ? "high" : "medium",
+                                     permissionEvent ? "event" : "counter");
+            if (permissionEvent) AddEventEvidence(d, in.eventsFile, EventSeqOf(*permissionEvent));
+            return d;
+        }
+        int line = FindLogLineNoCase(in, kPermissionPattern);
+        if (line > 0) {
+            PermissionDenial fallback;
+            FillPermissionDiagnostic(d, in, fallback, "", "high", "log");
+            AddLogEvidence(d, in.logFile, line);
+            return d;
+        }
     }
 
     // 5. rate_limited: a rejected rate_limit event, or an equivalent error/log line.
@@ -1106,35 +1526,23 @@ TaskQueueFailureDiagnostic ClassifyTaskQueueFailure(const TaskQueueFailureInput&
         }
     }
 
-    // 7. permission_denied: explicit denials, or a non-zero permission_denials count.
+    // 7. permission_denied: remaining wording not covered by the higher-priority 4.5 rule.
+    // The shared writer keeps evidence and nextSteps identical across both rules.
     {
         int64_t denials = runEnded ? EventDataInt(*runEnded, "permissionDenials", 0) : 0;
         if (permissionEvent || denials > 0) {
-            d.failureClass = "permission_denied";
-            d.confidence = permissionEvent ? "high" : "medium";
-            d.detail["rule"] = "builtin.permission_denied";
-            if (permissionEvent) {
-                std::string msg = EventDataString(*permissionEvent, "message");
-                if (!msg.empty()) d.detail["message"] = msg;
-                d.summary = msg.empty() ? "A tool call was denied by permissions."
-                                        : "Permission denied: " + msg;
-            } else {
-                d.detail["permissionDenials"] = denials;
-                d.summary = "The agent was denied permission " + std::to_string(denials) + " time(s).";
-            }
-            d.suggestedAction = "fix_spec";
+            PermissionDenial fallback;
+            fallback.count = denials;
+            std::string msg = permissionEvent ? EventDataString(*permissionEvent, "message") : "";
+            FillPermissionDiagnostic(d, in, fallback, msg, permissionEvent ? "high" : "medium",
+                                     permissionEvent ? "event" : "counter");
             if (permissionEvent) AddEventEvidence(d, in.eventsFile, EventSeqOf(*permissionEvent));
-            EnsureEvidence(d, in);
             return d;
         }
         int line = FindLogLineNoCase(in, kPermissionPattern);
         if (line > 0) {
-            d.failureClass = "permission_denied";
-            d.confidence = "high";
-            d.summary = "The log reports a permission denial.";
-            d.detail["rule"] = "builtin.permission_denied";
-            d.detail["source"] = "log";
-            d.suggestedAction = "fix_spec";
+            PermissionDenial fallback;
+            FillPermissionDiagnostic(d, in, fallback, "", "high", "log");
             AddLogEvidence(d, in.logFile, line);
             return d;
         }
@@ -1298,6 +1706,9 @@ std::string TaskQueueFailureDiagnosticToJson(const TaskQueueFailureDiagnostic& d
         } else {
             continue;
         }
+        if (!e.tool.empty()) item["tool"] = e.tool;
+        if (!e.target.empty()) item["target"] = e.target;
+        if (!e.engine.empty()) item["engine"] = e.engine;
         evidence.push_back(std::move(item));
     }
     o["evidence"] = std::move(evidence);
@@ -1322,6 +1733,37 @@ std::string TaskQueueFailureDiagnosticToJson(const TaskQueueFailureDiagnostic& d
         if (!d.llmGuess.rationale.empty()) guess["rationale"] = d.llmGuess.rationale;
         if (!d.llmGuess.source.empty()) guess["source"] = d.llmGuess.source;
         o["llmGuess"] = std::move(guess);
+    }
+    if (!d.likelyCauses.empty()) {
+        nlohmann::json causes = nlohmann::json::array();
+        for (const auto& c : d.likelyCauses) {
+            nlohmann::json item = nlohmann::json::object();
+            item["id"] = c.id;
+            item["why"] = c.why;
+            causes.push_back(std::move(item));
+        }
+        o["likelyCauses"] = std::move(causes);
+    }
+    if (!d.nextSteps.empty()) {
+        nlohmann::json steps = nlohmann::json::array();
+        for (const auto& s : d.nextSteps) {
+            nlohmann::json item = nlohmann::json::object();
+            item["action"] = s.action;
+            if (s.change.is_object() && !s.change.empty()) {
+                item["change"] = s.change;
+            }
+            if (s.needsApproval) {
+                item["needsApproval"] = true;
+            }
+            if (!s.question.empty()) {
+                item["question"] = s.question;
+            }
+            steps.push_back(std::move(item));
+        }
+        o["nextSteps"] = std::move(steps);
+    }
+    if (!d.supervisorNote.empty()) {
+        o["supervisorNote"] = d.supervisorNote;
     }
     // Log text and process error messages may contain invalid UTF-8; keep the record valid.
     return o.dump(-1, ' ', false, nlohmann::json::error_handler_t::replace);
@@ -1477,6 +1919,9 @@ static TaskQueueFailureDiagnostic ParseFailureDiagnostic(const std::string& obj)
             e.seq = JsonUInt64(item, "seq");
             e.log = item.value("log", std::string());
             e.line = static_cast<int>(JsonInt64(item, "line"));
+            e.tool = item.value("tool", std::string());
+            e.target = item.value("target", std::string());
+            e.engine = item.value("engine", std::string());
             d.evidence.push_back(e);
         }
     }
@@ -1501,6 +1946,30 @@ static TaskQueueFailureDiagnostic ParseFailureDiagnostic(const std::string& obj)
         d.llmGuess.rationale = readGuess("rationale");
         d.llmGuess.source = readGuess("source");
     }
+    auto causes = o.find("likelyCauses");
+    if (causes != o.end() && causes->is_array()) {
+        for (const auto& item : *causes) {
+            if (!item.is_object()) continue;
+            TaskQueueFailureLikelyCause c;
+            c.id = item.value("id", std::string());
+            c.why = item.value("why", std::string());
+            d.likelyCauses.push_back(std::move(c));
+        }
+    }
+    auto steps = o.find("nextSteps");
+    if (steps != o.end() && steps->is_array()) {
+        for (const auto& item : *steps) {
+            if (!item.is_object()) continue;
+            TaskQueueFailureNextStep s;
+            s.action = item.value("action", std::string());
+            auto ch = item.find("change");
+            if (ch != item.end() && ch->is_object()) s.change = *ch;
+            s.needsApproval = item.value("needsApproval", false);
+            s.question = item.value("question", std::string());
+            d.nextSteps.push_back(std::move(s));
+        }
+    }
+    d.supervisorNote = readString("supervisorNote");
     return d;
 }
 
@@ -1675,7 +2144,7 @@ static bool ParseDeferChecked(const std::string& json, int successExitCode, Task
 
 static bool RetryClassKnown(const std::string& c) {
     static const char* kClasses[] = {
-        "launch_error", "timeout", "idle_stall", "exit_nonzero", "crash",
+        "launch_error", "timeout", "idle_stall", "startup_hang", "exit_nonzero", "crash",
         "success_check_failed", "rate_limited", "auth_error", "permission_denied",
         "turn_or_context_limit", "tool_error_loop", "incomplete", "killed",
         "dependency_blocked", "resource_conflict", "unknown",
@@ -1855,6 +2324,17 @@ static TaskQueueJob ParseJob(const std::string& j) {
     job.cwd = JsonFieldStr(j, "cwd", "");
     job.host = JsonFieldStr(j, "host", "");
     job.env = ParseJsonStringMap(JsonFieldObj(j, "env"));
+    for (const auto& needJson : JsonFieldObjArray(j, "needs")) {
+        TaskQueueNeed need;
+        need.kind = JsonFieldStr(needJson, "kind", "");
+        need.target = JsonFieldStr(needJson, "target", "");
+        if (!need.kind.empty() && !need.target.empty()) job.needs.push_back(need);
+    }
+    job.onPermissionDenied = JsonFieldStr(j, "on_permission_denied", "");
+    job.waitPermits = JsonFieldStrArray(j, "wait_permits");
+    job.resumeSession = JsonFieldStr(j, "resume_session", "");
+    job.permissionResumeCount = static_cast<int>(JsonFieldInt(j, "permission_resume_count", 0));
+    job.permissionResumeLimit = static_cast<int>(JsonFieldInt(j, "permission_resume_limit", 2));
     for (const auto& depJson : JsonFieldObjArray(j, "depends_on")) {
         TaskQueueDependency dep;
         dep.id = JsonFieldStr(depJson, "id", "");
@@ -1866,6 +2346,7 @@ static TaskQueueJob ParseJob(const std::string& j) {
     std::string idleObj = JsonFieldObj(j, "idle");
     job.idle.outputSec = static_cast<int>(JsonFieldInt(idleObj, "output_sec", 0));
     job.idle.cpuSec = static_cast<int>(JsonFieldInt(idleObj, "cpu_sec", 0));
+    job.idle.firstEventSec = static_cast<int>(JsonFieldInt(idleObj, "first_event_sec", 0));
     job.maxAttempts = static_cast<int>(JsonFieldInt(j, "max_attempts", 2));
     job.retryDelaySec = static_cast<int>(JsonFieldInt(j, "retry_delay_sec", 0));
     std::string retryErr;
@@ -1895,6 +2376,19 @@ static TaskQueueJob ParseJob(const std::string& j) {
     if (job.suspendDelaySec > 86400) job.suspendDelaySec = 86400;
     job.suspendHibernate = JsonFieldBool(j, "suspend_hibernate", false);
     job.state = JsonFieldStr(j, "state", "pending");
+    if (HasJsonKey(j, "takeover")) {
+        const std::string t = JsonFieldObj(j, "takeover", "");
+        if (!t.empty()) {
+            job.takeover.present = true;
+            job.takeover.by = JsonFieldStr(t, "by", "");
+            job.takeover.reason = JsonFieldStr(t, "reason", "");
+            job.takeover.at = JsonFieldStr(t, "at", "");
+            job.takeover.completedAt = JsonFieldStr(t, "completed_at", "");
+            job.takeover.report = JsonFieldStr(t, "report", "");
+            job.takeover.result = JsonFieldStr(t, "result", "");
+            job.takeover.completionReason = JsonFieldStr(t, "completion_reason", "");
+        }
+    }
     for (const auto& attJson : JsonFieldObjArray(j, "attempts")) {
         job.attempts.push_back(ParseAttempt(attJson));
     }
@@ -1902,6 +2396,8 @@ static TaskQueueJob ParseJob(const std::string& j) {
     job.createdAt = JsonFieldStr(j, "created_at", "");
     job.updatedAt = JsonFieldStr(j, "updated_at", "");
     job.notes = JsonFieldStr(j, "notes", "");
+    job.engineSwitch = !HasJsonKey(j, "engine_switch") || JsonFieldBool(j, "engine_switch", true);
+    job.holdReason = JsonFieldStr(j, "hold_reason", "");
     job.retryAtMs = JsonFieldInt(j, "retry_at_ms", 0);
     if (HasJsonKey(j, "bt")) {
         std::string btObj = JsonFieldObj(j, "bt", "");
@@ -2223,6 +2719,10 @@ TaskQueueCounts TaskQueueManager::GetJobCounts() const {
                 counts.cancelled++;
             } else if (job.state == "closed") {
                 counts.closed++;
+            } else if (job.state == "takenOver") {
+                counts.takenOver++;
+            } else if (job.state == "waitingForPermit") {
+                counts.waitingForPermit++;
             }
         }
     }
@@ -2236,7 +2736,7 @@ constexpr int kDefaultSuspendDelaySec = 10;
 
 bool IsTerminalJobState(const std::string& state) {
     return state == "succeeded" || state == "failed" || state == "cancelled" ||
-           state == "closed" || state == "blocked";
+           state == "closed" || state == "blocked" || state == "takenOver";
 }
 
 } // namespace
@@ -2589,7 +3089,8 @@ bool TaskQueueManager::FindUnfinishedJobByCommand(const std::string& command, st
     for (const auto& [name, tq] : queues_) {
         if (name == "plain") continue;
         for (const auto& job : tq.jobs) {
-            if (job.state == "succeeded" || job.state == "cancelled") continue;
+            if (job.state == "succeeded" || job.state == "cancelled" || job.state == "takenOver" ||
+                job.state == "closed") continue;
             if (job.command == command) {
                 outJobId = job.id;
                 return true;
@@ -2786,10 +3287,22 @@ std::string TaskQueueManager::JobToJson(const TaskQueueJob& job, bool includeIns
         << ",\"cwd\":\"" << JsonEscape(job.cwd) << "\""
         << ",\"host\":\"" << JsonEscape(job.host) << "\""
         << ",\"env\":" << EnvToJson(job.env)
+        << ",\"needs\":[";
+    for (size_t i = 0; i < job.needs.size(); ++i) {
+        if (i) oss << ",";
+        oss << "{\"kind\":\"" << JsonEscape(job.needs[i].kind)
+            << "\",\"target\":\"" << JsonEscape(job.needs[i].target) << "\"}";
+    }
+    oss << "]"
+        << ",\"on_permission_denied\":\"" << JsonEscape(job.onPermissionDenied) << "\""
+        << ",\"wait_permits\":" << StrArrayToJson(job.waitPermits)
+        << ",\"resume_session\":\"" << JsonEscape(job.resumeSession) << "\""
+        << ",\"permission_resume_count\":" << job.permissionResumeCount
+        << ",\"permission_resume_limit\":" << job.permissionResumeLimit
         << ",\"depends_on\":" << DepsToJson(job.dependsOn)
         << ",\"timeout_sec\":" << job.timeoutSec
         << ",\"estimate_sec\":" << job.estimateSec
-        << ",\"idle\":{\"output_sec\":" << job.idle.outputSec << ",\"cpu_sec\":" << job.idle.cpuSec << "}"
+        << ",\"idle\":{\"output_sec\":" << job.idle.outputSec << ",\"cpu_sec\":" << job.idle.cpuSec << ",\"first_event_sec\":" << job.idle.firstEventSec << "}"
         << ",\"max_attempts\":" << job.maxAttempts
         << ",\"retry_delay_sec\":" << job.retryDelaySec;
     if (job.retry.configured) oss << ",\"retry\":" << RetryToJson(job.retry);
@@ -2806,14 +3319,31 @@ std::string TaskQueueManager::JobToJson(const TaskQueueJob& job, bool includeIns
         << ",\"suspend_hibernate\":" << (job.suspendHibernate ? "true" : "false")
         << ",\"shutdown_when_done\":" << (job.shutdownWhenDone ? "true" : "false")
         << ",\"shutdown_delay_sec\":" << job.shutdownDelaySec
-        << ",\"state\":\"" << JsonEscape(job.state) << "\""
-        << ",\"attempts\":" << AttemptsToJson(job.attempts)
+        << ",\"state\":\"" << JsonEscape(job.state) << "\"";
+    if (job.takeover.present) {
+        oss << ",\"takeover\":{\"by\":\"" << JsonEscape(job.takeover.by)
+            << "\",\"reason\":\"" << JsonEscape(job.takeover.reason)
+            << "\",\"at\":\"" << JsonEscape(job.takeover.at) << "\"";
+        if (!job.takeover.completedAt.empty())
+            oss << ",\"completed_at\":\"" << JsonEscape(job.takeover.completedAt) << "\"";
+        if (!job.takeover.report.empty())
+            oss << ",\"report\":\"" << JsonEscape(job.takeover.report) << "\"";
+        if (!job.takeover.result.empty())
+            oss << ",\"result\":\"" << JsonEscape(job.takeover.result) << "\"";
+        if (!job.takeover.completionReason.empty())
+            oss << ",\"completion_reason\":\"" << JsonEscape(job.takeover.completionReason) << "\"";
+        oss << "}";
+    }
+    oss << ",\"attempts\":" << AttemptsToJson(job.attempts)
         << ",\"blocked_by\":";
     if (job.blockedBy.empty()) oss << "null";
     else oss << "\"" << JsonEscape(job.blockedBy) << "\"";
     oss << ",\"created_at\":\"" << JsonEscape(job.createdAt) << "\""
         << ",\"updated_at\":\"" << JsonEscape(job.updatedAt) << "\""
-        << ",\"notes\":\"" << JsonEscape(job.notes) << "\"";
+        << ",\"notes\":\"" << JsonEscape(job.notes) << "\""
+        << ",\"engine_switch\":" << (job.engineSwitch ? "true" : "false");
+    const std::string hold = JobHoldReasonLocked(job, static_cast<int64_t>(GetNowTickMs()));
+    if (!hold.empty()) oss << ",\"hold_reason\":\"" << JsonEscape(hold) << "\"";
     if (!job.bt.id.empty()) {
         oss << ",\"bt\":{\"id\":\"" << JsonEscape(job.bt.id)
             << "\",\"node\":\"" << JsonEscape(job.bt.node)
@@ -2926,6 +3456,13 @@ const TaskQueueJob* TaskQueueManager::FindJobConst(const std::string& id) const 
 
 
 bool TaskQueueManager::IsDepSatisfied(const TaskQueueJob& dep, const std::string& on) {
+    if (dep.state == "takenOver") {
+        // The supervisor owns the work now. Dependents wait (stay pending) until the takeover
+        // is completed; only a recorded "succeeded" result satisfies a success dependency.
+        if (!dep.takeover.present || dep.takeover.result.empty()) return false;
+        if (on == "done") return true;
+        return dep.takeover.result == "succeeded";
+    }
     if (on == "done") {
         return dep.state == "succeeded" || dep.state == "failed" || dep.state == "cancelled" ||
                dep.state == "closed";
@@ -3283,7 +3820,88 @@ bool TaskQueueManager::IsReadyLocked(const TaskQueueJob& job, int64_t nowMs) con
         const TaskQueueJob* dep = FindJobConst(d.id);
         if (!dep || !IsDepSatisfied(*dep, d.on)) return false;
     }
+    // 091-6: a job on a down engine stays pending (held), never failed.
+    if (!JobHoldReasonLocked(job, nowMs).empty()) return false;
     return true;
+}
+
+static void ReplaceTextAll(std::string& text, const std::string& from, const std::string& to) {
+    if (from.empty()) return;
+    size_t pos = 0;
+    while ((pos = text.find(from, pos)) != std::string::npos) {
+        text.replace(pos, from.size(), to);
+        pos += to.size();
+    }
+}
+
+bool TaskQueueManager::JobEngineModel(const TaskQueueJob& job, std::string& engine,
+                                      std::string& model) {
+    return ParseCommandEngineModel(job.command, job.name, engine, model);
+}
+
+std::string TaskQueueManager::JobHoldReasonLocked(const TaskQueueJob& job, int64_t nowMs) const {
+    std::string engine, model;
+    if (!JobEngineModel(job, engine, model)) return "";
+    engine_health::Store store;
+    std::string err;
+    if (!engine_health::Load(engine_health::DefaultPath(), store, err)) return "";
+    const engine_health::Entry* e = engine_health::Find(store, engine, model);
+    if (!e || e->status != "down") return "";
+    (void)nowMs;
+    return e->HoldReason();
+}
+
+bool TaskQueueManager::TryEngineSwitchLocked(TaskQueueJob& job, const std::string& engine,
+                                             const std::string& model, int64_t nowMs) {
+    if (!job.engineSwitch) return false;
+    const std::string& cmd = job.command;
+    const bool switchable = cmd.find("{engine}") != std::string::npos ||
+                            cmd.find("{model}") != std::string::npos ||
+                            cmd.find("-Engine") != std::string::npos ||
+                            cmd.find("-Model") != std::string::npos;
+    if (!switchable) return false;
+    llm::Config cfg;
+    std::string err;
+    if (!llm::Load(llm::DefaultPath(), cfg, err)) return false;
+    const std::vector<llm::Entry> usable = llm::Usable(cfg, llm::kWorker);
+    if (usable.empty()) return false;
+    engine_health::Store health;
+    if (!engine_health::Load(engine_health::DefaultPath(), health, err)) return false;
+
+    size_t currentIndex = usable.size();
+    for (size_t i = 0; i < usable.size(); ++i) {
+        if (usable[i].engine == engine && (usable[i].model == model || model.empty())) {
+            currentIndex = i;
+            break;
+        }
+    }
+    if (currentIndex == usable.size()) return false;
+    for (size_t i = currentIndex + 1; i < usable.size(); ++i) {
+        const auto& candidate = usable[i];
+        if (candidate.engine == engine && candidate.model == model) continue;
+        if (engine_health::IsDown(health, candidate.engine, candidate.model)) continue;
+        const std::string oldEngine = engine;
+        const std::string oldModel = model;
+        ReplaceTextAll(job.command, oldEngine, candidate.engine);
+        if (!oldModel.empty()) ReplaceTextAll(job.command, oldModel, candidate.model);
+        job.holdReason.clear();
+        std::ostringstream note;
+        note << "[engineSwitch] worker list #" << candidate.rank << " (approved via "
+             << candidate.approvedVia << "): " << oldEngine << "/" << oldModel << " -> "
+             << candidate.engine << "/" << candidate.model << " (engine down)";
+        job.notes = job.notes.empty() ? note.str() : (job.notes + "\n" + note.str());
+        job.updatedAt = GetCurrentTimestampStr();
+        (void)nowMs;
+        return true;
+    }
+    return false;
+}
+
+void TaskQueueManager::RefreshEngineHealthLocked(int64_t nowMs) {
+    if (nowMs - lastHealthCheckTickMs_ < 1000) return;
+    lastHealthCheckTickMs_ = nowMs;
+    engine_health::RunDueHealthProbes(engine_health::DefaultPath(), engine_health::NowEpochMs(),
+                                      engine_health::LoadSettings());
 }
 
 // Global start order: higher priority first, then earlier registration, then queue and id.
@@ -3493,6 +4111,61 @@ static std::vector<std::string> ParseObjectArrayDirect(const std::string& arrJso
 namespace pc {
 
 // ---------------------------------------------------------------------------
+// Worker idle defaults & detection (090-2)
+// ---------------------------------------------------------------------------
+
+struct WorkerIdleDefaults {
+    int firstEventSec = 180;
+    int outputSec = 600;
+};
+
+static WorkerIdleDefaults LoadWorkerIdleDefaults() {
+    WorkerIdleDefaults defs;
+    std::string content = ReadFileUtf8Wide(PathJoinWide(GetEffectiveDataDirectoryWide(), L"config.json"));
+    if (!content.empty()) {
+        nlohmann::json cfg = nlohmann::json::parse(content, nullptr, false);
+        if (cfg.is_object()) {
+            if (cfg.contains("llm_idle_timeout_sec") && cfg["llm_idle_timeout_sec"].is_number()) {
+                int v = cfg["llm_idle_timeout_sec"].get<int>();
+                if (v >= 0) defs.outputSec = v;
+            }
+            if (cfg.contains("taskqueue") && cfg["taskqueue"].is_object()) {
+                const auto& tq = cfg["taskqueue"];
+                if (tq.contains("worker_idle_defaults") && tq["worker_idle_defaults"].is_object()) {
+                    const auto& wid = tq["worker_idle_defaults"];
+                    if (wid.contains("first_event_sec") && wid["first_event_sec"].is_number()) {
+                        int v = wid["first_event_sec"].get<int>();
+                        if (v >= 0) defs.firstEventSec = v;
+                    }
+                    if (wid.contains("output_sec") && wid["output_sec"].is_number()) {
+                        int v = wid["output_sec"].get<int>();
+                        if (v >= 0) defs.outputSec = v;
+                    }
+                }
+            }
+        }
+    }
+    return defs;
+}
+
+static bool IsWorkerJob(const TaskQueueJob& job, const std::string& rawJson = "") {
+    if (!DetectAgentType(job.command, job.name).empty()) return true;
+    if (job.command.find("--json-stream") != std::string::npos) return true;
+    auto adapterIt = job.env.find("HANCHO_ADAPTER");
+    if (adapterIt != job.env.end() && !adapterIt->second.empty()) return true;
+    if (!rawJson.empty()) {
+        if (JsonFieldBool(rawJson, "json_stream", false)) return true;
+        std::string eng = JsonFieldStr(rawJson, "engine", "");
+        if (!eng.empty() && eng != "none") return true;
+        std::string agent = JsonFieldStr(rawJson, "agent", "");
+        if (!agent.empty()) return true;
+    }
+    std::string lcmd = LowerAscii(job.command);
+    if (lcmd.find("codestral") != std::string::npos) return true;
+    return false;
+}
+
+// ---------------------------------------------------------------------------
 // Job definition parsing + validation
 // ---------------------------------------------------------------------------
 
@@ -3556,13 +4229,26 @@ static bool ParseNewJob(const std::string& rawJson, const std::string& taskqueue
         err = "job '" + job.id + "': estimate_sec must be 0 or greater";
         return false;
     }
+    const bool hasExplicitIdle = HasJsonKey(j, "idle");
     std::string idleObj = JsonFieldObj(j, "idle");
-    job.idle.outputSec = static_cast<int>(JsonFieldInt(idleObj, "output_sec", 0));
-    job.idle.cpuSec = static_cast<int>(JsonFieldInt(idleObj, "cpu_sec", 0));
-    if (job.idle.outputSec < 0 || job.idle.cpuSec < 0) {
+    if (hasExplicitIdle && (JsonFieldInt(j, "idle", -1) == 0 || (idleObj == "{}" && JsonFieldStr(j, "idle", "") == "0"))) {
+        job.idle.outputSec = 0;
+        job.idle.cpuSec = 0;
+        job.idle.firstEventSec = 0;
+        job.idle.explicitZero = true;
+    } else {
+        job.idle.outputSec = static_cast<int>(JsonFieldInt(idleObj, "output_sec", 0));
+        job.idle.cpuSec = static_cast<int>(JsonFieldInt(idleObj, "cpu_sec", 0));
+        job.idle.firstEventSec = static_cast<int>(JsonFieldInt(idleObj, "first_event_sec", 0));
+        if (hasExplicitIdle && job.idle.outputSec == 0 && job.idle.firstEventSec == 0) {
+            job.idle.explicitZero = true;
+        }
+    }
+    if (job.idle.outputSec < 0 || job.idle.cpuSec < 0 || job.idle.firstEventSec < 0) {
         err = "job '" + job.id + "': idle values must not be negative";
         return false;
     }
+    job.engineSwitch = !HasJsonKey(j, "engine_switch") || JsonFieldBool(j, "engine_switch", true);
     job.maxAttempts = static_cast<int>(JsonFieldInt(j, "max_attempts", defaultMaxAttempts));
     if (job.maxAttempts < 1) job.maxAttempts = 1;
     job.retryDelaySec = static_cast<int>(JsonFieldInt(j, "retry_delay_sec", 0));
@@ -3629,6 +4315,34 @@ static bool ParseNewJob(const std::string& rawJson, const std::string& taskqueue
         return false;
     }
     job.env = ParseJsonStringMap(JsonFieldObj(j, "env"));
+    for (const auto& needJson : JsonFieldObjArray(j, "needs")) {
+        TaskQueueNeed need;
+        need.kind = JsonFieldStr(needJson, "kind", "");
+        need.target = JsonFieldStr(needJson, "target", "");
+        if (!permit::IsValidKind(need.kind)) {
+            err = "job '" + job.id + "': needs.kind must be read_path, write_path, command or network";
+            return false;
+        }
+        if (need.target.empty()) {
+            err = "job '" + job.id + "': needs.target is required";
+            return false;
+        }
+        job.needs.push_back(need);
+    }
+    job.onPermissionDenied = JsonFieldStr(j, "on_permission_denied", "");
+    if (!job.onPermissionDenied.empty() && job.onPermissionDenied != "fail" &&
+        job.onPermissionDenied != "wait") {
+        err = "job '" + job.id + "': on_permission_denied must be fail or wait";
+        return false;
+    }
+    job.permissionResumeLimit = static_cast<int>(JsonFieldInt(j, "permission_resume_limit", 2));
+    if (job.permissionResumeLimit < 0) job.permissionResumeLimit = 0;
+    if (!hasExplicitIdle && IsWorkerJob(job, j)) {
+        WorkerIdleDefaults defs = LoadWorkerIdleDefaults();
+        job.idle.firstEventSec = defs.firstEventSec;
+        job.idle.outputSec = defs.outputSec;
+        job.idle.cpuSec = 1;
+    }
     {
         size_t aStart = 0;
         size_t aEnd = 0;
@@ -3791,7 +4505,27 @@ std::string TaskQueueManager::TaskQueueAdd(const std::string& taskqueue, const s
         oss << "\"" << JsonEscape(newJobs[i].id) << "\"";
     }
     oss << "],\"concurrency\":" << queues_[taskqueue].concurrency
-        << ",\"data_dir\":\"" << JsonEscape(WideToUtf8(GetEffectiveDataDirectoryWide())) << "\"}";
+        << ",\"data_dir\":\"" << JsonEscape(WideToUtf8(GetEffectiveDataDirectoryWide())) << "\"";
+    // 091-7: warn about declared permissions that have not been approved yet.
+    {
+        permit::Config cfg;
+        std::string err;
+        permit::Load(permit::DefaultPath(), cfg, err);
+        const std::string scope = "taskqueue:" + taskqueue;
+        nlohmann::json warnings = nlohmann::json::array();
+        for (const auto& job : newJobs) {
+            for (const auto& need : job.needs) {
+                if (permit::IsApproved(cfg, need.kind, need.target, "", scope)) continue;
+                warnings.push_back(nlohmann::json{
+                    {"code", "permit_not_approved"}, {"job", job.id},
+                    {"kind", need.kind}, {"target", need.target},
+                    {"suggestion", "hancho-cli permit request --kind " + need.kind +
+                                   " --target \"" + need.target + "\" --reason \"...\""}});
+            }
+        }
+        oss << ",\"warnings\":" << warnings.dump();
+    }
+    oss << "}";
     return oss.str();
 }
 
@@ -4119,7 +4853,8 @@ std::string TaskQueueManager::TaskQueueUpdate(const std::string& id, const std::
     // Only "notes" may be updated after a job has finished or is running.
     if (onlyNotes) {
         for (const char* k : {"summary","command","cwd","host","timeout_sec","idle","max_attempts",
-                              "retry_delay_sec","retry","defer","priority","kill_exclude","resources","memory","env","success",
+                               "retry_delay_sec","retry","defer","priority","kill_exclude","resources","memory","env","success",
+                               "needs","on_permission_denied","permission_resume_limit",
                               "suspend_when_done","suspend_delay_sec","suspend_hibernate",
                               "shutdown_when_done","shutdown_delay_sec",
                               "instructions_text","instructions_file","depends_on"}) {
@@ -4153,7 +4888,8 @@ std::string TaskQueueManager::TaskQueueUpdate(const std::string& id, const std::
         }
         const std::string oldModel = ExtractCommandModel(job->command);
         const std::string newModel = ExtractCommandModel(c);
-        if (oldModel != newModel && ModelChangeRequiresApproval()) {
+        const bool newModelPreApproved = !newModel.empty() && IsApprovedWorkerModel(newModel);
+        if (oldModel != newModel && ModelChangeRequiresApproval() && !newModelPreApproved) {
             std::string approvedBy = JsonFieldStr(patchJson, "approved_by", "");
             if (approvedBy.empty()) approvedBy = JsonFieldStr(patchJson, "approvedBy", "");
             std::string approvalReason = JsonFieldStr(patchJson, "approval_reason", "");
@@ -4166,6 +4902,11 @@ std::string TaskQueueManager::TaskQueueUpdate(const std::string& id, const std::
             const std::string line = "[model] " + (oldModel.empty() ? std::string("(none)") : oldModel) +
                                      " -> " + (newModel.empty() ? std::string("(none)") : newModel) +
                                      " approved by " + approvedBy + ": " + approvalReason;
+            job->notes = job->notes.empty() ? line : job->notes + "\n" + line;
+        } else if (oldModel != newModel && newModelPreApproved) {
+            const std::string line = "[model] " + (oldModel.empty() ? std::string("(none)") : oldModel) +
+                                     " -> " + newModel +
+                                     " allowed without extra approval: approved in the worker LLM list";
             job->notes = job->notes.empty() ? line : job->notes + "\n" + line;
         }
         job->command = c;
@@ -4194,9 +4935,22 @@ std::string TaskQueueManager::TaskQueueUpdate(const std::string& id, const std::
         job->timeoutSec = t;
     }
     if (HasJsonKey(patchJson, "idle")) {
-        std::string idleObj = JsonFieldObj(patchJson, "idle");
-        job->idle.outputSec = static_cast<int>(JsonFieldInt(idleObj, "output_sec", job->idle.outputSec));
-        job->idle.cpuSec = static_cast<int>(JsonFieldInt(idleObj, "cpu_sec", job->idle.cpuSec));
+        if (JsonFieldInt(patchJson, "idle", -1) == 0 || JsonFieldStr(patchJson, "idle", "") == "0") {
+            job->idle.outputSec = 0;
+            job->idle.cpuSec = 0;
+            job->idle.firstEventSec = 0;
+            job->idle.explicitZero = true;
+        } else {
+            std::string idleObj = JsonFieldObj(patchJson, "idle");
+            job->idle.outputSec = static_cast<int>(JsonFieldInt(idleObj, "output_sec", job->idle.outputSec));
+            job->idle.cpuSec = static_cast<int>(JsonFieldInt(idleObj, "cpu_sec", job->idle.cpuSec));
+            job->idle.firstEventSec = static_cast<int>(JsonFieldInt(idleObj, "first_event_sec", job->idle.firstEventSec));
+            if (job->idle.outputSec == 0 && job->idle.firstEventSec == 0) {
+                job->idle.explicitZero = true;
+            } else {
+                job->idle.explicitZero = false;
+            }
+        }
     }
     if (HasJsonKey(patchJson, "max_attempts")) {
         int m = static_cast<int>(JsonFieldInt(patchJson, "max_attempts", job->maxAttempts));
@@ -4230,6 +4984,25 @@ std::string TaskQueueManager::TaskQueueUpdate(const std::string& id, const std::
         job->memory = ParseMemory(JsonFieldObj(patchJson, "memory", ""));
     }
     if (HasJsonKey(patchJson, "env")) job->env = ParseJsonStringMap(JsonFieldObj(patchJson, "env"));
+    if (HasJsonKey(patchJson, "needs")) {
+        job->needs.clear();
+        for (const auto& needJson : JsonFieldObjArray(patchJson, "needs")) {
+            TaskQueueNeed need;
+            need.kind = JsonFieldStr(needJson, "kind", "");
+            need.target = JsonFieldStr(needJson, "target", "");
+            if (!permit::IsValidKind(need.kind) || need.target.empty()) {
+                outError = "needs entries require a valid kind and target";
+                return BuildError(outError);
+            }
+            job->needs.push_back(need);
+        }
+    }
+    if (HasJsonKey(patchJson, "on_permission_denied")) {
+        job->onPermissionDenied = JsonFieldStr(patchJson, "on_permission_denied", "");
+    }
+    if (HasJsonKey(patchJson, "permission_resume_limit")) {
+        job->permissionResumeLimit = static_cast<int>(JsonFieldInt(patchJson, "permission_resume_limit", 2));
+    }
     if (HasJsonKey(patchJson, "success")) {
         std::string successObj = JsonFieldObj(patchJson, "success");
         job->success.exitCode = static_cast<int>(JsonFieldInt(successObj, "exit_code", job->success.exitCode));
@@ -4470,6 +5243,126 @@ std::string TaskQueueManager::TaskQueueClose(const std::string& id, std::string&
         pm->KillProcess(pid, err);
     }
     FlushFinishedCallbacks();
+    return resp;
+}
+
+std::string TaskQueueManager::TaskQueueTakeover(const std::string& id, const std::string& by,
+                                                const std::string& reason, std::string& outError) {
+    outError.clear();
+    if (reason.empty()) {
+        outError = "takeover requires a non-empty reason";
+        return BuildError(outError);
+    }
+    std::string resp;
+    ProcessManager* pm = nullptr;
+    int pid = 0;
+    std::string remoteHost;
+    int remotePid = 0;
+    RemoteKillCallback remoteKill;
+    {
+        std::lock_guard<std::mutex> lock(mutex_);
+        TaskQueue* tq = nullptr;
+        TaskQueueJob* job = FindJob(id, &tq);
+        if (!job) {
+            outError = "job not found: " + id;
+            return BuildError(outError);
+        }
+        const std::string& st = job->state;
+        if (st == "succeeded" || st == "cancelled" || st == "takenOver" || st == "closed") {
+            outError = "job '" + id + "' cannot be taken over from state " + st;
+            return BuildError(outError);
+        }
+        if (st != "failed" && st != "blocked" && st != "waiting" && st != "pending" && st != "running") {
+            outError = "job '" + id + "' cannot be taken over from state " + st;
+            return BuildError(outError);
+        }
+        if (st == "running" && !job->attempts.empty()) {
+            pid = job->attempts.back().processId;
+            remoteHost = job->attempts.back().remoteHost;
+            remotePid = job->attempts.back().remoteProcessId;
+        }
+        job->takeover.present = true;
+        job->takeover.by = by.empty() ? "cli" : by;
+        job->takeover.reason = reason;
+        job->takeover.at = GetCurrentTimestampStr();
+        job->takeover.completedAt.clear();
+        job->takeover.report.clear();
+        job->takeover.result.clear();
+        job->takeover.completionReason.clear();
+        job->state = "takenOver";
+        job->paused = false;
+        job->blockedBy.clear();
+        job->retryAtMs = 0;
+        job->updatedAt = job->takeover.at;
+        EmitEventLocked(*tq, "jobTakenOver", id, job->attempts.empty() ? 0 : job->attempts.back().n);
+        ReevaluateAll();
+        SaveQueue(*tq);
+        if (schedulerRunning_.load()) {
+            pendingFinished_.push_back({*job, "takenOver"});
+        }
+        resp = "{\"ok\":true,\"job\":" + JobToJson(*job, true) + "}";
+        pm = pm_;
+        remoteKill = remoteKillCb_;
+    }
+    if (!remoteHost.empty() && remotePid > 0) {
+        if (remoteKill) {
+            std::string err;
+            remoteKill(remoteHost, remotePid, err);
+        }
+    } else if (pm && pid > 0) {
+        std::string err;
+        pm->KillProcess(pid, err);
+    }
+    FlushFinishedCallbacks();
+    return resp;
+}
+
+std::string TaskQueueManager::TaskQueueComplete(const std::string& id, const std::string& report,
+                                                const std::string& result, const std::string& reason,
+                                                std::string& outError) {
+    outError.clear();
+    if (reason.empty()) {
+        outError = "complete requires a non-empty reason";
+        return BuildError(outError);
+    }
+    std::string finalResult = result.empty() ? "succeeded" : result;
+    if (finalResult != "succeeded" && finalResult != "failed") {
+        outError = "complete --result must be succeeded or failed";
+        return BuildError(outError);
+    }
+    std::string resp;
+    {
+        std::lock_guard<std::mutex> lock(mutex_);
+        TaskQueue* tq = nullptr;
+        TaskQueueJob* job = FindJob(id, &tq);
+        if (!job) {
+            outError = "job not found: " + id;
+            return BuildError(outError);
+        }
+        if (job->state != "takenOver") {
+            outError = "job '" + id + "' is not taken over";
+            return BuildError(outError);
+        }
+        if (job->takeover.present && !job->takeover.completedAt.empty()) {
+            outError = "job '" + id + "' takeover is already completed";
+            return BuildError(outError);
+        }
+        if (!job->takeover.present) {
+            job->takeover.present = true;
+            job->takeover.by = "cli";
+        }
+        job->takeover.completedAt = GetCurrentTimestampStr();
+        job->takeover.report = report;
+        job->takeover.result = finalResult;
+        job->takeover.completionReason = reason;
+        job->updatedAt = job->takeover.completedAt;
+        EmitEventLocked(*tq, "jobTakeoverCompleted", id, job->attempts.empty() ? 0 : job->attempts.back().n);
+        ReevaluateAll();
+        SaveAllLocked();
+        CheckQueueNotices(*tq);
+        cv_.notify_all();
+        resp = "{\"ok\":true,\"job\":" + JobToJson(*job, true) + "}";
+    }
     return resp;
 }
 
@@ -4769,7 +5662,8 @@ void TaskQueueManager::SaveAllLocked() {
 }
 
 bool TaskQueueManager::ReevaluateJob(TaskQueue& tq, TaskQueueJob& job) {
-    if (job.state == "running" || job.state == "succeeded" || job.state == "cancelled") return false;
+    if (job.state == "running" || job.state == "succeeded" || job.state == "cancelled" ||
+        job.state == "takenOver" || job.state == "closed") return false;
 
     std::string blocker;
     for (const auto& d : job.dependsOn) {
@@ -4781,7 +5675,8 @@ bool TaskQueueManager::ReevaluateJob(TaskQueue& tq, TaskQueueJob& job) {
         }
         if (!dep) { blocker = d.id; break; }
         if (d.on == "success" &&
-            (dep->state == "failed" || dep->state == "cancelled" || dep->state == "blocked")) {
+            (dep->state == "failed" || dep->state == "cancelled" || dep->state == "blocked" ||
+             (dep->state == "takenOver" && dep->takeover.present && dep->takeover.result == "failed"))) {
             blocker = dep->id;
             break;
         }
@@ -5222,11 +6117,72 @@ bool TaskQueueManager::EvaluateSuccess(const TaskQueueJob& job, TaskQueueAttempt
     return true;
 }
 
+// startup_timed_out classifies as startup_hang, the same kind of timeout as
+// idle_timed_out (idle_stall). Let retry.on/retry.never treat them alike.
+static bool RetryClassMatches(const std::string& configured, const std::string& failureClass) {
+    const std::string a = LowerAscii(configured);
+    const std::string b = LowerAscii(failureClass);
+    if (a == b) return true;
+    const bool aTimeout = (a == "idle_stall" || a == "startup_hang");
+    const bool bTimeout = (b == "idle_stall" || b == "startup_hang");
+    return aTimeout && bTimeout;
+}
+
+// 091-7: the engine's session id travels on normalized events (agent.sessionId). A denial
+// that ended a session can be continued with `opencode run --session <id>` / `claude --resume`.
+static std::string LatestSessionId(const std::vector<nlohmann::json>& events) {
+    std::string found;
+    for (const auto& ev : events) {
+        if (!ev.is_object()) continue;
+        auto agent = ev.find("agent");
+        if (agent != ev.end() && agent->is_object()) {
+            std::string id = agent->value("sessionId", std::string());
+            if (!id.empty()) found = id;
+        }
+    }
+    return found;
+}
+
+PermissionHoldPlan PlanPermissionHandling(const TaskQueueFailureDiagnostic& diagnostic,
+                                          const std::string& sessionId, int resumeCount,
+                                          int resumeLimit, const std::string& taskqueue,
+                                          const std::string& onPermissionDenied) {
+    PermissionHoldPlan out;
+    if (diagnostic.failureClass != "permission_denied") return out;
+    if (onPermissionDenied == "fail") return out; // caller fails the job immediately
+    if (!sessionId.empty() && resumeCount < resumeLimit) {
+        out.resume = true;
+        return out;
+    }
+    out.wait = true;
+    auto perm = diagnostic.detail.find("permission");
+    if (perm != diagnostic.detail.end() && perm->is_object()) {
+        out.target = perm->value("target", std::string());
+        out.engine = perm->value("engine", std::string());
+        const std::string tool = LowerAscii(perm->value("tool", std::string()));
+        out.kind = (tool == "bash" || tool.find("bash") != std::string::npos ||
+                    tool == "powershell" || tool.find("shell") != std::string::npos)
+                       ? "command" : "read_path";
+    }
+    if (out.target.empty()) {
+        for (const auto& step : diagnostic.nextSteps) {
+            if (step.action == "permit_request" && step.change.is_object()) {
+                out.kind = step.change.value("kind", out.kind);
+                out.target = step.change.value("target", out.target);
+                break;
+            }
+        }
+    }
+    out.scope = "taskqueue:" + taskqueue;
+    out.permitId = permit::MakeId(out.kind, out.target, out.scope);
+    return out;
+}
+
 TaskQueueRetryDecision DecideTaskQueueRetry(const TaskQueueJob& job, const std::string& failureClass,
-                                            int countedAttempts, bool allowRateLimitWait) {
+                                             int countedAttempts, bool allowRateLimitWait) {
     auto listed = [&failureClass](const std::vector<std::string>& classes) {
         for (const auto& c : classes) {
-            if (LowerAscii(c) == LowerAscii(failureClass)) return true;
+            if (RetryClassMatches(c, failureClass)) return true;
         }
         return false;
     };
@@ -5270,9 +6226,15 @@ void TaskQueueManager::ApplyAttemptOutcome(TaskQueue& tq, TaskQueueJob& job, boo
     }
 
     if (success) {
+        std::string eng, mod;
+        if (JobEngineModel(job, eng, mod)) {
+            engine_health::MarkSuccess(engine_health::DefaultPath(), eng, mod,
+                                       engine_health::NowEpochMs());
+        }
         job.state = "succeeded";
         job.blockedBy.clear();
         job.retryAtMs = 0;
+        job.holdReason.clear();
         EmitEventLocked(tq, "jobSucceeded", job.id, a.n);
         ReevaluateAll();
         SaveAllLocked();
@@ -5310,6 +6272,72 @@ void TaskQueueManager::ApplyAttemptOutcome(TaskQueue& tq, TaskQueueJob& job, boo
     // Classify only real failures: a deferral did not run the job's work and is not one.
     if (!success && failureInput) {
         a.failure = ClassifyTaskQueueFailure(*failureInput);
+
+        // 091-6: trip the shared circuit breaker for failures that hide a dead engine.
+        std::string eng = failureInput->engine;
+        std::string mod = failureInput->model;
+        if (eng.empty() || mod.empty()) {
+            std::string e2, m2;
+            if (JobEngineModel(job, e2, m2)) { eng = e2; mod = m2; }
+        }
+        if (!eng.empty() && !mod.empty()) {
+            using namespace engine_health;
+            const int64_t nowEpoch = NowEpochMs();
+            int64_t retryAtMs = 0;
+            if (!a.failure.retryAt.empty()) {
+                retryAtMs = ParseTimestampStrToEpoch(a.failure.retryAt) * 1000;
+            }
+            MarkDown(DefaultPath(), eng, mod, a.failure.failureClass, checkDetail,
+                     nowEpoch, retryAtMs, LoadSettings());
+            if (!HasWorkerActivityEvents(failureInput->events)) {
+                RecordZeroEventFailure(DefaultPath(), eng, mod, nowEpoch);
+            }
+        }
+    }
+
+    // 091-7: a permission denial never becomes a plain failure by itself. First continue the
+    // same engine session (up to permissionResumeLimit), then auto-request a permit and hold
+    // the job in waitingForPermit until a human approves or rejects it.
+    if (a.failure.failureClass == "permission_denied" && job.onPermissionDenied != "fail") {
+        const std::string session = failureInput ? LatestSessionId(failureInput->events) : "";
+        const PermissionHoldPlan plan = PlanPermissionHandling(
+            a.failure, session, job.permissionResumeCount, job.permissionResumeLimit,
+            tq.name, job.onPermissionDenied);
+        if (plan.resume) {
+            job.permissionResumeCount++;
+            job.resumeSession = session;
+            a.reason = "permissionResume";
+            job.state = "pending";
+            job.retryAtMs = static_cast<int64_t>(GetNowTickMs()) + 1000;
+            job.holdReason.clear();
+            EmitEventLocked(tq, "jobDeferred", job.id, a.n, &a.failure);
+            SaveAllLocked();
+            CheckQueueNotices(tq);
+            cv_.notify_all();
+            return;
+        }
+        if (plan.wait && !plan.target.empty()) {
+            std::vector<std::string> engines;
+            if (!plan.engine.empty()) engines.push_back(plan.engine);
+            std::string reason = "auto-requested after permission_denied on job '" + job.id + "'";
+            permit::Result r = permit::Request(permit::DefaultPath(), plan.kind, plan.target, engines,
+                                               plan.scope, reason, "worker");
+            if (r.ok && std::find(job.waitPermits.begin(), job.waitPermits.end(), plan.permitId) ==
+                            job.waitPermits.end()) {
+                job.waitPermits.push_back(plan.permitId);
+            }
+        }
+        a.reason = "waitingForPermit";
+        job.state = "waitingForPermit";
+        job.retryAtMs = 0;
+        job.holdReason = "waiting for permit approval";
+        a.failure.nextSteps.push_back({"wait_permit", nullptr, true,
+                                       "Approve the requested permit in the dashboard or with `permit approve`."});
+        EmitEventLocked(tq, "jobWaitingForPermit", job.id, a.n, &a.failure);
+        SaveAllLocked();
+        CheckQueueNotices(tq);
+        cv_.notify_all();
+        return;
     }
 
     // An attempt cut short by a Hancho restart is not the job's fault,
@@ -5324,6 +6352,10 @@ void TaskQueueManager::ApplyAttemptOutcome(TaskQueue& tq, TaskQueueJob& job, boo
     // max_attempts, until defer.limit deferrals have happened.
     TaskQueueRetryDecision decision =
         DecideTaskQueueRetry(job, a.failure.failureClass, countedAttempts);
+    if (a.failure.failureClass == "permission_denied" && job.onPermissionDenied == "fail") {
+        // Explicit opt-out: no resume, no holding, no automatic retry.
+        decision.action = TaskQueueRetryAction::GiveUp;
+    }
     if (decision.action == TaskQueueRetryAction::WaitForRateLimit) {
         int deferrals = 0;
         for (const auto& att : job.attempts) {
@@ -5352,6 +6384,34 @@ void TaskQueueManager::ApplyAttemptOutcome(TaskQueue& tq, TaskQueueJob& job, boo
     }
 
     EmitEventLocked(tq, "jobAttemptFailed", job.id, a.n, &a.failure);
+
+    // 091-6: the attempt that revealed the dead engine waits for recovery instead of using
+    // up its retry budget. It is started again automatically once the engine probes healthy.
+    {
+        std::string waitEngine, waitModel;
+        if (JobEngineModel(job, waitEngine, waitModel)) {
+            using namespace engine_health;
+            Store health;
+            std::string healthErr;
+            if (Load(DefaultPath(), health, healthErr)) {
+                const Entry* e = Find(health, waitEngine, waitModel);
+                if (e && e->status == "down" && countedAttempts < job.maxAttempts) {
+                    a.reason = "engineWaiting";
+                    job.state = "pending";
+                    int64_t waitMs = e->nextProbeAtMs - NowEpochMs();
+                    if (waitMs < 0) waitMs = 0;
+                    job.retryAtMs = static_cast<int64_t>(GetNowTickMs()) + waitMs + 1000;
+                    job.holdReason = e->HoldReason();
+                    EmitEventLocked(tq, "jobDeferred", job.id, a.n, &a.failure);
+                    SaveAllLocked();
+                    CheckQueueNotices(tq);
+                    cv_.notify_all();
+                    return;
+                }
+            }
+        }
+    }
+
     if (decision.action == TaskQueueRetryAction::Retry) {
         job.state = "pending";
         job.retryAtMs = static_cast<int64_t>(GetNowTickMs()) + static_cast<int64_t>(job.retryDelaySec) * 1000;
@@ -5443,19 +6503,18 @@ static bool ModelChangeRequiresApproval() {
     return true;
 }
 
-// Default idle/hang timeout for LLM workers when the job does not set one.
-// llm_idle_timeout_sec in config.json overrides it; 0 disables the default.
-static int LlmJobIdleTimeoutSec() {
-    std::string content = ReadFileUtf8Wide(PathJoinWide(GetEffectiveDataDirectoryWide(), L"config.json"));
-    if (!content.empty()) {
-        nlohmann::json cfg = nlohmann::json::parse(content, nullptr, false);
-        if (cfg.is_object() && cfg.contains("llm_idle_timeout_sec") && cfg["llm_idle_timeout_sec"].is_number()) {
-            const int v = cfg["llm_idle_timeout_sec"].get<int>();
-            if (v >= 0) return v;
-        }
+// A change to a model already approved and enabled in the worker LLM list is safe: the user
+// gave prior, per-row approval for exactly this kind of switch (doc/HanchoExpectations.md 8.3).
+static bool IsApprovedWorkerModel(const std::string& model) {
+    llm::Config cfg;
+    std::string err;
+    if (!llm::Load(llm::DefaultPath(), cfg, err)) return false;
+    for (const auto& e : cfg.worker) {
+        if (e.Usable() && e.model == model) return true;
     }
-    return 600;
+    return false;
 }
+
 
 bool TaskQueueManager::BuildLaunchRequest(TaskQueue& tq, TaskQueueJob& job, int attemptN, LaunchItem& out) {
     out.taskqueue = tq.name;
@@ -5539,10 +6598,39 @@ bool TaskQueueManager::BuildLaunchRequest(TaskQueue& tq, TaskQueueJob& job, int 
     req.supervisorGoal = job.summary;
     req.supervisorNotes = "Task ID: " + job.id + (job.summary.empty() ? "" : " - " + job.summary);
     req.agentType = DetectAgentType(req.commandLine, req.name);
-    if (!req.agentType.empty()) {
+    if (!req.agentType.empty() || req.commandLine.find("--json-stream") != std::string::npos || job.idle.firstEventSec > 0) {
         req.jsonStream = true;
     }
     req.env = job.env;
+    // 091-7: hand approved permits to the worker. The user's global engine config is never
+    // written; all values are process-environment overrides for this launch only.
+    {
+        permit::Config cfg;
+        std::string permitErr;
+        if (permit::Load(permit::DefaultPath(), cfg, permitErr)) {
+            const std::string scope = "taskqueue:" + tq.name;
+            const auto rows = permit::Approved(cfg, req.agentType, scope);
+            nlohmann::json approved = nlohmann::json::array();
+            for (const auto& row : rows) approved.push_back(row.ToJson());
+            req.env["HANCHO_WORKER_PERMITS"] = BuildWorkerPermitsJson(approved);
+            WorkerEngineRegistry registry;
+            const std::wstring enginesPath = PathJoinWide(GetEffectiveDataDirectoryWide(), L"engines.json");
+            std::string engErr;
+            if (PathExistsWide(enginesPath)) registry.LoadFromJson(ReadFileUtf8Wide(enginesPath), engErr);
+            std::vector<std::string> warnings;
+            const WorkerEngineDef* def = registry.Find(req.agentType);
+            const std::string envConfig = registry.BuildPermitEnvironment(req.agentType, approved, warnings);
+            if (def && !def->permitEnv.empty() && !envConfig.empty()) {
+                req.env[def->permitEnv] = envConfig;
+            }
+            const std::string permitArgs = registry.BuildPermitArgs(req.agentType, approved, warnings);
+            ReplaceAllInPlace(req.commandLine, "{permitArgs}", permitArgs);
+            for (const auto& warning : warnings) {
+                if (!job.holdReason.empty()) job.holdReason += "; ";
+                job.holdReason += "permit: " + warning;
+            }
+        }
+    }
     auto adapterIt = req.env.find("HANCHO_ADAPTER");
     if (adapterIt != req.env.end()) {
         if (!adapterIt->second.empty()) {
@@ -5552,9 +6640,12 @@ bool TaskQueueManager::BuildLaunchRequest(TaskQueue& tq, TaskQueueJob& job, int 
         req.env.erase(adapterIt);
     }
     req.killExclude = job.killExclude;
-    if (job.idle.outputSec > 0 && job.idle.cpuSec > 0) {
+    if (job.idle.outputSec > 0) {
         req.idleTimeoutSec = job.idle.outputSec;
-        req.idleCpuSec = job.idle.cpuSec;
+        req.idleCpuSec = job.idle.cpuSec > 0 ? job.idle.cpuSec : 1;
+    }
+    if (job.idle.firstEventSec > 0) {
+        req.idleFirstEventSec = job.idle.firstEventSec;
     }
 
     req.env["PC_JOB_ID"] = job.id;
@@ -5571,11 +6662,35 @@ bool TaskQueueManager::BuildLaunchRequest(TaskQueue& tq, TaskQueueJob& job, int 
         if (job.host.empty() && !prev.lastLinesFile.empty()) req.env["PC_PREV_TAIL"] = prev.lastLinesFile;
     }
 
+    // 091-7: continue the same engine session after a denial instead of starting over.
+    if (!job.resumeSession.empty()) {
+        const std::string eng = LowerAscii(req.agentType);
+        if (eng == "opencode") {
+            req.commandLine += " --session " + QuoteCommandArgLocal(job.resumeSession);
+        } else if (eng == "claude") {
+            req.commandLine += " --resume " + QuoteCommandArgLocal(job.resumeSession);
+        }
+        std::string target;
+        if (!job.attempts.empty()) {
+            auto perm = job.attempts.back().failure.detail.find("permission");
+            if (perm != job.attempts.back().failure.detail.end() && perm->is_object()) {
+                target = perm->value("target", std::string());
+            }
+        }
+        req.env["HANCHO_PERMIT_RESUME"] =
+            "Access to '" + target + "' is not permitted. Continue using methods inside the "
+            "project (cwd) only; add it to `needs` and request a permit if it is genuinely required.";
+    }
+
     // LLM workers can hang on a silent tool call for hours (the 2026-11-17 incident:
     // 04-navigation ran 8.5 h after "Calling grep"). Default to a 10-minute idle/hang
     // timeout unless the job sets one explicitly. CPU activity keeps a busy job alive.
-    if (req.idleTimeoutSec == 0 && !req.agentType.empty()) {
-        req.idleTimeoutSec = LlmJobIdleTimeoutSec();
+    if (req.idleTimeoutSec == 0 && !job.idle.explicitZero && !req.agentType.empty()) {
+        WorkerIdleDefaults defs = LoadWorkerIdleDefaults();
+        req.idleTimeoutSec = defs.outputSec;
+        if (req.idleFirstEventSec == 0) {
+            req.idleFirstEventSec = defs.firstEventSec;
+        }
     }
 
     out.req = std::move(req);
@@ -5592,6 +6707,81 @@ void TaskQueueManager::ProcessSchedulerTick() {
         std::lock_guard<std::mutex> lock(mutex_);
         if (!pm_) return;
         int64_t now = static_cast<int64_t>(GetNowTickMs());
+        RefreshEngineHealthLocked(now);
+
+        // 091-6: held jobs keep their pending state and show why they are waiting. If the job
+        // can be switched to the next approved worker-list candidate, it is rewritten in place.
+        bool healthChanged = false;
+        // 091-7: a job held in waitingForPermit is resumed automatically when a human approves
+        // one of the permits auto-requested on its denial. A rejected request fails the job.
+        {
+            permit::Config permits;
+            std::string permitErr;
+            const bool permitsLoaded = permit::Load(permit::DefaultPath(), permits, permitErr);
+            for (auto& [name, tq] : queues_) {
+                (void)name;
+                for (auto& j : tq.jobs) {
+                    if (j.state != "waitingForPermit") continue;
+                    if (!permitsLoaded || j.waitPermits.empty()) continue;
+                    bool approvedAny = false;
+                    bool rejectedAll = true;
+                    for (const auto& id : j.waitPermits) {
+                        bool found = false;
+                        for (const auto& row : permits.permits) {
+                            if (row.id != id) continue;
+                            found = true;
+                            if (row.status == "approved") approvedAny = true;
+                            else if (row.status != "rejected" && row.status != "revoked") rejectedAll = false;
+                            break;
+                        }
+                        if (!found) rejectedAll = false;
+                    }
+                    if (approvedAny) {
+                        j.state = "pending";
+                        j.retryAtMs = now;
+                        j.holdReason.clear();
+                        j.waitPermits.clear();
+                        TaskQueueFailureDiagnostic* diag = j.attempts.empty()
+                            ? nullptr : &j.attempts.back().failure;
+                        EmitEventLocked(tq, "jobPermitApproved", j.id,
+                                        j.attempts.empty() ? 1 : j.attempts.back().n, diag);
+                        if (diag) diag->nextSteps.push_back({"retry", nullptr, false,
+                            "A permit was approved; the job is being re-run."});
+                        healthChanged = true;
+                        SaveAllLocked();
+                    } else if (rejectedAll) {
+                        j.state = "failed";
+                        j.retryAtMs = 0;
+                        j.holdReason.clear();
+                        j.waitPermits.clear();
+                        TaskQueueFailureDiagnostic* diag = j.attempts.empty()
+                            ? nullptr : &j.attempts.back().failure;
+                        if (diag) {
+                            diag->nextSteps.push_back({"fix_spec", nullptr, true,
+                                "The permit was rejected; change the instructions to stay inside the project."});
+                        }
+                        EmitEventLocked(tq, "jobFailed", j.id,
+                                        j.attempts.empty() ? 1 : j.attempts.back().n, diag);
+                        healthChanged = true;
+                        SaveAllLocked();
+                    }
+                }
+            }
+        }
+        for (auto& [name, tq] : queues_) {
+            (void)name;
+            for (auto& j : tq.jobs) {
+                if (j.state != "pending") continue;
+                j.holdReason = JobHoldReasonLocked(j, now);
+                if (!j.holdReason.empty()) {
+                    std::string eng, mod;
+                    if (JobEngineModel(j, eng, mod)) {
+                        healthChanged = TryEngineSwitchLocked(j, eng, mod, now) || healthChanged;
+                        j.holdReason = JobHoldReasonLocked(j, now);
+                    }
+                }
+            }
+        }
 
         // Ready jobs of all queues in one global order (priority, then registration order), so jobs
         // that share a resource start in that order even when they live in different queues.
@@ -5690,7 +6880,7 @@ void TaskQueueManager::ProcessSchedulerTick() {
             }
             changed = true;
         }
-        if (changed) SaveAllLocked();
+        if (changed || healthChanged) SaveAllLocked();
     }
     FlushFinishedCallbacks();
 }
@@ -6303,8 +7493,8 @@ void TaskQueueManager::OnProcessFinished(int processId, int exitCode, const std:
                 if (job.attempts.empty()) continue;
                 TaskQueueAttempt& a = job.attempts.back();
                 if (a.processId != processId) continue;
+                if (job.state != "running" && job.state != "cancelled") continue;
                 handled = true;
-                if (job.state != "running" && job.state != "cancelled") return;
 
                 std::wstring logPath = GetAttemptLogPathWide(job.id, a.n);
                 std::string logText = ReadFileUtf8Wide(logPath);
@@ -6328,6 +7518,7 @@ void TaskQueueManager::OnProcessFinished(int processId, int exitCode, const std:
                 ProcessSnapshot snap;
                 if (pm_ && pm_->GetSnapshot(processId, snap)) {
                     fin.elapsedSec = static_cast<int64_t>(snap.elapsedMs / 1000);
+                    fin.cpuSec = snap.cpuTimeMs > 0 ? (static_cast<double>(snap.cpuTimeMs) / 1000.0) : 0.0;
                     if (!snap.activity.empty() || !snap.activityTarget.empty()) {
                         fin.lastActivity = snap.activity;
                         fin.lastActivityTarget = snap.activityTarget;
@@ -6354,6 +7545,25 @@ void TaskQueueManager::OnProcessFinished(int processId, int exitCode, const std:
                     fin.eventsFile = HanchoEventsFilePathForStream(snap.streamFilePath);
                     if (!fin.eventsFile.empty()) {
                         fin.events = ReadHanchoEventsFile(fin.eventsFile, 500, "", 0);
+                    }
+                    if (!snap.processTreeSnapshot.empty()) {
+                        nlohmann::json pt = nlohmann::json::array();
+                        for (const auto& item : snap.processTreeSnapshot) {
+                            pt.push_back({
+                                {"name", item.name},
+                                {"pid", item.pid},
+                                {"cpuSec", item.cpuSec}
+                            });
+                        }
+                        fin.processTree = std::move(pt);
+                    }
+                }
+
+                if (fin.stderrText.empty()) {
+                    std::wstring stderrFile = PathJoinWide(GetTaskQueueLogDirWide(),
+                        Utf8ToWide(SanitizeFileNameComponent(job.id)) + L"." + std::to_wstring(a.n) + L".stderr.log");
+                    if (std::filesystem::exists(stderrFile)) {
+                        fin.stderrText = ReadFileUtf8Wide(stderrFile);
                     }
                 }
 

@@ -1,0 +1,8 @@
+{"engine":"hangdummy","key":"hangdummy/m1","model":"m1","nextProbeAt":1795124167968,"reason":"startup_hang","since":1795124166968,"timestamp":"2026-11-20 06:36:06","type":"engineDown"}
+{"engine":"okdummy","key":"okdummy/m2","model":"m2","nextProbeAt":1795124226968,"reason":"rate_limited","since":1795124166968,"timestamp":"2026-11-20 06:36:06","type":"engineDown"}
+{"engine":"okdummy","key":"okdummy/m2","model":"m2","nextProbeAt":0,"reason":"manual reset","since":0,"timestamp":"2026-11-20 06:36:06","type":"engineRecovered"}
+{"engine":"hangdummy","key":"hangdummy/m1","model":"m1","nextProbeAt":0,"reason":"manual reset","since":0,"timestamp":"2026-11-20 06:36:07","type":"engineRecovered"}
+{"engine":"okdummy","key":"okdummy/m4","model":"m4","nextProbeAt":1795124169168,"reason":"startup_hang","since":1795124168168,"timestamp":"2026-11-20 06:36:08","type":"engineDown"}
+{"engine":"okdummy","key":"okdummy/m4","model":"m4","nextProbeAt":0,"reason":"probe succeeded","since":0,"timestamp":"2026-11-20 06:36:10","type":"engineRecovered"}
+{"engine":"swA","key":"swA/mA","model":"mA","nextProbeAt":1795124171650,"reason":"startup_hang","since":1795124170650,"timestamp":"2026-11-20 06:36:10","type":"engineDown"}
+{"engine":"swC","key":"swC/mC","model":"mC","nextProbeAt":1795124171880,"reason":"startup_hang","since":1795124170880,"timestamp":"2026-11-20 06:36:10","type":"engineDown"}

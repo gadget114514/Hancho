@@ -1,0 +1,128 @@
+{
+  "consult": [
+    {
+      "approvedAt": "",
+      "approvedVia": "",
+      "enabled": true,
+      "engine": "opencode",
+      "model": "opencode-go/deepseek-v4.1-flash",
+      "note": "same model, different role",
+      "provider": "opencode-go",
+      "rank": 1,
+      "status": "proposed",
+      "userSaid": ""
+    }
+  ],
+  "history": [
+    {
+      "action": "add",
+      "at": "2026-11-20 06:32:04",
+      "by": "cli",
+      "entry": {
+        "approvedAt": "",
+        "approvedVia": "",
+        "enabled": true,
+        "engine": "opencode",
+        "model": "opencode-go/deepseek-v4.1-flash",
+        "note": "primary",
+        "provider": "opencode-go",
+        "rank": 1,
+        "status": "proposed",
+        "userSaid": ""
+      },
+      "list": "worker",
+      "reason": "seed worker"
+    },
+    {
+      "action": "add",
+      "at": "2026-11-20 06:32:04",
+      "by": "cli",
+      "entry": {
+        "approvedAt": "",
+        "approvedVia": "",
+        "enabled": true,
+        "engine": "opencode",
+        "model": "opencode-go/deepseek-v4.1-flash",
+        "note": "same model, different role",
+        "provider": "opencode-go",
+        "rank": 1,
+        "status": "proposed",
+        "userSaid": ""
+      },
+      "list": "consult",
+      "reason": "seed consult"
+    },
+    {
+      "action": "approve",
+      "at": "2026-11-20 06:32:04",
+      "by": "chat",
+      "entry": {
+        "approvedAt": "2026-11-20 06:32:04",
+        "approvedVia": "chat",
+        "enabled": true,
+        "engine": "opencode",
+        "model": "opencode-go/deepseek-v4.1-flash",
+        "note": "primary",
+        "provider": "opencode-go",
+        "rank": 1,
+        "status": "approved",
+        "userSaid": "yes, use opencode"
+      },
+      "list": "worker",
+      "reason": "yes, use opencode"
+    },
+    {
+      "action": "disable",
+      "at": "2026-11-20 06:32:04",
+      "by": "cli",
+      "entry": {
+        "approvedAt": "2026-11-20 06:32:04",
+        "approvedVia": "chat",
+        "enabled": false,
+        "engine": "opencode",
+        "model": "opencode-go/deepseek-v4.1-flash",
+        "note": "primary",
+        "provider": "opencode-go",
+        "rank": 1,
+        "status": "approved",
+        "userSaid": "yes, use opencode"
+      },
+      "list": "worker",
+      "reason": "rest"
+    },
+    {
+      "action": "edit",
+      "at": "2026-11-20 06:32:04",
+      "by": "cli",
+      "entry": {
+        "approvedAt": "",
+        "approvedVia": "",
+        "enabled": false,
+        "engine": "opencode",
+        "model": "opencode-go/new-model",
+        "note": "primary",
+        "provider": "opencode-go",
+        "rank": 1,
+        "status": "proposed",
+        "userSaid": ""
+      },
+      "list": "worker",
+      "reason": "model change"
+    }
+  ],
+  "supervisor": [],
+  "worker": [
+    {
+      "approvedAt": "",
+      "approvedVia": "",
+      "enabled": false,
+      "engine": "opencode",
+      "model": "opencode-go/new-model",
+      "note": "primary",
+      "provider": "opencode-go",
+      "rank": 1,
+      "status": "proposed",
+      "userSaid": ""
+    }
+  ]
+}

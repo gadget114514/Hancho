@@ -151,6 +151,18 @@ hancho-cli.exe power status
 - **モデル / provider を勝手に変えない。** `taskqueue update` で `--model` を変えるには `--approve-model-change --reason "..."` が必要。監督は変更せず、カードを判断待ちに残す。
 - **data-dir を1つに固定する。** 例: `<project>/.hancho`。毎回 `--data-dir` を付けるか、`hancho-cli.exe mcp install --data-dir .hancho` で埋め込む。
 
+## ワーカーが失敗・ハングしたとき
+
+**これは事後の手順。** あらかじめハング対策を組めなかったときの対処法で、BT を書く段階で入れるべき手順は下の「BT を書くときはハング対策を最初から入れる」を参照。
+
+最初の正規化イベントが出ないハングは、worker ジョブの初回イベント監視（`idle.firstEventSec`、既定 180 秒）と idle 監視で早期に止まり、`class: "startup_hang"`（終了理由 `startup_timed_out`）としてジョブに残る。kill の直前に採取されたプロセストリースナップショットは `detail.processTree` にある。次の順で対処する。
+
+1. **自分のシェルのタイムアウトで kill しない。** Hancho の初回イベント監視・idle 監視に任せる。
+2. `taskqueue why <id>` を読み、`likelyCauses`（`[{id, why}]`。例: `no_model`、`same_engine_nesting`、`waiting_for_input`）と `nextSteps`（`[{action, change?, needsApproval?, question?}]`）を確認する。同じ失敗レコードは `taskqueue get --json` の `failure` にもある。
+3. `nextSteps` の順に試す。1 回目は同じ設定で `taskqueue retry` → 2 回目は `change` を付けて設定を変える（モデル／エンジンの変更は `taskqueue update --approve-model-change --reason "..."` の承認付き）→ 3 回目は escalate。triage カードの候補にも `retry_with_change` が出る。
+4. **自分で実装するなら、先に記録する。** 単発ジョブは `taskqueue takeover --id <id> --reason "..."` で引き取り（`takenOver` + `takeover` レコード）を残し、終わったら `taskqueue complete --id <id> --reason "..." [--report <path>] [--result succeeded|failed]` で結果を戻す。BT なら `bt resume --id <btid> --node <node> --answer takeover --rationale "..."` で escalate ノードに記録する（`expect` に無くても受け付けられる）。
+5. **黙って委任をやめない。** チャットへの報告は補足。一次記録はジョブに残す。
+
 ## supervisor 側のコツ
 
 - 成功条件を先に決める（「ビルドが通る」ではなく「`build/Release/app.exe` が更新される」）。
@@ -271,7 +283,19 @@ test → 失敗なら修正 → 再ビルド → 再テスト、の例:
 }
 ```
 
-ノード: `job` / `worker` / `wait` / `set` / `escalate` / `fail` / `succeed`。複合: `sequence` / `fallback` / `parallel` / `if`。装飾: `retry` / `repeat` / `invert` / `forceSuccess` / `forceFailure` / `timeout`。条件: `fileExists` / `fileNewer` / `outputMatches` / `exitCode` / `jsonValue` / `var` / `nodeState`。変数: `${name}`、`${<node>.state|exitCode|logFile|jobId|runs}`、`${<worker>.result}`、`${<escalate>.answer}`。詳細は `doc/behavior-tree.md`。
+ノード: `job` / `worker` / `probe` / `wait` / `set` / `escalate` / `fail` / `succeed`。複合: `sequence` / `fallback` / `parallel` / `if` / **`catch`**。装飾: `retry` / `repeat` / `invert` / `forceSuccess` / `forceFailure` / `timeout`。条件: `fileExists` / `fileNewer` / `outputMatches` / `exitCode` / **`failure`** / `jsonValue` / `var` / `nodeState`。変数: `${name}`、`${<node>.state|exitCode|logFile|jobId|runs}`、`${<worker>.result}`、`${<escalate>.answer}`、失敗診断の `${<node>.failureClass|failureSummary|likelyCauses|suggestedAction|retryAt|engine|model}`。詳細は `doc/behavior-tree.md` / `doc/behavior-tree-ja.md`。
+
+#### BT を書くときはハング対策を最初から入れる
+
+ハングしてから気付くのではなく、BT を書く時点で監視・退避・エスカレーションを組み込む。手順:
+
+1. **`bt template resilient-worker` から始める**（ww カード列なら `card-sequence`）。 `<...>` プレースホルダを実値に置き換える。テンプレートには `defaults.worker.idle` / `probe: true` / `engines` + `switchEngineOn` / `catch` / `escalate` が最初から入っている。`hancho-cli.exe bt template resilient-worker --json` で実物を取得できる。
+2. **`bt validate --strict` で警告ゼロにする。** `bt validate` の `warnings[]` はそのままでは検証成功なので、`--strict`（MCP `bt_validate` の `strict: true`）でエラーに昇格させてから直す。`no_hang_watch` / `opencode_without_model` / `unguarded_worker` / `engines_without_switch` / `switch_without_engines` / `engine_not_permitted` / `unswitchable_command` / `escalate_without_takeover` / `permit_not_approved` が主な警告。
+3. **候補は承認済みのリストから選ぶ。** worker の候補は `llm list --list worker`、escalate の代理回答 (`fallback`) は `llm list --list consult` にあるものだけを使う。足りなければ `llm add --list <l> --engine <e> --model <m> --reason "..."` で提案し、ユーザーに承認をもらってから使う（ダッシュボードの LLM ページで承認してもらうか、チャットで確認して `llm approve --list <l> --engine <e> --model <m> --user-said "<ユーザーの言葉>"` で記録する）。MCP は `llm_list` / `llm_add` / `llm_remove` / `llm_set_enabled` / `llm_approve`。
+4. **必要なら事前確認する。** `worker probe`（1 行、`hancho-cli.exe worker probe --engine <e> --model <m> --json`。MCP `worker_probe`）で「1 行返すだけ」の最小プロンプトを走らせ、共有の故障状態は `worker health`（MCP `worker_health`）で見る。本番起動前に壊れたエンジンを除外できる。
+5. そのうえで `bt start` → `bt wait --id <btid> --timeout-ms 600000` → `bt get --id <btid> --compact` で監視する。
+
+worker ノードの `engines` / `switchEngineOn`、`probe` 葉、`{engine}` / `{model}` プレースホルダ、`needs` による権限宣言の詳細は `doc/behavior-tree.md` の 5.3 / 5.4 と 11 章を参照。
 
 ### `escalate`（supervisor が呼ばれる唯一の場所）
 
@@ -377,3 +401,6 @@ hancho-cli.exe mcp install --data-dir .hancho --dry-run --json
 - 1文字修正なのにコーディングエージェントを起動して数十分待つ → `quickfix` を使う。
 - 監督に直接ファイルを編集させる → 置換・パッチ・ジョブを出させ、適用は Hancho に任せる。
 - モデルを勝手に切り替える → `taskqueue update --approve-model-change --reason "..."` で人の承認を記録する。
+- BT を書くときにハング対策を入れ忘れる → `bt template resilient-worker` から始め、`bt validate --strict` で警告ゼロにしてから `bt start` する（worker / consult の候補は `llm list` で選び、未承認なら承認をもらう）。
+- ワーカーがハングしたら委任をやめて自分で書く → `taskqueue takeover --id <id> --reason "..."`（BT なら `bt resume --answer takeover --rationale "..."`）で記録してから実装する。
+- 「supervisor 自身にコードを書かせない」ルールの例外は、この記録付きの引き取り（`takenOver`）だけ。黙って自分で書くのは禁止。

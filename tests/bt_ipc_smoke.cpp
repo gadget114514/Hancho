@@ -153,6 +153,49 @@ int main() {
             json rBad = h.Call({{"action", "bt_validate"}, {"bt", badBt}});
             Check(!rBad.value("ok", true) && !rBad.value("valid", true) && !rBad.value("error", "").empty(),
                   "bt_validate rejects invalid retry.max=999");
+
+            json warnBt = {
+                {"id", "ipc-val-warn"},
+                {"cwd", tempDirUtf8},
+                {"root", {
+                    {"type", "worker"},
+                    {"id", "w"},
+                    {"summary", "Warning worker"},
+                    {"prompt", "p"},
+                    {"timeoutSec", 60}
+                }}
+            };
+            json rWarn = h.Call({{"action", "bt_validate"}, {"bt", warnBt}});
+            Check(rWarn.value("ok", false) && rWarn.value("valid", false) &&
+                  rWarn.contains("warnings") && rWarn["warnings"].is_array() &&
+                  !rWarn["warnings"].empty() &&
+                  rWarn["warnings"][0].value("code", "") == "no_hang_watch",
+                  "bt_validate returns warnings without failing strict=false");
+            json rStrict = h.Call({{"action", "bt_validate"}, {"bt", warnBt}, {"strict", true}});
+            Check(!rStrict.value("ok", true) && !rStrict.value("valid", true) &&
+                  rStrict.value("error", "").find("no_hang_watch") != std::string::npos,
+                  "bt_validate strict=true turns warnings into errors");
+        }
+
+        // 1b. bt_start starts even with warnings and reports them; paused so no job is launched.
+        {
+            json warnBt = {
+                {"id", "ipc-warn-start"},
+                {"cwd", tempDirUtf8},
+                {"root", {
+                    {"type", "worker"},
+                    {"id", "w"},
+                    {"summary", "Warning worker"},
+                    {"prompt", "p"},
+                    {"timeoutSec", 60}
+                }}
+            };
+            json rStart = h.Call({{"action", "bt_start"}, {"bt", warnBt}, {"paused", true}});
+            Check(rStart.value("ok", false) && rStart.contains("warnings") &&
+                  rStart["warnings"].is_array() && !rStart["warnings"].empty(),
+                  "bt_start succeeds and includes warnings in its response");
+            json rCancel = h.Call({{"action", "bt_cancel"}, {"id", "ipc-warn-start"}});
+            Check(rCancel.value("ok", false), "bt_cancel cleans up the warning-start tree");
         }
 
         // 2. bt_start of a two-job BT (cmd /c exit 0), bt_wait until finished, bt_get compact, bt_list

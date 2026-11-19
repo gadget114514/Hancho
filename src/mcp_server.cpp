@@ -3,7 +3,13 @@
 #include "common.h"
 #include "memory_search.h"
 #include "llm_stream.h"
+#include "llm_config.h"
+#include "permit_config.h"
+#include "worker_probe.h"
+#include "engine_health.h"
+#include "bt_templates.h"
 #include "nlohmann/json.hpp"
+#include <algorithm>
 #include <fstream>
 #include <filesystem>
 #include <iostream>
@@ -551,7 +557,7 @@ int RunMcpServer() {
                  << "\"description\":\"List task queue jobs with state, attempts, last reason and blockedBy. Failed jobs carry the same top-level failure record (class, summary, suggestedAction, evidence) as taskqueue_get. Provisional 'planned' rows for idle job/worker leaves of running behavior trees are included by default; set includePlanned=false to omit them and the task-group row. The active task group (the BT root) appears as a virtual row with id 'group:<id>' and state running, waitingForLlm or paused. Neither row is a stored job; read a task group with bt_get and answer it with bt_resume.\","
                 << "\"inputSchema\":{\"type\":\"object\",\"properties\":{"
                 << "\"taskqueue\":{\"type\":\"string\",\"description\":\"Optional task queue name (all queues when omitted)\"},"
-                << "\"state\":{\"type\":\"string\",\"description\":\"Optional state filter: pending, planned, running, succeeded, failed, blocked, cancelled\"},"
+                << "\"state\":{\"type\":\"string\",\"description\":\"Optional state filter: pending, planned, running, succeeded, failed, blocked, cancelled, waitingForPermit\"},"
                 << "\"since\":{\"type\":\"string\",\"description\":\"Optional time window: only jobs updated within this period, e.g. 30m, 6h, 2d\"},"
                 << "\"origin\":{\"type\":\"string\",\"description\":\"Optional: 'self' for only the jobs your session added, or an origin label or session id (prefix)\"},"
                 << "\"bt\":{\"type\":\"string\",\"description\":\"Optional behavior-tree id: list every job of that tree across its parallel branch queues\"},"
@@ -560,7 +566,7 @@ int RunMcpServer() {
                 << "},"
                 << "{"
                  << "\"name\":\"taskqueue_get\","
-                 << "\"description\":\"Get a job with attempt history, instructions text, and sourceChanged/sourceMissing flags. A failed job also carries a top-level failure record (class, confidence, summary, lastActivity, evidence, suggestedAction, retryAt) plus failure.history for earlier attempts.\","
+                 << "\"description\":\"Get a job with attempt history, instructions text, and sourceChanged/sourceMissing flags. A failed job also carries a top-level failure record (class, confidence, summary, lastActivity, evidence, suggestedAction, retryAt, likelyCauses, nextSteps, supervisorNote) plus failure.history for earlier attempts.\","
                 << "\"inputSchema\":{\"type\":\"object\",\"properties\":{"
                 << "\"id\":{\"type\":\"string\",\"description\":\"Job id\"},"
                 << "\"includeInstructions\":{\"type\":\"boolean\",\"description\":\"Include instructions text (default true)\"},"
@@ -610,6 +616,24 @@ int RunMcpServer() {
                 << "\"inputSchema\":{\"type\":\"object\",\"properties\":{"
                 << "\"id\":{\"type\":\"string\",\"description\":\"Job id\"}"
                 << "},\"required\":[\"id\"]}"
+                << "},"
+                << "{"
+                << "\"name\":\"taskqueue_takeover\","
+                << "\"description\":\"Record that you are taking a job over instead of delegating again. The job becomes the terminal state takenOver with a takeover record {by, reason, at}; a running attempt is stopped and dependents stay pending until taskqueue_complete. Accepted from failed/blocked/waiting/pending/running; rejected for succeeded/cancelled.\","
+                << "\"inputSchema\":{\"type\":\"object\",\"properties\":{"
+                << "\"id\":{\"type\":\"string\",\"description\":\"Job id\"},"
+                << "\"reason\":{\"type\":\"string\",\"description\":\"Required: why you are taking this job over\"}"
+                << "},\"required\":[\"id\",\"reason\"]}"
+                << "},"
+                << "{"
+                << "\"name\":\"taskqueue_complete\","
+                << "\"description\":\"Finish a taken-over job and record {completedAt, report, result, completionReason}. With result succeeded (default), dependents advance as if the dependency succeeded; with failed, dependents are blocked. Requires a reason.\","
+                << "\"inputSchema\":{\"type\":\"object\",\"properties\":{"
+                << "\"id\":{\"type\":\"string\",\"description\":\"Job id\"},"
+                << "\"reason\":{\"type\":\"string\",\"description\":\"Required: reason for the completion decision\"},"
+                << "\"report\":{\"type\":\"string\",\"description\":\"Optional path to the report or test result\"},"
+                << "\"result\":{\"type\":\"string\",\"enum\":[\"succeeded\",\"failed\"],\"description\":\"Result of the taken-over work (default succeeded)\"}"
+                << "},\"required\":[\"id\",\"reason\"]}"
                 << "},"
                 << "{"
                 << "\"name\":\"taskqueue_pause\","
@@ -683,10 +707,11 @@ int RunMcpServer() {
                 << "},"
                 << "{"
                 << "\"name\":\"bt_validate\","
-                << "\"description\":\"Validate a behavior tree JSON definition without running it.\","
+                << "\"description\":\"Validate a behavior tree without running it; returns lint warnings in warnings[] (--strict turns them into errors).\","
                 << "\"inputSchema\":{\"type\":\"object\",\"properties\":{"
                 << "\"bt\":{\"type\":\"object\",\"description\":\"Behavior tree definition object\"},"
-                << "\"file\":{\"type\":\"string\",\"description\":\"Path to a behavior tree JSON file\"}"
+                << "\"file\":{\"type\":\"string\",\"description\":\"Path to a behavior tree JSON file\"},"
+                << "\"strict\":{\"type\":\"boolean\",\"description\":\"Treat lint warnings as errors (default false)\"}"
                 << "}}"
                 << "},"
                 << "{"
@@ -697,6 +722,13 @@ int RunMcpServer() {
                 << "\"file\":{\"type\":\"string\",\"description\":\"Path to a behavior tree JSON file\"},"
                 << "\"paused\":{\"type\":\"boolean\",\"description\":\"Register the tree paused without creating any jobs (default false)\"}"
                 << ",\"originLabel\":{\"type\":\"string\",\"description\":\"Optional short name shown as the Origin of the jobs this tree adds\"}"
+                << "}}"
+                << "},"
+                << "{"
+                << "\"name\":\"bt_template\","
+                << "\"description\":\"List hang-safe BT templates or return one full template with <...> placeholders to replace before validation.\","
+                << "\"inputSchema\":{\"type\":\"object\",\"properties\":{"
+                << "\"name\":{\"type\":\"string\",\"description\":\"Template name (resilient-worker or card-sequence); omit to list templates\"}"
                 << "}}"
                 << "},"
                 << "{"
@@ -1056,8 +1088,30 @@ int RunMcpServer() {
                 << "\"maxHops\":{\"type\":\"integer\",\"description\":\"Stop replying after this many LLM reply hops\"},"
                 << "\"concurrency\":{\"type\":\"integer\",\"description\":\"Handler queue concurrency\"}"
                 << "}}"
-                << "}"
-                << "]}}";
+                 << "}"
+                 << ","
+                 << "{\"name\":\"llm_list\",\"description\":\"List the per-role LLM candidate lists (worker, consult, supervisor) from <data-dir>/llms.json, including which rows are still proposed (unused until approved).\",\"inputSchema\":{\"type\":\"object\",\"properties\":{\"list\":{\"type\":\"string\",\"enum\":[\"worker\",\"consult\",\"supervisor\"],\"description\":\"Only this list; omit for all three\"}}}}"
+                 << ","
+                 << "{\"name\":\"llm_add\",\"description\":\"Add a proposed (unused) row to an LLM list. Requires reason. Use llm_approve or the dashboard to approve it.\",\"inputSchema\":{\"type\":\"object\",\"properties\":{\"list\":{\"type\":\"string\",\"enum\":[\"worker\",\"consult\",\"supervisor\"]},\"engine\":{\"type\":\"string\"},\"model\":{\"type\":\"string\"},\"provider\":{\"type\":\"string\"},\"rank\":{\"type\":\"integer\"},\"note\":{\"type\":\"string\"},\"reason\":{\"type\":\"string\"}},\"required\":[\"list\",\"engine\",\"model\",\"reason\"]}}"
+                 << ","
+                 << "{\"name\":\"llm_remove\",\"description\":\"Remove a row from an LLM list. Requires reason.\",\"inputSchema\":{\"type\":\"object\",\"properties\":{\"list\":{\"type\":\"string\",\"enum\":[\"worker\",\"consult\",\"supervisor\"]},\"engine\":{\"type\":\"string\"},\"model\":{\"type\":\"string\"},\"reason\":{\"type\":\"string\"}},\"required\":[\"list\",\"engine\",\"model\",\"reason\"]}}"
+                 << ","
+                 << "{\"name\":\"llm_set_enabled\",\"description\":\"Enable or disable a row in an LLM list. Requires reason.\",\"inputSchema\":{\"type\":\"object\",\"properties\":{\"list\":{\"type\":\"string\",\"enum\":[\"worker\",\"consult\",\"supervisor\"]},\"engine\":{\"type\":\"string\"},\"model\":{\"type\":\"string\"},\"enabled\":{\"type\":\"boolean\"},\"reason\":{\"type\":\"string\"}},\"required\":[\"list\",\"engine\",\"model\",\"enabled\",\"reason\"]}}"
+                 << ","
+                  << "{\"name\":\"llm_approve\",\"description\":\"Approve a proposed LLM list row, quoting what the user said (recorded as approvedVia=chat).\",\"inputSchema\":{\"type\":\"object\",\"properties\":{\"list\":{\"type\":\"string\",\"enum\":[\"worker\",\"consult\",\"supervisor\"]},\"engine\":{\"type\":\"string\"},\"model\":{\"type\":\"string\"},\"userSaid\":{\"type\":\"string\"}},\"required\":[\"list\",\"engine\",\"model\",\"userSaid\"]}}"
+                  << ","
+                  << "{\"name\":\"permit_list\",\"description\":\"List worker permits from <data-dir>/permits.json, including proposals that are not yet approved.\",\"inputSchema\":{\"type\":\"object\",\"properties\":{\"scope\":{\"type\":\"string\",\"description\":\"Only this scope (global, taskqueue:<name>, bt:<id>)\"}}}}"
+                  << ","
+                  << "{\"name\":\"permit_request\",\"description\":\"Propose a worker permission (status proposed, not used until a human approves it).\",\"inputSchema\":{\"type\":\"object\",\"properties\":{\"kind\":{\"type\":\"string\",\"enum\":[\"read_path\",\"write_path\",\"command\",\"network\"]},\"target\":{\"type\":\"string\"},\"engine\":{\"type\":\"string\"},\"engines\":{\"type\":\"string\",\"description\":\"Optional comma-separated engine list\"},\"scope\":{\"type\":\"string\"},\"reason\":{\"type\":\"string\"}},\"required\":[\"kind\",\"target\",\"reason\"]}}"
+                  << ","
+                  << "{\"name\":\"permit_approve\",\"description\":\"Approve a proposed permit, quoting what the user said (approvedVia=chat).\",\"inputSchema\":{\"type\":\"object\",\"properties\":{\"id\":{\"type\":\"string\"},\"userSaid\":{\"type\":\"string\"}},\"required\":[\"id\",\"userSaid\"]}}"
+                  << ","
+                  << "{\"name\":\"permit_revoke\",\"description\":\"Revoke an approved permit. Requires reason.\",\"inputSchema\":{\"type\":\"object\",\"properties\":{\"id\":{\"type\":\"string\"},\"reason\":{\"type\":\"string\"}},\"required\":[\"id\",\"reason\"]}}"
+                  << ","
+                  << "{\"name\":\"worker_probe\",\"description\":\"Health-check an engine with a minimal prompt (closed stdin). Returns {ok, engine, model, elapsedMs, failureClass?, detail?, cached}. Result is cached in <data-dir>/probes.json.\",\"inputSchema\":{\"type\":\"object\",\"properties\":{\"engine\":{\"type\":\"string\"},\"model\":{\"type\":\"string\"},\"timeout\":{\"type\":\"integer\"},\"no_cache\":{\"type\":\"boolean\"}},\"required\":[\"engine\"]}}"
+                  << ","
+                  << "{\"name\":\"worker_health\",\"description\":\"Read the shared engine-health registry (<data-dir>/engine-health.json). Pass reset=true with engine/model to mark an engine healthy again.\",\"inputSchema\":{\"type\":\"object\",\"properties\":{\"engine\":{\"type\":\"string\"},\"model\":{\"type\":\"string\"},\"reset\":{\"type\":\"boolean\"}}}}"
+                  << "]}}";
             EmitLine(oss.str());
         }
         else if (method == "tools/call") {
@@ -1067,6 +1121,136 @@ int RunMcpServer() {
             const std::string& argsJson = req.argumentsJson;
             WriteAuditLog("MCP_TOOL_CALL", "tool=" + toolName + " args=" + argsJson);
             std::ostringstream ipcReq;
+
+            if (toolName == "bt_template") {
+                nlohmann::json out = BtTemplateResult(JsonGetString(argsJson, "name", ""));
+                const bool ok = out.value("ok", false);
+                WriteAuditLog("MCP_TOOL_RESP", "tool=" + toolName + " ok=" + (ok ? "true" : "false"));
+                EmitLine(BuildMcpToolResult(rpcId, out.dump(), !ok));
+                continue;
+            }
+
+            if (toolName.rfind("permit_", 0) == 0) {
+                const std::wstring permitPath = permit::DefaultPath();
+                const std::string by = mcpClient.empty() ? "mcp" : mcpClient;
+                permit::Result res;
+                if (toolName == "permit_list") {
+                    res = permit::List(permitPath, JsonGetString(argsJson, "scope", ""));
+                } else if (toolName == "permit_request") {
+                    std::vector<std::string> engines;
+                    nlohmann::json parsed = nlohmann::json::parse(argsJson, nullptr, false);
+                    if (!parsed.is_discarded() && parsed.is_object()) {
+                        auto it = parsed.find("engines");
+                        if (it != parsed.end()) {
+                            if (it->is_string()) {
+                                std::string list = it->get<std::string>();
+                                size_t start = 0;
+                                while (start <= list.size()) {
+                                    size_t end = list.find(',', start);
+                                    std::string e = list.substr(start, end == std::string::npos ? std::string::npos : end - start);
+                                    while (!e.empty() && e.front() == ' ') e.erase(e.begin());
+                                    while (!e.empty() && e.back() == ' ') e.pop_back();
+                                    if (!e.empty()) engines.push_back(e);
+                                    if (end == std::string::npos) break;
+                                    start = end + 1;
+                                }
+                            } else if (it->is_array()) {
+                                for (const auto& e : *it) if (e.is_string()) engines.push_back(e.get<std::string>());
+                            }
+                        }
+                    }
+                    const std::string single = JsonGetString(argsJson, "engine", "");
+                    if (!single.empty() && std::find(engines.begin(), engines.end(), single) == engines.end()) {
+                        engines.push_back(single);
+                    }
+                    res = permit::Request(permitPath, JsonGetString(argsJson, "kind", ""),
+                                          JsonGetString(argsJson, "target", ""), engines,
+                                          JsonGetString(argsJson, "scope", ""),
+                                          JsonGetString(argsJson, "reason", ""), by);
+                } else if (toolName == "permit_approve") {
+                    res = permit::Approve(permitPath, JsonGetString(argsJson, "id", ""),
+                                          JsonGetString(argsJson, "userSaid", ""), by);
+                } else if (toolName == "permit_revoke") {
+                    res = permit::Revoke(permitPath, JsonGetString(argsJson, "id", ""),
+                                         JsonGetString(argsJson, "reason", ""), by);
+                } else {
+                    res.error = "unknown tool: " + toolName;
+                }
+                std::string respStr = res.ok ? res.data.dump()
+                    : nlohmann::json{{"ok", false}, {"error", res.error}}.dump();
+                WriteAuditLog("MCP_TOOL_RESP", "tool=" + toolName + " ok=" + (res.ok ? "true" : "false"));
+                EmitLine(BuildMcpToolResult(rpcId, respStr, !res.ok));
+                continue;
+            }
+
+            if (toolName.rfind("llm_", 0) == 0 || toolName == "worker_probe" || toolName == "worker_health") {
+                const std::wstring llmPath = llm::DefaultPath();
+                const std::string by = mcpClient.empty() ? "mcp" : mcpClient;
+                const std::string list = JsonGetString(argsJson, "list", "");
+                const std::string engine = JsonGetString(argsJson, "engine", "");
+                const std::string model = JsonGetString(argsJson, "model", "");
+                const std::string reason = JsonGetString(argsJson, "reason", "");
+                llm::Result res;
+                if (toolName == "llm_list") {
+                    res = llm::List(llmPath, list);
+                } else if (toolName == "llm_add") {
+                    bool hasRank = argsJson.find("\"rank\"") != std::string::npos;
+                    res = llm::Add(llmPath, list, engine, model,
+                                   JsonGetString(argsJson, "provider", ""),
+                                   static_cast<int>(JsonGetInt(argsJson, "rank", 0)), hasRank,
+                                   JsonGetString(argsJson, "note", ""), by, reason);
+                } else if (toolName == "llm_remove") {
+                    res = llm::Remove(llmPath, list, engine, model, by, reason);
+                } else if (toolName == "llm_set_enabled") {
+                    res = llm::SetEnabled(llmPath, list, engine, model,
+                                          JsonGetBool(argsJson, "enabled", true), by, reason);
+                } else if (toolName == "llm_approve") {
+                    res = llm::Approve(llmPath, list, engine, model,
+                                       JsonGetString(argsJson, "userSaid", ""), by);
+                } else if (toolName == "worker_probe") {
+                    WorkerEngineRegistry registry;
+                    std::wstring enginesPath = PathJoinWide(GetEffectiveDataDirectoryWide(), L"engines.json");
+                    std::string engErr;
+                    if (PathExistsWide(enginesPath)) registry.LoadFromJson(ReadFileUtf8Wide(enginesPath), engErr);
+                    ProbeOptions opts;
+                    opts.timeoutSec = static_cast<int>(JsonGetInt(argsJson, "timeout", 60));
+                    opts.noCache = JsonGetBool(argsJson, "no_cache", false);
+                    ProbeOutcome out = ProbeEngine(registry, engine, model, opts);
+                    res.ok = out.ok;
+                    res.data = out.ToJson();
+                    if (!out.ok) res.error = out.failureClass.empty() ? "probe_failed" : out.failureClass;
+                } else if (toolName == "worker_health") {
+                    const std::wstring healthPath = engine_health::DefaultPath();
+                    if (JsonGetBool(argsJson, "reset", false)) {
+                        if (engine.empty()) {
+                            res.ok = false;
+                            res.error = "engine is required for reset";
+                        } else {
+                            res.ok = engine_health::Reset(healthPath, engine, model,
+                                                          engine_health::NowEpochMs());
+                            res.data = nlohmann::json{{"status", "healthy"},
+                                                      {"key", engine_health::Key(engine, model)}};
+                        }
+                    } else {
+                        engine_health::Store store;
+                        std::string err;
+                        if (!engine_health::Load(healthPath, store, err)) {
+                            res.ok = false;
+                            res.error = err.empty() ? "could not read engine health" : err;
+                        } else {
+                            res.ok = true;
+                            res.data = nlohmann::json{{"engines", store.ToJson()["engines"]}};
+                        }
+                    }
+                } else {
+                    res.error = "unknown tool: " + toolName;
+                }
+                std::string respStr = res.ok ? res.data.dump()
+                    : nlohmann::json{{"ok", false}, {"error", res.error}}.dump();
+                WriteAuditLog("MCP_TOOL_RESP", "tool=" + toolName + " ok=" + (res.ok ? "true" : "false"));
+                EmitLine(BuildMcpToolResult(rpcId, respStr, !res.ok));
+                continue;
+            }
 
             if (toolName == "usage_stats") {
                 LlmUsageStatsOptions opts;
@@ -1432,6 +1616,24 @@ int RunMcpServer() {
             else if (toolName == "taskqueue_cancel") {
                 ipcReq << "{\"action\":\"taskqueue_cancel\",\"id\":\""
                        << JsonEscape(JsonGetString(argsJson, "id", "")) << "\"}";
+            }
+            else if (toolName == "taskqueue_takeover" || toolName == "taskqueue_complete") {
+                const std::string reason = JsonGetString(argsJson, "reason", "");
+                if (reason.empty()) {
+                    EmitLine(BuildMcpToolResult(rpcId, toolName + " requires a non-empty reason", true));
+                    continue;
+                }
+                std::string by = mcpClient;
+                const size_t space = by.find(' ');
+                if (space != std::string::npos) by.resize(space);
+                if (by.empty()) by = "mcp";
+                ipcReq << "{\"action\":\"" << toolName << "\",\"id\":\""
+                       << JsonEscape(JsonGetString(argsJson, "id", ""))
+                       << "\",\"by\":\"" << JsonEscape(by)
+                       << "\",\"reason\":\"" << JsonEscape(reason)
+                       << "\",\"report\":\"" << JsonEscape(JsonGetString(argsJson, "report", ""))
+                       << "\",\"result\":\"" << JsonEscape(JsonGetString(argsJson, "result", "succeeded"))
+                       << "\"}";
             }
             else if (toolName == "taskqueue_pause" || toolName == "taskqueue_resume") {
                 ipcReq << "{\"action\":\"" << toolName << "\",\"taskqueue\":\""

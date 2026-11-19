@@ -195,8 +195,10 @@ std::string AttemptReason(const json& attempt) {
 }
 
 bool TimedOut(const json& attempt) {
-    return AttemptReason(attempt) == "timed_out" ||
-           FailureClass(Object(attempt, "failure")) == "timeout";
+    const std::string reason = AttemptReason(attempt);
+    const std::string fclass = FailureClass(Object(attempt, "failure"));
+    return reason == "timed_out" || reason == "idle_timed_out" || reason == "startup_timed_out" ||
+           fclass == "timeout" || fclass == "startup_hang" || fclass == "idle_stall";
 }
 
 std::string Confidence(const json& failure) {
@@ -463,6 +465,8 @@ json BuildJobFailureCard(const json& job, const TriageInputs& in) {
 
     json candidates = json::array();
     AddCandidate(candidates, "retry", "Retry", "Run this job again.", true);
+    AddCandidate(candidates, "retry_with_change", "Retry with changes",
+                 "Retry the job with a different model or engine.", false);
     AddCandidate(candidates, "retry_raise_timeout", "Retry with a longer timeout",
                  "Double the timeout, then retry (bounded by original and queue limits).", true,
                  {{"multiplier", 2}, {"originalTimeoutSec", timeoutSec}});
@@ -478,14 +482,65 @@ json BuildJobFailureCard(const json& job, const TriageInputs& in) {
     std::string rationaleKey = "noRecommendation";
     json rationaleParams = json::object();
     bool needsHuman = false;
-    if (failureClass == "timeout" || attemptReason == "timed_out") {
+
+    auto applyNextStepsRecommendation = [&](const std::string& defaultCandidate) {
+        const json nextSteps = Array(failure, "nextSteps");
+        if (!nextSteps.empty() && nextSteps[0].is_object()) {
+            const std::string act = String(nextSteps[0], "action");
+            const bool hasChange = nextSteps[0].contains("change") && nextSteps[0]["change"].is_object() && !nextSteps[0]["change"].empty();
+            if (act == "retry" && hasChange) {
+                candidateId = "retry_with_change";
+                recConfidence = "high";
+                needsHuman = true;
+            } else if (act == "retry") {
+                candidateId = "retry";
+                recConfidence = "high";
+            } else if (act == "fix_spec") {
+                candidateId = "fix_spec";
+                recConfidence = "high";
+            } else {
+                candidateId = "investigate";
+                recConfidence = "medium";
+            }
+        } else {
+            candidateId = defaultCandidate;
+            recConfidence = (defaultCandidate == "retry_with_change" || defaultCandidate == "retry" || defaultCandidate == "fix_spec") ? "high" : "medium";
+            if (candidateId == "retry_with_change") needsHuman = true;
+        }
+
+        const json likelyCauses = Array(failure, "likelyCauses");
+        std::string causeIds;
+        for (const auto& cause : likelyCauses) {
+            if (cause.is_object() && cause.contains("id") && cause["id"].is_string()) {
+                if (!causeIds.empty()) causeIds += ", ";
+                causeIds += cause["id"].get<std::string>();
+            }
+        }
+        if (!causeIds.empty()) {
+            rationale = "Likely causes: " + causeIds + ". Recommendation: " + candidateId + ".";
+            rationaleParams = {{"causes", causeIds}};
+        } else {
+            if (failureClass == "startup_hang") {
+                rationale = "The worker hung at startup; retry with change.";
+            } else if (failureClass == "idle_stall") {
+                rationale = "The worker stalled without activity; check causes or retry.";
+            } else {
+                rationale = "The job stopped making progress before the timeout; check causes or retry.";
+            }
+        }
+    };
+
+    if (failureClass == "startup_hang") {
+        applyNextStepsRecommendation("retry_with_change");
+        rationaleKey = "startupHang";
+    } else if (failureClass != "permission_denied" &&
+               (failureClass == "timeout" || attemptReason == "timed_out")) {
         if (pattern == "progressing") {
             candidateId = "retry_raise_timeout"; recConfidence = "high";
             rationale = "The job was still making progress near its timeout; retry with more time.";
             rationaleKey = "timeoutProgressing"; rationaleParams = {{"timeoutSec", timeoutSec}};
         } else if (pattern == "stalled") {
-            candidateId = "investigate"; recConfidence = "medium";
-            rationale = "The job had stopped making progress well before the timeout; investigate first.";
+            applyNextStepsRecommendation("investigate");
             rationaleKey = "timeoutStalled";
         } else if (pattern == "repeated") {
             rationale = "Consecutive attempts timed out; gather more information before retrying.";
@@ -496,9 +551,28 @@ json BuildJobFailureCard(const json& job, const TriageInputs& in) {
             rationaleKey = "timeoutUnknown";
         }
     } else if (failureClass == "idle_stall") {
-        candidateId = "investigate"; recConfidence = "medium";
-        rationale = "The job stalled without activity; investigate the cause first.";
+        applyNextStepsRecommendation("investigate");
         rationaleKey = "idleStall";
+    } else if (failureClass == "permission_denied") {
+        // 091-7: same three recommendations as the diagnostic (fix_spec / permit request /
+        // escalate). The first nextStep is fix_spec, so map it there without re-applying the
+        // generic retry-oriented next-step logic.
+        candidateId = "fix_spec";
+        recConfidence = "high";
+        needsHuman = true;
+        rationale = "The worker was denied access. Rewrite the instructions to stay inside the project, "
+                    "apply for a permit with `hancho-cli permit request`, or ask the user to approve it.";
+        rationaleKey = "permissionDenied";
+        const json steps = Array(failure, "nextSteps");
+        for (const auto& step : steps) {
+            if (step.is_object() && String(step, "action") == "permit_request") {
+                rationale += " Proposed permit: " + step.dump() + ".";
+                break;
+            }
+        }
+    } else if (String(failure, "suggestedAction") == "retry_with_change") {
+        applyNextStepsRecommendation("retry_with_change");
+        rationaleKey = "retryWithChange";
     } else if (String(failure, "suggestedAction") == "retry_after") {
         candidateId = "retry"; recConfidence = "high";
         rationale = "The failure is rate-limited; retry after " + String(failure, "retryAt", "the indicated delay") + ".";
@@ -533,7 +607,7 @@ json BuildJobFailureCard(const json& job, const TriageInputs& in) {
         recConfidence = "low";
     }
     if (String(failure, "suggestedAction") == "human" || failureClass == "auth_error" ||
-        failureClass == "cancelled") needsHuman = true;
+        failureClass == "cancelled" || candidateId == "retry_with_change") needsHuman = true;
     if (candidateId.empty() && rationale.empty()) rationale = "No recommendation is available.";
     AddItem(info["reason"], "recommendationRationale", {{"key", rationaleKey}, {"params", rationaleParams}},
             "recommendation: " + rationale);
@@ -620,7 +694,7 @@ std::string TriageTimeoutPattern(const nlohmann::json& job) {
     const json failure = FailureFor(job);
     const json attempts = Array(job, "attempts");
     const json last = LastAttempt(job);
-    if (FailureClass(failure) == "idle_stall") return "stalled";
+    if (FailureClass(failure) == "idle_stall" || FailureClass(failure) == "startup_hang") return "stalled";
     if (FailureClass(failure) != "timeout" && AttemptReason(last) != "timed_out") return "";
     if (attempts.size() >= 2 && TimedOut(attempts[attempts.size() - 2])) return "repeated";
     const json activity = Object(failure, "lastActivity");
@@ -686,7 +760,7 @@ nlohmann::json BuildTriageCandidates(const TriageInputs& in) {
                 const std::string state = String(candidate, "state");
                 if (String(candidate, "taskqueue") == String(job, "taskqueue") &&
                     String(candidate, "name").rfind(jobName, 0) == 0 && state != "succeeded" &&
-                    state != "failed" && state != "cancelled") ++affected;
+                    state != "failed" && state != "cancelled" && state != "takenOver") ++affected;
             }
             AddItem(info["conditions"], "recalibrateCount", affected,
                     "unfinished same-name jobs recalibrate would change: " + std::to_string(affected));
@@ -811,7 +885,7 @@ nlohmann::json BuildProcessTriageCandidates(const nlohmann::json& processes) {
         const std::string state = Lower(String(process, "state"));
         // "killed" means someone stopped the process on purpose (kill command, dashboard button,
         // closing a supervisor terminal); that needs no decision, so only Hancho-detected ends count.
-        if (state != "failed" && state != "timed_out" && state != "idle_timed_out") continue;
+        if (state != "failed" && state != "timed_out" && state != "idle_timed_out" && state != "startup_timed_out") continue;
         const std::string id = process.contains("id") && process["id"].is_string()
             ? process["id"].get<std::string>()
             : (process.contains("id") && process["id"].is_number()
@@ -1033,11 +1107,14 @@ bool TriageNeedsLlm(const nlohmann::json& card, const std::string& mode,
     }
     // Hancho cannot judge a plain process; in "uncertain" mode it is only sent to the LLM on request.
     if (String(card, "kind") == "process_failure") return false;
-    bool timedOut = currentClass == "timeout";
+    bool timedOut = currentClass == "timeout" || currentClass == "startup_hang" || currentClass == "idle_stall";
     for (const auto& item : Array(info, "reason")) {
-        if (item.is_object() && String(item, "k") == "attemptReason" && InfoValue(item) == "timed_out") timedOut = true;
+        if (item.is_object() && String(item, "k") == "attemptReason") {
+            const std::string r = InfoValue(item);
+            if (r == "timed_out" || r == "idle_timed_out" || r == "startup_timed_out") timedOut = true;
+        }
         const std::string text = InfoText(item);
-        if (text == "attempt reason: timed_out") timedOut = true;
+        if (text == "attempt reason: timed_out" || text == "attempt reason: idle_timed_out" || text == "attempt reason: startup_timed_out") timedOut = true;
     }
     const std::string pattern = String(flags, "timeoutPattern");
     if (timedOut && (pattern == "repeated" || pattern.empty())) return true;
@@ -1185,6 +1262,9 @@ json TriageOutcomeForJob(const json& card, const json& job, const std::string& c
     // A person closed the job (taskqueue close): it is finished, so it reports as cancelled.
     if (jobState == "closed")
         return {{"state", "cancelled"}, {"detail", "the job was closed"}};
+    // The supervisor took the job over: it is handled, never left in "awaiting decision".
+    if (jobState == "takenOver")
+        return {{"state", "succeeded"}, {"detail", "the job was taken over by the supervisor"}};
     if (jobState == "running" || jobState == "waiting" || jobState == "pending" || jobState == "blocked")
         return {{"state", "rerunning"}, {"detail", "attempt " + std::to_string(currentAttempt) + " " + jobState}};
     if (currentAttempt <= cardAttempt) {

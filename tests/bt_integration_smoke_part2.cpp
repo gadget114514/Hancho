@@ -379,6 +379,44 @@ void RunPart2IntegrationTests(const std::wstring& tempDirW, const std::string& t
               "BT failure.class/suggestedAction use the newest failure even when later events follow (got " +
                   waitResp.value("state", "") + ")");
     }
+
+    // 091-2: bt_get compact text and full tree render catch handlers and the selected handler.
+    {
+        TestHarness h;
+        json btDef = {
+            {"id", "bt-catch-display"},
+            {"cwd", tempDirUtf8},
+            {"root", {
+                {"type", "catch"}, {"id", "guard"},
+                {"child", {{"type", "fail"}, {"id", "impl"}, {"detail", "boom"}}},
+                {"handlers", json::array({
+                    {{"class", "*"}, {"do", {{"type", "set"}, {"id", "fix"},
+                                             {"var", "fixed"}, {"value", "1"}}}}
+                })},
+                {"otherwise", "fail"}
+            }}
+        };
+        json startResp = json::parse(h.btm->Start(btDef.dump()), nullptr, false);
+        Check(startResp.value("state", "") == "succeeded", "091-2: catch display BT completed");
+        json getResp = json::parse(h.btm->Get("bt-catch-display", false), nullptr, false);
+        std::string compact = getResp.value("compact", "");
+        Check(compact.find("catch guard") != std::string::npos &&
+              compact.find("handlers=1") != std::string::npos &&
+              compact.find("maxRetries=1") != std::string::npos &&
+              compact.find("handler[0]") != std::string::npos,
+              "091-2: bt_get compact shows catch handlers/maxRetries/selected handler");
+        Check(compact.find("do: set fix") != std::string::npos &&
+              compact.find("[failed] fail impl") != std::string::npos,
+              "091-2: bt_get compact shows do and child nodes");
+        json tree = getResp.value("tree", json::object());
+        json rootNode = tree.value("root", json::object());
+        Check(rootNode.value("type", "") == "catch" &&
+              rootNode.contains("handlers") && rootNode["handlers"].is_array() &&
+              rootNode["handlers"].size() == 1 &&
+              rootNode["handlers"][0].contains("do") &&
+              rootNode["handlers"][0]["do"].value("id", "") == "fix",
+              "091-2: bt_get tree keeps catch handlers with their do nodes");
+    }
 }
 
 } // namespace bt_int_test

@@ -136,6 +136,16 @@ void BehaviorTree::Impl::StartEscalateNode(BehaviorTree& bt, BtNode& node, int64
         logsObj[logNodeRef] = tail;
     }
 
+    // A failed node named in include.logs carries its taskqueue diagnosis with it. The
+    // supervisor needs the reason (not just the log tail) to decide how to answer.
+    json diagnosticsObj = json::object();
+    for (const std::string& logNodeRef : node.include.logs) {
+        const BtNode* ln = FindNodeConst(logNodeRef, bt.id_);
+        if (ln && ln->state == "failed" && ln->hasFailureDiagnostic) {
+            diagnosticsObj[logNodeRef] = ln->failureDiagnostic;
+        }
+    }
+
     json incVarsObj = json::object();
     for (const std::string& vn : node.include.vars) {
         std::string v;
@@ -167,6 +177,7 @@ void BehaviorTree::Impl::StartEscalateNode(BehaviorTree& bt, BtNode& node, int64
     pktJson["path"] = pathArr;
     pktJson["include"] = {
         {"logs", logsObj},
+        {"diagnostics", diagnosticsObj},
         {"vars", incVarsObj},
         {"files", filesObj}
     };
@@ -202,6 +213,13 @@ void BehaviorTree::Impl::StartEscalateNode(BehaviorTree& bt, BtNode& node, int64
         md << "## Included Logs\n";
         for (auto it = logsObj.begin(); it != logsObj.end(); ++it) {
             md << "### " << it.key() << "\n```\n" << it.value().get<std::string>() << "\n```\n\n";
+        }
+    }
+    if (!diagnosticsObj.empty()) {
+        md << "## Included Failure Diagnostics\n";
+        for (auto it = diagnosticsObj.begin(); it != diagnosticsObj.end(); ++it) {
+            md << "### " << it.key() << "\n```json\n"
+               << it.value().dump(2, ' ', false, json::error_handler_t::replace) << "\n```\n\n";
         }
     }
     if (!filesObj.empty()) {
@@ -240,15 +258,37 @@ void BehaviorTree::Impl::LaunchEscalateFallback(BehaviorTree& bt, BtNode& node, 
     wspec.nodeKey = node.nodeKey;
     wspec.run = node.runs;
     wspec.proposedJobId = proposedId;
-    wspec.engine = !node.fallback.engine.empty()
-        ? node.fallback.engine
-        : (!bt.workerDefaults_.engine.empty() ? bt.workerDefaults_.engine
-                                              : (bt.catalog_ ? bt.catalog_->DefaultEngine() : "agy"));
-    wspec.model = !node.fallback.model.empty()
-        ? node.fallback.model
-        : ((node.fallback.engine.empty() || node.fallback.engine == bt.workerDefaults_.engine)
-               ? bt.workerDefaults_.model
-               : "");
+    // 091-6: proxy answers come from approved `consult` rows, in rank order, skipping any
+    // engine already marked down. The authored fallback remains the compatibility default.
+    if (node.fallbackCandidates.empty()) {
+        std::vector<BtEngineChoice> usable;
+        if (bt.health_) {
+            for (const auto& c : bt.health_->Candidates("consult")) {
+                if (bt.health_->IsDown(c.first, c.second)) continue;
+                usable.push_back({c.first, c.second, "consult", "consult list"});
+            }
+        }
+        if (usable.empty()) {
+            const std::string e = !node.fallback.engine.empty()
+                ? node.fallback.engine
+                : (!bt.workerDefaults_.engine.empty() ? bt.workerDefaults_.engine
+                                                      : (bt.catalog_ ? bt.catalog_->DefaultEngine() : "agy"));
+            const std::string m = !node.fallback.model.empty()
+                ? node.fallback.model
+                : ((node.fallback.engine.empty() || node.fallback.engine == bt.workerDefaults_.engine)
+                       ? bt.workerDefaults_.model : "");
+            if (bt.health_ && bt.health_->IsDown(e, m)) return;  // all candidates down: keep waiting
+            usable.push_back({e, m, "", "authored fallback"});
+        }
+        node.fallbackCandidates = std::move(usable);
+        node.fallbackCandidateIndex = 0;
+    }
+    if (node.fallbackCandidateIndex >= node.fallbackCandidates.size()) return;
+    const BtEngineChoice& cand = node.fallbackCandidates[node.fallbackCandidateIndex];
+    wspec.engine = cand.engine;
+    wspec.model = cand.model;
+    node.lastEngine = cand.engine;
+    node.lastModel = cand.model;
     wspec.prompt = node.currentPacket.markdown;
     wspec.summary = "Fallback escalation for " + node.nodeKey;
     wspec.cwd = bt.cwd_;
@@ -284,7 +324,9 @@ bool BehaviorTree::Impl::ApplyEscalateAnswer(BehaviorTree& bt,
         err = "answer must not be empty";
         return false;
     }
-    if (!node.expect.empty()) {
+    // "takeover" is always a legal answer, even when expect does not list it (task 090-3).
+    const bool isTakeover = (answer == "takeover");
+    if (!isTakeover && !node.expect.empty()) {
         if (std::find(node.expect.begin(), node.expect.end(), answer) == node.expect.end()) {
             err = "answer '" + answer + "' is not in allowed expect list";
             return false;
@@ -305,6 +347,13 @@ bool BehaviorTree::Impl::ApplyEscalateAnswer(BehaviorTree& bt,
     node.rationale = rationale;
     node.state = "succeeded";
     node.detail.clear();
+    if (isTakeover) {
+        node.takenOver = true;
+        node.takeover = json::object();
+        node.takeover["by"] = "mcp";
+        node.takeover["reason"] = rationale;
+        node.takeover["at"] = GetCurrentTimestampStr();
+    }
 
     std::string ansVar = (!node.id.empty() ? node.id : node.nodeKey) + ".answer";
     bt.vars_[ansVar] = answer;

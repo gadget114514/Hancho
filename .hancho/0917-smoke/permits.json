@@ -1,0 +1,108 @@
+{
+  "history": [
+    {
+      "action": "request",
+      "at": "2026-11-20 06:32:07",
+      "by": "cli",
+      "entry": {
+        "approvedAt": "",
+        "approvedVia": "",
+        "engines": [
+          "opencode"
+        ],
+        "id": "read_path|global|%TEMP%/pc_*/**",
+        "kind": "read_path",
+        "note": "test artifact directory",
+        "scope": "global",
+        "status": "proposed",
+        "target": "%TEMP%/pc_*/**",
+        "userSaid": ""
+      },
+      "reason": "test artifact directory"
+    },
+    {
+      "action": "approve",
+      "at": "2026-11-20 06:32:07",
+      "by": "chat",
+      "entry": {
+        "approvedAt": "2026-11-20 06:32:07",
+        "approvedVia": "chat",
+        "engines": [
+          "opencode"
+        ],
+        "id": "read_path|global|%TEMP%/pc_*/**",
+        "kind": "read_path",
+        "note": "test artifact directory",
+        "scope": "global",
+        "status": "approved",
+        "target": "%TEMP%/pc_*/**",
+        "userSaid": "yes, allow reading test artifacts"
+      },
+      "reason": "yes, allow reading test artifacts"
+    },
+    {
+      "action": "request",
+      "at": "2026-11-20 06:32:07",
+      "by": "cli",
+      "entry": {
+        "approvedAt": "",
+        "approvedVia": "",
+        "engines": [],
+        "id": "command|global|git status *",
+        "kind": "command",
+        "note": "diagnostics",
+        "scope": "global",
+        "status": "proposed",
+        "target": "git status *",
+        "userSaid": ""
+      },
+      "reason": "diagnostics"
+    },
+    {
+      "action": "approve",
+      "at": "2026-11-20 06:32:07",
+      "by": "dashboard",
+      "entry": {
+        "approvedAt": "2026-11-20 06:32:07",
+        "approvedVia": "dashboard",
+        "engines": [],
+        "id": "command|global|git status *",
+        "kind": "command",
+        "note": "diagnostics",
+        "scope": "global",
+        "status": "approved",
+        "target": "git status *",
+        "userSaid": ""
+      },
+      "reason": "approved from dashboard"
+    }
+  ],
+  "permits": [
+    {
+      "approvedAt": "2026-11-20 06:32:07",
+      "approvedVia": "chat",
+      "engines": [
+        "opencode"
+      ],
+      "id": "read_path|global|%TEMP%/pc_*/**",
+      "kind": "read_path",
+      "note": "test artifact directory",
+      "scope": "global",
+      "status": "approved",
+      "target": "%TEMP%/pc_*/**",
+      "userSaid": "yes, allow reading test artifacts"
+    },
+    {
+      "approvedAt": "2026-11-20 06:32:07",
+      "approvedVia": "dashboard",
+      "engines": [],
+      "id": "command|global|git status *",
+      "kind": "command",
+      "note": "diagnostics",
+      "scope": "global",
+      "status": "approved",
+      "target": "git status *",
+      "userSaid": ""
+    }
+  ]
+}

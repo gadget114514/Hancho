@@ -145,6 +145,7 @@ int ProcessManager::StartProcess(const StartProcessRequest& req, std::string& ou
     proc->timeoutSec = req.timeoutSec;
     proc->idleTimeoutSec = req.idleTimeoutSec;
     proc->idleCpuSec = req.idleCpuSec;
+    proc->idleFirstEventSec = req.idleFirstEventSec;
     proc->jobKey = req.jobKey;
     proc->jobId = req.jobId;
     proc->attemptN = req.attemptN;
@@ -188,7 +189,7 @@ int ProcessManager::StartProcess(const StartProcessRequest& req, std::string& ou
         detectedAgent = DetectAgentType(proc->commandLine, proc->name);
     }
     proc->agentType = detectedAgent;
-    proc->jsonStream = req.jsonStream || !detectedAgent.empty();
+    proc->jsonStream = req.jsonStream || !detectedAgent.empty() || (proc->idleFirstEventSec > 0);
     proc->supervisorNotes = req.supervisorNotes;
     proc->supervisorGoal = req.supervisorGoal;
 
@@ -319,6 +320,14 @@ int ProcessManager::StartProcess(const StartProcessRequest& req, std::string& ou
         std::wstring streamPathW = logsDirW + L"/proc_" + Utf8ToWide(std::to_string(proc->id)) +
                                    L"_" + Utf8ToWide(safeName) + L"_stream.jsonl";
         proc->streamTracker = std::make_unique<LlmStreamTracker>();
+        std::weak_ptr<ManagedProcess> weakProc = proc;
+        proc->streamTracker->SetOnNormalizedEventCallback([weakProc]() {
+            auto sp = weakProc.lock();
+            if (sp) {
+                sp->firstEventReceived.store(true);
+                sp->lastOutputTickMs = GetNowTickMs();
+            }
+        });
         proc->streamTracker->Init(proc->id, proc->agentType, WideToUtf8(streamPathW),
                                   proc->supervisorNotes, proc->supervisorGoal, "",
                                   proc->jobId > 0 ? std::to_string(proc->jobId) : std::string(),
@@ -380,7 +389,9 @@ void ProcessManager::ReaderThreadFunc(std::shared_ptr<ManagedProcess> proc) {
         }
         if (n <= 0) break;
 
-        proc->lastOutputTickMs = GetNowTickMs();
+        if (!proc->jsonStream) {
+            proc->lastOutputTickMs = GetNowTickMs();
+        }
         std::string chunk(buffer, static_cast<size_t>(n));
         std::string cleanChunk = StripAnsiCodes(chunk);
         std::wstring logPathW;
@@ -494,6 +505,19 @@ void ProcessManager::MonitorThreadFunc() {
                 UpdateJobMetrics(*proc);
             }
 
+            if (proc->idleFirstEventSec > 0 && !proc->firstEventReceived.load()) {
+                uint64_t activeMs = (now >= proc->startTickMs) ? (now - proc->startTickMs) : 0;
+                const uint64_t pausedMs = proc->suspendedTotalMs.load();
+                if (activeMs > pausedMs) activeMs -= pausedMs; else activeMs = 0;
+                uint64_t elapsedSec = activeMs / 1000;
+                if (elapsedSec >= static_cast<uint64_t>(proc->idleFirstEventSec)) {
+                    TerminateJobInternal(*proc, ProcState::StartupTimedOut,
+                        "Process tree terminated: Exceeded first event timeout (" + std::to_string(proc->idleFirstEventSec) + "s without any normalized event)");
+                    SaveState();
+                    continue;
+                }
+            }
+
             if (proc->timeoutSec > 0 && (now - proc->startTickMs) / 1000 >= static_cast<uint64_t>(proc->timeoutSec)) {
                 TerminateJobInternal(*proc, ProcState::TimedOut,
                     "Process tree terminated: Exceeded runtime timeout (" + std::to_string(proc->timeoutSec) + "s)");
@@ -567,6 +591,13 @@ bool ProcessManager::SendInput(int id, const std::string& text, bool appendNewli
 
 void ProcessManager::TerminateJobInternal(ManagedProcess& proc, ProcState finalState,
                                           const std::string& reasonMsg) {
+    if (finalState == ProcState::TimedOut || finalState == ProcState::IdleTimedOut || finalState == ProcState::StartupTimedOut) {
+        if (proc.tree) {
+            try {
+                proc.processTreeSnapshot = proc.tree->SnapshotProcesses();
+            } catch (...) {}
+        }
+    }
     if (proc.tree) proc.tree->Kill(1);
     else if (proc.rootPid > 0) ::kill(-static_cast<pid_t>(proc.rootPid), SIGKILL);
     if (proc.stdinFd >= 0) {
@@ -731,6 +762,8 @@ ProcessSnapshot ProcessManager::BuildSnapshot(ManagedProcess& p, uint64_t now) {
     }
     snap.timeoutSec = p.timeoutSec;
     snap.idleTimeoutSec = p.idleTimeoutSec;
+    snap.idleFirstEventSec = p.idleFirstEventSec;
+    snap.processTreeSnapshot = p.processTreeSnapshot;
     snap.treeProcessCount = p.treeProcessCount.load();
     snap.treeMemoryBytes = p.treeMemoryBytes.load();
     snap.terminalHwnd = nullptr;

@@ -502,8 +502,10 @@
     if (s === 'pending' || s === 'queued' || s === 'waiting' || s === 'planned') return 'badge badge-planned';
     if (s === 'blocked') return 'badge badge-blocked';
     if (s === 'completed' || s === 'succeeded') return 'badge badge-completed';
-    if (s === 'failed' || s === 'timed_out' || s === 'idle_timed_out') return 'badge badge-failed';
+    if (s === 'failed' || s === 'timed_out' || s === 'idle_timed_out' || s === 'startup_timed_out') return 'badge badge-failed';
     if (s === 'cancelled' || s === 'killed') return 'badge badge-cancelled';
+    if (s === 'takenover') return 'badge badge-taken-over';
+    if (s === 'waitingforpermit') return 'badge badge-blocked';
     return 'badge';
   }
 
@@ -518,7 +520,7 @@
       const st = (p.state || '').toLowerCase();
       if (filter !== 'all') {
         if (filter === 'completed' && st !== 'completed' && st !== 'finished') return false;
-        if (filter === 'failed' && st !== 'failed' && st !== 'timed_out' && st !== 'idle_timed_out') return false;
+        if (filter === 'failed' && st !== 'failed' && st !== 'timed_out' && st !== 'idle_timed_out' && st !== 'startup_timed_out') return false;
         if (filter === 'running' && st !== 'running') return false;
       }
       if (q) {
@@ -660,7 +662,7 @@
       const st = (job.state || '').toLowerCase();
       if (filter !== 'all') {
         if (filter === 'succeeded' && st !== 'succeeded' && st !== 'completed') return false;
-        if (filter === 'failed' && st !== 'failed' && st !== 'timed_out' && st !== 'idle_timed_out') return false;
+        if (filter === 'failed' && st !== 'failed' && st !== 'timed_out' && st !== 'idle_timed_out' && st !== 'startup_timed_out') return false;
         if (filter === 'pending' && st !== 'pending' && st !== 'queued' && st !== 'waiting' && st !== 'planned') return false;
         if (filter === 'running' && st !== 'running') return false;
         if (filter === 'cancelled' && st !== 'cancelled' && st !== 'killed') return false;
@@ -974,7 +976,7 @@
   function checkFailuresFromJobs() {
     const failedJobs = state.jobs.filter(j => {
       const s = (j.state || '').toLowerCase();
-      return s === 'failed' || s === 'timed_out' || s === 'idle_timed_out';
+      return s === 'failed' || s === 'timed_out' || s === 'idle_timed_out' || s === 'startup_timed_out';
     });
 
     elBadgeFailCount.textContent = failedJobs.length;
@@ -1012,7 +1014,7 @@
     const q = state.diagSearch.toLowerCase().trim();
     const failedJobs = state.jobs.filter(j => {
       const s = (j.state || '').toLowerCase();
-      return s === 'failed' || s === 'timed_out' || s === 'idle_timed_out';
+      return s === 'failed' || s === 'timed_out' || s === 'idle_timed_out' || s === 'startup_timed_out';
     });
 
     if (failedJobs.length === 0) {

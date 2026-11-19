@@ -1,0 +1,40 @@
+{
+  "history": [
+    {
+      "action": "request",
+      "at": "2026-11-20 06:16:00",
+      "by": "cli",
+      "entry": {
+        "approvedAt": "",
+        "approvedVia": "",
+        "engines": [
+          "claude"
+        ],
+        "id": "command|global|git status *",
+        "kind": "command",
+        "note": "eng-test",
+        "scope": "global",
+        "status": "proposed",
+        "target": "git status *",
+        "userSaid": ""
+      },
+      "reason": "eng-test"
+    }
+  ],
+  "permits": [
+    {
+      "approvedAt": "",
+      "approvedVia": "",
+      "engines": [
+        "claude"
+      ],
+      "id": "command|global|git status *",
+      "kind": "command",
+      "note": "eng-test",
+      "scope": "global",
+      "status": "proposed",
+      "target": "git status *",
+      "userSaid": ""
+    }
+  ]
+}

@@ -169,6 +169,43 @@ void RunPart2Tests(const std::string& tempDirUtf8, const std::wstring& tempDirW)
               "fallback worker result file applied like Resume");
     }
 
+    // 7b. Escalate answer "takeover" is accepted even without expect, and is recorded.
+    {
+        std::string takeoverBt = R"({
+            "id": "takeover-test",
+            "cwd": ")" + JsonEscape(tempDirUtf8) + R"(",
+            "root": {
+                "type": "sequence",
+                "children": [
+                    { "type": "escalate", "id": "ask", "question": "Delegate again?",
+                      "expect": ["approve", "reject"] }
+                ]
+            }
+        })";
+
+        FakeJobRunner runner;
+        BehaviorTree bt;
+        std::string err;
+        Check(bt.LoadDefinition(takeoverBt, &catalog, err), "load takeover BT: " + err);
+        bt.SetJobRunner(&runner);
+        bt.Start(1000);
+        Check(bt.State() == "waitingForLlm", "takeover BT reaches waitingForLlm");
+
+        bool okTakeover = bt.Resume("ask", "takeover", "I will implement this myself", {}, 2000, err);
+        Check(okTakeover && err.empty(), "takeover answer accepted without being in expect: " + err);
+        Check(bt.NodeState("ask") == "succeeded", "escalate node itself is succeeded after takeover");
+        Check(bt.State() == "succeeded", "takeover BT succeeded after answering takeover");
+        std::string stateJson = bt.ToStateJson();
+        std::string noWs;
+        for (char c : stateJson) {
+            if (c != ' ' && c != '\n' && c != '\r' && c != '\t') noWs.push_back(c);
+        }
+        Check(noWs.find("\"takenOver\":true") != std::string::npos &&
+              noWs.find("\"takeover\":{") != std::string::npos &&
+              stateJson.find("I will implement this myself") != std::string::npos,
+              "BT state records takenOver and the takeover rationale");
+    }
+
     // 8. Limits (maxNodeRuns) and validation errors (missing max, duplicate id, depth, subtree)
     {
         std::string limBt = R"({
@@ -326,6 +363,422 @@ void RunPart2Tests(const std::string& tempDirUtf8, const std::wstring& tempDirW)
         BtDebugNode sampleDbg;
         Check(ParseBtDebugTree(sampleBt.ToStateJson(), sampleDbg, dbgErr) && sampleDbg.state == "succeeded",
               "resumed feature-x.json ToStateJson loads in ParseBtDebugTree");
+    }
+
+    // 091-2: catch node and tree-level defaults.
+    const std::string diagHang = R"({"class":"startup_hang","confidence":"high",)"
+        R"("summary":"no events","suggestedAction":"retry_with_change","retryAt":null,)"
+        R"("likelyCauses":[{"id":"no_model","why":"no --model"}]})";
+    const std::string diagRate = R"({"class":"rate_limited","summary":"quota","likelyCauses":[]})";
+
+    // (1) handler match, selected-handler detail, thenRetry and maxRetries -> otherwise node.
+    {
+        const std::string def = R"({"id":"catch-match","root":{"type":"catch","id":"guard","maxRetries":1,)"
+            R"("child":{"type":"job","id":"impl","summary":"impl","command":"c","timeoutSec":60},)"
+            R"("handlers":[)"
+            R"({"class":["startup_hang","idle_stall"],"cause":"no_model",)"
+            R"("do":{"type":"set","id":"fix","var":"fixed","value":"yes"},"thenRetry":true},)"
+            R"({"class":["rate_limited"],"do":{"type":"wait","id":"backoff","sec":0}}],)"
+            R"("otherwise":{"type":"fail","id":"otherwise","detail":"no handler"}}})";
+        FakeJobRunner runner;
+        BehaviorTree bt;
+        std::string err;
+        Check(bt.LoadDefinition(def, &catalog, err), "091-2: load catch-match BT: " + err);
+        bt.SetJobRunner(&runner);
+        bt.Start(1000);
+        Check(bt.NodeState("impl") == "running" && runner.startedJobs.size() == 1, "091-2: catch starts child");
+        bt.OnJobFinished("catch-match-impl-1", false, -1, "", "", 1100, "", "", "hang", diagHang);
+        Check(bt.NodeState("fix") == "succeeded" && bt.GetVar("fixed") == "yes", "091-2: matching handler's do ran");
+        Check(runner.startedJobs.size() == 2 && bt.NodeState("impl") == "running",
+              "091-2: thenRetry re-ran child");
+        Check(bt.NodeDetail("guard").find("handler[0]") != std::string::npos &&
+              bt.NodeDetail("guard").find("no_model") != std::string::npos,
+              "091-2: selected handler recorded in running node state: " + bt.NodeDetail("guard"));
+
+        bt.OnJobFinished("catch-match-impl-2", false, -1, "", "", 1200, "", "", "hang2", diagHang);
+        Check(bt.NodeState("otherwise") == "failed" && bt.NodeState("guard") == "failed",
+              "091-2: maxRetries exceeded runs otherwise and fails catch");
+        bool detailInEvent = false;
+        for (const auto& e : bt.Events()) {
+            if (e.type == "nodeFinished" && e.nodeKey == "guard" &&
+                e.detail.find("handler[0]") != std::string::npos) detailInEvent = true;
+        }
+        Check(detailInEvent, "091-2: nodeFinished detail carries selected handler");
+        Check(bt.NodeDetail("guard").find("no handler") != std::string::npos,
+              "091-2: otherwise failure detail kept: " + bt.NodeDetail("guard"));
+
+        BtDebugNode dbg;
+        std::string dbgErr;
+        Check(ParseBtDebugTree(bt.ToStateJson(), dbg, dbgErr), "091-2: catch state parses in debug view: " + dbgErr);
+        bool foundGuard = false, foundDo = false, foundOtherwise = false;
+        auto walk = [&](auto&& self, const BtDebugNode& n) -> void {
+            if (n.nodeId == "guard") {
+                foundGuard = n.label.find("handlers=2") != std::string::npos &&
+                             n.label.find("maxRetries=1") != std::string::npos &&
+                             n.label.find("handler[0]") != std::string::npos;
+            }
+            if (n.nodeId == "fix") foundDo = (n.role == "do");
+            if (n.nodeId == "otherwise") foundOtherwise = true;
+            for (const auto& c : n.children) self(self, c);
+        };
+        walk(walk, dbg);
+        Check(foundGuard, "091-2: debug view label shows catch handlers/maxRetries/selected handler");
+        Check(foundDo && foundOtherwise, "091-2: debug view shows do and otherwise child slots");
+    }
+
+    // (2) child success; no match with default otherwise; "*" wildcard; do failure.
+    {
+        auto makeCatch = [](const std::string& id, const std::string& handlers, const std::string& otherwise) {
+            return std::string("{\"id\":\"") + id + R"(","root":{"type":"catch","id":"guard",)"
+                R"("child":{"type":"job","id":"impl","summary":"impl","command":"c","timeoutSec":60},)"
+                R"("handlers":)" + handlers + R"(,"otherwise":)" + otherwise + "}}";
+        };
+        {
+            FakeJobRunner runner;
+            BehaviorTree bt;
+            std::string err;
+            Check(bt.LoadDefinition(makeCatch("catch-ok", R"([{"class":"startup_hang","do":{"type":"succeed"}}])", R"("fail")"), &catalog, err),
+                  "091-2: load catch-ok BT: " + err);
+            bt.SetJobRunner(&runner);
+            bt.Start(1000);
+            bt.OnJobFinished("catch-ok-impl-1", true, 0, "", "", 1100);
+            Check(bt.State() == "succeeded" && bt.NodeState("guard") == "succeeded" &&
+                  bt.NodeDetail("guard").empty(), "091-2: child success makes catch succeed");
+        }
+        {
+            FakeJobRunner runner;
+            BehaviorTree bt;
+            std::string err;
+            Check(bt.LoadDefinition(makeCatch("catch-nomatch",
+                  R"([{"class":"startup_hang","do":{"type":"succeed"}}])", R"("fail")"), &catalog, err),
+                  "091-2: load catch-nomatch BT: " + err);
+            bt.SetJobRunner(&runner);
+            bt.Start(1000);
+            bt.OnJobFinished("catch-nomatch-impl-1", false, 1, "", "", 1100, "", "", "boom", diagRate);
+            Check(bt.NodeState("guard") == "failed" && bt.NodeDetail("guard") == "boom",
+                  "091-2: no handler match with default otherwise fails with child detail");
+        }
+        {
+            FakeJobRunner runner;
+            BehaviorTree bt;
+            std::string err;
+            Check(bt.LoadDefinition(makeCatch("catch-star",
+                  R"([{"class":"*","cause":"*none","do":{"type":"set","var":"star","value":"x"}},)"
+                  R"({"class":"*","do":{"type":"set","var":"star","value":"ok"}}])", R"("fail")"), &catalog, err),
+                  "091-2: load catch-star BT: " + err);
+            bt.SetJobRunner(&runner);
+            bt.Start(1000);
+            bt.OnJobFinished("catch-star-impl-1", false, 1, "", "", 1100, "", "", "boom", diagRate);
+            Check(bt.NodeState("guard") == "succeeded" && bt.GetVar("star") == "ok",
+                  "091-2: '*' matches any failure and falls through to the next handler when cause misses");
+        }
+        {
+            FakeJobRunner runner;
+            BehaviorTree bt;
+            std::string err;
+            Check(bt.LoadDefinition(makeCatch("catch-dofail",
+                  R"([{"class":"*","do":{"type":"fail","detail":"do broke"}}])", R"("fail")"), &catalog, err),
+                  "091-2: load catch-dofail BT: " + err);
+            bt.SetJobRunner(&runner);
+            bt.Start(1000);
+            bt.OnJobFinished("catch-dofail-impl-1", false, 1, "", "", 1100, "", "", "boom", diagRate);
+            Check(bt.NodeState("guard") == "failed" &&
+                  bt.NodeDetail("guard").find("do failed: do broke") != std::string::npos,
+                  "091-2: failing do fails the catch: " + bt.NodeDetail("guard"));
+        }
+    }
+
+    // (2b) a composite child reports the last failed job/worker leaf's diagnosis.
+    {
+        const std::string def = R"({"id":"catch-composite","root":{"type":"catch","id":"guard",)"
+            R"("child":{"type":"fallback","children":[)"
+            R"({"type":"job","id":"first","summary":"first","command":"a","timeoutSec":60},)"
+            R"({"type":"job","id":"last","summary":"last","command":"b","timeoutSec":60}]},)"
+            R"("handlers":[{"class":"startup_hang","cause":"no_model",)"
+            R"("do":{"type":"set","var":"matched","value":"last"}}],"otherwise":"fail"}})";
+        FakeJobRunner runner;
+        BehaviorTree bt;
+        std::string err;
+        Check(bt.LoadDefinition(def, &catalog, err), "091-2: load catch-composite BT: " + err);
+        bt.SetJobRunner(&runner);
+        bt.Start(1000);
+        bt.OnJobFinished("catch-composite-first-1", false, 1, "", "", 1100, "", "", "boom", diagRate);
+        Check(bt.NodeState("last") == "running", "091-2: fallback moved to the second job");
+        bt.OnJobFinished("catch-composite-last-1", false, 1, "", "", 1200, "", "", "hang", diagHang);
+        Check(bt.GetVar("matched") == "last" && bt.NodeState("guard") == "succeeded",
+              "091-2: catch matches the last failed leaf's diagnosis under a composite child");
+    }
+
+    // (3) validation errors.
+    {
+        auto invalid = [&](const std::string& label, const std::string& def, const std::string& needle) {
+            std::vector<std::string> errs;
+            bool ok = BehaviorTree::ValidateJson(def, &catalog, errs);
+            bool found = false;
+            for (const auto& e : errs) if (e.find(needle) != std::string::npos) found = true;
+            Check(!ok && found, label);
+        };
+        std::string base = R"({"id":"catch-bad","root":{"type":"catch",)"
+            R"("child":{"type":"succeed"},"handlers":%s,"otherwise":%s}})" ;
+        auto fmt = [&](const std::string& handlers, const std::string& otherwise) {
+            std::string s = base;
+            s.replace(s.find("%s"), 2, handlers);
+            s.replace(s.find("%s"), 2, otherwise);
+            return s;
+        };
+        invalid("091-2: empty handlers rejected", fmt(R"([])", R"("fail")"), "handlers");
+        invalid("091-2: handler without do rejected", fmt(R"([{"class":"*"}] )", R"("fail")"), "'do'");
+        invalid("091-2: maxRetries above 10 rejected",
+                R"({"id":"catch-bad","root":{"type":"catch","child":{"type":"succeed"},)"
+                R"("handlers":[{"class":"*","do":{"type":"succeed"}}],"maxRetries":11}})",
+                "maxRetries");
+        invalid("091-2: unknown otherwise string rejected",
+                fmt(R"([{"class":"*","do":{"type":"succeed"}}])", R"("escalate")"), "otherwise");
+    }
+
+    // (4) state save/resume mid-handler and bt_retry --from a node inside the catch.
+    {
+        const std::string def = R"({"id":"catch-state","root":{"type":"catch","id":"guard",)"
+            R"("child":{"type":"job","id":"impl","summary":"impl","command":"c","timeoutSec":60},)"
+            R"("handlers":[{"class":"startup_hang",)"
+            R"("do":{"type":"job","id":"fix","summary":"fix","command":"fix","timeoutSec":60},)"
+            R"("thenRetry":true}],"otherwise":"fail"}})";
+        FakeJobRunner runner;
+        BehaviorTree bt;
+        std::string err;
+        Check(bt.LoadDefinition(def, &catalog, err), "091-2: load catch-state BT: " + err);
+        bt.SetJobRunner(&runner);
+        bt.Start(1000);
+        bt.OnJobFinished("catch-state-impl-1", false, -1, "", "", 1100, "", "", "hang", diagHang);
+        Check(bt.NodeState("fix") == "running" && runner.startedJobs.size() == 2,
+              "091-2: handler do job is running");
+        std::string saved = bt.ToStateJson();
+        BehaviorTree restored;
+        Check(restored.LoadFromStateJson(saved, &catalog, 1200, err), "091-2: catch state reloads: " + err);
+        restored.SetJobRunner(&runner);
+        Check(restored.NodeState("guard") == "running" && restored.NodeState("fix") == "running",
+              "091-2: catch phase and do job restored");
+        restored.OnJobFinished("catch-state-fix-1", false, 1, "", "", 1300, "", "", "do failed", R"({"class":"auth_error"})");
+        Check(restored.NodeState("guard") == "failed", "091-2: do failure after reload fails catch");
+        std::string retryErr;
+        Check(restored.Retry("fix", false, 1400, retryErr), "091-2: bt_retry from handler node: " + retryErr);
+        Check(restored.NodeState("guard") == "running" && restored.NodeState("fix") == "running" &&
+              runner.startedJobs.back().proposedJobId == "catch-state-fix-2",
+              "091-2: retry from do node re-runs the handler");
+        restored.OnJobFinished("catch-state-fix-2", true, 0, "", "", 1500, "", "", "");
+        Check(restored.NodeState("impl") == "running" &&
+              runner.startedJobs.back().proposedJobId == "catch-state-impl-2",
+              "091-2: successful do after retry re-runs the child");
+        restored.OnJobFinished("catch-state-impl-2", true, 0, "", "", 1600);
+        Check(restored.State() == "succeeded" &&
+              restored.NodeDetail("guard").find("handler[0]") != std::string::npos,
+              "091-2: catch succeeds after resumed retry with handler detail");
+    }
+
+    // (5) pendingEstimateSec / PlannedTasks follow the catch's current phase.
+    {
+        const std::string def = R"({"id":"catch-est","root":{"type":"catch",)"
+            R"("child":{"type":"job","id":"impl","summary":"impl","command":"c","timeoutSec":100},)"
+            R"("handlers":[{"class":"*","thenRetry":true,)"
+            R"("do":{"type":"job","id":"fix","summary":"fix","command":"fix","timeoutSec":50}}],)"
+            R"("otherwise":"fail","maxRetries":2}})";
+        FakeJobRunner runner;
+        BehaviorTree bt;
+        std::string err;
+        Check(bt.LoadDefinition(def, &catalog, err), "091-2: load catch-est BT: " + err);
+        bt.SetJobRunner(&runner);
+        bt.Start(1000);
+        Check(bt.PendingEstimateSec() == 300 && bt.PlannedTasks().empty(),
+              "091-2: catch with running child estimates future retries only: " +
+                  std::to_string(bt.PendingEstimateSec()));
+        bt.OnJobFinished("catch-est-impl-1", false, 1, "", "", 1100, "", "", "boom", diagRate);
+        Check(bt.NodeState("fix") == "running" && bt.PendingEstimateSec() == 300,
+              "091-2: catch estimate counts running do plus future child retries: " +
+                  std::to_string(bt.PendingEstimateSec()));
+    }
+
+    // (6) tree-level defaults: explicit values win, including explicit 0.
+    {
+        const std::string def = R"({"id":"defaults-test",)"
+            R"("worker":{"engine":"claude","model":"sonnet"},)"
+            R"("defaults":{"worker":{"idle":{"firstEventSec":180,"outputSec":600},"maxAttempts":2,"probe":true},)"
+            R"("job":{"idle":{"outputSec":900}}},)"
+            R"("root":{"type":"sequence","children":[)"
+            R"({"type":"worker","id":"w1","summary":"w1","prompt":"p","timeoutSec":60},)"
+            R"({"type":"worker","id":"w2","summary":"w2","prompt":"p","timeoutSec":60,"idle":0,"maxAttempts":1},)"
+            R"({"type":"job","id":"j1","summary":"j1","command":"build.exe","timeoutSec":60},)"
+            R"({"type":"job","id":"j2","summary":"j2","command":"ww-run --task x","timeoutSec":60},)"
+            R"({"type":"job","id":"j3","summary":"j3","command":"claude -p hi","timeoutSec":60},)"
+            R"({"type":"job","id":"j4","summary":"j4","command":"build.exe","timeoutSec":60,)"
+            R"("idle":{"outputSec":0,"cpuSec":0,"firstEventSec":0},"maxAttempts":4}]}})";
+        FakeJobRunner runner;
+        BehaviorTree bt;
+        std::string err;
+        Check(bt.LoadDefinition(def, &catalog, err), "091-2: load defaults BT: " + err);
+        Check(bt.Defaults().hasWorkerIdle() && bt.Defaults().hasJobIdle() &&
+              bt.Defaults().workerMaxAttempts == 2 && bt.Defaults().workerProbe &&
+              bt.Defaults().hasWorkerProbe, "091-2: defaults parsed and stored");
+        bt.SetJobRunner(&runner);
+        bt.Start(1000);
+        auto finish = [&](const std::string& id, int64_t t) {
+            std::string jid = "defaults-test-" + id + "-1";
+            if (id[0] == 'w') bt.OnJobFinished(jid, true, 0, "", "", t, "ok", "{}");
+            else bt.OnJobFinished(jid, true, 0, "", "", t);
+        };
+        finish("w1", 1100);
+        Check(runner.startedWorkers[0].idle.firstEventSec == 180 &&
+              runner.startedWorkers[0].idle.outputSec == 600 &&
+              runner.startedWorkers[0].idle.configured &&
+              runner.startedWorkers[0].maxAttempts == 2,
+              "091-2: worker node gets worker idle and maxAttempts defaults");
+        finish("w2", 1200);
+        Check(runner.startedWorkers.size() == 2 &&
+              runner.startedWorkers[1].idle.outputSec == 0 &&
+              runner.startedWorkers[1].idle.firstEventSec == 0 &&
+              runner.startedWorkers[1].idle.configured &&
+              runner.startedWorkers[1].maxAttempts == 1,
+              "091-2: explicit idle:0 and maxAttempts on a worker are respected");
+        finish("j1", 1300);
+        Check(runner.startedJobs[0].idle.outputSec == 900 && runner.startedJobs[0].maxAttempts == 1,
+              "091-2: plain job gets defaults.job.idle, not worker defaults");
+        finish("j2", 1400);
+        Check(runner.startedJobs[1].idle.firstEventSec == 180 &&
+              runner.startedJobs[1].idle.outputSec == 600 && runner.startedJobs[1].maxAttempts == 2,
+              "091-2: ww-run job gets worker defaults");
+        finish("j3", 1500);
+        Check(runner.startedJobs[2].idle.firstEventSec == 180 && runner.startedJobs[2].maxAttempts == 2,
+              "091-2: known LLM CLI job gets worker defaults");
+        finish("j4", 1600);
+        Check(runner.startedJobs[3].idle.outputSec == 0 && runner.startedJobs[3].maxAttempts == 4,
+              "091-2: explicit job idle/maxAttempts win over defaults");
+        Check(bt.State() == "succeeded", "091-2: defaults BT completed");
+
+        std::string saved = bt.ToStateJson();
+        Check(saved.find("\"defaults\"") != std::string::npos &&
+              saved.find("\"probe\": true") != std::string::npos,
+              "091-2: defaults persisted in state JSON");
+        BehaviorTree restored;
+        Check(restored.LoadFromStateJson(saved, &catalog, 1700, err) &&
+              restored.Defaults().workerProbe && restored.Defaults().workerMaxAttempts == 2,
+              "091-2: defaults survive state reload");
+    }
+
+    // (7) defaults validation errors.
+    {
+        auto invalidDefaults = [&](const std::string& label, const std::string& def, const std::string& needle) {
+            std::vector<std::string> errs;
+            bool ok = BehaviorTree::ValidateJson(def, &catalog, errs);
+            bool found = false;
+            for (const auto& e : errs) if (e.find(needle) != std::string::npos) found = true;
+            Check(!ok && found, label);
+        };
+        std::string head = R"({"id":"defaults-bad","defaults":)";
+        std::string tail = R"(,"root":{"type":"succeed"}})";
+        invalidDefaults("091-2: bad defaults.worker.idle rejected", head + R"({"worker":{"idle":42}})" + tail, "idle");
+        invalidDefaults("091-2: bad defaults.worker.maxAttempts rejected",
+                        head + R"({"worker":{"maxAttempts":0}})" + tail, "maxAttempts");
+        invalidDefaults("091-2: bad defaults.worker.probe rejected",
+                        head + R"({"worker":{"probe":"yes"}})" + tail, "probe");
+    }
+
+    // 092: bt retry --from must discard later siblings, including a stale escalate answer.
+    {
+        const std::string def = R"({"id":"bt-retry-siblings","cwd":")" + JsonEscape(tempDirUtf8) + R"(",)"
+            R"("root":{"type":"fallback","children":[)"
+            R"({"type":"sequence","id":"do","children":[)"
+            R"({"type":"job","id":"a","summary":"a","command":"a","timeoutSec":60},)"
+            R"({"type":"job","id":"b","summary":"b","command":"b","timeoutSec":60},)"
+            R"({"type":"job","id":"c","summary":"c","command":"c","timeoutSec":60}]},)"
+            R"({"type":"sequence","id":"alt","children":[)"
+            R"({"type":"escalate","id":"gate","question":"Continue?","expect":["continue","stop"]},)"
+            R"({"type":"if","id":"check",)"
+            R"("cond":{"type":"var","name":"gate.answer","eq":"continue"},)"
+            R"("then":{"type":"job","id":"after_gate","summary":"after","command":"after","timeoutSec":60},)"
+            R"("else":{"type":"fail","detail":"stopped at 091-7"}}]}]}})";
+
+        auto runToFailed = [&](FakeJobRunner& runner, BehaviorTree& bt) {
+            std::string e;
+            Check(bt.LoadDefinition(def, &catalog, e), "092: load retry-siblings BT: " + e);
+            bt.SetJobRunner(&runner);
+            bt.Start(1000);
+            bt.OnJobFinished("bt-retry-siblings-a-1", true, 0, "", "a ok", 1100);
+            bt.OnJobFinished("bt-retry-siblings-b-1", true, 0, "", "b ok", 1200);
+            bt.OnJobFinished("bt-retry-siblings-c-1", false, 1, "", "c failed", 1300);
+            Check(bt.State() == "waitingForLlm" && bt.NodeState("gate") == "running",
+                  "092: c failure escalates the gate");
+            Check(bt.Resume("gate", "stop", "Stopped at 091-7", {}, 1400, e), "092: resume stop: " + e);
+            Check(bt.State() == "failed" && bt.GetVar("gate.answer") == "stop",
+                  "092: stop answer fails the tree and sets gate.answer");
+        };
+
+        // --from a: a, b and c all re-run; succeeding c keeps the gate untouched.
+        {
+            FakeJobRunner runner;
+            BehaviorTree bt;
+            runToFailed(runner, bt);
+            Check(runner.startedJobs.size() == 3, "092: first run launched a, b, c");
+
+            std::string err;
+            Check(bt.Retry("a", true, 5000, err), "092: retry --from a: " + err);
+            Check(bt.NodeState("a") == "running" && runner.startedJobs.size() == 4 &&
+                  runner.startedJobs.back().proposedJobId == "bt-retry-siblings-a-2",
+                  "092: a re-launched after retry");
+            Check(bt.NodeState("b") == "idle" && bt.NodeState("c") == "idle" &&
+                  bt.NodeState("gate") == "idle" && bt.GetVar("gate.answer").empty(),
+                  "092: later siblings and stale gate answer discarded");
+            bt.OnJobFinished("bt-retry-siblings-a-2", true, 0, "", "a ok", 5100);
+            Check(runner.startedJobs.size() == 5 &&
+                  runner.startedJobs.back().proposedJobId == "bt-retry-siblings-b-2",
+                  "092: b re-runs after a succeeds");
+            bt.OnJobFinished("bt-retry-siblings-b-2", true, 0, "", "b ok", 5200);
+            Check(runner.startedJobs.size() == 6 &&
+                  runner.startedJobs.back().proposedJobId == "bt-retry-siblings-c-2",
+                  "092: c re-runs after b succeeds");
+            bt.OnJobFinished("bt-retry-siblings-c-2", true, 0, "", "c ok", 5300);
+            Check(bt.State() == "succeeded" && bt.NodeState("gate") == "idle" &&
+                  bt.NodeState("after_gate") == "idle",
+                  "092: c success makes the tree succeed without re-running the gate");
+            Check(runner.startedWorkers.empty(), "092: no escalation after successful retry");
+        }
+
+        // --from b: a is kept, b and c re-run, and the stale gate branch is discarded.
+        {
+            FakeJobRunner runner;
+            BehaviorTree bt;
+            runToFailed(runner, bt);
+
+            std::string err;
+            Check(bt.Retry("b", true, 6000, err), "092: retry --from b: " + err);
+            Check(bt.NodeState("a") == "succeeded" && runner.startedJobs.size() == 4 &&
+                  runner.startedJobs.back().proposedJobId == "bt-retry-siblings-b-2",
+                  "092: a is kept and b re-runs");
+            Check(bt.NodeState("c") == "idle" && bt.NodeState("gate") == "idle" &&
+                  bt.GetVar("gate.answer").empty(),
+                  "092: c and the escalate branch are reset by --from b");
+            bt.OnJobFinished("bt-retry-siblings-b-2", true, 0, "", "b ok", 6100);
+            bt.OnJobFinished("bt-retry-siblings-c-2", true, 0, "", "c ok", 6200);
+            Check(bt.State() == "succeeded", "092: tree succeeds after --from b");
+        }
+
+        // The gate is re-evaluated with a clean answer when the earlier branch fails again.
+        {
+            FakeJobRunner runner;
+            BehaviorTree bt;
+            runToFailed(runner, bt);
+
+            std::string err;
+            Check(bt.Retry("a", true, 7000, err), "092: retry --from a again: " + err);
+            Check(bt.GetVar("gate.answer").empty(), "092: gate.answer cleared before re-escalation");
+            bt.OnJobFinished("bt-retry-siblings-a-2", true, 0, "", "a ok", 7100);
+            bt.OnJobFinished("bt-retry-siblings-b-2", true, 0, "", "b ok", 7200);
+            bt.OnJobFinished("bt-retry-siblings-c-2", false, 1, "", "c failed again", 7300);
+            Check(bt.State() == "waitingForLlm" && bt.NodeState("gate") == "running",
+                  "092: gate re-escalates when c fails again");
+            Check(bt.GetVar("gate.answer").empty(), "092: re-escalated gate has no stale answer");
+            Check(bt.Resume("gate", "continue", "Try again", {}, 7400, err), "092: resume continue: " + err);
+            bt.OnJobFinished("bt-retry-siblings-after_gate-1", true, 0, "", "after ok", 7500);
+            Check(bt.State() == "succeeded", "092: continue branch completes after re-escalation");
+        }
     }
 }
 

@@ -15,6 +15,18 @@ namespace pc {
 
 using nlohmann::json;
 
+struct BtNode;
+
+// One `catch` handler. `doNode` is parsed from the handler's "do" object and ticks like a
+// normal child; `rawDef` keeps the authored handler fields for state persistence and updates.
+struct BtCatchHandler {
+    json rawDef = json::object();
+    std::vector<std::string> classes;
+    std::string cause;
+    bool thenRetry = false;
+    std::unique_ptr<BtNode> doNode;
+};
+
 struct BtCaptureRule {
     // Either regex capture from job log tail, or JSON path from a JSON file.
     std::string regex;
@@ -36,6 +48,25 @@ struct BtEscalateFallback {
     int afterSec = 0;
     std::string engine;
     std::string model;
+};
+
+// One pre-approved engine candidate for a worker node (doc/HanchoExpectations.md 8.3).
+struct BtEngineChoice {
+    std::string engine;
+    std::string model;
+    std::string list;      // LLM list the choice came from, when known
+    std::string entry;     // compact description of the approving list row
+};
+
+// Record of one tried candidate, kept in the node status for auditability.
+struct BtEngineAttempt {
+    std::string engine;
+    std::string model;
+    std::string result;        // "succeeded" or "failed"
+    std::string failureClass;
+    std::string detail;
+    std::string list;          // "worker" — the LLM list the choice came from
+    std::string entry;         // compact description of the approving list row
 };
 
 struct BtNode {
@@ -72,12 +103,29 @@ struct BtNode {
     std::string instructionsText;
     std::string instructionsFile;
     int maxAttempts = 1;
+    bool maxAttemptsConfigured = false;
+    bool probe = false;
+    bool probeConfigured = false;
     std::string engine;
     std::string model;
     std::string prompt;
     std::string promptFile;
     std::string outputSchema;
     std::map<std::string, BtCaptureRule> capture;
+
+    // Engine switching (091-3). `engineCandidates` is the `engines` list; when it is
+    // non-empty the node runs the first usable candidate and advances on a failure class
+    // listed in `switchEngineOn`. `engine` / `model` may not be combined with `engines`.
+    std::vector<BtEngineChoice> engineCandidates;
+    std::vector<std::string> switchEngineOn;
+    int engineCandidateIndex = 0;
+    std::vector<BtEngineAttempt> engineAttempts;
+    int probeTimeoutSec = 60;
+    // 091-6: a worker whose engine is down waits for recovery instead of failing.
+    bool waitingForEngine = false;
+    int64_t engineWaitUntilMs = 0;
+    std::vector<BtEngineChoice> fallbackCandidates;  // consult-list proxy answer candidates
+    size_t fallbackCandidateIndex = 0;
 
     // Set leaf
     std::string setVar;
@@ -114,6 +162,18 @@ struct BtNode {
     json condLt;
     bool hasExists = false;
     bool condExists = true;
+    // "failure" condition: the referenced node must have failed with a matching class/cause.
+    std::vector<std::string> condFailureClasses;
+    std::string condFailureCause;
+
+    // catch node parameters
+    std::vector<BtCatchHandler> catchHandlers;
+    int catchMaxRetries = 1;
+    // catch execution phase: 0 child, 1 selected handler's do, 3 otherwise node
+    int catchPhase = 0;
+    int catchRetries = 0;
+    int catchHandlerIndex = -1;
+    std::string catchHandler;  // label of the selected handler, kept in state and nodeFinished detail
 
     // Child pointers
     std::vector<std::unique_ptr<BtNode>> children;
@@ -122,6 +182,7 @@ struct BtNode {
     std::unique_ptr<BtNode> elseChild;
     std::unique_ptr<BtNode> singleChild;
     std::unique_ptr<BtNode> untilChild;
+    std::unique_ptr<BtNode> otherwiseChild;
 
     // Runtime state (persisted in status)
     bool hasStatus = false;
@@ -134,11 +195,22 @@ struct BtNode {
     std::string detail;
     std::string answer;
     std::string rationale;
+    // Set when the escalate answer is "takeover": the supervisor owns the work. The node
+    // still counts as succeeded so the tree can continue, but the decision is persisted.
+    bool takenOver = false;
+    json takeover;
 
     // Transient / engine runtime state for this node
     std::string activeJobId;
     std::string fallbackJobId;
     bool isWorkerJob = false;
+    // Engine/model actually used for the last worker launch (empty for a plain job).
+    std::string lastEngine;
+    std::string lastModel;
+    // Failure diagnostic of the most recent attempt (the taskqueue JSON record). Cleared on
+    // success so a stale failure never leaks into ${<node>.failureClass} or a `failure` condition.
+    bool hasFailureDiagnostic = false;
+    json failureDiagnostic = json::object();
     int lastExitCode = 0;
     bool hasExitCode = false;
     std::string lastLogFile;
@@ -178,6 +250,9 @@ struct BehaviorTree::Impl {
     void ApplyCaptures(BehaviorTree& bt, BtNode& node, const std::string& logTail, int64_t nowMs);
     void StoreWorkerOutputs(BehaviorTree& bt, BtNode& node, const std::string& finalResponse,
                             const std::string& resultFileJson, int64_t nowMs);
+    // Stores/clears the failure diagnostic and its ${<node>.*} variables (8.1).
+    void ApplyFailureDiagnostic(BehaviorTree& bt, BtNode& node, const std::string& diagnosticJson,
+                                bool succeeded, int64_t nowMs);
 
     // Condition evaluation (behavior_tree_cond.cpp)
     bool CompareJsonValue(const BehaviorTree& bt, const BtNode& node, bool valueExists,
@@ -198,9 +273,21 @@ struct BehaviorTree::Impl {
                              int64_t nowMs, std::string& err);
 
     // Execution helpers (behavior_tree_exec.cpp)
-    void ResetSubtreeForRun(BtNode& node, bool resetHistory);
+    void ResetSubtreeForRun(BehaviorTree& bt, BtNode& node, bool resetHistory);
     void CancelSubtreeJobs(BehaviorTree& bt, BtNode& node, bool markSkipped);
+    // Reopens the ancestors of `target` and discards the results of every child that runs
+    // after the one containing `target` (behavior_tree_runtime.cpp).
+    bool ReopenAncestorsToTarget(BehaviorTree& bt, BtNode* cur, BtNode* target, bool resetCounters);
     void TickNode(BehaviorTree& bt, BtNode& node, int64_t nowMs);
+    // Advances a worker node to its next engine candidate when `failureClass` is switchable.
+    // Records the attempt, emits `engineSwitched` and resets the node to idle for relaunch.
+    bool TrySwitchEngine(BehaviorTree& bt, BtNode& node, const std::string& failureClass,
+                         const std::string& detail, int64_t nowMs);
+    bool ShouldSwitchEngine(const BtNode& node, const std::string& failureClass) const;
+    // 091-6: hold a leaf while its engine is down instead of failing it.
+    bool HoldForEngine(BehaviorTree& bt, BtNode& node, const std::string& engine,
+                       const std::string& model, int64_t nowMs);
+    void RunProbeLeaf(BehaviorTree& bt, BtNode& node, int64_t nowMs);
     bool HasWaitingEscalation(const BtNode& node) const;
     void CollectNextWakeMs(const BtNode& node, int64_t& minWakeMs) const;
     void CheckTimers(BehaviorTree& bt, BtNode& node, int64_t nowMs, bool& anyFired);
@@ -215,9 +302,9 @@ std::unique_ptr<BtNode> ParseSingleNodeJson(const json& j,
                                             const std::string& path,
                                             const std::string& role,
                                             int depth,
-                                            const IBtEngineCatalog* catalog,
-                                            const BtWorkerDefaults& workerDefaults,
-                                            const std::string& btCwd,
+                                             const IBtEngineCatalog* catalog,
+                                             const BtDefaults& defaults,
+                                             const std::string& btCwd,
                                             const std::vector<std::string>& existingIdsOutsideTarget,
                                             int existingNodesOutsideTarget,
                                             const std::string& baseQueue,

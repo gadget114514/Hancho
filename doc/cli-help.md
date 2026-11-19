@@ -145,7 +145,7 @@ MCP SERVER SETUP:
       fine). Paths/globs resolve against cwd; "@name" is a named lock.
     - Success is verified: exit code AND optional filesNewer / outputRegex.
     - States: waiting = queued and ready; pending = dependencies not satisfied;
-      blocked = a dependency failed; running; succeeded; failed; cancelled.
+      blocked = a dependency failed; running; succeeded; failed; cancelled; takenOver.
     - Observe with taskqueue_wait / taskqueue_list / taskqueue_graph; after fixing
       the cause use taskqueue_retry (blocked dependents resume automatically).
 
@@ -343,6 +343,16 @@ COMMANDS:
   worker info <id> [--notes "<notes>"] [--goal "<goal>"]
       Update supervisor notes or goal for an ongoing worker.
 
+  worker probe --engine <e> [--model <m>] [--timeout <sec>] [--no-cache]
+       Health-check an engine with a minimal prompt (stdin closed). Returns
+       {ok, engine, model, elapsedMs, failureClass?, detail?, cached}. Result is
+       cached in <data-dir>/probes.json (success 10 min, failure 2 min by default).
+
+  worker health [--json] | worker health --reset <engine/model>
+       List the shared engine-health registry (<data-dir>/engine-health.json):
+       status, reason, since, nextProbeAt, probeCount, retryAt. Down engines hold
+       their jobs until a core probe succeeds. --reset marks an engine healthy.
+
   agent install-template [--path <dir>] [--dry-run]
       Write the hancho-runner subagent to <dir>\.claude\agents\hancho-runner.md (default: the current
       directory). It runs long commands through Hancho and returns a short summary.
@@ -410,6 +420,9 @@ TASK QUEUE:
       that failed within the period, e.g. `taskqueue retry --failed --since 6h`
       retries the failures of the last 6 hours. Blocked dependents resume.
   taskqueue cancel <id>
+  taskqueue takeover --id <id> --reason "..."    (record that the supervisor takes the job over)
+  taskqueue complete --id <id> --reason "..." [--report <path>] [--result succeeded|failed]
+       Finish a taken-over job. succeeded (default) lets dependents advance; failed blocks them.
   taskqueue pause|resume <name>
   taskqueue pause-job <id>                   (suspend one running job, or hold a queued one)
   taskqueue resume-job <id>
@@ -421,6 +434,12 @@ TASK QUEUE:
 
 BEHAVIOR TREES (for LLM agents; next step depends on results):
   bt validate|start --file <bt.json>    Check / register and run a behavior tree
+  bt validate --file <bt.json> [--strict]
+      Check a tree without running it. warnings[] are returned as warnings;
+      --strict turns every warning into an error (ok/valid = false).
+  bt template [<name>] [--json]
+      List hang-safe BT templates or print one full template (resilient-worker,
+      card-sequence). Replace <...> placeholders before validation.
   bt wait --id <id> [--since-version <n>] [--timeout-ms <ms>]
       Long-poll until the tree finishes or waits for your decision (escalate).
   bt resume --id <id> --node <node> --answer <a> --rationale <why> [--vars <json>]
@@ -430,11 +449,33 @@ BEHAVIOR TREES (for LLM agents; next step depends on results):
   bt cancel --id <id>  |  bt pause --id <id> [--paused true|false]
       Leaves: job (one command), worker (one task for a worker LLM; engine/model);
       composites: sequence, fallback, parallel, if, retry/repeat (max required),
-      timeout; conditions: fileExists, fileNewer, outputMatches, exitCode,
+      timeout; catch (failure-class handlers) and probe (preflight health check);
+      conditions: fileExists, fileNewer, outputMatches, exitCode, failure,
       jsonValue, var, nodeState; escalate returns a decision packet to you.
+      Top-level defaults fills worker idle / maxAttempts / probe and job idle.
       Each leaf runs as an ordinary task-queue job; retry BT jobs with bt retry,
       not taskqueue retry. Full format and examples: doc\behavior-tree.md in the
       installation folder; `hancho-cli bt --help` for all options.
+
+LLM LISTS AND PERMISSIONS (pre-approved engine candidates and worker permits):
+  llm list [--list <worker|consult|supervisor>] [--json]
+      Show rows with status; proposed rows are unused until approved.
+  llm add --list <l> --engine <e> --model <m> [--provider <p>] [--rank <n>] [--note <t>] --reason "..."
+  llm remove --list <l> --engine <e> --model <m> --reason "..."
+  llm enable --list <l> --engine <e> --model <m> --reason "..."
+  llm disable --list <l> --engine <e> --model <m> --reason "..."
+  llm approve --list <l> --engine <e> --model <m> --user-said "<user's words>"
+      Rows added by CLI/MCP are proposed; approve them from the dashboard LLM
+      page or with --user-said (quoted user words) before a BT can use them.
+      All changes are recorded in <data-dir>/llms.json history.
+  permit list [--scope <s>] [--json]
+  permit request --kind <read_path|write_path|command|network> --target <glob> [--engine <e>]
+                 [--scope <global|taskqueue:name|bt:id>] --reason "..."
+  permit approve <id> --user-said "<user's words>"
+  permit reject <id> [--reason "..."]
+  permit revoke <id> --reason "..."
+      Worker permissions in <data-dir>/permits.json. A denial becomes
+      permission_denied, then waitingForPermit after session resumes are used up.
 
   start/run ... --allow-chain
       Allow a chained command (&&, ||, &, ';') as a single process. Task-queue
@@ -514,17 +555,19 @@ SETUP FOR LLM AGENTS:
         and returns the result. The wrapper costs extra tokens; calling run_worker
         directly is cheapest.
 
-    MCP tools (34):
+    MCP tools:
       Process:    start_process, list_processes, get_process_output,
                   send_process_input, wait_process, kill_process
       Worker:     run_worker, wait_worker, get_worker_stream, get_worker_state,
-                  update_worker_info
+                  update_worker_info, worker_probe, worker_health
       Task queue: taskqueue_add, taskqueue_list, taskqueue_get, taskqueue_retry,
                   taskqueue_update, taskqueue_cancel, taskqueue_pause, taskqueue_resume,
                   taskqueue_pause_job, taskqueue_resume_job, taskqueue_wait,
                   taskqueue_purge, taskqueue_link, taskqueue_unlink, taskqueue_graph
-      Behavior tree: bt_validate, bt_start, bt_get, bt_list, bt_wait, bt_resume,
-                  bt_retry, bt_update, bt_cancel, bt_pause
+      Behavior tree: bt_validate (strict), bt_template (name), bt_start, bt_get,
+                  bt_list, bt_wait, bt_resume, bt_retry, bt_update, bt_cancel, bt_pause
+      LLM lists:  llm_list, llm_add, llm_remove, llm_set_enabled, llm_approve
+      Permits:    permit_list, permit_request, permit_approve, permit_revoke
 
 NOTE:
   The GUI dashboard is provided by Hancho.exe, which is auto-started

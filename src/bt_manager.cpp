@@ -1,6 +1,9 @@
 #include "bt_manager.h"
 #include "behavior_tree_internal.h"
 #include "common.h"
+#include "llm_config.h"
+#include "worker_probe.h"
+#include "engine_health.h"
 #include "nlohmann/json.hpp"
 
 #ifdef _WIN32
@@ -74,10 +77,11 @@ nlohmann::json BuildAddBtJobJson(const std::string& jobId,
     if (!success.contentRegex.empty()) succObj["content_regex"] = success.contentRegex;
     if (success.engineResult) succObj["engine_result"] = true;
     j["success"] = std::move(succObj);
-    if (idle.outputSec > 0 || idle.cpuSec > 0) {
+    if (idle.configured || idle.outputSec > 0 || idle.cpuSec > 0 || idle.firstEventSec > 0) {
         j["idle"] = {
             {"output_sec", idle.outputSec},
-            {"cpu_sec", idle.cpuSec}
+            {"cpu_sec", idle.cpuSec},
+            {"first_event_sec", idle.firstEventSec}
         };
     }
     return j;
@@ -191,6 +195,73 @@ bool BtManager::Knows(const std::string& engine, const std::string& model, std::
     return engines_.Knows(engine, model, err);
 }
 
+bool BtManager::IsApprovedForList(const std::string& list, const std::string& engine,
+                                  const std::string& model) const {
+    llm::Config cfg;
+    std::string err;
+    if (!llm::Load(llm::DefaultPath(), cfg, err)) return false;
+    const bool anyConfigured = !cfg.worker.empty() || !cfg.consult.empty() || !cfg.supervisor.empty();
+    // With no lists configured at all, keep the legacy behaviour: the registry is the
+    // only gate and a single `engines` candidate is allowed.
+    if (!anyConfigured) return true;
+    return llm::HasUsable(cfg, list, engine, model);
+}
+
+BtProbeResult BtManager::Probe(const std::string& engine, const std::string& model,
+                               int timeoutSec) {
+    ProbeOptions opts;
+    opts.timeoutSec = timeoutSec > 0 ? timeoutSec : 60;
+    ProbeOutcome out = ProbeEngine(engines_, engine, model, opts);
+    BtProbeResult result;
+    result.ok = out.ok;
+    result.elapsedMs = out.elapsedMs;
+    result.failureClass = out.failureClass;
+    result.detail = out.detail;
+    result.cached = out.cached;
+    return result;
+}
+
+bool BtManager::IsDown(const std::string& engine, const std::string& model) const {
+    engine_health::Store store;
+    std::string err;
+    if (!engine_health::Load(engine_health::DefaultPath(), store, err)) return false;
+    return engine_health::IsDown(store, engine, model);
+}
+
+void BtManager::MarkDown(const std::string& engine, const std::string& model,
+                         const std::string& failureClass, const std::string& detail,
+                         int64_t nowMs) {
+    engine_health::MarkDown(engine_health::DefaultPath(), engine, model, failureClass, detail,
+                            nowMs, 0, engine_health::LoadSettings());
+}
+
+void BtManager::MarkHealthy(const std::string& engine, const std::string& model,
+                            const std::string& reason, int64_t nowMs) {
+    engine_health::MarkHealthy(engine_health::DefaultPath(), engine, model, reason, nowMs);
+}
+
+int64_t BtManager::NextProbeAtMs(const std::string& engine, const std::string& model) const {
+    engine_health::Store store;
+    std::string err;
+    if (!engine_health::Load(engine_health::DefaultPath(), store, err)) return 0;
+    const engine_health::Entry* e = engine_health::Find(store, engine, model);
+    return e ? e->nextProbeAtMs : 0;
+}
+
+bool BtManager::IsDownWorthy(const std::string& failureClass) const {
+    return engine_health::IsDownWorthyFailure(failureClass);
+}
+
+std::vector<std::pair<std::string, std::string>> BtManager::Candidates(
+    const std::string& list) const {
+    std::vector<std::pair<std::string, std::string>> out;
+    llm::Config cfg;
+    std::string err;
+    if (!llm::Load(llm::DefaultPath(), cfg, err)) return out;
+    for (const auto& e : llm::Usable(cfg, list)) out.push_back({e.engine, e.model});
+    return out;
+}
+
 std::string BtManager::LookupQueueNameForBtLocked(const std::string& btId) const {
     auto it = trees_.find(btId);
     if (it != trees_.end() && it->second && it->second->tree) {
@@ -294,9 +365,9 @@ std::string BtManager::StartWorker(const BtWorkerSpec& spec) {
         spec.cwd,
         instructions,
         effTimeout,
-        spec.estimateSec,
-        1,
-        env,
+         spec.estimateSec,
+         spec.maxAttempts,
+         env,
         spec.resources,
         spec.success,
         spec.idle);
@@ -448,16 +519,22 @@ void BtManager::DeliverJobOutcomeLocked(TreeEntry& entry,
         failDetail = job.attempts.back().checkDetail;
     }
 
+    std::string failureDiagnosticJson;
+    if (!succeeded && !job.attempts.empty() && !job.attempts.back().failure.Empty()) {
+        failureDiagnosticJson = TaskQueueFailureDiagnosticToJson(job.attempts.back().failure);
+    }
+
     activeLaunchingQueueName_ = entry.tree->TaskQueueName();
     entry.tree->OnJobFinished(job.id,
                               succeeded,
                               exitCode,
                               logFile,
                               lastLines,
+                              nowMs,
                               resultText,
                               resultFile,
-                              nowMs,
-                              failDetail);
+                              failDetail,
+                              failureDiagnosticJson);
     activeLaunchingQueueName_.clear();
 }
 
@@ -552,6 +629,8 @@ void BtManager::LoadPersistedTrees() {
             continue;
         }
         tree->SetJobRunner(this);
+        tree->SetProber(this);
+        tree->SetEngineHealth(this);
 
         auto entry = std::make_unique<TreeEntry>();
         entry->lastFlushedVersion = tree->Version();

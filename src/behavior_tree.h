@@ -9,6 +9,7 @@
 #include <map>
 #include <memory>
 #include <string>
+#include <utility>
 #include <vector>
 
 namespace pc {
@@ -24,6 +25,8 @@ std::string BtVarPreview(const std::string& v, size_t maxBytes = kBtVarPreviewBy
 struct BtJobIdle {
     int outputSec = 0;
     int cpuSec = 0;
+    int firstEventSec = 0;
+    bool configured = false;
 };
 
 struct BtJobSuccess {
@@ -82,6 +85,7 @@ struct BtWorkerSpec {
     BtJobIdle idle;
     BtJobResources resources;
     std::string outputSchema;
+    int maxAttempts = 1;
 };
 
 class IBtJobRunner {
@@ -94,6 +98,47 @@ public:
         return "";
     }
     virtual void CancelJob(const std::string& jobId) = 0;
+};
+
+// Result of a health probe (091-3). A failed probe carries a failure class that can be
+// handled by `switchEngineOn` ("probe_failed", "startup_hang", "auth_error").
+struct BtProbeResult {
+    bool ok = false;
+    int elapsedMs = 0;
+    std::string failureClass;
+    std::string detail;
+    bool cached = false;
+};
+
+// Injected health prober. The BT core stays process-agnostic; BtManager wires the real
+// engine-registry based prober and tests use a fake.
+class IBtProber {
+public:
+    virtual ~IBtProber() = default;
+    virtual BtProbeResult Probe(const std::string& engine, const std::string& model,
+                                int timeoutSec) = 0;
+};
+
+// Shared engine health (091-6). The BT core stays storage-agnostic: BtManager wires the
+// file-backed registry and tests use a fake.
+class IBtEngineHealth {
+public:
+    virtual ~IBtEngineHealth() = default;
+    virtual bool IsDown(const std::string& /*engine*/, const std::string& /*model*/) const { return false; }
+    virtual void MarkDown(const std::string& /*engine*/, const std::string& /*model*/,
+                          const std::string& /*failureClass*/, const std::string& /*detail*/,
+                          int64_t /*nowMs*/) {}
+    virtual void MarkHealthy(const std::string& /*engine*/, const std::string& /*model*/,
+                             const std::string& /*reason*/, int64_t /*nowMs*/) {}
+    virtual int64_t NextProbeAtMs(const std::string& /*engine*/, const std::string& /*model*/) const { return 0; }
+    virtual bool IsDownWorthy(const std::string& failureClass) const {
+        return failureClass == "startup_hang" || failureClass == "probe_failed" ||
+               failureClass == "startup_timed_out" || failureClass == "idle_stall" ||
+               failureClass == "rate_limited" || failureClass == "quota";
+    }
+    // Approved candidates for a role, sorted by rank (consult / supervisor fallbacks).
+    virtual std::vector<std::pair<std::string, std::string>> Candidates(
+        const std::string& /*list*/) const { return {}; }
 };
 
 // A job/worker leaf that is still idle and will start later if the tree keeps its current
@@ -118,6 +163,29 @@ struct BtLimits {
 struct BtWorkerDefaults {
     std::string engine;
     std::string model;
+};
+
+// Tree-level defaults (doc/HanchoExpectations.md 8.2). A node's explicit values always win,
+// including an explicit 0. `configured` on the idle fields means the default block was present.
+struct BtDefaults {
+    BtWorkerDefaults worker;       // engine/model from the top-level "worker" block
+    BtJobIdle workerIdle;
+    int workerMaxAttempts = 0;     // 0 = not specified
+    bool workerProbe = false;
+    bool hasWorkerProbe = false;
+    BtJobIdle jobIdle;
+
+    bool hasWorkerIdle() const { return workerIdle.configured; }
+    bool hasJobIdle() const { return jobIdle.configured; }
+};
+
+// A non-fatal lint finding from `bt validate` (doc/HanchoExpectations.md 8.4). Warnings never
+// fail validation; --strict turns them into errors.
+struct BtWarning {
+    std::string path;
+    std::string code;
+    std::string message;
+    std::string suggestion;
 };
 
 struct BtEvent {
@@ -162,6 +230,18 @@ public:
     static bool ValidateJson(const std::string& jsonText,
                              const IBtEngineCatalog* catalog,
                              std::string& outError);
+    // Same validation plus the hang-protection lint warnings. Errors and warnings are
+    // independent: a tree can be valid (no errors) but still carry warnings.
+    static bool ValidateJson(const std::string& jsonText,
+                             const IBtEngineCatalog* catalog,
+                             std::vector<std::string>& outErrors,
+                             std::vector<BtWarning>& outWarnings);
+
+    // JSON response shared by the CLI/IPC/MCP `bt validate` entry points. With strict=true,
+    // warnings become errors and the response reports ok=false / valid=false.
+    static std::string ValidateResponse(const std::string& jsonText,
+                                        const IBtEngineCatalog* catalog,
+                                        bool strict);
 
     // Parses and validates a fresh BT definition.
     bool LoadDefinition(const std::string& jsonText,
@@ -179,6 +259,8 @@ public:
 
     void SetJobRunner(IBtJobRunner* runner) { runner_ = runner; }
     void SetEngineCatalog(const IBtEngineCatalog* catalog) { catalog_ = catalog; }
+    void SetProber(IBtProber* prober) { prober_ = prober; }
+    void SetEngineHealth(IBtEngineHealth* health) { health_ = health; }
 
     // Execution entry points (event-driven tick, section 5.2).
     void Start(int64_t nowMs, bool paused = false);
@@ -209,6 +291,19 @@ public:
                        const std::string& resultFileJson,
                        int64_t nowMs,
                        const std::string& failDetail = "");
+
+    // As above, with the taskqueue failure diagnostic JSON for the finished attempt. The
+    // diagnostic fields become ${<node>.failureClass} etc. (doc/HanchoExpectations.md 8.1).
+    void OnJobFinished(const std::string& jobId,
+                       bool succeeded,
+                       int exitCode,
+                       const std::string& logFile,
+                       const std::string& logTail,
+                       int64_t nowMs,
+                       const std::string& finalResponse,
+                       const std::string& resultFileJson,
+                       const std::string& failDetail,
+                       const std::string& failureDiagnosticJson);
 
     void OnTimer(int64_t nowMs);
     void Tick(int64_t nowMs);
@@ -259,6 +354,7 @@ public:
     const std::string& UpdatedAt() const { return updatedAt_; }
     int NodeRuns() const { return nodeRuns_; }
     const BtLimits& Limits() const { return limits_; }
+    const BtDefaults& Defaults() const { return defaults_; }
     const std::map<std::string, std::string>& Vars() const { return vars_; }
 
     std::vector<std::string> RunningJobIds() const;
@@ -296,6 +392,8 @@ private:
 
     IBtJobRunner* runner_ = nullptr;
     const IBtEngineCatalog* catalog_ = nullptr;
+    IBtProber* prober_ = nullptr;
+    IBtEngineHealth* health_ = nullptr;
 
     std::string id_;
     std::string summary_;
@@ -304,6 +402,7 @@ private:
     std::string cwd_;
     std::string notifyFile_;
     BtLimits limits_;
+    BtDefaults defaults_;
     BtWorkerDefaults workerDefaults_;
     std::string state_ = "idle";
     std::string detail_;

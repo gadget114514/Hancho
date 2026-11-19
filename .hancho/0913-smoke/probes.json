@@ -1,0 +1,16 @@
+{
+  "hangdummy/": {
+    "at": 1795123927685,
+    "detail": "no first event within the timeout",
+    "elapsedMs": 3006,
+    "failureClass": "startup_hang",
+    "ok": false
+  },
+  "okdummy/": {
+    "at": 1795123927718,
+    "detail": "ok",
+    "elapsedMs": 31,
+    "failureClass": "",
+    "ok": true
+  }
+}

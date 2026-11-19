@@ -332,6 +332,7 @@ std::string ProcStateToString(ProcState state) {
         case ProcState::Failed: return "failed";
         case ProcState::TimedOut: return "timed_out";
         case ProcState::IdleTimedOut: return "idle_timed_out";
+        case ProcState::StartupTimedOut: return "startup_timed_out";
         case ProcState::Killed: return "killed";
     }
     return "unknown";
@@ -343,6 +344,7 @@ ProcState StringToProcState(const std::string& s) {
     if (s == "failed") return ProcState::Failed;
     if (s == "timed_out") return ProcState::TimedOut;
     if (s == "idle_timed_out") return ProcState::IdleTimedOut;
+    if (s == "startup_timed_out") return ProcState::StartupTimedOut;
     if (s == "killed") return ProcState::Killed;
     return ProcState::Completed;
 }
@@ -355,6 +357,7 @@ std::wstring ProcStateToDisplayWide(ProcState state, bool isIdleWarning) {
         case ProcState::Failed: return L"FAILED";
         case ProcState::TimedOut: return L"TIMEOUT";
         case ProcState::IdleTimedOut: return L"HANG TIMEOUT";
+        case ProcState::StartupTimedOut: return L"STARTUP TIMEOUT";
         case ProcState::Killed: return L"KILLED";
     }
     return L"UNKNOWN";

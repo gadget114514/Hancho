@@ -1,0 +1,1 @@
+﻿{"engines":{"dummy":{"command":"cmd /c echo OK","stream":"dummy","models":[]},"dummyhang":{"command":"cmd /c ping -n 20 127.0.0.1 >nul","stream":"dummy","models":[]}},"default":"dummy"}

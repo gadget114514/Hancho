@@ -1,0 +1,58 @@
+{
+  "consult": [],
+  "history": [
+    {
+      "action": "add",
+      "at": "2026-11-20 02:18:44",
+      "by": "cli",
+      "entry": {
+        "approvedAt": "",
+        "approvedVia": "",
+        "enabled": true,
+        "engine": "agy",
+        "model": "gemini-3.8-flash-high",
+        "note": "",
+        "provider": "",
+        "rank": 1,
+        "status": "proposed",
+        "userSaid": ""
+      },
+      "list": "worker",
+      "reason": "probe test"
+    },
+    {
+      "action": "approve",
+      "at": "2026-11-20 02:18:44",
+      "by": "cli",
+      "entry": {
+        "approvedAt": "2026-11-20 02:18:44",
+        "approvedVia": "chat",
+        "enabled": true,
+        "engine": "agy",
+        "model": "gemini-3.8-flash-high",
+        "note": "",
+        "provider": "",
+        "rank": 1,
+        "status": "approved",
+        "userSaid": "yes use agy"
+      },
+      "list": "worker",
+      "reason": "yes use agy"
+    }
+  ],
+  "supervisor": [],
+  "worker": [
+    {
+      "approvedAt": "2026-11-20 02:18:44",
+      "approvedVia": "chat",
+      "enabled": true,
+      "engine": "agy",
+      "model": "gemini-3.8-flash-high",
+      "note": "",
+      "provider": "",
+      "rank": 1,
+      "status": "approved",
+      "userSaid": "yes use agy"
+    }
+  ]
+}

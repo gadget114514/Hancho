@@ -1,0 +1,13 @@
+{
+  "terminal": {
+    "history_bytes": 33554432,
+    "host": "0.0.0.0",
+    "local": true,
+    "port": 9139,
+    "remote": false,
+    "token": "0114aed7925a815e5ff3adfa2a7e3bc9"
+  },
+  "webui": {
+    "token": "50e08642447e16baae898bffededf210"
+  }
+}

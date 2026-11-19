@@ -703,6 +703,8 @@ const char kStyleCss_0[] = R"CSS_0(/* Hancho Dashboard Modern Dark Theme - 5 Pan
   --blocked-bg: rgba(249, 115, 22, 0.12);
   --cancelled: #9ca3af;
   --cancelled-bg: rgba(156, 163, 175, 0.12);
+  --taken-over: #a78bfa;
+  --taken-over-bg: rgba(167, 139, 250, 0.12);
   --l1-color: #818cf8;
   --l1-bg: rgba(129, 140, 248, 0.12);
   --l2-color: #fbbf24;
@@ -1167,7 +1169,8 @@ body {
 .badge-blocked { background-color: var(--blocked-bg); color: var(--blocked); }
 .badge-completed, .badge-succeeded { background-color: var(--success-bg); color: var(--success); }
 .badge-failed { background-color: var(--error-bg); color: var(--error); }
-.badge-cancelled { background-color: var(--cancelled-bg); color: var(--cancelled); }
+ .badge-cancelled { background-color: var(--cancelled-bg); color: var(--cancelled); }
+ .badge-taken-over { background-color: var(--taken-over-bg); color: var(--taken-over); border: 1px solid var(--taken-over); }
 .badge-l1 { background-color: var(--l1-bg); color: var(--l1-color); }
 .badge-l2 { background-color: var(--l2-bg); color: var(--l2-color); }
 .badge-l3 { background-color: var(--l3-bg); color: var(--l3-color); }
@@ -2197,8 +2200,10 @@ const char kAppJs_1[] = R"JS_1(    if (data.events && Array.isArray(data.events)
     if (s === 'pending' || s === 'queued' || s === 'waiting' || s === 'planned' || s === 'waitingforllm' || s === 'paused') return 'badge badge-planned';
     if (s === 'blocked') return 'badge badge-blocked';
     if (s === 'completed' || s === 'succeeded') return 'badge badge-completed';
-    if (s === 'failed' || s === 'timed_out' || s === 'idle_timed_out') return 'badge badge-failed';
+    if (s === 'failed' || s === 'timed_out' || s === 'idle_timed_out' || s === 'startup_timed_out') return 'badge badge-failed';
     if (s === 'cancelled' || s === 'killed' || s === 'closed') return 'badge badge-cancelled';
+    if (s === 'takenover') return 'badge badge-taken-over';
+    if (s === 'waitingforpermit') return 'badge badge-blocked';
     return 'badge';
   }
 
@@ -2213,7 +2218,7 @@ const char kAppJs_1[] = R"JS_1(    if (data.events && Array.isArray(data.events)
       const st = (p.state || '').toLowerCase();
       if (filter !== 'all') {
         if (filter === 'completed' && st !== 'completed' && st !== 'finished') return false;
-        if (filter === 'failed' && st !== 'failed' && st !== 'timed_out' && st !== 'idle_timed_out') return false;
+        if (filter === 'failed' && st !== 'failed' && st !== 'timed_out' && st !== 'idle_timed_out' && st !== 'startup_timed_out') return false;
         if (filter === 'running' && st !== 'running') return false;
       }
       if (q) {
@@ -2354,7 +2359,7 @@ const char kAppJs_1[] = R"JS_1(    if (data.events && Array.isArray(data.events)
       const st = (job.state || '').toLowerCase();
       if (filter !== 'all') {
         if (filter === 'succeeded' && st !== 'succeeded' && st !== 'completed') return false;
-        if (filter === 'failed' && st !== 'failed' && st !== 'timed_out' && st !== 'idle_timed_out') return false;
+        if (filter === 'failed' && st !== 'failed' && st !== 'timed_out' && st !== 'idle_timed_out' && st !== 'startup_timed_out') return false;
         if (filter === 'pending' && st !== 'pending' && st !== 'queued' && st !== 'waiting' && st !== 'planned') return false;
         if (filter === 'running' && st !== 'running') return false;
         if (filter === 'cancelled' && st !== 'cancelled' && st !== 'killed') return false;
@@ -2669,7 +2674,7 @@ const char kAppJs_2[] = R"JS_2(    if (filtered.length === 0) {
   function checkFailuresFromJobs() {
     const failedJobs = state.jobs.filter(j => {
       const s = (j.state || '').toLowerCase();
-      return s === 'failed' || s === 'timed_out' || s === 'idle_timed_out';
+      return s === 'failed' || s === 'timed_out' || s === 'idle_timed_out' || s === 'startup_timed_out';
     });
 
     elBadgeFailCount.textContent = failedJobs.length;
@@ -2708,7 +2713,7 @@ const char kAppJs_2[] = R"JS_2(    if (filtered.length === 0) {
     const failedJobs = state.jobs.filter(j => {
 )JS_2";
 const char kAppJs_3[] = R"JS_3(      const s = (j.state || '').toLowerCase();
-      return s === 'failed' || s === 'timed_out' || s === 'idle_timed_out';
+      return s === 'failed' || s === 'timed_out' || s === 'idle_timed_out' || s === 'startup_timed_out';
     });
 
     if (failedJobs.length === 0) {

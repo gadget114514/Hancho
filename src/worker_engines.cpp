@@ -1,4 +1,5 @@
 #include "worker_engines.h"
+#include "permit_config.h"
 #include "platform/platform.h"
 #include "nlohmann/json.hpp"
 
@@ -14,6 +15,20 @@ std::string QuoteCommandArg(const std::string& s) {
 }
 
 namespace {
+
+std::string LowerAscii(std::string s) {
+    for (char& c : s) c = static_cast<char>(std::tolower(static_cast<unsigned char>(c)));
+    return s;
+}
+
+std::string JoinStrings(const std::vector<std::string>& parts, const std::string& sep) {
+    std::string out;
+    for (size_t i = 0; i < parts.size(); ++i) {
+        if (i) out += sep;
+        out += parts[i];
+    }
+    return out;
+}
 
 void ReplaceAll(std::string& s, const std::string& from, const std::string& to) {
     if (from.empty()) return;
@@ -194,7 +209,7 @@ void WorkerEngineRegistry::ResetToBuiltins() {
     engines_["agy"] = std::move(agy);
 
     WorkerEngineDef claude;
-    claude.command = "claude -p {prompt} --output-format stream-json --verbose --model {model} {permissionArgs}";
+    claude.command = "claude -p {prompt} --output-format stream-json --verbose --model {model} {permissionArgs} {permitArgs}";
     claude.defaultModel = "";
     claude.stream = "claude";
     claude.permissionArgs = "--dangerously-skip-permissions";
@@ -206,6 +221,9 @@ void WorkerEngineRegistry::ResetToBuiltins() {
     opencode.defaultModel = "";
     opencode.stream = "opencode";
     opencode.permissionArgs = "";
+    // 091-7: OPENCODE_PERMISSION is an inline permission block (v1) and has higher
+    // precedence than the user's global opencode.json(c), which Hancho never touches.
+    opencode.permitEnv = "OPENCODE_PERMISSION";
     // OpenCode has no CLI read-only switch; without --auto it asks (and a headless run denies).
     opencode.advicePermissionArgs = "";
     engines_["opencode"] = std::move(opencode);
@@ -252,6 +270,8 @@ bool WorkerEngineRegistry::LoadFromJson(const std::string& jsonText, std::string
                 def.command = obj["command"].get<std::string>();
                 if (!obj.contains("defaultModel")) def.defaultModel.clear();
                 if (!obj.contains("permissionArgs")) def.permissionArgs.clear();
+                if (!obj.contains("permitArgs")) def.permitArgs.clear();
+                if (!obj.contains("permitEnv")) def.permitEnv.clear();
                 if (!obj.contains("advicePermissionArgs")) def.advicePermissionArgs.clear();
                 if (!obj.contains("models")) def.models.clear();
                 if (!obj.contains("adapter")) def.adapter.clear();
@@ -281,6 +301,20 @@ bool WorkerEngineRegistry::LoadFromJson(const std::string& jsonText, std::string
                     return false;
                 }
                 def.permissionArgs = obj["permissionArgs"].get<std::string>();
+            }
+            if (obj.contains("permitArgs")) {
+                if (!obj["permitArgs"].is_string()) {
+                    err = "engine '" + name + "': 'permitArgs' must be a string";
+                    return false;
+                }
+                def.permitArgs = obj["permitArgs"].get<std::string>();
+            }
+            if (obj.contains("permitEnv")) {
+                if (!obj["permitEnv"].is_string()) {
+                    err = "engine '" + name + "': 'permitEnv' must be a string";
+                    return false;
+                }
+                def.permitEnv = obj["permitEnv"].get<std::string>();
             }
             if (obj.contains("advicePermissionArgs")) {
                 if (!obj["advicePermissionArgs"].is_string()) {
@@ -412,8 +446,9 @@ bool WorkerEngineRegistry::BuildCommand(const std::string& engine,
                                         std::string& outCommand,
                                         std::string& outStreamType,
                                         std::string& err,
-                                        std::string* outAdapter,
-                                        const std::string* permissionArgsOverride) const {
+                                         std::string* outAdapter,
+                                         const std::string* permissionArgsOverride,
+                                         const std::string* permitArgsOverride) const {
     outCommand.clear();
     outStreamType.clear();
     if (outAdapter) outAdapter->clear();
@@ -436,6 +471,7 @@ bool WorkerEngineRegistry::BuildCommand(const std::string& engine,
     }
 
     ReplaceAll(cmd, "{permissionArgs}", permissionArgsOverride ? *permissionArgsOverride : def.permissionArgs);
+    ReplaceAll(cmd, "{permitArgs}", permitArgsOverride ? *permitArgsOverride : def.permitArgs);
 
     int timeoutMin = timeoutSec > 0 ? (timeoutSec + 59) / 60 : 30;
     if (timeoutMin < 1) timeoutMin = 1;
@@ -450,6 +486,94 @@ bool WorkerEngineRegistry::BuildCommand(const std::string& engine,
     outCommand = cmd;
     outStreamType = def.stream;
     return true;
+}
+
+std::string BuildWorkerPermitsJson(const nlohmann::json& approved) {
+    json out = json::object();
+    out["permits"] = approved.is_array() ? approved : json::array();
+    return out.dump();
+}
+
+std::string WorkerEngineRegistry::BuildPermitEnvironment(const std::string& engine,
+                                                          const nlohmann::json& approved,
+                                                          std::vector<std::string>& warnings) const {
+    const WorkerEngineDef* def = Find(engine);
+    if (!def) {
+        if (!approved.empty()) warnings.push_back("unknown engine '" + engine + "': permits not applied");
+        return "";
+    }
+    if (def->permitEnv.empty()) return ""; // engine has no engine-specific permission config
+    if (LowerAscii(engine) != "opencode") {
+        if (!approved.empty()) warnings.push_back("engine '" + engine + "': permit conversion is not implemented");
+        return "";
+    }
+    // opencode v1 (verified against 1.19.5 config.ts): OPENCODE_PERMISSION is JSON.parse'd and
+    // merged into `permission`, so the value must be the rules object itself (no "permission"
+    // key). A "deny" rule returns a tool error instead of prompting, so a headless session
+    // continues; "ask" in a non-interactive session would end it.
+    json external = json{{"*", "deny"}};
+    json read = json{{"*.env", "deny"}, {"*.env.*", "deny"}};
+    json edit = json::object();
+    json bash = json{{"*", "deny"}};
+    json webfetch = json{{"*", "deny"}};
+    for (const auto& row : approved) {
+        if (!row.is_object()) continue;
+        const std::string kind = row.value("kind", std::string());
+        const std::string target = permit::ExpandTarget(row.value("target", std::string()));
+        if (target.empty()) continue;
+        if (kind == "read_path") {
+            external[target] = "allow";
+            read[target] = "allow";
+        } else if (kind == "write_path") {
+            external[target] = "allow";
+            edit[target] = "allow";
+        } else if (kind == "command") {
+            bash[target] = "allow";
+        } else if (kind == "network") {
+            webfetch[target] = "allow";
+        }
+    }
+    json permission;
+    permission["external_directory"] = std::move(external);
+    permission["read"] = std::move(read);
+    permission["edit"] = std::move(edit);
+    permission["bash"] = std::move(bash);
+    permission["webfetch"] = std::move(webfetch);
+    return permission.dump();
+}
+
+std::string WorkerEngineRegistry::BuildPermitArgs(const std::string& engine,
+                                                   const nlohmann::json& approved,
+                                                   std::vector<std::string>& warnings) const {
+    const WorkerEngineDef* def = Find(engine);
+    if (!def || approved.empty()) return "";
+    if (LowerAscii(engine) != "claude") {
+        if (!def->permitEnv.empty() || def->command.find("--dangerously-skip-permissions") == std::string::npos) {
+            warnings.push_back("engine '" + engine + "': permitted paths cannot be passed as command arguments");
+        }
+        return "";
+    }
+    std::vector<std::string> args;
+    std::vector<std::string> allowed;
+    for (const auto& row : approved) {
+        if (!row.is_object()) continue;
+        const std::string kind = row.value("kind", std::string());
+        const std::string target = permit::ExpandTarget(row.value("target", std::string()));
+        if (target.empty()) continue;
+        if (kind == "read_path") {
+            args.push_back("--add-dir " + QuoteCommandArg(target));
+            allowed.push_back(QuoteCommandArg("Read(" + target + ")"));
+        } else if (kind == "write_path") {
+            args.push_back("--add-dir " + QuoteCommandArg(target));
+            allowed.push_back(QuoteCommandArg("Edit(" + target + ")"));
+        } else if (kind == "command") {
+            allowed.push_back(QuoteCommandArg("Bash(" + target + ")"));
+        } else if (kind == "network") {
+            allowed.push_back(QuoteCommandArg("WebFetch(" + target + ")"));
+        }
+    }
+    if (!allowed.empty()) args.push_back("--allowedTools " + JoinStrings(allowed, ","));
+    return JoinStrings(args, " ");
 }
 
 bool ValidateOutput(const std::string& jsonText, const std::string& outputSchemaJson, std::string& err) {
