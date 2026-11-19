@@ -108,6 +108,7 @@ The skill starts with `hancho-cli.exe help --json`, so the commands it shows alw
 | [Release Checklist](doc/release-checklist.md) | Per-release review of the graduation feature map and cleanup commands |
 | [CLI help output](doc/cli-help.md) | Full `Hancho.exe --help` and `hancho-cli.exe help` text |
 | [Hancho skill](skills/hancho/SKILL.md) | Agent skill for using Hancho well |
+| [CLAUDE.md example](doc/example-claude.md) | Example of CLAUDE.md |
 | [tools/ww](tools/ww/README-ww.md) | Optional, independent task-card runner template (not part of Hancho) |
 
 ---
