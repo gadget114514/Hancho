@@ -321,7 +321,11 @@ BtRemainingInfo BtManager::GetRemainingInfo() const {
         (void)id;
         if (!entry || !entry->tree) continue;
         const std::string& state = entry->tree->State();
-        if (state != "running" && state != "waitingForLlm" && state != "paused") continue;
+        // A failed tree is not over yet: it waits for bt_retry or for the user to close it
+        // (bt_cancel / bt_remove), so its group row stays reachable from the task list.
+        // Only succeeded and cancelled (closed) trees drop out.
+        const bool active = state == "running" || state == "waitingForLlm" || state == "paused";
+        if (!active && state != "failed") continue;
         TaskGroupInfo group;
         group.id = entry->tree->Id();
         group.state = state;
@@ -329,6 +333,7 @@ BtRemainingInfo BtManager::GetRemainingInfo() const {
         group.detail = entry->tree->Detail();
         group.taskqueue = entry->tree->TaskQueueName();
         out.groups.push_back(std::move(group));
+        if (!active) continue;  // nothing will start until it is retried
         out.pendingSec += entry->tree->PendingEstimateSec();
         std::vector<BtPlannedTask> planned = entry->tree->PlannedTasks();
         out.planned.insert(out.planned.end(), planned.begin(), planned.end());

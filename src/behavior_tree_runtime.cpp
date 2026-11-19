@@ -320,7 +320,8 @@ int64_t BehaviorTree::NextWakeMs() const {
 
 void BehaviorTree::Cancel(int64_t nowMs) {
     if (!impl_ || !impl_->root) return;
-    if (state_ == "succeeded" || state_ == "failed" || state_ == "cancelled") return;
+    // A failed tree can still be closed: it stays listed until it is retried or closed.
+    if (state_ == "succeeded" || state_ == "cancelled") return;
     impl_->CancelSubtreeJobs(*this, *impl_->root, true);
     state_ = "cancelled";
     detail_ = "cancelled";

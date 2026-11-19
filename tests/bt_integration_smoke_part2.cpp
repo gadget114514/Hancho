@@ -30,6 +30,17 @@ void RunPart2IntegrationTests(const std::wstring& tempDirW, const std::string& t
             Check(waitFail.value("state", "") == "failed",
                   "bt-tq-guard failed initially");
 
+            // A failed tree is not over: its group row stays listed (without planned work)
+            // so it can still be retried or closed from the task list.
+            auto groupState = [&](const std::string& id) {
+                for (const auto& g : h.btm->GetRemainingInfo().groups) {
+                    if (g.id == id) return g.state;
+                }
+                return std::string();
+            };
+            Check(groupState("bt-tq-guard") == "failed",
+                  "failed tree keeps its task-group row");
+
             std::string jobId = "bt-tq-guard-guarded_job-1";
             TaskQueueJob snap;
             Check(h.tqm.GetJobSnapshot(jobId, snap) && snap.bt.id == "bt-tq-guard" &&
@@ -74,6 +85,23 @@ void RunPart2IntegrationTests(const std::wstring& tempDirW, const std::string& t
             json waitGuiOk = json::parse(h.btm->Wait("bt-tq-guard", 0, 15000), nullptr, false);
             Check(waitGuiOk.value("state", "") == "succeeded",
                   "bt-tq-guard reached succeeded after GUI TaskQueueRetry forwarding");
+            Check(groupState("bt-tq-guard").empty(),
+                  "succeeded tree drops its task-group row");
+
+            // Closing a failed tree (bt_cancel) marks it cancelled and drops its row.
+            json closeDef = {
+                {"id", "bt-close-failed"},
+                {"cwd", tempDirUtf8},
+                {"root", {{"type", "job"}, {"id", "always_fail"}, {"summary", "Always fails"},
+                          {"command", "cmd.exe /c exit 1"}, {"timeoutSec", 30}}}
+            };
+            h.btm->Start(closeDef.dump());
+            json closeWait = json::parse(h.btm->Wait("bt-close-failed", 0, 15000), nullptr, false);
+            Check(closeWait.value("state", "") == "failed" && groupState("bt-close-failed") == "failed",
+                  "bt-close-failed failed and stays listed");
+            json closed = json::parse(h.btm->Cancel("bt-close-failed"), nullptr, false);
+            Check(closed.value("state", "") == "cancelled" && groupState("bt-close-failed").empty(),
+                  "Cancel(id) closes a failed tree and drops its task-group row");
         }
 
         // 8. Pause and Cancel

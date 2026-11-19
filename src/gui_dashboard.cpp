@@ -3618,7 +3618,7 @@ static std::wstring TaskQueueStateLabel(const std::string& state, const std::str
 // ---------------------------------------------------------------------------
 // Memory dialogs (doc/design-v3.md 3.11, 3.12).
 //
-// "Past runs" is the second tab of a task queue job's detail window. It lists the
+// "Past runs" is the third tab of a task queue job's detail window. It lists the
 // L1 RunRecords for the same job name, the failure-class trend and related notes.
 // The memory list lets a human retract an L2 note or promote it to L3 knowledge.
 // ---------------------------------------------------------------------------
@@ -3717,11 +3717,25 @@ static bool PromoteMemoryNoteToL3(DashboardState* dash, const std::string& id, s
     return true;
 }
 
+static void PopulateJsonTreeRecursive(
+    HWND hTree,
+    HTREEITEM hParent,
+    const nlohmann::json& j,
+    const std::string& keyName,
+    const std::string& currentPath,
+    std::unordered_map<HTREEITEM, std::string>& nodeJsonMap,
+    std::unordered_map<HTREEITEM, std::string>& nodePathMap,
+    std::unordered_map<HTREEITEM, std::wstring>& nodeTipMap,
+    int depth = 0);
+
 struct PastRunsDlgState {
     DashboardState* dash = nullptr;
     HFONT fontUi = nullptr;
     HWND tab = nullptr;
     HWND jobEdit = nullptr;
+    HWND jsonTree = nullptr;
+    HWND jsonTreePath = nullptr;
+    HWND jsonNodeEdit = nullptr;
     HWND summaryEdit = nullptr;
     HWND list = nullptr;
     HWND detailEdit = nullptr;
@@ -3736,6 +3750,10 @@ struct PastRunsDlgState {
     nlohmann::json job;
     nlohmann::json failure;
     std::vector<nlohmann::json> evidence;
+    nlohmann::json rootJson;
+    std::unordered_map<HTREEITEM, std::string> nodeJsonMap;
+    std::unordered_map<HTREEITEM, std::string> nodePathMap;
+    std::unordered_map<HTREEITEM, std::wstring> nodeTipMap;
     int activeTab = 0;
 };
 
@@ -3757,6 +3775,15 @@ static void PastRunsLayout(HWND hwnd, PastRunsDlgState* ds) {
     if (ds->activeTab == 0) {
         if (ds->jobEdit) MoveWindow(ds->jobEdit, page.left, page.top, pw, contentH, TRUE);
     } else if (ds->activeTab == 1) {
+        int treeW = (std::max)(180, pw * 44 / 100);
+        int detailX = page.left + treeW + 8;
+        int detailW = (std::max)(100, pw - treeW - 8);
+        if (ds->jsonTree) MoveWindow(ds->jsonTree, page.left, page.top, treeW, contentH, TRUE);
+        int pathH = 20;
+        if (ds->jsonTreePath) MoveWindow(ds->jsonTreePath, detailX, page.top, detailW, pathH, TRUE);
+        if (ds->jsonNodeEdit) MoveWindow(ds->jsonNodeEdit, detailX, page.top + pathH + 4,
+                                         detailW, (std::max)(40, contentH - pathH - 4), TRUE);
+    } else if (ds->activeTab == 2) {
         int sumH = (std::min)(120, (std::max)(60, contentH / 4));
         if (ds->summaryEdit) MoveWindow(ds->summaryEdit, page.left, page.top, pw, sumH, TRUE);
         int listY = page.top + sumH + 6;
@@ -3783,12 +3810,15 @@ static void PastRunsSelectTab(HWND hwnd, PastRunsDlgState* ds, int tab) {
     ds->activeTab = tab;
     if (ds->tab) TabCtrl_SetCurSel(ds->tab, tab);
     if (ds->jobEdit) ShowWindow(ds->jobEdit, tab == 0 ? SW_SHOW : SW_HIDE);
-    if (ds->summaryEdit) ShowWindow(ds->summaryEdit, tab == 1 ? SW_SHOW : SW_HIDE);
-    if (ds->list) ShowWindow(ds->list, tab == 1 ? SW_SHOW : SW_HIDE);
-    if (ds->detailEdit) ShowWindow(ds->detailEdit, tab == 1 ? SW_SHOW : SW_HIDE);
-    if (ds->whyEdit) ShowWindow(ds->whyEdit, tab == 2 ? SW_SHOW : SW_HIDE);
-    if (ds->whyList) ShowWindow(ds->whyList, tab == 2 ? SW_SHOW : SW_HIDE);
-    if (ds->whyDetail) ShowWindow(ds->whyDetail, tab == 2 ? SW_SHOW : SW_HIDE);
+    if (ds->jsonTree) ShowWindow(ds->jsonTree, tab == 1 ? SW_SHOW : SW_HIDE);
+    if (ds->jsonTreePath) ShowWindow(ds->jsonTreePath, tab == 1 ? SW_SHOW : SW_HIDE);
+    if (ds->jsonNodeEdit) ShowWindow(ds->jsonNodeEdit, tab == 1 ? SW_SHOW : SW_HIDE);
+    if (ds->summaryEdit) ShowWindow(ds->summaryEdit, tab == 2 ? SW_SHOW : SW_HIDE);
+    if (ds->list) ShowWindow(ds->list, tab == 2 ? SW_SHOW : SW_HIDE);
+    if (ds->detailEdit) ShowWindow(ds->detailEdit, tab == 2 ? SW_SHOW : SW_HIDE);
+    if (ds->whyEdit) ShowWindow(ds->whyEdit, tab == 3 ? SW_SHOW : SW_HIDE);
+    if (ds->whyList) ShowWindow(ds->whyList, tab == 3 ? SW_SHOW : SW_HIDE);
+    if (ds->whyDetail) ShowWindow(ds->whyDetail, tab == 3 ? SW_SHOW : SW_HIDE);
     PastRunsLayout(hwnd, ds);
 }
 
@@ -4046,17 +4076,46 @@ static LRESULT CALLBACK PastRunsWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPAR
                 12, 12, 760, 480, hwnd, (HMENU)2700, nullptr, nullptr);
             TCITEMW tie = {};
             tie.mask = TCIF_TEXT;
-            tie.pszText = const_cast<wchar_t*>(Tr(L"ジョブ", L"Job", L"Trabajo"));
+            tie.pszText = const_cast<wchar_t*>(Tr(L"生 JSON", L"Raw JSON", L"JSON sin formato"));
             TabCtrl_InsertItem(ds->tab, 0, &tie);
-            tie.pszText = const_cast<wchar_t*>(Tr(L"過去の実行", L"Past runs", L"Ejecuciones"));
+            tie.pszText = const_cast<wchar_t*>(Tr(L"JSON ツリー", L"JSON Tree", L"Árbol JSON"));
             TabCtrl_InsertItem(ds->tab, 1, &tie);
-            tie.pszText = const_cast<wchar_t*>(Tr(L"なぜ失敗したか", L"Why failed", L"Por qué falló"));
+            tie.pszText = const_cast<wchar_t*>(Tr(L"過去の実行", L"Past runs", L"Ejecuciones"));
             TabCtrl_InsertItem(ds->tab, 2, &tie);
+            tie.pszText = const_cast<wchar_t*>(Tr(L"なぜ失敗したか", L"Why failed", L"Por qué falló"));
+            TabCtrl_InsertItem(ds->tab, 3, &tie);
 
             ds->jobEdit = CreateWindowExW(WS_EX_CLIENTEDGE, L"EDIT", Utf8ToWide(ds->jobJson).c_str(),
                 WS_CHILD | WS_VISIBLE | WS_VSCROLL | WS_HSCROLL | ES_MULTILINE | ES_READONLY |
                     ES_AUTOVSCROLL | ES_AUTOHSCROLL,
                 20, 60, 700, 360, hwnd, (HMENU)2701, nullptr, nullptr);
+
+            ds->jsonTree = CreateWindowExW(WS_EX_CLIENTEDGE, WC_TREEVIEWW, L"",
+                WS_CHILD | TVS_HASLINES | TVS_LINESATROOT | TVS_HASBUTTONS | TVS_SHOWSELALWAYS | TVS_INFOTIP,
+                20, 60, 300, 360, hwnd, (HMENU)2708, nullptr, nullptr);
+            TreeView_SetBkColor(ds->jsonTree, g_theme.panel);
+            TreeView_SetTextColor(ds->jsonTree, g_theme.listText);
+            TreeView_SetLineColor(ds->jsonTree, g_theme.border);
+
+            ds->jsonTreePath = CreateWindowExW(0, L"STATIC", L"", WS_CHILD,
+                330, 60, 380, 20, hwnd, nullptr, nullptr, nullptr);
+
+            ds->jsonNodeEdit = CreateWindowExW(WS_EX_CLIENTEDGE, L"EDIT", L"",
+                WS_CHILD | WS_VSCROLL | WS_HSCROLL | ES_MULTILINE | ES_READONLY |
+                    ES_AUTOVSCROLL | ES_AUTOHSCROLL,
+                330, 84, 380, 336, hwnd, (HMENU)2709, nullptr, nullptr);
+
+            ds->rootJson = nlohmann::json::parse(ds->jobJson, nullptr, false);
+            if (ds->rootJson.is_discarded()) ds->rootJson = nlohmann::json();
+            if (!ds->rootJson.is_null()) {
+                SendMessageW(ds->jsonTree, WM_SETREDRAW, FALSE, 0);
+                PopulateJsonTreeRecursive(ds->jsonTree, TVI_ROOT, ds->rootJson, "root", "root",
+                                          ds->nodeJsonMap, ds->nodePathMap, ds->nodeTipMap, 0);
+                SendMessageW(ds->jsonTree, WM_SETREDRAW, TRUE, 0);
+                InvalidateRect(ds->jsonTree, nullptr, TRUE);
+                SetWindowTextW(ds->jsonNodeEdit,
+                    NormalizeCrLfWide(ds->rootJson.dump(2, ' ', false, nlohmann::json::error_handler_t::replace)).c_str());
+            }
 
             ds->summaryEdit = CreateWindowExW(WS_EX_CLIENTEDGE, L"EDIT", L"",
                 WS_CHILD | WS_VSCROLL | ES_MULTILINE | ES_READONLY | ES_AUTOVSCROLL,
@@ -4099,7 +4158,8 @@ static LRESULT CALLBACK PastRunsWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPAR
                 Tr(L"タスク詳細ダイアログを閉じます。", L"Closes the task details dialog.",
                    L"Cierra el diálogo de detalles de la tarea."));
 
-            HWND controls[] = {ds->tab, ds->jobEdit, ds->summaryEdit, ds->list, ds->detailEdit,
+            HWND controls[] = {ds->tab, ds->jobEdit, ds->jsonTree, ds->jsonTreePath, ds->jsonNodeEdit,
+                               ds->summaryEdit, ds->list, ds->detailEdit,
                                ds->whyEdit, ds->whyList, ds->whyDetail, ds->btnClose};
             for (HWND h : controls) {
                 if (h && ds->fontUi) SendMessageW(h, WM_SETFONT, reinterpret_cast<WPARAM>(ds->fontUi), TRUE);
@@ -4107,7 +4167,7 @@ static LRESULT CALLBACK PastRunsWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPAR
 
             PastRunsLoad(ds);
             WhyLoad(ds);
-            PastRunsSelectTab(hwnd, ds, ds->activeTab == 1 ? 1 : ds->activeTab == 2 ? 2 : 0);
+            PastRunsSelectTab(hwnd, ds, ds->activeTab);
             ApplyNativeThemeToWindow(hwnd);
             return 0;
         }
@@ -4117,6 +4177,30 @@ static LRESULT CALLBACK PastRunsWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPAR
             if (nm && nm->hwndFrom == ds->tab && nm->code == TCN_SELCHANGE) {
                 PastRunsSelectTab(hwnd, ds, TabCtrl_GetCurSel(ds->tab));
                 return 0;
+            }
+            if (nm && nm->hwndFrom == ds->jsonTree) {
+                if (nm->code == TVN_SELCHANGEDW) {
+                    HTREEITEM hSel = reinterpret_cast<NMTREEVIEWW*>(lParam)->itemNew.hItem;
+                    if (hSel && ds->jsonNodeEdit) {
+                        auto it = ds->nodeJsonMap.find(hSel);
+                        if (it != ds->nodeJsonMap.end())
+                            SetWindowTextW(ds->jsonNodeEdit, NormalizeCrLfWide(it->second).c_str());
+                    }
+                    if (hSel && ds->jsonTreePath) {
+                        auto it = ds->nodePathMap.find(hSel);
+                        std::wstring path = (it != ds->nodePathMap.end()) ? Utf8ToWide(it->second) : L"root";
+                        SetWindowTextW(ds->jsonTreePath,
+                            (std::wstring(Tr(L"JSON パス: ", L"JSON Path: ", L"Ruta JSON: ")) + path).c_str());
+                    }
+                    return 0;
+                }
+                if (nm->code == TVN_GETINFOTIPW) {
+                    auto* tip = reinterpret_cast<NMTVGETINFOTIPW*>(lParam);
+                    auto it = ds->nodeTipMap.find(tip->hItem);
+                    if (it != ds->nodeTipMap.end() && tip->pszText && tip->cchTextMax > 0)
+                        wcsncpy_s(tip->pszText, static_cast<size_t>(tip->cchTextMax), it->second.c_str(), _TRUNCATE);
+                    return 0;
+                }
             }
             if (nm && nm->hwndFrom == ds->list && nm->code == LVN_GETINFOTIPW) {
                 auto* tip = reinterpret_cast<NMLVGETINFOTIPW*>(lParam);
@@ -4200,9 +4284,9 @@ static void ShowTaskQueueJobDetails(DashboardState* st, const std::string& jobId
         gui_platform::GetGuiPlatform()->ShowMessageBox(
             st->hwndMain,
             Tr(L"タスクグループ", L"Task Group", L"Grupo de tareas"),
-            Tr(L"これは活動中のタスクグループです。「予定 (未登録)」行はこのグループに属します。\nグループの状態や進み具合はタスクグループ表示で確認できます。",
-               L"This is an active task group. The \"planned\" rows belong to it.\nOpen the task group view to see its state and progress.",
-               L"Este es un grupo de tareas activo. Las filas «previstas» le pertenecen.\nAbre la vista del grupo para ver su estado y progreso."),
+            Tr(L"これはタスクグループです。「予定 (未登録)」行はこのグループに属します。\nグループの状態や進み具合はタスクグループ表示で確認できます。\n失敗したグループは、再実行するか closed にするまで一覧に残ります。",
+               L"This is a task group. The \"planned\" rows belong to it.\nOpen the task group view to see its state and progress.\nA failed group stays in the list until you retry or close it.",
+               L"Este es un grupo de tareas. Las filas «previstas» le pertenecen.\nAbre la vista del grupo para ver su estado y progreso.\nUn grupo fallido permanece en la lista hasta que lo reintentes o cierres."),
             gui_platform::MessageBoxType::Info,
             false);
         return;
@@ -4230,7 +4314,7 @@ static void ShowTaskQueueJobDetails(DashboardState* st, const std::string& jobId
     ds->jobName = job.is_object() ? job.value("name", std::string()) : std::string();
     if (ds->jobName.empty()) ds->jobName = jobId;
     ds->taskqueue = job.is_object() ? job.value("taskqueue", std::string()) : std::string();
-    ds->activeTab = initialTab == 1 ? 1 : initialTab == 2 ? 2 : 0;
+    ds->activeTab = (initialTab >= 0 && initialTab <= 3) ? initialTab : 0;
 
     HINSTANCE hInst = GetModuleHandleW(nullptr);
     static bool registered = false;
@@ -5647,7 +5731,15 @@ static void ShowTaskQueueContextMenu(DashboardState* st, const std::string& jobI
     AppendMenuW(hMenu, MF_SEPARATOR, 0, nullptr);
     if (virtualJob) {
         HMENU hAnswerMenu = nullptr;
-        if (groupRow) {
+        // A failed group stays listed until it is retried or closed; answering and pausing
+        // only apply while it is still running.
+        const bool groupFailed = groupRow && btWait.state == "failed";
+        if (groupFailed) {
+            AppendMenuW(hMenu, MF_STRING, 3211,
+                        Tr(L"失敗した枝からタスクグループを再実行",
+                           L"Retry the task group from the failed branch",
+                           L"Reintentar el grupo desde la rama fallida"));
+        } else if (groupRow) {
             // Always available: the cause may be a rate limit, auth, a provider outage, a
             // hung request, a context limit, or something else on the LLM side. The dialog
             // shows what was found and offers answer / retry / wait.
@@ -5772,7 +5864,9 @@ static void ShowTaskQueueContextMenu(DashboardState* st, const std::string& jobI
             ShowBtAnswerDialog(st, btWait, groupId);
         } else if (cmd == 3211) {
             std::wstring retryErr;
-            if (SubmitBtRetry(st, virtualBtId, btWait.retryNode, retryErr)) {
+            // A failed tree finds its own deepest failed node; a job's recorded failure may be
+            // an older one the tree already absorbed.
+            if (SubmitBtRetry(st, virtualBtId, groupFailed ? std::string() : btWait.retryNode, retryErr)) {
                 ShowTaskQueueResult(
                     st, Tr(L"枝を再実行", L"Branch retry", L"Reintento de rama"),
                     Tr(L"止まっていた枝を再実行しました。結果はタスク一覧に反映されます。",
@@ -6079,9 +6173,9 @@ static void ShowTaskQueueContextMenu(DashboardState* st, const std::string& jobI
     } else if (cmd == 3106) {
         ShowTaskQueueJobDetails(st, jobId);
     } else if (cmd == 3112) {
-        ShowTaskQueueJobDetails(st, jobId, 1);
-    } else if (cmd == 3114) {
         ShowTaskQueueJobDetails(st, jobId, 2);
+    } else if (cmd == 3114) {
+        ShowTaskQueueJobDetails(st, jobId, 3);
     } else if (cmd == 3113) {
         ShowMemoryListDialog(st);
     } else if (cmd == 3115) {
@@ -7727,7 +7821,7 @@ static void PopulateJsonTreeRecursive(
     std::unordered_map<HTREEITEM, std::string>& nodeJsonMap,
     std::unordered_map<HTREEITEM, std::string>& nodePathMap,
     std::unordered_map<HTREEITEM, std::wstring>& nodeTipMap,
-    int depth = 0
+    int depth
 ) {
     TVINSERTSTRUCTW tvis = {};
     tvis.hParent = hParent;
@@ -18059,7 +18153,7 @@ static LRESULT CALLBACK TriageWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM
                     }
                 }
                 if (!path.empty()) ShellExecuteW(hwnd, L"open", path.c_str(), nullptr, nullptr, SW_SHOWNORMAL);
-                else ShowTaskQueueJobDetails(ds->dash, jobId, 2);
+                else ShowTaskQueueJobDetails(ds->dash, jobId, 3);
             }
             return 0;
         }

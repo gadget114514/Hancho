@@ -2657,8 +2657,10 @@ TASK QUEUE:
       Idle BT leaves appear as provisional "planned" rows so the queue shows the
       work a running tree may start; --no-planned hides them and the task-group
       row. The active task group (the BT root) is also a virtual row with id
-      "group:<id>" and state running, waitingForLlm or paused. Neither row is a
-      stored job; both disappear when the tree moves on or finishes.
+      "group:<id>" and state running, waitingForLlm, paused or failed. Neither row
+      is a stored job. Planned rows disappear when the tree moves on; the group row
+      stays until the tree succeeds or is closed (a failed tree waits for bt retry,
+      bt cancel or bt remove).
 
   taskqueue record-plain --cmd <cmd> [--name <name>] [--exit-code <n>] [--log <path>] [--summary <text>]
       Record a plain execution outside a queue into logs/taskqueues/plain.json.
@@ -3461,7 +3463,7 @@ void PrintCliUsageJson() {
       "pending": "Not in the run queue yet; dependencies are not satisfied.",
       "blocked": "A success-dependency failed/cancelled; fix and retry the dependency.",
       "planned": "Provisional row for an idle job/worker leaf of a running behavior tree. It is not a stored queue job and disappears when the tree changes branch or finishes. taskqueue_list includes it by default; set include_planned: false (CLI --no-planned) to omit it and the task-group row.",
-      "taskGroup": "The active task group (the BT root) is a virtual row with id 'group:<id>' and state running, waitingForLlm or paused. It is re-derived on every query and disappears together with its planned rows when the group finishes. It is not a queue job; read it with bt_get and answer a waitingForLlm group with bt_resume. include_planned: false (CLI --no-planned) hides it too.",
+      "taskGroup": "The task group (the BT root) is a virtual row with id 'group:<id>' and state running, waitingForLlm, paused or failed. It is re-derived on every query and stays until the group succeeds or is closed; a failed group waits for bt_retry, bt_cancel or bt_remove. It is not a queue job; read it with bt_get and answer a waitingForLlm group with bt_resume. include_planned: false (CLI --no-planned) hides it too.",
       "running": "An attempt is executing.",
       "succeeded": "Success conditions met.",
       "failed": "Attempts exhausted or launch failed.",
