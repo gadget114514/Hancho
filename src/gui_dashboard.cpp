@@ -15674,7 +15674,6 @@ static void DrawUsagePanel(HWND hwnd, HDC hdc, DashboardState* st) {
 
     int nBuckets = 12;
     double bucketSec = 1.0;
-    int64_t windowStartBucket = 0;
     std::vector<std::vector<uint64_t>> vals;
     std::vector<std::vector<uint64_t>> valIn;
     std::vector<std::vector<uint64_t>> valOut;
@@ -15683,25 +15682,66 @@ static void DrawUsagePanel(HWND hwnd, HDC hdc, DashboardState* st) {
     std::vector<uint64_t> bucketTotal;
 
     if (rangeIdx <= 1) {
-        // 4h / 24h: live U0 points (fallback to today's daily log if in-memory history empty)
+        // 4h / 24h: live U0 points. Buckets are aligned to the axis: bucket i covers
+        // [since + i*bucketSec, since + (i+1)*bucketSec), so bars line up with the labels.
+        int gx0_tmp = 58;
+        int colW_tmp = (w - 24) / 3;
+        if (colW_tmp < 1) colW_tmp = 1;
+        int graphW_tmp = (12 + colW_tmp - 8) - gx0_tmp;
+        if (graphW_tmp < 1) graphW_tmp = 1;
+        nBuckets = graphW_tmp / 7;
+        if (nBuckets < 12) nBuckets = 12;
+        if (nBuckets > 96) nBuckets = 96;
+        bucketSec = static_cast<double>(kUsageRangeSec[rangeIdx]) / nBuckets;
+        if (bucketSec < 1.0) bucketSec = 1.0;
+
         std::vector<LlmUsagePoint> points = GetLlmUsageHistory(since);
         if (points.empty()) {
+            // Daily rollups have no intra-day timestamps. Spread each record over the buckets
+            // between its first and last event instead of piling it all on the first second.
             auto daily = ReadDailyUsageSummary("24h", "");
+            auto split = [](uint64_t total, int index, int count) -> uint64_t {
+                return total * (index + 1) / count - total * index / count;
+            };
             for (const auto& d : daily) {
-                LlmUsagePoint pt;
-                pt.epochSec = d.firstEpochSec > 0 ? d.firstEpochSec : now;
-                if (pt.epochSec < since) pt.epochSec = since;
-                if (pt.epochSec > now) pt.epochSec = now;
-                pt.inputTokens = d.inputTokens;
-                pt.outputTokens = d.outputTokens;
-                pt.thinkingTokens = d.thinkingTokens;
-                pt.cacheReadTokens = d.cacheReadTokens;
-                pt.cacheWriteTokens = d.cacheWriteTokens;
-                pt.totalTokens = d.totalTokens;
-                pt.costUsd = d.costUsd;
-                pt.agentType = d.engine;
-                pt.model = d.model;
-                points.push_back(pt);
+                int64_t first = d.firstEpochSec > 0 ? d.firstEpochSec : now;
+                int64_t last = d.lastEpochSec >= first ? d.lastEpochSec : first;
+                if (last < since || first > now) continue;
+                int64_t fullFirst = first;
+                int64_t fullLast = last;
+                if (first < since) first = since;
+                if (last > now) last = now;
+                if (last < first) last = first;
+                double overlap = (fullLast > fullFirst)
+                    ? static_cast<double>(last - first + 1) / static_cast<double>(fullLast - fullFirst + 1)
+                    : 1.0;
+                if (overlap > 1.0) overlap = 1.0;
+                auto scale = [overlap](uint64_t v) -> uint64_t {
+                    return overlap >= 1.0 ? v : static_cast<uint64_t>(std::llround(static_cast<double>(v) * overlap));
+                };
+                int chunks = 1;
+                if (bucketSec > 0.0) {
+                    double span = static_cast<double>(last - first) + 1.0;
+                    chunks = static_cast<int>(std::ceil(span / bucketSec));
+                    if (chunks < 1) chunks = 1;
+                    if (chunks > nBuckets) chunks = nBuckets;
+                }
+                for (int c = 0; c < chunks; ++c) {
+                    int64_t t0 = first + (last - first) * c / chunks;
+                    int64_t t1 = first + (last - first) * (c + 1) / chunks;
+                    LlmUsagePoint pt;
+                    pt.epochSec = (t0 + t1) / 2;
+                    pt.inputTokens = split(scale(d.inputTokens), c, chunks);
+                    pt.outputTokens = split(scale(d.outputTokens), c, chunks);
+                    pt.thinkingTokens = split(scale(d.thinkingTokens), c, chunks);
+                    pt.cacheReadTokens = split(scale(d.cacheReadTokens), c, chunks);
+                    pt.cacheWriteTokens = split(scale(d.cacheWriteTokens), c, chunks);
+                    pt.totalTokens = split(scale(d.totalTokens), c, chunks);
+                    pt.costUsd = d.costUsd * overlap / chunks;
+                    pt.agentType = d.engine;
+                    pt.model = d.model;
+                    points.push_back(pt);
+                }
             }
         }
         for (const auto& p : points) {
@@ -15720,19 +15760,6 @@ static void DrawUsagePanel(HWND hwnd, HDC hdc, DashboardState* st) {
             if (p.epochSec > keys[idx].lastEpochSec) keys[idx].lastEpochSec = p.epochSec;
         }
 
-        int gx0_tmp = 58;
-        int colW_tmp = (w - 24) / 3;
-        if (colW_tmp < 1) colW_tmp = 1;
-        int graphW_tmp = (12 + colW_tmp - 8) - gx0_tmp;
-        if (graphW_tmp < 1) graphW_tmp = 1;
-        nBuckets = graphW_tmp / 7;
-        if (nBuckets < 12) nBuckets = 12;
-        if (nBuckets > 96) nBuckets = 96;
-        bucketSec = static_cast<double>(kUsageRangeSec[rangeIdx]) / nBuckets;
-        if (bucketSec < 1.0) bucketSec = 1.0;
-        int64_t currentBucket = static_cast<int64_t>(now / bucketSec);
-        windowStartBucket = currentBucket - nBuckets + 1;
-
         vals.assign(nBuckets, std::vector<uint64_t>(keys.size(), 0));
         valIn.assign(nBuckets, std::vector<uint64_t>(keys.size(), 0));
         valOut.assign(nBuckets, std::vector<uint64_t>(keys.size(), 0));
@@ -15740,13 +15767,11 @@ static void DrawUsagePanel(HWND hwnd, HDC hdc, DashboardState* st) {
         valCache.assign(nBuckets, std::vector<uint64_t>(keys.size(), 0));
         bucketTotal.assign(nBuckets, 0);
 
-        int64_t windowStartSec = static_cast<int64_t>(windowStartBucket * bucketSec);
         for (const auto& p : points) {
             int64_t pe = p.epochSec;
-            if (pe < windowStartSec) pe = windowStartSec;
+            if (pe < since) pe = since;
             if (pe > now) pe = now;
-            int64_t pb = static_cast<int64_t>(pe / bucketSec);
-            int bi = static_cast<int>(pb - windowStartBucket);
+            int bi = static_cast<int>(static_cast<double>(pe - since) / bucketSec);
             if (bi < 0) bi = 0;
             if (bi >= nBuckets) bi = nBuckets - 1;
             std::string name = p.agentType.empty() ? "unknown" : p.agentType;
@@ -15971,10 +15996,6 @@ static void DrawUsagePanel(HWND hwnd, HDC hdc, DashboardState* st) {
     if (selStart > 0 && !keys.empty()) {
         int64_t ws = since;
         int64_t we = now;
-        if (rangeIdx <= 1) {
-            ws = static_cast<int64_t>(windowStartBucket * bucketSec);
-            we = ws + static_cast<int64_t>(nBuckets * bucketSec);
-        }
         int64_t s = std::max(selStart, ws);
         int64_t e = std::min(selEnd > 0 ? selEnd : now, we);
         if (e > s && we > ws) {

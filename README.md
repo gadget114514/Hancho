@@ -121,6 +121,10 @@ The application icons are modeled on the character "Telephone Cat" (電話猫, D
 
 
 
+### v0.9.36
+- **Usage panel time axis**: the 4h/24h token-usage bars now line up with the axis labels. Previously the bars were aligned to fixed two-hour boundaries while the labels showed `now - range` to `now`, so the whole chart could be shifted by up to one bucket.
+- **Usage fallback after a restart**: when the in-memory usage history is empty, daily rollups are now spread over the time they cover instead of being placed at the first event of the day. Records outside the selected range are skipped and partially overlapping ones are scaled to the visible portion, so the 4h view no longer shows a full day's tokens in the leftmost bar.
+
 ### v0.9.35
 - **Task details: raw JSON and JSON tree tabs**: the task details window now offers a "Raw JSON" tab and a "JSON Tree" tab. The tree expands objects and arrays; selecting a node shows that node's JSON and JSON path in the pane beside it. "Past runs" and "Why failed" remain available.
 - **Failed task groups stay listed**: a failed behavior tree is not finished yet — its `group:` row remains in the task list so it can be retried or closed (`bt_retry` / `bt_cancel` / `bt_remove`). Planned rows disappear until the tree moves on. The CLI state documentation was updated to match.
