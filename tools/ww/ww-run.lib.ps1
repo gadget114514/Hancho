@@ -86,15 +86,18 @@ function Get-OpencodeRuns { Get-WorkerRuns }
 # The command ww-run runs (inside a child powershell) for each engine. $Model is passed only when
 # set; agy has a default model. The prompt is read from a UTF-8 file into $prompt by the caller.
 function Get-EngineCommand {
-    param([Parameter(Mandatory = $true)][string]$Engine, [string]$Model = "", [string]$Agent = "")
+    param([Parameter(Mandatory = $true)][string]$Engine, [string]$Model = "", [string]$Agent = "", [string]$Resume = "")
     $m = $Model.Replace("'", "''")
+    $resumeId = $Resume.Replace("'", "''")
+    $opencodeResume = if ($Resume) { " --session '$resumeId'" } else { "" }
+    $claudeResume = if ($Resume) { " --resume '$resumeId'" } else { "" }
     # -Agent names a Claude Code agent definition (.claude/agents/<name>.md). Only claude takes it.
     if ($Agent -and $Engine -ne 'claude') { throw "-Agent is only supported with -Engine claude (engine: $Engine)" }
     if ($Agent -and $Agent -notmatch '^[A-Za-z0-9][A-Za-z0-9_-]*$') { throw "invalid agent name '$Agent' (letters, digits, '-' and '_')" }
     switch ($Engine) {
-        'opencode' { return "& opencode.cmd run --format json$(if ($Model) { " --model '$m'" }) `$prompt" }
+        'opencode' { return "& opencode.cmd run --format json$(if ($Model) { " --model '$m'" })$opencodeResume `$prompt" }
         'agy'      { return "& agy.exe -p `$prompt --output-format stream-json --model '$(if ($Model) { $m } else { 'gemini-3.8-flash-medium' })' --dangerously-skip-permissions --print-timeout 180m" }
-        'claude'   { return "& claude -p `$prompt --output-format stream-json --verbose --dangerously-skip-permissions$(if ($Model) { " --model '$m'" })$(if ($Agent) { " --agent $Agent" })" }
+        'claude'   { return "& claude -p `$prompt --output-format stream-json --verbose --dangerously-skip-permissions$(if ($Model) { " --model '$m'" })$(if ($Agent) { " --agent $Agent" })$claudeResume" }
         'codex'    { return "& codex exec --json --dangerously-bypass-approvals-and-sandbox$(if ($Model) { " --model '$m'" }) `$prompt" }
     }
     throw "unknown engine '$Engine' (agy, opencode, claude, codex)"

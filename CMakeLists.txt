@@ -71,6 +71,10 @@ set(HANCHO_SOURCES
     src/behavior_tree_state.cpp
     src/behavior_tree_runtime.cpp
     src/worker_engines.cpp
+    src/llm_config.cpp
+    src/permit_config.cpp
+    src/worker_probe.cpp
+    src/engine_health.cpp
     src/bt_manager.cpp
     src/bt_manager_api.cpp
     src/gui_dashboard.cpp
@@ -192,8 +196,14 @@ add_executable(hancho-cli
     src/llm_stream_opencode.cpp
     src/llm_stream_agy.cpp
     src/llm_stream_codex.cpp
+    src/worker_engines.cpp
+    src/llm_config.cpp
+    src/permit_config.cpp
+    src/worker_probe.cpp
+    src/engine_health.cpp
     src/event_schema.cpp
     src/common.cpp
+    src/platform/platform_windows.cpp
     src/power.cpp
     src/hancho-cli.rc
     src/agent_template.rc
@@ -350,6 +360,11 @@ add_dependencies(wct_smoke wct)
 add_executable(taskqueue_smoke
     tests/taskqueue_smoke.cpp
     src/taskqueue.cpp
+    src/worker_engines.cpp
+    src/worker_probe.cpp
+    src/engine_health.cpp
+    src/llm_config.cpp
+    src/permit_config.cpp
     src/chain_guard.cpp
     src/process_manager.cpp
     src/platform/platform_windows.cpp
@@ -651,6 +666,10 @@ target_link_libraries(bt_debug_view_smoke PRIVATE
 add_executable(worker_engines_smoke
     tests/worker_engines_smoke.cpp
     src/worker_engines.cpp
+    src/llm_config.cpp
+    src/permit_config.cpp
+    src/worker_probe.cpp
+    src/engine_health.cpp
     src/platform/platform_windows.cpp
     src/common.cpp
 )
@@ -678,6 +697,7 @@ add_executable(triage_smoke
     src/triage.cpp
     src/triage_text.cpp
     src/worker_engines.cpp
+    src/permit_config.cpp
     src/platform/platform_windows.cpp
     src/common.cpp
 )
@@ -712,6 +732,7 @@ add_executable(behavior_tree_smoke
     src/behavior_tree_state.cpp
     src/behavior_tree_runtime.cpp
     src/worker_engines.cpp
+    src/permit_config.cpp
     src/platform/platform_windows.cpp
     src/bt_debug_view.cpp
     src/common.cpp
@@ -736,6 +757,41 @@ target_link_libraries(behavior_tree_smoke PRIVATE
     crypt32
 )
 
+# Regression tests for BT retry, escalation and LLM-boundary behavior (tests/bt_regression_smoke.cpp).
+add_executable(bt_regression_smoke
+    tests/bt_regression_smoke.cpp
+    src/behavior_tree.cpp
+    src/behavior_tree_parse.cpp
+    src/behavior_tree_vars.cpp
+    src/behavior_tree_cond.cpp
+    src/behavior_tree_exec.cpp
+    src/behavior_tree_escalate.cpp
+    src/behavior_tree_state.cpp
+    src/behavior_tree_runtime.cpp
+    src/worker_engines.cpp
+    src/permit_config.cpp
+    src/platform/platform_windows.cpp
+    src/bt_debug_view.cpp
+    src/common.cpp
+)
+
+target_include_directories(bt_regression_smoke PRIVATE
+    src
+    include
+)
+
+if(MSVC)
+    target_compile_options(bt_regression_smoke PRIVATE /W4 /utf-8 /EHsc)
+endif()
+
+target_link_libraries(bt_regression_smoke PRIVATE
+    user32
+    shell32
+    advapi32
+    psapi
+    crypt32
+)
+
 # Headless integration test for BtManager + TaskQueueManager + ProcessManager.
 add_executable(bt_integration_smoke
     tests/bt_integration_smoke.cpp
@@ -751,6 +807,10 @@ add_executable(bt_integration_smoke
     src/behavior_tree_state.cpp
     src/behavior_tree_runtime.cpp
     src/worker_engines.cpp
+    src/llm_config.cpp
+    src/permit_config.cpp
+    src/worker_probe.cpp
+    src/engine_health.cpp
     src/platform/platform_windows.cpp
     src/taskqueue.cpp
     src/triage.cpp
@@ -829,6 +889,10 @@ add_executable(bt_ipc_smoke
     src/behavior_tree_state.cpp
     src/behavior_tree_runtime.cpp
     src/worker_engines.cpp
+    src/llm_config.cpp
+    src/permit_config.cpp
+    src/worker_probe.cpp
+    src/engine_health.cpp
     src/platform/platform_windows.cpp
     src/taskqueue.cpp
     src/triage.cpp
@@ -1086,6 +1150,10 @@ add_executable(webui_config_smoke
     src/behavior_tree_state.cpp
     src/behavior_tree_runtime.cpp
     src/worker_engines.cpp
+    src/llm_config.cpp
+    src/permit_config.cpp
+    src/worker_probe.cpp
+    src/engine_health.cpp
     src/platform/platform_windows.cpp
     src/taskqueue.cpp
     src/triage.cpp
@@ -1185,6 +1253,8 @@ else()
         src/platform/platform_posix.cpp
         src/process_manager_posix.cpp
         src/taskqueue.cpp
+        src/llm_config.cpp
+        src/permit_config.cpp
         src/triage.cpp
         src/triage_manager.cpp
         src/chain_guard_posix.cpp
@@ -1219,6 +1289,11 @@ else()
         src/behavior_tree_state.cpp
         src/behavior_tree_runtime.cpp
         src/worker_engines.cpp
+        src/llm_config.cpp
+        src/permit_config.cpp
+        src/worker_probe.cpp
+        src/engine_health.cpp
+    src/engine_health.cpp
         src/bt_manager.cpp
         src/bt_manager_api.cpp
     )
@@ -1244,6 +1319,12 @@ else()
         src/llm_stream_opencode.cpp
         src/llm_stream_agy.cpp
         src/llm_stream_codex.cpp
+        src/worker_engines.cpp
+        src/llm_config.cpp
+        src/permit_config.cpp
+        src/worker_probe.cpp
+        src/engine_health.cpp
+    src/engine_health.cpp
         src/event_schema.cpp
         src/common_posix.cpp
         src/power.cpp

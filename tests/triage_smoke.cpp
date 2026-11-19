@@ -165,6 +165,67 @@ int main() {
               "stalled timeout recommends investigation");
     }
 
+    // 2.5 startup_hang recommendation is not investigate (090-1)
+    {
+        TriageInputs in;
+        json job = TimeoutJob(50);
+        job["failure"]["class"] = "startup_hang";
+        job["failure"]["suggestedAction"] = "retry_with_change";
+        job["failure"]["likelyCauses"] = json::array({
+            {{"id", "no_model"}, {"why", "opencode was launched without --model"}}
+        });
+        job["failure"]["nextSteps"] = json::array({
+            {{"action", "retry"}}
+        });
+        in.jobs = json::array({job});
+        in.now = now;
+        const json card = BuildTriageCandidates(in).front();
+        Check(card["recommendation"]["candidateId"] != "investigate",
+              "startup_hang recommendation is not investigate");
+        Check(card["recommendation"]["candidateId"] == "retry",
+              "startup_hang with retry in nextSteps recommends retry");
+        Check(card["recommendation"]["rationale"].get<std::string>().find("no_model") != std::string::npos,
+              "startup_hang rationale includes no_model");
+    }
+
+    // 2.6 091-7: a permission denial recommends fixing the spec, not a blind retry. A job held
+    // in waitingForPermit is not a failure (design 8.8): it is notified on the permits page and
+    // auto-resumed on approval, so triage must not create a failure card for it.
+    {
+        json job = TimeoutJob(50);
+        job["failure"]["class"] = "permission_denied";
+        job["failure"]["confidence"] = "high";
+        job["failure"]["suggestedAction"] = "fix_spec";
+        job["failure"]["nextSteps"] = json::array({
+            {{"action", "fix_spec"}},
+            {{"action", "permit_request"}, {"change", {{"kind", "read_path"}, {"target", "C:/outside"}}}}
+        });
+        TriageInputs in;
+        in.jobs = json::array({job});
+        in.now = now;
+        const json cards = BuildTriageCandidates(in);
+        if (cards.empty()) {
+            Check(false, "permission_denied produces a triage card");
+        } else {
+            const json& card = cards.front();
+            Check(card["recommendation"]["candidateId"] == "fix_spec",
+                  "permission_denied recommends fix_spec");
+            Check(card["recommendation"]["rationaleKey"] == "permissionDenied",
+                  "permission_denied has its own rationale key");
+            Check(card["recommendation"]["rationale"].get<std::string>().find("permit request") !=
+                      std::string::npos,
+                  "permission_denied rationale mentions the permit request");
+        }
+
+        json held = job;
+        held["state"] = "waitingForPermit";
+        TriageInputs heldIn;
+        heldIn.jobs = json::array({held});
+        heldIn.now = now;
+        Check(BuildTriageCandidates(heldIn).empty(),
+              "waitingForPermit job produces no triage card (held, not failed)");
+    }
+
     // 3. Consecutive timeout attempts are treated as a repeated pattern.
     {
         TriageInputs in;

@@ -6,6 +6,8 @@
 #include "taskqueue.h"
 #include "triage.h"
 #include "worker_engines.h"
+#include "llm_config.h"
+#include "engine_health.h"
 
 #include <algorithm>
 #include <chrono>
@@ -1092,7 +1094,8 @@ void TriageManager::UpdateOutcomesLocked(const json& jobs, const json& btStates)
                             return GetString(candidate, "id") == cardId->second;
                         });
                         if (failedCard == store_["cards"].end() || !IsClosedCard(*failedCard)) branchClosed = false;
-                    } else if (state != "succeeded" && state != "cancelled" && state != "closed") {
+                    } else if (state != "succeeded" && state != "cancelled" && state != "closed" &&
+                               state != "takenOver") {
                         branchClosed = false;
                     }
                 }
@@ -1263,6 +1266,32 @@ std::string TriageManager::Handoff(const std::vector<std::string>& ids, bool all
         timeoutSec = supervisorTimeoutSec_;
     }
     if (cards.empty()) return Error("no pending card to hand off (or it is already with a supervisor)").dump();
+
+    // 091-6: the supervisor obeys the same health constraint. Approved rows from the
+    // `supervisor` list are tried in rank order; a down engine is skipped. If all are down,
+    // the hand-off waits instead of launching a supervisor that cannot answer.
+    {
+        llm::Config cfg;
+        std::string cfgErr;
+        if (llm::Load(llm::DefaultPath(), cfg, cfgErr) && !cfg.supervisor.empty()) {
+            engineName.clear();
+            modelName.clear();
+            engine_health::Store health;
+            std::string healthErr;
+            if (engine_health::Load(engine_health::DefaultPath(), health, healthErr)) {
+                for (const auto& e : llm::Usable(cfg, llm::kSupervisor)) {
+                    if (engine_health::IsDown(health, e.engine, e.model)) continue;
+                    engineName = e.engine;
+                    modelName = e.model;
+                    break;
+                }
+            }
+            if (engineName.empty()) {
+                return json{{"ok", true}, {"waiting", true},
+                            {"reason", "all supervisor candidates are down"}}.dump();
+            }
+        }
+    }
 
     // The worker must talk to this core, so give it this hancho-cli and data dir explicitly.
     std::wstring cliPath = L"hancho-cli.exe";

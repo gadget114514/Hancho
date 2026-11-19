@@ -106,6 +106,7 @@ std::string EndKindFromState(const std::string& state) {
     if (state == "failed") return "failed";
     if (state == "timed_out") return "timed_out";
     if (state == "idle_timed_out") return "idle_timed_out";
+    if (state == "startup_timed_out") return "startup_timed_out";
     if (state == "killed") return "killed";
     return "completed";
 }
@@ -120,6 +121,7 @@ int RemoteStart(const std::string& host, const StartProcessRequest& req, std::st
     j["open_stdin"] = false;
     j["timeout_sec"] = req.timeoutSec;
     j["idle_timeout_sec"] = req.idleTimeoutSec;
+    j["idle_first_event_sec"] = req.idleFirstEventSec;
     if (!req.estimatedEndTimeStr.empty()) j["estimate_end"] = req.estimatedEndTimeStr;
     j["agent_type"] = req.agentType;
     j["json_stream"] = req.jsonStream;

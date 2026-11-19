@@ -45,6 +45,7 @@ std::string SnapshotToJson(const ProcessSnapshot& s) {
         << "\"idle_ms\":" << s.idleMs << ","
         << "\"timeout_sec\":" << s.timeoutSec << ","
         << "\"idle_timeout_sec\":" << s.idleTimeoutSec << ","
+        << "\"idle_first_event_sec\":" << s.idleFirstEventSec << ","
         << "\"tree_procs\":" << s.treeProcessCount << ","
         << "\"memory_bytes\":" << s.treeMemoryBytes << ","
         << "\"memory_str\":\"" << JsonEscape(FormatBytes(s.treeMemoryBytes)) << "\","
@@ -816,6 +817,7 @@ std::string IpcServer::HandleRequestJson(const std::string& reqJson) {
         req.openStdin = JsonGetBool(reqJson, "open_stdin", true);
         req.timeoutSec = static_cast<int>(JsonGetInt(reqJson, "timeout_sec", 0));
         req.idleTimeoutSec = static_cast<int>(JsonGetInt(reqJson, "idle_timeout_sec", 0));
+        req.idleFirstEventSec = static_cast<int>(JsonGetInt(reqJson, "idle_first_event_sec", 0));
         req.estimatedEndTimeStr = JsonGetString(reqJson, "estimate_end", "");
         req.agentType = JsonGetString(reqJson, "agent_type", "");
         req.jsonStream = JsonGetBool(reqJson, "json_stream", false);
@@ -1453,6 +1455,15 @@ std::string IpcServer::HandleRequestJson(const std::string& reqJson) {
                 resp = btm_->Cancel(StripGroupRowPrefix(id));
                 err.clear();
             }
+        } else if (action == "taskqueue_takeover") {
+            resp = tqm_.TaskQueueTakeover(JsonGetString(reqJson, "id", ""),
+                                          JsonGetString(reqJson, "by", "cli"),
+                                          JsonGetString(reqJson, "reason", ""), err);
+        } else if (action == "taskqueue_complete") {
+            resp = tqm_.TaskQueueComplete(JsonGetString(reqJson, "id", ""),
+                                          JsonGetString(reqJson, "report", ""),
+                                          JsonGetString(reqJson, "result", "succeeded"),
+                                          JsonGetString(reqJson, "reason", ""), err);
         } else if (action == "taskqueue_pause" || action == "taskqueue_resume") {
             const bool paused = (action == "taskqueue_pause");
             const std::string name = JsonGetString(reqJson, "taskqueue", "");
@@ -1523,6 +1534,8 @@ std::string IpcServer::HandleRequestJson(const std::string& reqJson) {
             counts["failed"] = c.failed;
             counts["cancelled"] = c.cancelled;
             counts["closed"] = c.closed;
+            counts["takenOver"] = c.takenOver;
+            counts["waitingForPermit"] = c.waitingForPermit;
             counts["total"] = totalWithPlanned;
             counts["bt_planned"] = btPlanned;
             counts["bt_remaining_sec"] = btPendingSec;
@@ -1539,6 +1552,8 @@ std::string IpcServer::HandleRequestJson(const std::string& reqJson) {
             out["failed"] = c.failed;
             out["cancelled"] = c.cancelled;
             out["closed"] = c.closed;
+            out["takenOver"] = c.takenOver;
+            out["waitingForPermit"] = c.waitingForPermit;
             out["total"] = totalWithPlanned;
             out["bt_planned"] = btPlanned;
             out["bt_remaining_sec"] = btPendingSec;
@@ -1635,7 +1650,7 @@ std::string IpcServer::HandleRequestJson(const std::string& reqJson) {
                     out["state"] = ProcStateToString(snap.state);
                     out["exit_code"] = snap.exitCode;
                     nlohmann::json fail;
-                    fail["class"] = (snap.state == ProcState::TimedOut || snap.state == ProcState::IdleTimedOut) ? "timeout" : (snap.exitCode != 0 ? "exit_nonzero" : "none");
+                    fail["class"] = (snap.state == ProcState::TimedOut || snap.state == ProcState::IdleTimedOut || snap.state == ProcState::StartupTimedOut) ? "timeout" : (snap.exitCode != 0 ? "exit_nonzero" : "none");
                     fail["summary"] = snap.lastLinePreview;
                     out["failure"] = fail;
                     return out.dump();
@@ -1738,7 +1753,7 @@ std::string IpcServer::HandleRequestJson(const std::string& reqJson) {
             if (!extractBtPayload(btJson, err)) {
                 return "{\"ok\":false,\"valid\":false,\"error\":\"" + JsonEscape(err) + "\"}";
             }
-            resp = btm_->Validate(btJson);
+            resp = btm_->Validate(btJson, JsonGetBool(reqJson, "strict", false));
         } else if (action == "bt_start") {
             std::string btJson, err;
             if (!extractBtPayload(btJson, err)) {

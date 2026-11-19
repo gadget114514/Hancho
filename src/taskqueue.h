@@ -2,6 +2,7 @@
 
 #include "process_manager.h"
 #include "parse_util.h"
+#include "engine_health.h"
 #include "nlohmann/json.hpp"
 #include <string>
 #include <vector>
@@ -35,6 +36,8 @@ enum class TaskQueueState {
     Blocked = 4,
     Cancelled = 5,
     Closed = 6,
+    TakenOver = 7,
+    WaitingForPermit = 8, // 091-7: stopped until the user approves an auto-requested permit
 };
 
 std::string TaskQueueStateToString(TaskQueueState state);
@@ -50,6 +53,8 @@ struct TaskQueueCounts {
     int failed = 0;
     int cancelled = 0;
     int closed = 0;
+    int takenOver = 0;
+    int waitingForPermit = 0; // 091-7
     int total = 0;
     int64_t minRemainingSec = -1;
     int64_t sumRemainingSec = -1;
@@ -70,6 +75,8 @@ struct TaskQueueInstructions {
 struct TaskQueueIdle {
     int outputSec = 0;
     int cpuSec = 0;
+    int firstEventSec = 0;
+    bool explicitZero = false;
 };
 
 struct TaskQueueSuccess {
@@ -148,6 +155,10 @@ struct TaskQueueFailureEvidence {
     uint64_t seq = 0;
     std::string log;    // attempt log file
     int line = 0;       // 1-based line in that log
+    // 091-7: a denied tool call records what was denied (read: filePath, bash: command).
+    std::string tool;
+    std::string target;
+    std::string engine;
     bool IsEvent() const { return !events.empty(); }
     bool IsLog() const { return !log.empty(); }
 };
@@ -171,6 +182,18 @@ struct TaskQueueFailureLlmGuess {
     bool Present() const { return !failureClass.empty(); }
 };
 
+struct TaskQueueFailureLikelyCause {
+    std::string id;
+    std::string why;
+};
+
+struct TaskQueueFailureNextStep {
+    std::string action;
+    nlohmann::json change = nullptr;
+    bool needsApproval = false;
+    std::string question;
+};
+
 struct TaskQueueFailureDiagnostic {
     std::string failureClass; // one of the 4.2 classes, "unknown" when nothing matched
     std::string confidence;   // high / medium / low
@@ -178,9 +201,12 @@ struct TaskQueueFailureDiagnostic {
     nlohmann::json detail = nlohmann::json::object();
     std::vector<TaskQueueFailureEvidence> evidence;
     TaskQueueFailureActivity lastActivity;
-    std::string suggestedAction; // retry / retry_after / raise_timeout / fix_spec / escalate / human
+    std::string suggestedAction; // retry / retry_after / raise_timeout / fix_spec / escalate / human / retry_with_change
     std::string retryAt;         // ISO 8601 local time, empty when not applicable
     TaskQueueFailureLlmGuess llmGuess; // reference only; empty unless an escalate answered
+    std::vector<TaskQueueFailureLikelyCause> likelyCauses;
+    std::vector<TaskQueueFailureNextStep> nextSteps;
+    std::string supervisorNote;
     bool Empty() const { return failureClass.empty(); }
 };
 
@@ -234,6 +260,7 @@ struct TaskQueueFailureInput {
     int timeoutSec = 0;
     int idleOutputSec = 0;
     int idleCpuSec = 0;
+    int idleFirstEventSec = 0;
     int64_t elapsedSec = 0;
     std::string blockedBy;     // dependency job id or resource holder
     std::string blockKind;     // "dependency" or "resource" ("" for an attempt failure)
@@ -256,7 +283,35 @@ struct TaskQueueFailureInput {
     // Optional answer already returned by an escalate node. It is applied only when the
     // deterministic rules leave the failure undecided and is stored as advisory only.
     std::string llmGuessJson;
+    // Context for startup_hang and likelyCauses mechanical diagnosis (090-1)
+    std::string command;
+    std::string engine;
+    std::string model;
+    std::string client;
+    std::string stderrText;
+    double cpuSec = -1.0;
+    nlohmann::json processTree = nullptr;
+    // 091-6 quota diagnosis context (filled from the shared engine-health registry).
+    bool recentSuccess = false;
+    bool otherZeroEventFailure = false;
+    bool engineDown = false;
 };
+
+// 091-7: pure decision helper for a permission denial. `resume` means continue the same
+// engine session; `wait` means auto-request a permit and hold the job in waitingForPermit.
+struct PermissionHoldPlan {
+    bool resume = false;
+    bool wait = false;
+    std::string kind;
+    std::string target;
+    std::string engine;
+    std::string scope;
+    std::string permitId;
+};
+PermissionHoldPlan PlanPermissionHandling(const TaskQueueFailureDiagnostic& diagnostic,
+                                          const std::string& sessionId, int resumeCount,
+                                          int resumeLimit, const std::string& taskqueue,
+                                          const std::string& onPermissionDenied);
 
 // <data-dir>/failure-rules.json. A missing or malformed file yields no rules.
 std::string TaskQueueFailureRulesPath();
@@ -494,7 +549,7 @@ inline bool SavePlainRunStateDirect(const PlainRunState& state, std::string& out
         jobObj["depends_on"] = nlohmann::json::array();
         jobObj["timeout_sec"] = 0;
         jobObj["estimate_sec"] = 0;
-        jobObj["idle"] = {{"output_sec", 0}, {"cpu_sec", 0}};
+        jobObj["idle"] = {{"output_sec", 0}, {"cpu_sec", 0}, {"first_event_sec", 0}};
         jobObj["max_attempts"] = 1;
         jobObj["retry_delay_sec"] = 0;
         jobObj["defer"] = {{"exit_codes", nlohmann::json::array()}, {"delay_sec", 60}, {"limit", 60}};
@@ -533,6 +588,25 @@ inline bool SavePlainRunStateDirect(const PlainRunState& state, std::string& out
     }
     return true;
 }
+
+// Decision record written when a supervisor takes a job over (doc/HanchoExpectations.md 7.5 D2).
+// `reason` is why the job was taken over; `completionReason` is the reason given to taskqueue_complete.
+struct TaskQueueTakeoverInfo {
+    bool present = false;
+    std::string by;
+    std::string reason;
+    std::string at;
+    std::string completedAt;
+    std::string report;
+    std::string result;
+    std::string completionReason;
+};
+
+// 091-7: a job declares the permissions it needs before it is run.
+struct TaskQueueNeed {
+    std::string kind;
+    std::string target;
+};
 
 struct TaskQueueJob {
     std::string id;
@@ -574,12 +648,22 @@ struct TaskQueueJob {
     bool shutdownWhenDone = false;
     int shutdownDelaySec = 0;      // 0 = default grace period
     std::string state;
+    TaskQueueTakeoverInfo takeover;
     std::vector<TaskQueueAttempt> attempts;
     std::string blockedBy;
     std::string createdAt;
     std::string updatedAt;
     std::string notes;
+    bool engineSwitch = true;       // false keeps a job on its down engine (091-6)
+    std::string holdReason;         // "engine down: ..." shown while the job is held
     int64_t retryAtMs = 0;
+    // 091-7 worker permissions.
+    std::vector<TaskQueueNeed> needs;
+    std::string onPermissionDenied; // "fail" stops immediately instead of waitingForPermit
+    std::vector<std::string> waitPermits; // permit ids auto-requested on a denial
+    std::string resumeSession;      // opencode/claude session to continue after a denial
+    int permissionResumeCount = 0;
+    int permissionResumeLimit = 2;
     TaskQueueBtRef bt;
     TaskQueueOrigin origin;
 };
@@ -605,7 +689,8 @@ struct TaskQueueRunJob {
     bool interrupted = false;
 
     bool Unfinished() const {
-        return state.empty() || state == "pending" || state == "running";
+        return state.empty() || state == "pending" || state == "running" ||
+               state == "waitingForPermit";
     }
     bool Cancelled() const {
         return state == "cancelled" || (interrupted && state != "failed" && state != "succeeded");
@@ -833,6 +918,15 @@ public:
     // Force-closes a job: stops any running process and sets the state to "closed", a terminal
     // state (like succeeded/failed/cancelled) that the scheduler never picks up again.
     std::string TaskQueueClose(const std::string& id, std::string& outError);
+    // Supervisor takes a job over: stops a running attempt and records a `takeover` decision
+    // (who/why/when). The job becomes the terminal state "takenOver" and never runs again.
+    std::string TaskQueueTakeover(const std::string& id, const std::string& by,
+                                  const std::string& reason, std::string& outError);
+    // Records the result of a taken-over job. result is "succeeded" (default) or "failed";
+    // dependents advance as a satisfied success dependency only for "succeeded".
+    std::string TaskQueueComplete(const std::string& id, const std::string& report,
+                                  const std::string& result, const std::string& reason,
+                                  std::string& outError);
     // Per-job pause. A pending job stops being scheduled; a running local job has
     // its process tree suspended and its timeout/idle clocks frozen.
     std::string TaskQueuePauseJob(const std::string& id, bool paused, std::string& outError);
@@ -951,6 +1045,12 @@ private:
     std::string ResourceWaitLocked(const TaskQueueJob& job, bool allSat, int64_t nowMs) const;
     bool IsReadyLocked(const TaskQueueJob& job, int64_t nowMs) const;
     static bool RunsBefore(const TaskQueueJob& a, const TaskQueueJob& b);
+    // 091-6 engine health. All helpers are called with mutex_ held.
+    static bool JobEngineModel(const TaskQueueJob& job, std::string& engine, std::string& model);
+    std::string JobHoldReasonLocked(const TaskQueueJob& job, int64_t nowMs) const;
+    bool TryEngineSwitchLocked(TaskQueueJob& job, const std::string& engine,
+                               const std::string& model, int64_t nowMs);
+    void RefreshEngineHealthLocked(int64_t nowMs);
     bool HasDependencyCycle(const TaskQueue& tq, const std::string& jobId,
                             const std::vector<TaskQueueDependency>& deps,
                             const std::string& ignoreDependency);
@@ -990,6 +1090,7 @@ private:
     std::map<std::string, TaskQueueOrigin> btOrigins_; // behavior tree id -> who started it
     std::map<std::string, std::string> lastNotice_; // taskqueue -> last emitted notice type
     int nextJobNum_ = 1;
+    int64_t lastHealthCheckTickMs_ = 0;  // auto-probe at most once per second
     std::atomic<bool> schedulerRunning_{false};
     std::atomic<bool> resourceLocksEnabled_{true};
     std::thread schedulerThread_;

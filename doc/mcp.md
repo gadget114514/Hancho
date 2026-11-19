@@ -60,6 +60,45 @@ You can also run the server directly with `Hancho.exe mcp`. It connects to the d
 | `taskqueue_link` / `taskqueue_unlink` | Add/remove one dependency (`job`, `dependsOn`, `on` = `success`\|`done`). |
 | `taskqueue_graph` | Dependency graph with `ready` / `waiting_for` / `dependents`. |
 
+**Behavior tree tools**
+
+| Tool | Description |
+| :--- | :--- |
+| `bt_validate` | Validate a tree (`bt` object or `file` path) without running it. `warnings[]` are non-fatal; `strict: true` promotes every warning to an error (`ok`/`valid` false). The same `warnings` are returned by `bt_start`. |
+| `bt_template` | List hang-safe templates or return one full template (`name`: `resilient-worker` or `card-sequence`; omit to list). Replace `<...>` placeholders before validation; `{engine}` / `{model}` are runtime placeholders. |
+
+Other BT tools (`bt_start`, `bt_get`, `bt_list`, `bt_wait`, `bt_resume`, `bt_retry`, `bt_update`, `bt_cancel`, `bt_pause`) are unchanged. See [behavior-tree.md](behavior-tree.md) for the warning codes and the template output.
+
+**LLM list tools**
+
+Three independent per-role candidate lists in `<data-dir>/llms.json` (`worker`, `consult`, `supervisor`). Rows added through MCP/CLI are `proposed` and unused until approved by a human (dashboard LLM page, or a quoted chat confirmation). All changes go to `history`. The CLI equivalents are `hancho-cli llm list|add|remove|enable|disable|approve`.
+
+| Tool | Description |
+| :--- | :--- |
+| `llm_list` | List rows with status (`list?`: `worker`\|`consult`\|`supervisor`; omit for all). |
+| `llm_add` | Add a proposed row (`list`, `engine`, `model`, required `reason`; optional `provider`, `rank`, `note`). |
+| `llm_remove` | Remove a row (`list`, `engine`, `model`, required `reason`). |
+| `llm_set_enabled` | Enable/disable a row (`list`, `engine`, `model`, `enabled`, required `reason`). CLI: `llm enable` / `llm disable`. |
+| `llm_approve` | Approve a proposed row, quoting the user's words (`list`, `engine`, `model`, `userSaid`; `approvedVia: chat`). |
+
+**Worker probe / health tools**
+
+| Tool | Description |
+| :--- | :--- |
+| `worker_probe` | Health-check an engine with a minimal prompt (stdin closed). Args: `engine` (required), `model?`, `timeout?`, `no_cache?`. Returns `{ok, engine, model, elapsedMs, failureClass?, detail?, cached}`; results are cached in `<data-dir>/probes.json`. CLI: `worker probe`. |
+| `worker_health` | Read the shared engine-health registry (`<data-dir>/engine-health.json`): no args lists all; `engine` + `model` + `reset: true` marks an engine healthy again. CLI: `worker health` / `worker health --reset <engine/model>`. Down engines hold their jobs until a core probe succeeds. |
+
+**Permit tools**
+
+Worker permissions live in `<data-dir>/permits.json`. A denial is classified as `permission_denied`; after session resumes are exhausted the job waits in `waitingForPermit` until a human approves the auto-requested permit. The user's global config files are never written.
+
+| Tool | Description |
+| :--- | :--- |
+| `permit_list` | List permits, including proposals (`scope?`: `global` / `taskqueue:<name>` / `bt:<id>`). |
+| `permit_request` | Propose a permit (`kind`: `read_path`\|`write_path`\|`command`\|`network`, `target`, required `reason`; optional `engine`/`engines`, `scope`). |
+| `permit_approve` | Approve a proposal with the user's quoted words (`id`, `userSaid`). |
+| `permit_revoke` | Revoke an approved permit (`id`, `reason`). |
+
 **Triage tools**
 
 Hancho prepares each card with its information, candidate actions and deterministic recommendation. Read the card before deciding; the supervisor chooses exactly one candidate id from it and provides a reason. `ignore` and `cancel` are allowed only with a reason.

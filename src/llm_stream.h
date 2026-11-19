@@ -7,6 +7,7 @@
 #include <deque>
 #include <memory>
 #include <mutex>
+#include <functional>
 #include <unordered_map>
 #include <cstdint>
 
@@ -330,6 +331,9 @@ public:
     bool HasEvents() const;
     uint64_t EventCount() const;
 
+    using OnNormalizedEventCallback = std::function<void()>;
+    void SetOnNormalizedEventCallback(OnNormalizedEventCallback cb);
+
 private:
     // Token counts of one usage object, used as the baseline for the next delta.
     struct UsageBaseline {
@@ -364,6 +368,7 @@ private:
     std::string ParentAgentIdLocked(const std::string& toolUseId) const;
 
     mutable std::mutex mutex_;
+    OnNormalizedEventCallback onNormalizedEvent_;
     int processId_ = 0;
     std::string agentType_;
     std::string jobId_;

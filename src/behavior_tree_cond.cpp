@@ -350,6 +350,38 @@ bool BehaviorTree::Impl::EvaluateCondition(BehaviorTree& bt, BtNode& node, int64
         return finishCond(ok);
     }
 
+    if (t == "failure") {
+        const BtNode* target = FindNodeConst(node.condNode, bt.id_);
+        if (!target) return finishCond(false, "unknown node: " + node.condNode);
+        // An unexecuted or successful node never matches, even if it failed on an earlier run.
+        if (target->state != "failed" || !target->hasFailureDiagnostic) return finishCond(false);
+        const json& diag = target->failureDiagnostic;
+        if (!node.condFailureClasses.empty()) {
+            std::string cls = diag.is_object() ? diag.value("class", std::string()) : std::string();
+            bool matched = false;
+            for (const auto& c : node.condFailureClasses) {
+                if (c == cls) { matched = true; break; }
+            }
+            if (!matched) return finishCond(false);
+        }
+        if (!node.condFailureCause.empty()) {
+            bool matched = false;
+            if (diag.is_object()) {
+                auto it = diag.find("likelyCauses");
+                if (it != diag.end() && it->is_array()) {
+                    for (const auto& c : *it) {
+                        if (c.is_object() && c.value("id", std::string()) == node.condFailureCause) {
+                            matched = true;
+                            break;
+                        }
+                    }
+                }
+            }
+            if (!matched) return finishCond(false);
+        }
+        return finishCond(true);
+    }
+
     return finishCond(false, "unsupported condition type: " + t);
 }
 

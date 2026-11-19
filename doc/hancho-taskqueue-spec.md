@@ -211,7 +211,7 @@ Job ──1:N── Attempt ──1:1── ManagedProcess (既存)
   "env": { "KEY": "VALUE" },
   "dependsOn": [{ "id": "prep", "on": "success" }],
   "timeoutSec": 1800,
-  "idle": { "outputSec": 720, "cpuSec": 720 },
+  "idle": { "outputSec": 720, "cpuSec": 720, "firstEventSec": 180 },
   "maxAttempts": 2,
   "retryDelaySec": 0,
   "success": { "exitCode": 0, "filesNewer": ["reports/A.md"], "outputRegex": null },
@@ -229,7 +229,12 @@ Job ──1:N── Attempt ──1:1── ManagedProcess (既存)
 - `summary`: **必須**。ジョブの内容を表す短い 1 行の文字列 (5.5)。
 - `timeoutSec`: **必須**。ジョブ 1 つ分の秒数 (4.1)。
 - `dependsOn[].on`: `success` (依存元が succeeded で開始) または `done` (終われば成否に関係なく開始)。文字列だけなら `success`。
-- `idle`: **出力が `outputSec` 秒止まり、かつプロセスツリーの CPU が `cpuSec` 秒止まった**ときだけハングと判定する。0 の条件は使わない。重い処理中 (CPU 使用中・出力なし) を誤って kill しないため。既存の `lastOutputTickMs` / `lastCpuActivityTickMs` を利用する。判定間隔は粗くてよい (既存の監視ループの周期で十分)。
+- `idle`: **出力が `outputSec` 秒止まり、かつプロセスツリーの CPU が `cpuSec` 秒止まった**とき、またはワーカー起動から `firstEventSec` 秒以内に正規化イベントが 1 つも到着しない (`startup_timed_out`) ときにハングと判定する。0 の条件は使わない。重い処理中 (CPU 使用中・出力なし) を誤って kill しないため。JSON ストリームジョブでは生の出力テキストではなくパースされたイベントのみを出力活動として計上する。ワーカー CLI ジョブで `idle` が未指定の場合、`firstEventSec = 180`、`outputSec = 600`、`cpuSec = 1` が既定値として適用される (`idle: 0` または `output_sec: 0, first_event_sec: 0` で無効化可能。`<data-dir>/config.json` の `taskqueue.worker_idle_defaults.first_event_sec` / `taskqueue.worker_idle_defaults.output_sec` で変更可能)。タイムアウト時にはツリー kill 前にプロセストリースナップショットが採取され、`detail.processTree` に記録される。`startup_timed_out` は診断クラス `startup_hang` になり、再試行ポリシーと triage では `idle_timed_out`（`idle_stall`）と同じタイムアウト扱い（`retry.on` / `retry.never` に `startup_hang` も指定できる）。既存の `lastOutputTickMs` / `lastCpuActivityTickMs` を利用する。判定間隔は粗くてよい (既存の監視ループの周期で十分)。
+- 失敗診断は attempt の `failure` に保存される。`class` は `startup_hang`（イベント 0 件、または `run.started` 以降に何も無い状態で `timeout` / `idle_timed_out` / `startup_timed_out` になった場合。このとき `raise_timeout` は勧めない）、`idle_stall`、`timeout`、`exit_nonzero` など。`confidence`、`summary`、`detail`（`endKind` / `idleFirstEventSec` / kill 前の `processTree` など）、`evidence`、`lastActivity`、`suggestedAction`（`retry` / `retry_with_change` / `raise_timeout` / `escalate` など）に加え、次を保持する:
+  - `likelyCauses`: `[{ "id", "why" }]`。機械的に判定できるものだけ（`no_model`、`same_engine_nesting`、`waiting_for_input`、`stderr_present`）。
+  - `nextSteps`: `[{ "action", "change"?, "needsApproval"?, "question"? }]`。試行回数に応じて 1 回目は同じ設定の `retry`、2 回目は `change`（モデル／エンジン変更は `needsApproval: true`）付きの `retry`、3 回目は `escalate`。
+  - `supervisorNote`: supervisor が自分で実装する前に判断を記録するよう促す文。
+  - これらのフィールドが無い古い保存データもそのまま読める（後方互換）。`taskqueue why <id>` はこれを人間向けに表示し、CLI `taskqueue get` / MCP `taskqueue_get` の失敗レコードにも同じ内容が入る。triage は `nextSteps[0]` から `retry` / `retry_with_change` / `fix_spec` の推奨を決め、`retry_with_change` は `needsHuman` となる。
 - `success`: 条件はすべて AND。`filesNewer` は cwd からの相対パスで、すべて存在し mtime が attempt の開始時刻より新しいこと。`outputRegex` はログ末尾 200 行に一致すること。省略時は `exitCode: 0` だけ。
 - `suspendWhenDone` / `suspendDelaySec` / `suspendHibernate`: このジョブが終了し、他の全ジョブ (running/waiting/pending) と Hancho 管理プロセスがアイドルになった後、`suspendDelaySec` (0 = 既定 10 秒) 後に PC をサスペンドする。`suspendHibernate` は休止。`hancho-cli power suspend --after-job <id>` と MCP `power_suspend` で後から指定でき、`power status` / `power cancel` で確認・解除する。
 - `shutdownWhenDone` / `shutdownDelaySec`: このジョブと他の全ジョブ・管理プロセスが終わった後に PC をシャットダウンする（`shutdownDelaySec` 0 = 既定 10 秒）。suspend と同時に armed なら shutdown が優先。`hancho-cli power shutdown --after-job <id>` / MCP `power_shutdown` で後から指定できる。シャットダウン権限が必要。
@@ -286,7 +291,11 @@ running ──(それ以外で終了)──> attempt 記録
 running ──(cancel)──> cancelled (ツリー kill)
 (PC 起動時に running だったジョブ) ──> reason=interrupted で attempt 記録 → 上と同じ再実行判定
 failed / blocked / cancelled ──(taskqueue_retry)──> pending
+failed / blocked / waiting / pending / running ──(taskqueue takeover --reason)──> takenOver
+takenOver ──(taskqueue complete --reason [--result succeeded|failed])──> takenOver (結果を記録)
 ```
+- `takenOver` は supervisor が委任をやめて自分で引き取ったことを記録する終端状態。`takeover` オブジェクトに `{by, reason, at, completed_at?, report?, result?, completion_reason?}` を保持する。スケジューラは拾わず、トリアージでは「処置済み」として扱う。BT では `escalate` の `answer: "takeover"`（`rationale` 必須）が `expect` に無くても受理され、ノードに `takenOver: true` と `takeover` を残す（ノード自身は `succeeded`）。
+- `taskqueue complete` 前の `takenOver` ジョブの後続は `pending` のまま進まない。`--result succeeded`（既定）で完了すると後続は依存成功として進み、`failed` なら後続は `blocked` になる。
 - `blocked` は依存元が `pending` に戻れば自動で `pending` に戻る。
 - スケジューリング: 実行可能なジョブを `priority` 降順 → 登録順で選ぶ。再実行するジョブは後ろに回さない。
 - 依存の循環・存在しない id への依存は登録時に拒否する。
@@ -352,6 +361,8 @@ failed / blocked / cancelled ──(taskqueue_retry)──> pending
 | `taskqueue_retry` | `id`, `resetAttempts?` (既定 true), `refreshInstructions?` (既定 true) | 指示書を元ファイルから取り込み直し、failed/blocked/cancelled を pending に戻す |
 | `taskqueue_update` | `id`, 変更可能フィールド (summary, instructionsFile, instructionsText, command, timeoutSec, idle, maxAttempts, success, env)。依存は 11.1 で変更する | pending/failed/blocked のときだけ。同じ検証 (連鎖・上限) を行う |
 | `taskqueue_cancel` | `id` | running ならツリー kill して cancelled |
+| `taskqueue_takeover` | `id`, `reason` | failed/blocked/waiting/pending/running ジョブを `takenOver` にし、`takeover` レコード `{by, reason, at}` を保存。running ならプロセスツリーを停止し、後続は complete まで pending のまま |
+| `taskqueue_complete` | `id`, `reason`, `report?`, `result?` (`succeeded` 既定 / `failed`) | `takenOver` ジョブに完了記録（`completed_at` / `report` / `result` / `completion_reason`）を残す。`succeeded` なら後続の依存成功として進め、`failed` なら blocked にする |
 | `taskqueue_pause` / `taskqueue_resume` | `taskqueue` | 新しいジョブの開始を止める / 再開する (実行中は止めない) |
 | `taskqueue_pause_job` / `taskqueue_resume_job` | `id` | 1 つのジョブを一時停止 / 再開する。待機中は起動しない。ローカルの実行中はプロセスツリーを suspend し、timeout と idle の時計を凍結する。停止は `taskqueue_cancel` |
 | `taskqueue_wait` | `taskqueue`, `sinceVersion`, `timeoutMs` | version が変わるまで待ち、変化したジョブと新しい version を返す |
@@ -378,7 +389,7 @@ failed / blocked / cancelled ──(taskqueue_retry)──> pending
 - `start_process` のツール説明文に「複数のコマンドを順に実行するときは `taskqueue_add` を使う。`&&` は拒否される」と書く (AI エージェントが最初から正しい方を選べるように)。
 
 ## 12. CLI
-`pc taskqueue add --file jobs.json`、`pc taskqueue list main`、`pc taskqueue retry <id>`、`pc taskqueue cancel <id>`、`pc run "<cmd>" [--allow-chain]`。jobs.json は `taskqueue_add` の引数と同じ形式。
+`pc taskqueue add --file jobs.json`、`pc taskqueue list main`、`pc taskqueue retry <id>`、`pc taskqueue cancel <id>`、`pc run "<cmd>" [--allow-chain]`。jobs.json は `taskqueue_add` の引数と同じ形式。`hancho-cli.exe` の場合は failure 診断を `taskqueue why <id>`（`class` / `likelyCauses` / `nextSteps` / `supervisorNote` を表示）で読み、引き取りを `taskqueue takeover --id <id> --reason "..."`、結果の戻しを `taskqueue complete --id <id> --reason "..." [--report <path>] [--result succeeded|failed]` で行う。両コマンドとも `--reason` は必須。`taskqueue update --id <id> --patch <json>` でコマンドの `--model` を変えるには `--approve-model-change --reason "..."` が要る。
 
 ## 13. GUI
 既存ダッシュボード (暗色テーマ、上部カウンタ、ツールバー、表) の見た目と操作感に合わせる。描画は既存と同じ Direct2D。

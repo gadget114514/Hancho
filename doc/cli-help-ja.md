@@ -343,6 +343,16 @@ COMMANDS:
   worker info <id> [--notes "<notes>"] [--goal "<goal>"]
       Update supervisor notes or goal for an ongoing worker.
 
+  worker probe --engine <e> [--model <m>] [--timeout <sec>] [--no-cache]
+       最小プロンプト (stdin を閉じる) でエンジンを健康診断する。
+       {ok, engine, model, elapsedMs, failureClass?, detail?, cached} を返す。
+       結果は <data-dir>/probes.json にキャッシュ (成功 10 分、失敗 2 分が既定)。
+
+  worker health [--json] | worker health --reset <engine/model>
+       共有のエンジン健全性レジストリ (<data-dir>/engine-health.json) を一覧する:
+       status, reason, since, nextProbeAt, probeCount, retryAt。故障中 (down) の
+       エンジンは core の probe が成功するまでジョブを保留する。--reset は手動回復。
+
   agent install-template [--path <dir>] [--dry-run]
       Write the hancho-runner subagent to <dir>\.claude\agents\hancho-runner.md (default: the current
       directory). It runs long commands through Hancho and returns a short summary.
@@ -410,6 +420,9 @@ TASK QUEUE:
       that failed within the period, e.g. `taskqueue retry --failed --since 6h`
       retries the failures of the last 6 hours. Blocked dependents resume.
   taskqueue cancel <id>
+  taskqueue takeover --id <id> --reason "..."    (supervisor がジョブを引き取った判断を記録する)
+  taskqueue complete --id <id> --reason "..." [--report <path>] [--result succeeded|failed]
+       引き取り済みジョブを完了させる。succeeded（既定）なら後続が進み、failed なら後続は blocked。
   taskqueue pause|resume <name>
   taskqueue pause-job <id>                   (実行中の 1 ジョブを停止、待機中は起動を保留)
   taskqueue resume-job <id>
@@ -421,6 +434,12 @@ TASK QUEUE:
 
 BEHAVIOR TREES (for LLM agents; next step depends on results):
   bt validate|start --file <bt.json>    Check / register and run a behavior tree
+  bt validate --file <bt.json> [--strict]
+      BT を実行せずに検証する。warnings[] は警告のまま返り、--strict を付けると
+      すべての警告がエラーに昇格する (ok/valid = false)。
+  bt template [<name>] [--json]
+      ハング対策入りの BT テンプレート一覧、または 1 つを完全な形で出力する
+      (resilient-worker / card-sequence)。検証前に <...> を実値へ置き換える。
   bt wait --id <id> [--since-version <n>] [--timeout-ms <ms>]
       Long-poll until the tree finishes or waits for your decision (escalate).
   bt resume --id <id> --node <node> --answer <a> --rationale <why> [--vars <json>]
@@ -430,11 +449,33 @@ BEHAVIOR TREES (for LLM agents; next step depends on results):
   bt cancel --id <id>  |  bt pause --id <id> [--paused true|false]
       Leaves: job (one command), worker (one task for a worker LLM; engine/model);
       composites: sequence, fallback, parallel, if, retry/repeat (max required),
-      timeout; conditions: fileExists, fileNewer, outputMatches, exitCode,
+      timeout; catch (失敗クラスごとの handler) と probe (本番前の健康診断);
+      conditions: fileExists, fileNewer, outputMatches, exitCode, failure,
       jsonValue, var, nodeState; escalate returns a decision packet to you.
+      トップレベルの defaults で worker の idle / maxAttempts / probe と job の idle を補完できる。
       Each leaf runs as an ordinary task-queue job; retry BT jobs with bt retry,
       not taskqueue retry. Full format and examples: doc\behavior-tree.md in the
       installation folder; `hancho-cli bt --help` for all options.
+
+LLM リストと権限 (事前承認済みエンジン候補とワーカー権限):
+  llm list [--list <worker|consult|supervisor>] [--json]
+      行と status を表示する。proposed の行は承認されるまで使われない。
+  llm add --list <l> --engine <e> --model <m> [--provider <p>] [--rank <n>] [--note <t>] --reason "..."
+  llm remove --list <l> --engine <e> --model <m> --reason "..."
+  llm enable --list <l> --engine <e> --model <m> --reason "..."
+  llm disable --list <l> --engine <e> --model <m> --reason "..."
+  llm approve --list <l> --engine <e> --model <m> --user-said "<ユーザーの言葉>"
+      CLI / MCP で追加した行は proposed。BT が使う前にダッシュボードの LLM ページか
+      --user-said (ユーザーの言葉の引用) で承認する。変更はすべて
+      <data-dir>/llms.json の history に残る。
+  permit list [--scope <s>] [--json]
+  permit request --kind <read_path|write_path|command|network> --target <glob> [--engine <e>]
+                 [--scope <global|taskqueue:name|bt:id>] --reason "..."
+  permit approve <id> --user-said "<ユーザーの言葉>"
+  permit reject <id> [--reason "..."]
+  permit revoke <id> --reason "..."
+      <data-dir>/permits.json のワーカー権限。拒否は permission_denied になり、
+      セッション再開を使い切ると waitingForPermit で保留される。
 
   start/run ... --allow-chain
       Allow a chained command (&&, ||, &, ';') as a single process. Task-queue
@@ -514,17 +555,19 @@ SETUP FOR LLM AGENTS:
         and returns the result. The wrapper costs extra tokens; calling run_worker
         directly is cheapest.
 
-    MCP tools (34):
+    MCP tools:
       Process:    start_process, list_processes, get_process_output,
                   send_process_input, wait_process, kill_process
       Worker:     run_worker, wait_worker, get_worker_stream, get_worker_state,
-                  update_worker_info
+                  update_worker_info, worker_probe, worker_health
       Task queue: taskqueue_add, taskqueue_list, taskqueue_get, taskqueue_retry,
                   taskqueue_update, taskqueue_cancel, taskqueue_pause, taskqueue_resume,
                   taskqueue_pause_job, taskqueue_resume_job, taskqueue_wait,
                   taskqueue_purge, taskqueue_link, taskqueue_unlink, taskqueue_graph
-      Behavior tree: bt_validate, bt_start, bt_get, bt_list, bt_wait, bt_resume,
-                  bt_retry, bt_update, bt_cancel, bt_pause
+      Behavior tree: bt_validate (strict), bt_template (name), bt_start, bt_get,
+                  bt_list, bt_wait, bt_resume, bt_retry, bt_update, bt_cancel, bt_pause
+      LLM リスト: llm_list, llm_add, llm_remove, llm_set_enabled, llm_approve
+      権限:       permit_list, permit_request, permit_approve, permit_revoke
 
 NOTE:
   The GUI dashboard is provided by Hancho.exe, which is auto-started

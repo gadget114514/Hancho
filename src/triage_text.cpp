@@ -73,6 +73,7 @@ std::string TranslateToken(Lang lang, const std::string& type, const std::string
     if (type == "class") {
         if (value == "timeout" || value == "timed_out") return Pick(lang, "タイムアウト", "timeout", "tiempo agotado");
         if (value == "idle_stall" || value == "hang" || value == "hung") return Pick(lang, "ハング", "hang", "bloqueo");
+        if (value == "startup_hang") return Pick(lang, "起動ハング", "startup hang", "bloqueo de inicio");
         if (value == "crash") return Pick(lang, "クラッシュ", "crash", "fallo inesperado");
         if (value == "nonzero_exit" || value == "exit_nonzero") return Pick(lang, "終了コード異常", "non-zero exit", "código de salida distinto de cero");
         if (value == "check_failed" || value == "success_check_failed") return Pick(lang, "成功条件不成立", "success check failed", "falló la comprobación de éxito");
@@ -92,6 +93,7 @@ std::string TranslateToken(Lang lang, const std::string& type, const std::string
     } else if (type == "attemptReason") {
         if (value == "timed_out") return Pick(lang, "タイムアウト", "timed out", "tiempo agotado");
         if (value == "idle_timed_out") return Pick(lang, "アイドルタイムアウト", "idle timeout", "tiempo de inactividad agotado");
+        if (value == "startup_timed_out") return Pick(lang, "起動タイムアウト", "startup timeout", "tiempo de inicio agotado");
         if (value == "exit_code") return Pick(lang, "終了コード", "exit code", "código de salida");
         if (value == "check_failed") return Pick(lang, "成功判定失敗", "success check failed", "falló la comprobación de éxito");
         if (value == "launch_failed" || value == "launch_error") return Pick(lang, "起動失敗", "launch failed", "falló el inicio");
@@ -140,6 +142,7 @@ std::string TranslateToken(Lang lang, const std::string& type, const std::string
         if (value == "cancelled") return Pick(lang, "キャンセル", "cancelled", "cancelado");
         if (value == "timed_out") return Pick(lang, "タイムアウト", "timed out", "tiempo agotado");
         if (value == "idle_timed_out") return Pick(lang, "アイドルタイムアウト", "idle timeout", "tiempo de inactividad agotado");
+        if (value == "startup_timed_out") return Pick(lang, "起動タイムアウト", "startup timeout", "tiempo de inicio agotado");
         if (value == "skipped") return Pick(lang, "スキップ", "skipped", "omitido");
     } else if (type == "kind") {
         if (value == "job_failure") return Pick(lang, "ジョブ失敗", "Job failure", "Fallo de tarea");

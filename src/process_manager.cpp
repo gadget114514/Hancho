@@ -255,6 +255,7 @@ int ProcessManager::StartProcess(const StartProcessRequest& req, std::string& ou
     proc->timeoutSec = req.timeoutSec;
     proc->idleTimeoutSec = req.idleTimeoutSec;
     proc->idleCpuSec = req.idleCpuSec;
+    proc->idleFirstEventSec = req.idleFirstEventSec;
     proc->jobKey = req.jobKey;
     proc->jobId = req.jobId;
     proc->attemptN = req.attemptN;
@@ -274,7 +275,9 @@ int ProcessManager::StartProcess(const StartProcessRequest& req, std::string& ou
         auto outputObserver = [weakProc, historyLimit](const char* data, size_t len) {
             auto sp = weakProc.lock();
             if (!sp || len == 0) return;
-            sp->lastOutputTickMs = GetNowTickMs();
+            if (!sp->jsonStream) {
+                sp->lastOutputTickMs = GetNowTickMs();
+            }
             std::string chunk(data, len);
             std::string cleanChunk = StripAnsiCodes(chunk);
             std::wstring logPathW;
@@ -484,7 +487,7 @@ int ProcessManager::StartProcess(const StartProcessRequest& req, std::string& ou
             detectedAgent = DetectAgentType(proc->commandLine, proc->name);
         }
         proc->agentType = detectedAgent;
-        proc->jsonStream = req.jsonStream || (!detectedAgent.empty());
+        proc->jsonStream = req.jsonStream || (!detectedAgent.empty()) || (proc->idleFirstEventSec > 0);
         proc->supervisorNotes = req.supervisorNotes;
         proc->supervisorGoal = req.supervisorGoal;
 
@@ -529,6 +532,14 @@ int ProcessManager::StartProcess(const StartProcessRequest& req, std::string& ou
                                       proc->supervisorGoal, defaultModel,
                                       proc->jobId > 0 ? std::to_string(proc->jobId) : std::string(),
                                       proc->attemptN);
+            std::weak_ptr<ManagedProcess> weakProc = proc;
+            proc->streamTracker->SetOnNormalizedEventCallback([weakProc]() {
+                auto sp = weakProc.lock();
+                if (sp) {
+                    sp->firstEventReceived.store(true);
+                    sp->lastOutputTickMs = GetNowTickMs();
+                }
+            });
             proc->eventTracker.store(proc->streamTracker.get());
         }
 
@@ -651,7 +662,9 @@ void ProcessManager::ReaderThreadFunc(std::shared_ptr<ManagedProcess> proc) {
             break;
         }
         uint64_t now = GetNowTickMs();
-        proc->lastOutputTickMs = now;
+        if (!proc->jsonStream) {
+            proc->lastOutputTickMs = now;
+        }
 
         std::string chunk(buffer, bytesRead);
         std::string cleanChunk = StripAnsiCodes(chunk);
@@ -733,6 +746,14 @@ void ProcessManager::WriteDoneFile(ManagedProcess& proc, ProcState finalState, D
 }
 
 void ProcessManager::TerminateJobInternal(ManagedProcess& proc, ProcState finalState, const std::string& reasonMsg) {
+    if (finalState == ProcState::TimedOut || finalState == ProcState::IdleTimedOut || finalState == ProcState::StartupTimedOut) {
+        if (proc.tree) {
+            try {
+                proc.processTreeSnapshot = proc.tree->SnapshotProcesses();
+            } catch (...) {}
+        }
+    }
+
     const bool treeKilled = proc.tree && proc.tree->Kill(1);
     if (!treeKilled && proc.hProcess) {
         TerminateProcess(proc.hProcess, 1);
@@ -906,6 +927,19 @@ void ProcessManager::MonitorThreadFunc() {
             // A suspended tree cannot make progress; freeze both timeout clocks
             // until ProcessManager::SuspendProcess(..., false) resumes it.
             if (proc->suspended.load()) continue;
+
+            if (proc->idleFirstEventSec > 0 && !proc->firstEventReceived.load()) {
+                uint64_t activeMs = (now >= proc->startTickMs) ? (now - proc->startTickMs) : 0;
+                const uint64_t pausedMs = proc->suspendedTotalMs.load();
+                if (activeMs > pausedMs) activeMs -= pausedMs; else activeMs = 0;
+                uint64_t elapsedSec = activeMs / 1000;
+                if (elapsedSec >= static_cast<uint64_t>(proc->idleFirstEventSec)) {
+                    TerminateJobInternal(*proc, ProcState::StartupTimedOut,
+                        "Process tree terminated: Exceeded first event timeout (" + std::to_string(proc->idleFirstEventSec) + "s without any normalized event)");
+                    SaveState();
+                    continue;
+                }
+            }
 
             if (proc->timeoutSec > 0) {
                 uint64_t activeMs = (now >= proc->startTickMs) ? (now - proc->startTickMs) : 0;
@@ -1405,6 +1439,8 @@ ProcessSnapshot ProcessManager::BuildSnapshot(ProcessManager::ManagedProcess& p,
     }
     snap.timeoutSec = p.timeoutSec;
     snap.idleTimeoutSec = p.idleTimeoutSec;
+    snap.idleFirstEventSec = p.idleFirstEventSec;
+    snap.processTreeSnapshot = p.processTreeSnapshot;
     snap.treeProcessCount = p.treeProcessCount.load();
     snap.treeMemoryBytes = p.treeMemoryBytes.load();
     snap.terminalHwnd = p.terminalView ? p.terminalView->Hwnd() : nullptr;

@@ -58,6 +58,45 @@ hancho-cli.exe mcp uninstall --delete-data-dir           # データディレク
 | `taskqueue_link` / `taskqueue_unlink` | 依存を 1 本追加 / 削除（`job`, `dependsOn`, `on` = `success`\|`done`）。 |
 | `taskqueue_graph` | 依存グラフ（`ready` / `waiting_for` / `dependents`）。 |
 
+**ビヘイビアツリー操作**
+
+| ツール | 説明 |
+| :--- | :--- |
+| `bt_validate` | BT を実行せずに検証（`bt` オブジェクトまたは `file` パス）。`warnings[]` は致命的ではなく、`strict: true` を付けると各警告がエラーに昇格して `ok` / `valid` が false になる。`bt_start` も同じ `warnings` を返す。 |
+| `bt_template` | ハング対策入りテンプレートの一覧、または 1 つを返す（`name`: `resilient-worker` または `card-sequence`。省略時は一覧）。検証前に `<...>` を実値へ置き換える。`{engine}` / `{model}` は実行時プレースホルダ。 |
+
+ほかの BT ツール (`bt_start`, `bt_get`, `bt_list`, `bt_wait`, `bt_resume`, `bt_retry`, `bt_update`, `bt_cancel`, `bt_pause`) は変更なし。警告コードとテンプレートの実出力は [behavior-tree-ja.md](behavior-tree-ja.md) を参照。
+
+**LLM リスト操作**
+
+`<data-dir>/llms.json` の役割ごとの 3 つの独立した候補リスト (`worker`, `consult`, `supervisor`)。MCP / CLI で追加した行は `proposed` で、人が承認するまで使われません (ダッシュボードの LLM ページ、またはチャットの言葉の引用)。変更はすべて `history` に残ります。CLI の対応は `hancho-cli llm list|add|remove|enable|disable|approve`。
+
+| ツール | 説明 |
+| :--- | :--- |
+| `llm_list` | 行と状態を一覧（`list?`: `worker`\|`consult`\|`supervisor`。省略時は全部）。 |
+| `llm_add` | proposed 行を追加（`list`, `engine`, `model`, 必須 `reason`。任意で `provider`, `rank`, `note`）。 |
+| `llm_remove` | 行を削除（`list`, `engine`, `model`, 必須 `reason`）。 |
+| `llm_set_enabled` | 行を有効／無効にする（`list`, `engine`, `model`, `enabled`, 必須 `reason`）。CLI は `llm enable` / `llm disable`。 |
+| `llm_approve` | proposed 行を承認し、ユーザーの言葉を引用して記録（`list`, `engine`, `model`, `userSaid`;`approvedVia: chat`）。 |
+
+**ワーカー probe / health 操作**
+
+| ツール | 説明 |
+| :--- | :--- |
+| `worker_probe` | 最小プロンプト (stdin を閉じる) でエンジンを健康診断。引数: `engine` (必須), `model?`, `timeout?`, `no_cache?`。`{ok, engine, model, elapsedMs, failureClass?, detail?, cached}` を返し、結果は `<data-dir>/probes.json` にキャッシュ。CLI は `worker probe`。 |
+| `worker_health` | 共有のエンジン健全性レジストリ (`<data-dir>/engine-health.json`) を読む。引数なしで一覧、`engine` + `model` + `reset: true` で手動回復。CLI は `worker health` / `worker health --reset <engine/model>`。故障中のエンジンは core の probe が成功するまでジョブを保留する。 |
+
+**権限 (permits) 操作**
+
+ワーカーの権限は `<data-dir>/permits.json` にあります。拒否は `permission_denied` に分類され、セッション再開を使い切ると自動申請した permit を人が承認するまで `waitingForPermit` で待ちます。ユーザーの全体設定ファイルは書き換えません。
+
+| ツール | 説明 |
+| :--- | :--- |
+| `permit_list` | 提案中の行も含めて一覧（`scope?`: `global` / `taskqueue:<名前>` / `bt:<id>`）。 |
+| `permit_request` | 権限を提案（`kind`: `read_path`\|`write_path`\|`command`\|`network`, `target`, 必須 `reason`。任意で `engine`/`engines`, `scope`）。 |
+| `permit_approve` | ユーザーの言葉を引用して提案を承認（`id`, `userSaid`）。 |
+| `permit_revoke` | 承認済みの権限を取り消す（`id`, `reason`）。 |
+
 **トリアージ操作**
 
 各カードの情報・処置候補・決定論的な推奨は Hancho が用意します。判断前にカードを読み、Supervisor はカードにある候補 id を 1 つ選び、理由を付けてください。`ignore` と `cancel` は理由がある場合のみ選べます。

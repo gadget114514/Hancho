@@ -61,7 +61,8 @@ enum class ProcState {
     Failed = 2,
     TimedOut = 3,
     IdleTimedOut = 4,
-    Killed = 5
+    Killed = 5,
+    StartupTimedOut = 6
 };
 
 std::wstring Utf8ToWide(const std::string& utf8);

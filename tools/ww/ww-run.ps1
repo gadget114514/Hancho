@@ -33,6 +33,7 @@ param(
     [string]$Queue = "",
     [int]$Concurrency = 3,
     [string]$HanchoDataDir = $env:HANCHO_LOG_DIR,
+    [string]$Resume = $(if ($env:HANCHO_RESUME_SESSION) { $env:HANCHO_RESUME_SESSION } else { "" }),
     [switch]$Help
 )
 
@@ -318,7 +319,10 @@ if ($Worktree) {
     }
     if ($card) { $promptCard = "$($paths.RelUrl)/tasks/$($card.Name)" }
 }
-$prompt = "Execute $promptCard. Read AGENTS.md first. $Extra".Trim()
+# 091-7: default to a narrow scope. The worker must stay inside the checkout (cwd); anything
+# outside it has to be declared in the card's `needs` and approved before it can be used.
+$scopeRule = "Read AGENTS.md in the project first. Do not read or write files outside the project (cwd); if a task genuinely needs one, state it in needs and ask for a permit instead of accessing it directly."
+$prompt = "Execute $promptCard. $scopeRule $Extra".Trim()
 $workDir = $root
 if ($Shared) {
     $prompt += " SHARED RUN: other runs edit this checkout in parallel. Edit only the files listed under Authorised edits. Skip compile/tests; list them under 'Verification pending' in the report. Do not commit."
@@ -336,7 +340,7 @@ if ($DryRun) {
     Write-Host "[ww-run] DRYRUN plan:"
     Write-Host "  engine      : $Engine"
     Write-Host "  model       : $(if ($Model) { $Model } elseif ($Engine -eq 'agy') { 'gemini-3.8-flash-medium (default)' } else { '(engine default)' })"
-    Write-Host "  command     : $(Get-EngineCommand -Engine $Engine -Model $Model -Agent $Agent)"
+    Write-Host "  command     : $(Get-EngineCommand -Engine $Engine -Model $Model -Agent $Agent -Resume $Resume)"
     if ($Agent) { Write-Host "  agent       : $Agent (.claude/agents/$Agent.md)" }
     Write-Host "  data dir    : $data"
     Write-Host "  mode        : $(if ($Worktree) { 'worktree' } elseif ($Shared) { 'shared' } else { 'main' })"
@@ -400,7 +404,7 @@ try {
     # -EncodedCommand avoids cmd.exe quoting entirely; the child closes stdin immediately (below).
     # stderr is left on the console (raw); JSON errors on stdout still reach the progress log.
     $safePrompt = $promptFile.Replace("'", "''")
-    $engineCommand = Get-EngineCommand -Engine $Engine -Model $Model -Agent $Agent
+    $engineCommand = Get-EngineCommand -Engine $Engine -Model $Model -Agent $Agent -Resume $Resume
     # HOOK: ww-run.selftest.ps1 replaces the real engine with a fake one (a command line, not a path).
     if ($env:WW_TEST_ENGINE_COMMAND) { $engineCommand = $env:WW_TEST_ENGINE_COMMAND }
     $launch = "`$ProgressPreference='SilentlyContinue'; `$prompt = (Get-Content -LiteralPath '$safePrompt' -Raw -Encoding UTF8).TrimEnd(); $engineCommand; if (`$null -eq `$LASTEXITCODE) { exit 1 } else { exit `$LASTEXITCODE }"
@@ -415,6 +419,33 @@ try {
     $psi.RedirectStandardOutput = $true
     $psi.StandardOutputEncoding = [System.Text.Encoding]::UTF8
     $psi.CreateNoWindow = $true
+    # 091-7: deny (not ask, never --auto) everything outside the project for opencode. Hancho
+    # passes approved permits as HANCHO_WORKER_PERMITS; turn them into allow rules here. The
+    # user's global config (~/.config/opencode/opencode.jsonc) is never read or written.
+    if ($Engine -eq 'opencode') {
+        $permission = @{
+            external_directory = @{ '*' = 'deny' }
+            read               = @{ '*.env' = 'deny'; '*.env.*' = 'deny' }
+            bash               = @{ '*' = 'allow' }
+            edit               = @{}
+            webfetch           = @{}
+        }
+        if ($env:HANCHO_WORKER_PERMITS) {
+            try {
+                $approved = ($env:HANCHO_WORKER_PERMITS | ConvertFrom-Json).permits
+                foreach ($p in $approved) {
+                    if (-not $p.target) { continue }
+                    switch ([string]$p.kind) {
+                        'read_path'  { $permission.external_directory[$p.target] = 'allow'; $permission.read[$p.target] = 'allow' }
+                        'write_path' { $permission.external_directory[$p.target] = 'allow'; $permission.edit[$p.target] = 'allow' }
+                        'command'    { $permission.bash[$p.target] = 'allow' }
+                        'network'    { $permission.webfetch[$p.target] = 'allow' }
+                    }
+                }
+            } catch { }
+        }
+        $psi.EnvironmentVariables['OPENCODE_PERMISSION'] = ($permission | ConvertTo-Json -Compress -Depth 8)
+    }
     $proc = [System.Diagnostics.Process]::Start($psi)
     $proc.StandardInput.Close()
 # Assign the job before anything else runs: children started before this point are not in it.
@@ -439,6 +470,19 @@ $job = New-EngineJob -Proc $proc
             if ($null -eq $line) { break }
             $exitedAt = $null
             [System.IO.File]::AppendAllText($events, $line + "`r`n", $utf8)
+            # 091-7: remember the engine session so a permission denial can be resumed with
+            # -Resume <id> (opencode run --session / claude --resume).
+            if ($line -match 'sessionID|session_id') {
+                try {
+                    $ev = $line | ConvertFrom-Json
+                    $sid = if ($ev.sessionID) { [string]$ev.sessionID } elseif ($ev.session_id) { [string]$ev.session_id } else { "" }
+                    if ($sid -and $sid -ne [string]$record.SessionID) {
+                        $record.SessionID = $sid
+                        $record | ConvertTo-Json -Depth 8 | Set-Content -Encoding UTF8 $taskRunFile
+                        if (-not $Worktree) { $record | ConvertTo-Json -Depth 8 | Set-Content -Encoding UTF8 $runningFile }
+                    }
+                } catch { }
+            }
             if ($JsonStdout) {
                 [Console]::Out.WriteLine($line)
             }

@@ -82,7 +82,8 @@
 
 ## 7. タスクキュー: 順序・依存・タイムアウト・自動再実行
 - ジョブを**1 コマンドずつ**登録すると、Hancho が実行順・同時実行数・優先度を決め、キューを永続化します（`logs/taskqueues/<name>.json`）。
-- ジョブ単位の `timeoutSec`、出力と CPU の両方を見るアイドル検出、成功条件（`exitCode` / `filesNewer` / `outputRegex` / JUnit・NUnit XML を読む `testReport`）、自動再実行（`maxAttempts`）、依存失敗時の `blocked` を提供します。
+- ジョブ単位の `timeoutSec`、出力と CPU の両方を見るアイドル検出（最初の正規化イベントを監視する `idle.firstEventSec` も含む。worker ジョブの既定は 180 秒）、成功条件（`exitCode` / `filesNewer` / `outputRegex` / JUnit・NUnit XML を読む `testReport`）、自動再実行（`maxAttempts`）、依存失敗時の `blocked` を提供します。
+- **失敗診断と引き取り**: イベントが出ない worker は `startup_timed_out` で停止し、`class: "startup_hang"` と診断されます。活動の無いタイムアウトに `raise_timeout` は勧めません。失敗レコードは `likelyCauses`（`[{id, why}]`。例: `no_model`、`same_engine_nesting`、`waiting_for_input`）、`nextSteps`（`[{action, change?, needsApproval?, question?}]`。同じ設定の再試行 → `retry_with_change` → escalate）、`supervisorNote` を持ち、`taskqueue why <id>` で表示できます。引き取りは `taskqueue takeover --id <id> --reason "..."` で終端状態 `takenOver` と `takeover` レコードに記録し、`taskqueue complete --id <id> --reason "..."` で結果を戻します（`succeeded` で後続が進みます）。
 - **ChainGuard** が `start_process` / `taskqueue_add` / `taskqueue_update` のシェル連鎖と待ちループを拒否します。順序は `dependsOn` で宣言してください。CLI の `--allow-chain` のみ例外（MCP には非公開）。
 - GUI: 左端の表示切替ボタン、または **Ctrl+T** で **2行同時表示 (Two Rows)**、**プロセスのみ (Processes Only)**、**タスクのみ (Tasks Only)** を順次トグル切り替え。2行表示時は水平スプリッターバーをドラッグして各領域の高さを自在に調整できます。実行中のジョブは上位に表示され、失敗は低彩度の赤、タイムアウトは低彩度のアンバーで表示されます。
 - 詳細は [タスクキュー](taskqueue-ja.md) を参照。

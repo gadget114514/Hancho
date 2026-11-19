@@ -31,7 +31,8 @@ struct BtRemainingInfo {
     std::vector<TaskGroupInfo> groups;   // active task groups, shown as virtual rows in the task list
 };
 
-class BtManager : public IBtJobRunner, public IBtEngineCatalog {
+class BtManager : public IBtJobRunner, public IBtEngineCatalog, public IBtProber,
+                  public IBtEngineHealth {
 public:
     BtManager(ProcessManager& pm, TaskQueueManager& tqm);
     ~BtManager() override;
@@ -47,6 +48,24 @@ public:
     // IBtEngineCatalog
     std::string DefaultEngine() const override;
     bool Knows(const std::string& engine, const std::string& model, std::string& err) const override;
+    bool IsApprovedForList(const std::string& list, const std::string& engine,
+                           const std::string& model) const override;
+
+    // IBtProber
+    BtProbeResult Probe(const std::string& engine, const std::string& model,
+                         int timeoutSec) override;
+
+    // IBtEngineHealth (091-6)
+    bool IsDown(const std::string& engine, const std::string& model) const override;
+    void MarkDown(const std::string& engine, const std::string& model,
+                  const std::string& failureClass, const std::string& detail,
+                  int64_t nowMs) override;
+    void MarkHealthy(const std::string& engine, const std::string& model,
+                     const std::string& reason, int64_t nowMs) override;
+    int64_t NextProbeAtMs(const std::string& engine, const std::string& model) const override;
+    bool IsDownWorthy(const std::string& failureClass) const override;
+    std::vector<std::pair<std::string, std::string>> Candidates(
+        const std::string& list) const override;
 
     // IBtJobRunner
     std::string StartJob(const BtJobSpec& spec) override;
@@ -58,7 +77,8 @@ public:
     BtRemainingInfo GetRemainingInfo() const;
 
     // JSON API (stage 2 & stage 3)
-    std::string Validate(const std::string& json);
+    // strict=true promotes 091-4 lint warnings to errors.
+    std::string Validate(const std::string& json, bool strict = false);
     std::string Start(const std::string& json, bool paused = false);
     std::string Get(const std::string& id, bool compact = false);
     std::string List();

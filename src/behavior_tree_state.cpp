@@ -19,6 +19,33 @@ json NodeToJson(const BtNode& node) {
         if (!node.detail.empty()) st["detail"] = node.detail;
         if (!node.answer.empty()) st["answer"] = node.answer;
         if (!node.rationale.empty()) st["rationale"] = node.rationale;
+        if (node.hasFailureDiagnostic) st["failure"] = node.failureDiagnostic;
+        if (!node.lastEngine.empty()) st["engine"] = node.lastEngine;
+        if (!node.lastModel.empty()) st["model"] = node.lastModel;
+        if (!node.engineCandidates.empty()) {
+            st["engineCandidateIndex"] = node.engineCandidateIndex;
+            json attempts = json::array();
+            for (const auto& a : node.engineAttempts) {
+                attempts.push_back(json{{"engine", a.engine}, {"model", a.model},
+                                        {"result", a.result}, {"failureClass", a.failureClass},
+                                        {"detail", a.detail}, {"list", a.list}, {"entry", a.entry}});
+            }
+            st["engineAttempts"] = std::move(attempts);
+        }
+        if (node.waitingForEngine) {
+            st["waitingForEngine"] = true;
+            st["engineWaitUntilMs"] = node.engineWaitUntilMs;
+        }
+        if (node.takenOver) {
+            st["takenOver"] = true;
+            st["takeover"] = node.takeover.is_object() ? node.takeover : json::object();
+        }
+        if (node.type == "catch") {
+            st["catchPhase"] = node.catchPhase;
+            st["catchRetries"] = node.catchRetries;
+            st["catchHandlerIndex"] = node.catchHandlerIndex;
+            if (!node.catchHandler.empty()) st["catchHandler"] = node.catchHandler;
+        }
         j["status"] = std::move(st);
     } else {
         j.erase("status");
@@ -36,6 +63,19 @@ json NodeToJson(const BtNode& node) {
     if (node.elseChild) j["else"] = NodeToJson(*node.elseChild);
     if (node.singleChild) j["child"] = NodeToJson(*node.singleChild);
     if (node.untilChild) j["until"] = NodeToJson(*node.untilChild);
+    if (!node.catchHandlers.empty() && j.contains("handlers") && j["handlers"].is_array()) {
+        json handlers = json::array();
+        for (size_t i = 0; i < node.catchHandlers.size() && i < j["handlers"].size(); ++i) {
+            const BtCatchHandler& h = node.catchHandlers[i];
+            json hj = h.rawDef;
+            if (hj.is_object() && h.doNode) hj["do"] = NodeToJson(*h.doNode);
+            handlers.push_back(std::move(hj));
+        }
+        j["handlers"] = std::move(handlers);
+    }
+    if (node.otherwiseChild && j.contains("otherwise") && j["otherwise"].is_object()) {
+        j["otherwise"] = NodeToJson(*node.otherwiseChild);
+    }
 
     return j;
 }
@@ -53,6 +93,25 @@ void UpdateNextJobSeqFromId(const std::string& btId, const std::string& jobId, i
         } catch (...) {
         }
     }
+}
+
+json IdleToJson(const BtJobIdle& idle) {
+    return {
+        {"outputSec", idle.outputSec},
+        {"cpuSec", idle.cpuSec},
+        {"firstEventSec", idle.firstEventSec}
+    };
+}
+
+json DefaultsToJson(const BtDefaults& d) {
+    json out = json::object();
+    json worker = json::object();
+    if (d.hasWorkerIdle()) worker["idle"] = IdleToJson(d.workerIdle);
+    if (d.workerMaxAttempts > 0) worker["maxAttempts"] = d.workerMaxAttempts;
+    if (d.hasWorkerProbe) worker["probe"] = d.workerProbe;
+    if (!worker.empty()) out["worker"] = std::move(worker);
+    if (d.hasJobIdle()) out["job"] = {{"idle", IdleToJson(d.jobIdle)}};
+    return out;
 }
 
 } // namespace
@@ -75,6 +134,37 @@ void BehaviorTree::Impl::RestoreNodeStatus(BehaviorTree& bt,
         node.detail = st.value("detail", std::string());
         node.answer = st.value("answer", std::string());
         node.rationale = st.value("rationale", std::string());
+        if (st.contains("failure") && st["failure"].is_object()) {
+            node.hasFailureDiagnostic = true;
+            node.failureDiagnostic = st["failure"];
+        }
+        node.lastEngine = st.value("engine", std::string());
+        node.lastModel = st.value("model", std::string());
+        node.engineCandidateIndex = st.value("engineCandidateIndex", 0);
+        node.waitingForEngine = st.value("waitingForEngine", false);
+        node.engineWaitUntilMs = st.value("engineWaitUntilMs", static_cast<int64_t>(0));
+        if (st.contains("engineAttempts") && st["engineAttempts"].is_array()) {
+            for (const auto& a : st["engineAttempts"]) {
+                if (!a.is_object()) continue;
+                BtEngineAttempt att;
+                att.engine = a.value("engine", std::string());
+                att.model = a.value("model", std::string());
+                att.result = a.value("result", std::string());
+                att.failureClass = a.value("failureClass", std::string());
+                att.detail = a.value("detail", std::string());
+                att.list = a.value("list", std::string());
+                att.entry = a.value("entry", std::string());
+                node.engineAttempts.push_back(std::move(att));
+            }
+        }
+        node.takenOver = st.value("takenOver", false);
+        if (st.contains("takeover") && st["takeover"].is_object()) node.takeover = st["takeover"];
+        if (node.type == "catch") {
+            node.catchPhase = st.value("catchPhase", 0);
+            node.catchRetries = st.value("catchRetries", 0);
+            node.catchHandlerIndex = st.value("catchHandlerIndex", -1);
+            node.catchHandler = st.value("catchHandler", std::string());
+        }
         if (!node.answer.empty()) {
             std::string ansKey = (!node.id.empty() ? node.id : node.nodeKey) + ".answer";
             vars[ansKey] = node.answer;
@@ -110,6 +200,18 @@ void BehaviorTree::Impl::RestoreNodeStatus(BehaviorTree& bt,
     }
     if (node.untilChild && jNode.contains("until")) {
         RestoreNodeStatus(bt, *node.untilChild, jNode["until"], baseMs, nextJobSeq, vars);
+    }
+    if (node.otherwiseChild && jNode.contains("otherwise") && jNode["otherwise"].is_object()) {
+        RestoreNodeStatus(bt, *node.otherwiseChild, jNode["otherwise"], baseMs, nextJobSeq, vars);
+    }
+    if (jNode.contains("handlers") && jNode["handlers"].is_array()) {
+        for (size_t i = 0; i < node.catchHandlers.size() && i < jNode["handlers"].size(); ++i) {
+            const BtCatchHandler& h = node.catchHandlers[i];
+            const json& hj = jNode["handlers"][i];
+            if (h.doNode && hj.is_object() && hj.contains("do")) {
+                RestoreNodeStatus(bt, *h.doNode, hj["do"], baseMs, nextJobSeq, vars);
+            }
+        }
     }
 
     if (node.state == "running") {
@@ -180,6 +282,8 @@ std::string BehaviorTree::ToStateJson() const {
         if (!workerDefaults_.model.empty()) w["model"] = workerDefaults_.model;
         out["worker"] = std::move(w);
     }
+    json defaults = DefaultsToJson(defaults_);
+    if (!defaults.empty()) out["defaults"] = std::move(defaults);
 
     json varsJson = json::object();
     for (const auto& [k, v] : vars_) {
@@ -248,6 +352,10 @@ void CollectOutsideTarget(const BtNode& cur,
     if (cur.elseChild) CollectOutsideTarget(*cur.elseChild, target, outIds, outCount);
     if (cur.singleChild) CollectOutsideTarget(*cur.singleChild, target, outIds, outCount);
     if (cur.untilChild) CollectOutsideTarget(*cur.untilChild, target, outIds, outCount);
+    if (cur.otherwiseChild) CollectOutsideTarget(*cur.otherwiseChild, target, outIds, outCount);
+    for (const auto& h : cur.catchHandlers) {
+        if (h.doNode) CollectOutsideTarget(*h.doNode, target, outIds, outCount);
+    }
 }
 
 bool FindJsonNodeByIdOrPath(const json& cur,
@@ -270,11 +378,21 @@ bool FindJsonNodeByIdOrPath(const json& cur,
             }
         }
     }
-    for (const char* slot : {"cond", "then", "else", "child", "until"}) {
+    for (const char* slot : {"cond", "then", "else", "child", "until", "otherwise"}) {
         if (cur.contains(slot) && cur[slot].is_object()) {
             if (FindJsonNodeByIdOrPath(cur[slot], curPath + "." + slot, targetId, targetPath, outJson)) {
                 return true;
             }
+        }
+    }
+    if (cur.contains("handlers") && cur["handlers"].is_array()) {
+        size_t i = 0;
+        for (const auto& h : cur["handlers"]) {
+            if (h.is_object() && h.contains("do") && h["do"].is_object()) {
+                if (FindJsonNodeByIdOrPath(h["do"], curPath + ".handlers[" + std::to_string(i) + "].do",
+                                           targetId, targetPath, outJson)) return true;
+            }
+            ++i;
         }
     }
     return false;
@@ -334,6 +452,26 @@ bool CheckJsonShapeMatchesNode(const BtNode& oldNode,
     if (!checkSlot("else", oldNode.elseChild)) return false;
     if (!checkSlot("child", oldNode.singleChild)) return false;
     if (!checkSlot("until", oldNode.untilChild)) return false;
+    if (oldNode.type == "catch") {
+        if (!checkSlot("otherwise", oldNode.otherwiseChild)) return false;
+        bool hasHandlers = jNew.contains("handlers") && jNew["handlers"].is_array();
+        if (!oldNode.catchHandlers.empty() || hasHandlers) {
+            if (!hasHandlers || jNew["handlers"].size() != oldNode.catchHandlers.size()) {
+                err = oldNode.pathKey + ": cannot change handlers count (tree shape must remain identical)";
+                return false;
+            }
+            for (size_t i = 0; i < oldNode.catchHandlers.size(); ++i) {
+                const BtCatchHandler& oldH = oldNode.catchHandlers[i];
+                const json& jh = jNew["handlers"][i];
+                bool hasDo = jh.is_object() && jh.contains("do") && jh["do"].is_object();
+                if (static_cast<bool>(oldH.doNode) != hasDo) {
+                    err = oldNode.pathKey + ": cannot add or remove a handler's 'do' child";
+                    return false;
+                }
+                if (hasDo && !CheckJsonShapeMatchesNode(*oldH.doNode, jh["do"], false, err)) return false;
+            }
+        }
+    }
     return true;
 }
 
@@ -341,7 +479,7 @@ json StripChildrenAndStatus(json j) {
     if (!j.is_object()) return j;
     j.erase("status");
     j.erase("children");
-    for (const char* slot : {"cond", "then", "else", "child", "until"}) {
+    for (const char* slot : {"cond", "then", "else", "child", "until", "otherwise", "handlers"}) {
         j.erase(slot);
     }
     return j;
@@ -353,6 +491,20 @@ bool CheckNotRunningForUpdate(const BtNode& oldNode,
                               bool& outAnyChanged,
                               std::string& err) {
     bool selfChanged = (StripChildrenAndStatus(oldNode.rawDef) != StripChildrenAndStatus(newNode.rawDef));
+    if (oldNode.type == "catch" && newNode.type == "catch") {
+        auto handlerMeta = [](const BtNode& n) {
+            json arr = json::array();
+            for (const auto& h : n.catchHandlers) {
+                json hj = json::object();
+                if (!h.classes.empty()) hj["class"] = h.classes;
+                if (!h.cause.empty()) hj["cause"] = h.cause;
+                if (h.thenRetry) hj["thenRetry"] = true;
+                arr.push_back(std::move(hj));
+            }
+            return arr;
+        };
+        if (handlerMeta(oldNode) != handlerMeta(newNode)) selfChanged = true;
+    }
     if (selfChanged) outAnyChanged = true;
 
     if (oldNode.state == "running" && (rejectAnyRunningInSubtree || selfChanged)) {
@@ -381,6 +533,16 @@ bool CheckNotRunningForUpdate(const BtNode& oldNode,
     if (oldNode.untilChild &&
         !CheckNotRunningForUpdate(*oldNode.untilChild, *newNode.untilChild,
                                   rejectAnyRunningInSubtree, outAnyChanged, err)) return false;
+    if (oldNode.otherwiseChild && newNode.otherwiseChild &&
+        !CheckNotRunningForUpdate(*oldNode.otherwiseChild, *newNode.otherwiseChild,
+                                  rejectAnyRunningInSubtree, outAnyChanged, err)) return false;
+    for (size_t i = 0; i < oldNode.catchHandlers.size() && i < newNode.catchHandlers.size(); ++i) {
+        const auto& oh = oldNode.catchHandlers[i];
+        const auto& nh = newNode.catchHandlers[i];
+        if (oh.doNode && nh.doNode &&
+            !CheckNotRunningForUpdate(*oh.doNode, *nh.doNode,
+                                      rejectAnyRunningInSubtree, outAnyChanged, err)) return false;
+    }
     return true;
 }
 
@@ -404,8 +566,16 @@ void CopyNodeDefinitionRecursive(BtNode& dst, const BtNode& src) {
     dst.instructionsText = src.instructionsText;
     dst.instructionsFile = src.instructionsFile;
     dst.maxAttempts = src.maxAttempts;
+    dst.maxAttemptsConfigured = src.maxAttemptsConfigured;
+    dst.probe = src.probe;
+    dst.probeConfigured = src.probeConfigured;
     dst.engine = src.engine;
     dst.model = src.model;
+    dst.engineCandidates = src.engineCandidates;
+    dst.switchEngineOn = src.switchEngineOn;
+    dst.engineCandidateIndex = src.engineCandidateIndex;
+    dst.engineAttempts = src.engineAttempts;
+    dst.probeTimeoutSec = src.probeTimeoutSec;
     dst.prompt = src.prompt;
     dst.promptFile = src.promptFile;
     dst.outputSchema = src.outputSchema;
@@ -441,6 +611,19 @@ void CopyNodeDefinitionRecursive(BtNode& dst, const BtNode& src) {
     dst.condLt = src.condLt;
     dst.hasExists = src.hasExists;
     dst.condExists = src.condExists;
+    dst.condFailureClasses = src.condFailureClasses;
+    dst.condFailureCause = src.condFailureCause;
+
+    dst.catchMaxRetries = src.catchMaxRetries;
+    for (size_t i = 0; i < dst.catchHandlers.size() && i < src.catchHandlers.size(); ++i) {
+        BtCatchHandler& dh = dst.catchHandlers[i];
+        const BtCatchHandler& sh = src.catchHandlers[i];
+        dh.rawDef = sh.rawDef;
+        dh.classes = sh.classes;
+        dh.cause = sh.cause;
+        dh.thenRetry = sh.thenRetry;
+        if (dh.doNode && sh.doNode) CopyNodeDefinitionRecursive(*dh.doNode, *sh.doNode);
+    }
 
     for (size_t i = 0; i < dst.children.size() && i < src.children.size(); ++i) {
         CopyNodeDefinitionRecursive(*dst.children[i], *src.children[i]);
@@ -450,6 +633,9 @@ void CopyNodeDefinitionRecursive(BtNode& dst, const BtNode& src) {
     if (dst.elseChild && src.elseChild) CopyNodeDefinitionRecursive(*dst.elseChild, *src.elseChild);
     if (dst.singleChild && src.singleChild) CopyNodeDefinitionRecursive(*dst.singleChild, *src.singleChild);
     if (dst.untilChild && src.untilChild) CopyNodeDefinitionRecursive(*dst.untilChild, *src.untilChild);
+    if (dst.otherwiseChild && src.otherwiseChild) {
+        CopyNodeDefinitionRecursive(*dst.otherwiseChild, *src.otherwiseChild);
+    }
 }
 
 } // namespace
@@ -523,7 +709,7 @@ bool BehaviorTree::UpdateDefinition(const std::string& jsonText,
 
     auto parsedNode = ParseSingleNodeJson(
         nodeJson, target->pathKey, target->role, target->depth,
-        catalog_, workerDefaults_, cwd_, outsideIds, outsideCount,
+        catalog_, defaults_, cwd_, outsideIds, outsideCount,
         taskqueue_, target->queueName, err);
     if (!parsedNode) {
         return false;

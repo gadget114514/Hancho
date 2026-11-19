@@ -426,6 +426,11 @@ std::pair<std::string, std::string> ClassifyDeterministicFailure(
     std::string r = LowerAscii(reason);
     std::string outLower = LowerAscii(outcome);
 
+    // 0. startup_hang
+    if (r == "startup_hang" || r == "startup_timed_out") {
+        return {"startup_hang", "The worker started but emitted no events."};
+    }
+
     // 1. launch_error: the process never started
     if (r == "launch_error" || r == "launcherror" || r == "launch_failed" || r == "launchfailed") {
         std::string summary = !checkDetail.empty() ? checkDetail : "The process could not be started.";

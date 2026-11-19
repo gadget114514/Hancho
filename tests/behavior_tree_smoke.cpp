@@ -1,6 +1,13 @@
 // Headless smoke test for the Behavior Tree core engine (src/behavior_tree_*.cpp).
 
 #include "behavior_tree_smoke_common.h"
+#include "../src/bt_templates.h"
+
+#include <fstream>
+#include <map>
+#include <set>
+#include <sstream>
+#include <utility>
 
 namespace bt_test {
 int g_failures = 0;
@@ -568,6 +575,625 @@ int main() {
         planned = bt.PlannedTasks();
         Check(planned.empty(), "failed branch's provisional job is gone after the tree moves on");
         Check(bt.PendingEstimateSec() == 0, "pending estimate follows the new branch");
+    }
+
+    // 091-1: failure diagnostic variables, the `failure` condition and escalate packet.
+    {
+        const std::string diagJson = R"({"class":"startup_hang","confidence":"high",)"
+            R"("summary":"The worker started but emitted no events.",)"
+            R"("suggestedAction":"retry_with_change","retryAt":null,)"
+            R"("likelyCauses":[{"id":"no_model","why":"no --model"},{"id":"waiting_for_input","why":"idle"}],)"
+            R"("nextSteps":[{"action":"retry"},{"action":"retry","change":{"model":"m"}}],)"
+            R"("supervisorNote":"do not take over"})";
+
+        auto treeWithCond = [](const std::string& id, const std::string& cond) {
+            return std::string("{\"id\":\"") + id + R"(","root":{"type":"fallback","children":[)"
+                R"({"type":"job","id":"impl","summary":"s","command":"c","timeoutSec":60},)"
+                + cond + "]}}";
+        };
+
+        // (2) class match (array) and the diagnostic variables.
+        {
+            FakeJobRunner runner;
+            BehaviorTree bt;
+            std::string err;
+            std::string def = treeWithCond("fc-match",
+                R"({"type":"failure","id":"cond","node":"impl","class":["startup_hang","idle_stall"]})");
+            Check(bt.LoadDefinition(def, &catalog, err), "091-1: load failure-match BT: " + err);
+            bt.SetJobRunner(&runner);
+            bt.Start(1000);
+            bt.OnJobFinished("fc-match-impl-1", false, -1, "", "", 1100, "", "", "timedOut", diagJson);
+            Check(bt.NodeState("cond") == "succeeded", "091-1: failure class array match succeeds");
+            Check(bt.GetVar("impl.failureClass") == "startup_hang", "091-1: ${impl.failureClass}");
+            Check(bt.GetVar("impl.failureSummary") == "The worker started but emitted no events.",
+                  "091-1: ${impl.failureSummary}");
+            Check(bt.GetVar("impl.likelyCauses") == "no_model,waiting_for_input",
+                  "091-1: ${impl.likelyCauses} is comma-separated ids");
+            Check(bt.GetVar("impl.suggestedAction") == "retry_with_change", "091-1: ${impl.suggestedAction}");
+            Check(bt.GetVar("impl.retryAt").empty(), "091-1: null retryAt becomes empty string");
+            Check(bt.GetVar("impl.engine").empty() && bt.GetVar("impl.model").empty(),
+                  "091-1: job leaves engine/model empty");
+
+            BtDebugNode dbg;
+            std::string dbgErr;
+            Check(ParseBtDebugTree(bt.ToStateJson(), dbg, dbgErr), "091-1: state parses in bt_debug_view: " + dbgErr);
+            bool foundLabel = false;
+            auto findNode = [&](auto&& self, const BtDebugNode& n) -> void {
+                if (n.nodeId == "cond") {
+                    foundLabel = n.label.find("startup_hang") != std::string::npos &&
+                                 n.label.find("idle_stall") != std::string::npos;
+                }
+                for (const auto& c : n.children) self(self, c);
+            };
+            findNode(findNode, dbg);
+            Check(foundLabel, "091-1: bt_debug_view label shows failure class values");
+        }
+
+        // (2) class mismatch and cause match.
+        {
+            FakeJobRunner runner;
+            BehaviorTree bt;
+            std::string err;
+            Check(bt.LoadDefinition(treeWithCond("fc-miss",
+                R"({"type":"failure","id":"cond","node":"impl","class":"auth_error"})"), &catalog, err),
+                "091-1: load failure-miss BT: " + err);
+            bt.SetJobRunner(&runner);
+            bt.Start(1000);
+            bt.OnJobFinished("fc-miss-impl-1", false, -1, "", "", 1100, "", "", "timedOut", diagJson);
+            Check(bt.NodeState("cond") == "failed", "091-1: failure class mismatch fails");
+        }
+        {
+            FakeJobRunner runner;
+            BehaviorTree bt;
+            std::string err;
+            Check(bt.LoadDefinition(treeWithCond("fc-cause",
+                R"({"type":"failure","id":"cond","node":"impl","cause":"no_model"})"), &catalog, err),
+                "091-1: load failure-cause BT: " + err);
+            bt.SetJobRunner(&runner);
+            bt.Start(1000);
+            bt.OnJobFinished("fc-cause-impl-1", false, -1, "", "", 1100, "", "", "timedOut", diagJson);
+            Check(bt.NodeState("cond") == "succeeded", "091-1: likely cause match succeeds");
+        }
+
+        // (2) unexecuted target node -> condition fails.
+        {
+            std::string def = R"({"id":"fc-unexec","root":{"type":"if",)"
+                R"("cond":{"type":"succeed"},)"
+                R"("then":{"type":"failure","id":"cond","node":"never","class":"startup_hang"},)"
+                R"("else":{"type":"job","id":"never","summary":"n","command":"n","timeoutSec":60}}})";
+            FakeJobRunner runner;
+            BehaviorTree bt;
+            std::string err;
+            Check(bt.LoadDefinition(def, &catalog, err), "091-1: load unexecuted-target BT: " + err);
+            bt.SetJobRunner(&runner);
+            bt.Start(1000);
+            Check(bt.NodeState("never") == "idle", "091-1: target node not executed");
+            Check(bt.NodeState("cond") == "failed", "091-1: failure condition on unexecuted node fails");
+        }
+
+        // (2) unknown node id is a validation error.
+        {
+            std::vector<std::string> errs;
+            std::string def = R"({"id":"fc-bad","root":{"type":"failure","node":"nope","class":"startup_hang"}})";
+            Check(!BehaviorTree::ValidateJson(def, &catalog, errs), "091-1: unknown node id rejected");
+            bool mentionsNode = false;
+            for (const auto& e : errs) if (e.find("nope") != std::string::npos) mentionsNode = true;
+            Check(mentionsNode, "091-1: validation error names the unknown node");
+        }
+
+        // (3) success clears the failure variables so a stale failure never leaks.
+        {
+            FakeJobRunner runner;
+            BehaviorTree bt;
+            std::string err;
+            Check(bt.LoadDefinition(treeWithCond("fc-clear",
+                R"({"type":"failure","id":"cond","node":"impl","class":"startup_hang"})"), &catalog, err),
+                "091-1: load clear-vars BT: " + err);
+            bt.SetJobRunner(&runner);
+            bt.Start(1000);
+            bt.OnJobFinished("fc-clear-impl-1", false, -1, "", "", 1100, "", "", "timedOut", diagJson);
+            Check(bt.GetVar("impl.failureClass") == "startup_hang" && bt.NodeState("cond") == "succeeded",
+                  "091-1: failure values present before recovery");
+            std::string rerr;
+            Check(bt.Retry("impl", false, 2000, rerr), "091-1: retry impl: " + rerr);
+            bt.OnJobFinished("fc-clear-impl-2", true, 0, "", "", 2100);
+            Check(bt.GetVar("impl.failureClass").empty(), "091-1: success clears ${impl.failureClass}");
+            Check(bt.GetVar("impl.likelyCauses").empty(), "091-1: success clears ${impl.likelyCauses}");
+            Check(bt.GetVar("impl.failureSummary").empty(), "091-1: success clears ${impl.failureSummary}");
+        }
+
+        // (4) escalate packet carries the diagnosis of failed include.logs nodes.
+        {
+            std::string def = R"({"id":"fc-esc","root":{"type":"fallback","children":[)"
+                R"({"type":"job","id":"impl","summary":"s","command":"c","timeoutSec":60},)"
+                R"({"type":"escalate","id":"gate","question":"What now?",)"
+                R"("include":{"logs":["impl"]}}]}})";
+            FakeJobRunner runner;
+            BehaviorTree bt;
+            std::string err;
+            Check(bt.LoadDefinition(def, &catalog, err), "091-1: load escalate-diagnostic BT: " + err);
+            bt.SetJobRunner(&runner);
+            bt.Start(1000);
+            bt.OnJobFinished("fc-esc-impl-1", false, -1, "", "", 1100, "", "", "timedOut", diagJson);
+            std::string pkt = bt.GetEscalationPacketJson("gate");
+            Check(pkt.find("\"diagnostics\"") != std::string::npos,
+                  "091-1: packet has include.diagnostics");
+            Check(pkt.find("startup_hang") != std::string::npos &&
+                  pkt.find("no_model") != std::string::npos &&
+                  pkt.find("retry_with_change") != std::string::npos &&
+                  pkt.find("nextSteps") != std::string::npos &&
+                  pkt.find("do not take over") != std::string::npos,
+                  "091-1: packet includes class/causes/action/nextSteps/supervisorNote");
+            std::string md = bt.GetEscalationPacketMarkdown("gate");
+            Check(md.find("Included Failure Diagnostics") != std::string::npos,
+                  "091-1: markdown has a failure diagnostics section");
+        }
+    }
+
+    // 091-3: engine candidates, switching, approvals and probes.
+    {
+        class ProbeCatalog : public bt_test::FakeEngineCatalog {
+        public:
+            mutable std::set<std::string> approved;
+            bool IsApprovedForList(const std::string&, const std::string& engine,
+                                   const std::string& model) const override {
+                return approved.count(engine + "/" + model) != 0;
+            }
+        };
+        class FakeProber : public IBtProber {
+        public:
+            std::vector<std::pair<std::string, bool>> script;
+            mutable int next = 0;
+            BtProbeResult Probe(const std::string& engine, const std::string&, int) override {
+                BtProbeResult r;
+                bool ok = true;
+                if (next < static_cast<int>(script.size())) ok = script[static_cast<size_t>(next++)].second;
+                r.ok = ok;
+                r.failureClass = ok ? "" : "startup_hang";
+                r.detail = ok ? "ok" : "no events";
+                r.elapsedMs = 5;
+                (void)engine;
+                return r;
+            }
+        };
+
+        const char* switchBt = R"JSON({"id":"eng-switch","root":{
+            "type":"worker","id":"impl","prompt":"do work","summary":"switch test","timeoutSec":60,
+            "engines":[{"engine":"opencode","model":"m1"},{"engine":"agy","model":"m2"}],
+            "switchEngineOn":["startup_hang","auth_error","probe_failed"]}})JSON";
+
+        ProbeCatalog catalogAll;
+        catalogAll.approved.insert("opencode/m1");
+        catalogAll.approved.insert("agy/m2");
+        FakeJobRunner runner;
+        BehaviorTree bt;
+        std::string err;
+        Check(bt.LoadDefinition(switchBt, &catalogAll, err), "091-3: load engines BT: " + err);
+        bt.SetJobRunner(&runner);
+        bt.Start(1000);
+        Check(runner.startedWorkers.size() == 1 && runner.startedWorkers[0].engine == "opencode",
+              "091-3: first approved candidate is used");
+        bt.OnJobFinished("eng-switch-impl-1", false, -1, "", "", 1100, "", "",
+                         "timedOut", R"({"class":"startup_hang","summary":"no events"})");
+        Check(runner.startedWorkers.size() == 2 && runner.startedWorkers[1].engine == "agy" &&
+              runner.startedWorkers[1].model == "m2", "091-3: startup_hang switches to next candidate");
+        bool sawSwitch = false;
+        for (const auto& ev : bt.Events()) if (ev.type == "engineSwitched") sawSwitch = true;
+        Check(sawSwitch, "091-3: engineSwitched event emitted");
+        Check(bt.GetVar("impl.engine") == "agy" && bt.GetVar("impl.model") == "m2",
+              "091-3: ${node.engine}/${node.model} track the last candidate");
+        Check(bt.ToStateJson().find("engineAttempts") != std::string::npos,
+              "091-3: attempt history persisted in node state");
+        bt.OnJobFinished("eng-switch-impl-2", true, 0, "", "ok", 1200, "done", "{}");
+        Check(bt.State() == "succeeded", "091-3: tree succeeds after switch");
+
+        // Non-switchable failure must not advance the candidate.
+        FakeJobRunner runner2;
+        BehaviorTree bt2;
+        bt2.LoadDefinition(switchBt, &catalogAll, err);
+        bt2.SetJobRunner(&runner2);
+        bt2.Start(1000);
+        bt2.OnJobFinished("eng-switch-impl-1", false, 1, "", "", 1100, "", "",
+                          "failed", R"({"class":"test_failed","summary":"assertion"})");
+        Check(runner2.startedWorkers.size() == 1 && bt2.State() == "failed",
+              "091-3: non-switchable failure does not switch");
+
+        // Candidate missing from the worker list is rejected; approval makes it pass.
+        ProbeCatalog catalogNone;
+        std::vector<std::string> errs;
+        Check(!BehaviorTree::ValidateJson(switchBt, &catalogNone, errs) &&
+              errs[0].find("llm add --list worker") != std::string::npos,
+              "091-3: bt validate rejects unapproved candidate with guidance");
+        errs.clear();
+        Check(BehaviorTree::ValidateJson(switchBt, &catalogAll, errs) && errs.empty(),
+              "091-3: bt validate accepts approved candidates");
+
+        // probe leaf and worker preflight.
+        const char* probeBt = R"JSON({"id":"probe-test","root":{"type":"sequence","children":[
+            {"type":"probe","id":"p","engine":"opencode","model":"m1","timeoutSec":5},
+            {"type":"succeed"}]}})JSON";
+        FakeProber proberOk;
+        proberOk.script.push_back({"opencode", true});
+        FakeJobRunner runner3;
+        BehaviorTree bt3;
+        bt3.LoadDefinition(probeBt, &catalogAll, err);
+        bt3.SetJobRunner(&runner3);
+        bt3.SetProber(&proberOk);
+        bt3.Start(1000);
+        Check(bt3.State() == "succeeded" && bt3.NodeState("p") == "succeeded",
+              "091-3: probe leaf succeeds when engine answers");
+
+        FakeProber proberBad;
+        proberBad.script.push_back({"opencode", false});
+        FakeJobRunner runner4;
+        BehaviorTree bt4;
+        bt4.LoadDefinition(probeBt, &catalogAll, err);
+        bt4.SetJobRunner(&runner4);
+        bt4.SetProber(&proberBad);
+        bt4.Start(1000);
+        Check(bt4.State() == "failed" && bt4.GetVar("p.failureClass") == "probe_failed",
+              "091-3: failed probe is classified probe_failed");
+
+        const char* preflightBt = R"JSON({"id":"preflight","root":{
+            "type":"worker","id":"impl","prompt":"do work","summary":"preflight","timeoutSec":60,
+            "probe":true,
+            "engines":[{"engine":"opencode","model":"m1"},{"engine":"agy","model":"m2"}],
+            "switchEngineOn":["probe_failed"]}})JSON";
+        FakeProber proberSwitch;
+        proberSwitch.script.push_back({"opencode", false});
+        proberSwitch.script.push_back({"agy", true});
+        FakeJobRunner runner5;
+        BehaviorTree bt5;
+        bt5.LoadDefinition(preflightBt, &catalogAll, err);
+        bt5.SetJobRunner(&runner5);
+        bt5.SetProber(&proberSwitch);
+        bt5.Start(1000);
+        Check(runner5.startedWorkers.size() == 1 && runner5.startedWorkers[0].engine == "agy",
+              "091-3: failed preflight switches before launching production");
+
+        FakeProber proberFailAll;
+        proberFailAll.script.push_back({"opencode", false});
+        proberFailAll.script.push_back({"agy", false});
+        FakeJobRunner runner6;
+        BehaviorTree bt6;
+        bt6.LoadDefinition(preflightBt, &catalogAll, err);
+        bt6.SetJobRunner(&runner6);
+        bt6.SetProber(&proberFailAll);
+        bt6.Start(1000);
+        Check(runner6.startedWorkers.empty() && bt6.State() == "failed" &&
+              bt6.GetVar("impl.failureClass") == "probe_failed",
+              "091-3: all probes fail -> production never starts");
+    }
+
+    // 091-4: validate warnings, strict mode and embedded templates.
+    {
+        class LintCatalog : public bt_test::FakeEngineCatalog {
+        public:
+            std::set<std::string> usable;
+            bool IsApprovedForList(const std::string& list, const std::string& engine,
+                                   const std::string& model) const override {
+                return usable.count(list + "/" + engine + "/" + model) != 0;
+            }
+        };
+        LintCatalog lintCatalog;
+        lintCatalog.usable.insert("worker/agy/m2");
+        lintCatalog.usable.insert("worker/agy/m3");
+        lintCatalog.usable.insert("worker/opencode/m1");
+        FakeEngineCatalog allApproved;
+
+        auto codes = [](const std::vector<BtWarning>& ws) {
+            std::set<std::string> out;
+            for (const auto& w : ws) out.insert(w.code);
+            return out;
+        };
+        auto hasCode = [&](const std::vector<BtWarning>& ws, const std::string& code) {
+            return codes(ws).count(code) != 0;
+        };
+        auto lint = [&](const std::string& def, std::vector<BtWarning>& ws) {
+            std::vector<std::string> errs;
+            bool ok = BehaviorTree::ValidateJson(def, &lintCatalog, errs, ws);
+            Check(ok, "091-4: lint input is valid: " + (errs.empty() ? std::string("") : errs[0]));
+            return ok;
+        };
+        auto pathFor = [](const std::vector<BtWarning>& ws, const std::string& code) {
+            for (const auto& w : ws) if (w.code == code) return w.path;
+            return std::string();
+        };
+        auto suggestionFor = [](const std::vector<BtWarning>& ws, const std::string& code) {
+            for (const auto& w : ws) if (w.code == code) return w.suggestion;
+            return std::string();
+        };
+
+        const char* bareWorker = R"JSON({"id":"lint-bare","root":{
+            "type":"worker","id":"impl","summary":"s","prompt":"p","timeoutSec":60}})JSON";
+        std::vector<BtWarning> ws;
+        lint(bareWorker, ws);
+        Check(hasCode(ws, "no_hang_watch"), "091-4: no_hang_watch on worker without idle/defaults");
+        Check(hasCode(ws, "unguarded_worker"), "091-4: unguarded_worker on root worker");
+        Check(!suggestionFor(ws, "no_hang_watch").empty(), "091-4: warning carries a suggestion");
+
+        const char* guardedDefaults = R"JSON({"id":"lint-guarded","defaults":{
+            "worker":{"idle":{"firstEventSec":180,"outputSec":600}}},
+            "root":{"type":"catch","id":"guard","child":{"type":"worker","id":"impl",
+            "summary":"s","prompt":"p","timeoutSec":60},"handlers":[{"do":{"type":"succeed"}}]}})JSON";
+        ws.clear();
+        lint(guardedDefaults, ws);
+        Check(ws.empty(), "091-4: guarded worker with defaults has no warnings");
+
+        const char* unguarded = R"JSON({"id":"lint-unguarded","defaults":{
+            "worker":{"idle":{"firstEventSec":180}}},"root":{"type":"worker","id":"impl",
+            "summary":"s","prompt":"p","timeoutSec":60}})JSON";
+        ws.clear();
+        lint(unguarded, ws);
+        Check(hasCode(ws, "unguarded_worker") && !hasCode(ws, "no_hang_watch"),
+              "091-4: unguarded_worker alone when idle defaults are present");
+
+        const char* opencodeNoModel = R"JSON({"id":"lint-opencode","defaults":{
+            "worker":{"idle":{"firstEventSec":180}}},"root":{"type":"catch","id":"guard",
+            "child":{"type":"worker","id":"impl","summary":"s","prompt":"p","timeoutSec":60,
+            "engine":"opencode"},"handlers":[{"do":{"type":"succeed"}}]}})JSON";
+        ws.clear();
+        lint(opencodeNoModel, ws);
+        Check(hasCode(ws, "opencode_without_model"), "091-4: opencode_without_model when model is missing");
+
+        const char* enginesNoSwitch = R"JSON({"id":"lint-engines","defaults":{
+            "worker":{"idle":{"firstEventSec":180}}},"root":{"type":"catch","id":"guard",
+            "child":{"type":"worker","id":"impl","summary":"s","prompt":"p","timeoutSec":60,
+            "engines":[{"engine":"opencode","model":"m1"},{"engine":"agy","model":"m2"}]},
+            "handlers":[{"do":{"type":"succeed"}}]}})JSON";
+        ws.clear();
+        lint(enginesNoSwitch, ws);
+        Check(hasCode(ws, "engines_without_switch"), "091-4: engines_without_switch on two candidates");
+
+        const char* switchNoEngines = R"JSON({"id":"lint-switch","defaults":{
+            "worker":{"idle":{"firstEventSec":180}}},"root":{"type":"catch","id":"guard",
+            "child":{"type":"worker","id":"impl","summary":"s","prompt":"p","timeoutSec":60,
+            "engines":[{"engine":"opencode","model":"m1"}],
+            "switchEngineOn":["startup_hang"]},"handlers":[{"do":{"type":"succeed"}}]}})JSON";
+        ws.clear();
+        lint(switchNoEngines, ws);
+        Check(hasCode(ws, "switch_without_engines"), "091-4: switch_without_engines on one candidate");
+
+        const char* notPermitted = R"JSON({"id":"lint-permit","defaults":{
+            "worker":{"idle":{"firstEventSec":180}}},"root":{"type":"catch","id":"guard","child":{
+            "type":"job","id":"llm","summary":"s","command":"echo m2","timeoutSec":60,
+            "engine":"agy","model":"m9"},"handlers":[{"do":{"type":"succeed"}}]}})JSON";
+        ws.clear();
+        lint(notPermitted, ws);
+        Check(hasCode(ws, "engine_not_permitted") && pathFor(ws, "engine_not_permitted") == "root.child.engine",
+              "091-4: engine_not_permitted for a job engine outside the worker list");
+        Check(!suggestionFor(ws, "engine_not_permitted").empty(),
+              "091-4: engine_not_permitted suggests llm add/approve");
+
+        const char* consultNotPermitted = R"JSON({"id":"lint-consult","root":{"type":"escalate",
+            "id":"ask","question":"q","expect":["continue","stop","takeover"],
+            "fallback":{"afterSec":60,"engine":"agy","model":"m9"}}})JSON";
+        ws.clear();
+        lint(consultNotPermitted, ws);
+        Check(hasCode(ws, "engine_not_permitted") && pathFor(ws, "engine_not_permitted") == "root.fallback",
+              "091-4: escalate fallback is checked against the consult list");
+
+        const char* unswitchable = R"JSON({"id":"lint-cmd","defaults":{
+            "worker":{"idle":{"firstEventSec":180}}},"root":{"type":"catch","id":"guard","child":{
+            "type":"job","id":"card","summary":"s",
+            "command":"ww-run.cmd 091 -Main -Engine agy -Model m2","timeoutSec":60},
+            "handlers":[{"do":{"type":"succeed"}}]}})JSON";
+        ws.clear();
+        lint(unswitchable, ws);
+        Check(hasCode(ws, "unswitchable_command"), "091-4: unswitchable_command without {engine}/{model}");
+
+        const char* noTakeover = R"JSON({"id":"lint-takeover","root":{"type":"escalate",
+            "id":"ask","question":"q","expect":["continue","stop"]}})JSON";
+        ws.clear();
+        lint(noTakeover, ws);
+        Check(hasCode(ws, "escalate_without_takeover"), "091-4: escalate_without_takeover without takeover");
+        ws.clear();
+        lint(consultNotPermitted, ws);
+        Check(!hasCode(ws, "escalate_without_takeover"),
+              "091-4: no escalate warning when takeover is offered");
+
+        std::string looseResp = BehaviorTree::ValidateResponse(unguarded, &lintCatalog, false);
+        nlohmann::json looseJson = nlohmann::json::parse(looseResp, nullptr, false);
+        Check(looseJson.value("ok", false) && looseJson.value("valid", false) &&
+              looseJson["warnings"].is_array() && !looseJson["warnings"].empty(),
+              "091-4: non-strict validate succeeds and returns warnings[]");
+        std::string strictResp = BehaviorTree::ValidateResponse(unguarded, &lintCatalog, true);
+        nlohmann::json strictJson = nlohmann::json::parse(strictResp, nullptr, false);
+        Check(!strictJson.value("ok", true) && !strictJson.value("valid", true) &&
+              strictJson.value("error", std::string()).find("unguarded_worker") != std::string::npos,
+              "091-4: strict mode turns warnings into errors");
+        std::string bareResp = BehaviorTree::ValidateResponse(guardedDefaults, &lintCatalog, true);
+        Check(nlohmann::json::parse(bareResp, nullptr, false).value("ok", false),
+              "091-4: strict mode passes a clean tree");
+
+        // 091-7 (4): an unapproved `needs` is a warning; --strict makes it an error with the
+        // permit_not_approved code and a permit request suggestion.
+        const char* needsTree = R"JSON({"id":"lint-needs","defaults":{
+            "worker":{"idle":{"firstEventSec":180,"outputSec":600}}},
+            "root":{"type":"catch","id":"guard","child":{"type":"worker","id":"impl",
+            "summary":"s","prompt":"p","timeoutSec":60,
+            "needs":[{"kind":"read_path","target":"C:/outside/0917-never-approved/**"}]},
+            "handlers":[{"do":{"type":"succeed"}}]}})JSON";
+        ws.clear();
+        lint(needsTree, ws);
+        Check(hasCode(ws, "permit_not_approved"),
+              "091-7: unapproved needs warns with permit_not_approved");
+        Check(!suggestionFor(ws, "permit_not_approved").empty() &&
+                  suggestionFor(ws, "permit_not_approved").find("permit request") != std::string::npos,
+              "091-7: warning suggests `permit request`");
+        nlohmann::json needsLoose = nlohmann::json::parse(
+            BehaviorTree::ValidateResponse(needsTree, &lintCatalog, false), nullptr, false);
+        Check(needsLoose.value("ok", false), "091-7: non-strict validate still succeeds");
+        nlohmann::json needsStrict = nlohmann::json::parse(
+            BehaviorTree::ValidateResponse(needsTree, &lintCatalog, true), nullptr, false);
+        Check(!needsStrict.value("ok", true) &&
+                  needsStrict.value("errorCodes", nlohmann::json::array()).size() > 0 &&
+                  needsStrict["errorCodes"][0] == "permit_not_approved",
+              "091-7: --strict reports error code permit_not_approved");
+
+        auto fillPlaceholders = [](std::string text) {
+            std::map<std::string, std::string> values;
+            size_t pos = 0;
+            while ((pos = text.find('<', pos)) != std::string::npos) {
+                size_t end = text.find('>', pos + 1);
+                if (end == std::string::npos) break;
+                std::string key = text.substr(pos + 1, end - pos - 1);
+                if (!values.count(key)) values[key] = "v" + std::to_string(values.size() + 1);
+                text.replace(pos, end - pos + 1, values[key]);
+                pos += values[key].size();
+            }
+            return text;
+        };
+        nlohmann::json list = BtTemplateListJson();
+        Check(list.value("ok", false) && list["templates"].is_array() &&
+              list["templates"].size() == 2 &&
+              list.value("note", std::string()).find("<...>") != std::string::npos,
+              "091-4: template list has two entries and a placeholder note");
+        Check(BtTemplateDefinition("does-not-exist").is_null() &&
+              !BtTemplateResult("does-not-exist").value("ok", true),
+              "091-4: unknown template is rejected");
+        for (const auto& entry : BtTemplateEntries()) {
+            nlohmann::json def = BtTemplateDefinition(entry.name);
+            Check(def.is_object() && def.value("id", std::string()) == entry.name,
+                  "091-4: template " + entry.name + " returns a full BT object");
+            nlohmann::json tool = BtTemplateResult(entry.name);
+            Check(tool.value("ok", false) && tool["bt"].is_object() &&
+                  tool.value("note", std::string()).find("bt validate") != std::string::npos,
+                  "091-4: MCP template result includes note and bt for " + entry.name);
+            std::string text = fillPlaceholders(def.dump());
+            Check(text.find('<') == std::string::npos, "091-4: all placeholders replaced in " + entry.name);
+            std::string resp = BehaviorTree::ValidateResponse(text, &allApproved, true);
+            nlohmann::json j = nlohmann::json::parse(resp, nullptr, false);
+            Check(j.value("ok", false) && j.value("valid", false) &&
+                  j["warnings"].is_array() && j["warnings"].empty(),
+                  "091-4: " + entry.name + " passes bt validate --strict with no warnings: " +
+                  j.value("error", std::string()));
+        }
+    }
+
+    // 091-4: existing checked-in plans must stay valid (warnings are allowed).
+    {
+#ifdef PC_REPO_DIR
+        std::wstring dir = Utf8ToWide(PC_REPO_DIR) + L"\\ww-data\\bt";
+        WIN32_FIND_DATAW fd = {};
+        HANDLE h = FindFirstFileW((dir + L"\\*.json").c_str(), &fd);
+        int checked = 0;
+        if (h != INVALID_HANDLE_VALUE) {
+            do {
+                const std::wstring name = fd.cFileName;
+                if (name == L"." || name == L"..") continue;
+                std::wstring pathW = dir + L"\\" + name;
+                std::ifstream ifs(pathW.c_str(), std::ios::binary);
+                if (!ifs) continue;
+                std::ostringstream ss;
+                ss << ifs.rdbuf();
+                std::vector<std::string> errs;
+                std::vector<BtWarning> warnings;
+                bool ok = BehaviorTree::ValidateJson(ss.str(), &catalog, errs, warnings);
+                Check(ok, "091-4: existing BT " + WideToUtf8(name) + " still validates without strict: " +
+                          (errs.empty() ? std::string("") : errs[0]));
+                checked++;
+            } while (FindNextFileW(h, &fd));
+            FindClose(h);
+        }
+        Check(checked > 0, "091-4: found existing BT JSON files to re-validate");
+#endif
+    }
+
+    // 091-6: shared engine health (down candidates are skipped, held nodes recover).
+    {
+        class FakeHealth : public IBtEngineHealth {
+        public:
+            std::set<std::string> down;
+            int64_t nextProbeAt = 0;
+            bool IsDown(const std::string& engine, const std::string& model) const override {
+                return down.count(engine + "/" + model) != 0;
+            }
+            void MarkDown(const std::string& engine, const std::string& model,
+                          const std::string&, const std::string&, int64_t) override {
+                down.insert(engine + "/" + model);
+            }
+            void MarkHealthy(const std::string& engine, const std::string& model,
+                             const std::string&, int64_t) override {
+                down.erase(engine + "/" + model);
+            }
+            int64_t NextProbeAtMs(const std::string&, const std::string&) const override {
+                return nextProbeAt;
+            }
+            bool IsDownWorthy(const std::string& cls) const override {
+                return cls == "startup_hang" || cls == "probe_failed";
+            }
+        };
+
+        class HealthCatalog : public bt_test::FakeEngineCatalog {
+        public:
+            mutable std::set<std::string> approved;
+            bool IsApprovedForList(const std::string&, const std::string& engine,
+                                   const std::string& model) const override {
+                return approved.count(engine + "/" + model) != 0;
+            }
+        };
+        HealthCatalog catalogAll;
+        catalogAll.approved.insert("opencode/m1");
+        catalogAll.approved.insert("agy/m2");
+        const char* twoCandidates = R"JSON({"id":"eh-two","root":{
+            "type":"worker","id":"impl","prompt":"do work","summary":"health test","timeoutSec":60,
+            "engines":[{"engine":"opencode","model":"m1"},{"engine":"agy","model":"m2"}],
+            "switchEngineOn":["startup_hang"]}})JSON";
+
+        FakeHealth skipHealth;
+        skipHealth.down.insert("opencode/m1");
+        FakeJobRunner skipRunner;
+        BehaviorTree skipTree;
+        std::string err;
+        Check(skipTree.LoadDefinition(twoCandidates, &catalogAll, err), "0916: load two-candidate BT: " + err);
+        skipTree.SetJobRunner(&skipRunner);
+        skipTree.SetEngineHealth(&skipHealth);
+        skipTree.Start(1000);
+        Check(skipRunner.startedWorkers.size() == 1 && skipRunner.startedWorkers[0].engine == "agy" &&
+              skipRunner.startedWorkers[0].model == "m2", "0916: down candidate skipped, next used");
+
+        const char* singleEngine = R"JSON({"id":"eh-single","root":{
+            "type":"worker","id":"impl","prompt":"do work","summary":"held test","timeoutSec":60,
+            "engine":"opencode","model":"m1"}})JSON";
+        FakeHealth holdHealth;
+        holdHealth.down.insert("opencode/m1");
+        holdHealth.nextProbeAt = 2500;
+        FakeJobRunner holdRunner;
+        BehaviorTree holdTree;
+        Check(holdTree.LoadDefinition(singleEngine, &catalogAll, err), "0916: load single-engine BT: " + err);
+        holdTree.SetJobRunner(&holdRunner);
+        holdTree.SetEngineHealth(&holdHealth);
+        holdTree.Start(1000);
+        Check(holdRunner.startedWorkers.empty() && holdTree.State() == "running",
+              "0916: single down engine holds the worker instead of failing it");
+        bool sawHold = false;
+        for (const auto& ev : holdTree.Events()) if (ev.type == "nodeHeldForEngine") sawHold = true;
+        Check(sawHold, "0916: nodeHeldForEngine event emitted");
+        Check(holdTree.ToStateJson().find("waitingForEngine") != std::string::npos,
+              "0916: held state is persisted");
+        holdTree.OnTimer(2400);
+        Check(holdRunner.startedWorkers.empty(), "0916: still held before nextProbeAt");
+        holdHealth.down.clear();
+        holdTree.OnTimer(2600);
+        bool sawRecovered = false;
+        for (const auto& ev : holdTree.Events()) if (ev.type == "engineRecovered") sawRecovered = true;
+        Check(sawRecovered, "0916: engineRecovered event emitted after recovery");
+        holdTree.Tick(2700);
+        Check(holdRunner.startedWorkers.size() == 1 &&
+              holdRunner.startedWorkers[0].engine == "opencode", "0916: held worker starts after recovery");
+
+        FakeHealth markHealth;
+        FakeJobRunner markRunner;
+        BehaviorTree markTree;
+        Check(markTree.LoadDefinition(singleEngine, &catalogAll, err), "0916: load mark BT: " + err);
+        markTree.SetJobRunner(&markRunner);
+        markTree.SetEngineHealth(&markHealth);
+        markTree.Start(1000);
+        markTree.OnJobFinished("eh-single-impl-1", false, -1, "", "", 1100, "", "",
+                               "timedOut", R"({"class":"startup_hang","summary":"no events"})");
+        Check(markHealth.IsDown("opencode", "m1"),
+              "0916: a startup_hang failure marks the engine down for other jobs");
     }
 
     RunPart2Tests(tempDirUtf8, tempDirW);

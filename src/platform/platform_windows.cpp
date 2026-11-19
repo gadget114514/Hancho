@@ -50,6 +50,17 @@ std::wstring Utf8ToWide(const std::string& text) {
     return out;
 }
 
+std::string WideToUtf8Local(const std::wstring& text) {
+    if (text.empty()) return std::string();
+    int need = WideCharToMultiByte(CP_UTF8, 0, text.data(), static_cast<int>(text.size()),
+                                   nullptr, 0, nullptr, nullptr);
+    if (need <= 0) return std::string();
+    std::string out(static_cast<size_t>(need), '\0');
+    WideCharToMultiByte(CP_UTF8, 0, text.data(), static_cast<int>(text.size()),
+                        out.data(), need, nullptr, nullptr);
+    return out;
+}
+
 std::string Win32ErrorMessage(DWORD code) {
     return "Win32 error " + std::to_string(static_cast<unsigned long>(code));
 }
@@ -281,6 +292,62 @@ public:
             if (TerminateProcess(rootProcess_, static_cast<UINT>(exitCode))) ok = true;
         }
         return ok;
+    }
+
+    std::vector<ProcessTreeItem> SnapshotProcesses() override {
+        std::vector<ProcessTreeItem> result;
+        if (!attached_ || rootPid_ == 0) return result;
+
+        auto snapshotOnePid = [](DWORD pid, ProcessTreeItem& item) -> bool {
+            HANDLE process = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, FALSE, pid);
+            if (!process) return false;
+            item.pid = pid;
+            WCHAR exePath[MAX_PATH] = {};
+            DWORD size = MAX_PATH;
+            if (QueryFullProcessImageNameW(process, 0, exePath, &size)) {
+                std::wstring pathStr(exePath, size);
+                size_t lastSlash = pathStr.find_last_of(L"\\/");
+                std::wstring nameW = (lastSlash != std::wstring::npos) ? pathStr.substr(lastSlash + 1) : pathStr;
+                item.name = WideToUtf8Local(nameW);
+            }
+            FILETIME creationTime = {}, exitTime = {}, kernelTime = {}, userTime = {};
+            if (GetProcessTimes(process, &creationTime, &exitTime, &kernelTime, &userTime)) {
+                ULARGE_INTEGER kt, ut;
+                kt.LowPart = kernelTime.dwLowDateTime;
+                kt.HighPart = kernelTime.dwHighDateTime;
+                ut.LowPart = userTime.dwLowDateTime;
+                ut.HighPart = userTime.dwHighDateTime;
+                uint64_t total100ns = kt.QuadPart + ut.QuadPart;
+                item.cpuSec = static_cast<double>(total100ns) / 10000000.0;
+            }
+            CloseHandle(process);
+            return true;
+        };
+
+        alignas(JOBOBJECT_BASIC_PROCESS_ID_LIST)
+        BYTE buffer[sizeof(JOBOBJECT_BASIC_PROCESS_ID_LIST) + sizeof(ULONG_PTR) * 1024] = {};
+        auto* pidList = reinterpret_cast<PJOBOBJECT_BASIC_PROCESS_ID_LIST>(buffer);
+        bool listed = false;
+        if (job_ && assigned_) {
+            listed = QueryInformationJobObject(job_, JobObjectBasicProcessIdList, pidList,
+                                               sizeof(buffer), nullptr) != FALSE;
+        }
+
+        if (listed && pidList->NumberOfProcessIdsInList > 0) {
+            for (DWORD i = 0; i < pidList->NumberOfProcessIdsInList; ++i) {
+                DWORD pid = static_cast<DWORD>(pidList->ProcessIdList[i]);
+                ProcessTreeItem item;
+                if (snapshotOnePid(pid, item)) {
+                    result.push_back(std::move(item));
+                }
+            }
+        } else if (rootPid_ != 0) {
+            ProcessTreeItem item;
+            if (snapshotOnePid(static_cast<DWORD>(rootPid_), item)) {
+                result.push_back(std::move(item));
+            }
+        }
+        return result;
     }
 
     bool Suspend(std::string& outError) override {

@@ -330,6 +330,67 @@ int main() {
         }
     }
 
+    // 091-1: a timed-out dummy job with no events yields startup_hang and its diagnostic is
+    // exposed as ${<node>.failureClass} and the other variables.
+    {
+        struct SimpleRunner : IBtJobRunner {
+            std::string StartJob(const BtJobSpec& spec) override { return spec.proposedJobId; }
+            void CancelJob(const std::string&) override {}
+        } runner;
+
+        TaskQueueFailureInput in;
+        in.jobId = "hang-job";
+        in.endKind = "timed_out";
+        in.timeoutSec = 3600;
+        in.elapsedSec = 3600;
+        in.attempt = 1;
+        in.maxAttempts = 3;
+        in.command = "mock_worker";
+        in.engine = "opencode";
+        in.nowEpochSec = 1000;
+        // events intentionally left empty: 0 events -> startup_hang
+        TaskQueueFailureDiagnostic diag = ClassifyTaskQueueFailure(in);
+        Check(diag.failureClass == "startup_hang", "091-1: 0-event timeout classifies as startup_hang");
+        std::string diagJson = TaskQueueFailureDiagnosticToJson(diag);
+
+        std::string def = R"({
+            "id": "bt-fail-vars",
+            "root": { "type": "job", "id": "x", "summary": "hang", "command": "hang", "timeoutSec": 3600 }
+        })";
+        BehaviorTree bt;
+        std::string err;
+        Check(bt.LoadDefinition(def, nullptr, err), "091-1: load BT: " + err);
+        bt.SetJobRunner(&runner);
+        bt.Start(1000);
+        bt.OnJobFinished("bt-fail-vars-x-1", false, -1, "", "", 2000, "", "", "timedOut", diagJson);
+
+        Check(bt.GetVar("x.failureClass") == "startup_hang", "091-1: ${x.failureClass} is startup_hang");
+        Check(bt.GetVar("x.failureSummary") == diag.summary, "091-1: ${x.failureSummary} from diagnostic");
+        Check(bt.GetVar("x.likelyCauses") == "no_model,waiting_for_input",
+              "091-1: ${x.likelyCauses} is the comma-separated cause ids");
+        Check(bt.GetVar("x.suggestedAction") == diag.suggestedAction, "091-1: ${x.suggestedAction} from diagnostic");
+        Check(bt.GetVar("x.engine").empty() && bt.GetVar("x.model").empty(),
+              "091-1: plain job leaves ${x.engine}/${x.model} empty");
+
+        // bt_get's compact tree text renders a failure condition's node/class/cause.
+        TestHarness displayHarness;
+        json dispDef = {
+            {"id", "bt-fail-display"},
+            {"root", {{"type", "sequence"}, {"children", json::array({
+                {{"type", "failure"}, {"id", "fc"}, {"node", "never"},
+                 {"class", "startup_hang"}, {"cause", "no_model"}},
+                {{"type", "job"}, {"id", "never"}, {"summary", "n"},
+                 {"command", "cmd.exe /c echo hi"}, {"timeoutSec", 30}}
+            })}}}
+        };
+        displayHarness.btm->Start(dispDef.dump());
+        json getResp = json::parse(displayHarness.btm->Get("bt-fail-display", false), nullptr, false);
+        std::string compact = getResp.value("compact", "");
+        Check(compact.find("startup_hang") != std::string::npos &&
+              compact.find("no_model") != std::string::npos,
+              "091-1: bt_get compact text shows failure class/cause");
+    }
+
     RunPart2IntegrationTests(tempDirW, tempDirUtf8);
 
     RemoveDirRecursive(tempDirW);

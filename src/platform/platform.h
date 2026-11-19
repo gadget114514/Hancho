@@ -56,6 +56,12 @@ struct ProcessMetrics {
     uint64_t cpuTimeMs = 0;
 };
 
+struct ProcessTreeItem {
+    std::string name;
+    uint64_t pid = 0;
+    double cpuSec = 0.0;
+};
+
 // A managed process tree: Job Object on Windows, process group / cgroup v2 on
 // POSIX. The root process is attached right after spawn.
 class IProcessTree {
@@ -64,6 +70,8 @@ public:
     virtual bool Attach(uint64_t rootPid, std::string& outError) = 0;
     virtual bool Query(ProcessMetrics& outMetrics) = 0;
     virtual bool Kill(int exitCode) = 0;
+    // Snapshot running processes in the tree (name, pid, cumulative cpu seconds)
+    virtual std::vector<ProcessTreeItem> SnapshotProcesses() { return {}; }
     // Stop/resume every process in the tree without killing it. Used by
     // task-level pause; unsupported members fail with an error message.
     virtual bool Suspend(std::string& outError) = 0;

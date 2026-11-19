@@ -29,6 +29,7 @@ struct StartProcessRequest {
     int timeoutSec = 0;      // 0 = no limit
     int idleTimeoutSec = 0;  // 0 = no limit (output idle)
     int idleCpuSec = 0;      // if > 0, require CPU idle too (AND with output idle)
+    int idleFirstEventSec = 0; // 0 = no limit (first normalized event idle)
     std::string estimatedEndTimeStr;  // optional estimated end time for display
     std::map<std::string, std::string> env;  // extra environment variables (UTF-8)
     std::vector<std::string> killExclude;    // image names excluded from tree kill (reserved)
@@ -69,6 +70,8 @@ struct ProcessSnapshot {
     uint64_t lastCpuActivityTickMs = 0;
     int timeoutSec = 0;
     int idleTimeoutSec = 0;
+    int idleFirstEventSec = 0;
+    std::vector<platform::ProcessTreeItem> processTreeSnapshot;
     uint32_t treeProcessCount = 0;
     uint64_t treeMemoryBytes = 0;
     uint64_t totalBytesRead = 0;
@@ -277,6 +280,9 @@ private:
         int timeoutSec = 0;
         int idleTimeoutSec = 0;
         int idleCpuSec = 0;
+        int idleFirstEventSec = 0;
+        std::atomic<bool> firstEventReceived{false};
+        std::vector<platform::ProcessTreeItem> processTreeSnapshot;
         std::string jobKey;
         int jobId = 0;
         int attemptN = 0;

@@ -70,6 +70,7 @@ Hancho のビヘイビアツリー (BT) は、条件分岐 (`if`/`fallback`)、�
 | `limits.maxWallSec` | 任意 | `86400` | BT 全体の経過時間上限 (秒、`> 0`)。超過時は `limitExceeded` で失敗。 |
 | `worker.engine` | 任意 | レジストリ既定 (`agy`) | `worker` および `escalate.fallback` の既定エンジン名。 |
 | `worker.model` | 任意 | エンジンの既定モデル (`agy` は `gemini-3.8-flash-medium`) | 既定エンジン使用時の既定モデル名。 |
+| `defaults` | 任意 | — | 明示値の無いノードに補完する値: `worker.idle`, `worker.maxAttempts`, `worker.probe`, `job.idle`。明示値 (明示 `0` を含む) が常に優先される。§5.3 参照。 |
 | `vars` | 任意 | `{}` | 初期変数マップ (文字列・真偽値・数値は文字列化して保持)。 |
 
 ---
@@ -88,6 +89,7 @@ Hancho のビヘイビアツリー (BT) は、条件分岐 (`if`/`fallback`)、�
 | `fallback` (別名 `selector`) | `"children": [...]` (非空配列) | 子を順番に実行し、最初に成功した時点で `succeeded`。すべて失敗したときのみ `failed`。 |
 | `parallel` | `"children": [...]` (非空配列) | 全子ノードを同時起動。任意 `"success"`: `"all"` (既定)、`"any"`、または整数 `1..N` (成功が必要な子の数)。結果確定時に残りの実行中子ノードをキャンセル。子ごとに専用のタスクキュー（ツリーIDと分岐から決まる）が割り当てられ、実際に並列実行される（リソースロックが競合すれば待機）。 |
 | `if` | `"cond"`, `"then"`, 任意 `"else"` | `"cond"` を評価し、成功なら `"then"`、失敗なら `"else"` (省略時は即 `succeeded`) を実行。 |
+| `catch` | `"child"` (オブジェクト), `"handlers"` (非空配列) | `"child"` を実行し、失敗したら最初に一致した handler の `do` を実行する (`class` は文字列・配列・`"*"`、`cause`、両方指定時は AND)。`"thenRetry": true` なら `"child"` を `"maxRetries"` 回まで再実行 (既定 `1`、`1..10`)。`"otherwise"` は `"fail"` (既定) またはノードオブジェクト。§11.3 参照。 |
 | `retry` | `"child"` | 必須 `"max"` (`1..100`)、任意 `"delaySec"` (または `"retryDelaySec"`, 既定 `0`)。`"child"` が失敗する間、最大 `"max"` 回まで実行する。 |
 | `repeat` | `"child"`, 任意 `"until"` | 必須 `"max"` (`1..100`)、任意 `"delaySec"` (既定 `0`)。`"child"` が成功するたびに反復。`"until"` がある場合は各成功後に `"until"` を評価し、`"until"` が成功すれば `succeeded` (`"max"` 回以内に `"until"` が成功しなければ `failed`)。`"until"` 省略時は `"max"` 回成功で `succeeded`。`"child"` が失敗したら即 `failed`。 |
 | `invert` | `"child"` | `"child"` の `succeeded` と `failed` を反転する。 |
@@ -102,10 +104,11 @@ Hancho のビヘイビアツリー (BT) は、条件分岐 (`if`/`fallback`)、�
 | `type` | 必須フィールド | 任意フィールドと動作 |
 |---|---|---|
 | `job` | `"command"`, `"summary"`, `"timeoutSec"` (`> 0`) | 任意: `"estimateSec"`（残り時間・ETA 表示用の見積もり秒数。タイムアウトは別に適用）、`"cwd"`, `"env"`, `"idle"` (`{outputSec, cpuSec}`), `"success"` (`{exitCode, filesNewer, outputRegex, testReport, contentFile, minBytes, contentRegex, engineResult}`), `"resources"` (`{write:[...], read:[...]}`), `"instructionsText"`, `"instructionsFile"`, `"maxAttempts"` (既定 `1`), `"capture"`。タスクキューに `<btId>-<ノードID>-<実行回>` のジョブ ID で登録して起動。起動時に `ChainGuard` が適用され、`&&` / `||` / `;` 等のシェル連結は `launchFailed` となる。 |
-| `worker` | `"summary"`, `"timeoutSec"` (`> 0`), `"prompt"` または `"promptFile"` | 任意: `"engine"`, `"model"`, `"outputSchema"` (JSON Schema オブジェクトまたは文字列), `"cwd"`, `"env"`, `"idle"`, `"success"`, `"resources"`, `"maxAttempts"`, `"capture"`。エンジンレジストリ経由で LLM ワーカーを起動する。 |
+| `worker` | `"summary"`, `"timeoutSec"` (`> 0`), `"prompt"` または `"promptFile"` | 任意: `"engine"`, `"model"`, `"engines"` (候補列。`engine`/`model` とは同時指定不可), `"switchEngineOn"` (次の候補へ進む失敗クラス), `"probe"` (本番前の健康診断), `"outputSchema"` (JSON Schema オブジェクトまたは文字列), `"cwd"`, `"env"`, `"idle"`, `"success"`, `"resources"`, `"maxAttempts"`, `"capture"`。エンジンレジストリ経由で LLM ワーカーを起動する。§5.3 / §5.4 参照。 |
+| `probe` | `"engine"` | 任意: `"model"`, `"timeoutSec"` (既定 `60`)。stdin を閉じた状態で最小プロンプトを送り、最初の出力があり正常終了すれば成功。失敗は常に `probe_failed` (元の分類は `detail` に記載)。結果は `<dataDir>/probes.json` にキャッシュ (成功 10 分、失敗 2 分)。 |
 | `wait` | `"sec"` (`>= 0`) | `"sec"` 秒待ってから `succeeded` になる。 |
 | `set` | `"var"` (または `"name"`), `"value"` | `"value"` 内の `${...}` を展開して `vars[var]` に格納し、`varSet` イベントを出して即 `succeeded`。 |
-| `escalate` | `"question"` | 任意: `"guidance"`, `"expect"` (許可する回答文字列配列), `"include"` (`{logs:[nodeIds], vars:[varNames], files:[relPaths], lines:100, maxBytes:16384}`), `"timeoutSec"` (既定 `86400`), `"fallback"` (`{afterSec, engine, model}`)。この枝を止め、ツリー状態を `waitingForLlm` にして判断パケットを保存し、`bt_resume` (または `fallback`) を待つ。 |
+| `escalate` | `"question"` | 任意: `"guidance"`, `"expect"` (許可する回答文字列配列), `"include"` (`{logs:[nodeIds], vars:[varNames], files:[relPaths], lines:100, maxBytes:16384}`), `"timeoutSec"` (既定 `86400`), `"fallback"` (`{afterSec, engine, model}`)。この枝を止め、ツリー状態を `waitingForLlm` にして判断パケットを保存し、`bt_resume` (または `fallback`) を待つ。回答 `"takeover"` は `expect` に無くても常に受け付けられ、ノードに `takenOver: true` と `takeover` オブジェクトを記録する（ノード自身は `succeeded`）。`bt_get` / `compact` とダッシュボードに表示される。 |
 | `fail` | *(なし)* | 任意 `"detail"` (または `"reason"`, 既定 `"fail node"`)。指定理由で即 `failed`。 |
 | `succeed` | *(なし)* | 即 `succeeded`。 |
 
@@ -119,6 +122,7 @@ Hancho のビヘイビアツリー (BT) は、条件分岐 (`if`/`fallback`)、�
 | `fileNewer` | `"path"`, `"than"` | `"path"` が `"than"` (別ファイルパス、または `"${build.start}"` のような ISO-8601 時刻文字列) より新しければ成功。 |
 | `outputMatches` | `"node"`, `"regex"` | 任意 `"lines"` (既定 `200`)。指定ノードの直近ログ末尾 `"lines"` 行に正規表現がマッチすれば成功。 |
 | `exitCode` | `"node"`, および `"eq"` / `"ne"` / `"in"` のいずれか | 指定ノードの直近終了コードを比較。 |
+| `failure` | `"node"`, および `"class"` (文字列または配列) と／または `"cause"` (文字列) | 参照先ノードが失敗し、失敗クラスおよび／または `likelyCauses[].id` が一致すれば成功。両方指定時は AND。少なくとも一方は必須。未知のノード id は検証エラー。未実行・成功ノードは常に false。§11.2 参照。 |
 | `jsonValue` | `"file"`, `"path"`, 比較演算子 (`eq`/`ne`/`in`/`gt`/`lt`/`exists`) | JSON ファイルの `"path"` (例 `"summary.failed"`, `"items[0].name"`) の値を比較。 |
 | `var` | `"name"` (または `"var"`), 比較演算子 (`eq`/`ne`/`in`/`gt`/`lt`/`exists`) | `vars[name]` の現在値を比較 (両辺が数値として解釈できる場合 `gt`/`lt` は数値比較)。 |
 | `nodeState` | `"node"`, および `"eq"` (または `"state"` / `"ne"` / `"in"`) | 指定ノードの現在状態 (`idle`, `running`, `succeeded`, `failed`, `skipped`) を比較。 |
@@ -145,6 +149,12 @@ Hancho のビヘイビアツリー (BT) は、条件分岐 (`if`/`fallback`)、�
 | `${<node>.output}` | `worker` | `PC_BT_RESULT_FILE` に書かれた生 JSON 文字列。 |
 | `${<node>.output.<path>}` | `worker` | `PC_BT_RESULT_FILE` 内の任意のフィールド・配列要素 (例 `${w1.output.target}`, `${w1.output.files[0]}`)。 |
 | `${<node>.answer}` | `escalate` | `bt_resume` または `fallback` ワーカーが返した回答文字列。 |
+| `${<node>.failureClass}` | `job`, `worker` | 直近アテンプトの失敗クラス (例: `startup_hang`, `idle_stall`, `rate_limited`, `permission_denied`)。成功時は空文字。 |
+| `${<node>.failureSummary}` | `job`, `worker` | 1 行の失敗要約。成功時は空文字。 |
+| `${<node>.likelyCauses}` | `job`, `worker` | 原因 id のカンマ区切り (例: `no_model,waiting_for_input`)。成功時は空文字。 |
+| `${<node>.suggestedAction}` | `job`, `worker` | 推奨アクション (`retry`, `retry_with_change` など)。成功時は空文字。 |
+| `${<node>.retryAt}` | `job`, `worker` | rate limit の再試行可能時刻。無い場合は空文字。 |
+| `${<node>.engine}` / `${<node>.model}` | `worker` | 直近アテンプトで実際に使ったエンジン／モデル (エンジン切り替え後も最新値)。 |
 
 ### 4.3 `capture` による変数抽出
 `job` / `worker` ノードの終了時にログ末尾や JSON ファイルから変数を抽出できます:
@@ -188,6 +198,61 @@ Hancho のビヘイビアツリー (BT) は、条件分岐 (`if`/`fallback`)、�
 - `worker` ジョブには環境変数 `PC_BT_RESULT_FILE` (`<dataDir>\behaviortrees\<btId>\results\<jobId>.json`) が渡されます。
 - `"outputSchema"` (`type`, `required`, `properties`, `enum`, `items`) を指定すると、スキーマと結果ファイルのパスをワーカーの指示書ファイルに追記し、ワーカー終了時に `PC_BT_RESULT_FILE` を検証します。終了コードが `0` でもファイル欠落・JSON 不正・スキーマ不一致なら `detail: "outputInvalid: <理由>"` (例: `outputInvalid: output is empty`) で失敗します。
 
+### 5.3 `engines` / `switchEngineOn` / `probe` / `defaults`
+
+`worker` (および LLM を起動する `job`) は、単一の `engine`/`model` の代わりに事前承認済みのエンジン候補列を書けます。
+
+```json
+{ "type": "worker", "id": "impl", "prompt": "<worker prompt>", "summary": "<task summary>",
+  "timeoutSec": 5400,
+  "probe": true,
+  "engines": [
+    { "engine": "opencode", "model": "<primary-model>" },
+    { "engine": "agy", "model": "<backup-model>" }
+  ],
+  "switchEngineOn": ["startup_hang", "auth_error", "probe_failed"] }
+```
+
+- 先頭から順に試します。`switchEngineOn` に含まれる失敗クラスなら次の候補へ進み、それ以外 (例: `test_failed`) では切り替えません。候補を使い切ると失敗します。
+- `engine`/`model` と `engines` の同時指定はパースエラー。`engines` は 1 つ以上必要です。
+- 切り替えのたびに `engineSwitched` イベントを発行し、`${<node>.engine}` / `${<node>.model}` を更新します。ノード状態には `engineCandidateIndex` と `engineAttempts` (engine / model / result / failureClass / detail / list / entry) を保存します。
+- 起動の直前に LLM リストを再読み込みし、`approved` かつ `enabled` でない候補は飛ばします。
+- job のコマンドでは `{engine}` / `{model}` プレースホルダが使えます。例: `ww-run.cmd 091-5 -Main -Engine {engine} -Model {model} -Root <root> -JsonStdout` と `"engine": "opencode", "model": "..."` の組み合わせ。プレースホルダの無いコマンドは切り替え対象になりません。`{engine}` / `{model}` は実行時プレースホルダで、`bt template` の `<...>` (置換用) とは別です。
+- `"probe": true` は本番起動前に各候補を probe します。失敗したら本番を起動せず `probe_failed` で終わります (`switchEngineOn` に入れておけば次の候補へ)。
+- `defaults` はノードに明示値の無い項目を補完します: `defaults.worker.idle` (`firstEventSec`, `outputSec`, `cpuSec`)、`defaults.worker.maxAttempts`、`defaults.worker.probe`、`defaults.job.idle`。明示値 (明示 `0` を含む) が常に優先されます。worker の既定は LLM らしい `job` ノード (`ww-run`、既知 LLM CLI、`engine` / `agentType` 付き) にも適用され、通常のビルド job には `defaults.job.idle` が適用されます。
+
+### 5.4 LLM リスト、権限 (permits)、`needs`
+
+候補の承認は `<dataDir>/llms.json` の 3 つの独立したリスト — `worker` (実作業)、`consult` (escalate の代理回答)、`supervisor` (Hancho が起動する監督役) — と `history` で管理します。BT の `worker` ノードの `engines` は `worker` リスト、escalate の `fallback` は `consult` リスト、Hancho が起動する supervisor は `supervisor` リストを使います。使われるのは `approved` かつ `enabled` の行だけです。LLM が CLI / MCP で追加した行は `proposed` で、人が承認するまで使われません (ダッシュボードの LLM ページなら `approvedVia: dashboard`、チャットで確認して `llm approve --user-said` なら `approvedVia: chat`)。engine / model / provider の変更は行を `proposed` に戻します。rank 変更と無効化は安全側の変更として承認不要です。すべての変更は `history` に残ります。
+
+CLI / MCP の対応:
+
+```powershell
+hancho-cli llm list --list worker --json
+hancho-cli llm add --list worker --engine opencode --model opencode-go/deepseek-v4.1-flash --reason "primary"
+hancho-cli llm approve --list worker --engine opencode --model opencode-go/deepseek-v4.1-flash --user-said "yes, use opencode"
+hancho-cli llm remove --list worker --engine opencode --model opencode-go/deepseek-v4.1-flash --reason "retired"
+hancho-cli llm enable --list worker --engine opencode --model opencode-go/deepseek-v4.1-flash --reason "back in service"
+hancho-cli llm disable --list worker --engine opencode --model opencode-go/deepseek-v4.1-flash --reason "quota exhausted"
+hancho-cli worker probe --engine opencode --model opencode-go/deepseek-v4.1-flash --json
+hancho-cli worker probe --engine dummy --timeout 5 --no-cache --json
+hancho-cli worker health --json
+hancho-cli worker health --reset opencode/opencode-go/deepseek-v4.1-flash --json
+```
+
+MCP ツール: `llm_list` (`list`)、`llm_add` (`list`, `engine`, `model`, `reason`、任意で `provider`/`rank`/`note`)、`llm_remove` (`list`, `engine`, `model`, `reason`)、`llm_set_enabled` (`list`, `engine`, `model`, `enabled`, `reason`)、`llm_approve` (`list`, `engine`, `model`, `userSaid`)、`worker_probe` (`engine`、任意で `model`/`timeout`/`no_cache`)、`worker_health` (引数なしで一覧、または `engine`/`model`/`reset`)。`reason` / `userSaid` は記載した場所では必須です。`no_cache` は CLI の `--no-cache` に対応します。
+
+ワーカーの権限は `<dataDir>/permits.json` (`{"permits":[...],"history":[...]}`) にあります。行は `kind` (`read_path`/`write_path`/`command`/`network`)、`target` (glob)、任意の `engines`、`scope` (`global` / `taskqueue:<名前>` / `bt:<id>`)、承認フィールドを持ちます。ジョブと BT ノードは `"needs": [{"kind": "read_path", "target": "..."}]` で必要な権限を宣言でき、未承認の needs は `bt validate` の警告と `--strict` でのエラー (`permit_not_approved`) になります。拒否されたワーカーは失敗クラス `permission_denied` になり、`permissionResumeLimit` (既定 2) 回のセッション再開後、自動申請した permit とともに `waitingForPermit` で保留され、承認されると自動で再実行されます (`onPermissionDenied: "fail"` で保留を無効化)。承認済み permit は起動時にエンジン設定へ変換され、ユーザーの全体設定ファイルは書き換えられません。
+
+```powershell
+hancho-cli permit list --json
+hancho-cli permit request --kind read_path --target "D:/repo/tools/**" --reason "read build tools"
+hancho-cli permit approve <id> --user-said "yes, allow reading tools"
+hancho-cli permit revoke <id> --reason "no longer needed"
+```
+
+MCP ツール: `permit_list` (`scope`)、`permit_request` (`kind`, `target`, `reason`、任意で `engine`/`engines`/`scope`)、`permit_approve` (`id`, `userSaid`)、`permit_revoke` (`id`, `reason`)。ダッシュボードにも LLM ページと権限 (Permits) ページがあり、そこで承認できます。
+
 ---
 
 ## 6. 上限 (Limits)
@@ -214,7 +279,7 @@ Hancho のビヘイビアツリー (BT) は、条件分岐 (`if`/`fallback`)、�
 
 ## 8. 再開・更新・キャンセル・一時停止 (`bt_retry`, `bt_update`, `bt_cancel`, `bt_pause`)
 
-- **`bt_retry`** (`id`, 任意 `from`, `resetCounters`): 失敗した葉ノード (または `from` で指定したノード) とそこに至る祖先を `idle` に戻して再開します。`resetCounters: true` で `runs` 回数も 0 に戻します。
+- **`bt_retry`** (`id`, 任意 `from`, `resetCounters`): 失敗した葉ノード (または `from` で指定したノード) とそこに至る祖先を `idle` に戻して再開します。`--from <node>` は指定ノード**とその後に実行されるノード**をやり直します。`sequence` / `fallback` / `parallel` の後ろの兄弟、`if` で選ばれなかった方の枝、`catch` の handler / `otherwise`、および前の枝が失敗したことで走った代替の枝 (escalate ゲートなど) も破棄して再評価します。指定ノードより前の成功済みの兄弟はそのまま残し、やり直しません。破棄した部分木の `${gate.answer}` などの古い変数値も消えます。`resetCounters: true` で `runs` 回数も 0 に戻します。
 - **`bt_update`** (`id`, 任意 `node`, `bt`/`patch`/`file`): `running` でないノードの定義を差し替えます。永続化状態と整合させるため、木構造 (`type`・`id`・子の数とスロット) の変更は拒否されます。
 - **`bt_cancel`** (`id`): BT を `cancelled` にし、実行中の BT ジョブをすべてキャンセルします。
 - **`bt_pause`** (`id`, `paused`): BT と対応タスクキューを一時停止 (`paused`) または再開 (`running`) します。
@@ -409,3 +474,181 @@ Hancho のビヘイビアツリー (BT) は、条件分岐 (`if`/`fallback`)、�
   - `escalationTimeout`: `escalate.timeoutSec` 以内に回答が得られなかった。
   - `limitExceeded`: `limits.maxNodeRuns` または `limits.maxWallSec` を超過した。
   - `jobMissing`: 再起動時の復元で、実行中だったジョブ ID がタスクキュー上に存在しなかった。
+
+---
+
+## 11. ハングに強い BT の書き方
+
+LLM ワーカーは何もイベントを出さないまま 1 時間止まり、単純な `timeoutSec` が発火するまで気付かないことがあります。ハング対策は失敗後に reactive に入れるのではなく、**BT を書く時点で**組み込んでください。§5.3 / §5.4 の部品は次のように組み合わせます。
+
+1. `defaults.worker.idle.firstEventSec` で最初のイベントが出ないワーカーを検知し、`outputSec` でその後の無出力を検知します。
+2. `defaults.worker.probe: true` (または `probe` 葉) で本番前に各エンジンを確認します。壊れたエンジンは 1 時間を無駄にせず `probe_failed` で終わります。
+3. `engines` + `switchEngineOn` で、`startup_hang` / `auth_error` / `probe_failed` のときに次の**承認済み**候補へ移ります。
+4. `catch` + `failure` で失敗クラス・原因ごとに分岐し、すべて失敗した場合は escalate に逃がします。
+5. ww カードのジョブコマンドで `{engine}` / `{model}` を使えるようにし、必要な権限は `needs` で先に宣言します。
+
+### 11.1 `bt validate` の警告と `--strict`
+
+`bt validate` は検証を成功させたまま `warnings[]` に警告を返します。`--strict` (MCP の `bt_validate` で `strict: true`) は各警告を `errors[]` に昇格させ、`ok` / `valid` を false にします。`bt start` も `warnings` を返しますが、ツリーは開始します。
+
+| `code` | 意味 |
+|---|---|
+| `no_hang_watch` | worker / LLM job に `idle.firstEventSec` / `idle.outputSec` も `defaults` も無い |
+| `opencode_without_model` | opencode を起動するのに `model` / `--model` が無い |
+| `unguarded_worker` | worker の祖先に `catch` / `fallback` / `retry` が無い |
+| `engines_without_switch` | 候補が 2 つ以上なのに `switchEngineOn` が無い |
+| `switch_without_engines` | `switchEngineOn` があるのに候補が 2 つ未満 |
+| `engine_not_permitted` | `engines` / job の候補が該当リストに無い・無効・未承認 |
+| `unswitchable_command` | LLM job のコマンドが `{engine}` / `{model}` を使っていない |
+| `escalate_without_takeover` | `expect` に `takeover` が無い |
+| `permit_not_approved` | 宣言した `needs` が未承認 |
+| `permit_invalid` | `needs` の形式が不正 |
+
+```powershell
+hancho-cli bt validate --file plan.json --json          # {"ok":true,"valid":true,"warnings":[...]}
+hancho-cli bt validate --file plan.json --strict        # 警告をエラーにする
+hancho-cli bt template                                  # テンプレート一覧
+hancho-cli bt template resilient-worker --json > plan.json
+```
+
+MCP は `bt_validate` が `bt` / `file` / `strict` を受け取り、`bt_template` が `name` を受け取ります (省略時は一覧)。テンプレートの `<...>` は検証前に実値へ置き換えてください。`{engine}` / `{model}` は実行時プレースホルダなのでそのまま残します。
+
+### 11.2 例: `bt template resilient-worker --json`
+
+`build\Release\hancho-cli.exe bt template resilient-worker --json` の実出力:
+
+```json
+{
+  "defaults": {
+    "worker": {
+      "idle": {
+        "firstEventSec": 180,
+        "outputSec": 600
+      },
+      "probe": true
+    }
+  },
+  "id": "resilient-worker",
+  "intent": "Run one resilient worker; replace <...> placeholders before validation",
+  "root": {
+    "child": {
+      "engines": [
+        {
+          "engine": "opencode",
+          "model": "<primary-model>"
+        },
+        {
+          "engine": "agy",
+          "model": "<backup-model>"
+        }
+      ],
+      "id": "impl",
+      "prompt": "Stay inside the project (cwd): do not read or write files outside it. If the task requires one, add it to needs and request a permit instead. <worker prompt>",
+      "summary": "<task summary>",
+      "switchEngineOn": [
+        "startup_hang",
+        "auth_error",
+        "probe_failed"
+      ],
+      "timeoutSec": 5400,
+      "type": "worker"
+    },
+    "handlers": [
+      {
+        "class": [
+          "startup_hang",
+          "idle_stall"
+        ],
+        "do": {
+          "type": "set",
+          "value": "engine-switch-handled",
+          "var": "hang"
+        }
+      },
+      {
+        "class": "rate_limited",
+        "do": {
+          "sec": 600,
+          "type": "wait"
+        },
+        "thenRetry": true
+      },
+      {
+        "class": "permission_denied",
+        "do": {
+          "type": "set",
+          "value": "requested",
+          "var": "permit"
+        },
+        "thenRetry": false
+      },
+      {
+        "class": "*",
+        "do": {
+          "expect": [
+            "continue",
+            "stop",
+            "takeover"
+          ],
+          "guidance": "The worker failed after all approved engine candidates were tried.",
+          "include": {
+            "logLines": 100,
+            "logs": [
+              "impl"
+            ]
+          },
+          "question": "<what should the supervisor decide?>",
+          "type": "escalate"
+        }
+      }
+    ],
+    "id": "impl_guard",
+    "maxRetries": 2,
+    "otherwise": "fail",
+    "type": "catch"
+  },
+  "summary": "A worker with hang watch, preflight probe, engine fallback and escalation"
+}
+```
+
+`defaults.worker.idle` + `probe: true` が起動時監視、2 つの `engines` + `switchEngineOn` が自動退避、`catch` の各 handler がハング・レート制限・権限拒否をカバーし、`"*"` handler が `takeover` 可能な escalate へ逃がします。
+
+### 11.3 作成手順
+
+1. `bt template resilient-worker` (ww カード列なら `card-sequence`) から始め、`<...>` プレースホルダを置き換える。
+2. worker の候補は `llm list --list worker`、escalate の代理回答は `llm list --list consult` から選ぶ。足りなければ `llm add --list <l> --reason "..."` で提案し、**使う前に**人が承認してもらう (ダッシュボードの LLM ページ、またはチャットで確認して `llm approve --user-said "..."` で記録)。
+3. `bt validate --strict` を実行し、警告をゼロにする。
+4. 必要なら `worker probe` で事前確認し、`worker health` で共有のエンジン健全性を確認する。
+5. そのうえで `bt start` し、`bt wait` / `bt get --compact` で監視する。
+
+BT に事前に組み込む時間が無かった場合は、`skills/hancho/SKILL.md` の「ワーカーが失敗・ハングしたとき」の事後手順を適用してください。
+
+### 11.4 `failure` 条件と `catch` の例
+
+```json
+{
+  "type": "failure",
+  "node": "impl",
+  "class": ["startup_hang", "idle_stall"],
+  "cause": "no_model"
+}
+```
+
+```json
+{ "type": "catch", "id": "impl_guard",
+  "child": { "type": "worker", "id": "impl", "...": "..." },
+  "handlers": [
+    { "class": ["startup_hang", "idle_stall"], "do": { "type": "set", "var": "fix", "value": "switch-model" }, "thenRetry": true },
+    { "class": "rate_limited", "do": { "type": "wait", "sec": 600 } },
+    { "class": "permission_denied", "do": { "type": "set", "var": "permit", "value": "requested" } },
+    { "class": "*", "do": { "type": "escalate", "question": "...", "expect": ["continue", "stop", "takeover"] } }
+  ],
+  "otherwise": "fail",
+  "maxRetries": 2 }
+```
+
+- `child` が成功すれば `catch` も成功。失敗すると上から順に handler を調べ、最初に一致したものの `do` を実行します。`class` は文字列・配列・`"*"` (任意の失敗に一致)、`cause` は `likelyCauses[].id` との一致、両方指定時は AND です。
+- `do` が成功して `thenRetry: true` なら `child` を再実行します (上限は `maxRetries`)。上限超過や不一致のときは `otherwise` (`"fail"` 既定、またはノードオブジェクト) へ。
+- 選択された handler は `handler[<index>] class=... cause=...` の形でノード状態・`detail`・`nodeFinished` イベントに残ります。
+- `failure` 条件は `node` が必須で、`class` / `cause` の少なくとも一方が必要です。対象が未実行・成功、診断が無い、不一致の場合は false です。
+- escalate の `include.logs` に失敗ノードを入れると、その完全な診断が判断パケットの `include.diagnostics[<node>]` と Markdown の `Included Failure Diagnostics` 節に載ります。

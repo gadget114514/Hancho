@@ -118,6 +118,12 @@ BtNode* FindNodeRecursive(BtNode* node, const std::string& key, const std::strin
     if (BtNode* f = FindNodeRecursive(node->elseChild.get(), key, btId)) return f;
     if (BtNode* f = FindNodeRecursive(node->singleChild.get(), key, btId)) return f;
     if (BtNode* f = FindNodeRecursive(node->untilChild.get(), key, btId)) return f;
+    if (BtNode* f = FindNodeRecursive(node->otherwiseChild.get(), key, btId)) return f;
+    for (const auto& h : node->catchHandlers) {
+        if (h.doNode) {
+            if (BtNode* f = FindNodeRecursive(h.doNode.get(), key, btId)) return f;
+        }
+    }
     return nullptr;
 }
 
@@ -203,7 +209,7 @@ std::vector<BtEvent> BehaviorTree::GetEventsSince(uint64_t sinceSeq) const {
     return out;
 }
 
-void BehaviorTree::Impl::ResetSubtreeForRun(BtNode& node, bool resetHistory) {
+void BehaviorTree::Impl::ResetSubtreeForRun(BehaviorTree& bt, BtNode& node, bool resetHistory) {
     node.state = "idle";
     node.detail.clear();
     node.activeJobId.clear();
@@ -216,20 +222,62 @@ void BehaviorTree::Impl::ResetSubtreeForRun(BtNode& node, bool resetHistory) {
     node.fallbackLaunched = false;
     node.ifBranch = 0;
     node.repeatWaitingUntil = false;
+    // Stale decision / diagnostic state must not survive a retry: an answered escalate gate
+    // would otherwise keep its old `answer` and `${gate.answer}` while the branch is re-run.
+    node.answer.clear();
+    node.rationale.clear();
+    node.takenOver = false;
+    node.takeover = json::object();
+    node.currentPacket = BtEscalationPacket{};
+    node.hasFailureDiagnostic = false;
+    node.failureDiagnostic = json::object();
+    // The proxy chain is derived from engine health at launch time and walked by index. A
+    // re-run must rebuild it from the first candidate, not resume at the last failed one.
+    if (node.type == "escalate") {
+        node.fallbackCandidates.clear();
+        node.fallbackCandidateIndex = 0;
+    }
     if (resetHistory) {
         node.runs = 0;
+        node.engineCandidateIndex = 0;
     } else if (node.type == "retry" || node.type == "repeat" ||
                node.type == "sequence" || node.type == "fallback" ||
-               node.type == "parallel" || node.type == "if") {
+               node.type == "parallel" || node.type == "if" || node.type == "catch") {
         node.runs = 0;
     }
+    if (node.type == "catch") {
+        node.catchPhase = 0;
+        node.catchRetries = 0;
+        node.catchHandlerIndex = -1;
+        node.catchHandler.clear();
+    }
 
-    for (const auto& c : node.children) ResetSubtreeForRun(*c, resetHistory);
-    if (node.condChild) ResetSubtreeForRun(*node.condChild, resetHistory);
-    if (node.thenChild) ResetSubtreeForRun(*node.thenChild, resetHistory);
-    if (node.elseChild) ResetSubtreeForRun(*node.elseChild, resetHistory);
-    if (node.singleChild) ResetSubtreeForRun(*node.singleChild, resetHistory);
-    if (node.untilChild) ResetSubtreeForRun(*node.untilChild, resetHistory);
+    // Remove variables written by this node in the previous run (answer, result, output.*,
+    // failure*, engine, model, ...). Variables belonging to siblings we keep are untouched.
+    const std::string prefix = node.id.empty() ? node.nodeKey : node.id;
+    if (!prefix.empty()) {
+        const std::string dotPrefix = prefix + ".";
+        for (auto it = bt.vars_.begin(); it != bt.vars_.end(); ) {
+            if (it->first.rfind(dotPrefix, 0) == 0) it = bt.vars_.erase(it);
+            else ++it;
+        }
+    }
+    if (!node.setVar.empty()) bt.vars_.erase(node.setVar);
+    for (const auto& [varName, rule] : node.capture) {
+        (void)rule;
+        bt.vars_.erase(varName);
+    }
+
+    for (const auto& c : node.children) ResetSubtreeForRun(bt, *c, resetHistory);
+    if (node.condChild) ResetSubtreeForRun(bt, *node.condChild, resetHistory);
+    if (node.thenChild) ResetSubtreeForRun(bt, *node.thenChild, resetHistory);
+    if (node.elseChild) ResetSubtreeForRun(bt, *node.elseChild, resetHistory);
+    if (node.singleChild) ResetSubtreeForRun(bt, *node.singleChild, resetHistory);
+    if (node.untilChild) ResetSubtreeForRun(bt, *node.untilChild, resetHistory);
+    if (node.otherwiseChild) ResetSubtreeForRun(bt, *node.otherwiseChild, resetHistory);
+    for (const auto& h : node.catchHandlers) {
+        if (h.doNode) ResetSubtreeForRun(bt, *h.doNode, resetHistory);
+    }
 }
 
 void BehaviorTree::Impl::CancelSubtreeJobs(BehaviorTree& bt, BtNode& node, bool markSkipped) {
@@ -262,6 +310,10 @@ void BehaviorTree::Impl::CancelSubtreeJobs(BehaviorTree& bt, BtNode& node, bool 
     if (node.elseChild) CancelSubtreeJobs(bt, *node.elseChild, markSkipped);
     if (node.singleChild) CancelSubtreeJobs(bt, *node.singleChild, markSkipped);
     if (node.untilChild) CancelSubtreeJobs(bt, *node.untilChild, markSkipped);
+    if (node.otherwiseChild) CancelSubtreeJobs(bt, *node.otherwiseChild, markSkipped);
+    for (const auto& h : node.catchHandlers) {
+        if (h.doNode) CancelSubtreeJobs(bt, *h.doNode, markSkipped);
+    }
 }
 
 bool BehaviorTree::Impl::HasWaitingEscalation(const BtNode& node) const {
@@ -274,6 +326,10 @@ bool BehaviorTree::Impl::HasWaitingEscalation(const BtNode& node) const {
     if (node.elseChild && HasWaitingEscalation(*node.elseChild)) return true;
     if (node.singleChild && HasWaitingEscalation(*node.singleChild)) return true;
     if (node.untilChild && HasWaitingEscalation(*node.untilChild)) return true;
+    if (node.otherwiseChild && HasWaitingEscalation(*node.otherwiseChild)) return true;
+    for (const auto& h : node.catchHandlers) {
+        if (h.doNode && HasWaitingEscalation(*h.doNode)) return true;
+    }
     return false;
 }
 
@@ -296,6 +352,7 @@ int64_t LeafBudgetSec(const BtNode& node) {
     if (node.type == "job" || node.type == "worker") {
         return node.estimateSec > 0 ? node.estimateSec : node.timeoutSec;
     }
+    if (node.type == "probe") return node.timeoutSec;
     if (node.type == "wait") return node.sec;
     return 0;
 }
@@ -314,7 +371,7 @@ int64_t RepeatBudgetSec(const BtNode& node, int64_t childBudget) {
 // Best-case duration of one complete run of the node, used for future retry/repeat attempts.
 int64_t FullBudgetSec(const BtNode& node) {
     const std::string& t = node.type;
-    if (t == "job" || t == "worker" || t == "wait") return ClampEstimateSec(LeafBudgetSec(node));
+    if (t == "job" || t == "worker" || t == "probe" || t == "wait") return ClampEstimateSec(LeafBudgetSec(node));
     if (t == "sequence") {
         int64_t sum = 0;
         for (const auto& c : node.children) sum += FullBudgetSec(*c);
@@ -338,6 +395,15 @@ int64_t FullBudgetSec(const BtNode& node) {
     if (t == "retry" || t == "repeat") {
         return node.singleChild ? RepeatBudgetSec(node, FullBudgetSec(*node.singleChild)) : 0;
     }
+    if (t == "catch") {
+        int64_t childBudget = node.singleChild ? FullBudgetSec(*node.singleChild) : 0;
+        int64_t handlerBudget = 0;
+        for (const auto& h : node.catchHandlers) {
+            if (h.doNode) handlerBudget = (std::max)(handlerBudget, FullBudgetSec(*h.doNode));
+        }
+        int retries = node.catchMaxRetries > 0 ? node.catchMaxRetries : 1;
+        return ClampEstimateSec(childBudget * (retries + 1) + handlerBudget * retries);
+    }
     if (t == "timeout") {
         int64_t childBudget = node.singleChild ? FullBudgetSec(*node.singleChild) : 0;
         if (node.sec <= 0) return childBudget;
@@ -354,7 +420,7 @@ int64_t FullBudgetSec(const BtNode& node) {
 int64_t PendingNodeSec(const BtNode& node) {
     if (IsFinalNodeState(node)) return 0;
     const std::string& t = node.type;
-    if (t == "job" || t == "worker" || t == "wait") {
+    if (t == "job" || t == "worker" || t == "probe" || t == "wait") {
         // Running jobs are already part of the task queue's remaining time.
         return node.state == "idle" ? ClampEstimateSec(LeafBudgetSec(node)) : 0;
     }
@@ -400,6 +466,29 @@ int64_t PendingNodeSec(const BtNode& node) {
     if (t == "invert" || t == "forceSuccess" || t == "forceFailure" || t == "timeout") {
         return node.singleChild ? PendingNodeSec(*node.singleChild) : 0;
     }
+    if (t == "catch") {
+        if (node.catchPhase == 3 && node.otherwiseChild) return PendingNodeSec(*node.otherwiseChild);
+        int64_t pending = 0;
+        bool willRetry = true;
+        if (node.catchPhase == 1 && node.catchHandlerIndex >= 0 &&
+            static_cast<size_t>(node.catchHandlerIndex) < node.catchHandlers.size()) {
+            const auto& h = node.catchHandlers[static_cast<size_t>(node.catchHandlerIndex)];
+            if (h.doNode) pending += PendingNodeSec(*h.doNode);
+            willRetry = h.thenRetry;
+        }
+        if (node.singleChild) pending += PendingNodeSec(*node.singleChild);
+        int retries = node.catchMaxRetries > 0 ? node.catchMaxRetries : 1;
+        int remaining = willRetry ? (retries - node.catchRetries) : 0;
+        if (remaining <= 0) {
+            return ClampEstimateSec(pending + (node.otherwiseChild ? PendingNodeSec(*node.otherwiseChild) : 0));
+        }
+        int64_t childBudget = node.singleChild ? FullBudgetSec(*node.singleChild) : 0;
+        int64_t handlerBudget = 0;
+        for (const auto& h : node.catchHandlers) {
+            if (h.doNode) handlerBudget = (std::max)(handlerBudget, FullBudgetSec(*h.doNode));
+        }
+        return ClampEstimateSec(pending + static_cast<int64_t>(remaining) * (childBudget + handlerBudget));
+    }
     return 0;
 }
 
@@ -443,6 +532,20 @@ void CollectPlannedTasks(const BtNode& node, const BehaviorTree& bt,
         const BtNode* branch = (node.ifBranch == 2) ? node.elseChild.get() : node.thenChild.get();
         if (!branch) branch = node.elseChild.get();
         if (branch) CollectPlannedTasks(*branch, bt, out);
+        return;
+    }
+    if (t == "catch") {
+        if (node.catchPhase == 3 && node.otherwiseChild) {
+            CollectPlannedTasks(*node.otherwiseChild, bt, out);
+            return;
+        }
+        if (node.catchPhase == 1 && node.catchHandlerIndex >= 0 &&
+            static_cast<size_t>(node.catchHandlerIndex) < node.catchHandlers.size()) {
+            const auto& h = node.catchHandlers[static_cast<size_t>(node.catchHandlerIndex)];
+            if (h.doNode) CollectPlannedTasks(*h.doNode, bt, out);
+            return;
+        }
+        if (node.singleChild) CollectPlannedTasks(*node.singleChild, bt, out);
         return;
     }
     if (node.singleChild) {

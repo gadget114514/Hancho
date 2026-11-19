@@ -57,6 +57,28 @@ std::string BtVarPreview(const std::string& v, size_t maxBytes) {
     return Utf8Prefix64K(v, maxBytes) + " ...[truncated, " + std::to_string(v.size()) + " bytes]";
 }
 
+std::string DiagString(const json& j, const char* key) {
+    if (!j.is_object()) return "";
+    auto it = j.find(key);
+    if (it == j.end() || it->is_null()) return "";
+    if (it->is_string()) return it->get<std::string>();
+    return it->dump();
+}
+
+std::string DiagLikelyCauseIds(const json& j) {
+    std::string out;
+    if (!j.is_object()) return out;
+    auto it = j.find("likelyCauses");
+    if (it == j.end() || !it->is_array()) return out;
+    for (const auto& c : *it) {
+        std::string id = c.is_object() ? DiagString(c, "id") : std::string();
+        if (id.empty()) continue;
+        if (!out.empty()) out += ",";
+        out += id;
+    }
+    return out;
+}
+
 bool BehaviorTree::Impl::LookupVar(const BehaviorTree& bt, const std::string& expr, std::string& outVal) const {
     auto it = bt.vars_.find(expr);
     if (it != bt.vars_.end()) {
@@ -91,6 +113,34 @@ bool BehaviorTree::Impl::LookupVar(const BehaviorTree& bt, const std::string& ex
             if (prop == "exitCode") {
                 if (!node->hasExitCode) return false;
                 outVal = std::to_string(node->lastExitCode);
+                return true;
+            }
+            if (prop == "failureClass") {
+                outVal = node->hasFailureDiagnostic ? DiagString(node->failureDiagnostic, "class") : "";
+                return true;
+            }
+            if (prop == "failureSummary") {
+                outVal = node->hasFailureDiagnostic ? DiagString(node->failureDiagnostic, "summary") : "";
+                return true;
+            }
+            if (prop == "likelyCauses") {
+                outVal = node->hasFailureDiagnostic ? DiagLikelyCauseIds(node->failureDiagnostic) : "";
+                return true;
+            }
+            if (prop == "suggestedAction") {
+                outVal = node->hasFailureDiagnostic ? DiagString(node->failureDiagnostic, "suggestedAction") : "";
+                return true;
+            }
+            if (prop == "retryAt") {
+                outVal = node->hasFailureDiagnostic ? DiagString(node->failureDiagnostic, "retryAt") : "";
+                return true;
+            }
+            if (prop == "engine") {
+                outVal = node->lastEngine;
+                return true;
+            }
+            if (prop == "model") {
+                outVal = node->lastModel;
                 return true;
             }
             if (prop == "logFile") {
@@ -236,6 +286,37 @@ void BehaviorTree::Impl::StoreWorkerOutputs(BehaviorTree& bt,
             }
         }
     }
+}
+
+void BehaviorTree::Impl::ApplyFailureDiagnostic(BehaviorTree& bt,
+                                                BtNode& node,
+                                                const std::string& diagnosticJson,
+                                                bool succeeded,
+                                                int64_t nowMs) {
+    json parsed = json::parse(diagnosticJson, nullptr, false);
+    bool usable = !succeeded && parsed.is_object() && !DiagString(parsed, "class").empty();
+    if (usable) {
+        node.hasFailureDiagnostic = true;
+        node.failureDiagnostic = std::move(parsed);
+    } else {
+        node.hasFailureDiagnostic = false;
+        node.failureDiagnostic = json::object();
+    }
+
+    std::string prefix = !node.id.empty() ? node.id : node.nodeKey;
+    auto setVar = [&](const char* suffix, const std::string& value) {
+        std::string key = prefix + "." + suffix;
+        bt.vars_[key] = value;
+        bt.EmitEvent(nowMs, "varSet", node.nodeKey, node.state, "", node.runs, key, value);
+    };
+
+    setVar("failureClass", usable ? DiagString(node.failureDiagnostic, "class") : "");
+    setVar("failureSummary", usable ? DiagString(node.failureDiagnostic, "summary") : "");
+    setVar("likelyCauses", usable ? DiagLikelyCauseIds(node.failureDiagnostic) : "");
+    setVar("suggestedAction", usable ? DiagString(node.failureDiagnostic, "suggestedAction") : "");
+    setVar("retryAt", usable ? DiagString(node.failureDiagnostic, "retryAt") : "");
+    setVar("engine", node.lastEngine);
+    setVar("model", node.lastModel);
 }
 
 } // namespace pc
