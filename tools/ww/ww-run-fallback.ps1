@@ -3,6 +3,8 @@
 # The first engine (agy by default) runs the card. If it fails because of a usage limit
 # (rate limit, quota, 429, ...), the card is run again with the fallback engine
 # (opencode by default) instead of failing the job. Any other failure is reported as is.
+# -FallbackModel (or WW_FALLBACK_MODEL) sets the model for the fallback run only, e.g.
+#   -Engine opencode -Model opencode-go/hy4-flash-free -Fallback opencode -FallbackModel opencode/gemini-4-hydrogen
 #
 # Only one engine's event stream reaches stdout, so the consumer (Hancho) sees one clean
 # stream: the primary run's stream is kept and printed when it is used, and the fallback
@@ -13,6 +15,8 @@ param(
     [string]$Engine = "agy",
     [string]$Fallback = "opencode",
     [string]$Model = $env:WW_MODEL,
+    # Model for the fallback run only (e.g. opencode/gemini-4-hydrogen). Empty = same as -Model.
+    [string]$FallbackModel = $env:WW_FALLBACK_MODEL,
     [string]$Extra = "",
     [string]$Root = $env:WW_ROOT,
     [switch]$Shared,
@@ -83,21 +87,23 @@ if (-not (Test-Path $runCmd)) {
     exit 1
 }
 
-function Get-EngineArgs([string]$engine) {
+function Get-EngineArgs([string]$engine, [string]$engineModel) {
     $a = @($Task, "-Engine", $engine)
     if ($Root) { $a += @("-Root", $Root) }
     if ($Shared) { $a += "-Shared" }
     if ($Main) { $a += "-Main" }
     if ($Worktree) { $a += "-Worktree" }
     if ($JsonStdout) { $a += "-JsonStdout" }
-    if ($Model) { $a += @("-Model", $Model) }
+    if ($engineModel) { $a += @("-Model", $engineModel) }
     if ($Extra) { $a += @("-Extra", $Extra) }
     return $a
 }
 
+$fallbackModelEff = if ($FallbackModel) { $FallbackModel } else { $Model }
+
 if ($DryRun) {
-    Write-Host "[ww-run-fallback] would run: $runCmd $((Get-EngineArgs $Engine) -join ' ')"
-    Write-Host "[ww-run-fallback] fallback:  $runCmd $((Get-EngineArgs $Fallback) -join ' ')"
+    Write-Host "[ww-run-fallback] would run: $runCmd $((Get-EngineArgs $Engine $Model) -join ' ')"
+    Write-Host "[ww-run-fallback] fallback:  $runCmd $((Get-EngineArgs $Fallback $fallbackModelEff) -join ' ')"
     exit 0
 }
 
@@ -106,7 +112,7 @@ $outFile = Join-Path $tempDir ("wwfb-{0}-{1}.out" -f $Task, [guid]::NewGuid().To
 $errFile = Join-Path $tempDir ("wwfb-{0}-{1}.err" -f $Task, [guid]::NewGuid().ToString("N").Substring(0, 8))
 
 Write-Host "[ww-run-fallback] $Task with $Engine"
-$proc = Start-Process -FilePath $runCmd -ArgumentList (Get-EngineArgs $Engine) -NoNewWindow -Wait -PassThru `
+$proc = Start-Process -FilePath $runCmd -ArgumentList (Get-EngineArgs $Engine $Model) -NoNewWindow -Wait -PassThru `
     -RedirectStandardOutput $outFile -RedirectStandardError $errFile
 $code = $proc.ExitCode
 
@@ -134,10 +140,10 @@ if (-not $hint) {
     exit $code
 }
 
-Write-FallbackNote "$Engine hit a usage limit ('$hint', exit code $code); retrying $Task with $Fallback"
+Write-FallbackNote "$Engine hit a usage limit ('$hint', exit code $code); retrying $Task with $Fallback ($fallbackModelEff)"
 
 # The fallback run streams its own events to stdout.
-& $runCmd (Get-EngineArgs $Fallback)
+& $runCmd (Get-EngineArgs $Fallback $fallbackModelEff)
 $fallbackCode = $LASTEXITCODE
 Remove-Item $outFile, $errFile -ErrorAction SilentlyContinue
 if ($fallbackCode -eq 0) {
