@@ -97,12 +97,12 @@ int main() {
         if (runner.startedWorkers.size() == 1) {
             Check(runner.startedWorkers[0].engine == "agy" &&
                   runner.startedWorkers[0].model == "gemini-4-argon-high" &&
-                  runner.startedWorkers[0].proposedJobId == "worker-test-1",
+                  runner.startedWorkers[0].proposedJobId == "worker-test-w1-1",
                   "w1 uses BT default engine/model");
         }
 
         // Complete w1 with valid outputSchema
-        bt.OnJobFinished("worker-test-1", true, 0, "w1.log", "done",
+        bt.OnJobFinished("worker-test-w1-1", true, 0, "w1.log", "done",
                          1500, "Found 2 issues in src/foo.cpp",
                          R"({"file":"src/foo.cpp","issues":2})");
 
@@ -120,7 +120,7 @@ int main() {
                   "w2 prompt expanded w1.result");
         }
 
-        bt.OnJobFinished("worker-test-2", true, 0, "w2.log", "fixed", 2000, "Fixed all", "{}");
+        bt.OnJobFinished("worker-test-w2-1", true, 0, "w2.log", "fixed", 2000, "Fixed all", "{}");
         Check(bt.State() == "succeeded", "worker BT succeeded");
 
         // Now test outputSchema failure -> fails with detail "outputInvalid"
@@ -129,7 +129,7 @@ int main() {
         bt2.LoadDefinition(workerBt, &catalog, err);
         bt2.SetJobRunner(&runner2);
         bt2.Start(1000);
-        bt2.OnJobFinished("worker-test-1", true, 0, "w1.log", "done",
+        bt2.OnJobFinished("worker-test-w1-1", true, 0, "w1.log", "done",
                           1200, "Bad json output", R"({"file":"only_file_missing_issues"})");
         Check(bt2.State() == "failed" && bt2.NodeDetail("w1").rfind("outputInvalid: ", 0) == 0 &&
               bt2.NodeDetail("w1").find("issues") != std::string::npos,
@@ -177,9 +177,9 @@ int main() {
         bt.Start(1000);
 
         Check(runner.startedJobs.size() == 1, "flaky attempt 1 started");
-        bt.OnJobFinished("comp-test-1", false, 1, "f1.log", "err1", 1100);
+        bt.OnJobFinished("comp-test-flaky-1", false, 1, "f1.log", "err1", 1100);
         Check(runner.startedJobs.size() == 2 && bt.NodeRunCount("r1") == 2, "retry started attempt 2");
-        bt.OnJobFinished("comp-test-2", true, 0, "f2.log", "ok", 1200);
+        bt.OnJobFinished("comp-test-flaky-2", true, 0, "f2.log", "ok", 1200);
 
         Check(bt.State() == "succeeded", "comp-test succeeded after retry recovery + selector + decorators");
         Check(bt.NodeState("fb1") == "succeeded" && bt.NodeState("fs") == "succeeded" && bt.NodeState("ff") == "failed",
@@ -191,9 +191,9 @@ int main() {
         btEx.LoadDefinition(compBt, &catalog, err);
         btEx.SetJobRunner(&runnerEx);
         btEx.Start(1000);
-        btEx.OnJobFinished("comp-test-1", false, 1, "", "", 1100);
-        btEx.OnJobFinished("comp-test-2", false, 2, "", "", 1200);
-        btEx.OnJobFinished("comp-test-3", false, 3, "", "", 1300);
+        btEx.OnJobFinished("comp-test-flaky-1", false, 1, "", "", 1100);
+        btEx.OnJobFinished("comp-test-flaky-2", false, 2, "", "", 1200);
+        btEx.OnJobFinished("comp-test-flaky-3", false, 3, "", "", 1300);
         Check(btEx.State() == "failed" && btEx.NodeRunCount("r1") == 3 && btEx.NodeRunCount("flaky") == 3,
               "retry exhaustion fails after max=3 attempts");
     }
@@ -226,9 +226,9 @@ int main() {
         Check(bt.TaskQueueName() != runner.startedJobs[0].queueName &&
                   bt.TaskQueueName() != runner.startedJobs[1].queueName,
               "parallel child queues differ from the tree queue");
-        bt.OnJobFinished("par-any-1", true, 0, "", "", 1100);
+        bt.OnJobFinished("par-any-j1-1", true, 0, "", "", 1100);
         Check(bt.State() == "succeeded", "parallel any succeeded when j1 succeeded");
-        Check(runner.WasCancelled("par-any-2"), "parallel any cancelled remaining running job j2");
+        Check(runner.WasCancelled("par-any-j2-1"), "parallel any cancelled remaining running job j2");
 
         // Parallel all: if j1 fails, j2 is cancelled and parallel fails immediately
         std::string parAllBt = R"({
@@ -248,8 +248,8 @@ int main() {
         bt2.LoadDefinition(parAllBt, &catalog, err);
         bt2.SetJobRunner(&runner2);
         bt2.Start(1000);
-        bt2.OnJobFinished("par-all-1", false, 1, "", "fail", 1100);
-        Check(bt2.State() == "failed" && runner2.WasCancelled("par-all-2"),
+        bt2.OnJobFinished("par-all-j1-1", false, 1, "", "fail", 1100);
+        Check(bt2.State() == "failed" && runner2.WasCancelled("par-all-j2-1"),
               "parallel all failed when j1 failed and cancelled j2");
 
         // Serial nodes never run together, so they stay on the tree queue (no extra queues).
@@ -321,7 +321,7 @@ int main() {
 
         Check(bt.GetVar("branch") == "took-else", "if/else took else branch");
         Check(runner.startedJobs.size() == 1 && runner.startedJobs[0].nodeId == "step", "repeat started iteration 1");
-        bt.OnJobFinished("flow-test-1", true, 0, "", "", 1100);
+        bt.OnJobFinished("flow-test-step-1", true, 0, "", "", 1100);
         Check(runner.startedJobs.size() == 2 && bt.NodeRunCount("rep1") == 2, "repeat started iteration 2 because until was false");
 
         // Now satisfy until condition via capture or before finishing job 2: let's set var via a job capture or check repeat
@@ -367,10 +367,10 @@ int main() {
         bt.SetJobRunner(&runner);
         bt.Start(1000);
 
-        bt.OnJobFinished("rep-wait-to-1", true, 0, "", "STATUS=warming", 1200);
+        bt.OnJobFinished("rep-wait-to-step-1", true, 0, "", "STATUS=warming", 1200);
         Check(bt.NodeRunCount("rep") == 2 && bt.State() == "running", "repeat continues when until is false");
 
-        bt.OnJobFinished("rep-wait-to-2", true, 0, "", "STATUS=ready", 1500);
+        bt.OnJobFinished("rep-wait-to-step-2", true, 0, "", "STATUS=ready", 1500);
         Check(bt.NodeState("rep") == "succeeded" && bt.NodeRunCount("rep") == 2, "repeat until succeeded at run 2/5");
         Check(bt.NodeState("wait5") == "running" && bt.NextWakeMs() == 6500, "wait5 is running with NextWakeMs=6500");
 
@@ -384,7 +384,7 @@ int main() {
         bt.OnTimer(16500);
         Check(bt.State() == "failed" && bt.NodeState("lim10") == "failed" && bt.NodeDetail("lim10") == "timeout",
               "timeout node failed at deadline");
-        Check(runner.WasCancelled("rep-wait-to-3"), "timeout cancelled running job beneath it");
+        Check(runner.WasCancelled("rep-wait-to-hung-1"), "timeout cancelled running job beneath it");
     }
 
     // 5. Capture (regex + jsonFile), variable quoting in command, engine variables, undefinedVar
@@ -444,7 +444,7 @@ int main() {
                   "summary uses plain replacement: " + runner.startedJobs[0].summary);
         }
 
-        bt.OnJobFinished("var-test-1", true, 0, "logs/j1.log",
+        bt.OnJobFinished("var-test-j1-1", true, 0, "logs/j1.log",
                          "Compiling...\r\nsrc/broken.cpp(17): error C2065: undeclared\r\nDone\r\n", 1500);
 
         Check(bt.GetVar("errFile") == "src/broken.cpp", "regex capture extracted errFile: " + bt.GetVar("errFile"));
@@ -453,11 +453,11 @@ int main() {
         Check(runner.startedJobs.size() == 2, "j2 started");
         if (runner.startedJobs.size() == 2) {
             Check(runner.startedJobs[1].summary ==
-                  "After succeeded exit=0 job=var-test-1 runs=1 btRuns=2 err=src/broken.cpp cfg=RelWithDebInfo",
+                  "After succeeded exit=0 job=var-test-j1-1 runs=1 btRuns=2 err=src/broken.cpp cfg=RelWithDebInfo",
                   "engine vars expanded in j2 summary: " + runner.startedJobs[1].summary);
         }
 
-        bt.OnJobFinished("var-test-2", true, 0, "logs/j2.log", "ok", 2000);
+        bt.OnJobFinished("var-test-j2-1", true, 0, "logs/j2.log", "ok", 2000);
         Check(bt.State() == "failed" && bt.NodeState("j_undef") == "failed" &&
               bt.NodeDetail("j_undef") == "undefinedVar: noSuchVar",
               "undefined variable fails node with undefinedVar: " + bt.NodeDetail("j_undef"));
@@ -528,7 +528,7 @@ int main() {
               "planned row carries queue and estimate");
         Check(bt.PendingEstimateSec() == 500, "pending estimate sums unstarted sequence jobs");
 
-        bt.OnJobFinished("plan-test-1", true, 0, "", "", 1100);
+        bt.OnJobFinished("plan-test-a-1", true, 0, "", "", 1100);
         planned = bt.PlannedTasks();
         Check(planned.size() == 1 && planned[0].nodeKey == "c", "finished job leaves the planned list");
         Check(bt.PendingEstimateSec() == 300, "pending estimate drops the finished job");
@@ -564,7 +564,7 @@ int main() {
               "fallback shows only the active branch's planned job");
         Check(bt.PendingEstimateSec() == 20, "fallback estimate ignores inactive branches");
 
-        bt.OnJobFinished("branch-test-1", false, 1, "", "", 1100);
+        bt.OnJobFinished("branch-test-f1-1", false, 1, "", "", 1100);
         planned = bt.PlannedTasks();
         Check(planned.empty(), "failed branch's provisional job is gone after the tree moves on");
         Check(bt.PendingEstimateSec() == 0, "pending estimate follows the new branch");

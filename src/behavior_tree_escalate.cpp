@@ -232,7 +232,8 @@ void BehaviorTree::Impl::LaunchEscalateFallback(BehaviorTree& bt, BtNode& node, 
     node.fallbackDeadlineMs = 0;
     if (!bt.runner_) return;
 
-    std::string proposedId = bt.id_ + "-" + node.nodeKey + "-" + std::to_string(node.runs);
+    node.launchSeq++;
+    std::string proposedId = bt.id_ + "-" + node.nodeKey + "-" + std::to_string(node.launchSeq);
     BtWorkerSpec wspec;
     wspec.btId = bt.id_;
     wspec.nodeId = node.id;

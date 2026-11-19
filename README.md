@@ -121,6 +121,14 @@ The application icons are modeled on the character "Telephone Cat" (電話猫, D
 
 
 
+### v0.9.35
+- **Task details: raw JSON and JSON tree tabs**: the task details window now offers a "Raw JSON" tab and a "JSON Tree" tab. The tree expands objects and arrays; selecting a node shows that node's JSON and JSON path in the pane beside it. "Past runs" and "Why failed" remain available.
+- **Failed task groups stay listed**: a failed behavior tree is not finished yet — its `group:` row remains in the task list so it can be retried or closed (`bt_retry` / `bt_cancel` / `bt_remove`). Planned rows disappear until the tree moves on. The CLI state documentation was updated to match.
+- **Unique BT job IDs across retries**: behavior-tree jobs now use a per-node launch counter (`<btId>-<nodeKey>-<launchSeq>`) that `bt_retry` does not reset, so a retried node no longer proposes the same job ID as an earlier attempt. Older saved trees fall back to their run count.
+- **Task-group actions accept `group:` ids**: `taskqueue get|cancel|close|remove` now strip the `group:` prefix before routing a virtual task-group row to its tree, so these actions no longer fail with "job not found".
+- **Standalone GUI finds the right dashboard**: the core only reuses an open dashboard whose title matches the current `--data-dir`, instead of picking up a dashboard for a different data directory.
+- **Triage: closed jobs are finished**: a `closed` job is treated as cancelled, a still-running or waiting behavior tree keeps its triage card open, and a failed dependent without a card of its own no longer blocks a branch. A second decision for the same card is refused while one is in progress.
+
 ### v0.9.34
 - **Deleting a task group removes its tasks**: `bt_remove` (and `taskqueue remove <btId>`) now also deletes the tree's task-queue jobs, so the group's rows leave the task list instead of reappearing. `taskqueue close <btId>` stops the group but keeps it; `taskqueue remove <btId>` deletes the tree and its jobs.
 - **Force-removing a running job kills its process**: a force-removed running job no longer keeps its process alive, so it does not finish later and reappear as a plain run.

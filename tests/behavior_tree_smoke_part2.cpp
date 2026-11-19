@@ -49,7 +49,7 @@ void RunPart2Tests(const std::string& tempDirUtf8, const std::wstring& tempDirW)
         Sleep(50);
         WriteFileAtomicWide(tempDirW + L"\\after_j1.txt", "newer content");
 
-        bt.OnJobFinished("cond-test-1", true, 0, "", "Line 1\nPASS_TOKEN_42\nDone", 1500);
+        bt.OnJobFinished("cond-test-j1-1", true, 0, "", "Line 1\nPASS_TOKEN_42\nDone", 1500);
         Check(bt.State() == "succeeded", "all 7 condition types succeeded: " + bt.Detail());
         Check(bt.NodeState("c_exists") == "succeeded" &&
               bt.NodeState("c_newer_start") == "succeeded" &&
@@ -106,7 +106,7 @@ void RunPart2Tests(const std::string& tempDirUtf8, const std::wstring& tempDirW)
         Check(bt.LoadDefinition(escBt, &catalog, err), "load escalate BT: " + err);
         bt.SetJobRunner(&runner);
         bt.Start(1000);
-        bt.OnJobFinished("esc-test-1", true, 0, "", "prep log line 1", 1500);
+        bt.OnJobFinished("esc-test-prep-1", true, 0, "", "prep log line 1", 1500);
 
         Check(bt.State() == "waitingForLlm", "BT enters waitingForLlm at escalate");
         std::string pktJson = bt.GetEscalationPacketJson("ask");
@@ -136,11 +136,11 @@ void RunPart2Tests(const std::string& tempDirUtf8, const std::wstring& tempDirW)
         // Resume arrives before fallback finishes -> cancels fallback worker and continues
         bool okRes = bt.Resume("ask", "approve", "All checks green", {{"extra", "prod"}}, 22000, err);
         Check(okRes, "Resume succeeds with valid answer and rationale: " + err);
-        Check(runner.WasCancelled("esc-test-2"), "Resume cancelled running fallback worker");
+        Check(runner.WasCancelled("esc-test-ask-1"), "Resume cancelled running fallback worker");
         Check(bt.GetVar("ask.answer") == "approve", "ask.answer variable set");
         Check(runner.startedJobs.size() == 2 && runner.startedJobs[1].summary == "Deploy prod",
               "deploy job started with extra var from Resume");
-        bt.OnJobFinished("esc-test-3", true, 0, "", "deployed", 23000);
+        bt.OnJobFinished("esc-test-deploy-1", true, 0, "", "deployed", 23000);
         Check(bt.State() == "succeeded", "escalate BT succeeded after deploy");
 
         // Escalate timeout test
@@ -149,7 +149,7 @@ void RunPart2Tests(const std::string& tempDirUtf8, const std::wstring& tempDirW)
         btTo.LoadDefinition(escBt, &catalog, err);
         btTo.SetJobRunner(&runnerTo);
         btTo.Start(1000);
-        btTo.OnJobFinished("esc-test-1", true, 0, "", "ok", 1500);
+        btTo.OnJobFinished("esc-test-prep-1", true, 0, "", "ok", 1500);
         btTo.OnTimer(101500); // past timeoutSec=100
         Check(btTo.State() == "failed" && btTo.NodeDetail("ask") == "escalationTimeout",
               "escalate fails with escalationTimeout when timeoutSec expires");
@@ -160,9 +160,9 @@ void RunPart2Tests(const std::string& tempDirUtf8, const std::wstring& tempDirW)
         btFb.LoadDefinition(escBt, &catalog, err);
         btFb.SetJobRunner(&runnerFb);
         btFb.Start(1000);
-        btFb.OnJobFinished("esc-test-1", true, 0, "", "ok", 1500);
+        btFb.OnJobFinished("esc-test-prep-1", true, 0, "", "ok", 1500);
         btFb.OnTimer(21500); // starts fallback worker esc-test-2
-        btFb.OnJobFinished("esc-test-2", true, 0, "", "", 22000, "Fallback decided",
+        btFb.OnJobFinished("esc-test-ask-1", true, 0, "", "", 22000, "Fallback decided",
                            R"({"answer":"approve","rationale":"Fallback approved","vars":{"extra":"auto"}})");
         Check(btFb.GetVar("ask.answer") == "approve" && runnerFb.startedJobs.size() == 2 &&
               runnerFb.startedJobs[1].summary == "Deploy auto",
@@ -270,7 +270,7 @@ void RunPart2Tests(const std::string& tempDirUtf8, const std::wstring& tempDirW)
         bt.Start(1000);
 
         // Fail attempt 1, attempt 2 starts and is now running
-        bt.OnJobFinished("feature-persist-1", false, 1, "", "err", 1200);
+        bt.OnJobFinished("feature-persist-build-1", false, 1, "", "err", 1200);
         Check(bt.State() == "running" && bt.NodeRunCount("build") == 2, "build attempt 2 is running");
 
         // Save state while feature-persist-2 is running
@@ -281,7 +281,7 @@ void RunPart2Tests(const std::string& tempDirUtf8, const std::wstring& tempDirW)
         std::string dbgErr;
         Check(ParseBtDebugTree(savedJson, dbg, dbgErr), "ToStateJson parses in ParseBtDebugTree: " + dbgErr);
         Check(dbg.btId == "feature-persist" && dbg.state == "running", "debug tree has btId and running state");
-        Check(FindBtNodeKeyByJob({dbg}, "feature-persist-2") == "feature-persist/build",
+        Check(FindBtNodeKeyByJob({dbg}, "feature-persist-build-2") == "feature-persist/build",
               "FindBtNodeKeyByJob finds running job on reloaded debug tree");
 
         // Restore into a brand new BehaviorTree instance and continue ticking!
@@ -292,7 +292,7 @@ void RunPart2Tests(const std::string& tempDirUtf8, const std::wstring& tempDirW)
               "restored tree has build running");
 
         // Finish the attached job feature-persist-2 with failure -> retry(max=2) exhausts -> tree fails!
-        restored.OnJobFinished("feature-persist-2", false, 2, "", "err2", 1500);
+        restored.OnJobFinished("feature-persist-build-2", false, 2, "", "err2", 1500);
         Check(restored.State() == "failed" && restored.NodeState("build-loop") == "failed",
               "restored tree failed when second build attempt failed");
         Check(restored.NodeState("test") == "idle", "unreached 'test' node remained idle");
@@ -304,14 +304,14 @@ void RunPart2Tests(const std::string& tempDirUtf8, const std::wstring& tempDirW)
         // Now Retry from failed node "build" with resetCounters=true
         Check(restored.Retry("build", true, 2000, err), "Retry from failed node 'build': " + err);
         Check(restored.State() == "running" && runner.startedJobs.size() == 3 &&
-              runner.startedJobs.back().proposedJobId == "feature-persist-3",
+              runner.startedJobs.back().proposedJobId == "feature-persist-build-3",
               "Retry launched job feature-persist-3");
 
-        restored.OnJobFinished("feature-persist-3", true, 0, "", "built!", 2500);
+        restored.OnJobFinished("feature-persist-build-3", true, 0, "", "built!", 2500);
         Check(restored.NodeState("test") == "running" && runner.startedJobs.size() == 4,
               "after build succeeded, 'test' job feature-persist-4 started");
 
-        restored.OnJobFinished("feature-persist-4", true, 0, "", "all tests passed", 3000);
+        restored.OnJobFinished("feature-persist-test-1", true, 0, "", "all tests passed", 3000);
         Check(restored.State() == "succeeded", "tree succeeded after Retry");
         Check(!restored.Events().empty() && restored.Version() > 0, "events and version counter populated");
 

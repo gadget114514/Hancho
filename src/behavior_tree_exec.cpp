@@ -150,7 +150,8 @@ void BehaviorTree::Impl::TickNode(BehaviorTree& bt, BtNode& node, int64_t nowMs)
             expRes.read.push_back(xr);
         }
 
-        std::string proposedId = bt.id_ + "-" + node.nodeKey + "-" + std::to_string(node.runs);
+        node.launchSeq++;
+        std::string proposedId = bt.id_ + "-" + node.nodeKey + "-" + std::to_string(node.launchSeq);
         node.lastStartMs = static_cast<int64_t>(CaptureStartFiletimeWithGuard());
         node.lastStartTimestamp = FormatEpochMsIso(nowMs);
 

@@ -8,6 +8,7 @@
 #include <string>
 #include <thread>
 #include <unordered_map>
+#include <unordered_set>
 #include <vector>
 
 namespace pc {
@@ -88,6 +89,9 @@ private:
     // Captured instructions text per "jobId#rev", so the once-a-second refresh does not
     // re-fetch it from the task queue for every failed job.
     std::unordered_map<std::string, std::string> instructionsCache_;
+    // Cards whose decision is in progress (action running, not yet recorded). A second decision for
+    // the same card is refused, so a person's click and an automatic decision cannot both act on it.
+    std::unordered_set<std::string> deciding_;
     std::atomic<bool> running_{false};
     std::atomic<uint64_t> lastRefreshTickMs_{0};
     std::thread thread_;

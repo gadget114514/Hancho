@@ -415,7 +415,7 @@ void CollectPlannedTasks(const BtNode& node, const BehaviorTree& bt,
         task.type = t;
         task.summary = node.summary;
         task.queueName = node.queueName.empty() ? bt.TaskQueueName() : node.queueName;
-        task.proposedJobId = bt.Id() + "-" + node.nodeKey + "-" + std::to_string(node.runs + 1);
+        task.proposedJobId = bt.Id() + "-" + node.nodeKey + "-" + std::to_string(node.launchSeq + 1);
         task.estimateSec = static_cast<int>(ClampEstimateSec(LeafBudgetSec(node)));
         out.push_back(std::move(task));
         return;

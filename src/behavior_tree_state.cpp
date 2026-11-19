@@ -10,10 +10,11 @@ namespace {
 json NodeToJson(const BtNode& node) {
     json j = node.rawDef;
 
-    if (node.hasStatus || node.state != "idle" || node.runs > 0 || !node.jobs.empty()) {
+    if (node.hasStatus || node.state != "idle" || node.runs > 0 || node.launchSeq > 0 || !node.jobs.empty()) {
         json st = json::object();
         st["state"] = node.state;
         if (node.runs > 0) st["runs"] = node.runs;
+        if (node.launchSeq > 0) st["launchSeq"] = node.launchSeq;
         if (!node.jobs.empty()) st["jobs"] = node.jobs;
         if (!node.detail.empty()) st["detail"] = node.detail;
         if (!node.answer.empty()) st["answer"] = node.answer;
@@ -69,6 +70,8 @@ void BehaviorTree::Impl::RestoreNodeStatus(BehaviorTree& bt,
         node.hasStatus = true;
         node.state = st.value("state", "idle");
         node.runs = st.value("runs", 0);
+        // Older saves have no launchSeq; fall back to runs so new IDs still don't collide with them.
+        node.launchSeq = st.value("launchSeq", node.runs);
         node.detail = st.value("detail", std::string());
         node.answer = st.value("answer", std::string());
         node.rationale = st.value("rationale", std::string());

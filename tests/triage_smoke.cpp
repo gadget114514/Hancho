@@ -465,6 +465,33 @@ int main() {
               "trim evicts oldest closed cards and retains open cards");
     }
 
+        // 15b. A closed job is a finished job, a running tree keeps the card open, and a failed
+    // dependent without a card of its own does not count as a branch Hancho must wait for.
+    {
+        const json original = TimeoutJob(3);
+        TriageInputs in;
+        in.jobs = json::array({original});
+        in.now = now;
+        json card = BuildTriageCandidates(in).front();
+        card["state"] = "acted";
+        json closedJob = original;
+        closedJob["state"] = "closed";
+        const json closed = TriageOutcome(card, json::array({closedJob}), json::object());
+        json succeeded = original;
+        succeeded["attempts"].push_back({{"n", 2}, {"reason", "completed"}});
+        succeeded["state"] = "succeeded";
+        json inTree = succeeded;
+        inTree["bt"] = {{"id", "tree"}, {"node", "node"}};
+        const json treeRunning = TriageOutcome(card, json::array({inTree}), json{{"tree", "running"}});
+        const json treeDone = TriageOutcome(card, json::array({inTree}), json{{"tree", "succeeded"}});
+        json closedDependent = {{"id", "dependent"}, {"state", "closed"}, {"depends_on", json::array({"job-timeout"})}};
+        const json closedBranch = TriageOutcome(card, json::array({succeeded, closedDependent}), json::object());
+        Check(closed.value("state", std::string()) == "cancelled" && closed.value("complete", false) &&
+              !treeRunning.value("complete", true) && treeDone.value("complete", false) &&
+              closedBranch.value("complete", false),
+              "closed jobs are finished and a running tree keeps the card open");
+    }
+
     // 16. The shared display catalog localizes keyed values, preserves legacy text, and
     //     keeps evidence and log output in independent rows.
     {

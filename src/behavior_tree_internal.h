@@ -127,6 +127,9 @@ struct BtNode {
     bool hasStatus = false;
     std::string state = "idle"; // "idle", "running", "succeeded", "failed", "skipped"
     int runs = 0;
+    // Monotonic per-node job launch counter. Unlike `runs`, it is never reset by Retry(resetCounters),
+    // so proposed job IDs stay unique within a BT (ids are "<btId>-<nodeKey>-<launchSeq>").
+    int launchSeq = 0;
     std::vector<std::string> jobs;
     std::string detail;
     std::string answer;

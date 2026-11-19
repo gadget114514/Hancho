@@ -279,6 +279,29 @@ static HWND FindOwnWindow(const wchar_t* cls) {
     return nullptr;
 }
 
+// A dashboard titles itself "Hancho" for the default data dir and "Hancho - <dir>" for a
+// --data-dir override (see MainWindowTitle in gui_dashboard.cpp). Match on that title so
+// the core only reuses a dashboard that shows its own data dir.
+static bool DashboardTitleMatchesDataDir(HWND h) {
+    wchar_t buf[1024] = {};
+    GetWindowTextW(h, buf, 1024);
+    const std::wstring title = buf;
+    const std::wstring dataDir = GetDataDirectoryOverride();
+    if (dataDir.empty()) return title == L"Hancho";
+    const std::wstring suffix = L" - " + dataDir;
+    if (title.size() < suffix.size()) return false;
+    return _wcsnicmp(title.c_str() + (title.size() - suffix.size()), suffix.c_str(),
+                     suffix.size()) == 0;
+}
+
+static HWND FindDashboardForDataDir() {
+    HWND h = nullptr;
+    while ((h = FindWindowExW(nullptr, h, kDashboardClass, nullptr)) != nullptr) {
+        if (DashboardTitleMatchesDataDir(h)) return h;
+    }
+    return nullptr;
+}
+
 struct CoreHostContext {
     ProcessManager* pm = nullptr;
     TaskQueueManager* tqm = nullptr;
@@ -390,7 +413,7 @@ static bool RelaunchAsRole(const wchar_t* roleName, const std::vector<std::strin
 
 static void CoreHostShowGui(CoreHostContext* ctx) {
     if (!ctx) return;
-    HWND dash = FindWindowW(kDashboardClass, nullptr);
+    HWND dash = FindDashboardForDataDir();
     if (dash) {
         if (IsIconic(dash)) ShowWindow(dash, SW_RESTORE);
         else ShowWindow(dash, SW_SHOW);
@@ -931,7 +954,7 @@ int main() {
 
         // GUI standalone client launch (doc/design-v3.md §2.3 段階 A, Card 060c):
         // 1. If a dashboard window is already open, bring it to front and exit.
-        HWND existingDash = FindWindowW(kDashboardClass, nullptr);
+        HWND existingDash = FindDashboardForDataDir();
         if (existingDash) {
             if (IsIconic(existingDash)) ShowWindow(existingDash, SW_RESTORE);
             else ShowWindow(existingDash, SW_SHOW);
