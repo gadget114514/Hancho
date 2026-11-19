@@ -1182,6 +1182,9 @@ json TriageOutcomeForJob(const json& card, const json& job, const std::string& c
     const std::string jobState = String(job, "state");
     if (jobState == "cancelled")
         return {{"state", "cancelled"}, {"detail", "the job was cancelled"}};
+    // A person closed the job (taskqueue close): it is finished, so it reports as cancelled.
+    if (jobState == "closed")
+        return {{"state", "cancelled"}, {"detail", "the job was closed"}};
     if (jobState == "running" || jobState == "waiting" || jobState == "pending" || jobState == "blocked")
         return {{"state", "rerunning"}, {"detail", "attempt " + std::to_string(currentAttempt) + " " + jobState}};
     if (currentAttempt <= cardAttempt) {
@@ -1211,7 +1214,9 @@ json TriageBranch(const std::string& jobId, const json& jobs) {
             if (id.empty() || seen.count(id) || !DependsOn(job, current)) continue;
             seen.insert(id);
             frontier.push_back(id);
-            const std::string state = String(job, "state");
+            // A closed job is finished (a person closed it), so it counts as a closed dependent.
+            std::string state = String(job, "state");
+            if (state == "closed") state = "cancelled";
             if (state == "succeeded") ++succeeded;
             else if (state == "failed") ++failed;
             else if (state == "blocked") ++blocked;
@@ -1283,7 +1288,11 @@ nlohmann::json TriageOutcome(const nlohmann::json& card, const nlohmann::json& j
     }
     const std::string outState = String(out, "state");
     const bool terminal = outState == "succeeded" || outState == "cancelled" || outState == "gone";
-    out["complete"] = terminal && branch["done"].get<bool>();
+    // The tree the job belongs to must have finished too (succeeded, cancelled or removed). A tree
+    // that is still running, waiting for an answer, paused or failed keeps the card open.
+    const std::string btState = out.contains("bt") ? String(out["bt"], "state") : std::string();
+    const bool treeFinished = btState.empty() || btState == "succeeded" || btState == "cancelled";
+    out["complete"] = terminal && branch["done"].get<bool>() && treeFinished;
     return out;
 }
 

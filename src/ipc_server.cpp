@@ -71,6 +71,12 @@ std::string SnapshotToJson(const ProcessSnapshot& s) {
 }
 
 
+// Task-group rows in the task list have ids "group:<treeId>"; the behavior tree manager keys trees by
+// the bare id, so strip the row prefix before handing the id to it.
+static std::string StripGroupRowPrefix(const std::string& id) {
+    return id.rfind("group:", 0) == 0 ? id.substr(6) : id;
+}
+
 static std::string ExtractRawJsonValue(const std::string& json, const std::string& key) {
     std::string pattern = "\"" + key + "\"";
     size_t keyPos = json.find(pattern);
@@ -1389,7 +1395,8 @@ std::string IpcServer::HandleRequestJson(const std::string& reqJson) {
                                      static_cast<int>(JsonGetInt(reqJson, "rev", 0)), err);
             // The id may be a task group rather than a job; return the tree instead.
             if (!err.empty() && btm_ && err.find("job not found") != std::string::npos) {
-                nlohmann::json btDoc = nlohmann::json::parse(btm_->Get(id, false), nullptr, false);
+                // Task-group rows carry a "group:" prefix that the behavior tree manager does not know.
+                nlohmann::json btDoc = nlohmann::json::parse(btm_->Get(StripGroupRowPrefix(id), false), nullptr, false);
                 if (btDoc.is_object() && btDoc.value("ok", false)) {
                     btDoc["kind"] = "taskGroup";
                     resp = btDoc.dump();
@@ -1435,7 +1442,7 @@ std::string IpcServer::HandleRequestJson(const std::string& reqJson) {
             resp = tqm_.TaskQueueCancel(id, err);
             // The id may be a task group rather than a job; cancel the tree instead.
             if (!err.empty() && btm_ && err.find("job not found") != std::string::npos) {
-                resp = btm_->Cancel(id);
+                resp = btm_->Cancel(StripGroupRowPrefix(id));
                 err.clear();
             }
         } else if (action == "taskqueue_close") {
@@ -1443,7 +1450,7 @@ std::string IpcServer::HandleRequestJson(const std::string& reqJson) {
             resp = tqm_.TaskQueueClose(id, err);
             // A task group has no job to close; stop the tree but keep it (use remove to delete).
             if (!err.empty() && btm_ && err.find("job not found") != std::string::npos) {
-                resp = btm_->Cancel(id);
+                resp = btm_->Cancel(StripGroupRowPrefix(id));
                 err.clear();
             }
         } else if (action == "taskqueue_pause" || action == "taskqueue_resume") {
@@ -1479,7 +1486,7 @@ std::string IpcServer::HandleRequestJson(const std::string& reqJson) {
             resp = tqm_.TaskQueueRemove(id, JsonGetBool(reqJson, "force", false), err);
             // The id may be a task group rather than a job; remove the tree instead.
             if (!err.empty() && btm_ && err.find("job not found") != std::string::npos) {
-                resp = btm_->Remove(id);
+                resp = btm_->Remove(StripGroupRowPrefix(id));
                 err.clear();
             }
         } else if (action == "taskqueue_link") {

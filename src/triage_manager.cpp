@@ -182,6 +182,8 @@ bool IsClosedCard(const json& card) {
     if (state == "ignored") return true;
     if (!TracksOutcome(card)) return state == "acted" || state == "resolved";
     const json outcome = GetObject(card, "outcome");
+    // Naturally resolved (the failure vanished) with nothing left to follow: nothing is pending any more.
+    if (state == "resolved" && outcome.empty()) return true;
     auto complete = outcome.find("complete");
     return complete != outcome.end() && complete->is_boolean() && complete->get<bool>();
 }
@@ -833,6 +835,7 @@ std::string TriageManager::DecideInternal(const std::string& id, const std::stri
         });
         if (found == store_["cards"].end()) return Error("triage card not found: " + id).dump();
         if (GetString(*found, "state") != "pending") return Error("triage card is not pending").dump();
+        if (deciding_.count(id)) return Error("triage card is already being decided").dump();
         if (!FindCandidate(*found, candidateId)) return Error("candidate is not present on this card").dump();
         if (candidateId == "ignore" && reason.empty()) return Error("ignore requires a reason").dump();
         if (candidateId == "ack" && reason.empty()) return Error("ack requires a reason").dump();
@@ -847,7 +850,13 @@ std::string TriageManager::DecideInternal(const std::string& id, const std::stri
                 return Error("automatic decision failed safety guards").dump();
         }
         card = *found;
+        deciding_.insert(id);
     }
+    // Released on every return path (the lock is not held when the deleter runs).
+    auto releaseDeciding = std::shared_ptr<void>(nullptr, [this, id](void*) {
+        std::lock_guard<std::mutex> lock(mutex_);
+        deciding_.erase(id);
+    });
 
     const json target = GetObject(card, "target");
     std::string result = "Recorded " + candidateId + ".";
@@ -1026,6 +1035,13 @@ void TriageManager::UpdateOutcomesLocked(const json& jobs, const json& btStates)
             card.erase("outcome");
             continue;
         }
+        // Cancelling the retry (its child card) cancels the job, which drops the failed attempt's key.
+        // Keep the link to the child card that was open for this outcome.
+        const json previousOutcome = GetObject(card, "outcome");
+        if (!outcome.contains("nextKey") && GetString(outcome, "state") == "cancelled" &&
+            previousOutcome.contains("nextKey")) {
+            outcome["nextKey"] = previousOutcome["nextKey"];
+        }
         if (outcome.contains("nextKey")) {
             const std::string nextKey = GetString(outcome, "nextKey");
             outcome["nextCardId"] = TriageCardIdFromKey(nextKey);
@@ -1058,8 +1074,8 @@ void TriageManager::UpdateOutcomesLocked(const json& jobs, const json& btStates)
                 const std::string nextKey = GetString(outcome, "nextKey");
                 const auto next = cardIdByKey.find(nextKey);
                 outcome["nextCardId"] = TriageCardIdFromKey(nextKey);
-                nextClosed = next != cardIdByKey.end();
-                if (nextClosed) {
+                // A failure that was not given a card (absorbed by a tree or kind off) has nothing to close.
+                if (next != cardIdByKey.end()) {
                     auto nextCard = std::find_if(store_["cards"].begin(), store_["cards"].end(), [&](const json& candidate) {
                         return GetString(candidate, "id") == next->second;
                     });
@@ -1074,22 +1090,29 @@ void TriageManager::UpdateOutcomesLocked(const json& jobs, const json& btStates)
                     if (state == "failed") {
                         const std::string key = GetString(item, "key");
                         const auto cardId = cardIdByKey.find(key);
-                        if (cardId == cardIdByKey.end()) { branchClosed = false; continue; }
+                        // No card for a failed dependent means Hancho does not track it (its behavior
+                        // tree absorbed the failure, it sits inside an escalation, or its kind is off).
+                        // Waiting for a card that will never exist would keep the branch open forever.
+                        if (cardId == cardIdByKey.end()) continue;
                         item["cardId"] = cardId->second;
                         auto failedCard = std::find_if(store_["cards"].begin(), store_["cards"].end(), [&](const json& candidate) {
                             return GetString(candidate, "id") == cardId->second;
                         });
                         if (failedCard == store_["cards"].end() || !IsClosedCard(*failedCard)) branchClosed = false;
-                    } else if (state != "succeeded" && state != "cancelled") {
+                    } else if (state != "succeeded" && state != "cancelled" && state != "closed") {
                         branchClosed = false;
                     }
                 }
                 branch["done"] = branchClosed;
                 outcome["branch"] = branch;
             }
+            // The tree the job belongs to must have finished as well (see TriageOutcome).
+            const std::string treeState = GetString(GetObject(outcome, "bt"), "state");
+            const bool treeFinished = treeState.empty() || treeState == "succeeded" || treeState == "cancelled";
             const bool rootTerminal = outcomeState == "succeeded" || outcomeState == "cancelled" ||
                                       outcomeState == "gone";
-            const bool complete = (rootTerminal || (outcomeState == "failed_again" && nextClosed)) && branchClosed;
+            const bool complete = (rootTerminal || (outcomeState == "failed_again" && nextClosed)) &&
+                                  branchClosed && (treeFinished || outcomeState == "gone");
             outcome["complete"] = complete;
             if (card.value("outcome", json::object()) != outcome) {
                 card["outcome"] = outcome;
