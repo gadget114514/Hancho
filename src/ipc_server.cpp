@@ -1367,6 +1367,12 @@ std::string IpcServer::HandleRequestJson(const std::string& reqJson) {
                             job["taskqueue"] = g.taskqueue;
                             job["created_at"] = "";
                             job["group"] = {{"id", g.id}, {"detail", g.detail}};
+                            // Group rows show the origin of the tree, like the jobs it adds.
+                            const std::string groupOrigin = tqm_.BtOriginJson(g.id);
+                            if (!groupOrigin.empty()) {
+                                nlohmann::json origin = nlohmann::json::parse(groupOrigin, nullptr, false);
+                                if (origin.is_object()) job["origin"] = std::move(origin);
+                            }
                             doc["jobs"].push_back(std::move(job));
                         }
                         if (stateFilter.empty() || stateFilter == "pending" || stateFilter == "planned") {

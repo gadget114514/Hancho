@@ -3409,6 +3409,13 @@ void TaskQueueManager::SetBtOrigin(const std::string& btId, const std::string& o
     else btOrigins_[btId] = o;
 }
 
+std::string TaskQueueManager::BtOriginJson(const std::string& btId) {
+    std::lock_guard<std::mutex> lock(mutex_);
+    auto it = btOrigins_.find(btId);
+    if (it == btOrigins_.end()) return "";
+    return OriginToJson(it->second);
+}
+
 void TaskQueueManager::RebuildJobIndexLocked() const {
     jobIndex_.clear();
     for (const auto& [name, tq] : queues_) {

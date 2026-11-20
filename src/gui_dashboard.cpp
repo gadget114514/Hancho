@@ -635,6 +635,7 @@ enum ControlId {
     IDC_BTN_IPMSG = 1051,
     IDC_BTN_TERM_SESSIONS = 1052,  // active WCSP terminal connections
     IDC_BTN_REEVAL_PLANNED = 1053,
+    IDC_COMBO_TASK_ORIGIN = 1055,  // origin filter for the task list (shown with the task search bar)
     IDC_SET_LANG_JA = 6001,
     IDC_SET_LANG_EN = 6002,
     IDC_SET_LANG_ES = 6003,
@@ -953,6 +954,16 @@ struct DashboardState {
     bool showTaskSearch = false;
     std::wstring procSearchText;
     std::wstring taskSearchText;
+    // Origin filter: the combo sits next to the task search bar. Empty filter = every origin.
+    HWND hwndTaskOriginCombo = nullptr;
+    std::wstring taskOriginFilter;
+    std::vector<std::wstring> taskOriginItems;  // origins in the combo, after its "all" entry
+    struct TaskOriginJob {
+        std::string id;
+        std::string state;
+        bool paused = false;
+    };
+    std::vector<TaskOriginJob> taskOriginJobs;  // the jobs the origin filter keeps, for the bulk actions
     HWND hwndStreamPane = nullptr;
     LlmStreamDlgState* streamPane = nullptr; // owned by hwndStreamPane
     bool showStreamPane = true;
@@ -5744,6 +5755,78 @@ static void RemoveTaskRows(DashboardState* st, const std::vector<std::string>& i
     }
 }
 
+static bool TaskJobIsFinished(const std::string& state) {
+    return state == "succeeded" || state == "failed" || state == "cancelled" || state == "closed" ||
+           state == "takenOver";
+}
+
+// Virtual rows (task groups and planned rows) are not queue jobs, so bulk actions skip them.
+static bool TaskRowIsRealJob(const std::string& id) {
+    return id.rfind("btplan:", 0) != 0 && id.rfind("group:", 0) != 0;
+}
+
+// Stop (3140), pause (3141), remove (3142) or resume (3143) the jobs the origin filter shows.
+static void RunOriginJobsAction(DashboardState* st, int cmd) {
+    if (!st || st->taskOriginFilter.empty()) return;
+    std::vector<std::string> ids;
+    bool anyUnfinished = false;
+    for (const auto& job : st->taskOriginJobs) {
+        if (!TaskRowIsRealJob(job.id)) continue;
+        const bool finished = TaskJobIsFinished(job.state);
+        if (!finished) anyUnfinished = true;
+        bool take = false;
+        if (cmd == 3142) take = true;
+        else if (cmd == 3140) take = !finished;
+        else if (cmd == 3141) take = !finished && !job.paused;
+        else if (cmd == 3143) take = !finished && job.paused;
+        if (take) ids.push_back(job.id);
+    }
+    if (ids.empty()) return;
+    if (cmd == 3142) {
+        RemoveTaskRows(st, ids, anyUnfinished);
+        return;
+    }
+    if (cmd == 3140 && gui_platform::GetGuiPlatform()->ShowMessageBox(
+            st->hwndMain,
+            Tr(L"発行元のタスクを停止", L"Stop tasks from this origin", L"Detener tareas de este origen"),
+            Tr(L"この発行元の未完了タスクを停止しますか？",
+               L"Stop the unfinished tasks from this origin?",
+               L"¿Detener las tareas sin terminar de este origen?"),
+            gui_platform::MessageBoxType::QuestionYesNo,
+            true) != gui_platform::MessageBoxResult::Yes) {
+        return;
+    }
+    size_t okCount = 0;
+    size_t failCount = 0;
+    std::wstring lastErr;
+    for (const auto& id : ids) {
+        std::string ipcErr;
+        std::wstring errW;
+        bool done = false;
+        if (cmd == 3140) done = CheckIpcResponse(TaskQueueCancelIpc(st, id, ipcErr), ipcErr, errW);
+        else done = CheckIpcResponse(TaskQueuePauseJobIpc(st, id, cmd == 3141, ipcErr), ipcErr, errW);
+        if (done) ++okCount;
+        else {
+            ++failCount;
+            lastErr = errW;
+        }
+    }
+    wchar_t summary[512] = {};
+    swprintf_s(summary,
+               Tr(L"発行元「%s」: 成功 %zu 件、失敗 %zu 件",
+                  L"Origin \"%s\": %zu done, %zu failed",
+                  L"Origen \"%s\": %zu correctos, %zu fallidos"),
+               st->taskOriginFilter.c_str(), okCount, failCount);
+    std::wstring text = summary;
+    if (failCount > 0 && !lastErr.empty()) text += L"\n" + lastErr;
+    ShowTaskQueueResult(
+        st,
+        cmd == 3140 ? Tr(L"停止", L"Stop", L"Detener")
+                    : (cmd == 3141 ? Tr(L"一時停止", L"Pause", L"Pausar")
+                                   : Tr(L"再開", L"Resume", L"Reanudar")),
+        text, failCount == 0);
+}
+
 static void ShowTaskQueueContextMenu(DashboardState* st, const std::string& jobId, POINT ptScreen, const std::wstring& cellText) {
     if (!st || jobId.empty()) return;
     const bool virtualJob = jobId.rfind("btplan:", 0) == 0 || jobId.rfind("group:", 0) == 0;
@@ -6032,6 +6115,36 @@ static void ShowTaskQueueContextMenu(DashboardState* st, const std::string& jobI
     if (resp.find("\"bt\":{") != std::string::npos) {
         AppendMenuW(hMenu, MF_STRING, 3111, Tr(L"タスクグループで表示", L"Show Task Group", L"Ver el grupo de tareas"));
     }
+    // With an origin filter on, the clicked job's origin gets bulk actions over every job it shows.
+    if (!st->taskOriginFilter.empty()) {
+        bool inOrigin = false;
+        size_t total = 0, unfinished = 0, pausable = 0, resumable = 0;
+        for (const auto& job : st->taskOriginJobs) {
+            if (job.id == jobId) inOrigin = true;
+            if (!TaskRowIsRealJob(job.id)) continue;
+            ++total;
+            if (TaskJobIsFinished(job.state)) continue;
+            ++unfinished;
+            if (job.paused) ++resumable;
+            else ++pausable;
+        }
+        if (inOrigin) {
+            wchar_t label[256] = {};
+            AppendMenuW(hMenu, MF_SEPARATOR, 0, nullptr);
+            swprintf_s(label, Tr(L"発行元の未完了を停止（%zu 件）", L"Stop unfinished from this origin (%zu)",
+                                 L"Detener sin terminar de este origen (%zu)"), unfinished);
+            AppendMenuW(hMenu, MF_STRING | (unfinished ? 0 : MF_GRAYED), 3140, label);
+            swprintf_s(label, Tr(L"発行元の未完了を一時停止（%zu 件）", L"Pause unfinished from this origin (%zu)",
+                                 L"Pausar sin terminar de este origen (%zu)"), pausable);
+            AppendMenuW(hMenu, MF_STRING | (pausable ? 0 : MF_GRAYED), 3141, label);
+            swprintf_s(label, Tr(L"発行元の一時停止を再開（%zu 件）", L"Resume paused from this origin (%zu)",
+                                 L"Reanudar pausados de este origen (%zu)"), resumable);
+            AppendMenuW(hMenu, MF_STRING | (resumable ? 0 : MF_GRAYED), 3143, label);
+            swprintf_s(label, Tr(L"発行元の全タスクを削除（%zu 件）", L"Remove all from this origin (%zu)",
+                                 L"Quitar todos de este origen (%zu)"), total);
+            AppendMenuW(hMenu, MF_STRING | (total ? 0 : MF_GRAYED), 3142, label);
+        }
+    }
     AppendMenuW(hMenu, MF_SEPARATOR, 0, nullptr);
     AppendMenuW(hMenu, MF_STRING, 3120, Tr(L"相談をクリップボードにコピー", L"Copy consultation to clipboard", L"Copiar consulta al portapapeles"));
 
@@ -6130,6 +6243,8 @@ static void ShowTaskQueueContextMenu(DashboardState* st, const std::string& jobI
                           : Tr(L"再開できませんでした", L"Could not resume", L"No se pudo reanudar"),
                 pauseErr, false);
         }
+    } else if (cmd >= 3140 && cmd <= 3143) {
+        RunOriginJobsAction(st, cmd);
     } else if (cmd == 3132) {
         RemoveTaskRows(st, {jobId}, !jobFinished);
     } else if (cmd == 3133) {
@@ -6411,6 +6526,35 @@ static std::wstring FormatTaskCost(double costUsd) {
     return buf;
 }
 
+// Refills the origin filter combo when the set of origins changed. Index 0 is "all origins".
+static void UpdateTaskOriginCombo(DashboardState* st, const std::map<std::wstring, int>& counts) {
+    if (!st || !st->hwndTaskOriginCombo) return;
+    std::vector<std::wstring> items;
+    items.reserve(counts.size() + 1);
+    for (const auto& entry : counts) items.push_back(entry.first);
+    // Keep the chosen origin in the list even when none of the current jobs has it any more.
+    if (!st->taskOriginFilter.empty() &&
+        std::find(items.begin(), items.end(), st->taskOriginFilter) == items.end()) {
+        items.push_back(st->taskOriginFilter);
+    }
+    HWND combo = st->hwndTaskOriginCombo;
+    if (items != st->taskOriginItems) {
+        st->taskOriginItems = items;
+        SendMessageW(combo, CB_RESETCONTENT, 0, 0);
+        const std::wstring allText = Tr(L"発行元: すべて", L"Origin: all", L"Origen: todos");
+        SendMessageW(combo, CB_ADDSTRING, 0, reinterpret_cast<LPARAM>(allText.c_str()));
+        for (const auto& item : items) {
+            SendMessageW(combo, CB_ADDSTRING, 0, reinterpret_cast<LPARAM>(item.c_str()));
+        }
+        int sel = 0;
+        if (!st->taskOriginFilter.empty()) {
+            auto it = std::find(items.begin(), items.end(), st->taskOriginFilter);
+            sel = static_cast<int>(it - items.begin()) + 1;
+        }
+        SendMessageW(combo, CB_SETCURSEL, sel, 0);
+    }
+}
+
 static void RefreshTaskQueueData(DashboardState* st, bool force = false, bool useCachedList = false) {
     if (!st || !st->hwndTaskList) return;
     if (st->listDisplayMode == ListDisplayMode::ProcessOnly) return;
@@ -6479,6 +6623,8 @@ static void RefreshTaskQueueData(DashboardState* st, bool force = false, bool us
     std::vector<TaskListRow> rows;  // one entry per job, in the order the list shows them
     std::unordered_set<std::string> nowRunning;  // jobs running now, to spot the ones that just ended
     std::map<std::string, int> failureCounts;   // failure class -> jobs, for the list caption
+    std::map<std::wstring, int> originCounts;   // origin text -> jobs, for the origin filter combo
+    std::vector<DashboardState::TaskOriginJob> originJobs;  // the jobs the origin filter keeps
     rows.reserve(jobs.size());
     for (const auto& j : jobs) {
         TaskListRow row;
@@ -6753,6 +6899,8 @@ static void RefreshTaskQueueData(DashboardState* st, bool force = false, bool us
         row.cells[10] = std::move(originStr);
         row.cells[11] = std::move(ownerUsageStr);
         row.cells[12] = std::move(resourcesStr);
+        if (!row.cells[10].empty()) ++originCounts[row.cells[10]];
+        if (!st->taskOriginFilter.empty() && row.cells[10] != st->taskOriginFilter) continue;
         if (!st->taskSearchText.empty()) {
             bool matches = false;
             for (const auto& cell : row.cells) {
@@ -6763,8 +6911,11 @@ static void RefreshTaskQueueData(DashboardState* st, bool force = false, bool us
             }
             if (!matches) continue;
         }
+        if (!st->taskOriginFilter.empty()) originJobs.push_back({jobId, state, jobPaused});
         rows.push_back(std::move(row));
     }
+    st->taskOriginJobs = std::move(originJobs);
+    UpdateTaskOriginCombo(st, originCounts);
 
     // The header click picks the column, so the order is applied to the rows here.
     SortTaskRows(rows, st->taskSortColumn, st->taskSortDirection);
@@ -7816,6 +7967,20 @@ static void LayoutControls(DashboardState* st, int width, int height) {
                         st->hwndSearchProcEdit, st->showProcSearch);
     st->taskCaptionExtraLeft = layoutCaptionSearch(st->rcTaskCaption, TaskListCaptionText(), st->hwndSearchTaskBtn,
                                                    st->hwndSearchTaskEdit, st->showTaskSearch);
+    // The origin combo follows the task search edit while the search bar is open.
+    if (st->hwndTaskOriginCombo) {
+        const int capH = st->rcTaskCaption.bottom - st->rcTaskCaption.top;
+        const int cx = st->taskCaptionExtraLeft;
+        const int ch = (std::max)(18, capH - 4);
+        int cw = (std::min)(180, static_cast<int>(st->rcTaskCaption.right) - 8 - cx);
+        if (st->showTaskSearch && capH > 0 && cw >= 80) {
+            MoveWindow(st->hwndTaskOriginCombo, cx, st->rcTaskCaption.top + 2, cw, ch, TRUE);
+            ShowWindow(st->hwndTaskOriginCombo, SW_SHOW);
+            st->taskCaptionExtraLeft = cx + cw + 12;
+        } else {
+            ShowWindow(st->hwndTaskOriginCombo, SW_HIDE);
+        }
+    }
 
     UpdateTaskListColumnWidths(st);
     LayoutTerminalViews(st);
@@ -19609,6 +19774,11 @@ static LRESULT CALLBACK DashboardWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPA
             for (HWND edit : {st->hwndSearchProcEdit, st->hwndSearchTaskEdit}) {
                 if (edit && st->hFontUi) SendMessageW(edit, WM_SETFONT, reinterpret_cast<WPARAM>(st->hFontUi), TRUE);
             }
+            st->hwndTaskOriginCombo = CreateWindowExW(0, L"COMBOBOX", L"",
+                WS_CHILD | CBS_DROPDOWNLIST | WS_VSCROLL, 0, 0, 160, 200, hwnd, (HMENU)IDC_COMBO_TASK_ORIGIN, nullptr, nullptr);
+            if (st->hwndTaskOriginCombo && st->hFontUi) {
+                SendMessageW(st->hwndTaskOriginCombo, WM_SETFONT, reinterpret_cast<WPARAM>(st->hFontUi), TRUE);
+            }
 
             static bool usageClassRegistered = false;
             if (!usageClassRegistered) {
@@ -20365,6 +20535,8 @@ static LRESULT CALLBACK DashboardWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPA
                 if (!st->showTaskSearch) {
                     st->taskSearchText.clear();
                     SetWindowTextW(st->hwndSearchTaskEdit, L"");
+                    st->taskOriginFilter.clear();
+                    if (st->hwndTaskOriginCombo) SendMessageW(st->hwndTaskOriginCombo, CB_SETCURSEL, 0, 0);
                     RefreshTaskQueueData(st, true);
                 } else {
                     SetFocus(st->hwndSearchTaskEdit);
@@ -20383,6 +20555,13 @@ static LRESULT CALLBACK DashboardWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPA
                 wchar_t buf[512] = {};
                 GetWindowTextW(st->hwndSearchTaskEdit, buf, 512);
                 st->taskSearchText = buf;
+            } else if (id == IDC_COMBO_TASK_ORIGIN && HIWORD(wParam) == CBN_SELCHANGE) {
+                const int sel = static_cast<int>(SendMessageW(st->hwndTaskOriginCombo, CB_GETCURSEL, 0, 0));
+                st->taskOriginFilter = (sel > 0 && sel - 1 < static_cast<int>(st->taskOriginItems.size()))
+                                           ? st->taskOriginItems[static_cast<size_t>(sel - 1)]
+                                           : std::wstring();
+                RefreshTaskQueueData(st, true);
+                InvalidateRect(st->hwndTaskList, nullptr, FALSE);
                 RefreshTaskQueueData(st, true);
                 InvalidateRect(st->hwndTaskList, nullptr, FALSE);
             }

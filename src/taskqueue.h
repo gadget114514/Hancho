@@ -895,6 +895,8 @@ public:
     std::string AddBtJob(const std::string& taskqueue, const std::string& jobJson, const TaskQueueBtRef& ref, std::string& outError);
     // Remember who started a behavior tree, so the jobs it adds carry the same origin.
     void SetBtOrigin(const std::string& btId, const std::string& originJson);
+    // The origin recorded for a behavior tree as JSON, or "" when none was recorded.
+    std::string BtOriginJson(const std::string& btId);
     // sinceSec > 0 keeps only jobs whose updatedAt is within the last sinceSec seconds.
     // origin (optional) keeps only jobs whose origin label, session or host session matches
     // (session ids also match by prefix); "pid:<n>" matches the origin process id.
