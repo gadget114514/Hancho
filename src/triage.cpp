@@ -944,6 +944,39 @@ nlohmann::json BuildProcessTriageCandidates(const nlohmann::json& processes) {
     return fresh;
 }
 
+nlohmann::json BuildRoutineStaleFailureCard(const std::string& name, const std::string& runId,
+                                            const nlohmann::json& diff,
+                                            const nlohmann::json& failedNodes,
+                                            const std::string& now) {
+    const std::string key = "routine-stale:" + name + ":" + runId;
+    json info = {{"intent", json::array()}, {"cause", json::array()}, {"background", json::array()},
+                 {"environment", json::array()}, {"conditions", json::array()},
+                 {"reason", json::array()}};
+    AddItem(info["summary"], "routineFailure", name + " was stale and failed",
+            "Routine '" + name + "' ran while its inputs were stale and failed; review the input diff and update the definition.");
+    AddItem(info["intent"], "routineName", name, "routine: " + name);
+    AddItem(info["cause"], "routineState", std::string("stale"),
+            "the routine run started while its inputs were stale");
+    AddItem(info["background"], "runId", runId, "run: " + runId);
+    AddItem(info["conditions"], "inputDiff", diff, "input diff: " + diff.dump());
+    AddItem(info["conditions"], "failedNodes", failedNodes, "failed nodes: " + failedNodes.dump());
+    AddItem(info["reason"], "staleFailure", name + " was stale and the run failed",
+            "routine '" + name + "' was stale and the run " + runId + " failed");
+    json candidates = json::array();
+    AddCandidate(candidates, "update_routine", "Update routine",
+                 "Compare `routine show` with the input diff and let the LLM update it with `routine save --reason`.",
+                 true, {{"name", name}, {"runId", runId}});
+    AddCandidate(candidates, "retry", "Retry", "Run the same routine again without changing it.",
+                 false, {{"name", name}});
+    json card = BuildSimpleCard(key, "routine_stale_failure",
+                                {{"routine", name}, {"runId", runId}}, info, candidates,
+                                "update_routine", "medium",
+                                "The routine was stale when it failed; its definition should be reviewed and saved again.",
+                                now);
+    card["persistent"] = true;
+    return card;
+}
+
 std::vector<std::string> MergeTriageCards(nlohmann::json& store,
                                           const nlohmann::json& fresh,
                                           const std::string& now) {
@@ -963,6 +996,7 @@ std::vector<std::string> MergeTriageCards(nlohmann::json& store,
     }
     for (auto& card : cards) {
         if (!card.is_object() || String(card, "state") != "pending") continue;
+        if (Bool(card, "persistent")) continue;
         const std::string key = String(card, "key");
         if (!key.empty() && keys.find(key) == keys.end()) {
             card["state"] = "resolved";
@@ -1071,7 +1105,8 @@ void ApplyTriageKindSettings(nlohmann::json& store, nlohmann::json& fresh,
     }
     if (!store.is_object() || !store.contains("cards") || !store["cards"].is_array()) return;
     for (auto& card : store["cards"]) {
-        if (String(card, "state") != "pending" || enabled(String(card, "kind"))) continue;
+        if (String(card, "state") != "pending" || Bool(card, "persistent") ||
+            enabled(String(card, "kind"))) continue;
         card["state"] = "resolved";
         card["resolvedReason"] = "kind_disabled";
         card["updatedAt"] = now;

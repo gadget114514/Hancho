@@ -8,6 +8,7 @@
 #include "worker_probe.h"
 #include "engine_health.h"
 #include "bt_templates.h"
+#include "screenshot.h"
 #include "nlohmann/json.hpp"
 #include <algorithm>
 #include <fstream>
@@ -119,6 +120,16 @@ static std::string BuildMcpToolResult(const std::string& rpcIdRaw, const std::st
         << ",\"result\":{\"content\":[{\"type\":\"text\",\"text\":\"" << JsonEscape(contentText) << "\"}]"
         << (isError ? ",\"isError\":true" : "")
         << "}}";
+    return oss.str();
+}
+
+// Text plus a PNG image block, so a multimodal client can look at the image directly.
+static std::string BuildMcpToolResultWithPng(const std::string& rpcIdRaw, const std::string& contentText,
+                                             const std::string& pngBase64) {
+    std::ostringstream oss;
+    oss << "{\"jsonrpc\":\"2.0\",\"id\":" << rpcIdRaw
+        << ",\"result\":{\"content\":[{\"type\":\"text\",\"text\":\"" << JsonEscape(contentText) << "\"},"
+        << "{\"type\":\"image\",\"data\":\"" << pngBase64 << "\",\"mimeType\":\"image/png\"}]}}";
     return oss.str();
 }
 
@@ -409,6 +420,14 @@ int RunMcpServer() {
         else if (method == "tools/list") {
             std::ostringstream oss;
             oss << "{\"jsonrpc\":\"2.0\",\"id\":" << rpcId << ",\"result\":{\"tools\":["
+                << "{"
+                << "\"name\":\"dashboard_snapshot\","
+                << "\"description\":\"Capture the Hancho GUI Dashboard window as a PNG and return it as an image, so the LLM can see the current screen. The image is downscaled to max_width (default 1024) to limit tokens. The file is also saved under logs/screenshots. Fails if the dashboard window is not open.\","
+                << "\"inputSchema\":{\"type\":\"object\",\"properties\":{"
+                << "\"max_width\":{\"type\":\"integer\",\"description\":\"Downscale the image to this width in pixels, keeping aspect ratio (default 1024; 0 = original size)\"},"
+                << "\"include_image\":{\"type\":\"boolean\",\"description\":\"Return the PNG inline as an image block (default true). Set false to only get the saved file path.\"}"
+                << "}}}"
+                << ","
                 << "{"
                 << "\"name\":\"start_process\","
                 << "\"description\":\"Start and manage an external LLM CLI or program (e.g. claude, opencode) under a Win32 Job Object and display it on the Hancho GUI Dashboard. Automatically writes live output to log_file and creates done_file atomically when the process exits. Set wait=true and wait_ms=0 to block until completion. To run multiple commands in order, use taskqueue_add instead; chained commands such as '&&' are rejected.\","
@@ -730,6 +749,83 @@ int RunMcpServer() {
                 << "\"inputSchema\":{\"type\":\"object\",\"properties\":{"
                 << "\"name\":{\"type\":\"string\",\"description\":\"Template name (resilient-worker or card-sequence); omit to list templates\"}"
                 << "}}"
+                << "},"
+                << "{"
+                << "\"name\":\"routine_list\","
+                << "\"description\":\"List saved routines (project and data scope, project wins on name clashes) with summary, location and last run (run id, state, time).\","
+                << "\"inputSchema\":{\"type\":\"object\",\"properties\":{"
+                << "\"cwd\":{\"type\":\"string\",\"description\":\"Project root to scan for .hancho/routines (default: server cwd)\"}"
+                << "}}"
+                << "},"
+                << "{"
+                << "\"name\":\"routine_show\","
+                << "\"description\":\"Show a routine definition and the last run's per-node results (state, duration, test report totals).\","
+                << "\"inputSchema\":{\"type\":\"object\",\"properties\":{"
+                << "\"name\":{\"type\":\"string\",\"description\":\"Routine name\"},"
+                << "\"cwd\":{\"type\":\"string\",\"description\":\"Project root to scan for .hancho/routines\"}"
+                << "},\"required\":[\"name\"]}"
+                << "},"
+                << "{"
+                << "\"name\":\"routine_run\","
+                << "\"description\":\"Run a saved behavior-tree routine with a fresh <name>-<yyyymmdd-hhmmss> id so repeated runs never collide on job ids. wait=true blocks until it finishes.\","
+                << "\"inputSchema\":{\"type\":\"object\",\"properties\":{"
+                << "\"name\":{\"type\":\"string\",\"description\":\"Routine name\"},"
+                << "\"cwd\":{\"type\":\"string\",\"description\":\"Project root to scan for .hancho/routines\"},"
+                << "\"wait\":{\"type\":\"boolean\",\"description\":\"Block until the run finishes (default false)\"},"
+                << "\"timeoutMs\":{\"type\":\"integer\",\"description\":\"Max wait in milliseconds when wait=true (default 60000; negative = no limit)\"}"
+                << "},\"required\":[\"name\"]}"
+                << "},"
+                << "{"
+                << "\"name\":\"routine_save\","
+                << "\"description\":\"Save or update a named routine. The BT is validated exactly as bt_validate does. History records {at, by, reason}.\","
+                << "\"inputSchema\":{\"type\":\"object\",\"properties\":{"
+                << "\"name\":{\"type\":\"string\",\"description\":\"Routine name\"},"
+                << "\"bt\":{\"type\":\"object\",\"description\":\"Behavior tree definition object\"},"
+                << "\"file\":{\"type\":\"string\",\"description\":\"Path to a BT JSON file (alternative to bt)\"},"
+                << "\"inputs\":{\"type\":\"array\",\"items\":{\"type\":\"string\"},\"description\":\"Input globs for the future freshness check (093-3)\"},"
+                << "\"summary\":{\"type\":\"string\",\"description\":\"Short description\"},"
+                << "\"notes\":{\"type\":\"string\",\"description\":\"Free-form notes\"},"
+                << "\"scope\":{\"type\":\"string\",\"description\":\"project or data (default project)\"},"
+                << "\"cwd\":{\"type\":\"string\",\"description\":\"Project root for project scope\"},"
+                << "\"reason\":{\"type\":\"string\",\"description\":\"Why this version was saved (recorded in history)\"}"
+                << "},\"required\":[\"name\"]}"
+                << "},"
+                << "{"
+                << "\"name\":\"routine_check\","
+                << "\"description\":\"Compare a routine's inputs with the snapshot saved by routine save. Returns state ok/stale and added/removed/changed/absorbed files.\","
+                << "\"inputSchema\":{\"type\":\"object\",\"properties\":{"
+                << "\"name\":{\"type\":\"string\",\"description\":\"Routine name\"},"
+                << "\"cwd\":{\"type\":\"string\",\"description\":\"Project root to scan for .hancho/routines\"}"
+                << "},\"required\":[\"name\"]}"
+                << "},"
+                << "{"
+                << "\"name\":\"routine_ask\","
+                << "\"description\":\"Ask a worker LLM to create or fix a routine from a plain-language request. The result is validated (strict BT validation, foreach dry-run, ChainGuard) and stored as a proposal; it never runs until approved. Use name to fix an existing routine.\","
+                << "\"inputSchema\":{\"type\":\"object\",\"properties\":{"
+                << "\"request\":{\"type\":\"string\",\"description\":\"What you want the routine to do\"},"
+                << "\"name\":{\"type\":\"string\",\"description\":\"Existing routine name to fix, or the name for a new one\"},"
+                << "\"cwd\":{\"type\":\"string\",\"description\":\"Project root (default: server cwd)\"},"
+                << "\"scope\":{\"type\":\"string\",\"description\":\"project or data (default project)\"},"
+                << "\"timeoutMs\":{\"type\":\"integer\",\"description\":\"Max wait for the worker in milliseconds\"}"
+                << "},\"required\":[\"request\"]}"
+                << "},"
+                << "{"
+                << "\"name\":\"routine_approve\","
+                << "\"description\":\"Approve a proposed routine so routine_run may execute it. userSaid must be the user's own words; an empty value is a rejection.\","
+                << "\"inputSchema\":{\"type\":\"object\",\"properties\":{"
+                << "\"name\":{\"type\":\"string\",\"description\":\"Routine name\"},"
+                << "\"userSaid\":{\"type\":\"string\",\"description\":\"The user's approval words\"},"
+                << "\"cwd\":{\"type\":\"string\",\"description\":\"Project root\"}"
+                << "},\"required\":[\"name\",\"userSaid\"]}"
+                << "},"
+                << "{"
+                << "\"name\":\"routine_reject\","
+                << "\"description\":\"Reject and discard a proposed routine.\","
+                << "\"inputSchema\":{\"type\":\"object\",\"properties\":{"
+                << "\"name\":{\"type\":\"string\",\"description\":\"Routine name\"},"
+                << "\"reason\":{\"type\":\"string\",\"description\":\"Why it was rejected\"},"
+                << "\"cwd\":{\"type\":\"string\",\"description\":\"Project root\"}"
+                << "},\"required\":[\"name\"]}"
                 << "},"
                 << "{"
                 << "\"name\":\"bt_get\","
@@ -1121,6 +1217,46 @@ int RunMcpServer() {
             const std::string& argsJson = req.argumentsJson;
             WriteAuditLog("MCP_TOOL_CALL", "tool=" + toolName + " args=" + argsJson);
             std::ostringstream ipcReq;
+
+            if (toolName == "dashboard_snapshot") {
+#ifdef _WIN32
+                nlohmann::json args = nlohmann::json::parse(argsJson, nullptr, false);
+                if (args.is_discarded() || !args.is_object()) args = nlohmann::json::object();
+                const int maxWidth = args.value("max_width", 1024);
+                const bool includeImage = args.value("include_image", true);
+
+                HWND dashboard = FindWindowW(L"HanchoDashboardWnd", nullptr);
+                std::string err;
+                std::vector<unsigned char> png;
+                const std::wstring path = NewSnapshotPath(L"mcp_dashboard");
+                bool ok = false;
+                if (!dashboard) {
+                    err = "dashboard window is not open (start it with `Hancho.exe gui`)";
+                } else {
+                    ok = CaptureWindowPng(dashboard, path, maxWidth, includeImage ? &png : nullptr, &err);
+                }
+                WriteAuditLog("MCP_TOOL_RESP", "tool=" + toolName + " ok=" + (ok ? "true" : "false"));
+                if (!ok) {
+                    EmitLine(BuildMcpToolResult(rpcId, "dashboard_snapshot failed: " + err, true));
+                    continue;
+                }
+                const bool visible = IsWindowVisible(dashboard) != FALSE;
+                nlohmann::json info = {
+                    {"ok", true},
+                    {"path", WideToUtf8(path)},
+                    {"visible", visible},
+                    {"note", visible ? "" : "dashboard is hidden in the tray; the image may be blank"}};
+                const std::string text = info.dump();
+                if (includeImage) {
+                    EmitLine(BuildMcpToolResultWithPng(rpcId, text, Base64Encode(png)));
+                } else {
+                    EmitLine(BuildMcpToolResult(rpcId, text));
+                }
+#else
+                EmitLine(BuildMcpToolResult(rpcId, "dashboard_snapshot is only supported on Windows", true));
+#endif
+                continue;
+            }
 
             if (toolName == "bt_template") {
                 nlohmann::json out = BtTemplateResult(JsonGetString(argsJson, "name", ""));
@@ -1905,6 +2041,22 @@ int RunMcpServer() {
                     continue;
                 }
                 ipcReq << argsObj.dump();
+            }
+            else if (toolName.rfind("routine_", 0) == 0) {
+                auto argsObj = nlohmann::json::parse(argsJson, nullptr, false);
+                if (argsObj.is_discarded() || !argsObj.is_object()) argsObj = nlohmann::json::object();
+                argsObj["action"] = toolName;
+                if (argsObj.contains("timeoutMs")) {
+                    argsObj["timeout_ms"] = argsObj["timeoutMs"];
+                    argsObj.erase("timeoutMs");
+                }
+                if (argsObj.contains("file") && argsObj["file"].is_string()) {
+                    const std::wstring absW = ResolveAbsolutePathWide(Utf8ToWide(argsObj["file"].get<std::string>()));
+                    argsObj["file"] = WideToUtf8(absW);
+                }
+        argsObj["origin"] = nlohmann::json::parse(
+            BuildCallerOriginJson(mcpClient, JsonGetString(argsJson, "originLabel", "")), nullptr, false);
+        ipcReq << argsObj.dump();
             }
             else {
                 EmitLine(BuildMcpToolResult(rpcId, "Unknown tool: " + toolName, true));

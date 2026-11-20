@@ -353,6 +353,8 @@ struct TaskQueueAttempt {
     std::string logFile;
     std::string lastLinesFile;
     std::string checkDetail;
+    // Populated on success when the job declares success.testReport (093-1).
+    TestReportSummary testReportSummary;
     // Memory ids handed to this attempt (memory_brief). Empty when injection is off.
     std::vector<std::string> memoryRefs;
     // Per-attempt diagnosis (doc/design-v3.md 4.3). Empty for a succeeded attempt.

@@ -7,7 +7,7 @@ namespace pc {
 
 namespace {
 
-json NodeToJson(const BtNode& node) {
+json NodeToJson(const BtNode& node, bool forceQueue = false) {
     json j = node.rawDef;
 
     if (node.hasStatus || node.state != "idle" || node.runs > 0 || node.launchSeq > 0 || !node.jobs.empty()) {
@@ -46,6 +46,8 @@ json NodeToJson(const BtNode& node) {
             st["catchHandlerIndex"] = node.catchHandlerIndex;
             if (!node.catchHandler.empty()) st["catchHandler"] = node.catchHandler;
         }
+        if (node.type == "foreach" && node.foreachExpanded) st["foreachExpanded"] = true;
+        if (forceQueue && !node.queueName.empty()) st["queueName"] = node.queueName;
         j["status"] = std::move(st);
     } else {
         j.erase("status");
@@ -54,7 +56,7 @@ json NodeToJson(const BtNode& node) {
     if (!node.children.empty()) {
         json kids = json::array();
         for (const auto& c : node.children) {
-            kids.push_back(NodeToJson(*c));
+            kids.push_back(NodeToJson(*c, node.type == "foreach"));
         }
         j["children"] = std::move(kids);
     }
@@ -123,9 +125,11 @@ void BehaviorTree::Impl::RestoreNodeStatus(BehaviorTree& bt,
                                            int& nextJobSeq,
                                            std::map<std::string, std::string>& vars) {
     if (!jNode.is_object()) return;
+    bool foreachExpanded = false;
 
     if (jNode.contains("status") && jNode["status"].is_object()) {
         const json& st = jNode["status"];
+        foreachExpanded = st.value("foreachExpanded", false);
         node.hasStatus = true;
         node.state = st.value("state", "idle");
         node.runs = st.value("runs", 0);
@@ -184,6 +188,34 @@ void BehaviorTree::Impl::RestoreNodeStatus(BehaviorTree& bt,
         size_t cnt = std::min(node.children.size(), jNode["children"].size());
         for (size_t i = 0; i < cnt; ++i) {
             RestoreNodeStatus(bt, *node.children[i], jNode["children"][i], baseMs, nextJobSeq, vars);
+        }
+    }
+    // A foreach node parses from its authored definition without children; rebuild the
+    // concrete children from the saved expanded state so bt get / retry keep working.
+    if (node.type == "foreach" && foreachExpanded && jNode.contains("children") &&
+        jNode["children"].is_array()) {
+        node.foreachExpanded = true;
+        node.children.clear();
+        size_t i = 0;
+        for (const auto& childJson : jNode["children"]) {
+            std::string childPath = node.pathKey + ".children[" + std::to_string(i) + "]";
+            std::string err;
+            auto child = ParseSingleNodeJson(childJson, childPath, "", node.depth + 1, nullptr,
+                                             bt.defaults_, bt.cwd_, {}, 0, bt.taskqueue_,
+                                             node.queueName, err);
+            if (child) {
+                child->isForeachChild = true;
+                if (childJson.is_object() && childJson.contains("status") &&
+                    childJson["status"].is_object()) {
+                    const json& cs = childJson["status"];
+                    if (cs.contains("queueName") && cs["queueName"].is_string()) {
+                        child->queueName = cs["queueName"].get<std::string>();
+                    }
+                }
+                RestoreNodeStatus(bt, *child, childJson, baseMs, nextJobSeq, vars);
+                node.children.push_back(std::move(child));
+            }
+            ++i;
         }
     }
     if (node.condChild && jNode.contains("cond")) {
@@ -421,7 +453,10 @@ bool CheckJsonShapeMatchesNode(const BtNode& oldNode,
         return false;
     }
 
-    if (!oldNode.children.empty() || jNew.contains("children")) {
+    // A foreach node's children are runtime-expanded copies, not authored shape: updates may
+    // change the glob/do definition and the children are rebuilt on the next expansion.
+    if (oldNode.type != "foreach" &&
+        (!oldNode.children.empty() || jNew.contains("children"))) {
         if (!jNew.contains("children") || !jNew["children"].is_array() ||
             jNew["children"].size() != oldNode.children.size()) {
             err = oldNode.pathKey + ": cannot change children count (tree shape must remain identical)";
@@ -613,6 +648,20 @@ void CopyNodeDefinitionRecursive(BtNode& dst, const BtNode& src) {
     dst.condExists = src.condExists;
     dst.condFailureClasses = src.condFailureClasses;
     dst.condFailureCause = src.condFailureCause;
+
+    dst.foreachGlob = src.foreachGlob;
+    dst.foreachAs = src.foreachAs;
+    dst.foreachMode = src.foreachMode;
+    dst.foreachExclude = src.foreachExclude;
+    dst.foreachMinMatches = src.foreachMinMatches;
+    dst.foreachExpanded = false;
+    dst.children.clear();
+    if (dst.type == "foreach" && src.rawDef.contains("do")) {
+        std::string err;
+        dst.doChild = ParseSingleNodeJson(src.rawDef["do"], dst.pathKey + ".do", "do", dst.depth + 1,
+                                          nullptr, BtDefaults{}, std::string(), {}, 0,
+                                          std::string(), dst.queueName, err);
+    }
 
     dst.catchMaxRetries = src.catchMaxRetries;
     for (size_t i = 0; i < dst.catchHandlers.size() && i < src.catchHandlers.size(); ++i) {

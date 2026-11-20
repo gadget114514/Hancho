@@ -7,6 +7,7 @@
 #include <windows.h>
 #include <ctime>
 #include <cstdio>
+#include <cwctype>
 #include <string>
 
 namespace pc {
@@ -64,6 +65,40 @@ int main() {
     std::wstring env = L"HANCHO_LOG_DIR=" + dir;
     _wputenv(env.c_str());
     SetDataDirectoryOverride(dir);
+
+    // --- Dashboard window title ----------------------------------------------------------
+    {
+        const std::wstring defaultDir = GetDefaultLogsDirectoryWide();
+        const std::wstring customDir = dir;
+
+        Check(DashboardWindowTitle(defaultDir) == L"Hancho - " + defaultDir,
+              "title includes the default data dir");
+        Check(DashboardWindowTitle(customDir) == L"Hancho - " + customDir,
+              "title includes the --data-dir override");
+
+        const std::wstring title = DashboardWindowTitle(customDir);
+        Check(DashboardTitleMatches(title, customDir), "title matches its data dir");
+        Check(DashboardTitleMatches(title, customDir + L"\\"), "trailing separator is ignored");
+
+        std::wstring slashed = customDir;
+        for (wchar_t& ch : slashed) {
+            if (ch == L'\\') ch = L'/';
+        }
+        Check(DashboardTitleMatches(title, slashed), "/ and \\ are equivalent");
+        Check(DashboardTitleMatches(DashboardWindowTitle(slashed) + L"/", customDir),
+              "title separators and trailing separator are ignored");
+
+        std::wstring lowered = slashed, raised = slashed;
+        for (wchar_t& ch : lowered) ch = static_cast<wchar_t>(std::towlower(ch));
+        for (wchar_t& ch : raised) ch = static_cast<wchar_t>(std::towupper(ch));
+        Check(DashboardTitleMatches(DashboardWindowTitle(lowered), raised),
+              "matching ignores case");
+
+        Check(!DashboardTitleMatches(title, defaultDir), "different data dir does not match");
+        Check(DashboardTitleMatches(L"Hancho", defaultDir), "legacy title matches default data dir");
+        Check(!DashboardTitleMatches(L"Hancho", customDir),
+              "legacy title does not match an explicit data dir");
+    }
 
     ProcessManager pm;
     TaskQueueManager tqm;

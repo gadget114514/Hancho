@@ -6,6 +6,7 @@
 #include <cstdint>
 #include <cstdio>
 #include <cstring>
+#include <functional>
 #include <set>
 #include <sstream>
 
@@ -436,6 +437,64 @@ std::unique_ptr<BtNode> ParseNode(const json& j, const std::string& path, const 
             } else {
                 ctx.AddError(path + ".otherwise", "must be 'fail' or a node object");
             }
+        }
+    } else if (t == "foreach") {
+        ReqStr(j, "glob", path, t, node->foreachGlob, ctx);
+        ReqStr(j, "as", path, t, node->foreachAs, ctx);
+        const std::string& alias = node->foreachAs;
+        bool aliasOk = std::isalpha(static_cast<unsigned char>(alias[0])) || alias[0] == '_';
+        for (char c : alias) {
+            if (!std::isalnum(static_cast<unsigned char>(c)) && c != '_') aliasOk = false;
+        }
+        if (!aliasOk) ctx.AddError(path + ".as", "must be a simple identifier (letters, digits, '_')");
+
+        node->foreachMode = j.value("mode", std::string("sequence"));
+        if (node->foreachMode != "sequence" && node->foreachMode != "parallel" && node->foreachMode != "all") {
+            ctx.AddError(path + ".mode", "must be 'sequence', 'parallel', or 'all'");
+        }
+        if (j.contains("exclude")) {
+            if (!j["exclude"].is_array()) ctx.AddError(path + ".exclude", "must be an array of glob strings");
+            else for (const auto& ex : j["exclude"]) {
+                if (!ex.is_string() || ex.get<std::string>().empty())
+                    ctx.AddError(path + ".exclude", "entries must be non-empty strings");
+                else node->foreachExclude.push_back(ex.get<std::string>());
+            }
+        }
+        if (j.contains("minMatches")) {
+            if (!j["minMatches"].is_number_integer() || j["minMatches"].get<int>() < 0)
+                ctx.AddError(path + ".minMatches", "must be a non-negative integer");
+            else node->foreachMinMatches = j["minMatches"].get<int>();
+        }
+        if (!j.contains("do") || !j["do"].is_object()) {
+            ctx.AddError(path, "'foreach' requires object 'do'");
+        } else {
+            node->doChild = ParseNode(j["do"], path + ".do", "do", depth + 1, ctx, queueScope);
+            const std::string prefix = "${" + alias + ".";
+            std::function<void(const json&, const std::string&)> checkRefs = [&](const json& cur, const std::string& p) {
+                if (cur.is_string()) {
+                    const std::string& s = cur.get<std::string>();
+                    size_t pos = 0;
+                    while ((pos = s.find(prefix, pos)) != std::string::npos) {
+                        size_t fieldStart = pos + prefix.size();
+                        size_t end = s.find('}', fieldStart);
+                        if (end == std::string::npos) {
+                            ctx.AddError(p, "unterminated '${" + alias + ".}' reference in 'do'");
+                            break;
+                        }
+                        std::string field = s.substr(fieldStart, end - fieldStart);
+                        if (field != "stem" && field != "name" && field != "path" && field != "index") {
+                            ctx.AddError(p, "unknown foreach field '" + field + "' for '" + alias +
+                                            "' (expected stem, name, path or index)");
+                        }
+                        pos = end + 1;
+                    }
+                } else if (cur.is_object() || cur.is_array()) {
+                    for (auto it = cur.begin(); it != cur.end(); ++it) {
+                        checkRefs(it.value(), p + (cur.is_array() ? "[" + it.key() + "]" : "." + it.key()));
+                    }
+                }
+            };
+            checkRefs(j["do"], path + ".do");
         }
     } else if (t == "invert" || t == "forceSuccess" || t == "forceFailure") {
         requireChildObj("child", "child", node->singleChild);
@@ -931,6 +990,7 @@ void CollectNodeWarnings(const BtNode& n, ParseContext& ctx, bool guarded,
     for (const auto& h : n.catchHandlers) {
         if (h.doNode) CollectNodeWarnings(*h.doNode, ctx, childGuarded, warnings);
     }
+    if (n.doChild) CollectNodeWarnings(*n.doChild, ctx, childGuarded, warnings);
 }
 
 void ValidateFailureNodeReferences(const BtNode& node, ParseContext& ctx) {
@@ -947,6 +1007,7 @@ void ValidateFailureNodeReferences(const BtNode& node, ParseContext& ctx) {
     for (const auto& h : node.catchHandlers) {
         if (h.doNode) ValidateFailureNodeReferences(*h.doNode, ctx);
     }
+    if (node.doChild) ValidateFailureNodeReferences(*node.doChild, ctx);
     if (node.otherwiseChild) ValidateFailureNodeReferences(*node.otherwiseChild, ctx);
 }
 

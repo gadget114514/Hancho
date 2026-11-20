@@ -17,6 +17,12 @@ struct TriageInputs {
 
 nlohmann::json BuildTriageCandidates(const TriageInputs& in);
 nlohmann::json BuildProcessTriageCandidates(const nlohmann::json& processes);
+// 093-3: card created when a stale routine fails. `diff` is the routine_check payload,
+// `failedNodes` an array of node ids that did not succeed.
+nlohmann::json BuildRoutineStaleFailureCard(const std::string& name, const std::string& runId,
+                                            const nlohmann::json& diff,
+                                            const nlohmann::json& failedNodes,
+                                            const std::string& now);
 std::string TriageCardIdFromKey(const std::string& key);
 std::string TriageTimeoutPattern(const nlohmann::json& job);
 std::vector<std::string> MergeTriageCards(nlohmann::json& store,

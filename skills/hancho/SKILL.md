@@ -131,6 +131,8 @@ hancho-cli.exe power status
 | 1文字修正・単純な文字列置換 | `quickfix`（LLM を使わない） |
 | 複数ステップに順番・依存がある | `taskqueue add` + `taskqueue wait` |
 | 前の結果で次が変わる（分岐、修正ループ、if/else） | `bt start` + `bt wait` / `bt resume` |
+| 毎回同じ定型作業（ビルド＋全スモークなど） | `routine run <name>`（BT を書き直さない） |
+| 定型作業を言葉で作らせたい／古くなったルーチンを直させたい | `routine ask "..."` → `routine show` → `routine approve`（提案は承認まで run 不可） |
 | 実行を一時的に止めたい（原因は直さない） | `taskqueue pause-job <id>` / `taskqueue pause <name>` / `bt pause --id <id>`（再開は resume） |
 | worker LLM に1件任せて最終結果だけ欲しい | MCP `run_worker` |
 | 対話 TUI（opencode / claude を `run` なしで） | `start --pty` |
@@ -144,6 +146,7 @@ hancho-cli.exe power status
 - **`id` / `command` / `summary`（200文字以内）/ `timeoutSec` は必須。** タイムアウトはジョブごと。合算しない。
 - **成功を偽装しない。** Hancho が `success.exitCode`（既定 0）と `filesNewer` / `outputRegex` / `testReport` で検証する。exit 0 だけでは成果物を保証できないときは `filesNewer` を足す。
 - **待つ。ポーリングしない。** `taskqueue wait` / `bt wait` / `wait_process` を使う。
+- **定型作業はルーチンにする。毎回 BT を書かない。** `routine run <name>` で名前付き BT を実行する。`stale` で失敗したときだけ `routine show` と差分を見て直す。LLM に作らせてもよいが、その場合は `routine ask` の結果を必ず `routine show` で確認し、ユーザーの言葉を付けて `routine approve` してから `run` する（提案は承認まで実行されない）。人手で直すなら `routine save --reason "..."`（理由なしの保存はしない）。
 - **一時停止は原因を直さない。** `taskqueue pause-job` / `taskqueue pause` / `bt pause` は実行（とローカル実行中ジョブの時計）を止めるだけ。LLM 応答待ち（`waitingForLlm`、rate limit、auth、provider 障害、ハング）は pause では解消しない。escalate は `bt resume` で回答するか `bt retry`、LLM 側の失敗は原因を直して `taskqueue retry`、無理なら `taskqueue cancel` / `bt cancel`。pause した実行中ジョブを resume しても同じリクエストが続く。
 - **supervisor の文脈を小さく保つ。** 詳細な指示は worker に渡し、成果物とログの末尾だけ読む。
 - **1文字修正にコーディングエージェントを起動しない。** `quickfix --file <path> --find <text> --replace <text>` を使う。決定的で数秒〜数十秒で終わる。
@@ -283,7 +286,7 @@ test → 失敗なら修正 → 再ビルド → 再テスト、の例:
 }
 ```
 
-ノード: `job` / `worker` / `probe` / `wait` / `set` / `escalate` / `fail` / `succeed`。複合: `sequence` / `fallback` / `parallel` / `if` / **`catch`**。装飾: `retry` / `repeat` / `invert` / `forceSuccess` / `forceFailure` / `timeout`。条件: `fileExists` / `fileNewer` / `outputMatches` / `exitCode` / **`failure`** / `jsonValue` / `var` / `nodeState`。変数: `${name}`、`${<node>.state|exitCode|logFile|jobId|runs}`、`${<worker>.result}`、`${<escalate>.answer}`、失敗診断の `${<node>.failureClass|failureSummary|likelyCauses|suggestedAction|retryAt|engine|model}`。詳細は `doc/behavior-tree.md` / `doc/behavior-tree-ja.md`。
+ノード: `job` / `worker` / `probe` / `wait` / `set` / `escalate` / `fail` / `succeed`。複合: `sequence` / `fallback` / `parallel` / `if` / **`catch`** / **`foreach`**（glob のファイルごとに `do` を展開、`exclude` 対応）。装飾: `retry` / `repeat` / `invert` / `forceSuccess` / `forceFailure` / `timeout`。条件: `fileExists` / `fileNewer` / `outputMatches` / `exitCode` / **`failure`** / `jsonValue` / `var` / `nodeState`。変数: `${name}`、`${<node>.state|exitCode|logFile|jobId|runs}`、`${<worker>.result}`、`${<escalate>.answer}`、失敗診断の `${<node>.failureClass|failureSummary|likelyCauses|suggestedAction|retryAt|engine|model}`。詳細は `doc/behavior-tree.md` / `doc/behavior-tree-ja.md`。
 
 #### BT を書くときはハング対策を最初から入れる
 
@@ -296,6 +299,28 @@ test → 失敗なら修正 → 再ビルド → 再テスト、の例:
 5. そのうえで `bt start` → `bt wait --id <btid> --timeout-ms 600000` → `bt get --id <btid> --compact` で監視する。
 
 worker ノードの `engines` / `switchEngineOn`、`probe` 葉、`{engine}` / `{model}` プレースホルダ、`needs` による権限宣言の詳細は `doc/behavior-tree.md` の 5.3 / 5.4 と 11 章を参照。
+
+### ルーチン（名前付き BT）
+
+```powershell
+hancho-cli.exe routine list
+hancho-cli.exe routine show smoke-all
+hancho-cli.exe routine check smoke-all
+hancho-cli.exe routine run smoke-all --wait --timeout-ms 3600000
+
+# LLM に作らせる／直させる（結果は提案。承認するまで run できない）
+hancho-cli.exe routine ask "全スモークを流して" --name smoke-all
+hancho-cli.exe routine show smoke-all            # 提案・差分・ドライラン・rationale を確認
+hancho-cli.exe routine approve smoke-all --user-said "承認する"
+hancho-cli.exe routine reject smoke-all --reason "不要になった"
+
+# 過去の BT から登録（人手は承認済み）
+hancho-cli.exe routine save --name from-past --from-bt <btId>
+```
+
+定義は `<cwd>/.hancho/routines/<name>.json`（project）または `<data-dir>/routines/<name>.json`（data）。実行ごとに `<name>-<yyyymmdd-hhmmss>` の ID が付き、ジョブ ID は衝突しない。MCP は `routine_list` / `routine_show` / `routine_run` / `routine_save` / `routine_check` / `routine_ask` / `routine_approve` / `routine_reject`。入力ファイルの変更で `stale` になっても実行は止まらないが、失敗した場合は triage の `routine_stale_failure` カード（`update_routine` 推奨）が出る。`update_routine` を選ぶと `routine ask`（直す）が起動し、結果は承認待ちの提案になる。
+
+`routine ask` の依頼は `routine-ask` キューの worker ジョブとして登録され、`worker` LLM リスト（rank 順、故障中はスキップ、空なら既定エンジン＋警告）で実行される。 worker の出力は厳格 BT 検証・`foreach` ドライラン・ChainGuard で検査され、不合格なら 1 回だけ直させる。合格した定義は `<dir>/.proposals/<name>.json` に `status: proposed` で保存され、更新提案の間も承認済みの旧版で `run` できる。人手の `routine save`（CLI／ダッシュボード）は承認済み、MCP の `routine_save` は提案になる。詳細は `doc/routines.md` / `doc/routines-ja.md`。
 
 ### `escalate`（supervisor が呼ばれる唯一の場所）
 

@@ -1,0 +1,59 @@
+{
+  "id": "bt-boundary",
+  "summary": "BT retry / escalation / LLM boundary regression cases",
+  "tests": [
+    {
+      "id": "bt.worker.max_attempts",
+      "kind": "api",
+      "summary": "BT maxAttempts reaches the LLM worker job spec",
+      "timeoutSec": 10
+    },
+    {
+      "id": "bt.retry.spent_budget",
+      "kind": "api",
+      "summary": "A spent retry budget refuses another attempt unless counters are reset",
+      "timeoutSec": 10
+    },
+    {
+      "id": "bt.escalate.diagnostics_in_packet",
+      "kind": "api",
+      "summary": "Failed worker diagnosis reaches the LLM escalation packet (JSON + markdown)",
+      "timeoutSec": 10
+    },
+    {
+      "id": "bt.escalate.takeover_persisted",
+      "kind": "api",
+      "summary": "takeover is legal outside expect and persisted in the saved state",
+      "timeoutSec": 10
+    },
+    {
+      "id": "bt.engine.down_hold_recovery",
+      "kind": "api",
+      "summary": "A down LLM engine holds the node and relaunches it after recovery",
+      "timeoutSec": 10
+    },
+    {
+      "id": "cli.version.json",
+      "kind": "cli",
+      "summary": "hancho-cli version --json returns ok/program/version",
+      "command": "${EXEDIR}/hancho-cli.exe version --json",
+      "timeoutSec": 30,
+      "expect": {
+        "exitCode": 0,
+        "stdoutJson": { "ok": true, "program": "hancho-cli" },
+        "stdoutContains": ["\"version\":\""]
+      }
+    },
+    {
+      "id": "cli.version.text",
+      "kind": "cli",
+      "summary": "hancho-cli --version prints hancho-cli <semver>",
+      "command": "${EXEDIR}/hancho-cli.exe --version",
+      "timeoutSec": 30,
+      "expect": {
+        "exitCode": 0,
+        "stdoutRegex": "hancho-cli [0-9]+\\.[0-9]+\\.[0-9]+"
+      }
+    }
+  ]
+}

@@ -16,6 +16,7 @@
 #include <filesystem>
 #include <iomanip>
 #include <map>
+#include <tuple>
 #include <regex>
 #include <chrono>
 #include <ctime>
@@ -69,11 +70,14 @@ static std::string Utf8Prefix(const std::string& s, size_t maxBytes) {
 }
 
 constexpr int64_t kUsageRetentionSec = 24 * 60 * 60;
+// Local time of day (minutes after midnight) at which older disk history is rounded to whole days.
+constexpr int kDefaultUsageRoundMinutes = 5 * 60; // 05:00
+static std::atomic<int> g_usageRoundMinutes{kDefaultUsageRoundMinutes};
 constexpr size_t kMaxUsagePoints = 200000;
 static std::mutex g_usageHistoryMutex;
 static std::deque<LlmUsagePoint> g_usageHistory;
 static bool g_usageHistoryLoaded = false;
-static bool g_usageHistoryPersist = false;
+static bool g_usageHistoryPersist = true;
 static bool g_dailyUsagePersist = true;
 static std::mutex g_usageFileMutex;
 static std::atomic<uint64_t> g_recordCalls{0};
@@ -216,34 +220,112 @@ bool ParseDailyUsageRecordJson(const nlohmann::json& j, LlmDailyUsageRecord& out
     return !out.date.empty();
 }
 
+// Most recent local occurrence of hh:mm at or before `epoch`.
+static int64_t LastRoundBoundary(int64_t epoch, int minutesOfDay) {
+    std::tm tm = {};
+    time_t t = static_cast<time_t>(epoch);
+    if (!LocalTimeFromSec(&t, &tm)) return epoch;
+    tm.tm_hour = minutesOfDay / 60;
+    tm.tm_min = minutesOfDay % 60;
+    tm.tm_sec = 0;
+    int64_t boundary = static_cast<int64_t>(std::mktime(&tm));
+    if (boundary > epoch) {
+        tm.tm_mday -= 1;
+        boundary = static_cast<int64_t>(std::mktime(&tm));
+    }
+    return boundary;
+}
+
+// Local midnight of the day containing `epoch`.
+static int64_t LocalDayStart(int64_t epoch) {
+    std::tm tm = {};
+    time_t t = static_cast<time_t>(epoch);
+    if (!LocalTimeFromSec(&t, &tm)) return epoch;
+    tm.tm_hour = 0;
+    tm.tm_min = 0;
+    tm.tm_sec = 0;
+    return static_cast<int64_t>(std::mktime(&tm));
+}
+
+bool SetUsageRoundTime(const std::string& hhmm) {
+    if (hhmm.size() != 5 || hhmm[2] != ':') return false;
+    auto digits = [&](size_t pos) {
+        return std::isdigit(static_cast<unsigned char>(hhmm[pos])) != 0;
+    };
+    if (!digits(0) || !digits(1) || !digits(3) || !digits(4)) return false;
+    int h = (hhmm[0] - '0') * 10 + (hhmm[1] - '0');
+    int m = (hhmm[3] - '0') * 10 + (hhmm[4] - '0');
+    if (h > 23 || m > 59) return false;
+    g_usageRoundMinutes.store(h * 60 + m);
+    return true;
+}
+
+std::string GetUsageRoundTime() {
+    int v = g_usageRoundMinutes.load();
+    char buf[8];
+    snprintf(buf, sizeof(buf), "%02d:%02d", v / 60, v % 60);
+    return buf;
+}
+
 void PruneUsageHistory(int64_t retentionSec, int64_t nowSec) {
     if (retentionSec <= 0) retentionSec = kUsageDiskRetentionSec;
     int64_t now = nowSec > 0 ? nowSec : static_cast<int64_t>(time(nullptr));
     int64_t cutoff = now - retentionSec;
+    int64_t roundCutoff = LastRoundBoundary(now, g_usageRoundMinutes.load());
     std::wstring path = UsageHistoryPathWide();
 
     std::lock_guard<std::mutex> fileLock(g_usageFileMutex);
     std::ifstream f(path);
     if (!f) return;
 
+    // Points before the last round boundary (the configured local time, default 05:00) are
+    // rounded to their local day and merged per (day, agentType, model). Newer points stay as they are.
+    static const char* const kCountFields[] = {
+        "inputTokens", "outputTokens", "thinkingTokens",
+        "cacheReadTokens", "cacheWriteTokens", "totalTokens"};
+    std::map<std::tuple<int64_t, std::string, std::string>, nlohmann::json> rounded;
     std::vector<std::string> keptLines;
     std::string line;
-    bool droppedAny = false;
+    bool changed = false;
     while (std::getline(f, line)) {
         if (line.empty()) continue;
         auto j = nlohmann::json::parse(line, nullptr, false);
         if (!j.is_object()) continue;
         int64_t epoch = j.value("epochSec", (int64_t)0);
-        if (epoch >= cutoff) {
+        if (epoch < cutoff) {
+            changed = true;
+            continue;
+        }
+        if (epoch >= roundCutoff) {
             keptLines.push_back(line);
+            continue;
+        }
+        int64_t day = LocalDayStart(epoch);
+        if (day != epoch) changed = true;
+        auto key = std::make_tuple(day, j.value("agentType", std::string()), j.value("model", std::string()));
+        auto it = rounded.find(key);
+        if (it == rounded.end()) {
+            nlohmann::json r = j;
+            r["epochSec"] = day;
+            rounded.emplace(key, std::move(r));
         } else {
-            droppedAny = true;
+            changed = true;
+            nlohmann::json& r = it->second;
+            for (const char* name : kCountFields) {
+                r[name] = r.value(name, (uint64_t)0) + j.value(name, (uint64_t)0);
+            }
+            r["costUsd"] = r.value("costUsd", 0.0) + j.value("costUsd", 0.0);
         }
     }
     f.close();
 
-    if (droppedAny) {
+    if (changed) {
+        // Rounded (older) points first, then the full-resolution points, keeps the file in time order.
         std::string rewritten;
+        for (const auto& kv : rounded) {
+            rewritten += kv.second.dump(-1, ' ', false, nlohmann::json::error_handler_t::replace);
+            rewritten += "\n";
+        }
         for (const auto& l : keptLines) {
             rewritten += l;
             rewritten += "\n";

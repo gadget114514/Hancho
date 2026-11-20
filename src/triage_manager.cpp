@@ -259,6 +259,34 @@ void TriageManager::SaveLocked() {
     WriteFileAtomicWide(CardsPath(), store_.dump(2));
 }
 
+std::string TriageManager::AddCard(const json& card) {
+    if (!card.is_object()) return "";
+    const std::string key = GetString(card, "key");
+    if (key.empty()) return "";
+    std::lock_guard<std::mutex> lock(mutex_);
+    const std::string now = GetCurrentTimestampStr();
+    json& cards = store_["cards"];
+    for (auto& existing : cards) {
+        if (!existing.is_object() || GetString(existing, "key") != key) continue;
+        if (GetString(existing, "state") == "pending") return GetString(existing, "id");
+        json item = card;
+        item["state"] = "pending";
+        item["updatedAt"] = now;
+        existing = std::move(item);
+        SaveLocked();
+        return GetString(existing, "id", TriageCardIdFromKey(key));
+    }
+    json item = card;
+    if (GetString(item, "id").empty()) item["id"] = TriageCardIdFromKey(key);
+    if (GetString(item, "createdAt").empty()) item["createdAt"] = now;
+    item["updatedAt"] = now;
+    item["state"] = "pending";
+    const std::string id = GetString(item, "id");
+    cards.push_back(std::move(item));
+    SaveLocked();
+    return id;
+}
+
 void TriageManager::Refresh() {
     std::lock_guard<std::mutex> refreshLock(refreshMutex_);
     std::string configText = ReadConfig();
@@ -863,6 +891,7 @@ std::string TriageManager::DecideInternal(const std::string& id, const std::stri
     const json target = GetObject(card, "target");
     std::string result = "Recorded " + candidateId + ".";
     std::string actionError;
+    json routineAskResult;
     if (candidateId == "retry" || candidateId == "retry_raise_timeout") {
         const std::string jobId = GetString(target, "jobId");
         if (jobId.empty()) return Error("job target is missing").dump();
@@ -960,6 +989,25 @@ std::string TriageManager::DecideInternal(const std::string& id, const std::stri
         result = reason.empty() ? "Recorded investigation request." : "Recorded investigation request: " + reason;
     } else if (candidateId == "wait") {
         result = "Recorded; the resource scheduler will continue waiting.";
+    } else if (candidateId == "update_routine") {
+        // 093-5: hand the stale routine to the LLM and wait for a proposal. The approved
+        // version keeps running until a person approves the proposal.
+        if (!routineAskHandler_) return Error("routine ask handler is unavailable").dump();
+        const std::string routineName = params.value("name", GetString(target, "routine"));
+        if (routineName.empty()) return Error("routine name is required for update_routine").dump();
+        const std::string cwd = params.value("cwd", std::string());
+        const std::string request = reason.empty()
+                                        ? "Fix the stale routine " + routineName +
+                                              ": compare routine show with its input diff and update the definition."
+                                        : reason;
+        const std::string response = routineAskHandler_(routineName, cwd, request);
+        routineAskResult = json::parse(response, nullptr, false);
+        if (routineAskResult.is_discarded() || !routineAskResult.value("ok", false)) {
+            return Error("routine ask failed: " +
+                         (routineAskResult.is_discarded() ? response
+                                                          : routineAskResult.value("error", response))).dump();
+        }
+        result = "Asked the LLM to update routine " + routineName + "; a proposal is awaiting approval.";
     } else if (candidateId == "show_holder" || candidateId == "fix_spec") {
         result = "Recorded " + candidateId + " for the dashboard to handle.";
     } else {
@@ -1001,6 +1049,14 @@ std::string TriageManager::DecideInternal(const std::string& id, const std::stri
         (*found)["state"] = state;
         (*found)["updatedAt"] = GetCurrentTimestampStr();
         (*found)["decision"] = std::move(decision);
+        if (!routineAskResult.is_null()) {
+            (*found)["routineAsk"] = routineAskResult;
+            json info = GetObject(*found, "info");
+            info["proposalPending"] = json::array({json{{"k", "proposalPending"},
+                                                         {"v", true},
+                                                         {"text", "A routine proposal is waiting for approval."}}});
+            (*found)["info"] = std::move(info);
+        }
         json manual = GetObject(*found, "manual");
         if (by == "human" && !manual.empty()) {
             (*found)["decision"]["route"] = "manual";

@@ -1,5 +1,5 @@
 cmake_minimum_required(VERSION 3.20)
-project(Hancho VERSION 0.9.36 LANGUAGES CXX)
+project(Hancho VERSION 0.9.37 LANGUAGES CXX)
 
 set(CMAKE_CXX_STANDARD 20)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
@@ -35,6 +35,7 @@ set(HANCHO_SOURCES
     src/platform/platform_windows.cpp
     src/process_manager.cpp
     src/taskqueue.cpp
+    src/routine.cpp
     src/triage.cpp
     src/triage_manager.cpp
     src/triage_text.cpp
@@ -78,6 +79,7 @@ set(HANCHO_SOURCES
     src/bt_manager.cpp
     src/bt_manager_api.cpp
     src/gui_dashboard.cpp
+    src/screenshot.cpp
     src/gui_ipmsg.cpp
     src/gui_theme.cpp
     src/term_launch.cpp
@@ -895,6 +897,7 @@ add_executable(bt_ipc_smoke
     src/engine_health.cpp
     src/platform/platform_windows.cpp
     src/taskqueue.cpp
+    src/routine.cpp
     src/triage.cpp
     src/triage_manager.cpp
     src/memory_record.cpp
@@ -951,8 +954,101 @@ target_link_libraries(bt_ipc_smoke PRIVATE
     "${CMAKE_CURRENT_SOURCE_DIR}/lib/libsixel.lib"
 )
 
+# Headless smoke test for routines: save/list/run twice/show/testReport summary/invalid BT.
+add_executable(routine_smoke
+    tests/routine_smoke.cpp
+    src/routine.cpp
+    src/ipc_server.cpp
+    src/ipc_server_remote.cpp
+    src/power.cpp
+    src/webui_server.cpp
+    src/ipmsg.cpp
+    src/ipmsg_handler.cpp
+    src/webui_assets.cpp
+    src/remote_client.cpp
+    src/remote_hosts.cpp
+    src/bt_manager.cpp
+    src/bt_manager_api.cpp
+    src/behavior_tree.cpp
+    src/behavior_tree_parse.cpp
+    src/behavior_tree_vars.cpp
+    src/behavior_tree_cond.cpp
+    src/behavior_tree_exec.cpp
+    src/behavior_tree_escalate.cpp
+    src/behavior_tree_state.cpp
+    src/behavior_tree_runtime.cpp
+    src/worker_engines.cpp
+    src/llm_config.cpp
+    src/permit_config.cpp
+    src/worker_probe.cpp
+    src/engine_health.cpp
+    src/platform/platform_windows.cpp
+    src/taskqueue.cpp
+    src/triage.cpp
+    src/triage_manager.cpp
+    src/memory_record.cpp
+    src/memory_search.cpp
+    src/chain_guard.cpp
+    src/process_manager.cpp
+    src/llm_stream.cpp
+    src/llm_stream_claude.cpp
+    src/llm_stream_opencode.cpp
+    src/llm_stream_agy.cpp
+    src/llm_stream_codex.cpp
+    src/event_schema.cpp
+    src/event_adapter.cpp
+    src/common.cpp
+    src/Terminal/src/ConPtySession.cpp
+    src/Terminal/src/ImageManager.cpp
+    src/Terminal/src/TerminalBuffer.cpp
+    src/Terminal/src/TerminalEmulator.cpp
+    src/Terminal/src/TerminalView.cpp
+    src/term_server.cpp
+    ${WCSP_SOURCES}
+)
 
+target_include_directories(routine_smoke PRIVATE
+    src
+    include
+    src/Terminal/include
+    src/Terminal/src
+    src/wcsp
+)
 
+if(MSVC)
+    target_compile_options(routine_smoke PRIVATE /W4 /utf-8 /EHsc)
+endif()
+
+target_link_libraries(routine_smoke PRIVATE
+    user32
+    gdi32
+    comctl32
+    shell32
+    advapi32
+    psapi
+    ole32
+    shlwapi
+    imm32
+    winmm
+    d2d1
+    dwrite
+    dwmapi
+    windowscodecs
+    crypt32
+    ws2_32
+    powrprof
+    "${CMAKE_CURRENT_SOURCE_DIR}/lib/libsixel.lib"
+)
+
+add_custom_command(TARGET routine_smoke POST_BUILD
+    COMMAND ${CMAKE_COMMAND} -E copy_if_different
+        "${CMAKE_CURRENT_SOURCE_DIR}/lib/conpty.dll"
+        "$<TARGET_FILE_DIR:routine_smoke>/conpty.dll"
+    COMMAND ${CMAKE_COMMAND} -E copy_if_different
+        "${CMAKE_CURRENT_SOURCE_DIR}/lib/OpenConsole.exe"
+        "$<TARGET_FILE_DIR:routine_smoke>/OpenConsole.exe"
+    COMMENT "Copying lib/conpty.dll and lib/OpenConsole.exe for routine_smoke"
+)
 
 # Headless smoke test for memory search/index/rebuild (src/memory_search.cpp).
 add_executable(memory_search_smoke
@@ -1156,6 +1252,7 @@ add_executable(webui_config_smoke
     src/engine_health.cpp
     src/platform/platform_windows.cpp
     src/taskqueue.cpp
+    src/routine.cpp
     src/triage.cpp
     src/triage_manager.cpp
     src/triage_text.cpp
@@ -1241,6 +1338,47 @@ target_link_libraries(term_server_smoke PRIVATE
     user32
 )
 
+add_executable(hancho_test
+    tests/framework/runner_main.cpp
+    tests/framework/process_runner.cpp
+    tests/api_tests/bt_boundary_tests.cpp
+    src/behavior_tree.cpp
+    src/behavior_tree_parse.cpp
+    src/behavior_tree_vars.cpp
+    src/behavior_tree_cond.cpp
+    src/behavior_tree_exec.cpp
+    src/behavior_tree_escalate.cpp
+    src/behavior_tree_state.cpp
+    src/behavior_tree_runtime.cpp
+    src/worker_engines.cpp
+    src/permit_config.cpp
+    src/platform/platform_windows.cpp
+    src/bt_debug_view.cpp
+    src/common.cpp
+)
+
+add_dependencies(hancho_test hancho-cli)
+
+target_compile_definitions(hancho_test PRIVATE PC_REPO_DIR="${CMAKE_CURRENT_SOURCE_DIR}")
+
+target_include_directories(hancho_test PRIVATE
+    src
+    include
+    tests
+)
+
+if(MSVC)
+    target_compile_options(hancho_test PRIVATE /W4 /utf-8 /EHsc)
+endif()
+
+target_link_libraries(hancho_test PRIVATE
+    user32
+    shell32
+    advapi32
+    psapi
+    crypt32
+)
+
 
 else()
     # POSIX headless core and CLI (doc/design-v3.md 2.4). There is no GUI here:
@@ -1253,6 +1391,7 @@ else()
         src/platform/platform_posix.cpp
         src/process_manager_posix.cpp
         src/taskqueue.cpp
+        src/routine.cpp
         src/llm_config.cpp
         src/permit_config.cpp
         src/triage.cpp

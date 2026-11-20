@@ -171,7 +171,7 @@ std::vector<LlmUsagePoint> GetLlmUsageHistory(int64_t sinceEpochSec);
 void SetUsageHistoryPersistence(bool enabled);
 bool IsUsageHistoryPersistence();
 
-constexpr int64_t kUsageDiskRetentionSec = 7 * 24 * 60 * 60; // 7 days (U0 on disk)
+constexpr int64_t kUsageDiskRetentionSec = 30 * 24 * 60 * 60; // 30 days (U0 on disk; older than the round time is per-day)
 
 // Long-term daily LLM usage aggregation record (U1, schema: hancho.usage.day/1).
 // Persisted in usage/daily/<YYYY-MM>.jsonl as an append-log of deltas.
@@ -200,6 +200,11 @@ bool ParseDailyUsageRecordJson(const nlohmann::json& j, LlmDailyUsageRecord& out
 
 // Prune logs/usage_history.jsonl dropping lines older than retentionSec (default 7 days).
 void PruneUsageHistory(int64_t retentionSec = kUsageDiskRetentionSec, int64_t nowSec = 0);
+
+// Local time "HH:MM" at which disk usage history older than that point is rounded to whole days.
+// Default "05:00". SetUsageRoundTime returns false (and keeps the current value) for invalid input.
+bool SetUsageRoundTime(const std::string& hhmm);
+std::string GetUsageRoundTime();
 
 // Persistence of daily delta logs (usage/daily/<YYYY-MM>.jsonl). On by default.
 void SetDailyUsagePersistence(bool enabled);

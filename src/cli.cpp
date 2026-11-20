@@ -2743,6 +2743,16 @@ BEHAVIOR TREES (for LLM agents; next step depends on results):
       not taskqueue retry. Full format and examples: doc\behavior-tree.md in the
       installation folder; `hancho-cli bt --help` for all options.
 
+ ROUTINES (named BT workflows, no LLM needed to re-run):
+   routine save --name <n> --file <bt.json> [--inputs <glob> ...]
+               [--summary <text>] [--project|--data] --reason <text>
+   routine list | routine show <name> | routine check <name>
+   routine run <name> [--wait] [--timeout-ms <n>]
+       Each run gets a fresh <name>-<yyyymmdd-hhmmss> id, so job ids never
+       collide. Definitions: <cwd>/.hancho/routines/<name>.json (project) or
+       <data-dir>/routines/<name>.json (data); project wins. History: the
+       data-dir .runs.json (last 50). `routine --help` for all options.
+
   start/run ... --allow-chain
       Allow a chained command (&&, ||, &, ';') as a single process. Task-queue
       jobs never allow chains; use dependsOn instead.
@@ -3143,6 +3153,19 @@ void PrintCliUsageJson() {
       "options": []
     },
     {
+      "name": "routine",
+      "description": "Named, reusable behavior-tree workflows: save once, run by name. Each run gets a unique <name>-<yyyymmdd-hhmmss> id so repeated runs never collide on job ids. Definitions live in <cwd>/.hancho/routines/<name>.json (project, shared) or <data-dir>/routines/<name>.json (data); project wins on name clashes. Run history is kept in <data-dir>/routines/<name>.runs.json (last 50).",
+      "usage": "hancho-cli routine <list|show|run|save|check> ...",
+      "subcommands": [
+        {"name": "list", "usage": "hancho-cli routine list [--json]", "description": "List saved routines with name, summary, location and last run (run id, state, time)."},
+        {"name": "show", "usage": "hancho-cli routine show <name> [--json]", "description": "Show the definition and the last run's per-node results (state, duration, test report totals)."},
+        {"name": "run", "usage": "hancho-cli routine run <name> [--wait] [--timeout-ms <n>] [--json]", "description": "Start the routine with a fresh run id; --wait blocks until it finishes and exits 1 on failure."},
+        {"name": "save", "usage": "hancho-cli routine save --name <n> --file <bt.json> [--inputs <glob> ...] [--summary <text>] [--project|--data] --reason <text>", "description": "Register or update a routine. The BT is validated exactly as bt validate does; history records {at, by, reason}."},
+        {"name": "check", "usage": "hancho-cli routine check <name>", "description": "Input freshness check. Placeholder for 093-3: always returns state ok with empty added/removed/changed."}
+      ],
+      "options": []
+    },
+    {
       "name": "adapter test",
       "description": "Run a Tier 1 declarative adapter (<data-dir>/adapters/<name>.json) against recorded input lines and compare the normalized {kind, data} pairs.",
       "usage": "hancho-cli adapter test <name> [--file <adapter.json>] [--dir <test-dir>] [--json]",
@@ -3398,7 +3421,7 @@ void PrintCliUsageJson() {
           }
         }
       },
-      "tools": ["start_process", "list_processes", "get_process_output", "send_process_input", "wait_process", "kill_process", "run_worker", "wait_worker", "get_worker_stream", "get_worker_state", "update_worker_info", "taskqueue_add", "taskqueue_list", "taskqueue_get", "taskqueue_retry", "taskqueue_update", "taskqueue_cancel", "taskqueue_takeover", "taskqueue_complete", "taskqueue_pause", "taskqueue_resume", "taskqueue_pause_job", "taskqueue_resume_job", "taskqueue_wait", "taskqueue_purge", "taskqueue_link", "taskqueue_unlink", "taskqueue_graph", "bt_validate", "bt_start", "bt_get", "bt_list", "bt_wait", "bt_resume", "bt_retry", "bt_update", "bt_cancel", "bt_pause", "bt_template", "power_suspend", "power_shutdown", "power_cancel", "power_status", "chat_status", "chat_peers", "chat_refresh", "chat_send", "chat_get", "chat_inbox", "chat_wait", "chat_read", "chat_download", "chat_log", "chat_handler", "memory_search", "memory_get", "memory_brief", "memory_stats", "memory_note", "memory_retract", "memory_approve", "usage_stats", "usage_export", "worker_health"]
+      "tools": ["start_process", "list_processes", "get_process_output", "send_process_input", "wait_process", "kill_process", "run_worker", "wait_worker", "get_worker_stream", "get_worker_state", "update_worker_info", "taskqueue_add", "taskqueue_list", "taskqueue_get", "taskqueue_retry", "taskqueue_update", "taskqueue_cancel", "taskqueue_takeover", "taskqueue_complete", "taskqueue_pause", "taskqueue_resume", "taskqueue_pause_job", "taskqueue_resume_job", "taskqueue_wait", "taskqueue_purge", "taskqueue_link", "taskqueue_unlink", "taskqueue_graph", "bt_validate", "bt_start", "bt_get", "bt_list", "bt_wait", "bt_resume", "bt_retry", "bt_update", "bt_cancel", "bt_pause", "bt_template", "routine_list", "routine_show", "routine_run", "routine_save", "routine_check", "routine_ask", "routine_approve", "routine_reject", "power_suspend", "power_shutdown", "power_cancel", "power_status", "chat_status", "chat_peers", "chat_refresh", "chat_send", "chat_get", "chat_inbox", "chat_wait", "chat_read", "chat_download", "chat_log", "chat_handler", "memory_search", "memory_get", "memory_brief", "memory_stats", "memory_note", "memory_retract", "memory_approve", "usage_stats", "usage_export", "worker_health"]
     }
   },
   "leaving": {
@@ -4012,12 +4035,165 @@ int PrintResponse(const std::string& action, const std::string& respJson, bool j
             if (!JsonGetBool(respJson, "finished", false)) return 124;
             if (!proc.empty()) return CompletionExitCode(proc);
         }
+        if (action == "routine_run" && JsonGetBool(respJson, "waited", false)) {
+            const std::string state = JsonGetString(respJson, "state", "");
+            if (state != "succeeded") return 1;
+        }
         return 0;
     }
 
     if (!JsonGetBool(respJson, "ok", false)) {
         std::cerr << "Error: " << JsonGetString(respJson, "error", "Unknown error.") << "\n";
         return 1;
+    }
+
+    if (action.rfind("routine_", 0) == 0) {
+        using json = nlohmann::json;
+        json r = json::parse(respJson, nullptr, false);
+        if (r.is_discarded() || !r.is_object()) {
+            std::cerr << "Error: invalid routine response.\n";
+            return 1;
+        }
+        if (action == "routine_list") {
+            std::cout << "Routines:\n";
+            if (r.contains("routines") && r["routines"].is_array()) {
+                for (const auto& row : r["routines"]) {
+                    const std::string state = row.value("state", std::string());
+                    std::cout << "  " << row.value("name", std::string())
+                              << "  [" << row.value("scope", std::string()) << "]  "
+                              << (state == "stale" ? "[STALE] " : "")
+                              << row.value("summary", std::string());
+                    if (state == "stale") {
+                        std::cout << "  diff: +" << row.value("added", json::array()).size()
+                                  << " -" << row.value("removed", json::array()).size()
+                                  << " ~" << row.value("changed", json::array()).size();
+                    }
+                    if (row.contains("lastRun") && row["lastRun"].is_object()) {
+                        std::cout << "  last: " << row["lastRun"].value("runId", std::string())
+                                  << " (" << row["lastRun"].value("state", std::string()) << ", "
+                                  << row["lastRun"].value("startedAt", std::string()) << ")";
+                    }
+                    std::cout << "\n";
+                }
+            }
+        } else if (action == "routine_show") {
+            std::cout << "Routine " << r.value("name", std::string())
+                      << " [" << r.value("scope", std::string()) << "]\n";
+            if (r.contains("definition") && r["definition"].is_object()) {
+                const json& def = r["definition"];
+                std::cout << "  summary: " << def.value("summary", std::string()) << "\n"
+                          << "  cwd:     " << def.value("cwd", std::string()) << "\n"
+                          << "  path:    " << r.value("path", std::string()) << "\n";
+                if (def.contains("inputs") && def["inputs"].is_array() && !def["inputs"].empty()) {
+                    std::cout << "  inputs:  " << def["inputs"].dump() << "\n";
+                }
+            }
+            if (r.value("hasProposal", false) && r.contains("proposal") && r["proposal"].is_object()) {
+                const json& p = r["proposal"];
+                std::cout << "  PROPOSAL pending (by " << p.value("by", std::string())
+                          << ", engine " << p.value("engine", std::string()) << ")\n"
+                          << "    request:   " << p.value("request", std::string()) << "\n"
+                          << "    rationale: " << p.value("rationale", std::string()) << "\n";
+                const json& dry = r.value("dryRun", json::object());
+                if (dry.is_object()) {
+                    std::cout << "    dry run: " << dry.value("count", 0) << " job(s)\n";
+                }
+            }
+            if (r.contains("state")) {
+                std::cout << "  inputs: " << r.value("state", std::string());
+                if (r.value("state", std::string()) == "stale") {
+                    std::cout << "  added=" << r.value("added", json::array()).dump()
+                              << " removed=" << r.value("removed", json::array()).dump()
+                              << " changed=" << r.value("changed", json::array()).dump()
+                              << " absorbed=" << r.value("absorbed", json::array()).dump();
+                }
+                std::cout << "\n";
+            }
+            if (r.contains("lastRun") && r["lastRun"].is_object()) {
+                std::cout << "  last run: " << r["lastRun"].value("runId", std::string())
+                          << " (" << r["lastRun"].value("state", std::string()) << ")\n";
+            }
+            if (r.contains("newlyFailed") || r.contains("fixed")) {
+                std::cout << "  vs previous: newlyFailed=" << r.value("newlyFailed", json::array()).dump()
+                          << " fixed=" << r.value("fixed", json::array()).dump() << "\n";
+            }
+            if (r.contains("nodes") && r["nodes"].is_array()) {
+                std::cout << "  node                                   state        ms     tests\n";
+                for (const auto& node : r["nodes"]) {
+                    std::cout << "  " << std::left << std::setw(38) << node.value("node", std::string())
+                              << std::setw(13) << node.value("state", std::string())
+                              << std::setw(7) << node.value("duration_ms", 0);
+                    bool first = true;
+                    if (node.contains("jobs") && node["jobs"].is_array()) {
+                        for (const auto& job : node["jobs"]) {
+                            if (job.contains("test_report_summary") && job["test_report_summary"].is_object()) {
+                                const json& s = job["test_report_summary"];
+                                std::cout << (first ? "" : ",") << s.value("total", 0) << "/"
+                                          << s.value("failed", 0) << "f/" << s.value("skipped", 0) << "s";
+                                first = false;
+                            }
+                        }
+                    }
+                    std::cout << std::right << "\n";
+                }
+            }
+        } else if (action == "routine_run") {
+            if (r.value("inputsState", std::string()) == "stale") {
+                const json& diff = r.value("inputDiff", json::object());
+                std::cout << "WARNING: routine inputs are stale: +" << diff.value("added", json::array()).size()
+                          << " -" << diff.value("removed", json::array()).size()
+                          << " ~" << diff.value("changed", json::array()).size() << "\n";
+            }
+            std::cout << "runId: " << r.value("runId", std::string())
+                      << "  state: " << r.value("state", std::string())
+                      << "  taskqueue: " << r.value("taskqueue", std::string()) << "\n";
+            if (r.contains("nodes") && r["nodes"].is_array()) {
+                for (const auto& node : r["nodes"]) {
+                    std::cout << "  " << node.value("node", std::string()) << "  "
+                              << node.value("state", std::string()) << "  "
+                              << node.value("duration_ms", 0) << " ms\n";
+                }
+            }
+            if (r.value("waited", false) && r.value("state", std::string()) != "succeeded") return 1;
+        } else if (action == "routine_check") {
+            std::cout << "state: " << r.value("state", std::string()) << "\n"
+                      << "  added:    " << r.value("added", json::array()).dump() << "\n"
+                      << "  removed:  " << r.value("removed", json::array()).dump() << "\n"
+                      << "  changed:  " << r.value("changed", json::array()).dump() << "\n"
+                      << "  absorbed: " << r.value("absorbed", json::array()).dump() << "\n";
+        } else if (action == "routine_ask") {
+            std::cout << "Proposed routine " << r.value("name", std::string())
+                      << " [" << r.value("scope", std::string()) << "] via "
+                      << r.value("engine", std::string()) << "/" << r.value("model", std::string()) << "\n"
+                      << "  summary:   " << r.value("summary", std::string()) << "\n"
+                      << "  rationale: " << r.value("rationale", std::string()) << "\n";
+            if (r.contains("warning")) std::cout << "  WARNING: " << r.value("warning", std::string()) << "\n";
+            const json& dry = r.value("dryRun", json::object());
+            if (dry.is_object()) {
+                std::cout << "  dry run: " << dry.value("count", 0) << " job(s)\n";
+                if (dry.contains("jobs") && dry["jobs"].is_array()) {
+                    for (const auto& row : dry["jobs"]) {
+                        std::cout << "    " << row.value("node", std::string()) << ": "
+                                  << row.value("command", std::string()) << "\n";
+                    }
+                }
+            }
+            std::cout << "  status: proposed (approve with `routine approve <name> --user-said \"...\"`)\n";
+        } else if (action == "routine_approve" || action == "routine_reject") {
+            std::cout << "Routine " << r.value("name", std::string()) << ": "
+                      << r.value("status", std::string()) << "\n";
+            if (action == "routine_approve") {
+                std::cout << "  approved via: " << r.value("approvedVia", std::string()) << "\n";
+            } else {
+                std::cout << "  reason: " << r.value("reason", std::string()) << "\n";
+            }
+        } else if (action == "routine_save_from_bt") {
+            std::cout << "Routine " << r.value("name", std::string())
+                      << " saved from BT [" << r.value("scope", std::string()) << "]\n";
+        } else {
+            std::cout << r.dump(2) << "\n";
+        }
+        return 0;
     }
 
     if (action.rfind("triage_", 0) == 0) {
@@ -7151,6 +7327,161 @@ if (subcmd == "start" || subcmd == "run") {
                 << "\",\"jobs\":" << jobs.dump()
                 << ",\"concurrency\":1,\"origin\":" << BuildCallerOriginJson("hancho-cli-cli", "") << "}";
         subcmd = "taskqueue_add";
+    }
+    else if (subcmd == "routine") {
+        auto printRoutineHelp = []() {
+            std::cout
+                << "Usage: hancho-cli routine <subcommand> [options] [--json]\n\n"
+                << "Subcommands:\n"
+                << "  list                                               List saved routines\n"
+                << "  show <name>                                        Definition and last run's node results\n"
+                << "  run <name> [--wait] [--timeout-ms <n>]             Run by name with a fresh run id\n"
+                << "  save --name <n> --file <bt.json> [--inputs <glob> ...]\n"
+                << "                                [--summary <text>] [--project|--data] --reason <text>\n"
+                << "                                                     Register or update a routine\n"
+                << "  check <name>                                       Compare inputs with the saved snapshot (ok/stale)\n"
+                << "  ask \"<what you want>\" [--name <n>] [--cwd <dir>]   Let a worker LLM create/fix a routine\n"
+                << "                                [--wait] [--scope <project|data>]\n"
+                << "  approve <name> --user-said \"<your words>\"          Approve a proposed routine\n"
+                << "  reject <name> --reason \"<why>\"                     Reject a proposed routine\n"
+                << "  save --name <n> --from-bt <btId> [--project|--data] Register a past BT as a routine\n\n"
+                << "Definitions: <cwd>/.hancho/routines/<name>.json (project) or\n"
+                << "             <data-dir>/routines/<name>.json (data). Project wins on name clashes.\n"
+                << "Proposals are kept in <dir>/.proposals/ and never run until approved.\n";
+        };
+        auto routineFail = [&](const std::string& msg) -> int {
+            if (jsonOutput) {
+                std::cout << "{\"ok\":false,\"error\":\"" << JsonEscape(msg) << "\"}\n";
+            } else {
+                std::cerr << "Error: " << msg << "\n";
+            }
+            return 1;
+        };
+
+        const std::string op = (args.size() >= 3) ? args[2] : "";
+        if (op.empty() || op == "--help" || op == "-h" || op == "help") {
+            printRoutineHelp();
+            return 0;
+        }
+
+        std::string name;
+        std::string file;
+        std::string summary;
+        std::string notes;
+        std::string reason;
+        std::string scope;
+        std::string cwdArg;
+        std::string request;
+        std::string userSaid;
+        std::string fromBt;
+        std::vector<std::string> inputs;
+        bool wait = false;
+        int timeoutMs = 60000;
+        for (size_t i = 3; i < args.size(); ++i) {
+            const std::string& a = args[i];
+            if (a == "--name" && i + 1 < args.size()) name = args[++i];
+            else if (a == "--file" && i + 1 < args.size()) file = args[++i];
+            else if (a == "--summary" && i + 1 < args.size()) summary = args[++i];
+            else if (a == "--notes" && i + 1 < args.size()) notes = args[++i];
+            else if (a == "--reason" && i + 1 < args.size()) reason = args[++i];
+            else if (a == "--scope" && i + 1 < args.size()) scope = args[++i];
+            else if (a == "--cwd" && i + 1 < args.size()) cwdArg = args[++i];
+            else if (a == "--request" && i + 1 < args.size()) request = args[++i];
+            else if (a == "--user-said" && i + 1 < args.size()) userSaid = args[++i];
+            else if (a == "--from-bt" && i + 1 < args.size()) fromBt = args[++i];
+            else if ((a == "--inputs" || a == "--input") && i + 1 < args.size()) inputs.push_back(args[++i]);
+            else if (a == "--wait") wait = true;
+            else if (a == "--timeout-ms" && i + 1 < args.size()) timeoutMs = std::atoi(args[++i].c_str());
+            else if (a == "--project") scope = "project";
+            else if (a == "--data") scope = "data";
+            else if (!a.empty() && a[0] != '-') {
+                if (op == "ask" && request.empty()) request = a;
+                else if (name.empty()) name = a;
+            }
+        }
+        const std::string cwd = cwdArg.empty()
+                                    ? WideToUtf8(GetCurrentDirectoryWide())
+                                    : ResolveAbsolutePathUtf8(cwdArg);
+
+        nlohmann::json jReq;
+        if (op == "list") {
+            jReq["action"] = "routine_list";
+            jReq["cwd"] = cwd;
+            subcmd = "routine_list";
+        } else if (op == "show" || op == "check" || op == "run") {
+            if (name.empty()) return routineFail("routine name is required");
+            jReq["action"] = "routine_" + op;
+            jReq["name"] = name;
+            jReq["cwd"] = cwd;
+            if (op == "run") {
+                jReq["wait"] = wait;
+                jReq["timeout_ms"] = timeoutMs;
+                jReq["origin"] = nlohmann::json::parse(BuildCallerOriginJson("hancho-cli-cli", ""), nullptr, false);
+            }
+            subcmd = "routine_" + op;
+        } else if (op == "save" && fromBt.empty()) {
+            if (name.empty()) return routineFail("--name is required for routine save");
+            if (file.empty()) return routineFail("--file is required for routine save (or use --from-bt)");
+            const std::wstring absW = ResolveAbsolutePathWide(Utf8ToWide(file));
+            std::ifstream ifs(NativePath(absW), std::ios::binary);
+            if (!ifs) return routineFail("cannot read BT file: " + file);
+            std::ostringstream ss;
+            ss << ifs.rdbuf();
+            jReq["action"] = "routine_save";
+            jReq["name"] = name;
+            jReq["cwd"] = cwd;
+            jReq["bt"] = ss.str();
+            jReq["inputs"] = inputs;
+            jReq["summary"] = summary;
+            jReq["notes"] = notes;
+            jReq["scope"] = scope.empty() ? "project" : scope;
+            jReq["reason"] = reason;
+            jReq["by"] = "hancho-cli";
+            subcmd = "routine_save";
+        } else if (op == "save" && !fromBt.empty()) {
+            if (name.empty()) return routineFail("--name is required for routine save");
+            jReq["action"] = "routine_save_from_bt";
+            jReq["name"] = name;
+            jReq["btId"] = fromBt;
+            jReq["cwd"] = cwd;
+            jReq["scope"] = scope.empty() ? "project" : scope;
+            jReq["reason"] = reason;
+            jReq["by"] = "hancho-cli";
+            subcmd = "routine_save_from_bt";
+        } else if (op == "ask") {
+            if (request.empty()) return routineFail("request text is required for routine ask");
+            jReq["action"] = "routine_ask";
+            jReq["request"] = request;
+            jReq["cwd"] = cwd;
+            jReq["scope"] = scope.empty() ? "project" : scope;
+            jReq["by"] = "chat";
+            jReq["wait"] = wait;
+            jReq["timeout_ms"] = timeoutMs;
+            if (!name.empty()) jReq["name"] = name;
+            subcmd = "routine_ask";
+        } else if (op == "approve") {
+            if (name.empty()) return routineFail("routine name is required");
+            if (userSaid.empty()) return routineFail("--user-said is required (an empty value means reject)");
+            jReq["action"] = "routine_approve";
+            jReq["name"] = name;
+            jReq["cwd"] = cwd;
+            jReq["userSaid"] = userSaid;
+            jReq["via"] = "chat";
+            jReq["by"] = "chat";
+            subcmd = "routine_approve";
+        } else if (op == "reject") {
+            if (name.empty()) return routineFail("routine name is required");
+            if (reason.empty()) return routineFail("--reason is required for routine reject");
+            jReq["action"] = "routine_reject";
+            jReq["name"] = name;
+            jReq["cwd"] = cwd;
+            jReq["reason"] = reason;
+            jReq["by"] = "chat";
+            subcmd = "routine_reject";
+        } else {
+            return routineFail("unknown routine command: " + op);
+        }
+        reqJson << jReq.dump();
     }
     else if (subcmd == "bt") {
         auto printBtHelp = []() {

@@ -1046,9 +1046,9 @@ int main() {
         };
         nlohmann::json list = BtTemplateListJson();
         Check(list.value("ok", false) && list["templates"].is_array() &&
-              list["templates"].size() == 2 &&
+              list["templates"].size() == 3 &&
               list.value("note", std::string()).find("<...>") != std::string::npos,
-              "091-4: template list has two entries and a placeholder note");
+              "091-4/093-2: template list has three entries and a placeholder note");
         Check(BtTemplateDefinition("does-not-exist").is_null() &&
               !BtTemplateResult("does-not-exist").value("ok", true),
               "091-4: unknown template is rejected");

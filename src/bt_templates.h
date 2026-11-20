@@ -18,7 +18,8 @@ struct BtTemplateEntry {
 
 inline constexpr const char* kBtTemplateNote =
     "Replace every <...> placeholder with a real value (do not use ${...}) before "
-    "bt validate / bt start. {engine} and {model} are intentional runtime placeholders.";
+    "bt validate / bt start. {engine}, {model} and the foreach expansions "
+    "${t.*} / ${foreach:...} are intentional runtime placeholders.";
 
 inline const char* const kResilientWorkerTemplate = R"JSON({
   "id": "resilient-worker",
@@ -185,12 +186,46 @@ inline const char* const kCardSequenceTemplate = R"JSON({
   }
 })JSON";
 
+inline const char* const kTestSuiteTemplate = R"JSON({
+  "id": "test-suite",
+  "summary": "Build all targets, then run every smoke test found under tests/",
+  "intent": "Build once and run a glob-driven smoke suite; replace <...> placeholders before validation",
+  "root": {
+    "type": "sequence",
+    "children": [
+      {
+        "type": "job",
+        "id": "build",
+        "summary": "Build Hancho and every smoke test",
+        "command": "cmake --build build --config Release --target Hancho HanchoChat HanchoTerm wct hancho-cli ${foreach:tests/*_smoke.cpp:stem: }",
+        "timeoutSec": 3600
+      },
+      {
+        "type": "foreach",
+        "id": "smokes",
+        "glob": "tests/*_smoke.cpp",
+        "as": "t",
+        "mode": "all",
+        "do": {
+          "type": "job",
+          "id": "test_${t.stem}",
+          "command": "build\\Release\\${t.stem}.exe",
+          "summary": "Run ${t.stem}",
+          "timeoutSec": 900
+        }
+      }
+    ]
+  }
+})JSON";
+
 inline std::vector<BtTemplateEntry> BtTemplateEntries() {
     return {
         {"resilient-worker",
          "Worker with idle defaults, probe, two approved engines, catch handlers and takeover-ready escalation."},
         {"card-sequence",
-         "ww cards in order, each hang-protected with engines and catch, plus a build job after each card."}
+         "ww cards in order, each hang-protected with engines and catch, plus a build job after each card."},
+        {"test-suite",
+         "Build targets with ${foreach:...}, then run each tests/*_smoke.cpp via a foreach node (mode all)."}
     };
 }
 
@@ -198,6 +233,7 @@ inline nlohmann::json BtTemplateDefinition(const std::string& name) {
     const char* text = nullptr;
     if (name == "resilient-worker") text = kResilientWorkerTemplate;
     else if (name == "card-sequence") text = kCardSequenceTemplate;
+    else if (name == "test-suite") text = kTestSuiteTemplate;
     else return nullptr;
     return nlohmann::json::parse(text, nullptr, false);
 }

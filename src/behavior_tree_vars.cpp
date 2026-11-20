@@ -201,6 +201,43 @@ bool BehaviorTree::Impl::ExpandString(const BehaviorTree& bt,
             size_t closePos = input.find('}', i + 2);
             if (closePos != std::string::npos) {
                 std::string varName = input.substr(i + 2, closePos - (i + 2));
+                if (varName.rfind("foreach:", 0) == 0) {
+                    // ${foreach:<glob>:<field>:<sep>} expands to a joined list at launch time.
+                    // Each value is a separate command argument, so quoting is not applied.
+                    const std::string rest = varName.substr(8);
+                    size_t c1 = rest.find(':');
+                    size_t c2 = c1 == std::string::npos ? std::string::npos : rest.find(':', c1 + 1);
+                    if (c1 == std::string::npos || c2 == std::string::npos) {
+                        outUndefinedVar = varName;
+                        return false;
+                    }
+                    const std::string glob = rest.substr(0, c1);
+                    const std::string field = rest.substr(c1 + 1, c2 - c1 - 1);
+                    std::string sep = rest.substr(c2 + 1);
+                    if (sep.empty()) sep = " ";
+                    if (field != "stem" && field != "name" && field != "path" && field != "index") {
+                        outUndefinedVar = varName;
+                        return false;
+                    }
+                    std::vector<std::string> paths;
+                    if (glob.empty() || !ExpandBtGlob(bt.cwd_, glob, {}, paths)) {
+                        outUndefinedVar = varName;
+                        return false;
+                    }
+                    std::string joined;
+                    for (size_t k = 0; k < paths.size(); ++k) {
+                        std::string v;
+                        if (field == "stem") v = BtPathStem(paths[k]);
+                        else if (field == "name") v = BtPathName(paths[k]);
+                        else if (field == "path") v = paths[k];
+                        else v = std::to_string(k);
+                        if (k > 0) joined += sep;
+                        joined += v;
+                    }
+                    outExpanded += joined;
+                    i = closePos + 1;
+                    continue;
+                }
                 std::string val;
                 if (!LookupVar(bt, varName, val)) {
                     outUndefinedVar = varName;

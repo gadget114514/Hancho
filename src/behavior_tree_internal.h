@@ -175,6 +175,17 @@ struct BtNode {
     int catchHandlerIndex = -1;
     std::string catchHandler;  // label of the selected handler, kept in state and nodeFinished detail
 
+    // foreach node parameters (093-2). `doChild` is the unexpanded template; once the node
+    // first ticks, one concrete copy per glob match is stored in `children`.
+    std::string foreachGlob;
+    std::string foreachAs = "t";
+    std::string foreachMode = "sequence"; // "sequence", "parallel", or "all"
+    std::vector<std::string> foreachExclude;
+    int foreachMinMatches = 0;
+    std::unique_ptr<BtNode> doChild;
+    bool foreachExpanded = false;
+    bool isForeachChild = false;
+
     // Child pointers
     std::vector<std::unique_ptr<BtNode>> children;
     std::unique_ptr<BtNode> condChild;
@@ -275,6 +286,9 @@ struct BehaviorTree::Impl {
     // Execution helpers (behavior_tree_exec.cpp)
     void ResetSubtreeForRun(BehaviorTree& bt, BtNode& node, bool resetHistory);
     void CancelSubtreeJobs(BehaviorTree& bt, BtNode& node, bool markSkipped);
+    // 093-2: expands a foreach node's `do` template into one child per glob match. On failure
+    // the node is failed and a nodeFinished event is emitted; on success children are ready to tick.
+    bool ExpandForeachNode(BehaviorTree& bt, BtNode& node, int64_t nowMs);
     // Reopens the ancestors of `target` and discards the results of every child that runs
     // after the one containing `target` (behavior_tree_runtime.cpp).
     bool ReopenAncestorsToTarget(BehaviorTree& bt, BtNode* cur, BtNode* target, bool resetCounters);
@@ -297,6 +311,14 @@ struct BehaviorTree::Impl {
 std::wstring ResolveBtPathWide(const std::string& cwdUtf8, const std::string& relOrAbsUtf8);
 std::string FormatEpochMsIso(int64_t nowMs);
 bool NavigateJsonPath(const json& root, const std::string& path, json& outVal);
+
+// 093-2: glob matcher used by the foreach node and ${foreach:...} expansion. Patterns are
+// relative to cwdUtf8 and use '/' separators; `*` / `?` never cross a segment and `**`
+// matches zero or more segments. Results are relative paths with '/' separators, sorted.
+bool ExpandBtGlob(const std::string& cwdUtf8, const std::string& globUtf8,
+                  const std::vector<std::string>& excludes, std::vector<std::string>& outPaths);
+std::string BtPathStem(const std::string& relPath);
+std::string BtPathName(const std::string& relPath);
 
 std::unique_ptr<BtNode> ParseSingleNodeJson(const json& j,
                                             const std::string& path,

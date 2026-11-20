@@ -7,8 +7,145 @@
 #include <algorithm>
 #include <cstdio>
 #include <ctime>
+#include <filesystem>
+#include <set>
 
 namespace pc {
+
+namespace {
+
+std::string NormalizeBtGlob(std::string s) {
+    for (char& c : s) if (c == '\\') c = '/';
+    return s;
+}
+
+// Iterative wildcard match for one path segment (`*` and `?` never match '/' because
+// segments are split before this runs).
+bool WildcardSegmentMatch(const std::string& pat, const std::string& text) {
+    size_t p = 0, t = 0;
+    size_t star = std::string::npos, starText = 0;
+    while (t < text.size()) {
+        if (p < pat.size() && (pat[p] == '?' || pat[p] == text[t])) {
+            p++;
+            t++;
+        } else if (p < pat.size() && pat[p] == '*') {
+            star = p++;
+            starText = t;
+        } else if (star != std::string::npos) {
+            p = star + 1;
+            t = ++starText;
+        } else {
+            return false;
+        }
+    }
+    while (p < pat.size() && pat[p] == '*') p++;
+    return p == pat.size();
+}
+
+std::vector<std::string> SplitBtSegments(const std::string& s) {
+    std::vector<std::string> out;
+    size_t start = 0;
+    while (start <= s.size()) {
+        size_t end = s.find('/', start);
+        if (end == std::string::npos) end = s.size();
+        if (end > start) out.push_back(s.substr(start, end - start));
+        start = end + 1;
+    }
+    return out;
+}
+
+bool BtGlobSegmentsMatch(const std::vector<std::string>& pat,
+                         const std::vector<std::string>& path,
+                         size_t pi, size_t si) {
+    if (pi == pat.size()) return si == path.size();
+    if (pat[pi] == "**") {
+        if (BtGlobSegmentsMatch(pat, path, pi + 1, si)) return true;
+        if (si < path.size() && BtGlobSegmentsMatch(pat, path, pi, si + 1)) return true;
+        return false;
+    }
+    if (si >= path.size()) return false;
+    if (!WildcardSegmentMatch(pat[pi], path[si])) return false;
+    return BtGlobSegmentsMatch(pat, path, pi + 1, si + 1);
+}
+
+bool BtGlobPathMatch(const std::vector<std::string>& pat, const std::vector<std::string>& path) {
+    return BtGlobSegmentsMatch(pat, path, 0, 0);
+}
+
+} // namespace
+
+bool ExpandBtGlob(const std::string& cwdUtf8, const std::string& globUtf8,
+                  const std::vector<std::string>& excludes, std::vector<std::string>& outPaths) {
+    outPaths.clear();
+    const std::string glob = NormalizeBtGlob(globUtf8);
+    if (glob.empty()) return false;
+    const std::vector<std::string> pat = SplitBtSegments(glob);
+    if (pat.empty()) return false;
+
+    std::vector<std::vector<std::string>> exPats;
+    for (const auto& rawEx : excludes) {
+        std::vector<std::string> ex = SplitBtSegments(NormalizeBtGlob(rawEx));
+        if (!ex.empty()) exPats.push_back(std::move(ex));
+    }
+
+    std::error_code ec;
+    std::filesystem::path base = cwdUtf8.empty()
+        ? std::filesystem::current_path(ec)
+        : std::filesystem::path(Utf8ToWide(cwdUtf8));
+    if (ec) return false;
+
+    size_t maxDepth = 0;
+    bool recursive = false;
+    for (const auto& seg : pat) {
+        if (seg == "**") recursive = true;
+        else maxDepth++;
+    }
+    if (!recursive) {
+        for (const auto& ex : exPats) {
+            for (const auto& seg : ex) if (seg == "**") recursive = true;
+        }
+    }
+
+    std::set<std::string> found;
+    std::filesystem::recursive_directory_iterator it(base, std::filesystem::directory_options::skip_permission_denied, ec);
+    std::filesystem::recursive_directory_iterator end;
+    for (; !ec && it != end; it.increment(ec)) {
+        if (recursive && maxDepth > 0 && it.depth() >= static_cast<int>(maxDepth + 32)) {
+            it.disable_recursion_pending();
+            continue;
+        }
+        if (!recursive && it.depth() >= static_cast<int>(pat.size())) {
+            it.disable_recursion_pending();
+        }
+        if (!it->is_regular_file(ec)) continue;
+        std::filesystem::path rel = it->path().lexically_relative(base);
+        std::string relStr = rel.generic_string();
+        for (char& c : relStr) if (c == '\\') c = '/';
+        while (relStr.rfind("./", 0) == 0) relStr = relStr.substr(2);
+        if (relStr.empty()) continue;
+        const std::vector<std::string> segs = SplitBtSegments(relStr);
+        if (!BtGlobPathMatch(pat, segs)) continue;
+        bool excluded = false;
+        for (const auto& ex : exPats) {
+            if (BtGlobPathMatch(ex, segs)) { excluded = true; break; }
+        }
+        if (!excluded) found.insert(relStr);
+    }
+    outPaths.assign(found.begin(), found.end());
+    return true;
+}
+
+std::string BtPathName(const std::string& relPath) {
+    size_t slash = relPath.find_last_of("/\\");
+    return slash == std::string::npos ? relPath : relPath.substr(slash + 1);
+}
+
+std::string BtPathStem(const std::string& relPath) {
+    std::string name = BtPathName(relPath);
+    size_t dot = name.find_last_of('.');
+    if (dot == std::string::npos || dot == 0) return name;
+    return name.substr(0, dot);
+}
 
 std::wstring ResolveBtPathWide(const std::string& cwdUtf8, const std::string& relOrAbsUtf8) {
     if (relOrAbsUtf8.empty()) return ResolveAbsolutePathWide(Utf8ToWide(cwdUtf8));
@@ -242,7 +379,8 @@ void BehaviorTree::Impl::ResetSubtreeForRun(BehaviorTree& bt, BtNode& node, bool
         node.engineCandidateIndex = 0;
     } else if (node.type == "retry" || node.type == "repeat" ||
                node.type == "sequence" || node.type == "fallback" ||
-               node.type == "parallel" || node.type == "if" || node.type == "catch") {
+               node.type == "parallel" || node.type == "foreach" ||
+               node.type == "if" || node.type == "catch") {
         node.runs = 0;
     }
     if (node.type == "catch") {
@@ -372,7 +510,7 @@ int64_t RepeatBudgetSec(const BtNode& node, int64_t childBudget) {
 int64_t FullBudgetSec(const BtNode& node) {
     const std::string& t = node.type;
     if (t == "job" || t == "worker" || t == "probe" || t == "wait") return ClampEstimateSec(LeafBudgetSec(node));
-    if (t == "sequence") {
+    if (t == "sequence" || t == "foreach") {
         int64_t sum = 0;
         for (const auto& c : node.children) sum += FullBudgetSec(*c);
         return ClampEstimateSec(sum);
@@ -424,10 +562,10 @@ int64_t PendingNodeSec(const BtNode& node) {
         // Running jobs are already part of the task queue's remaining time.
         return node.state == "idle" ? ClampEstimateSec(LeafBudgetSec(node)) : 0;
     }
-    if (t == "sequence") {
+    if (t == "sequence" || t == "foreach") {
         int64_t sum = 0;
         for (const auto& c : node.children) {
-            if (c->state == "failed") return 0;
+            if (c->state == "failed" && t == "sequence") return 0;
             sum += PendingNodeSec(*c);
         }
         return ClampEstimateSec(sum);
@@ -509,7 +647,7 @@ void CollectPlannedTasks(const BtNode& node, const BehaviorTree& bt,
         out.push_back(std::move(task));
         return;
     }
-    if (t == "sequence") {
+    if (t == "sequence" || t == "foreach" || t == "parallel") {
         for (const auto& c : node.children) CollectPlannedTasks(*c, bt, out);
         return;
     }

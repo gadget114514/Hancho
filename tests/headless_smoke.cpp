@@ -308,9 +308,18 @@ int main() {
     Check(exitWait == WAIT_OBJECT_0, "headless core exits after quit");
     CloseHandle(pi.hProcess);
 
-    // 5. After the core is gone, the pipe is no longer served.
+    // 5. After the core is gone, the pipe is no longer served. The short-lived launcher
+    // exits before the role-named core and quit answers before shutdown starts, so wait
+    // for the pipe instead of assuming the core stopped immediately.
     json pingAfter;
-    Check(!IpcCall({{"action", "ping"}}, pingAfter) || !pingAfter.value("ok", false),
+    bool stillServed = false;
+    for (int i = 0; i < 150; ++i) {
+        pingAfter = json();
+        stillServed = IpcCall({{"action", "ping"}}, pingAfter);
+        if (!stillServed || !pingAfter.value("ok", false)) break;
+        Sleep(100);
+    }
+    Check(!stillServed || !pingAfter.value("ok", false),
           "IPC is no longer served after the core exits");
 
     // 6. Launching GUI standalone with --no-prompt when core is not running exits with error

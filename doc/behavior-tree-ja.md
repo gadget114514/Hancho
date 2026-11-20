@@ -88,6 +88,7 @@ Hancho のビヘイビアツリー (BT) は、条件分岐 (`if`/`fallback`)、�
 | `sequence` | `"children": [...]` (非空配列) | 子を順番に実行。すべて成功すれば `succeeded`、1 つでも失敗した時点で `failed`。 |
 | `fallback` (別名 `selector`) | `"children": [...]` (非空配列) | 子を順番に実行し、最初に成功した時点で `succeeded`。すべて失敗したときのみ `failed`。 |
 | `parallel` | `"children": [...]` (非空配列) | 全子ノードを同時起動。任意 `"success"`: `"all"` (既定)、`"any"`、または整数 `1..N` (成功が必要な子の数)。結果確定時に残りの実行中子ノードをキャンセル。子ごとに専用のタスクキュー（ツリーIDと分岐から決まる）が割り当てられ、実際に並列実行される（リソースロックが競合すれば待機）。 |
+| `foreach` | `"glob"` (文字列), `"as"` (単純識別子), `"do"` (ノードの雛形) | `"glob"` に一致するファイル 1 件ごとに `"do"` を展開して実行する (パスは `cwd` 基準。`*` / `?` はセグメント内、`**` は複数セグメントに一致)。任意 `"mode"`: `"sequence"` (既定、最初の失敗で停止)、`"all"` (全子を流してから 1 つでも失敗なら失敗)、`"parallel"` (子ごとに別キュー)。任意 `"exclude"` (相対 glob の配列) と `"minMatches"` (一致数が少なければ失敗)。`"do"` 内では `${<as>.stem}` / `${<as>.name}` / `${<as>.path}` / `${<as>.index}` (0 起点) が使える。一致ファイルが変わると次回展開で子が作り直される。 |
 | `if` | `"cond"`, `"then"`, 任意 `"else"` | `"cond"` を評価し、成功なら `"then"`、失敗なら `"else"` (省略時は即 `succeeded`) を実行。 |
 | `catch` | `"child"` (オブジェクト), `"handlers"` (非空配列) | `"child"` を実行し、失敗したら最初に一致した handler の `do` を実行する (`class` は文字列・配列・`"*"`、`cause`、両方指定時は AND)。`"thenRetry": true` なら `"child"` を `"maxRetries"` 回まで再実行 (既定 `1`、`1..10`)。`"otherwise"` は `"fail"` (既定) またはノードオブジェクト。§11.3 参照。 |
 | `retry` | `"child"` | 必須 `"max"` (`1..100`)、任意 `"delaySec"` (または `"retryDelaySec"`, 既定 `0`)。`"child"` が失敗する間、最大 `"max"` 回まで実行する。 |
@@ -135,6 +136,7 @@ Hancho のビヘイビアツリー (BT) は、条件分岐 (`if`/`fallback`)、�
 - ノード実行時に文字列フィールド (`command`, `summary`, `cwd`, `env`, `prompt`, `instructionsText`, `set.value`, `fail.detail`, `escalate.question`/`guidance`, 条件ノードのパス・比較値) 内の `${name}` を展開します。
 - **未定義変数の検出**: ノードの実行・評価時に未定義の `${name}` があると、そのノードは `detail: "undefinedVar: <name>"` で即座に失敗します。
 - **`command` での自動クォート**: `job` の `"command"` 内に書かれた `${...}` は、`QuoteCommandArg` により単一の Windows コマンドライン引数として自動的にクォートされます (空白や特殊文字を含む値でも引数が分裂しません)。一方、`prompt`・`summary`・`set.value`・条件式など `"command"` 以外のフィールドではクォートを付けずにそのまま展開されます。
+- **一覧展開 `${foreach:<glob>:<field>:<sep>}`**: 起動時に `<glob>` を展開し、一致ごとの `<field>` (`stem` / `name` / `path` / `index`) を `<sep>` (既定は空白 1 つ) で連結します。各値は別のコマンド引数として扱われ、自動クォートは適用されません。`foreach` ノードの `exclude` は効かないため、一部を除外したい場合は glob 自体を絞ってください。
 
 ### 4.2 自動設定されるノード変数
 ノード `<node>` の実行開始・終了時に以下の変数が自動設定されます。
@@ -164,6 +166,41 @@ Hancho のビヘイビアツリー (BT) は、条件分岐 (`if`/`fallback`)、�
   "failCount": { "jsonFile": "build/report.json", "path": "summary.failed" }
 }
 ```
+
+### 4.4 `foreach` と `${foreach:...}` の例
+```json
+{
+  "id": "test-suite",
+  "root": {
+    "type": "sequence",
+    "children": [
+      {
+        "type": "job",
+        "id": "build",
+        "summary": "Build all targets",
+        "command": "cmake --build build --config Release --target Hancho hancho-cli ${foreach:tests/*_smoke.cpp:stem: }",
+        "timeoutSec": 3600
+      },
+      {
+        "type": "foreach",
+        "id": "smokes",
+        "glob": "tests/*_smoke.cpp",
+        "as": "t",
+        "mode": "all",
+        "exclude": ["tests/posix_core_smoke.cpp"],
+        "do": {
+          "type": "job",
+          "id": "test_${t.stem}",
+          "command": "build\\Release\\${t.stem}.exe",
+          "summary": "Run ${t.stem}",
+          "timeoutSec": 900
+        }
+      }
+    ]
+  }
+}
+```
+ビルドコマンドは glob で見つかった全 smoke ターゲットをビルドし、`foreach` ノードは生成された exe を順に実行して `exclude` のものは飛ばします。名前を付けて繰り返し使う場合は [ルーチン](routines-ja.md) を参照してください。
 
 ---
 

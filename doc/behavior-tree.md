@@ -88,6 +88,7 @@ Every node is a JSON object with a required `"type"` string and an optional `"id
 | `sequence` | `"children": [...]` (non-empty array) | Runs children in order. Succeeds when all succeed; fails immediately on the first child failure. |
 | `fallback` (or `selector`) | `"children": [...]` (non-empty array) | Runs children in order until one succeeds. Fails only if all children fail. |
 | `parallel` | `"children": [...]` (non-empty array) | Starts all children concurrently. Optional `"success"`: `"all"` (default), `"any"`, or integer `1..N` (number of children required to succeed). Cancels remaining running children once the outcome is decided. |
+| `foreach` | `"glob"` (string), `"as"` (simple identifier), `"do"` (node template) | Expands `"do"` once per matching file (paths are relative to `cwd`; `*` / `?` work inside one segment, `**` spans segments). Optional `"mode"`: `"sequence"` (default, stop at the first failure), `"all"` (run every child, then fail if any failed), `"parallel"` (one queue per child). Optional `"exclude"` (array of relative glob strings) and `"minMatches"` (integer; fail if fewer matches). Inside `"do"`, use `${<as>.stem}`, `${<as>.name}`, `${<as>.path}`, or `${<as>.index}` (0-based). Children are rebuilt on the next expansion when the matched files change. |
 | `if` | `"cond"` (object), `"then"` (object), optional `"else"` (object) | Evaluates `"cond"`. If `"cond"` succeeds, ticks `"then"`; if `"cond"` fails, ticks `"else"` (or succeeds immediately if `"else"` is omitted). |
 | `catch` | `"child"` (object), `"handlers"` (non-empty array) | Runs `"child"`; on failure, executes the `do` of the first matching handler (`class` string/array/`"*"`, `cause`, both = AND). `"thenRetry": true` re-runs `"child"` up to `"maxRetries"` (default `1`, `1..10`). `"otherwise"` is `"fail"` (default) or a node object. See §11.3. |
 | `retry` | `"child"` (object) | Required `"max"` (`1..100`). Optional `"delaySec"` (or `"retryDelaySec"`, default `0`). Re-runs `"child"` when it fails, up to `"max"` total runs. Succeeds as soon as `"child"` succeeds. |
@@ -135,6 +136,7 @@ Condition leaves complete in the same tick they are evaluated (`succeeded` when 
 - Any string field in a running node (`command`, `summary`, `cwd`, `env` values, `prompt`, `instructionsText`, `set.value`, `fail.detail`, `escalate.question`/`guidance`, condition paths/operands) expands `${name}`.
 - **Undefined variables**: Checked dynamically when a node executes. Referencing an undefined `${name}` immediately fails that node with `detail: "undefinedVar: <name>"`.
 - **Automatic quoting in `command`**: In a `job`'s `"command"`, each `${...}` placeholder is quoted as a single Windows command-line argument (`QuoteCommandArg`), preventing spaces or special characters in variable values from splitting arguments. In all other fields (`prompt`, `summary`, `set.value`, conditions), `${...}` is substituted verbatim without extra quotes.
+- **List expansion `${foreach:<glob>:<field>:<sep>}`**: expands `<glob>` at launch time and joins `<field>` (`stem`, `name`, `path`, `index`) for every match with `<sep>` (default a single space). Values are emitted as separate command arguments, so automatic quoting is not applied. Unlike a `foreach` node, this expansion has no `exclude` — use a narrower glob if some matches must be skipped.
 
 ### 4.2 Engine-Populated Node Variables
 When a node with key `<node>` runs or finishes, Hancho populates:
@@ -166,6 +168,41 @@ A `job` or `worker` node can extract variables into `vars` when the attempt fini
 ```
 - `regex`: Searches the job's log tail and stores capture group `group` (default `1`).
 - `jsonFile` + `path`: Reads the JSON file (relative to `cwd`) and extracts the value at `path`.
+
+### 4.4 `foreach` and `${foreach:...}` Example
+```json
+{
+  "id": "test-suite",
+  "root": {
+    "type": "sequence",
+    "children": [
+      {
+        "type": "job",
+        "id": "build",
+        "summary": "Build all targets",
+        "command": "cmake --build build --config Release --target Hancho hancho-cli ${foreach:tests/*_smoke.cpp:stem: }",
+        "timeoutSec": 3600
+      },
+      {
+        "type": "foreach",
+        "id": "smokes",
+        "glob": "tests/*_smoke.cpp",
+        "as": "t",
+        "mode": "all",
+        "exclude": ["tests/posix_core_smoke.cpp"],
+        "do": {
+          "type": "job",
+          "id": "test_${t.stem}",
+          "command": "build\\Release\\${t.stem}.exe",
+          "summary": "Run ${t.stem}",
+          "timeoutSec": 900
+        }
+      }
+    ]
+  }
+}
+```
+The build command builds every smoke target found by the glob; the `foreach` node runs each resulting exe and skips the excluded one. For a reusable, named version see [Routines](routines.md).
 
 ---
 

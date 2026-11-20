@@ -31,6 +31,8 @@ Hand Hancho one command, a queue of ordered jobs, or a whole behavior tree. It r
 
 See [Overview](doc/overview.md) for the working model in detail: `run_worker`, suspending the PC after a job, behavior trees, stable events and adapters, and how to leave Hancho without losing work.
 
+A behavior tree can also be saved as a named **routine** and re-run with `routine run <name>` — ideal for fixed chores like "build all targets and run every smoke test"; stale inputs and run results are tracked automatically. See [Routines](doc/routines.md).
+
 ### Executables
 
 | File | Description |
@@ -96,6 +98,7 @@ The skill starts with `hancho-cli.exe help --json`, so the commands it shows alw
 | [Console CLI](doc/cli.md) | `hancho-cli.exe` usage, JSON output, stdin modes, completion, `help --json` keys |
 | [Task Queue](doc/taskqueue.md) | Ordered jobs, dependencies, job fields, states, ChainGuard |
 | [Behavior Trees](doc/behavior-tree.md) | BT format, node types, variables, worker engines, escalate, examples |
+| [Routines](doc/routines.md) | Named, repeatable BT workflows: `routine list/show/run/save/check`, run ids, stale/absorbed, triage and dashboard |
 | [BT Token Optimization](doc/behavior-tree-token-optimization.md) | Token-saving architecture, `compact: true`, lightweight escalation packets |
 | [BT Design Plan](doc/behavior-tree-plan-en.md) | Architecture and implementation plan for the BT engine |
 | [MCP Server](doc/mcp.md) | MCP registration and the MCP tools |
@@ -120,6 +123,13 @@ The application icons are modeled on the character "Telephone Cat" (電話猫, D
 ## Release Notes
 
 
+
+### v0.9.37
+- **Routines**: save a behavior tree under a name and run it again without an LLM (`hancho-cli routine list/show/run/save/check`, MCP `routine_*`). Each run gets its own ID, so repeated runs do not collide. A `foreach` node expands a file glob at run time, so new tests are picked up automatically. Hancho reports a routine as `stale` when its input files change; a failed stale run opens a triage card. `routine ask` lets a worker LLM write or fix a routine, which runs only after you approve it. The dashboard has a Routines page.
+- **Hang handling**: startup hangs are detected early and diagnosed with likely causes and next steps. Behavior trees gain a `catch` node, defaults, failure variables, `bt template`, and validate warnings. Pre-approved worker / consult / supervisor LLM lists with probes, and a shared circuit breaker for broken engines.
+- **Worker permits**: a worker that is refused a permission is reported as `permission_denied` instead of a misdiagnosed failure. Approve permissions ahead of time with `hancho-cli permit` (MCP `permit_*`).
+- **`bt retry --from`** now also re-runs the nodes after the retried node, instead of keeping their old results.
+- **Dashboard**: the window title always shows the data directory. Task list origin filter with bulk actions per origin. MCP `dashboard_snapshot` and a tray "Save Screenshot" item.
 
 ### v0.9.36
 - **Usage panel time axis**: the 4h/24h token-usage bars now line up with the axis labels. Previously the bars were aligned to fixed two-hour boundaries while the labels showed `now - range` to `now`, so the whole chart could be shifted by up to one bucket.

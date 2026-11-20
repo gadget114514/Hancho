@@ -31,6 +31,7 @@
 #include <dwmapi.h>
 #include <uxtheme.h>
 #include <commdlg.h>
+#include "screenshot.h"
 #include <mmsystem.h>
 #include <map>
 #include <fstream>
@@ -635,6 +636,7 @@ enum ControlId {
     IDC_BTN_IPMSG = 1051,
     IDC_BTN_TERM_SESSIONS = 1052,  // active WCSP terminal connections
     IDC_BTN_REEVAL_PLANNED = 1053,
+    IDC_SAVE_SNAPSHOT = 1054,  // Ctrl+Shift+S / tray menu: save a PNG of the dashboard window
     IDC_COMBO_TASK_ORIGIN = 1055,  // origin filter for the task list (shown with the task search bar)
     IDC_SET_LANG_JA = 6001,
     IDC_SET_LANG_EN = 6002,
@@ -738,7 +740,8 @@ enum ControlId {
     IDM_TRAY_EXIT = 4004,
     IDM_TRAY_USAGE = 4005,
     IDM_TRAY_MEMORY = 4006,
-    IDM_TRAY_QUIT = 4007
+    IDM_TRAY_QUIT = 4007,
+    IDM_TRAY_SNAPSHOT = 4008
 };
 
 enum class ShellType {
@@ -888,10 +891,10 @@ struct DashboardState {
     HWND hwndUsageTip = nullptr;
     bool showUsagePanel = true;
     int usagePanelHeight = 170;
-    int usageRangeIndex = 1; // 0: 4h, 1: 24h (default), 2: 7d, 3: 30d, 4: 12m
+    int usageRangeIndex = 3; // 0: 1h, 1: 4h, 2: 12h, 3: 24h (default), 4: 7d, 5: 30d
     int usageGraphMode = 0; // 0: token kinds (default), 1: by provider/model
     int ganttRangeIndex = 2; // Task Gantt job count: 0: 3, 1: 5, 2: 10 (default)
-    bool restoreUsageGraph = false;
+    bool restoreUsageGraph = true;
     int64_t llmMaxEvents = kDefaultLlmMaxEvents;  // events kept per stream tracker; -1 = unlimited
     bool resourceLocks = true; // task queue resource locks (doc/resource-locks.md)
     bool showHiddenTasks = false; // include internal (e.g. Chat handler) jobs in the task list
@@ -9954,6 +9957,16 @@ static std::vector<ActivityRow> BuildActivityRows(const std::vector<MonitorEvent
     for (auto& r : rows) {
         for (int i = r.firstEvent; i <= r.lastEvent && i < static_cast<int>(events.size()); ++i) AddEventTokens(r, events[i]);
     }
+    // Usage is reported once per step, after the step's tool events, so it lies outside every row's
+    // range. Attribute it to the last activity before it.
+    for (int u = 0; u < static_cast<int>(events.size()); ++u) {
+        if (events[u].kind != "usage") continue;
+        int owner = -1;
+        for (int j = 0; j < static_cast<int>(rows.size()); ++j) {
+            if (rows[j].firstEvent < u) owner = j;
+        }
+        if (owner >= 0 && u > rows[owner].lastEvent) AddEventTokens(rows[owner], events[u]);
+    }
     return rows;
 }
 
@@ -10194,6 +10207,15 @@ static void BuildMonitorTreeRows(LlmStreamDlgState* ds, bool running) {
         // Other agents' events can lie between this row's first and last event.
         for (int k = t.firstEvent; k <= t.lastEvent && k < eventCount; ++k) {
             if (ds->events[k].agentId == t.agentId) AddEventTokens(tok, ds->events[k]);
+        }
+        // Usage follows the step's tool events, outside this row's range: attribute the usage of
+        // this agent that comes before the next activity of any row.
+        int nextStart = eventCount;
+        for (const auto& o : ds->treeRows) {
+            if (!o.isBranch && o.firstEvent > t.lastEvent && o.firstEvent < nextStart) nextStart = o.firstEvent;
+        }
+        for (int k = t.lastEvent + 1; k < nextStart && k < eventCount; ++k) {
+            if (ds->events[k].kind == "usage" && ds->events[k].agentId == t.agentId) AddEventTokens(tok, ds->events[k]);
         }
         t.tokIn = tok.tokIn;
         t.tokOut = tok.tokOut;
@@ -11821,8 +11843,9 @@ static void LoadShellConfig(DashboardState* st) {
     int graphMode = static_cast<int>(JsonGetInt(content, "usage_graph_mode", 0));
     if (graphMode < 0 || graphMode > 1) graphMode = 0;
     st->usageGraphMode = graphMode;
-    st->restoreUsageGraph = JsonGetBool(content, "restore_usage_graph", false);
+    st->restoreUsageGraph = JsonGetBool(content, "restore_usage_graph", true);
     SetUsageHistoryPersistence(st->restoreUsageGraph);
+    SetUsageRoundTime(JsonGetString(content, "usage_round_time", "05:00"));
     st->llmMaxEvents = ClampLlmMaxEvents(JsonGetInt(content, "llm_max_events", kDefaultLlmMaxEvents));
     SetLlmMaxEvents(st->llmMaxEvents);
     st->resourceLocks = JsonGetBool(content, "resource_locks", true);
@@ -11957,6 +11980,7 @@ static void SaveShellConfig(const DashboardState* st) {
         << "  \"kpi_saturation\": " << static_cast<int>(g_kpiSaturation * 100 + 0.5f) << ",\n"
         << "  \"usage_graph_mode\": " << st->usageGraphMode << ",\n"
         << "  \"restore_usage_graph\": " << (st->restoreUsageGraph ? "true" : "false") << ",\n"
+        << "  \"usage_round_time\": \"" << GetUsageRoundTime() << "\",\n"
         << "  \"llm_max_events\": " << st->llmMaxEvents << ",\n"
         << "  \"resource_locks\": " << (st->resourceLocks ? "true" : "false") << ",\n"
         << "  \"memory_max_bytes\": " << st->memoryMaxBytes << ",\n"
@@ -12145,17 +12169,9 @@ static void UpdateToolbarLabels(DashboardState* st) {
     }
 }
 
-static const wchar_t* const kMainWindowTitle = L"Hancho";
-
-// Adds the --data-dir override to the title so that several dashboards can be told apart.
+// The title always shows the effective data directory, even when it is the default.
 static std::wstring MainWindowTitle() {
-    std::wstring title = kMainWindowTitle;
-    const std::wstring dataDir = GetDataDirectoryOverride();
-    if (!dataDir.empty()) {
-        title += L" - ";
-        title += dataDir;
-    }
-    return title;
+    return DashboardWindowTitle(GetEffectiveDataDirectoryWide());
 }
 
 static void ApplyLanguageToUi(DashboardState* st) {
@@ -12553,6 +12569,40 @@ static void RestoreFromTray(DashboardState* st) {
     }
 }
 
+// Captures the dashboard window to <logs>\screenshots.
+// Returns the saved file path, or an empty string on failure.
+static std::wstring SaveDashboardSnapshot(DashboardState* st) {
+    if (!st || !st->hwndMain) return {};
+    const std::wstring path = NewSnapshotPath(L"dashboard");
+    std::string err;
+    if (!CaptureWindowPng(st->hwndMain, path, 0, nullptr, &err)) {
+        WriteAuditLog("SNAPSHOT", "dashboard capture failed: " + err);
+        return {};
+    }
+    return path;
+}
+
+static void SaveDashboardSnapshotWithFeedback(DashboardState* st) {
+    if (!st) return;
+    const std::wstring title = Tr(L"スクリーンショット", L"Screenshot", L"Captura de pantalla");
+    const std::wstring path = SaveDashboardSnapshot(st);
+    if (path.empty()) {
+        WriteAuditLog("SNAPSHOT", "dashboard screenshot failed");
+        gui_platform::GetGuiPlatform()->ShowMessageBox(
+            st->hwndMain, title,
+            Tr(L"スクリーンショットの保存に失敗しました。",
+               L"Failed to save the screenshot.",
+               L"No se pudo guardar la captura de pantalla."),
+            gui_platform::MessageBoxType::Error);
+        return;
+    }
+    WriteAuditLog("SNAPSHOT", "dashboard screenshot saved: " + WideToUtf8(path));
+    gui_platform::GetGuiPlatform()->ShowMessageBox(
+        st->hwndMain, title,
+        Tr(L"保存しました:\n", L"Saved:\n", L"Guardado:\n") + path,
+        gui_platform::MessageBoxType::Info);
+}
+
 static void ShowTrayContextMenu(DashboardState* st) {
     if (!st || !st->hwndMain) return;
     POINT pt = {};
@@ -12565,6 +12615,7 @@ static void ShowTrayContextMenu(DashboardState* st) {
     }
     AppendMenuW(hMenu, MF_STRING, IDM_TRAY_USAGE, Tr(L"トークン使用量グラフ", L"Token Usage Graph", L"Gráfico de uso de tokens"));
     AppendMenuW(hMenu, MF_STRING, IDM_TRAY_MEMORY, Tr(L"メモリ一覧...", L"Memory List...", L"Lista de memoria..."));
+    AppendMenuW(hMenu, MF_STRING, IDM_TRAY_SNAPSHOT, Tr(L"スクリーンショットを保存", L"Save Screenshot", L"Guardar captura"));
     if (IsWindowVisible(st->hwndMain)) {
         AppendMenuW(hMenu, MF_STRING, IDM_TRAY_HIDE, Tr(L"タスクトレイに格納", L"Hide to Tray", L"Ocultar en bandeja"));
     }
@@ -12596,6 +12647,10 @@ static void ShowTrayContextMenu(DashboardState* st) {
         GetClientRect(st->hwndMain, &rcClient);
         LayoutControls(st, rcClient.right, rcClient.bottom);
         InvalidateRect(st->hwndMain, nullptr, FALSE);
+    } else if (cmd == IDM_TRAY_SNAPSHOT) {
+        RestoreFromTray(st);
+        // Post so the capture runs after the restore has been painted.
+        PostMessageW(st->hwndMain, WM_COMMAND, IDC_SAVE_SNAPSHOT, 0);
     } else if (cmd == IDM_TRAY_MEMORY) {
         RestoreFromTray(st);
         ShowMemoryListDialog(st);
@@ -15744,10 +15799,10 @@ static void ShowSettingsDialog(DashboardState* st) {
 // ---------------------------------------------------------------------------
 // Token usage panel (docked below the KPI cards)
 // ---------------------------------------------------------------------------
-// Index 0-1 use live per-call history (time buckets), 2-3 daily rollups, 4 monthly rollups.
-static const int kUsageRangeCount = 5;
-static const int64_t kUsageRangeSec[kUsageRangeCount] = {4 * 3600, 86400, 7 * 86400, 30 * 86400, 365 * 86400};
-static const wchar_t* const kUsageRangeLabels[kUsageRangeCount] = {L"4h", L"24h", L"7d", L"30d", L"12m"};
+// Index 0-3 (1h / 4h / 12h / 24h) use live per-call history (time buckets), 4-5 (7d / 30d) daily rollups.
+static const int kUsageRangeCount = 6;
+static const int64_t kUsageRangeSec[kUsageRangeCount] = {3600, 4 * 3600, 12 * 3600, 86400, 7 * 86400, 30 * 86400};
+static const wchar_t* const kUsageRangeLabels[kUsageRangeCount] = {L"1h", L"4h", L"12h", L"24h", L"7d", L"30d"};
 static const RECT kUsageViewToggleRc = {292, 7, 324, 24};
 static const COLORREF kUsagePalette[] = {
     RGB(0x4F, 0x8C, 0xFF), RGB(0x3D, 0xD5, 0x98), RGB(0xFF, 0xB4, 0x54),
@@ -15767,8 +15822,8 @@ static std::wstring FormatCompactTokens(uint64_t v) {
 static void GetUsagePillRects(int width, RECT out[kUsageRangeCount], RECT& closeRc) {
     int x = 66;
     for (int i = 0; i < kUsageRangeCount; ++i) {
-        out[i] = {x, 7, x + 40, 24};
-        x += 44;
+        out[i] = {x, 7, x + 34, 24};
+        x += 36;
     }
     closeRc = {width - 28, 5, width - 8, 25};
 }
@@ -16204,8 +16259,8 @@ static void DrawUsagePanel(HWND hwnd, HDC hdc, DashboardState* st) {
     std::vector<std::vector<uint64_t>> valCache;
     std::vector<uint64_t> bucketTotal;
 
-    if (rangeIdx <= 1) {
-        // 4h / 24h: live U0 points. Buckets are aligned to the axis: bucket i covers
+    if (rangeIdx <= 3) {
+        // 1h / 4h / 12h / 24h: live U0 points. Buckets are aligned to the axis: bucket i covers
         // [since + i*bucketSec, since + (i+1)*bucketSec), so bars line up with the labels.
         int gx0_tmp = 58;
         int colW_tmp = (w - 24) / 3;
@@ -16220,51 +16275,25 @@ static void DrawUsagePanel(HWND hwnd, HDC hdc, DashboardState* st) {
 
         std::vector<LlmUsagePoint> points = GetLlmUsageHistory(since);
         if (points.empty()) {
-            // Daily rollups have no intra-day timestamps. Spread each record over the buckets
-            // between its first and last event instead of piling it all on the first second.
+            // Daily rollups carry no intra-day timestamps except the real first event time.
+            // Place each record once at its own first event time (never spread it over
+            // synthetic times). Records whose first event is outside the window are skipped.
             auto daily = ReadDailyUsageSummary("24h", "");
-            auto split = [](uint64_t total, int index, int count) -> uint64_t {
-                return total * (index + 1) / count - total * index / count;
-            };
             for (const auto& d : daily) {
-                int64_t first = d.firstEpochSec > 0 ? d.firstEpochSec : now;
-                int64_t last = d.lastEpochSec >= first ? d.lastEpochSec : first;
-                if (last < since || first > now) continue;
-                int64_t fullFirst = first;
-                int64_t fullLast = last;
-                if (first < since) first = since;
-                if (last > now) last = now;
-                if (last < first) last = first;
-                double overlap = (fullLast > fullFirst)
-                    ? static_cast<double>(last - first + 1) / static_cast<double>(fullLast - fullFirst + 1)
-                    : 1.0;
-                if (overlap > 1.0) overlap = 1.0;
-                auto scale = [overlap](uint64_t v) -> uint64_t {
-                    return overlap >= 1.0 ? v : static_cast<uint64_t>(std::llround(static_cast<double>(v) * overlap));
-                };
-                int chunks = 1;
-                if (bucketSec > 0.0) {
-                    double span = static_cast<double>(last - first) + 1.0;
-                    chunks = static_cast<int>(std::ceil(span / bucketSec));
-                    if (chunks < 1) chunks = 1;
-                    if (chunks > nBuckets) chunks = nBuckets;
-                }
-                for (int c = 0; c < chunks; ++c) {
-                    int64_t t0 = first + (last - first) * c / chunks;
-                    int64_t t1 = first + (last - first) * (c + 1) / chunks;
-                    LlmUsagePoint pt;
-                    pt.epochSec = (t0 + t1) / 2;
-                    pt.inputTokens = split(scale(d.inputTokens), c, chunks);
-                    pt.outputTokens = split(scale(d.outputTokens), c, chunks);
-                    pt.thinkingTokens = split(scale(d.thinkingTokens), c, chunks);
-                    pt.cacheReadTokens = split(scale(d.cacheReadTokens), c, chunks);
-                    pt.cacheWriteTokens = split(scale(d.cacheWriteTokens), c, chunks);
-                    pt.totalTokens = split(scale(d.totalTokens), c, chunks);
-                    pt.costUsd = d.costUsd * overlap / chunks;
-                    pt.agentType = d.engine;
-                    pt.model = d.model;
-                    points.push_back(pt);
-                }
+                if (d.firstEpochSec <= 0) continue;
+                if (d.firstEpochSec < since || d.firstEpochSec > now) continue;
+                LlmUsagePoint pt;
+                pt.epochSec = d.firstEpochSec;
+                pt.inputTokens = d.inputTokens;
+                pt.outputTokens = d.outputTokens;
+                pt.thinkingTokens = d.thinkingTokens;
+                pt.cacheReadTokens = d.cacheReadTokens;
+                pt.cacheWriteTokens = d.cacheWriteTokens;
+                pt.totalTokens = d.totalTokens;
+                pt.costUsd = d.costUsd;
+                pt.agentType = d.engine;
+                pt.model = d.model;
+                points.push_back(pt);
             }
         }
         for (const auto& p : points) {
@@ -16338,9 +16367,9 @@ static void DrawUsagePanel(HWND hwnd, HDC hdc, DashboardState* st) {
                 }
             }
         }
-    } else if (rangeIdx == 2 || rangeIdx == 3) {
+    } else if (rangeIdx == 4 || rangeIdx == 5) {
         // 7d or 30d: daily buckets from U1 daily rollups
-        int nDays = (rangeIdx == 2) ? 7 : 30;
+        int nDays = (rangeIdx == 4) ? 7 : 30;
         nBuckets = nDays;
         std::vector<std::string> dayKeys;
         dayKeys.reserve(nDays);
@@ -16382,70 +16411,6 @@ static void DrawUsagePanel(HWND hwnd, HDC hdc, DashboardState* st) {
             int bi = -1;
             for (int i = 0; i < nDays; ++i) {
                 if (dayKeys[i] == d.date) { bi = i; break; }
-            }
-            if (bi < 0 || bi >= nBuckets) continue;
-            std::string name = d.engine.empty() ? "unknown" : d.engine;
-            if (!d.model.empty()) name += " / " + d.model;
-            else name += " / (default)";
-            int k = getKeyIndex(name);
-            uint64_t pt = d.totalTokens;
-            if (pt == 0) pt = d.inputTokens + d.outputTokens + d.thinkingTokens + d.cacheReadTokens + d.cacheWriteTokens;
-            vals[bi][k] += pt;
-            valIn[bi][k] += d.inputTokens;
-            valOut[bi][k] += d.outputTokens;
-            valThink[bi][k] += d.thinkingTokens;
-            valCache[bi][k] += d.cacheReadTokens + d.cacheWriteTokens;
-            bucketTotal[bi] += pt;
-        }
-    } else {
-        // 12m: monthly buckets from U1 rollups summed by month
-        nBuckets = 12;
-        std::vector<std::string> monthKeys;
-        monthKeys.reserve(12);
-        time_t nowT = static_cast<time_t>(now);
-        std::tm curTm = {};
-        LocalTimeFromSec(&nowT, &curTm);
-        int curY = curTm.tm_year + 1900;
-        int curM = curTm.tm_mon + 1;
-        for (int i = 11; i >= 0; --i) {
-            int m = curM - i;
-            int y = curY;
-            while (m <= 0) { m += 12; y--; }
-            char buf[16];
-            snprintf(buf, sizeof(buf), "%04d-%02d", y, m);
-            monthKeys.push_back(buf);
-        }
-        std::string sinceStr = monthKeys.front() + "-01";
-        auto daily = ReadDailyUsageSummary(sinceStr, "");
-
-        for (const auto& d : daily) {
-            std::string name = d.engine.empty() ? "unknown" : d.engine;
-            if (!d.model.empty()) name += " / " + d.model;
-            else name += " / (default)";
-            int idx = getKeyIndex(name);
-            keys[idx].total += d.totalTokens;
-            keys[idx].in += d.inputTokens;
-            keys[idx].out += d.outputTokens;
-            keys[idx].think += d.thinkingTokens;
-            keys[idx].cache += d.cacheReadTokens + d.cacheWriteTokens;
-            rangeTotal += d.totalTokens;
-            rangeCost += d.costUsd;
-            if (d.firstEpochSec > 0 && (keys[idx].firstEpochSec == 0 || d.firstEpochSec < keys[idx].firstEpochSec)) keys[idx].firstEpochSec = d.firstEpochSec;
-            if (d.lastEpochSec > keys[idx].lastEpochSec) keys[idx].lastEpochSec = d.lastEpochSec;
-        }
-
-        vals.assign(nBuckets, std::vector<uint64_t>(keys.size(), 0));
-        valIn.assign(nBuckets, std::vector<uint64_t>(keys.size(), 0));
-        valOut.assign(nBuckets, std::vector<uint64_t>(keys.size(), 0));
-        valThink.assign(nBuckets, std::vector<uint64_t>(keys.size(), 0));
-        valCache.assign(nBuckets, std::vector<uint64_t>(keys.size(), 0));
-        bucketTotal.assign(nBuckets, 0);
-
-        for (const auto& d : daily) {
-            std::string ym = d.date.size() >= 7 ? d.date.substr(0, 7) : d.date;
-            int bi = -1;
-            for (int i = 0; i < 12; ++i) {
-                if (monthKeys[i] == ym) { bi = i; break; }
             }
             if (bi < 0 || bi >= nBuckets) continue;
             std::string name = d.engine.empty() ? "unknown" : d.engine;
@@ -16747,10 +16712,10 @@ static void DrawUsagePanel(HWND hwnd, HDC hdc, DashboardState* st) {
     struct tm nowTm = {};
     localtime_s(&nowTm, &nowT);
 
-    if (rangeIdx <= 1) {
+    if (rangeIdx <= 3) {
         swprintf_s(tbuf, L"%02d:%02d", tmv.tm_hour, tmv.tm_min);
         swprintf_s(nowBuf, L"%02d:%02d", nowTm.tm_hour, nowTm.tm_min);
-    } else if (rangeIdx == 2 || rangeIdx == 3) {
+    } else if (rangeIdx == 4 || rangeIdx == 5) {
         swprintf_s(tbuf, L"%02d/%02d", tmv.tm_mon + 1, tmv.tm_mday);
         swprintf_s(nowBuf, L"%02d/%02d", nowTm.tm_mon + 1, nowTm.tm_mday);
     } else {
@@ -20431,6 +20396,8 @@ static LRESULT CALLBACK DashboardWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPA
                 }
             } else if (id == IDC_BT_DEBUG) {
                 ShowBtDebugDialog(st);
+            } else if (id == IDC_SAVE_SNAPSHOT) {
+                SaveDashboardSnapshotWithFeedback(st);
             } else if (id == IDC_BTN_VIEW_TASKS) {
                 if (st->listDisplayMode == ListDisplayMode::TwoRows) {
                     st->listDisplayMode = ListDisplayMode::ProcessOnly;
@@ -20555,13 +20522,13 @@ static LRESULT CALLBACK DashboardWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPA
                 wchar_t buf[512] = {};
                 GetWindowTextW(st->hwndSearchTaskEdit, buf, 512);
                 st->taskSearchText = buf;
+                RefreshTaskQueueData(st, true);
+                InvalidateRect(st->hwndTaskList, nullptr, FALSE);
             } else if (id == IDC_COMBO_TASK_ORIGIN && HIWORD(wParam) == CBN_SELCHANGE) {
                 const int sel = static_cast<int>(SendMessageW(st->hwndTaskOriginCombo, CB_GETCURSEL, 0, 0));
                 st->taskOriginFilter = (sel > 0 && sel - 1 < static_cast<int>(st->taskOriginItems.size()))
                                            ? st->taskOriginItems[static_cast<size_t>(sel - 1)]
                                            : std::wstring();
-                RefreshTaskQueueData(st, true);
-                InvalidateRect(st->hwndTaskList, nullptr, FALSE);
                 RefreshTaskQueueData(st, true);
                 InvalidateRect(st->hwndTaskList, nullptr, FALSE);
             }
@@ -21044,14 +21011,17 @@ int RunGuiDashboard(ProcessManager* pm, IpcServer* ipc, TaskQueueManager* tqm) {
     UpdateWindow(hwnd);
     ApplyNativeThemeToWindow(hwnd);
 
-    ACCEL accels[2] = {};
+    ACCEL accels[3] = {};
     accels[0].fVirt = FVIRTKEY | FCONTROL;
     accels[0].key = 'T';
     accels[0].cmd = IDC_BTN_VIEW_TASKS;
     accels[1].fVirt = FVIRTKEY | FCONTROL | FSHIFT;
     accels[1].key = 'B';
     accels[1].cmd = IDC_BT_DEBUG;
-    HACCEL hAccel = CreateAcceleratorTableW(accels, 2);
+    accels[2].fVirt = FVIRTKEY | FCONTROL | FSHIFT;
+    accels[2].key = 'S';
+    accels[2].cmd = IDC_SAVE_SNAPSHOT;
+    HACCEL hAccel = CreateAcceleratorTableW(accels, 3);
 
     MSG msg;
     while (GetMessageW(&msg, nullptr, 0, 0)) {

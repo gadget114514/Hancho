@@ -92,6 +92,14 @@ const char kIndexHtml_0[] = R"HTML_0(<!DOCTYPE html>
           <span>Memory</span>
           <span class="tab-badge" id="badge-mem-count">0</span>
         </button>
+
+        <button class="nav-tab" data-tab="routines">
+          <svg viewBox="0 0 24 24" width="16" height="16" fill="none" stroke="currentColor" stroke-width="2">
+            <polygon points="5 3 19 12 5 21 5 3"></polygon>
+          </svg>
+          <span>Routines</span>
+          <span class="tab-badge" id="badge-routine-count">0</span>
+        </button>
       </nav>
 
       <div class="header-right">
@@ -529,6 +537,43 @@ const char kIndexHtml_1[] = R"HTML_1(              <th>Command</th>
             </tbody>
           </table>
         </div>
+      </div>
+    </section>
+
+    <!-- PANE 6: ROUTINES -->
+    <section id="pane-routines" class="tab-pane">
+      <div class="card">
+        <div class="card-header">
+          <div class="card-title">
+            <svg viewBox="0 0 24 24" width="16" height="16" fill="none" stroke="currentColor" stroke-width="2">
+              <polygon points="5 3 19 12 5 21 5 3"></polygon>
+            </svg>
+            <span>Routines</span>
+          </div>
+          <div class="memory-actions">
+            <button id="btn-routine-run" class="btn btn-sm btn-primary" title="Run the selected routine">▶ Run</button>
+            <button id="btn-routine-approve" class="btn btn-sm" title="Approve the pending proposal">Approve</button>
+            <button id="btn-routine-reject" class="btn btn-sm" title="Reject the pending proposal">Reject</button>
+            <button id="btn-routine-refresh" class="btn btn-sm">Refresh</button>
+          </div>
+        </div>
+        <div class="memory-actions" style="padding: 8px 12px;">
+          <input type="text" id="input-routine-ask" class="form-control" style="flex:1; min-width:240px;" placeholder="LLM に頼む (例: 全スモークを流して)" />
+          <button id="btn-routine-ask" class="btn btn-sm">LLM に頼む</button>
+        </div>
+        <div id="routine-status" class="pane-info"></div>
+        <table class="data-table">
+          <thead>
+            <tr><th>Name</th><th>Summary</th><th>Inputs</th><th>Last run</th><th>Started</th></tr>
+          </thead>
+          <tbody id="routine-tbody">
+            <tr class="empty-row"><td colspan="5">Loading routines...</td></tr>
+          </tbody>
+        </table>
+      </div>
+      <div class="card" style="margin-top: 12px;">
+        <div class="card-header"><div class="card-title">Last run details</div></div>
+        <div id="routine-detail" class="pane-info">Select a routine to see its node results.</div>
       </div>
     </section>
 
@@ -1756,7 +1801,13 @@ const char kAppJs_0[] = R"JS_0(/**
     memoryRecords: [],
     memLayerFilter: 'all',
     memSearch: '',
-    selectedMemoryRecord: null
+    selectedMemoryRecord: null,
+
+    // Routines
+    routines: [],
+    selectedRoutine: null,
+    routineRequestKind: '',
+    routineBusy: false
   };
 
   // --- DOM Elements ---
@@ -1774,6 +1825,18 @@ const char kAppJs_0[] = R"JS_0(/**
   const elBadgeTqCount = document.getElementById('badge-tq-count');
   const elBadgeFailCount = document.getElementById('badge-fail-count');
   const elBadgeMemCount = document.getElementById('badge-mem-count');
+  const elBadgeRoutineCount = document.getElementById('badge-routine-count');
+
+  // Routines Elements
+  const elRoutineTbody = document.getElementById('routine-tbody');
+  const elRoutineStatus = document.getElementById('routine-status');
+  const elRoutineDetail = document.getElementById('routine-detail');
+  const elBtnRoutineRun = document.getElementById('btn-routine-run');
+  const elBtnRoutineRefresh = document.getElementById('btn-routine-refresh');
+  const elBtnRoutineAsk = document.getElementById('btn-routine-ask');
+  const elInputRoutineAsk = document.getElementById('input-routine-ask');
+  const elBtnRoutineApprove = document.getElementById('btn-routine-approve');
+  const elBtnRoutineReject = document.getElementById('btn-routine-reject');
 
   // Processes Elements
   const elProcTbody = document.getElementById('proc-tbody');
@@ -2056,6 +2119,56 @@ const char kAppJs_1[] = R"JS_1(    if (data.events && Array.isArray(data.events)
       renderMemoryTable();
       return;
     }
+
+    // Routines
+    if (data.routines && Array.isArray(data.routines)) {
+      state.routines = data.routines;
+      elBadgeRoutineCount.textContent = state.routines.length;
+      renderRoutinesTable();
+      if (state.selectedRoutine) {
+        const current = state.routines.find(r => r.name === state.selectedRoutine);
+        if (current && current.lastRun && current.lastRun.state === 'running' && !state.routineBusy) {
+          startRoutineRun(current.name);
+        }
+      }
+      return;
+    }
+    if (data.definition && Array.isArray(data.nodes)) {
+      renderRoutineDetail(data);
+      return;
+    }
+)JS_1";
+const char kAppJs_1a[] = R"JS_1a(    if (data.name && (data.status === 'proposed' || data.status === 'approved' || data.status === 'rejected') && data.engine !== undefined) {
+      elRoutineStatus.textContent = `routine ${data.name}: ${data.status}` +
+        (data.rationale ? ` - ${data.rationale}` : '');
+      state.selectedRoutine = data.name;
+      loadRoutineDetail(data.name);
+      sendWsRequest({ action: 'routine_list' });
+      return;
+    }
+    if (data.name && data.status === 'approved' && data.approvedVia !== undefined) {
+      elRoutineStatus.textContent = `routine ${data.name} approved via ${data.approvedVia}`;
+      state.selectedRoutine = data.name;
+      loadRoutineDetail(data.name);
+      sendWsRequest({ action: 'routine_list' });
+      return;
+    }
+    if (data.name && data.status === 'rejected' && data.reason !== undefined) {
+      elRoutineStatus.textContent = `routine ${data.name} proposal rejected: ${data.reason}`;
+      sendWsRequest({ action: 'routine_list' });
+      return;
+    }
+    if (data.runId && data.taskqueue && data.inputsState) {
+      const failed = data.waited && data.state !== 'succeeded';
+      elRoutineStatus.textContent = (data.inputsState === 'stale' ? 'STALE inputs - ' : '') +
+        `run ${data.runId}: ${data.state || 'running'}`;
+      if (failed) elRoutineStatus.textContent += ' (failed)';
+      state.routineBusy = false;
+      state.selectedRoutine = data.name || state.selectedRoutine;
+      loadRoutineDetail(state.selectedRoutine);
+      sendWsRequest({ action: 'routine_list' });
+      return;
+    }
   }
 
   // --- Tab Navigation & Refreshing ---
@@ -2106,7 +2219,143 @@ const char kAppJs_1[] = R"JS_1(    if (data.events && Array.isArray(data.events)
     } else if (state.activeTab === 'memory') {
       sendWsRequest({ action: 'memory_storage_stats' });
       searchMemory();
+    } else if (state.activeTab === 'routines') {
+      sendWsRequest({ action: 'routine_list' });
     }
+  }
+
+  function loadRoutineDetail(name) {
+    if (!name) return;
+    state.routineRequestKind = 'show';
+    sendWsRequest({ action: 'routine_show', name: name });
+  }
+
+  function startRoutineRun(name) {
+    if (!name) return;
+    state.routineBusy = true;
+    state.selectedRoutine = name;
+    elRoutineStatus.textContent = `Starting ${name}...`;
+    sendWsRequest({ action: 'routine_run', name: name, wait: false });
+  }
+
+  function askRoutine(request, name) {
+    if (!request) return;
+    elRoutineStatus.textContent = `Asking the LLM to ${name ? 'fix ' + name : 'create a routine'}...`;
+    const req = { action: 'routine_ask', request: request, cwd: state.projectCwd || '' };
+    if (name) req.name = name;
+    sendWsRequest(req);
+  }
+
+  function approveRoutine(name) {
+    if (!name) return;
+    const said = window.prompt('承認しますか？あなたの言葉を入力してください (空欄で拒否):', '承認する');
+    if (said === null) return;
+    sendWsRequest({ action: 'routine_approve', name: name, userSaid: said, via: 'chat' });
+  }
+
+  function rejectRoutine(name) {
+    if (!name) return;
+    const reason = window.prompt('却下の理由を入力してください:', '');
+    if (reason === null) return;
+    sendWsRequest({ action: 'routine_reject', name: name, reason: reason });
+  }
+
+)JS_1a";
+const char kAppJs_1c[] = R"JS_1c(  function renderRoutinesTable() {
+    if (!elRoutineTbody) return;
+    if (state.routines.length === 0) {
+      elRoutineTbody.innerHTML = '<tr class="empty-row"><td colspan="5">No routines saved yet.</td></tr>';
+      return;
+    }
+    let html = '';
+    state.routines.forEach(r => {
+      const stale = r.state === 'stale';
+      const diff = stale
+        ? ` (+${(r.added || []).length} -${(r.removed || []).length} ~${(r.changed || []).length})`
+        : '';
+      const last = r.lastRun || {};
+      html += `<tr class="routine-row${state.selectedRoutine === r.name ? ' selected' : ''}" data-routine="${escapeHtml(r.name)}" style="cursor:pointer;">` +
+        `<td>${escapeHtml(r.name)}</td>` +
+        `<td>${escapeHtml(r.summary || '')}</td>` +
+        `<td class="${stale ? 'status-failed' : 'status-success'}">${stale ? 'STALE' : 'ok'}${diff}</td>` +
+        `<td>${escapeHtml(last.state || '-')}</td>` +
+        `<td>${escapeHtml(last.startedAt || '-')}` +
+        `<button class="btn btn-xs btn-fix-routine" data-fix="${escapeHtml(r.name)}" title="LLM に直させる">LLM に直させる</button>` +
+        (r.hasProposal ? ' <span class="status-failed">[提案中]</span>' : '') +
+        `</td></tr>`;
+    });
+    elRoutineTbody.innerHTML = html;
+    elRoutineTbody.querySelectorAll('.routine-row').forEach(row => {
+      row.addEventListener('click', () => {
+        state.selectedRoutine = row.getAttribute('data-routine');
+        renderRoutinesTable();
+        loadRoutineDetail(state.selectedRoutine);
+      });
+    });
+    elRoutineTbody.querySelectorAll('.btn-fix-routine').forEach(btn => {
+      btn.addEventListener('click', ev => {
+        ev.stopPropagation();
+        const name = btn.getAttribute('data-fix');
+        askRoutine(`直す: ${name}。${rSummary(name)} を確認して、失敗したノードと入力の差分を直してください。`, name);
+      });
+    });
+  }
+
+  function rSummary(name) {
+    const row = (state.routines || []).find(r => r.name === name);
+    return row ? (row.summary || name) : name;
+  }
+
+  function renderRoutineDetail(data) {
+    if (!elRoutineDetail) return;
+    const last = data.lastRun || {};
+    let html = `<div><strong>${escapeHtml(data.name || '')}</strong> [${escapeHtml(data.scope || '')}] ` +
+      `inputs: ${escapeHtml(data.state || 'ok')}</div>`;
+    if (data.state === 'stale') {
+      html += `<div class="status-failed">added: ${escapeHtml(JSON.stringify(data.added || []))} ` +
+        `removed: ${escapeHtml(JSON.stringify(data.removed || []))} ` +
+        `changed: ${escapeHtml(JSON.stringify(data.changed || []))} ` +
+        `absorbed: ${escapeHtml(JSON.stringify(data.absorbed || []))}</div>`;
+    }
+    html += `<div>last run: ${escapeHtml(last.runId || '-')} (${escapeHtml(last.state || '-')})</div>`;
+    if (data.hasProposal && data.proposal) {
+      const p = data.proposal;
+      html += `<div class="status-failed">提案中 (${escapeHtml(p.by || '')} / ${escapeHtml(p.engine || '')}): ` +
+        `${escapeHtml(p.request || '')}</div>`;
+      html += `<div>rationale: ${escapeHtml(p.rationale || '')}</div>`;
+      const dry = data.dryRun || {};
+      html += `<div>dry run: ${escapeHtml(String(dry.count || 0))} job(s)</div>`;
+      if (Array.isArray(dry.jobs)) {
+        html += '<table class="data-table"><thead><tr><th>Node</th><th>Command</th></tr></thead><tbody>';
+        dry.jobs.forEach(j => {
+          html += `<tr><td>${escapeHtml(j.node || '')}</td><td>${escapeHtml(j.command || '')}</td></tr>`;
+        });
+        html += '</tbody></table>';
+      }
+      html += `<div>承認: <button id="routine-detail-approve" class="btn btn-xs">Approve</button> ` +
+        `<button id="routine-detail-reject" class="btn btn-xs">Reject</button></div>`;
+    }
+    if (Array.isArray(data.newlyFailed) || Array.isArray(data.fixed)) {
+      html += `<div>vs previous: newly failed ${escapeHtml(JSON.stringify(data.newlyFailed || []))}, ` +
+        `fixed ${escapeHtml(JSON.stringify(data.fixed || []))}</div>`;
+    }
+    html += '<table class="data-table"><thead><tr><th>Node</th><th>State</th><th>ms</th><th>Tests</th></tr></thead><tbody>';
+    (data.nodes || []).forEach(n => {
+      let tests = '';
+      (n.jobs || []).forEach(j => {
+        const s = j.test_report_summary;
+        if (s) tests += `${s.total || 0}/${s.failed || 0}f/${s.skipped || 0}s `;
+      });
+      html += `<tr><td>${escapeHtml(n.node || '')}</td><td>${escapeHtml(n.state || '')}</td>` +
+        `<td>${n.duration_ms || 0}</td><td>${escapeHtml(tests)}</td></tr>`;
+    });
+    html += '</tbody></table>';
+    elRoutineDetail.innerHTML = html;
+    const approveBtn = document.getElementById('routine-detail-approve');
+
+    if (approveBtn) approveBtn.addEventListener('click', () => approveRoutine(data.name));
+    const rejectBtn = document.getElementById('routine-detail-reject');
+    if (rejectBtn) rejectBtn.addEventListener('click', () => rejectRoutine(data.name));
   }
 
   function setupAutoRefresh() {
@@ -2336,7 +2585,8 @@ const char kAppJs_1[] = R"JS_1(    if (data.events && Array.isArray(data.events)
     }
   }
 
-  // ==========================================
+)JS_1c";
+const char kAppJs_1b[] = R"JS_1b(  // ==========================================
   // PANE 2: TASK QUEUE
   // ==========================================
   function updateTqKpis() {
@@ -2376,7 +2626,7 @@ const char kAppJs_1[] = R"JS_1(    if (data.events && Array.isArray(data.events)
       return true;
     });
 
-)JS_1";
+)JS_1b";
 const char kAppJs_2[] = R"JS_2(    if (filtered.length === 0) {
       const msg = state.jobs.length === 0 ? 'No jobs in queue.' : 'No jobs match current filter.';
       elTqTbody.innerHTML = `<tr class="empty-row"><td colspan="11">${escapeHtml(msg)}</td></tr>`;
@@ -2931,6 +3181,21 @@ const char kAppJs_3[] = R"JS_3(      const s = (j.state || '').toLowerCase();
     });
   });
 
+  // Routines Actions
+  if (elBtnRoutineRun) elBtnRoutineRun.addEventListener('click', () => startRoutineRun(state.selectedRoutine));
+  if (elBtnRoutineRefresh) elBtnRoutineRefresh.addEventListener('click', () => refreshCurrentTab());
+  if (elBtnRoutineAsk) elBtnRoutineAsk.addEventListener('click', () => {
+    const request = elInputRoutineAsk ? elInputRoutineAsk.value.trim() : '';
+    if (!request) return;
+    askRoutine(request, state.selectedRoutine);
+    elInputRoutineAsk.value = '';
+  });
+  if (elInputRoutineAsk) elInputRoutineAsk.addEventListener('keydown', ev => {
+    if (ev.key === 'Enter' && elBtnRoutineAsk) elBtnRoutineAsk.click();
+  });
+  if (elBtnRoutineApprove) elBtnRoutineApprove.addEventListener('click', () => approveRoutine(state.selectedRoutine));
+  if (elBtnRoutineReject) elBtnRoutineReject.addEventListener('click', () => rejectRoutine(state.selectedRoutine));
+
   // Global Header Actions
   elBtnRefresh.addEventListener('click', () => refreshCurrentTab());
   elBtnReconnectNow.addEventListener('click', () => connectWs());
@@ -3181,7 +3446,7 @@ const char kAppJs_4[] = R"JS_4(        if (p.getAttribute('data-filter') === st)
 })();
 )JS_4";
 static const std::string& GetAppJs() {
-    static const std::string s = std::string(kAppJs_0) + kAppJs_1 + kAppJs_2 + kAppJs_3 + kAppJs_4;
+    static const std::string s = std::string(kAppJs_0) + kAppJs_1 + kAppJs_1a + kAppJs_1c + kAppJs_1b + kAppJs_2 + kAppJs_3 + kAppJs_4;
     return s;
 }
 

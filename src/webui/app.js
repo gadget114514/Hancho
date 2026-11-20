@@ -59,7 +59,13 @@
     memoryRecords: [],
     memLayerFilter: 'all',
     memSearch: '',
-    selectedMemoryRecord: null
+    selectedMemoryRecord: null,
+
+    // Routines
+    routines: [],
+    selectedRoutine: null,
+    routineRequestKind: '',
+    routineBusy: false
   };
 
   // --- DOM Elements ---
@@ -77,6 +83,18 @@
   const elBadgeTqCount = document.getElementById('badge-tq-count');
   const elBadgeFailCount = document.getElementById('badge-fail-count');
   const elBadgeMemCount = document.getElementById('badge-mem-count');
+  const elBadgeRoutineCount = document.getElementById('badge-routine-count');
+
+  // Routines Elements
+  const elRoutineTbody = document.getElementById('routine-tbody');
+  const elRoutineStatus = document.getElementById('routine-status');
+  const elRoutineDetail = document.getElementById('routine-detail');
+  const elBtnRoutineRun = document.getElementById('btn-routine-run');
+  const elBtnRoutineRefresh = document.getElementById('btn-routine-refresh');
+  const elBtnRoutineAsk = document.getElementById('btn-routine-ask');
+  const elInputRoutineAsk = document.getElementById('input-routine-ask');
+  const elBtnRoutineApprove = document.getElementById('btn-routine-approve');
+  const elBtnRoutineReject = document.getElementById('btn-routine-reject');
 
   // Processes Elements
   const elProcTbody = document.getElementById('proc-tbody');
@@ -358,6 +376,55 @@
       renderMemoryTable();
       return;
     }
+
+    // Routines
+    if (data.routines && Array.isArray(data.routines)) {
+      state.routines = data.routines;
+      elBadgeRoutineCount.textContent = state.routines.length;
+      renderRoutinesTable();
+      if (state.selectedRoutine) {
+        const current = state.routines.find(r => r.name === state.selectedRoutine);
+        if (current && current.lastRun && current.lastRun.state === 'running' && !state.routineBusy) {
+          startRoutineRun(current.name);
+        }
+      }
+      return;
+    }
+    if (data.definition && Array.isArray(data.nodes)) {
+      renderRoutineDetail(data);
+      return;
+    }
+    if (data.name && (data.status === 'proposed' || data.status === 'approved' || data.status === 'rejected') && data.engine !== undefined) {
+      elRoutineStatus.textContent = `routine ${data.name}: ${data.status}` +
+        (data.rationale ? ` - ${data.rationale}` : '');
+      state.selectedRoutine = data.name;
+      loadRoutineDetail(data.name);
+      sendWsRequest({ action: 'routine_list' });
+      return;
+    }
+    if (data.name && data.status === 'approved' && data.approvedVia !== undefined) {
+      elRoutineStatus.textContent = `routine ${data.name} approved via ${data.approvedVia}`;
+      state.selectedRoutine = data.name;
+      loadRoutineDetail(data.name);
+      sendWsRequest({ action: 'routine_list' });
+      return;
+    }
+    if (data.name && data.status === 'rejected' && data.reason !== undefined) {
+      elRoutineStatus.textContent = `routine ${data.name} proposal rejected: ${data.reason}`;
+      sendWsRequest({ action: 'routine_list' });
+      return;
+    }
+    if (data.runId && data.taskqueue && data.inputsState) {
+      const failed = data.waited && data.state !== 'succeeded';
+      elRoutineStatus.textContent = (data.inputsState === 'stale' ? 'STALE inputs - ' : '') +
+        `run ${data.runId}: ${data.state || 'running'}`;
+      if (failed) elRoutineStatus.textContent += ' (failed)';
+      state.routineBusy = false;
+      state.selectedRoutine = data.name || state.selectedRoutine;
+      loadRoutineDetail(state.selectedRoutine);
+      sendWsRequest({ action: 'routine_list' });
+      return;
+    }
   }
 
   // --- Tab Navigation & Refreshing ---
@@ -408,7 +475,141 @@
     } else if (state.activeTab === 'memory') {
       sendWsRequest({ action: 'memory_storage_stats' });
       searchMemory();
+    } else if (state.activeTab === 'routines') {
+      sendWsRequest({ action: 'routine_list' });
     }
+  }
+
+  function loadRoutineDetail(name) {
+    if (!name) return;
+    state.routineRequestKind = 'show';
+    sendWsRequest({ action: 'routine_show', name: name });
+  }
+
+  function startRoutineRun(name) {
+    if (!name) return;
+    state.routineBusy = true;
+    state.selectedRoutine = name;
+    elRoutineStatus.textContent = `Starting ${name}...`;
+    sendWsRequest({ action: 'routine_run', name: name, wait: false });
+  }
+
+  function askRoutine(request, name) {
+    if (!request) return;
+    elRoutineStatus.textContent = `Asking the LLM to ${name ? 'fix ' + name : 'create a routine'}...`;
+    const req = { action: 'routine_ask', request: request, cwd: state.projectCwd || '' };
+    if (name) req.name = name;
+    sendWsRequest(req);
+  }
+
+  function approveRoutine(name) {
+    if (!name) return;
+    const said = window.prompt('承認しますか？あなたの言葉を入力してください (空欄で拒否):', '承認する');
+    if (said === null) return;
+    sendWsRequest({ action: 'routine_approve', name: name, userSaid: said, via: 'chat' });
+  }
+
+  function rejectRoutine(name) {
+    if (!name) return;
+    const reason = window.prompt('却下の理由を入力してください:', '');
+    if (reason === null) return;
+    sendWsRequest({ action: 'routine_reject', name: name, reason: reason });
+  }
+
+  function renderRoutinesTable() {
+    if (!elRoutineTbody) return;
+    if (state.routines.length === 0) {
+      elRoutineTbody.innerHTML = '<tr class="empty-row"><td colspan="5">No routines saved yet.</td></tr>';
+      return;
+    }
+    let html = '';
+    state.routines.forEach(r => {
+      const stale = r.state === 'stale';
+      const diff = stale
+        ? ` (+${(r.added || []).length} -${(r.removed || []).length} ~${(r.changed || []).length})`
+        : '';
+      const last = r.lastRun || {};
+      html += `<tr class="routine-row${state.selectedRoutine === r.name ? ' selected' : ''}" data-routine="${escapeHtml(r.name)}" style="cursor:pointer;">` +
+        `<td>${escapeHtml(r.name)}</td>` +
+        `<td>${escapeHtml(r.summary || '')}</td>` +
+        `<td class="${stale ? 'status-failed' : 'status-success'}">${stale ? 'STALE' : 'ok'}${diff}</td>` +
+        `<td>${escapeHtml(last.state || '-')}</td>` +
+        `<td>${escapeHtml(last.startedAt || '-')}` +
+        `<button class="btn btn-xs btn-fix-routine" data-fix="${escapeHtml(r.name)}" title="LLM に直させる">LLM に直させる</button>` +
+        (r.hasProposal ? ' <span class="status-failed">[提案中]</span>' : '') +
+        `</td></tr>`;
+    });
+    elRoutineTbody.innerHTML = html;
+    elRoutineTbody.querySelectorAll('.routine-row').forEach(row => {
+      row.addEventListener('click', () => {
+        state.selectedRoutine = row.getAttribute('data-routine');
+        renderRoutinesTable();
+        loadRoutineDetail(state.selectedRoutine);
+      });
+    });
+    elRoutineTbody.querySelectorAll('.btn-fix-routine').forEach(btn => {
+      btn.addEventListener('click', ev => {
+        ev.stopPropagation();
+        const name = btn.getAttribute('data-fix');
+        askRoutine(`直す: ${name}。${rSummary(name)} を確認して、失敗したノードと入力の差分を直してください。`, name);
+      });
+    });
+  }
+
+  function rSummary(name) {
+    const row = (state.routines || []).find(r => r.name === name);
+    return row ? (row.summary || name) : name;
+  }
+
+  function renderRoutineDetail(data) {
+    if (!elRoutineDetail) return;
+    const last = data.lastRun || {};
+    let html = `<div><strong>${escapeHtml(data.name || '')}</strong> [${escapeHtml(data.scope || '')}] ` +
+      `inputs: ${escapeHtml(data.state || 'ok')}</div>`;
+    if (data.state === 'stale') {
+      html += `<div class="status-failed">added: ${escapeHtml(JSON.stringify(data.added || []))} ` +
+        `removed: ${escapeHtml(JSON.stringify(data.removed || []))} ` +
+        `changed: ${escapeHtml(JSON.stringify(data.changed || []))} ` +
+        `absorbed: ${escapeHtml(JSON.stringify(data.absorbed || []))}</div>`;
+    }
+    html += `<div>last run: ${escapeHtml(last.runId || '-')} (${escapeHtml(last.state || '-')})</div>`;
+    if (data.hasProposal && data.proposal) {
+      const p = data.proposal;
+      html += `<div class="status-failed">提案中 (${escapeHtml(p.by || '')} / ${escapeHtml(p.engine || '')}): ` +
+        `${escapeHtml(p.request || '')}</div>`;
+      html += `<div>rationale: ${escapeHtml(p.rationale || '')}</div>`;
+      const dry = data.dryRun || {};
+      html += `<div>dry run: ${escapeHtml(String(dry.count || 0))} job(s)</div>`;
+      if (Array.isArray(dry.jobs)) {
+        html += '<table class="data-table"><thead><tr><th>Node</th><th>Command</th></tr></thead><tbody>';
+        dry.jobs.forEach(j => {
+          html += `<tr><td>${escapeHtml(j.node || '')}</td><td>${escapeHtml(j.command || '')}</td></tr>`;
+        });
+        html += '</tbody></table>';
+      }
+      html += `<div>承認: <button id="routine-detail-approve" class="btn btn-xs">Approve</button> ` +
+        `<button id="routine-detail-reject" class="btn btn-xs">Reject</button></div>`;
+    }
+    if (Array.isArray(data.newlyFailed) || Array.isArray(data.fixed)) {
+      html += `<div>vs previous: newly failed ${escapeHtml(JSON.stringify(data.newlyFailed || []))}, ` +
+        `fixed ${escapeHtml(JSON.stringify(data.fixed || []))}</div>`;
+    }
+    html += '<table class="data-table"><thead><tr><th>Node</th><th>State</th><th>ms</th><th>Tests</th></tr></thead><tbody>';
+    (data.nodes || []).forEach(n => {
+      let tests = '';
+      (n.jobs || []).forEach(j => {
+        const s = j.test_report_summary;
+        if (s) tests += `${s.total || 0}/${s.failed || 0}f/${s.skipped || 0}s `;
+      });
+      html += `<tr><td>${escapeHtml(n.node || '')}</td><td>${escapeHtml(n.state || '')}</td>` +
+        `<td>${n.duration_ms || 0}</td><td>${escapeHtml(tests)}</td></tr>`;
+    });
+    html += '</tbody></table>';
+    elRoutineDetail.innerHTML = html;
+    const approveBtn = document.getElementById('routine-detail-approve');
+    if (approveBtn) approveBtn.addEventListener('click', () => approveRoutine(data.name));
+    const rejectBtn = document.getElementById('routine-detail-reject');
+    if (rejectBtn) rejectBtn.addEventListener('click', () => rejectRoutine(data.name));
   }
 
   function setupAutoRefresh() {
@@ -1231,6 +1432,21 @@
       if (targetTab) switchTab(targetTab);
     });
   });
+
+  // Routines Actions
+  if (elBtnRoutineRun) elBtnRoutineRun.addEventListener('click', () => startRoutineRun(state.selectedRoutine));
+  if (elBtnRoutineRefresh) elBtnRoutineRefresh.addEventListener('click', () => refreshCurrentTab());
+  if (elBtnRoutineAsk) elBtnRoutineAsk.addEventListener('click', () => {
+    const request = elInputRoutineAsk ? elInputRoutineAsk.value.trim() : '';
+    if (!request) return;
+    askRoutine(request, state.selectedRoutine);
+    elInputRoutineAsk.value = '';
+  });
+  if (elInputRoutineAsk) elInputRoutineAsk.addEventListener('keydown', ev => {
+    if (ev.key === 'Enter' && elBtnRoutineAsk) elBtnRoutineAsk.click();
+  });
+  if (elBtnRoutineApprove) elBtnRoutineApprove.addEventListener('click', () => approveRoutine(state.selectedRoutine));
+  if (elBtnRoutineReject) elBtnRoutineReject.addEventListener('click', () => rejectRoutine(state.selectedRoutine));
 
   // Global Header Actions
   elBtnRefresh.addEventListener('click', () => refreshCurrentTab());

@@ -28,6 +28,8 @@ Hancho には、1 コマンドだけ、順番のあるジョブのキュー、�
 
 詳しくは [概要](doc/overview-ja.md) を参照してください。`run_worker`、ジョブ終了後の PC サスペンド、ビヘイビアツリー、安定したイベントとアダプター、Hancho をやめるとき（卒業）の手順をまとめています。
 
+ビヘイビアツリーは名前付きの**ルーチン**として保存でき、`routine run <name>` で繰り返し実行できます（「全ターゲットをビルドして全スモークを走らせる」などの定型作業向け）。入力の変更や実行結果も自動で追跡します。詳しくは [ルーチン](doc/routines-ja.md)。
+
 ### 実行ファイル
 
 | ファイル | 説明 |
@@ -93,6 +95,7 @@ New-Item -ItemType Junction -Path .claude\skills\hancho -Target (Resolve-Path sk
 | [CLI](doc/cli-ja.md) | `hancho-cli.exe` の使い方、stdin モード、完了通知 |
 | [タスクキュー](doc/taskqueue-ja.md) | 順序・依存・ジョブのフィールド・状態・ChainGuard |
 | [ビヘイビアツリー](doc/behavior-tree-ja.md) | BT の形式、ノードの種類、変数、ワーカーのエンジン、escalate、例 |
+| [ルーチン](doc/routines-ja.md) | 名前付き BT の繰り返し実行: `routine list/show/run/save/check`、実行 ID、stale/absorbed、triage、ダッシュボード |
 | [BT トークン削減ガイド](doc/behavior-tree-token-optimization-ja.md) | トークン削減アーキテクチャ、`compact: true`、軽量化パケット |
 | [BT 設計計画書](doc/behavior-tree-plan.md) | ビヘイビアツリーエンジンのアーキテクチャと実装計画 |
 | [MCP サーバー](doc/mcp-ja.md) | MCP 登録と MCP ツール |
@@ -116,6 +119,13 @@ New-Item -ItemType Junction -Path .claude\skills\hancho -Target (Resolve-Path sk
 ## リリースノート
 
 
+
+### v0.9.37
+- **ルーチン**: ビヘイビアツリーに名前を付けて保存し、LLM を通さずに何度でも実行できます（`hancho-cli routine list/show/run/save/check`、MCP `routine_*`）。実行ごとに別の ID が付くので、続けて流しても重複しません。`foreach` ノードは実行時にファイルの glob を展開するので、テストが増えても自動で拾います。入力ファイルが変わったルーチンは `stale` と表示し、`stale` のまま失敗したら triage カードを作ります。`routine ask` で worker LLM にルーチンを作らせたり直させたりでき、承認するまでは実行されません。ダッシュボードにルーチンページを追加しました。
+- **ハング対策**: 起動直後のハングを早く検知し、考えられる原因と次の一手を出します。BT に `catch` ノード、defaults、失敗理由の変数、`bt template`、validate の警告を追加しました。worker / consult / supervisor の LLM を事前承認するリストと probe、故障したエンジンを共有するサーキットブレーカーを入れました。
+- **ワーカーの権限**: 権限を拒否されて終わった worker を、誤診せずに `permission_denied` として報告します。必要な権限は `hancho-cli permit`（MCP `permit_*`）で事前に承認できます。
+- **`bt retry --from`** が、やり直したノードの後に続くノードも再実行するようになりました（以前は古い結果が残っていました）。
+- **ダッシュボード**: ウィンドウタイトルに常にデータディレクトリを表示します。タスク一覧に起動元の絞り込みと、起動元ごとの一括操作を追加しました。MCP `dashboard_snapshot` とトレイの「スクリーンショットを保存」を追加しました。
 
 ### v0.9.36
 - **使用量パネルの時間軸**: 4h/24h のトークン使用量の棒が軸ラベルと一致するようになりました。以前は棒を固定の2時間境界に揃えつつラベルは `now - range` 〜 `now` を表示していたため、グラフ全体が最大1バケット分ずれていました。

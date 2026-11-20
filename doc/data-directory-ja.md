@@ -19,4 +19,6 @@ hancho-cli.exe mcp install --data-dir .hancho   # プロジェクトの MCP 設�
 5. データディレクトリごとにダッシュボードインスタンス・Named Pipe・ミューテックスが分離され、複数プロジェクトを同時に運用してもプロセス/キューを共有しない。
 6. 確認: `hancho-cli.exe --data-dir <path> help --json` の `effective_data_dir`、またはダッシュボードのステータスバー。
 
+ダッシュボードのウィンドウタイトルは既定のディレクトリのときも常に「Hancho - <データディレクトリ>」です。タイトルを見るだけで対象のインスタンスを判別できます。
+
 環境変数 `HANCHO_LOG_DIR` も同等の指定方法です。

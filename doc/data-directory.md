@@ -19,4 +19,6 @@ How consistency is guaranteed:
 5. Different data directories are fully isolated: each gets its own dashboard instance, Named Pipe and mutex, so multiple projects can run at once without sharing processes or queues.
 6. Verify with `hancho-cli.exe --data-dir <path> help --json` (`effective_data_dir`) or the dashboard status bar, which shows the active data directory.
 
+The dashboard window title is always `Hancho - <data directory>`, including when the default directory is used, so the instance can be identified from the title alone.
+
 The environment variable `HANCHO_LOG_DIR` is an equivalent fallback.

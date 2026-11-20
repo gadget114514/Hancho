@@ -102,6 +102,10 @@ std::string BuildNodeLabel(const json& n, const std::string& type, const std::st
     } else if (type == "parallel") {
         auto it = n.find("success");
         if (it != n.end()) ss << " success=" << (it->is_string() ? it->get<std::string>() : it->dump());
+    } else if (type == "foreach") {
+        std::string glob = Str(n, "glob");
+        if (!glob.empty()) ss << " glob=" << OneLine(glob, 40);
+        ss << " mode=" << n.value("mode", std::string("sequence"));
     } else if (type == "catch") {
         auto hs = n.find("handlers");
         ss << " handlers=" << (hs != n.end() && hs->is_array() ? hs->size() : 0)

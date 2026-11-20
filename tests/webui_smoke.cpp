@@ -191,6 +191,15 @@ int main() {
 
     std::printf("Running WebUI smoke tests...\n");
 
+    std::string indexHtml, appJs, assetMime;
+    Check(GetWebUiAsset("/index.html", "", indexHtml, assetMime) &&
+              indexHtml.find("data-tab=\"routines\"") != std::string::npos,
+          "embedded Web UI serves the Routines tab");
+    Check(GetWebUiAsset("/app.js", "", appJs, assetMime) &&
+              appJs.find("renderRoutinesTable") != std::string::npos &&
+              appJs.find("routine_run") != std::string::npos,
+          "embedded Web UI app.js handles routine_list / routine_run");
+
     // Mock IPC handler simulating core
     auto mockIpcHandler = [](const std::string& reqJson) -> std::string {
         nlohmann::json req = nlohmann::json::parse(reqJson, nullptr, false);
@@ -314,6 +323,28 @@ int main() {
                     {"summary", "Test note for webui"}
                 }
             });
+            return resp.dump();
+        }
+        if (action == "routine_list") {
+            nlohmann::json resp;
+            resp["ok"] = true;
+            resp["routines"] = nlohmann::json::array({
+                {{"name", "demo"}, {"summary", "Demo routine"}, {"state", "stale"},
+                 {"added", nlohmann::json::array()}, {"removed", nlohmann::json::array()},
+                 {"changed", nlohmann::json::array({"inputs/a.txt"})},
+                 {"lastRun", {{"state", "succeeded"}, {"startedAt", "2026-11-20 11:00:00"}}}}
+            });
+            return resp.dump();
+        }
+        if (action == "routine_run") {
+            nlohmann::json resp;
+            resp["ok"] = true;
+            resp["name"] = "demo";
+            resp["runId"] = "demo-1";
+            resp["taskqueue"] = "routine-demo";
+            resp["state"] = "running";
+            resp["inputsState"] = "stale";
+            resp["waited"] = false;
             return resp.dump();
         }
         return "{\"ok\":true}";
@@ -456,6 +487,15 @@ int main() {
             std::string memSearchResp = SendWsFrame(wsSock2, "{\"action\":\"memory_search\",\"text\":\"test\"}");
             Check(memSearchResp.find("\"results\"") != std::string::npos, "Pane 5: memory_search ok");
             Check(memSearchResp.find("note_001") != std::string::npos, "Pane 5: results contains note_001");
+
+            // Pane 6: Routines list and run over WebSocket IPC
+            std::string routineResp = SendWsFrame(wsSock2, "{\"action\":\"routine_list\"}");
+            Check(routineResp.find("\"routines\"") != std::string::npos &&
+                      routineResp.find("\"stale\"") != std::string::npos,
+                  "Pane 6: routine_list returns routines with stale state");
+            std::string routineRunResp = SendWsFrame(wsSock2, "{\"action\":\"routine_run\",\"name\":\"demo\"}");
+            Check(routineRunResp.find("\"runId\":\"demo-1\"") != std::string::npos,
+                  "Pane 6: routine_run is callable over the Web UI IPC");
 
             closesocket(wsSock2);
         }

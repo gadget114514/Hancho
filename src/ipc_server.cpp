@@ -1,6 +1,9 @@
 #include "ipc_server.h"
 #include "bt_manager.h"
+#include "bt_templates.h"
+#include "behavior_tree_internal.h"
 #include "chain_guard.h"
+#include "llm_config.h"
 #include "common.h"
 #include "event_schema.h"
 #include "ipmsg.h"
@@ -10,18 +13,30 @@
 #include "memory_search.h"
 #include "power.h"
 #include "remote_hosts.h"
+#include "routine.h"
+#include "triage.h"
 #include "triage_manager.h"
 #include "webui_server.h"
 #include "term_server.h"
 #include "nlohmann/json.hpp"
+#include <atomic>
 #include <ctime>
+#include <functional>
 #include <fstream>
 #include <sstream>
 #include <cctype>
+#include <set>
 
 namespace pc {
 
 constexpr UINT WM_PC_IPC_EVENT = WM_APP + 101;
+
+// 093-5 (defined below): shared by routine_ask and triage's update_routine handler.
+static std::string HandleRoutineAsk(RoutineManager& routines, BtManager* btm,
+                                    TaskQueueManager* tqm, const std::string& requestText,
+                                    const std::string& requestedName, const std::string& cwd,
+                                    const std::string& scope, const std::string& by,
+                                    int timeoutMs);
 
 std::string SnapshotToJson(const ProcessSnapshot& s) {
     std::ostringstream oss;
@@ -121,12 +136,41 @@ static std::string ExtractRawJsonValue(const std::string& json, const std::strin
     return json.substr(p, end - p);
 }
 
+void IpcServer::InstallRoutineValidator() {
+    if (!routineManager_) return;
+    if (!btm_) {
+        routineManager_->SetValidator(nullptr);
+        return;
+    }
+    routineManager_->SetValidator([this](const std::string& btJson, std::string& outError) -> bool {
+        nlohmann::json result = nlohmann::json::parse(btm_->Validate(btJson, false), nullptr, false);
+        if (result.is_discarded() || !result.is_object()) {
+            outError = "invalid validation response";
+            return false;
+        }
+        if (result.value("ok", false) && result.value("valid", false)) return true;
+        outError = result.value("error", std::string("invalid definition"));
+        if (outError.empty() && result.contains("errors") && result["errors"].is_array()) {
+            outError = result["errors"].dump();
+        }
+        return false;
+    });
+}
+
 IpcServer::IpcServer(ProcessManager& pm, TaskQueueManager& tqm, HWND notifyHwnd)
     : pm_(pm), tqm_(tqm), btm_(nullptr), notifyHwnd_(notifyHwnd),
       webuiRestart_([this]() { RestartWebUi(); }),
       termRestart_([this]() { RestartTermServer(); }),
       ipmsgRestart_([this]() { RestartIpmsg(); }) {
+    routineManager_ = std::make_unique<RoutineManager>();
+    InstallRoutineValidator();
     triageManager_ = std::make_unique<TriageManager>(pm_, tqm_, btm_);
+    triageManager_->SetRoutineAskHandler([this](const std::string& name, const std::string& cwd,
+                                                const std::string& request) {
+        return HandleRoutineAsk(*routineManager_, btm_, &tqm_, request, name,
+                                cwd.empty() ? WideToUtf8(GetCurrentDirectoryWide()) : cwd,
+                                "project", "triage", 600000);
+    });
     ipmsg_ = std::make_unique<IpmsgNode>();
     ipmsgHandler_ = std::make_unique<IpmsgHandler>(tqm_, pm_, ipmsg_.get());
     InstallRemoteCallbacks();
@@ -137,7 +181,15 @@ IpcServer::IpcServer(ProcessManager& pm, TaskQueueManager& tqm, BtManager* btm, 
       webuiRestart_([this]() { RestartWebUi(); }),
       termRestart_([this]() { RestartTermServer(); }),
       ipmsgRestart_([this]() { RestartIpmsg(); }) {
+    routineManager_ = std::make_unique<RoutineManager>();
+    InstallRoutineValidator();
     triageManager_ = std::make_unique<TriageManager>(pm_, tqm_, btm_);
+    triageManager_->SetRoutineAskHandler([this](const std::string& name, const std::string& cwd,
+                                                const std::string& request) {
+        return HandleRoutineAsk(*routineManager_, btm_, &tqm_, request, name,
+                                cwd.empty() ? WideToUtf8(GetCurrentDirectoryWide()) : cwd,
+                                "project", "triage", 600000);
+    });
     ipmsg_ = std::make_unique<IpmsgNode>();
     ipmsgHandler_ = std::make_unique<IpmsgHandler>(tqm_, pm_, ipmsg_.get());
     InstallRemoteCallbacks();
@@ -548,6 +600,647 @@ std::string IpcServer::HandleChatAction(const std::string& action, const std::st
         return ipmsg_->Clear().dump();
     }
     return "{\"ok\":false,\"error\":\"Unknown chat action: " + JsonEscape(action) + "\"}";
+}
+
+static void CollectRoutineNodes(const nlohmann::json& node, const std::string& prefix,
+                                TaskQueueManager& tqm, nlohmann::json& rows) {
+    using json = nlohmann::json;
+    if (node.is_array()) {
+        int index = 0;
+        for (const auto& child : node) {
+            CollectRoutineNodes(child, prefix + "/" + std::to_string(index++), tqm, rows);
+        }
+        return;
+    }
+    if (!node.is_object()) return;
+
+    std::string key;
+    if (node.contains("id") && node["id"].is_string()) {
+        key = node["id"].get<std::string>();
+    } else if (prefix.empty()) {
+        key = node.value("type", std::string("root"));
+    } else {
+        key = prefix;
+    }
+
+    if (node.contains("status") && node["status"].is_object()) {
+        const json& status = node["status"];
+        json row;
+        row["node"] = key;
+        row["type"] = node.value("type", std::string());
+        row["summary"] = node.value("summary", std::string());
+        row["state"] = status.value("state", std::string("idle"));
+        row["runs"] = status.value("runs", 0);
+
+        json jobResults = json::array();
+        int64_t totalMs = 0;
+        if (status.contains("jobs") && status["jobs"].is_array()) {
+            for (const auto& jobIdValue : status["jobs"]) {
+                if (!jobIdValue.is_string()) continue;
+                const std::string jobId = jobIdValue.get<std::string>();
+                TaskQueueJob job;
+                json jobRow;
+                jobRow["id"] = jobId;
+                if (!tqm.GetJobSnapshot(jobId, job)) {
+                    jobRow["state"] = "missing";
+                    jobResults.push_back(std::move(jobRow));
+                    continue;
+                }
+                jobRow["state"] = job.state;
+                if (!job.attempts.empty()) {
+                    const TaskQueueAttempt& attempt = job.attempts.back();
+                    jobRow["attempt"] = attempt.n;
+                    jobRow["exit_code"] = attempt.exitCode;
+                    jobRow["check_detail"] = attempt.checkDetail;
+                    const int64_t started = ParseTimestampStrToEpoch(attempt.start);
+                    const int64_t ended = ParseTimestampStrToEpoch(attempt.end);
+                    const int64_t durationMs = (started > 0 && ended >= started) ? (ended - started) * 1000 : 0;
+                    jobRow["duration_ms"] = durationMs;
+                    totalMs += durationMs;
+                    if (attempt.testReportSummary.total > 0) {
+                        json summary;
+                        summary["total"] = attempt.testReportSummary.total;
+                        summary["failed"] = attempt.testReportSummary.failed;
+                        summary["skipped"] = attempt.testReportSummary.skipped;
+                        summary["failed_names"] = attempt.testReportSummary.failedNames;
+                        jobRow["test_report_summary"] = std::move(summary);
+                    }
+                }
+                jobResults.push_back(std::move(jobRow));
+            }
+        }
+        row["jobs"] = jobResults;
+        row["duration_ms"] = totalMs;
+        rows.push_back(std::move(row));
+    }
+
+    for (const char* childKey : {"root", "children", "cond", "then", "else", "child", "until", "handlers"}) {
+        auto it = node.find(childKey);
+        if (it != node.end()) CollectRoutineNodes(*it, key, tqm, rows);
+    }
+}
+
+static nlohmann::json RoutineNodeResults(BtManager* btm, TaskQueueManager& tqm, const std::string& runId) {
+    using json = nlohmann::json;
+    json rows = json::array();
+    if (!btm) return rows;
+    json tree = json::parse(btm->Get(runId, false), nullptr, false);
+    if (tree.is_discarded() || !tree.value("ok", false) || !tree.contains("tree")) return rows;
+    CollectRoutineNodes(tree["tree"], "", tqm, rows);
+    return rows;
+}
+
+// 093-3: compare a run's node results with the previous run and report newly failed / fixed nodes.
+static void AddRoutineNodeDiff(nlohmann::json& resp, BtManager* btm, TaskQueueManager& tqm,
+                               const nlohmann::json& runs, const nlohmann::json& nodes) {
+    if (!btm || !runs.is_array() || runs.size() < 2) return;
+    const auto failedNodes = [](const nlohmann::json& list) {
+        std::set<std::string> out;
+        for (const auto& node : list) {
+            if (!node.is_object()) continue;
+            const std::string state = node.value("state", std::string());
+            if (state != "succeeded" && state != "skipped") out.insert(node.value("node", std::string()));
+        }
+        return out;
+    };
+    const auto previousRun = runs[runs.size() - 2];
+    if (!previousRun.is_object()) return;
+    const std::string previousId = previousRun.value("runId", std::string());
+    if (previousId.empty()) return;
+    const std::set<std::string> before = failedNodes(RoutineNodeResults(btm, tqm, previousId));
+    const std::set<std::string> after = failedNodes(nodes.is_array() ? nodes : nlohmann::json::array());
+    std::vector<std::string> newlyFailed, fixed;
+    for (const auto& name : after) if (!before.count(name)) newlyFailed.push_back(name);
+    for (const auto& name : before) if (!after.count(name)) fixed.push_back(name);
+    resp["newlyFailed"] = nlohmann::json::array();
+    for (const auto& name : newlyFailed) resp["newlyFailed"].push_back(name);
+    resp["fixed"] = nlohmann::json::array();
+    for (const auto& name : fixed) resp["fixed"].push_back(name);
+}
+
+static nlohmann::json RoutineFailedNodes(BtManager* btm, TaskQueueManager& tqm, const std::string& runId) {
+    nlohmann::json failed = nlohmann::json::array();
+    for (const auto& node : RoutineNodeResults(btm, tqm, runId)) {
+        if (!node.is_object()) continue;
+        const std::string state = node.value("state", std::string());
+        if (state != "succeeded" && state != "skipped" && state != "cancelled") {
+            failed.push_back(node.value("node", std::string()));
+        }
+    }
+    return failed;
+}
+
+// Captures the final state of a routine run: advances the snapshot on success and opens a
+// `routine_stale_failure` triage card on failure when the routine was stale at start.
+static void FinalizeRoutineRun(RoutineManager& routines, TriageManager* triage, BtManager* btm,
+                               TaskQueueManager& tqm, const std::string& name, const std::string& cwd,
+                               const std::string& runId, const std::string& state,
+                               bool wasStale, const nlohmann::json& diff) {
+    if (state != "succeeded" && state != "failed") return;
+    std::string err;
+    routines.UpdateLatestRun(name, {{"state", state}, {"finishedAt", GetCurrentTimestampStr()}}, err);
+    if (!wasStale) return;
+    if (state == "succeeded") {
+        routines.RefreshInputsSnapshot(name, cwd, "routine-run", err);
+    } else if (triage) {
+        triage->AddCard(BuildRoutineStaleFailureCard(
+            name, runId, diff, RoutineFailedNodes(btm, tqm, runId), GetCurrentTimestampStr()));
+    }
+}
+
+// --------------------------------------------------------------------------------------------
+// 093-5: routine ask. A worker LLM writes a routine definition; Hancho validates it and stores
+// it as a proposal. All of this runs synchronously so `--wait` always returns the final result.
+// --------------------------------------------------------------------------------------------
+
+static std::string AskReplaceAll(std::string text, const std::string& from, const std::string& to) {
+    if (from.empty()) return text;
+    size_t pos = 0;
+    while ((pos = text.find(from, pos)) != std::string::npos) {
+        text.replace(pos, from.size(), to);
+        pos += to.size();
+    }
+    return text;
+}
+
+static std::string AskGlobField(const std::string& rel, const std::string& field) {
+    if (field == "stem") return BtPathStem(rel);
+    if (field == "name" || field == "filename") return BtPathName(rel);
+    if (field == "base") {
+        const std::string name = BtPathName(rel);
+        const size_t dot = name.find_last_of('.');
+        return dot == std::string::npos ? name : name.substr(0, dot);
+    }
+    return rel;
+}
+
+// Expands ${foreach:<glob>:<field>:<separator>} placeholders used by the test-suite template.
+static std::string AskExpandForeachTokens(const std::string& text, const std::string& cwd) {
+    std::string out = text;
+    const std::string prefix = "${foreach:";
+    size_t pos = 0;
+    while ((pos = out.find(prefix, pos)) != std::string::npos) {
+        const size_t end = out.find('}', pos);
+        if (end == std::string::npos) break;
+        const std::string inner = out.substr(pos + prefix.size(), end - pos - prefix.size());
+        const size_t first = inner.find(':');
+        const std::string glob = first == std::string::npos ? inner : inner.substr(0, first);
+        std::string field = "path";
+        std::string separator = " ";
+        if (first != std::string::npos) {
+            const std::string rest = inner.substr(first + 1);
+            const size_t second = rest.find(':');
+            field = second == std::string::npos ? rest : rest.substr(0, second);
+            if (second != std::string::npos) separator = rest.substr(second + 1);
+        }
+        std::vector<std::string> matches;
+        ExpandBtGlob(cwd, glob, {}, matches);
+        std::string joined;
+        for (size_t i = 0; i < matches.size(); ++i) {
+            if (i) joined += separator;
+            joined += AskGlobField(matches[i], field);
+        }
+        out.replace(pos, end - pos + 1, joined);
+        pos += joined.size();
+    }
+    return out;
+}
+
+static std::string AskReplaceVarTokens(std::string text, const std::string& var,
+                                       const std::string& rel) {
+    const std::string prefix = "${" + var + ".";
+    size_t pos = 0;
+    while ((pos = text.find(prefix, pos)) != std::string::npos) {
+        const size_t end = text.find('}', pos);
+        if (end == std::string::npos) break;
+        const std::string field = text.substr(pos + prefix.size(), end - pos - prefix.size());
+        const std::string value = AskGlobField(rel, field);
+        text.replace(pos, end - pos + 1, value);
+        pos += value.size();
+    }
+    return text;
+}
+
+static json AskExpandJson(const json& node, const std::string& var, const std::string& rel) {
+    if (node.is_array()) {
+        json out = json::array();
+        for (const auto& child : node) out.push_back(AskExpandJson(child, var, rel));
+        return out;
+    }
+    if (node.is_object()) {
+        json out = json::object();
+        for (auto it = node.begin(); it != node.end(); ++it) {
+            if (it.value().is_string()) {
+                out[it.key()] = AskReplaceVarTokens(AskExpandForeachTokens(it.value().get<std::string>(), ""), var, rel);
+            } else {
+                out[it.key()] = AskExpandJson(it.value(), var, rel);
+            }
+        }
+        return out;
+    }
+    return node;
+}
+
+// Dry-run: expand foreach globs into the concrete list of jobs that would run, and reject
+// definitions that contain unattended-hostile nodes or chained commands.
+static json AskDryRun(const json& bt, const std::string& cwd, std::string& outError) {
+    json jobs = json::array();
+    std::function<void(const json&, const std::string&)> walk = [&](const json& node,
+                                                                    const std::string& key) {
+        if (!outError.empty()) return;
+        if (node.is_array()) {
+            int index = 0;
+            for (const auto& child : node) walk(child, key + "/" + std::to_string(index++));
+            return;
+        }
+        if (!node.is_object()) return;
+        const std::string type = node.value("type", std::string());
+        if (type == "worker" || type == "escalate") {
+            outError = "routine must not contain '" + type +
+                       "' nodes (it has to run unattended without a worker or escalation)";
+            return;
+        }
+        if (type == "job") {
+            std::string command = AskExpandForeachTokens(node.value("command", std::string()), cwd);
+            std::string chainError;
+            if (!CheckChainGuard(command, chainError)) {
+                outError = "ChainGuard: " + chainError;
+                return;
+            }
+            json row;
+            row["node"] = node.value("id", key);
+            row["command"] = command;
+            row["summary"] = node.value("summary", std::string());
+            jobs.push_back(std::move(row));
+        } else if (type == "foreach") {
+            std::vector<std::string> excludes;
+            if (node.contains("exclude") && node["exclude"].is_array()) {
+                for (const auto& item : node["exclude"]) {
+                    if (item.is_string()) excludes.push_back(item.get<std::string>());
+                }
+            }
+            std::vector<std::string> matches;
+            ExpandBtGlob(cwd, node.value("glob", std::string()), excludes, matches);
+            const std::string var = node.value("as", std::string("item"));
+            for (const auto& rel : matches) {
+                walk(AskExpandJson(node.value("do", json::object()), var, rel), key + "[" + rel + "]");
+            }
+        }
+        for (const char* childKey : {"root", "children", "cond", "then", "else", "child", "until", "handlers"}) {
+            auto it = node.find(childKey);
+            if (it != node.end()) walk(*it, key);
+        }
+    };
+    walk(bt.value("root", json::object()), "");
+
+    json out = json::object();
+    out["jobs"] = std::move(jobs);
+    out["count"] = out["jobs"].size();
+    out["expanded"] = true;
+    return out;
+}
+
+static json AskSelectWorkers(BtManager* btm, bool& outUsedDefault) {
+    json candidates = json::array();
+    llm::Config cfg;
+    std::string err;
+    if (llm::Load(llm::DefaultPath(), cfg, err)) {
+        for (const auto& entry : llm::Usable(cfg, llm::kWorker)) {
+            if (btm && btm->IsDown(entry.engine, entry.model)) continue;
+            json candidate;
+            candidate["engine"] = entry.engine;
+            candidate["model"] = entry.model;
+            candidate["rank"] = entry.rank;
+            candidates.push_back(std::move(candidate));
+        }
+    }
+    outUsedDefault = candidates.empty();
+    if (outUsedDefault) {
+        json candidate;
+        candidate["engine"] = btm ? btm->DefaultEngine() : std::string("agy");
+        candidate["model"] = "";
+        candidate["rank"] = 0;
+        candidates.push_back(std::move(candidate));
+    }
+    return candidates;
+}
+
+struct AskWorkerResult {
+    bool ok = false;
+    json value = json::object();
+    std::string error;
+    std::string engine;
+    std::string model;
+    bool usedDefault = false;
+};
+
+static AskWorkerResult AskRunWorker(BtManager* btm, const std::string& cwd,
+                                    const std::string& prompt, const json& candidates,
+                                    bool usedDefault, int timeoutMs) {
+    AskWorkerResult result;
+    if (!btm) {
+        result.error = "behavior trees are not available";
+        return result;
+    }
+    result.usedDefault = usedDefault;
+    result.engine = candidates.empty() ? std::string() : candidates[0].value("engine", std::string());
+    result.model = candidates.empty() ? std::string() : candidates[0].value("model", std::string());
+
+    json schema = {
+        {"type", "object"},
+        {"required", json::array({"name", "summary", "bt", "inputs", "notes", "rationale"})},
+        {"properties", {
+            {"name", {{"type", "string"}}},
+            {"summary", {{"type", "string"}}},
+            {"bt", {{"type", "object"}}},
+            {"inputs", {{"type", "array"}, {"items", {{"type", "string"}}}}},
+            {"notes", {{"type", "string"}}},
+            {"rationale", {{"type", "string"}}}
+        }}
+    };
+
+    static std::atomic<int> sequence{0};
+    const std::string stamp = SanitizeFileNameComponent(GetCurrentTimestampStr());
+    const std::string btId = "routine-ask-" + stamp + "-" + std::to_string(++sequence);
+    json bt = {
+        {"id", btId},
+        {"summary", "Generate a Hancho routine proposal"},
+        {"cwd", cwd},
+        {"taskqueue", "routine-ask"},
+        {"vars", {{"dollar", "$"}}},
+        {"root", {
+            {"type", "worker"},
+            {"id", "ask"},
+            {"summary", "Ask an LLM for a routine definition"},
+            {"prompt", prompt},
+            {"timeoutSec", 900},
+            {"outputSchema", schema}
+        }}
+    };
+    if (usedDefault) {
+        bt["root"]["engine"] = result.engine;
+        bt["root"]["model"] = result.model;
+    } else {
+        bt["root"]["engines"] = candidates;
+    }
+
+    json start = json::parse(btm->Start(bt.dump(), false), nullptr, false);
+    if (start.is_discarded() || !start.value("ok", false)) {
+        result.error = start.is_discarded() ? "failed to start routine ask worker"
+                                            : start.value("error", start.dump());
+        return result;
+    }
+    json waited = json::parse(btm->Wait(btId, 0, timeoutMs, false), nullptr, false);
+    if (waited.is_discarded()) {
+        result.error = "routine ask worker did not return a state";
+        return result;
+    }
+    const std::string state = waited.value("state", std::string());
+    if (waited.value("timedOut", false) || (state != "succeeded" && state != "failed" && state != "cancelled")) {
+        result.error = "routine ask worker did not finish in time (state=" + state + ")";
+        return result;
+    }
+    if (state != "succeeded") {
+        std::string detail = waited.value("detail", std::string());
+        json tree = json::parse(btm->Get(btId, false), nullptr, false);
+        if (!tree.is_discarded() && tree.contains("tree")) {
+            std::function<void(const json&)> findDetail = [&](const json& node) {
+                if (node.is_array()) { for (const auto& c : node) findDetail(c); return; }
+                if (!node.is_object()) return;
+                if (node.contains("status") && node["status"].is_object() &&
+                    node.value("id", std::string()) == "ask") {
+                    const std::string d = node["status"].value("detail", std::string());
+                    if (!d.empty()) detail = d;
+                }
+                for (auto it = node.begin(); it != node.end(); ++it) findDetail(it.value());
+            };
+            findDetail(tree["tree"]);
+        }
+        result.error = "routine ask worker failed: " + (detail.empty() ? state : detail);
+        return result;
+    }
+
+    const std::wstring resultPath = BtManager::GetBtResultFileWide(btId, btId + "-ask-1");
+    if (!PathExistsWide(resultPath)) {
+        result.error = "routine ask worker produced no result file";
+        return result;
+    }
+    json value = json::parse(ReadFileUtf8Wide(resultPath), nullptr, false);
+    if (value.is_discarded() || !value.is_object()) {
+        result.error = "routine ask worker result is not a JSON object";
+        return result;
+    }
+    result.ok = true;
+    result.value = std::move(value);
+    return result;
+}
+
+static std::string AskBuildPrompt(const std::string& requestText, const std::string& cwd,
+                                  const std::string& name, bool fix,
+                                  const json& existing, const json& diff,
+                                  const json& lastRun, const json& nodes,
+                                  const std::string& logTail, const std::string& extraError) {
+    std::ostringstream oss;
+    oss << "You are helping the Hancho supervisor create or update a saved routine.\n\n"
+        << "Request from the user:\n" << requestText << "\n\n"
+        << "Working directory (cwd): " << cwd << "\n"
+        << "Routine name: " << (name.empty() ? std::string("(choose a short kebab-case name)") : name) << "\n"
+        << "Mode: " << (fix ? "FIX an existing routine" : "CREATE a new routine") << "\n\n";
+    if (!extraError.empty()) {
+        oss << "A previous attempt was rejected. Fix these problems:\n" << extraError << "\n\n";
+    }
+    oss << "A routine is a JSON file with these fields: name, summary, cwd, bt, inputs, notes.\n"
+        << "`bt` is the behavior-tree definition: {id, summary, root:{type, children:[...]}}.\n"
+        << "Use `job` nodes with a single command and `foreach` nodes with a glob/`do` body.\n"
+        << "In commands, ${foreach:<glob>:<field>:<separator>} expands to every matching file;\n"
+        << "inside a foreach body, ${<as>.stem} / ${<as>.name} refer to the current match.\n"
+        << "Prefer a foreach node with globs over a fixed list of files.\n"
+        << "Do not use `worker` or `escalate` nodes: a routine must run unattended.\n"
+        << "Do not chain commands (&&, ||, ;, newline); use separate job nodes instead.\n\n";
+    oss << "Reference example (`bt template test-suite`):\n"
+        << BtTemplateDefinition("test-suite").dump(2) << "\n\n";
+    oss << "Existing routines in this project:\n";
+    oss << "[routine names and summaries are supplied by Hancho]\n\n";
+    if (fix) {
+        oss << "Current definition:\n" << existing.dump(2) << "\n\n"
+            << "routine check diff:\n" << diff.dump(2) << "\n\n"
+            << "Last run:\n" << lastRun.dump(2) << "\n\n"
+            << "Per-node results:\n" << nodes.dump(2) << "\n\n"
+            << "Failed node log tail:\n" << logTail << "\n\n";
+    }
+    oss << "Read the repository under cwd to confirm the real build and test commands.\n"
+        << "Write ONLY a JSON object with name, summary, bt, inputs, notes and rationale to the\n"
+        << "file named by the PC_BT_RESULT_FILE environment variable. `rationale` explains your\n"
+        << "choice to the person who will approve the proposal.\n";
+    // The BT engine expands ${...} in a worker prompt; keep the literal foreach syntax intact
+    // by spelling the dollar sign through a variable that is set to "$" on the ask tree.
+    return AskReplaceAll(oss.str(), "${", "${dollar}{");
+}
+
+// Main entry point shared by the IPC action and the triage `update_routine` candidate.
+static std::string HandleRoutineAsk(RoutineManager& routines, BtManager* btm,
+                                    TaskQueueManager* tqm, const std::string& requestText,
+                                    const std::string& requestedName, const std::string& cwd,
+                                    const std::string& scope, const std::string& by,
+                                    int timeoutMs) {
+    using json = nlohmann::json;
+    const std::string name = requestedName.empty() ? std::string("ask-") + SanitizeFileNameComponent(
+                                  requestText.substr(0, 40)) : requestedName;
+    if (!RoutineManager::ValidName(name)) {
+        return json{{"ok", false}, {"error", "invalid routine name: " + name}}.dump();
+    }
+
+    bool fix = false;
+    json existing = json::object();
+    json diff = json::object();
+    json lastRun = json::object();
+    json nodes = json::array();
+    std::string logTail;
+    if (RoutineManager::HasProposal(name, cwd)) {
+        json proposal = RoutineManager::ReadProposal(name, cwd);
+        if (!proposal.is_null()) {
+            fix = true;
+            existing = proposal;
+            diff = proposal.value("proposal", json::object()).value("diff", json::object());
+        }
+    } else {
+        std::string foundScope;
+        bool found = false;
+        const std::wstring defPath = RoutineManager::DefinitionPathWide(name, "", cwd, &foundScope, &found);
+        if (found) {
+            fix = true;
+            existing = json::parse(ReadFileUtf8Wide(defPath), nullptr, false);
+            json check = json::parse(routines.Check(name, cwd), nullptr, false);
+            if (!check.is_discarded() && check.value("ok", false)) diff = check;
+        }
+    }
+    if (fix && existing.is_object()) {
+        json shown = json::parse(routines.Show(name, cwd), nullptr, false);
+        if (!shown.is_discarded() && shown.value("ok", false)) {
+            if (shown.contains("lastRun") && shown["lastRun"].is_object()) lastRun = shown["lastRun"];
+            if (shown.contains("nodes") && shown["nodes"].is_array()) nodes = shown["nodes"];
+        }
+        if (tqm && nodes.is_array()) {
+            for (const auto& node : nodes) {
+                if (!node.is_object()) continue;
+                const std::string state = node.value("state", std::string());
+                if (state == "succeeded" || state == "skipped") continue;
+                if (!node.contains("jobs") || !node["jobs"].is_array()) continue;
+                for (const auto& job : node["jobs"]) {
+                    if (!job.is_object()) continue;
+                    TaskQueueJob snapshot;
+                    if (!tqm->GetJobSnapshot(job.value("id", std::string()), snapshot)) continue;
+                    if (snapshot.attempts.empty()) continue;
+                    const std::wstring log = Utf8ToWide(snapshot.attempts.back().lastLinesFile);
+                    if (!log.empty() && PathExistsWide(log)) {
+                        logTail = ReadFileUtf8Wide(log);
+                        if (logTail.size() > 4000) logTail = logTail.substr(logTail.size() - 4000);
+                        break;
+                    }
+                }
+                if (!logTail.empty()) break;
+            }
+        }
+    }
+
+    bool usedDefault = false;
+    const json candidates = AskSelectWorkers(btm, usedDefault);
+    std::string extraError;
+    AskWorkerResult worker;
+    json resultValue;
+    json dryRun = json::object();
+    std::string validationError;
+    int usedAttempts = 0;
+
+    for (int attempt = 0; attempt < 2; ++attempt) {
+        usedAttempts = attempt + 1;
+        const std::string prompt = AskBuildPrompt(requestText, cwd, name, fix, existing, diff,
+                                                  lastRun, nodes, logTail, extraError);
+        worker = AskRunWorker(btm, cwd, prompt, candidates, usedDefault, timeoutMs);
+        if (!worker.ok) {
+            return json{{"ok", false}, {"error", worker.error},
+                        {"engine", worker.engine}, {"model", worker.model}}.dump();
+        }
+        resultValue = worker.value;
+        validationError.clear();
+        json bt = json::parse(resultValue.value("bt", json::object()).dump(), nullptr, false);
+        std::string btJson = bt.is_discarded() ? std::string() : bt.dump();
+        if (btJson.empty() || !bt.is_object() || !bt.contains("root")) {
+            validationError = "the proposed 'bt' must be an object with a root node";
+        } else {
+            if (btm) {
+                json validated = json::parse(btm->Validate(btJson, true), nullptr, false);
+                if (validated.is_discarded() || !validated.value("ok", false) ||
+                    !validated.value("valid", false)) {
+                    validationError = validated.is_discarded()
+                                          ? "strict BT validation failed"
+                                          : validated.value("error", validated.dump());
+                }
+            }
+            if (validationError.empty()) {
+                dryRun = AskDryRun(bt, cwd, validationError);
+            }
+        }
+        if (validationError.empty()) break;
+        if (attempt == 0) {
+            extraError = validationError + "\nWrite a corrected definition now.";
+            continue;
+        }
+        return json{{"ok", false},
+                    {"error", "proposed routine failed validation after one fix: " + validationError},
+                    {"engine", worker.engine}, {"model", worker.model},
+                    {"dryRun", dryRun}}.dump();
+    }
+
+    const std::string resultName = resultValue.value("name", name);
+    if (!RoutineManager::ValidName(resultName)) {
+        return json{{"ok", false}, {"error", "worker returned an invalid routine name: " + resultName}}.dump();
+    }
+    std::vector<std::string> inputs;
+    if (resultValue.contains("inputs") && resultValue["inputs"].is_array()) {
+        for (const auto& input : resultValue["inputs"]) {
+            if (input.is_string()) inputs.push_back(input.get<std::string>());
+        }
+    }
+    const std::string effectiveScope = scope.empty() ? std::string("project") : scope;
+    json meta = {
+        {"request", requestText},
+        {"rationale", resultValue.value("rationale", std::string())},
+        {"engine", worker.engine},
+        {"model", worker.model},
+        {"usedDefaultEngine", usedDefault},
+        {"diff", diff},
+        {"dryRun", dryRun},
+        {"at", GetCurrentTimestampStr()},
+        {"by", by}
+    };
+    json saved = json::parse(routines.SaveProposal(
+        resultName, resultValue.value("bt", json::object()).dump(), inputs,
+        resultValue.value("summary", std::string()), resultValue.value("notes", std::string()),
+        effectiveScope, cwd, by,
+        "routine ask" + std::string(fix ? " (fix)" : " (create)") + ": " + requestText, meta),
+        nullptr, false);
+    if (saved.is_discarded() || !saved.value("ok", false)) {
+        return saved.is_discarded() ? json{{"ok", false}, {"error", "failed to save proposal"}}.dump()
+                                    : saved.dump();
+    }
+
+    json out = json{{"ok", true}};
+    out["name"] = resultName;
+    out["status"] = "proposed";
+    out["scope"] = effectiveScope;
+    out["engine"] = worker.engine;
+    out["model"] = worker.model;
+    out["usedDefaultEngine"] = usedDefault;
+    out["rationale"] = resultValue.value("rationale", std::string());
+    out["summary"] = resultValue.value("summary", std::string());
+    out["dryRun"] = dryRun;
+    out["attempts"] = usedAttempts;
+    out["proposal"] = saved;
+    if (usedDefault) {
+        out["warning"] = "worker LLM list is empty; used the default engine";
+    }
+    return out.dump();
 }
 
 std::string IpcServer::HandleRequestJson(const std::string& reqJson) {
@@ -1937,6 +2630,9 @@ std::string IpcServer::HandleRequestJson(const std::string& reqJson) {
             if (!cfg.contains("restore_usage_graph")) {
                 cfg["restore_usage_graph"] = IsUsageHistoryPersistence();
             }
+            if (!cfg.contains("usage_round_time")) {
+                cfg["usage_round_time"] = GetUsageRoundTime();
+            }
             if (!cfg.contains("webui") || !cfg["webui"].is_object()) {
                 cfg["webui"] = nlohmann::json::object();
             }
@@ -2035,6 +2731,9 @@ std::string IpcServer::HandleRequestJson(const std::string& reqJson) {
             if (cfg.contains("restore_usage_graph") && cfg["restore_usage_graph"].is_boolean()) {
                 SetUsageHistoryPersistence(cfg["restore_usage_graph"].get<bool>());
             }
+            if (cfg.contains("usage_round_time") && cfg["usage_round_time"].is_string()) {
+                SetUsageRoundTime(cfg["usage_round_time"].get<std::string>());
+            }
             // Restart a listener only when its block actually changed. A caller that
             // sends the whole config back (dashboard settings save, CLI) used to
             // restart the terminal server and Chat on every unrelated change, and the
@@ -2058,6 +2757,212 @@ std::string IpcServer::HandleRequestJson(const std::string& reqJson) {
             return out.dump();
         }
         return "{\"ok\":false,\"error\":\"Unknown config action: " + JsonEscape(action) + "\"}";
+    }
+    else if (action.rfind("routine_", 0) == 0) {
+        using json = nlohmann::json;
+        json req = json::parse(reqJson, nullptr, false);
+        if (req.is_discarded() || !req.is_object()) {
+            return "{\"ok\":false,\"error\":\"invalid JSON request\"}";
+        }
+        if (!routineManager_) {
+            return "{\"ok\":false,\"error\":\"routines are not available\"}";
+        }
+        const std::string name = req.value("name", std::string());
+        std::string cwd = req.value("cwd", std::string());
+        if (cwd.empty()) cwd = WideToUtf8(GetCurrentDirectoryWide());
+
+        json resp;
+        std::string err;
+        if (action == "routine_list") {
+            resp = json::parse(routineManager_->List(cwd), nullptr, false);
+        } else if (action == "routine_show") {
+            if (name.empty()) return "{\"ok\":false,\"error\":\"name is required\"}";
+            resp = json::parse(routineManager_->Show(name, cwd), nullptr, false);
+            if (!resp.is_discarded() && resp.value("ok", false) && resp.contains("lastRun") &&
+                resp["lastRun"].is_object()) {
+                const std::string runId = resp["lastRun"].value("runId", std::string());
+                const std::string state = resp["lastRun"].value("state", std::string());
+                if (!runId.empty() && state != "succeeded" && state != "failed" && state != "cancelled" && btm_) {
+                    json tree = json::parse(btm_->Get(runId, true), nullptr, false);
+                    if (!tree.is_discarded() && tree.value("ok", false)) {
+                        const std::string liveState = tree.value("state", state);
+                        if (liveState != state) {
+                            const bool wasStale = resp["lastRun"].value("staleAtStart", false);
+                            json diff = resp["lastRun"].value("inputDiff", json::object());
+                            if (liveState == "succeeded" || liveState == "failed") {
+                                FinalizeRoutineRun(*routineManager_, triageManager_.get(), btm_, tqm_,
+                                                   name, cwd, runId, liveState, wasStale, diff);
+                            } else {
+                                json patch = {{"state", liveState}};
+                                if (liveState == "cancelled") patch["finishedAt"] = GetCurrentTimestampStr();
+                                routineManager_->UpdateLatestRun(name, patch, err);
+                            }
+                            resp["lastRun"]["state"] = liveState;
+                            if (liveState == "succeeded" || liveState == "failed" || liveState == "cancelled") {
+                                resp["lastRun"]["finishedAt"] = GetCurrentTimestampStr();
+                                if (resp.contains("runs") && resp["runs"].is_array() && !resp["runs"].empty()) {
+                                    resp["runs"].back() = resp["lastRun"];
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+            if (!resp.is_discarded() && resp.value("ok", false) && resp.contains("lastRun") &&
+                resp["lastRun"].is_object()) {
+                const std::string runId = resp["lastRun"].value("runId", std::string());
+                resp["nodes"] = runId.empty() ? json::array() : RoutineNodeResults(btm_, tqm_, runId);
+                AddRoutineNodeDiff(resp, btm_, tqm_, resp.value("runs", json::array()), resp["nodes"]);
+            }
+        } else if (action == "routine_check") {
+            if (name.empty()) return "{\"ok\":false,\"error\":\"name is required\"}";
+            resp = json::parse(routineManager_->Check(name, cwd), nullptr, false);
+        } else if (action == "routine_save") {
+            if (name.empty()) return "{\"ok\":false,\"error\":\"name is required\"}";
+            std::string btText;
+            if (req.contains("bt") && !req["bt"].is_null()) {
+                if (req["bt"].is_string()) btText = req["bt"].get<std::string>();
+                else btText = req["bt"].dump();
+            } else if (req.contains("file") && req["file"].is_string()) {
+                const std::wstring absPath = ResolveAbsolutePathWide(Utf8ToWide(req["file"].get<std::string>()));
+                std::ifstream ifs(absPath, std::ios::binary);
+                if (!ifs) return "{\"ok\":false,\"error\":\"cannot read BT file\"}";
+                std::ostringstream ss;
+                ss << ifs.rdbuf();
+                btText = ss.str();
+            } else {
+                return "{\"ok\":false,\"error\":\"routine_save requires 'bt' or 'file'\"}";
+            }
+            std::vector<std::string> inputs;
+            if (req.contains("inputs") && req["inputs"].is_array()) {
+                for (const auto& item : req["inputs"]) {
+                    if (item.is_string()) inputs.push_back(item.get<std::string>());
+                }
+            }
+            const std::string by = req.value("by", std::string("hancho-cli"));
+            bool fromMcp = false;
+            if (req.contains("origin") && req["origin"].is_object()) {
+                const std::string client = req["origin"].value("client", std::string());
+                fromMcp = !client.empty() && client.find("hancho-cli") == std::string::npos;
+            }
+            if (fromMcp) {
+                json meta = {{"request", "routine_save via MCP"},
+                             {"rationale", req.value("reason", std::string())},
+                             {"by", by}};
+                resp = json::parse(routineManager_->SaveProposal(
+                    name, btText, inputs,
+                    req.value("summary", std::string()),
+                    req.value("notes", std::string()),
+                    req.value("scope", std::string("project")),
+                    cwd, by,
+                    req.value("reason", std::string()), meta), nullptr, false);
+            } else {
+                resp = json::parse(routineManager_->Save(
+                    name, btText, inputs,
+                    req.value("summary", std::string()),
+                    req.value("notes", std::string()),
+                    req.value("scope", std::string("project")),
+                    cwd, by,
+                    req.value("reason", std::string())), nullptr, false);
+            }
+        } else if (action == "routine_save_from_bt") {
+            if (name.empty()) return "{\"ok\":false,\"error\":\"name is required\"}";
+            resp = json::parse(routineManager_->SaveFromBt(
+                name, req.value("btId", req.value("fromBt", std::string())),
+                req.value("scope", std::string("project")), cwd,
+                req.value("by", std::string("hancho-cli")),
+                req.value("proposed", false),
+                req.value("reason", std::string())), nullptr, false);
+        } else if (action == "routine_ask") {
+            const std::string requestText = req.value("request", req.value("text", std::string()));
+            if (requestText.empty()) return "{\"ok\":false,\"error\":\"request text is required\"}";
+            const int timeoutMs = static_cast<int>(JsonGetInt(reqJson, "timeout_ms", 600000));
+            resp = json::parse(HandleRoutineAsk(*routineManager_, btm_, &tqm_, requestText,
+                                                name, cwd,
+                                                req.value("scope", std::string("project")),
+                                                req.value("by", std::string("chat")), timeoutMs),
+                               nullptr, false);
+        } else if (action == "routine_approve") {
+            if (name.empty()) return "{\"ok\":false,\"error\":\"name is required\"}";
+            resp = json::parse(routineManager_->Approve(
+                name, cwd, req.value("userSaid", std::string()),
+                req.value("by", std::string("user")),
+                req.value("via", std::string("chat"))), nullptr, false);
+        } else if (action == "routine_reject") {
+            if (name.empty()) return "{\"ok\":false,\"error\":\"name is required\"}";
+            resp = json::parse(routineManager_->Reject(
+                name, cwd, req.value("reason", std::string()),
+                req.value("by", std::string("user"))), nullptr, false);
+        } else if (action == "routine_run") {
+            if (name.empty()) return "{\"ok\":false,\"error\":\"name is required\"}";
+            if (!btm_) return "{\"ok\":false,\"error\":\"behavior trees are not available\"}";
+            resp = json::parse(routineManager_->PrepareRun(name, cwd), nullptr, false);
+            if (resp.is_discarded() || !resp.value("ok", false)) {
+                return resp.is_discarded() ? "{\"ok\":false,\"error\":\"invalid routine response\"}" : resp.dump();
+            }
+            const std::string runId = resp["runId"].get<std::string>();
+            const std::string btText = resp["bt"].get<std::string>();
+            const std::string taskqueue = resp["taskqueue"].get<std::string>();
+            const bool wasStale = resp.value("state", std::string()) == "stale";
+            json inputDiff = json::object();
+            for (const char* key : {"state", "added", "removed", "changed", "absorbed"}) {
+                if (resp.contains(key)) inputDiff[key] = resp[key];
+            }
+            if (req.contains("origin") && req["origin"].is_object()) {
+                tqm_.SetBtOrigin(runId, req["origin"].dump());
+            }
+            json start = json::parse(btm_->Start(btText, false), nullptr, false);
+            if (start.is_discarded() || !start.value("ok", false)) {
+                return start.is_discarded() ? "{\"ok\":false,\"error\":\"BT start failed\"}" : start.dump();
+            }
+            json runRecord;
+            runRecord["runId"] = runId;
+            runRecord["name"] = name;
+            runRecord["state"] = "running";
+            runRecord["startedAt"] = GetCurrentTimestampStr();
+            runRecord["finishedAt"] = "";
+            runRecord["taskqueue"] = taskqueue;
+            runRecord["staleAtStart"] = wasStale;
+            runRecord["inputDiff"] = inputDiff;
+            routineManager_->AppendRun(name, runRecord, err);
+
+            json out;
+            out["ok"] = true;
+            out["name"] = name;
+            out["runId"] = runId;
+            out["taskqueue"] = taskqueue;
+            out["state"] = "running";
+            out["waited"] = false;
+            out["inputsState"] = wasStale ? "stale" : "ok";
+            out["inputDiff"] = inputDiff;
+
+            const bool wait = req.value("wait", false);
+            if (wait) {
+                const int timeoutMs = static_cast<int>(JsonGetInt(reqJson, "timeout_ms", 60000));
+                json waited = json::parse(btm_->Wait(runId, 0, timeoutMs, false), nullptr, false);
+                const bool timedOut = waited.value("timedOut", false);
+                const std::string finalState = waited.value("state", "running");
+                out["waited"] = true;
+                out["timedOut"] = timedOut;
+                out["state"] = finalState;
+                if (!timedOut) {
+                    FinalizeRoutineRun(*routineManager_, triageManager_.get(), btm_, tqm_, name,
+                                       cwd, runId, finalState, wasStale, inputDiff);
+                }
+                out["nodes"] = RoutineNodeResults(btm_, tqm_, runId);
+                AddRoutineNodeDiff(out, btm_, tqm_, RoutineManager::ReadRuns(name), out["nodes"]);
+                out["bt"] = std::move(waited);
+            } else {
+                out["bt"] = std::move(start);
+            }
+            resp = std::move(out);
+        } else {
+            return "{\"ok\":false,\"error\":\"Unknown routine IPC action: " + JsonEscape(action) + "\"}";
+        }
+
+        HWND hwnd = notifyHwnd_.load();
+        if (hwnd) PostMessageW(hwnd, WM_PC_IPC_EVENT, 0, 0);
+        return resp.is_discarded() ? "{\"ok\":false,\"error\":\"invalid routine response\"}" : resp.dump();
     }
     return "{\"ok\":false,\"error\":\"Unknown IPC action: " + JsonEscape(action) + "\"}";
 }

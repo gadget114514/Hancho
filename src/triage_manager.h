@@ -4,6 +4,7 @@
 
 #include <atomic>
 #include <condition_variable>
+#include <functional>
 #include <mutex>
 #include <string>
 #include <thread>
@@ -29,11 +30,20 @@ public:
     void Stop();
     std::string List(const std::string& state = "pending");
     std::string Get(const std::string& id);
+    // Insert (or reopen) one externally produced card without touching the other cards.
+    // Returns the card id, or an empty string when the card has no key.
+    std::string AddCard(const nlohmann::json& card);
     std::string RequestAdvice(const std::string& id);
     std::string Decide(const std::string& id, const std::string& candidateId,
                        const std::string& reason, const nlohmann::json& params,
                        const std::string& by = "human");
     std::string Acknowledge(const std::string& id, bool allAuto = false);
+    // 093-5: lets the IPC layer implement the `update_routine` candidate as a routine ask
+    // (the triage manager itself owns no RoutineManager). Returns the routine_ask JSON.
+    using RoutineAskHandler = std::function<std::string(const std::string& name,
+                                                        const std::string& cwd,
+                                                        const std::string& request)>;
+    void SetRoutineAskHandler(RoutineAskHandler handler) { routineAskHandler_ = std::move(handler); }
     // Hands pending cards (the given ids, or every pending card when allPending) to a non-interactive
     // supervisor worker, run as a hidden job in queue `_supervisor` with a timeout. The cards stay pending;
     // the worker records its decisions with `hancho-cli triage decide`.
@@ -75,6 +85,7 @@ private:
     std::string llmModel_;
     // Actions the triage advisor may take. Default is read-only; "run_commands",
     // "write_files" or "use_worker_permissions" opt into the engine's worker permission args.
+    RoutineAskHandler routineAskHandler_;
     std::vector<std::string> llmPermissions_{"read_files"};
     // The batch supervisor must act, so it defaults to the worker permissions. A person can
     // restrict it to the read-only advice flags when they only want proposals.

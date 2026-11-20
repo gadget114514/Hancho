@@ -80,6 +80,14 @@
           <span>Memory</span>
           <span class="tab-badge" id="badge-mem-count">0</span>
         </button>
+
+        <button class="nav-tab" data-tab="routines">
+          <svg viewBox="0 0 24 24" width="16" height="16" fill="none" stroke="currentColor" stroke-width="2">
+            <polygon points="5 3 19 12 5 21 5 3"></polygon>
+          </svg>
+          <span>Routines</span>
+          <span class="tab-badge" id="badge-routine-count">0</span>
+        </button>
       </nav>
 
       <div class="header-right">
@@ -516,6 +524,43 @@
             </tbody>
           </table>
         </div>
+      </div>
+    </section>
+
+    <!-- PANE 6: ROUTINES -->
+    <section id="pane-routines" class="tab-pane">
+      <div class="card">
+        <div class="card-header">
+          <div class="card-title">
+            <svg viewBox="0 0 24 24" width="16" height="16" fill="none" stroke="currentColor" stroke-width="2">
+              <polygon points="5 3 19 12 5 21 5 3"></polygon>
+            </svg>
+            <span>Routines</span>
+          </div>
+          <div class="memory-actions">
+            <button id="btn-routine-run" class="btn btn-sm btn-primary" title="Run the selected routine">▶ Run</button>
+            <button id="btn-routine-approve" class="btn btn-sm" title="Approve the pending proposal">Approve</button>
+            <button id="btn-routine-reject" class="btn btn-sm" title="Reject the pending proposal">Reject</button>
+            <button id="btn-routine-refresh" class="btn btn-sm">Refresh</button>
+          </div>
+        </div>
+        <div class="memory-actions" style="padding: 8px 12px;">
+          <input type="text" id="input-routine-ask" class="form-control" style="flex:1; min-width:240px;" placeholder="LLM に頼む (例: 全スモークを流して)" />
+          <button id="btn-routine-ask" class="btn btn-sm">LLM に頼む</button>
+        </div>
+        <div id="routine-status" class="pane-info"></div>
+        <table class="data-table">
+          <thead>
+            <tr><th>Name</th><th>Summary</th><th>Inputs</th><th>Last run</th><th>Started</th></tr>
+          </thead>
+          <tbody id="routine-tbody">
+            <tr class="empty-row"><td colspan="5">Loading routines...</td></tr>
+          </tbody>
+        </table>
+      </div>
+      <div class="card" style="margin-top: 12px;">
+        <div class="card-header"><div class="card-title">Last run details</div></div>
+        <div id="routine-detail" class="pane-info">Select a routine to see its node results.</div>
       </div>
     </section>
 

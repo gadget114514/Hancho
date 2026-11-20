@@ -279,19 +279,13 @@ static HWND FindOwnWindow(const wchar_t* cls) {
     return nullptr;
 }
 
-// A dashboard titles itself "Hancho" for the default data dir and "Hancho - <dir>" for a
-// --data-dir override (see MainWindowTitle in gui_dashboard.cpp). Match on that title so
-// the core only reuses a dashboard that shows its own data dir.
+// Dashboards always title themselves "Hancho - <effective data dir>" (the legacy plain
+// "Hancho" title is still accepted for the default dir). Match on that title so the core
+// only reuses a dashboard that shows its own data dir.
 static bool DashboardTitleMatchesDataDir(HWND h) {
     wchar_t buf[1024] = {};
     GetWindowTextW(h, buf, 1024);
-    const std::wstring title = buf;
-    const std::wstring dataDir = GetDataDirectoryOverride();
-    if (dataDir.empty()) return title == L"Hancho";
-    const std::wstring suffix = L" - " + dataDir;
-    if (title.size() < suffix.size()) return false;
-    return _wcsnicmp(title.c_str() + (title.size() - suffix.size()), suffix.c_str(),
-                     suffix.size()) == 0;
+    return DashboardTitleMatches(buf, GetEffectiveDataDirectoryWide());
 }
 
 static HWND FindDashboardForDataDir() {

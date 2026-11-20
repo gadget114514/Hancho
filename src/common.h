@@ -116,6 +116,9 @@ std::string StripAnsiCodes(const std::string& input);
 // Trims leading and trailing whitespace characters (space, tab, cr, lf)
 std::string Trim(const std::string& s);
 
+// Lowercase hex SHA-256 digest. Used for instructions_file versioning and routine inputs snapshots.
+std::string Sha256Hex(const std::string& input);
+
 inline bool LocalTimeFromSec(const time_t* t, std::tm* out) {
 #ifdef _WIN32
     return localtime_s(out, t) == 0;
@@ -151,6 +154,7 @@ std::string FormatUptimeHMS(uint64_t ms);
 std::string FormatBytes(uint64_t bytes);
 
 // Persistent logging helpers (used by MCP, CLI, IPC, and ProcessManager)
+std::wstring GetDefaultLogsDirectoryWide();
 std::wstring GetLogsDirectoryWide();
 std::string GetLogsDirectoryUtf8();
 
@@ -162,6 +166,14 @@ void SetDataDirectoryOverride(const std::wstring& dir);
 std::wstring GetDataDirectoryOverride();
 bool HasCustomDataDirectory();
 std::wstring GetEffectiveDataDirectoryWide();
+
+// Dashboard window title. It always carries the effective data directory, including
+// the default one, so a title alone identifies the instance. Matching is tolerant of
+// case, / vs \ and a trailing separator, and accepts the legacy plain "Hancho" title
+// only for the default data directory.
+std::wstring DashboardWindowTitle(const std::wstring& dataDir);
+bool DashboardTitleMatches(const std::wstring& title, const std::wstring& dataDir);
+
 std::wstring GetPipeNameWide();
 std::wstring GetGuiMutexNameWide();
 std::string SanitizeFileNameComponent(const std::string& s);

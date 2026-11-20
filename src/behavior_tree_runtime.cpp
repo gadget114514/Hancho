@@ -31,7 +31,7 @@ BtNode* FindDeepestFailedNode(BtNode* cur) {
 // discarded so the branch is re-evaluated from the target onwards.
 void CollectExecOrderChildren(BtNode& node, std::vector<BtNode*>& out) {
     const std::string& t = node.type;
-    if (t == "sequence" || t == "fallback" || t == "parallel") {
+    if (t == "sequence" || t == "fallback" || t == "parallel" || t == "foreach") {
         for (const auto& c : node.children) if (c) out.push_back(c.get());
         return;
     }

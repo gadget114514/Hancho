@@ -5,6 +5,9 @@
 #include <windows.h>
 #endif
 #include <algorithm>
+#include <cstdio>
+#include <functional>
+#include <set>
 
 namespace pc {
 
@@ -111,7 +114,127 @@ std::string CatchHandlerLabel(const BtCatchHandler& h, int index) {
     if (!h.cause.empty()) out += " cause=" + h.cause;
     return out;
 }
+
+// Replaces ${<as>.<field>} in every string of a foreach child definition. Field values are
+// computed from the matched relative path; `index` is the 0-based position in the sorted result.
+json SubstituteForeachFields(json j, const std::string& alias, const std::string& path,
+                             size_t index) {
+    auto fieldValue = [&](const std::string& f) -> std::string {
+        if (f == "stem") return BtPathStem(path);
+        if (f == "name") return BtPathName(path);
+        if (f == "path") return path;
+        if (f == "index") return std::to_string(index);
+        return "";
+    };
+    std::function<void(json&)> walk = [&](json& cur) {
+        if (cur.is_string()) {
+            std::string s = cur.get<std::string>();
+            for (const char* f : {"stem", "name", "path", "index"}) {
+                ReplaceAll(s, "${" + alias + "." + f + "}", fieldValue(f));
+            }
+            cur = s;
+        } else if (cur.is_object() || cur.is_array()) {
+            for (auto it = cur.begin(); it != cur.end(); ++it) walk(it.value());
+        }
+    };
+    walk(j);
+    return j;
+}
+
+// Ids of every real node in the tree. The foreach being expanded and its `do` template are
+// excluded: neither is a concrete child, so neither can collide with a generated child id.
+void CollectRealNodeIds(const BtNode& cur, const BtNode* skip, std::set<std::string>& out) {
+    if (&cur == skip) return;
+    if (!cur.id.empty()) out.insert(cur.id);
+    for (const auto& c : cur.children) CollectRealNodeIds(*c, skip, out);
+    if (cur.condChild) CollectRealNodeIds(*cur.condChild, skip, out);
+    if (cur.thenChild) CollectRealNodeIds(*cur.thenChild, skip, out);
+    if (cur.elseChild) CollectRealNodeIds(*cur.elseChild, skip, out);
+    if (cur.singleChild) CollectRealNodeIds(*cur.singleChild, skip, out);
+    if (cur.untilChild) CollectRealNodeIds(*cur.untilChild, skip, out);
+    if (cur.otherwiseChild) CollectRealNodeIds(*cur.otherwiseChild, skip, out);
+    for (const auto& h : cur.catchHandlers) {
+        if (h.doNode) CollectRealNodeIds(*h.doNode, skip, out);
+    }
+}
+
+std::string ForeachQueueHash(const std::string& s) {
+    uint32_t h = 2166136261u;
+    for (unsigned char c : s) {
+        h ^= c;
+        h *= 16777619u;
+    }
+    char buf[9] = {};
+    std::snprintf(buf, sizeof(buf), "%08x", h);
+    return buf;
+}
 } // namespace
+
+bool BehaviorTree::Impl::ExpandForeachNode(BehaviorTree& bt, BtNode& node, int64_t nowMs) {
+    auto fail = [&](const std::string& detail) {
+        node.state = "failed";
+        node.detail = detail;
+        bt.EmitEvent(nowMs, "nodeFinished", node.nodeKey, node.state, node.detail, node.runs);
+    };
+
+    if (node.foreachExpanded) return true;
+    if (!node.doChild) {
+        fail("foreach: missing 'do' template");
+        return false;
+    }
+
+    std::vector<std::string> matches;
+    if (!ExpandBtGlob(bt.cwd_, node.foreachGlob, node.foreachExclude, matches)) {
+        fail("foreach: cannot enumerate glob '" + node.foreachGlob + "'");
+        return false;
+    }
+    if (static_cast<int>(matches.size()) < node.foreachMinMatches) {
+        fail("foreach: minMatches not met (" + std::to_string(matches.size()) + " < " +
+             std::to_string(node.foreachMinMatches) + ")");
+        return false;
+    }
+
+    std::set<std::string> usedIds;
+    CollectRealNodeIds(*root, &node, usedIds);
+    bool collision = false;
+    std::string collidingId;
+    for (size_t i = 0; i < matches.size() && !collision; ++i) {
+        json def = SubstituteForeachFields(node.doChild->rawDef, node.foreachAs, matches[i], i);
+        std::string id = def.value("id", std::string());
+        if (!id.empty() && !usedIds.insert(id).second) {
+            collision = true;
+            collidingId = id;
+        }
+    }
+    if (collision) {
+        fail("foreach: duplicate expanded child id '" + collidingId + "'");
+        return false;
+    }
+
+    node.children.clear();
+    const std::string queueBase = bt.taskqueue_.empty() ? node.queueName : bt.taskqueue_;
+    for (size_t i = 0; i < matches.size(); ++i) {
+        json def = SubstituteForeachFields(node.doChild->rawDef, node.foreachAs, matches[i], i);
+        std::string childPath = node.pathKey + ".children[" + std::to_string(i) + "]";
+        std::string childQueue = node.queueName;
+        if (node.foreachMode == "parallel") {
+            childQueue = queueBase + ".f" + ForeachQueueHash(node.pathKey) + "." + std::to_string(i);
+        }
+        std::string err;
+        auto child = ParseSingleNodeJson(def, childPath, "", node.depth + 1, nullptr,
+                                         bt.defaults_, bt.cwd_, {}, 0, queueBase, childQueue, err);
+        if (!child) {
+            node.children.clear();
+            fail("foreach: invalid expanded child at index " + std::to_string(i) + ": " + err);
+            return false;
+        }
+        child->isForeachChild = true;
+        node.children.push_back(std::move(child));
+    }
+    node.foreachExpanded = true;
+    if (matches.empty()) node.detail = "foreach: 0 matches from " + node.foreachGlob;
+    return true;
+}
 
 // 091-6: keep a leaf waiting (never failed) while its engine is down.
 bool BehaviorTree::Impl::HoldForEngine(BehaviorTree& bt, BtNode& node,
@@ -358,6 +481,20 @@ void BehaviorTree::Impl::TickNode(BehaviorTree& bt, BtNode& node, int64_t nowMs)
             expRes.read.push_back(xr);
         }
 
+        // 093-2: success predicates may contain ${foreach:...} / variable expansions too.
+        BtJobSuccess expSuccess = node.success;
+        auto expandSuccessField = [&](std::string& s) -> bool {
+            std::string out, u;
+            if (!ExpandString(bt, s, false, out, u)) { failNodeUndef(u); return false; }
+            s = out;
+            return true;
+        };
+        if (!expandSuccessField(expSuccess.outputRegex) ||
+            !expandSuccessField(expSuccess.testReport) ||
+            !expandSuccessField(expSuccess.contentFile) ||
+            !expandSuccessField(expSuccess.contentRegex)) return;
+        for (auto& f : expSuccess.filesNewer) if (!expandSuccessField(f)) return;
+
         node.launchSeq++;
         std::string proposedId = bt.id_ + "-" + node.nodeKey + "-" + std::to_string(node.launchSeq);
         node.lastStartMs = static_cast<int64_t>(CaptureStartFiletimeWithGuard());
@@ -411,7 +548,7 @@ void BehaviorTree::Impl::TickNode(BehaviorTree& bt, BtNode& node, int64_t nowMs)
 
             BtJobSpec spec{bt.id_, node.id, node.nodeKey, node.runs, proposedId, node.queueName,
                            expCmd, expSummary,
-                           expCwd, node.timeoutSec, node.estimateSec, std::move(expEnv), node.success, node.idle,
+                           expCwd, node.timeoutSec, node.estimateSec, std::move(expEnv), expSuccess, node.idle,
                            std::move(expRes), expInstr, node.maxAttempts};
             if (bt.runner_) jobId = bt.runner_->StartJob(spec);
         } else {
@@ -489,8 +626,8 @@ void BehaviorTree::Impl::TickNode(BehaviorTree& bt, BtNode& node, int64_t nowMs)
 
             BtWorkerSpec wspec{bt.id_, node.id, node.nodeKey, node.runs, proposedId, node.queueName,
                                effEng, effMod,
-                               expPrompt, expSummary, expCwd, node.timeoutSec, node.estimateSec, std::move(expEnv),
-                                node.success, node.idle, std::move(expRes), node.outputSchema,
+                                expPrompt, expSummary, expCwd, node.timeoutSec, node.estimateSec, std::move(expEnv),
+                                expSuccess, node.idle, std::move(expRes), node.outputSchema,
                                 node.maxAttempts};
             node.isWorkerJob = true;
             node.lastEngine = effEng;
@@ -509,6 +646,54 @@ void BehaviorTree::Impl::TickNode(BehaviorTree& bt, BtNode& node, int64_t nowMs)
         node.jobs.push_back(jobId);
         runningJobs[jobId] = RunningJobInfo{&node, false, node.isWorkerJob};
         bt.EmitEvent(nowMs, "nodeStarted", node.nodeKey, node.state, jobId, node.runs);
+        return;
+    }
+
+    if (t == "foreach") {
+        if (node.state == "idle") {
+            if (!ExpandForeachNode(bt, node, nowMs)) return;
+            node.hasStatus = true;
+            node.state = "running";
+            node.runs++;
+            bt.EmitEvent(nowMs, "nodeStarted", node.nodeKey, node.state, "", node.runs);
+            if (node.children.empty()) {
+                node.state = "succeeded";
+                bt.EmitEvent(nowMs, "nodeFinished", node.nodeKey, node.state, node.detail, node.runs);
+                return;
+            }
+        }
+        const bool serial = (node.foreachMode == "sequence");
+        bool anyRunning = false;
+        std::string firstFailDetail;
+        for (const auto& child : node.children) {
+            if (serial && child->state == "succeeded") continue;
+            if (child->state == "idle" || child->state == "running") {
+                TickNode(bt, *child, nowMs);
+                if (bt.state_ == "failed" || bt.state_ == "cancelled") return;
+            }
+            if (serial && child->state == "running") {
+                return;  // sequence semantics: only one child runs at a time
+            }
+            if (child->state == "running" || child->state == "idle") anyRunning = true;
+            if (child->state == "failed") {
+                if (firstFailDetail.empty()) firstFailDetail = child->detail;
+                if (serial) {
+                    node.state = "failed";
+                    node.detail = child->detail;
+                    bt.EmitEvent(nowMs, "nodeFinished", node.nodeKey, node.state, node.detail, node.runs);
+                    return;
+                }
+            }
+        }
+        if (anyRunning) return;
+        if (!firstFailDetail.empty()) {
+            node.state = "failed";
+            node.detail = firstFailDetail;
+        } else {
+            node.state = "succeeded";
+            node.detail.clear();
+        }
+        bt.EmitEvent(nowMs, "nodeFinished", node.nodeKey, node.state, node.detail, node.runs);
         return;
     }
 

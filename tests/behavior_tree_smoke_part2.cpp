@@ -780,6 +780,248 @@ void RunPart2Tests(const std::string& tempDirUtf8, const std::wstring& tempDirW)
             Check(bt.State() == "succeeded", "092: continue branch completes after re-escalation");
         }
     }
+
+    // 093-2: foreach node and ${foreach:...} expansion.
+    {
+        auto makeSuiteDir = [&](const std::string& name, const std::vector<std::string>& smokes) -> std::wstring {
+            std::wstring d = tempDirW + L"\\fe_" + Utf8ToWide(name);
+            CreateDirectoryW(d.c_str(), nullptr);
+            CreateDirectoryW((d + L"\\tests").c_str(), nullptr);
+            for (const auto& s : smokes) {
+                WriteFileAtomicWide(d + L"\\tests\\" + Utf8ToWide(s), "// " + s);
+            }
+            return d;
+        };
+        auto makeForeachDef = [&](const std::string& id, const std::wstring& d,
+                                  const std::string& mode, const std::string& extra) {
+            return std::string(R"JSON({"id":")JSON") + id + R"JSON(","cwd":")JSON" +
+                JsonEscape(WideToUtf8(d)) +
+                R"JSON(","root":{"type":"foreach","id":"smokes","glob":"tests/*_smoke.cpp","as":"t","mode":")JSON" +
+                mode + "\"," + extra +
+                R"JSON("do":{"type":"job","id":"run_${t.stem}","summary":"Run ${t.stem} from ${t.name} #${t.index}","command":"build\\Release\\${t.stem}.exe","timeoutSec":900}}})JSON";
+        };
+
+        // (1) two files -> two children ticked in sorted order; state/debug view show them.
+        {
+            std::wstring d = makeSuiteDir("basic", {"a_smoke.cpp", "b_smoke.cpp"});
+            std::string def = makeForeachDef("fe-basic", d, "sequence", "");
+            std::vector<std::string> errs;
+            Check(BehaviorTree::ValidateJson(def, &catalog, errs), "093-2: foreach BT validates");
+
+            FakeJobRunner runner;
+            BehaviorTree bt;
+            std::string err;
+            Check(bt.LoadDefinition(def, &catalog, err), "093-2: load foreach BT: " + err);
+            bt.SetJobRunner(&runner);
+            bt.Start(1000);
+            Check(runner.startedJobs.size() == 1 && runner.startedJobs[0].nodeKey == "run_a_smoke" &&
+                  runner.startedJobs[0].command == "build\\Release\\a_smoke.exe" &&
+                  runner.startedJobs[0].summary == "Run a_smoke from a_smoke.cpp #0",
+                  "093-2: first expanded child uses stem/name/index (command=" +
+                  (runner.startedJobs.empty() ? "" : runner.startedJobs[0].command) + ")");
+            Check(bt.NodeState("run_b_smoke") == "idle", "093-2: second child still idle");
+            bt.OnJobFinished("fe-basic-run_a_smoke-1", true, 0, "", "a ok", 1100);
+            Check(runner.startedJobs.size() == 2 && runner.startedJobs[1].nodeKey == "run_b_smoke" &&
+                  runner.startedJobs[1].summary == "Run b_smoke from b_smoke.cpp #1",
+                  "093-2: second child starts after first succeeds");
+            bt.OnJobFinished("fe-basic-run_b_smoke-1", true, 0, "", "b ok", 1200);
+            Check(bt.State() == "succeeded" && bt.NodeState("smokes") == "succeeded",
+                  "093-2: sequence foreach succeeds after all children");
+
+            std::string state = bt.ToStateJson();
+            Check(state.find("\"foreachExpanded\": true") != std::string::npos &&
+                  state.find("\"id\": \"run_a_smoke\"") != std::string::npos &&
+                  state.find("\"id\": \"run_b_smoke\"") != std::string::npos,
+                  "093-2: expanded children and marker persisted in state JSON");
+            BtDebugNode dbg;
+            std::string de;
+            Check(ParseBtDebugTree(state, dbg, de), "093-2: foreach state parses in debug view: " + de);
+            Check(FindBtNodeKeyByJob({dbg}, "fe-basic-run_a_smoke-1") == "fe-basic/run_a_smoke",
+                  "093-2: expanded child visible as a normal debug node");
+
+            // bt retry --from <expanded child> re-runs it (092 consistency).
+            BehaviorTree restored;
+            Check(restored.LoadFromStateJson(state, &catalog, 2000, err),
+                  "093-2: foreach state reloads: " + err);
+            Check(restored.NodeState("run_a_smoke") == "succeeded", "093-2: child state restored");
+            FakeJobRunner r2;
+            restored.SetJobRunner(&r2);
+            Check(restored.Retry("run_a_smoke", true, 3000, err), "093-2: retry --from expanded child: " + err);
+            Check(r2.startedJobs.size() == 1 && r2.startedJobs[0].nodeKey == "run_a_smoke",
+                  "093-2: retried child relaunched");
+            restored.OnJobFinished("fe-basic-run_a_smoke-2", true, 0, "", "a ok", 3100);
+            Check(r2.startedJobs.size() == 2 && r2.startedJobs[1].nodeKey == "run_b_smoke",
+                  "093-2: retry re-runs the later sibling (092 semantics)");
+            restored.OnJobFinished("fe-basic-run_b_smoke-2", true, 0, "", "b ok", 3200);
+            Check(restored.State() == "succeeded", "093-2: tree succeeds after child retry");
+        }
+
+        // (2) adding a file and restarting grows the expanded set to three.
+        {
+            std::wstring d = makeSuiteDir("regrow", {"a_smoke.cpp", "b_smoke.cpp"});
+            std::string def = makeForeachDef("fe-regrow", d, "sequence", "");
+            WriteFileAtomicWide(d + L"\\tests\\c_smoke.cpp", "// c");
+            FakeJobRunner runner;
+            BehaviorTree bt;
+            std::string err;
+            Check(bt.LoadDefinition(def, &catalog, err), "093-2: load regrow BT: " + err);
+            bt.SetJobRunner(&runner);
+            bt.Start(1000);
+            bt.OnJobFinished("fe-regrow-run_a_smoke-1", true, 0, "", "ok", 1100);
+            bt.OnJobFinished("fe-regrow-run_b_smoke-1", true, 0, "", "ok", 1200);
+            Check(runner.startedJobs.size() == 3 && runner.startedJobs[2].nodeKey == "run_c_smoke",
+                  "093-2: restart after adding a file expands to three children");
+        }
+
+        // (3) exclude, minMatches, zero matches, and mode:all with a failure.
+        {
+            std::wstring d = makeSuiteDir("exclude", {"a_smoke.cpp", "b_smoke.cpp"});
+            std::string def = makeForeachDef("fe-exclude", d, "all", R"JSON("exclude":["tests/a_smoke.cpp"],)JSON");
+            FakeJobRunner runner;
+            BehaviorTree bt;
+            std::string err;
+            Check(bt.LoadDefinition(def, &catalog, err), "093-2: load exclude BT: " + err);
+            bt.SetJobRunner(&runner);
+            bt.Start(1000);
+            Check(runner.startedJobs.size() == 1 && runner.startedJobs[0].nodeKey == "run_b_smoke",
+                  "093-2: exclude removes the matching file");
+            bt.OnJobFinished("fe-exclude-run_b_smoke-1", true, 0, "", "ok", 1100);
+            Check(bt.State() == "succeeded", "093-2: excluded foreach succeeds");
+        }
+        {
+            std::wstring d = makeSuiteDir("min", {"a_smoke.cpp"});
+            std::string def = makeForeachDef("fe-min", d, "sequence", R"JSON("minMatches":2,)JSON");
+            FakeJobRunner runner;
+            BehaviorTree bt;
+            std::string err;
+            Check(bt.LoadDefinition(def, &catalog, err), "093-2: load minMatches BT: " + err);
+            bt.SetJobRunner(&runner);
+            bt.Start(1000);
+            Check(bt.State() == "failed" && bt.NodeDetail("smokes").find("minMatches") != std::string::npos &&
+                  runner.startedJobs.empty(), "093-2: minMatches failure stops before launching children");
+        }
+        {
+            std::wstring d = makeSuiteDir("empty", {});
+            std::string def = makeForeachDef("fe-empty", d, "sequence", "");
+            FakeJobRunner runner;
+            BehaviorTree bt;
+            std::string err;
+            Check(bt.LoadDefinition(def, &catalog, err), "093-2: load empty foreach BT: " + err);
+            bt.SetJobRunner(&runner);
+            bt.Start(1000);
+            Check(bt.State() == "succeeded" && runner.startedJobs.empty() &&
+                  bt.ToStateJson().find("0 matches") != std::string::npos,
+                  "093-2: zero matches succeeds with a warning detail");
+        }
+        {
+            std::wstring d = makeSuiteDir("all", {"a_smoke.cpp", "b_smoke.cpp", "c_smoke.cpp"});
+            std::string def = makeForeachDef("fe-all", d, "all", "");
+            FakeJobRunner runner;
+            BehaviorTree bt;
+            std::string err;
+            Check(bt.LoadDefinition(def, &catalog, err), "093-2: load mode:all BT: " + err);
+            bt.SetJobRunner(&runner);
+            bt.Start(1000);
+            bt.OnJobFinished("fe-all-run_a_smoke-1", true, 0, "", "ok", 1100);
+            bt.OnJobFinished("fe-all-run_b_smoke-1", false, 1, "", "b broke", 1200);
+            Check(runner.startedJobs.size() == 3 && runner.startedJobs[2].nodeKey == "run_c_smoke",
+                  "093-2: mode:all keeps launching after a failure");
+            bt.OnJobFinished("fe-all-run_c_smoke-1", true, 0, "", "ok", 1300);
+            Check(bt.State() == "failed" && bt.NodeState("run_c_smoke") == "succeeded",
+                  "093-2: mode:all fails at the end when any child failed");
+        }
+
+        // parallel mode launches every child and a '**' glob matches nested files.
+        {
+            std::wstring d = makeSuiteDir("parallel", {});
+            CreateDirectoryW((d + L"\\tests\\unit").c_str(), nullptr);
+            WriteFileAtomicWide(d + L"\\tests\\unit\\a_smoke.cpp", "// a");
+            WriteFileAtomicWide(d + L"\\tests\\unit\\b_smoke.cpp", "// b");
+            std::string def = std::string(R"JSON({"id":"fe-parallel","cwd":")JSON") +
+                JsonEscape(WideToUtf8(d)) +
+                R"JSON(","root":{"type":"foreach","id":"smokes","glob":"tests/**/*_smoke.cpp","as":"t","mode":"parallel","do":{"type":"job","id":"run_${t.stem}","summary":"s ${t.path}","command":"c","timeoutSec":30}}})JSON";
+            FakeJobRunner runner;
+            BehaviorTree bt;
+            std::string err;
+            Check(bt.LoadDefinition(def, &catalog, err), "093-2: load parallel/** BT: " + err);
+            bt.SetJobRunner(&runner);
+            bt.Start(1000);
+            Check(runner.startedJobs.size() == 2 &&
+                  runner.startedJobs[0].nodeKey == "run_a_smoke" &&
+                  runner.startedJobs[1].nodeKey == "run_b_smoke" &&
+                  runner.startedJobs[0].summary == "s tests/unit/a_smoke.cpp",
+                  "093-2: parallel foreach launches all children from a '**' glob");
+            bt.OnJobFinished("fe-parallel-run_a_smoke-1", true, 0, "", "ok", 1100);
+            Check(bt.State() == "running", "093-2: parallel foreach waits for remaining children");
+            bt.OnJobFinished("fe-parallel-run_b_smoke-1", true, 0, "", "ok", 1200);
+            Check(bt.State() == "succeeded", "093-2: parallel foreach succeeds when all children succeed");
+        }
+
+        // (4) ${foreach:...} joins stems/names in command, summary and success strings.
+        {
+            std::wstring d = makeSuiteDir("list", {"a_smoke.cpp", "b_smoke.cpp"});
+            std::string def = std::string(R"JSON({"id":"fe-list","cwd":")JSON") +
+                JsonEscape(WideToUtf8(d)) +
+                R"JSON(","root":{"type":"job","id":"build","summary":"Targets ${foreach:tests/*_smoke.cpp:stem:|}","command":"cmake --build build --config Release --target Hancho ${foreach:tests/*_smoke.cpp:stem: }","timeoutSec":60,"success":{"testReport":"build\\Release\\${foreach:tests/*_smoke.cpp:stem:_}.txt","outputRegex":"^${foreach:tests/*_smoke.cpp:name:,}$"}}})JSON";
+            FakeJobRunner runner;
+            BehaviorTree bt;
+            std::string err;
+            Check(bt.LoadDefinition(def, &catalog, err), "093-2: load ${foreach:...} BT: " + err);
+            bt.SetJobRunner(&runner);
+            bt.Start(1000);
+            Check(runner.startedJobs.size() == 1, "093-2: ${foreach:...} job started");
+            if (!runner.startedJobs.empty()) {
+                const auto& j = runner.startedJobs[0];
+                Check(j.command == "cmake --build build --config Release --target Hancho a_smoke b_smoke",
+                      "093-2: ${foreach:stem: } joined into command: " + j.command);
+                Check(j.summary == "Targets a_smoke|b_smoke", "093-2: ${foreach:stem:|} joined into summary: " + j.summary);
+                Check(j.success.testReport == "build\\Release\\a_smoke_b_smoke.txt" &&
+                      j.success.outputRegex == "^a_smoke.cpp,b_smoke.cpp$",
+                      "093-2: ${foreach:...} expanded in success strings");
+            }
+            Check(bt.State() == "running", "093-2: ${foreach:...} job waits for completion");
+        }
+
+        // (5) duplicate expanded child ids are rejected.
+        {
+            std::wstring d = makeSuiteDir("collision", {"a_smoke.cpp", "b_smoke.cpp"});
+            std::string def = std::string(R"JSON({"id":"fe-collision","cwd":")JSON") +
+                JsonEscape(WideToUtf8(d)) +
+                R"JSON(","root":{"type":"foreach","id":"smokes","glob":"tests/*_smoke.cpp","as":"t","do":{"type":"job","id":"fixed","summary":"s","command":"c","timeoutSec":30}}})JSON";
+            FakeJobRunner runner;
+            BehaviorTree bt;
+            std::string err;
+            Check(bt.LoadDefinition(def, &catalog, err), "093-2: load collision BT: " + err);
+            bt.SetJobRunner(&runner);
+            bt.Start(1000);
+            Check(bt.State() == "failed" &&
+                  bt.NodeDetail("smokes").find("duplicate expanded child id") != std::string::npos &&
+                  runner.startedJobs.empty(), "093-2: expanded id collision is an error");
+        }
+
+        // validate checks the unexpanded `do` and the as/${...} field correspondence.
+        {
+            std::wstring d = makeSuiteDir("validate", {"a_smoke.cpp"});
+            std::string bad = makeForeachDef("fe-bad", d, "sequence", "");
+            size_t p = 0;
+            while ((p = bad.find("${t.stem}", p)) != std::string::npos) {
+                bad.replace(p, 9, "${t.extension}");
+                p += 14;
+            }
+            std::vector<std::string> errs;
+            bool ok = BehaviorTree::ValidateJson(bad, &catalog, errs);
+            bool found = false;
+            for (const auto& e : errs) if (e.find("unknown foreach field") != std::string::npos) found = true;
+            Check(!ok && found, "093-2: validate rejects unknown ${t.<field>} references");
+
+            std::string noCmd = std::string(R"JSON({"id":"fe-nocmd","cwd":")JSON") +
+                JsonEscape(WideToUtf8(d)) +
+                R"JSON(","root":{"type":"foreach","id":"smokes","glob":"tests/*_smoke.cpp","as":"t","do":{"type":"job","id":"x","summary":"s","timeoutSec":30}}})JSON";
+            errs.clear();
+            Check(!BehaviorTree::ValidateJson(noCmd, &catalog, errs),
+                  "093-2: validate checks the unexpanded do template");
+        }
+    }
 }
 
 } // namespace bt_test

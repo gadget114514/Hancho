@@ -17,6 +17,12 @@
 
 [Ll]ogs/
 ww-data/
+.hancho*/
+.hancho-*/
+# Routines are project-owned BT definitions; keep them versioned.
+!.hancho/
+.hancho/*
+!.hancho/routines/
 
 # User-specific files (MonoDevelop/Xamarin Studio)
 *.userprefs
