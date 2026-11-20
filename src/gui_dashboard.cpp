@@ -880,6 +880,8 @@ struct DashboardState {
     std::string currentTriageCardId;
     int chatUnread = 0;      // unread Chat messages (badge on the Chat toolbar button)
     uint64_t lastChatPollTickMs = 0;
+    bool chatBaselineDone = false;   // older Chat messages are never announced
+    uint64_t chatNotifiedMaxId = 0;  // newest incoming Chat message id already handled
     // Signatures already popped up. Automatic hints skip them so a second divergence, failure or
     // contention surfaces while the first one is still in the list. Capped; see EvaluateSupervisorHint.
     std::unordered_set<std::string> shownHintSignatures;
@@ -1083,7 +1085,75 @@ static TerminalView* GetTerminalViewForProcess(DashboardState* st, int id) {
 static const int kGuiIpcTimeoutMs = 30000;
 
 static bool GuiIpcCall(DashboardState* st, const nlohmann::json& req, nlohmann::json& outResp,
-                       std::string* outError = nullptr, int timeoutMs = kGuiIpcTimeoutMs) {
+                       std::string* outError = nullptr, int timeoutMs = kGuiIpcTimeoutMs);
+
+// Chat has no tray icon of its own, so new incoming messages are announced by a
+// balloon on this dashboard's tray icon.
+static void SetChatNotifyBaseline(DashboardState* st) {
+    nlohmann::json resp;
+    if (GuiIpcCall(st, {{"action", "chat_inbox"}, {"since_id", 0}, {"unread_only", false},
+                        {"include_outgoing", false}, {"limit", 1}}, resp) &&
+        resp.value("ok", false)) {
+        st->chatNotifiedMaxId = resp.value("last_id", uint64_t(0));
+        st->chatBaselineDone = true;
+    }
+}
+
+static std::wstring ChatBalloonLine(const std::string& text, size_t maxChars) {
+    std::string line;
+    for (char c : text) {
+        if (c == '\n') {
+            if (!Trim(line).empty()) break;
+            line.clear();
+            continue;
+        }
+        if (c == '\r' || (static_cast<unsigned char>(c) < 0x20 && c != '\t')) continue;
+        line.push_back(c);
+    }
+    std::wstring out = Utf8ToWide(Trim(line));
+    if (out.size() > maxChars) out = out.substr(0, maxChars) + L"...";
+    return out;
+}
+
+static void NotifyNewChatMessages(DashboardState* st) {
+    nlohmann::json resp;
+    if (!GuiIpcCall(st, {{"action", "chat_inbox"}, {"since_id", st->chatNotifiedMaxId},
+                         {"unread_only", true}, {"include_outgoing", false}, {"limit", 0}}, resp) ||
+        !resp.value("ok", false) || !resp.contains("messages") || !resp["messages"].is_array()) {
+        return;
+    }
+    for (const auto& m : resp["messages"]) {
+        const uint64_t id = m.value("id", uint64_t(0));
+        if (id > st->chatNotifiedMaxId) st->chatNotifiedMaxId = id;
+        if (m.value("direction", std::string()) != "in") continue;
+        if (m.value("audience", std::string()) == "agent") continue;
+        if (!st->trayAdded) continue;
+
+        std::wstring peer;
+        if (m.contains("peer") && m["peer"].is_object()) {
+            const auto& p = m["peer"];
+            peer = Utf8ToWide(p.value("nickname", std::string()));
+            if (peer.empty()) peer = Utf8ToWide(p.value("host", std::string()));
+        }
+        if (peer.empty()) peer = L"?";
+
+        std::wstring body = ChatBalloonLine(m.value("text", std::string()), 160);
+        if (body.empty() && m.contains("files") && m["files"].is_array()) {
+            for (const auto& f : m["files"]) {
+                if (!f.is_object()) continue;
+                if (!body.empty()) body += L", ";
+                body += Utf8ToWide(f.value("name", std::string("?")));
+            }
+        }
+        if (body.empty()) body = Tr(L"新着メッセージ", L"New message", L"Nuevo mensaje");
+
+        gui_platform::GetGuiPlatform()->TrayShowBalloon(
+            st->nid, L"Hancho Chat - " + peer.substr(0, 40), body.substr(0, 200), false);
+    }
+}
+
+static bool GuiIpcCall(DashboardState* st, const nlohmann::json& req, nlohmann::json& outResp,
+                       std::string* outError, int timeoutMs) {
     std::string resp;
     std::string err;
     bool ok = false;
@@ -7213,6 +7283,11 @@ static void RefreshDashboardData(DashboardState* st) {
             int unread = 0;
             if (GuiIpcCall(st, {{"action", "chat_status"}}, chatResp) && chatResp.value("ok", false)) {
                 unread = chatResp.value("unread", 0);
+                if (!st->chatBaselineDone) {
+                    SetChatNotifyBaseline(st);
+                } else if (unread > st->chatUnread) {
+                    NotifyNewChatMessages(st);
+                }
             }
             if (unread != st->chatUnread) {
                 st->chatUnread = unread;
