@@ -1,80 +1,38 @@
 {
-  "name": "smoke-all",
-  "summary": "Build all targets and run every *_smoke test",
-  "cwd": "D:/wsgit/Hancho",
   "bt": {
     "id": "smoke-all",
-    "summary": "Build all targets and run every *_smoke test",
     "root": {
-      "type": "sequence",
       "children": [
         {
-          "type": "job",
+          "command": "cmake --build build --config Release",
           "id": "build",
-          "summary": "Build Hancho and every smoke test",
-          "command": "cmake --build build --config Release --target Hancho HanchoChat HanchoTerm wct hancho-cli ${foreach:tests/*_smoke.cpp:stem: }",
-          "timeoutSec": 3600
+          "summary": "Build every target (CMake only defines the smokes that build on this OS)",
+          "timeoutSec": 3600,
+          "type": "job"
         },
         {
-          "type": "foreach",
-          "id": "smokes",
-          "glob": "tests/*_smoke.cpp",
           "as": "t",
-          "mode": "all",
+          "do": {
+            "command": "build\\Release\\${t.stem}.exe",
+            "id": "test_${t.stem}",
+            "summary": "Run ${t.stem}",
+            "timeoutSec": 900,
+            "type": "job"
+          },
           "exclude": [
             "tests/posix_core_smoke.cpp"
           ],
-          "do": {
-            "type": "job",
-            "id": "test_${t.stem}",
-            "command": "build\\Release\\${t.stem}.exe",
-            "summary": "Run ${t.stem}",
-            "timeoutSec": 900
-          }
+          "glob": "tests/*_smoke.cpp",
+          "id": "smokes",
+          "mode": "all",
+          "type": "foreach"
         }
-      ]
-    }
+      ],
+      "type": "sequence"
+    },
+    "summary": "Build all targets and run every *_smoke test"
   },
-  "inputs": [
-    "CMakeLists.txt",
-    "tests/*.cpp",
-    "tests/*.h"
-  ],
-  "notes": "Windows smoke suite: posix_core_smoke is excluded from the foreach because CMake only builds it on POSIX. The ${foreach:...} expansion in the build command does not apply exclude; see ww-data/reports/093-4.md.",
-  "inputsSnapshot": {
-    "CMakeLists.txt": "585773d45500f240b06bbaffae13d65b9e177b83f893fa757500715114039280",
-    "tests/activity_tree_smoke.cpp": "bb428f4165b4863d3b49e9d5fa5872ec55f0f3a403e18f62017723dbf810315b",
-    "tests/behavior_tree_smoke.cpp": "e034847f616d6b5f96801f96774a26f94874aa4470c928baf2519dc84892d3e3",
-    "tests/behavior_tree_smoke_common.h": "291ed98dfb8c6cc2e46a4e727a7bf83c1958b261ba133b661238f67c8b4cea74",
-    "tests/behavior_tree_smoke_part2.cpp": "4816727244de4bfec53dc2ff439dc65ab523df4f2fe4e9ca2404797a5acc6d41",
-    "tests/bt_debug_view_smoke.cpp": "73e646a310464ecd427a4c8314437cd18d41231805587d99462049741ece6d7b",
-    "tests/bt_integration_smoke.cpp": "79cea2d67f91dd8ebe718709e95bedf7e3987893490e1c0a9b2e8d608ce50e09",
-    "tests/bt_integration_smoke_common.h": "92d547a2ac82a7865cb2a8ae3edc3afaf6db8621eba44b38317f9718c373ee4a",
-    "tests/bt_integration_smoke_part2.cpp": "407dbb371c3df46c7b38e709259db92e83be5b1a3dd7898a0fb53cccb19fd690",
-    "tests/bt_ipc_smoke.cpp": "0f9c6e21243d63ab4b71a1664b7f6e2ae5401d2a4f04956ee298b3cdfde8b352",
-    "tests/bt_regression_smoke.cpp": "fa7ff316cc66218c8418d5927eac70e8bf38f11e2f316f6411f943d9f61a94b2",
-    "tests/cli_top_smoke.cpp": "9c2a426f185f78dbfd7855e24e16ea76c14b58c0c47e5f26da94a678b33460ef",
-    "tests/event_adapter_smoke.cpp": "6e2d746cd4a26916bce24b235624ed2da137a70a9764ac5b7b06fdcbe432afc8",
-    "tests/event_pipe_smoke.cpp": "1d72e3a4ab20f74cd5ec6bd6d25ae6e9cd588c165ae31d870aa769fcb4ef0c7e",
-    "tests/event_schema_smoke.cpp": "09ff8170fb2cd213a693607eba74b9adb9608959aa7fb150804ff48c3ba58750",
-    "tests/gui_platform.h": "1840ed1e21985c7e9cd5a3c4219e1d6ae3d3332d55170e2429958f18153bfc40",
-    "tests/gui_platform_smoke.cpp": "e37a30f922b4bd05a265c4f92ab67ec2335b59710093689cd26964ecba58d38e",
-    "tests/headless_smoke.cpp": "475aac430b94b670b55965c543ca1d9bf204c90f524b35a7ce1701398bb0d0b4",
-    "tests/llm_stream_smoke.cpp": "f8b29826439da68514f6388c85813b277a267481273894647035ed65e25dd3e7",
-    "tests/memory_record_smoke.cpp": "73ec30561c38079fe334f0181393ad5abfc1d3c83ea8079df67d432309b0bf0f",
-    "tests/memory_search_smoke.cpp": "3b56f9f039768f6453a829497ab349e32df71a5fad8e92e4cb38bf6bcf205899",
-    "tests/platform_abstraction_smoke.cpp": "6133ef938935d5ea3d7a055598ab04e3856d64fe44db5e56bb58bea2d3db9fb4",
-    "tests/posix_core_smoke.cpp": "b925207c499d53a0d7d4d982e5c9eece0f5d99d1a43c10f4ac3fc10aa0dfd9bf",
-    "tests/remote_ws_test.h": "2ce1ee3f16466858a4477bef8e007de29db4760f51ce40de0fd61ee059de99a5",
-    "tests/routine_smoke.cpp": "1fc27cc911f59128d71d604c166dbf8dd13c2fa948d7b4e3f2e65f8d25c648af",
-    "tests/taskqueue_smoke.cpp": "eb0811ee9011e4ab74cd7fac08dd72494107994b9b99a45b15ab3bf72cc9f788",
-    "tests/term_server_smoke.cpp": "03cea93e80329e7351246e72dcfd22383998e112aaa11fe9d0d1eb0e7f76257a",
-    "tests/triage_smoke.cpp": "91384e3e5eb870c962a32930695f26e495ea44f1839cdb411485f104073f0f4a",
-    "tests/wct_smoke.cpp": "0e0e2e4c0fed15b4938d0850c1367add5a741dfe09b4a6a4eb50daec7368dbc8",
-    "tests/webui_config_smoke.cpp": "d2e838eaefe5310e69f3125fb9dbc7b3791fb7dcdf7291bf5662f21dd6e45113",
-    "tests/webui_smoke.cpp": "e6c34fe2efb23eb6a1effc0f2b7e579db4f43fe306ed53848b67f70dae08c436",
-    "tests/worker_engines_smoke.cpp": "db20ba6d1deb9a40ea6fbdfcb2cc31c978d7c8c39c6d9461369167691c94109f"
-  },
+  "cwd": "D:\\wsgit\\Hancho",
   "foreachSnapshot": [
     "tests/activity_tree_smoke.cpp",
     "tests/behavior_tree_smoke.cpp",
@@ -106,6 +64,53 @@
       "at": "2026-11-20 11:39:41",
       "by": "manual",
       "reason": "093-4: initial smoke-all routine"
+    },
+    {
+      "at": "2026-11-20 14:02:59",
+      "by": "hancho-cli",
+      "reason": "Build step passed posix_core_smoke (not a Windows target) via \\, which has no exclude; build all targets instead."
     }
-  ]
+  ],
+  "inputs": [
+    "CMakeLists.txt",
+    "tests/*.cpp",
+    "tests/*.h"
+  ],
+  "inputsSnapshot": {
+    "CMakeLists.txt": "f9c681254c59cd91b0fd5ff4b5a9aff5211bc8aa0f34fc5d12feb5287b9ba4b9",
+    "tests/activity_tree_smoke.cpp": "bb428f4165b4863d3b49e9d5fa5872ec55f0f3a403e18f62017723dbf810315b",
+    "tests/behavior_tree_smoke.cpp": "e034847f616d6b5f96801f96774a26f94874aa4470c928baf2519dc84892d3e3",
+    "tests/behavior_tree_smoke_common.h": "291ed98dfb8c6cc2e46a4e727a7bf83c1958b261ba133b661238f67c8b4cea74",
+    "tests/behavior_tree_smoke_part2.cpp": "4816727244de4bfec53dc2ff439dc65ab523df4f2fe4e9ca2404797a5acc6d41",
+    "tests/bt_debug_view_smoke.cpp": "73e646a310464ecd427a4c8314437cd18d41231805587d99462049741ece6d7b",
+    "tests/bt_integration_smoke.cpp": "79cea2d67f91dd8ebe718709e95bedf7e3987893490e1c0a9b2e8d608ce50e09",
+    "tests/bt_integration_smoke_common.h": "92d547a2ac82a7865cb2a8ae3edc3afaf6db8621eba44b38317f9718c373ee4a",
+    "tests/bt_integration_smoke_part2.cpp": "407dbb371c3df46c7b38e709259db92e83be5b1a3dd7898a0fb53cccb19fd690",
+    "tests/bt_ipc_smoke.cpp": "0f9c6e21243d63ab4b71a1664b7f6e2ae5401d2a4f04956ee298b3cdfde8b352",
+    "tests/bt_regression_smoke.cpp": "fa7ff316cc66218c8418d5927eac70e8bf38f11e2f316f6411f943d9f61a94b2",
+    "tests/cli_top_smoke.cpp": "9c2a426f185f78dbfd7855e24e16ea76c14b58c0c47e5f26da94a678b33460ef",
+    "tests/event_adapter_smoke.cpp": "6e2d746cd4a26916bce24b235624ed2da137a70a9764ac5b7b06fdcbe432afc8",
+    "tests/event_pipe_smoke.cpp": "1d72e3a4ab20f74cd5ec6bd6d25ae6e9cd588c165ae31d870aa769fcb4ef0c7e",
+    "tests/event_schema_smoke.cpp": "09ff8170fb2cd213a693607eba74b9adb9608959aa7fb150804ff48c3ba58750",
+    "tests/gui_platform.h": "1840ed1e21985c7e9cd5a3c4219e1d6ae3d3332d55170e2429958f18153bfc40",
+    "tests/gui_platform_smoke.cpp": "e37a30f922b4bd05a265c4f92ab67ec2335b59710093689cd26964ecba58d38e",
+    "tests/headless_smoke.cpp": "d86172559dbc091b4aa742a940160f7ad4fac3d2772460cc1f253efdf71974a2",
+    "tests/llm_stream_smoke.cpp": "f8b29826439da68514f6388c85813b277a267481273894647035ed65e25dd3e7",
+    "tests/memory_record_smoke.cpp": "73ec30561c38079fe334f0181393ad5abfc1d3c83ea8079df67d432309b0bf0f",
+    "tests/memory_search_smoke.cpp": "3b56f9f039768f6453a829497ab349e32df71a5fad8e92e4cb38bf6bcf205899",
+    "tests/platform_abstraction_smoke.cpp": "6133ef938935d5ea3d7a055598ab04e3856d64fe44db5e56bb58bea2d3db9fb4",
+    "tests/posix_core_smoke.cpp": "b925207c499d53a0d7d4d982e5c9eece0f5d99d1a43c10f4ac3fc10aa0dfd9bf",
+    "tests/remote_ws_test.h": "2ce1ee3f16466858a4477bef8e007de29db4760f51ce40de0fd61ee059de99a5",
+    "tests/routine_smoke.cpp": "0578a6ace94f72b60ef43904d4642191b75fab697a610e4a455b0f7bf77781f4",
+    "tests/taskqueue_smoke.cpp": "c69e46101130492fead816e3adef4b6c69a6ca9d8cbba44347eb5ca58e8c7e0a",
+    "tests/term_server_smoke.cpp": "03cea93e80329e7351246e72dcfd22383998e112aaa11fe9d0d1eb0e7f76257a",
+    "tests/triage_smoke.cpp": "91384e3e5eb870c962a32930695f26e495ea44f1839cdb411485f104073f0f4a",
+    "tests/wct_smoke.cpp": "0e0e2e4c0fed15b4938d0850c1367add5a741dfe09b4a6a4eb50daec7368dbc8",
+    "tests/webui_config_smoke.cpp": "d2e838eaefe5310e69f3125fb9dbc7b3791fb7dcdf7291bf5662f21dd6e45113",
+    "tests/webui_smoke.cpp": "e6c34fe2efb23eb6a1effc0f2b7e579db4f43fe306ed53848b67f70dae08c436",
+    "tests/worker_engines_smoke.cpp": "db20ba6d1deb9a40ea6fbdfcb2cc31c978d7c8c39c6d9461369167691c94109f"
+  },
+  "name": "smoke-all",
+  "notes": "",
+  "summary": "Build all targets and run every *_smoke test"
 }

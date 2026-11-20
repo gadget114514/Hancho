@@ -50,12 +50,11 @@ USAGE:
       Run as a Model Context Protocol (MCP) stdio server for Claude.
       Automatically connects to (or launches) the Win32 GUI Dashboard.
 
-  Hancho.exe chat [--data-dir <path>] [--tray]   (alias: ipmsg)
+  Hancho.exe chat [--data-dir <path>]   (alias: ipmsg)
       Run the Chat dialog only (IPMsg compatible protocol; no main dashboard).
       Connects to the running core, or starts the headless core first.
       One dialog per data dir; a second launch brings the existing one forward.
-      --tray starts hidden in the notification area. Close (X) hides to tray;
-      exit from the tray menu.
+      Chat has no tray icon. Close (X) ends it. Open it from the Hancho tray menu.
 
   Hancho.exe --help
       Show this help.
@@ -850,12 +849,10 @@ int main() {
     // Like hancho-cli, --json may come before or after the command.
     bool jsonOutput = false;
     bool noPrompt = false;
-    bool trayFlag = false;
     std::string firstCmd;
     for (size_t i = 1; i < args.size(); ++i) {
         if (args[i] == "--json" || args[i] == "-j") jsonOutput = true;
         else if (args[i] == "--no-prompt" || args[i] == "--no-start-core") noPrompt = true;
-        else if (args[i] == "--tray") trayFlag = true;
         // Starting is now the default; keep the old flag accepted so existing shortcuts still work.
         else if (args[i] == "--auto-start-core" || args[i] == "--start-core") {}
         else if (args[i] == "--webui-port" && i + 1 < args.size()) {
@@ -919,7 +916,7 @@ int main() {
         }
         // Hide the console window of the GUI client process if present.
         HideOwnConsoleWindow();
-        return RunIpmsgDialog(trayFlag);
+        return RunIpmsgDialog();
     }
 
     if (subcmd == "quit" || subcmd == "--quit") {

@@ -215,13 +215,10 @@ std::wstring FormatSize(uint64_t bytes) {
 const wchar_t* kWndClass = L"HanchoIpmsgWnd";
 const wchar_t* kPropDataDir = L"HanchoIpmsgDataDir";
 
-constexpr UINT kTrayMessage = WM_APP + 301;
 constexpr UINT_PTR TIMER_POLL = 1;
 constexpr UINT_PTR TIMER_PEERS = 2;
 constexpr UINT_PTR TIMER_RELOAD = 3;
-constexpr UINT kTrayId = 1;
 constexpr int kChatAppIconResourceId = 2;
-constexpr int kChatTrayIconResourceId = 4;  // the tray keeps the classic chat icon
 
 enum ControlId : int {
     IDC_TAB = 2100,
@@ -276,8 +273,6 @@ enum ControlId : int {
     IDC_SET_STATUS = 2158,
     IDC_SET_WARNING = 2159,
     IDC_SET_SKIP_PERMISSIONS = 2162,
-    IDM_TRAY_OPEN = 2160,
-    IDM_TRAY_EXIT = 2161,
 };
 
 struct DialogState {
@@ -351,10 +346,6 @@ struct DialogState {
     std::vector<nlohmann::json> messagesJson;
     nlohmann::json selectedMessage;
     std::vector<std::string> attachFiles;
-    std::set<uint64_t> notified;
-
-    int64_t startedMs = 0;
-    bool firstMessageLoad = true;
     uint64_t lastVersion = 0;
     bool haveVersion = false;
     bool running = false;
@@ -371,11 +362,7 @@ struct DialogState {
     std::wstring replyLabel;
     uint64_t replyToId = 0;
 
-    NOTIFYICONDATAW nid = {};
-    bool trayAdded = false;
     bool exiting = false;
-    bool startHidden = false;
-    UINT taskbarCreated = 0;
 
     UINT dpi = 96;
     HFONT font = nullptr;
@@ -1059,29 +1046,7 @@ void ShowPage(DialogState* st, int page) {
 // Tray icon
 // ---------------------------------------------------------------------------
 
-void UpdateTitleAndTray(DialogState* st);
-
-void AddTrayIcon(DialogState* st) {
-    if (!st || st->trayAdded) return;
-    st->nid = {};
-    st->nid.cbSize = sizeof(NOTIFYICONDATAW);
-    st->nid.hWnd = st->hwnd;
-    st->nid.uID = kTrayId;
-    st->nid.uFlags = NIF_ICON | NIF_MESSAGE | NIF_TIP;
-    st->nid.uCallbackMessage = kTrayMessage;
-    st->nid.hIcon = LoadIconW(st->inst, MAKEINTRESOURCEW(kChatTrayIconResourceId));
-    if (!st->nid.hIcon) st->nid.hIcon = LoadIconW(nullptr, IDI_APPLICATION);
-    wcsncpy_s(st->nid.szTip, L"Hancho Chat", _TRUNCATE);
-    if (Shell_NotifyIconW(NIM_ADD, &st->nid)) st->trayAdded = true;
-}
-
-void RemoveTrayIcon(DialogState* st) {
-    if (!st || !st->trayAdded) return;
-    Shell_NotifyIconW(NIM_DELETE, &st->nid);
-    st->trayAdded = false;
-}
-
-void UpdateTitleAndTray(DialogState* st) {
+void UpdateTitle(DialogState* st) {
     if (!st || !st->hwnd) return;
     std::wstring name = Utf8ToWide(st->nickname);
     if (name.empty()) name = L"Hancho";
@@ -1098,29 +1063,6 @@ void UpdateTitleAndTray(DialogState* st) {
         st->currentTitle = title;
         SetWindowTextW(st->hwnd, title.c_str());
     }
-    if (st->trayAdded) {
-        std::wstring tip = title;
-        if (st->unread > 0) {
-            tip += L" - ";
-            tip += std::to_wstring(st->unread);
-            tip += T(L" 件の未読", L" unread", L" sin leer");
-        }
-        wcsncpy_s(st->nid.szTip, tip.c_str(), _TRUNCATE);
-        st->nid.uFlags = NIF_TIP;
-        Shell_NotifyIconW(NIM_MODIFY, &st->nid);
-    }
-}
-
-void ShowBalloon(DialogState* st, const std::wstring& peer, const std::wstring& preview) {
-    if (!st) return;
-    if (!st->trayAdded) AddTrayIcon(st);
-    if (!st->trayAdded) return;
-    st->nid.uFlags = NIF_INFO | NIF_TIP | NIF_ICON | NIF_MESSAGE;
-    st->nid.dwInfoFlags = NIIF_INFO;
-    st->nid.uTimeout = 10000;
-    wcsncpy_s(st->nid.szInfoTitle, TruncateW(peer, 60).c_str(), _TRUNCATE);
-    wcsncpy_s(st->nid.szInfo, TruncateW(preview, 200).c_str(), _TRUNCATE);
-    Shell_NotifyIconW(NIM_MODIFY, &st->nid);
 }
 
 void ShowMainWindow(DialogState* st) {
@@ -1138,21 +1080,6 @@ void ShowMainWindow(DialogState* st) {
     BringWindowToTop(st->hwnd);
     SetActiveWindow(st->hwnd);
     if (attached) AttachThreadInput(fgThread, myThread, FALSE);
-}
-
-void ShowTrayMenu(DialogState* st) {
-    HMENU menu = CreatePopupMenu();
-    if (!menu) return;
-    AppendMenuW(menu, MF_STRING, IDM_TRAY_OPEN, T(L"開く", L"Open", L"Abrir"));
-    AppendMenuW(menu, MF_SEPARATOR, 0, nullptr);
-    AppendMenuW(menu, MF_STRING, IDM_TRAY_EXIT,
-                T(L"Hancho Chat終了", L"Quit Hancho Chat", L"Salir de Hancho Chat"));
-    POINT pt = {};
-    GetCursorPos(&pt);
-    SetForegroundWindow(st->hwnd);
-    TrackPopupMenu(menu, TPM_RIGHTBUTTON | TPM_BOTTOMALIGN | TPM_LEFTALIGN,
-                   pt.x, pt.y, 0, st->hwnd, nullptr);
-    DestroyMenu(menu);
 }
 
 // ---------------------------------------------------------------------------
@@ -1357,23 +1284,6 @@ void LoadMessages(DialogState* st) {
         InsertRow(st->messages, cells, static_cast<LPARAM>(i));
     }
 
-    // Balloons only for messages that arrived while this dialog was running.
-    for (const auto& m : st->messagesJson) {
-        uint64_t id = m.value("id", 0ULL);
-        const bool first = st->firstMessageLoad;
-        bool newlyNotified = st->notified.insert(id).second;
-        if (!newlyNotified) continue;
-        if (first && m.value("time_ms", 0LL) < st->startedMs) continue;
-        if (m.value("direction", std::string()) != "in") continue;
-        if (m.value("read", false)) continue;
-        if (m.value("audience", std::string()) == "agent") continue;
-        std::wstring peer = PeerText(m);
-        std::wstring preview = PreviewOf(m.value("text", std::string()), 160);
-        if (preview.empty()) preview = FilesText(m);
-        ShowBalloon(st, peer, preview);
-    }
-    st->firstMessageLoad = false;
-
     if (selectedId) {
         // Restoring the selection must not re-enter reply mode: the user may
         // have pressed New (or picked a host) after selecting a received message.
@@ -1400,7 +1310,7 @@ void PollStatus(DialogState* st) {
     st->nickname = status.value("nickname", std::string());
     st->downloadDir = status.value("download_dir", std::string());
     uint64_t version = status.value("version", 0ULL);
-    UpdateTitleAndTray(st);
+    UpdateTitle(st);
     UpdatePeerCount(st);
     if (!st->haveVersion || version != st->lastVersion) {
         st->haveVersion = true;
@@ -2244,12 +2154,6 @@ LRESULT CALLBACK IpmsgWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam)
         ShowMainWindow(st);
         return 0;
     }
-    if (st && st->taskbarCreated && msg == st->taskbarCreated) {
-        st->trayAdded = false;
-        AddTrayIcon(st);
-        UpdateTitleAndTray(st);
-        return 0;
-    }
 
     switch (msg) {
         case WM_ERASEBKGND: {
@@ -2284,8 +2188,6 @@ LRESULT CALLBACK IpmsgWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam)
             st->hwnd = hwnd;
             st->inst = GetModuleHandleW(nullptr);
             st->dpi = SystemDpi();
-            st->startedMs = static_cast<int64_t>(GetNowTickMs());
-            st->taskbarCreated = RegisterWindowMessageW(L"TaskbarCreated");
             st->font = MakeFont(st->dpi);
 
             std::wstring dataDir = GetEffectiveDataDirectoryWide();
@@ -2323,8 +2225,7 @@ LRESULT CALLBACK IpmsgWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam)
             ApplyDialogTheme(st, true);
             ShowPage(st, 0);
             LoadSettings(st);
-            AddTrayIcon(st);
-            UpdateTitleAndTray(st);
+            UpdateTitle(st);
             PollStatus(st);
             SetTimer(hwnd, TIMER_POLL, 1000, nullptr);
             return 0;
@@ -2464,15 +2365,6 @@ LRESULT CALLBACK IpmsgWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam)
             if (!st) return 0;
             const int id = LOWORD(wParam);
             const int code = HIWORD(wParam);
-            if (id == IDM_TRAY_OPEN) {
-                ShowMainWindow(st);
-                return 0;
-            }
-            if (id == IDM_TRAY_EXIT) {
-                st->exiting = true;
-                DestroyWindow(hwnd);
-                return 0;
-            }
             if (id == IDC_SET_NICK && code == EN_CHANGE) {
                 std::string agent = Trim(GetTextUtf8(st->setAgent));
                 if (agent.empty() || agent == st->autoAgentAtLoad) {
@@ -2698,22 +2590,6 @@ LRESULT CALLBACK IpmsgWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam)
             }
             return 0;
         }
-        case kTrayMessage: {
-            if (!st) return 0;
-            switch (LOWORD(lParam)) {
-                case WM_LBUTTONUP:
-                case NIN_SELECT:
-                case NIN_BALLOONUSERCLICK:
-                    ShowMainWindow(st);
-                    break;
-                case WM_RBUTTONUP:
-                    ShowTrayMenu(st);
-                    break;
-                default:
-                    break;
-            }
-            return 0;
-        }
         case WM_COPYDATA: {
             if (!st) return FALSE;
             auto* cds = reinterpret_cast<COPYDATASTRUCT*>(lParam);
@@ -2733,11 +2609,8 @@ LRESULT CALLBACK IpmsgWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam)
             return FALSE;
         }
         case WM_CLOSE:
-            if (st && !st->exiting) {
-                SaveWindowPlacement(st);
-                ShowWindow(hwnd, SW_HIDE);
-                return 0;
-            }
+            // Closing the window ends Chat. There is no tray icon to hide into.
+            if (st) SaveWindowPlacement(st);
             return DefWindowProcW(hwnd, msg, wParam, lParam);
         case WM_ENDSESSION:
             if (st && wParam) {
@@ -2751,7 +2624,6 @@ LRESULT CALLBACK IpmsgWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam)
             KillTimer(hwnd, TIMER_RELOAD);
             if (st) {
                 SaveWindowPlacement(st);
-                RemoveTrayIcon(st);
                 RemovePropW(hwnd, kPropDataDir);
                 if (st->dataDirAtom) {
                     GlobalDeleteAtom(st->dataDirAtom);
@@ -2832,7 +2704,7 @@ bool SendDraftToIpmsgDialog(const std::wstring& text) {
     return true;
 }
 
-int RunIpmsgDialog(bool startHidden) {
+int RunIpmsgDialog() {
     SetProcessDPIAware();
 
     INITCOMMONCONTROLSEX icex = {};
@@ -2848,10 +2720,8 @@ int RunIpmsgDialog(bool startHidden) {
     std::wstring mutexName = GetGuiMutexNameWide() + L"_ipmsg";
     HANDLE mutex = CreateMutexW(nullptr, FALSE, mutexName.c_str());
     if (mutex && GetLastError() == ERROR_ALREADY_EXISTS) {
-        if (!startHidden) {
-            if (HWND other = FindExistingDialog()) {
-                PostMessageW(other, g_showMessage, 0, 0);
-            }
+        if (HWND other = FindExistingDialog()) {
+            PostMessageW(other, g_showMessage, 0, 0);
         }
         CloseHandle(mutex);
         return 0;
@@ -2859,8 +2729,6 @@ int RunIpmsgDialog(bool startHidden) {
 
     DialogState st;
     st.mutex = mutex;
-    st.startHidden = startHidden;
-    st.startedMs = static_cast<int64_t>(GetNowTickMs());
     st.dpi = SystemDpi();
     st.inst = GetModuleHandleW(nullptr);
     g_state = &st;
@@ -2894,17 +2762,12 @@ int RunIpmsgDialog(bool startHidden) {
         MonitorFromRect(&st.windowPlacement.rcNormalPosition, MONITOR_DEFAULTTONULL) != nullptr;
     if (validPlacement) {
         WINDOWPLACEMENT wp = st.windowPlacement;
-        if (startHidden) {
-            wp.showCmd = SW_HIDE;
-        } else if (wp.showCmd == SW_HIDE) {
-            wp.showCmd = SW_SHOWNORMAL;
-        }
+        // A placement saved as hidden (older tray builds) must still show the window.
+        if (wp.showCmd == SW_HIDE) wp.showCmd = SW_SHOWNORMAL;
         SetWindowPlacement(hwnd, &wp);
     }
-    if (!startHidden) {
-        ShowWindow(hwnd, SW_SHOW);
-        UpdateWindow(hwnd);
-    }
+    ShowWindow(hwnd, SW_SHOW);
+    UpdateWindow(hwnd);
 
     MSG msg;
     while (GetMessageW(&msg, nullptr, 0, 0) > 0) {

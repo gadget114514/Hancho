@@ -220,6 +220,30 @@ int main() {
         }
     }
 
+    // A relative program path (build\Release\app.exe style) resolves against the job's
+    // working directory, not the current directory of the process that launches it.
+    {
+        const std::string exeDir = ExeDir();
+        const size_t slash = exeDir.find_last_of("\\/");
+        const std::string parentDir = exeDir.substr(0, slash);
+        const std::string leaf = exeDir.substr(slash + 1);
+        StartProcessRequest rreq;
+        rreq.name = "relative-program";
+        rreq.workingDir = parentDir;
+        rreq.timeoutSec = 20;
+        rreq.commandLine = leaf + "\\hancho-cli.exe --version";
+        wchar_t prevCwd[MAX_PATH] = {};
+        GetCurrentDirectoryW(MAX_PATH, prevCwd);
+        SetCurrentDirectoryW(temp.wstring().c_str());  // somewhere the relative path does not exist
+        std::string rerr;
+        int rid = pm.StartProcess(rreq, rerr);
+        SetCurrentDirectoryW(prevCwd);
+        Check(rid > 0, "relative program path resolves against the job cwd: " + rerr);
+        if (rid > 0) {
+            Check(pm.WaitForExit(rid, 15000), "relative-path program exits");
+        }
+    }
+
     std::string killError;
     pm.KillProcess(id, killError);
     SetDataDirectoryOverride(L"");

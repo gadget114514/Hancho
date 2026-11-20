@@ -5,11 +5,48 @@
 
 namespace pc {
 
-static std::wstring ResolveCommandLineForWin32(const std::string& rawCmdUtf8) {
+// CreateProcessW resolves a relative program path such as build\Release\app.exe against the
+// current directory of *this* process, not lpCurrentDirectory. Rewrite such a path to an
+// absolute one under the job's working directory when the file exists there.
+static std::wstring AnchorRelativeProgram(const std::wstring& cmd, const std::wstring& cwd) {
+    if (cwd.empty() || cmd.empty()) return cmd;
+    const bool quoted = cmd[0] == L'"';
+    size_t progEnd = std::wstring::npos;
+    std::wstring prog;
+    if (quoted) {
+        progEnd = cmd.find(L'"', 1);
+        if (progEnd == std::wstring::npos) return cmd;
+        prog = cmd.substr(1, progEnd - 1);
+        ++progEnd;  // past the closing quote
+    } else {
+        progEnd = cmd.find_first_of(L" \t");
+        prog = (progEnd == std::wstring::npos) ? cmd : cmd.substr(0, progEnd);
+    }
+    if (prog.find_first_of(L"\\/") == std::wstring::npos) return cmd;  // bare name: PATH search
+    if (prog.size() >= 2 && prog[1] == L':') return cmd;                // drive-qualified
+    if (prog[0] == L'\\' || prog[0] == L'/') return cmd;                // rooted / UNC
+    std::wstring candidate = cwd;
+    if (candidate.back() != L'\\' && candidate.back() != L'/') candidate += L'\\';
+    candidate += prog;
+    for (wchar_t& ch : candidate) {
+        if (ch == L'/') ch = L'\\';
+    }
+    DWORD attrs = GetFileAttributesW(candidate.c_str());
+    if (attrs == INVALID_FILE_ATTRIBUTES || (attrs & FILE_ATTRIBUTE_DIRECTORY)) {
+        const std::wstring withExe = candidate + L".exe";
+        attrs = GetFileAttributesW(withExe.c_str());
+        if (attrs == INVALID_FILE_ATTRIBUTES || (attrs & FILE_ATTRIBUTE_DIRECTORY)) return cmd;
+        candidate = withExe;
+    }
+    const std::wstring rest = (progEnd == std::wstring::npos) ? L"" : cmd.substr(progEnd);
+    return L"\"" + candidate + L"\"" + rest;
+}
+
+static std::wstring ResolveCommandLineForWin32(const std::string& rawCmdUtf8, const std::wstring& cwd) {
     std::wstring cmd = Utf8ToWide(rawCmdUtf8);
     size_t start = cmd.find_first_not_of(L" \t");
     if (start == std::wstring::npos) return L"";
-    cmd = cmd.substr(start);
+    cmd = AnchorRelativeProgram(cmd.substr(start), cwd);
 
     std::wstring prog;
     if (cmd[0] == L'"') {
@@ -211,14 +248,14 @@ int ProcessManager::StartProcess(const StartProcessRequest& req, std::string& ou
         return -1;
     }
 
-    std::wstring resolvedCmd = ResolveCommandLineForWin32(req.commandLine);
+    std::wstring cwdWide = ResolveAbsolutePathWide(Utf8ToWide(req.workingDir));
+    const wchar_t* cwdPtr = cwdWide.c_str();
+
+    std::wstring resolvedCmd = ResolveCommandLineForWin32(req.commandLine, cwdWide);
     if (resolvedCmd.empty()) {
         outError = "Failed to resolve command line.";
         return -1;
     }
-
-    std::wstring cwdWide = ResolveAbsolutePathWide(Utf8ToWide(req.workingDir));
-    const wchar_t* cwdPtr = cwdWide.c_str();
 
     // HANCHO_EVENT_PIPE: a per-process named pipe that the CLI (or a wrapper) can write
     // hancho.event/1 lines to. Only pipe-mode workers with streaming get one.

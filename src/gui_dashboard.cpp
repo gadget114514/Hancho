@@ -741,7 +741,8 @@ enum ControlId {
     IDM_TRAY_USAGE = 4005,
     IDM_TRAY_MEMORY = 4006,
     IDM_TRAY_QUIT = 4007,
-    IDM_TRAY_SNAPSHOT = 4008
+    IDM_TRAY_SNAPSHOT = 4008,
+    IDM_TRAY_CHAT = 4009
 };
 
 enum class ShellType {
@@ -11659,18 +11660,16 @@ static std::wstring GetConfigFilePathWide() {
     return GetLogsDirectoryWide() + L"\\config.json";
 }
 
-// Launches the standalone Chat dialog. One instance per data dir; a second
-// launch activates the existing window instead of creating another one.
-static void LaunchIpmsgDialog(bool startHidden) {
-    // A toolbar click raises the window that already exists; the tray launch at
-    // dashboard start must not pull it to the foreground.
-    if (!startHidden && ActivateIpmsgDialog()) return;
+// Opens the standalone Chat window for this data dir (toolbar button or the
+// Hancho tray menu). One instance per data dir; if it is already open, its
+// window is brought to the front instead of starting another one.
+static void LaunchIpmsgDialog() {
+    if (ActivateIpmsgDialog()) return;
     wchar_t exePath[MAX_PATH] = {};
     GetModuleFileNameW(nullptr, exePath, MAX_PATH);
     std::wstring cmd = L"\"";
     cmd += exePath;
     cmd += L"\" chat";
-    if (startHidden) cmd += L" --tray";
     if (HasCustomDataDirectory()) {
         cmd += L" --data-dir \"";
         cmd += GetEffectiveDataDirectoryWide();
@@ -11686,17 +11685,6 @@ static void LaunchIpmsgDialog(bool startHidden) {
         CloseHandle(pi.hThread);
         CloseHandle(pi.hProcess);
     }
-}
-
-static bool IpmsgEnabledInConfig() {
-    std::string content = ReadFileUtf8Wide(GetConfigFilePathWide());
-    if (content.empty()) return false;
-    nlohmann::json j = nlohmann::json::parse(content, nullptr, false);
-    if (!j.is_object()) return false;
-    auto it = j.find("chat");
-    if (it == j.end() || !it->is_object()) it = j.find("ipmsg");
-    if (it == j.end() || !it->is_object()) return false;
-    return it->value("enabled", false);
 }
 
 // Sets TIMER_REFRESH_ID to the configured interval, doubled while nothing is running.
@@ -12613,6 +12601,7 @@ static void ShowTrayContextMenu(DashboardState* st) {
     if (st->pm) {
         AppendMenuW(hMenu, MF_STRING, IDM_TRAY_GRID_VIEW, Tr(L"グリッド表示を開く", L"Open Grid View", L"Abrir vista de cuadrícula"));
     }
+    AppendMenuW(hMenu, MF_STRING, IDM_TRAY_CHAT, Tr(L"チャットを開く", L"Open Chat", L"Abrir chat"));
     AppendMenuW(hMenu, MF_STRING, IDM_TRAY_USAGE, Tr(L"トークン使用量グラフ", L"Token Usage Graph", L"Gráfico de uso de tokens"));
     AppendMenuW(hMenu, MF_STRING, IDM_TRAY_MEMORY, Tr(L"メモリ一覧...", L"Memory List...", L"Lista de memoria..."));
     AppendMenuW(hMenu, MF_STRING, IDM_TRAY_SNAPSHOT, Tr(L"スクリーンショットを保存", L"Save Screenshot", L"Guardar captura"));
@@ -12640,6 +12629,9 @@ static void ShowTrayContextMenu(DashboardState* st) {
             LayoutTerminalViews(st);
             st->gridView->Show();
         }
+    } else if (cmd == IDM_TRAY_CHAT) {
+        // Chat is its own window; the dashboard stays in the tray.
+        LaunchIpmsgDialog();
     } else if (cmd == IDM_TRAY_USAGE) {
         RestoreFromTray(st);
         st->showUsagePanel = true;
@@ -14114,7 +14106,7 @@ static void UpdateSettingsDialogTexts(HWND hwnd) {
             Tr(L"管理", L"Maintenance", L"Mantenimiento"),
             Tr(L"パフォーマンス", L"Performance", L"Rendimiento"),
             Tr(L"色詳細", L"Color details", L"Detalles de color"),
-            Tr(L"バージョン情報", L"About", L"Acerca de"),
+            Tr(L"版", L"About", L"Acerca de"),
             Tr(L"LLM", L"LLM", L"LLM"),
             Tr(L"権限", L"Permits", L"Permisos"),
         };
@@ -14403,7 +14395,7 @@ static LRESULT CALLBACK SettingsWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPAR
 
             ds->tabCtrl = CreateWindowExW(0, WC_TABCONTROLW, L"",
                 WS_CHILD | WS_VISIBLE | WS_TABSTOP | WS_CLIPSIBLINGS | TCS_TABS | TCS_SINGLELINE | TCS_OWNERDRAWFIXED,
-                8, 8, 744, 760, hwnd, (HMENU)IDC_SET_TAB, hInst, nullptr);
+                8, 8, 894, 760, hwnd, (HMENU)IDC_SET_TAB, hInst, nullptr);
             SendMessageW(ds->tabCtrl, WM_SETFONT, (WPARAM)ds->dash->hFontUi, TRUE);
             SetWindowSubclass(ds->tabCtrl, SettingsTabSubclassProc, 1, 0);
             for (int t = 0; t < kSettingsTabCount; ++t) {
@@ -14490,7 +14482,7 @@ static LRESULT CALLBACK SettingsWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPAR
             ds->btnClear = CreateWindowExW(0, L"BUTTON", L"", WS_CHILD | WS_VISIBLE | BS_OWNERDRAW,
                 402, 48, 180, 32, hwnd, (HMENU)IDC_SET_CLEAR_ENDED, hInst, nullptr);
             ds->btnClose = CreateWindowExW(0, L"BUTTON", L"", WS_CHILD | WS_VISIBLE | BS_OWNERDRAW,
-                560, 784, 110, 32, hwnd, (HMENU)IDCANCEL, hInst, nullptr);
+                710, 784, 110, 32, hwnd, (HMENU)IDCANCEL, hInst, nullptr);
             // Static version of the power status, so a person can see before arming a job
             // whether this Hancho can actually suspend or shut the PC down.
             ds->hwndPowerPrivilege = CreateWindowExW(0, L"STATIC", L"", WS_CHILD | SS_LEFT,
@@ -15775,7 +15767,7 @@ static void ShowSettingsDialog(DashboardState* st) {
     ds->dash = st;
     RECT rcParent = {};
     GetWindowRect(st->hwndMain, &rcParent);
-    int dlgW = 760;
+    int dlgW = 910;
     int dlgH = 870;
     int x = rcParent.left + ((rcParent.right - rcParent.left) - dlgW) / 2;
     int y = rcParent.top + ((rcParent.bottom - rcParent.top) - dlgH) / 2;
@@ -19802,7 +19794,6 @@ static LRESULT CALLBACK DashboardWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPA
             LoadShellConfig(st);
             UpdateToolbarLabels(st);
             SetWindowTextW(hwnd, MainWindowTitle().c_str());
-            if (IpmsgEnabledInConfig()) LaunchIpmsgDialog(true);
 
             st->hwndList = CreateWindowExW(WS_EX_CLIENTEDGE, WC_LISTVIEWW, L"",
                 WS_CHILD | WS_VISIBLE | LVS_REPORT | LVS_SINGLESEL | LVS_SHOWSELALWAYS,
@@ -20481,7 +20472,7 @@ static LRESULT CALLBACK DashboardWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPA
             } else if (id == IDC_BTN_HISTORY) {
                 ShowTriageDialog(st);
             } else if (id == IDC_BTN_IPMSG) {
-                LaunchIpmsgDialog(false);
+                LaunchIpmsgDialog();
             } else if (id == IDC_BTN_SEARCH_PROC) {
                 st->showProcSearch = !st->showProcSearch;
                 SetWindowTextW(st->hwndSearchProcBtn, st->showProcSearch ? L"✕" : L"🔍");

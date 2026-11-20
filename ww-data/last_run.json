@@ -1,18 +1,18 @@
 ﻿{
     "Worktree":  null,
-    "Minutes":  16.7,
+    "Minutes":  29.9,
     "Engine":  "opencode",
     "Shared":  false,
-    "Started":  "2026-11-20T08:10:55",
+    "Started":  "2026-11-20T12:36:06",
     "EditViolations":  [
 
                        ],
-    "Log":  "D:\\wsgit\\Hancho\\ww-data\\logs\\092-20261120-081055.log",
-    "Task":  "092",
-    "Ended":  "2026-11-20T08:27:38",
-    "Card":  "092-bt-retry-from-siblings.md",
+    "Log":  "D:\\wsgit\\Hancho\\ww-data\\logs\\094-20261120-123606.log",
+    "Task":  "094",
+    "Ended":  "2026-11-20T13:05:58",
+    "Card":  "094-title-data-dir.md",
     "ReportsWritten":  [
-                           "092.md"
+                           "094.md"
                        ],
     "ExitCode":  0
 }

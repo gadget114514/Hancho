@@ -1227,6 +1227,7 @@ target_link_libraries(webui_smoke PRIVATE
 # off: config_set must answer while a WebSocket request is still running.
 add_executable(webui_config_smoke
     tests/webui_config_smoke.cpp
+    src/power.cpp
     src/ipc_server.cpp
     src/ipc_server_remote.cpp
     src/webui_server.cpp
@@ -1291,6 +1292,7 @@ if(MSVC)
 endif()
 
 target_link_libraries(webui_config_smoke PRIVATE
+    powrprof
     user32
     gdi32
     comctl32
