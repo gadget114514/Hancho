@@ -124,6 +124,12 @@ The application icons are modeled on the character "Telephone Cat" (電話猫, D
 
 
 
+### v0.9.38
+- **Chat window**: Chat no longer has its own tray icon. Closing it ends Chat; the `--tray` option is removed. Open Chat from the toolbar or the Hancho dashboard tray menu ("Open Chat").
+- **Chat notifications**: new incoming Chat messages show a balloon on the Hancho dashboard's tray icon. Messages already waiting at dashboard start are not announced.
+- **Relative program paths**: job commands such as `build\Releasepp.exe` resolve against the job's working directory.
+
+
 ### v0.9.37
 - **Routines**: save a behavior tree under a name and run it again without an LLM (`hancho-cli routine list/show/run/save/check`, MCP `routine_*`). Each run gets its own ID, so repeated runs do not collide. A `foreach` node expands a file glob at run time, so new tests are picked up automatically. Hancho reports a routine as `stale` when its input files change; a failed stale run opens a triage card. `routine ask` lets a worker LLM write or fix a routine, which runs only after you approve it. The dashboard has a Routines page.
 - **Hang handling**: startup hangs are detected early and diagnosed with likely causes and next steps. Behavior trees gain a `catch` node, defaults, failure variables, `bt template`, and validate warnings. Pre-approved worker / consult / supervisor LLM lists with probes, and a shared circuit breaker for broken engines.
