@@ -16,6 +16,7 @@
 #include "routine.h"
 #include "triage.h"
 #include "triage_manager.h"
+#include "permit_draft.h"
 #include "webui_server.h"
 #include "term_server.h"
 #include "nlohmann/json.hpp"
@@ -165,6 +166,7 @@ IpcServer::IpcServer(ProcessManager& pm, TaskQueueManager& tqm, HWND notifyHwnd)
     routineManager_ = std::make_unique<RoutineManager>();
     InstallRoutineValidator();
     triageManager_ = std::make_unique<TriageManager>(pm_, tqm_, btm_);
+    permitDraft_ = std::make_unique<PermitDraftManager>(pm_, btm_);
     triageManager_->SetRoutineAskHandler([this](const std::string& name, const std::string& cwd,
                                                 const std::string& request) {
         return HandleRoutineAsk(*routineManager_, btm_, &tqm_, request, name,
@@ -184,6 +186,7 @@ IpcServer::IpcServer(ProcessManager& pm, TaskQueueManager& tqm, BtManager* btm, 
     routineManager_ = std::make_unique<RoutineManager>();
     InstallRoutineValidator();
     triageManager_ = std::make_unique<TriageManager>(pm_, tqm_, btm_);
+    permitDraft_ = std::make_unique<PermitDraftManager>(pm_, btm_);
     triageManager_->SetRoutineAskHandler([this](const std::string& name, const std::string& cwd,
                                                 const std::string& request) {
         return HandleRoutineAsk(*routineManager_, btm_, &tqm_, request, name,
@@ -1328,6 +1331,14 @@ std::string IpcServer::HandleRequestJson(const std::string& reqJson) {
     else if (action == "triage_get") {
         return triageManager_ ? triageManager_->Get(JsonGetString(reqJson, "id", ""))
                               : "{\"ok\":false,\"error\":\"triage manager is unavailable\"}";
+    }
+    else if (action == "permit_draft") {
+        return permitDraft_ ? permitDraft_->Start(JsonGetString(reqJson, "request", ""))
+                            : "{\"ok\":false,\"error\":\"permit draft is unavailable\"}";
+    }
+    else if (action == "permit_draft_get") {
+        return permitDraft_ ? permitDraft_->Get(JsonGetString(reqJson, "draftId", ""))
+                            : "{\"ok\":false,\"error\":\"permit draft is unavailable\"}";
     }
     else if (action == "triage_advise") {
         return triageManager_ ? triageManager_->RequestAdvice(JsonGetString(reqJson, "id", ""))

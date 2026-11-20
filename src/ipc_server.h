@@ -18,6 +18,7 @@ namespace pc {
 class BtManager;
 class RoutineManager;
 class TriageManager;
+class PermitDraftManager;
 class WebUiServer;
 class TermServer;
 class IpmsgNode;
@@ -148,6 +149,7 @@ private:
     BtManager* btm_ = nullptr;
     std::unique_ptr<RoutineManager> routineManager_;
     std::unique_ptr<TriageManager> triageManager_;
+    std::unique_ptr<PermitDraftManager> permitDraft_;
     std::atomic<HWND> notifyHwnd_{nullptr};
     std::function<void()> guiShowCb_;
     std::function<void()> shutdownCb_;

@@ -41,6 +41,7 @@ set(HANCHO_SOURCES
     src/triage_text.cpp
     src/chain_guard.cpp
     src/ipc_server.cpp
+    src/permit_draft.cpp
     src/ipc_server_remote.cpp
     src/webui_server.cpp
     src/ipmsg.cpp
@@ -872,6 +873,7 @@ target_link_libraries(bt_integration_smoke PRIVATE
 add_executable(bt_ipc_smoke
     tests/bt_ipc_smoke.cpp
     src/ipc_server.cpp
+    src/permit_draft.cpp
     src/ipc_server_remote.cpp
     src/power.cpp
     src/webui_server.cpp
@@ -959,6 +961,7 @@ add_executable(routine_smoke
     tests/routine_smoke.cpp
     src/routine.cpp
     src/ipc_server.cpp
+    src/permit_draft.cpp
     src/ipc_server_remote.cpp
     src/power.cpp
     src/webui_server.cpp
@@ -1229,6 +1232,7 @@ add_executable(webui_config_smoke
     tests/webui_config_smoke.cpp
     src/power.cpp
     src/ipc_server.cpp
+    src/permit_draft.cpp
     src/ipc_server_remote.cpp
     src/webui_server.cpp
     src/ipmsg.cpp
@@ -1400,6 +1404,7 @@ else()
         src/triage_manager.cpp
         src/chain_guard_posix.cpp
         src/ipc_server.cpp
+    src/permit_draft.cpp
         src/ipc_server_posix.cpp
         src/ipc_server_remote.cpp
         src/webui_server.cpp

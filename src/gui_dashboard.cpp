@@ -725,6 +725,8 @@ enum ControlId {
     IDC_SET_PERMIT_REJECT = 6118,
     IDC_SET_PERMIT_REVOKE = 6119,
     IDC_SET_PERMIT_REFRESH = 6120,
+    IDC_SET_PERMIT_DRAFT_TEXT = 6121,  // outside the REQUEST..REFRESH range on purpose
+    IDC_SET_PERMIT_DRAFT = 6122,
     IDC_SET_TERM_LOCAL = 6071,
     IDC_SET_TERM_REMOTE = 6072,
     IDC_SET_TERM_TOKEN = 6076,
@@ -13003,6 +13005,17 @@ struct SettingsDlgState {
         HWND editPermitEngine = nullptr;
         HWND editPermitScope = nullptr;
         HWND editPermitNote = nullptr;
+        HWND lblPermitKind = nullptr;
+        HWND lblPermitTarget = nullptr;
+        HWND lblPermitEngine = nullptr;
+        HWND lblPermitScope = nullptr;
+        HWND lblPermitNote = nullptr;
+        HWND lblPermitHint = nullptr;
+        HWND lblPermitDraft = nullptr;
+        HWND editPermitDraft = nullptr;
+        HWND btnPermitDraft = nullptr;
+        HWND lblPermitDraftStatus = nullptr;
+        std::string permitDraftId;  // set while an LLM draft is running
         HWND btnPermitRequest = nullptr;
         HWND btnPermitApprove = nullptr;
         HWND btnPermitReject = nullptr;
@@ -13082,7 +13095,10 @@ static void PermitFillSelectedRow(SettingsDlgState* ds) {
     int sel = static_cast<int>(SendMessageW(ds->lstPermitRows, LB_GETCURSEL, 0, 0));
     if (sel < 0 || sel >= static_cast<int>(ds->permitVisibleRows.size())) return;
     const permit::Entry& e = ds->permitVisibleRows[static_cast<size_t>(sel)];
-    SetWindowTextW(ds->editPermitKind, Utf8ToWide(e.kind).c_str());
+    // Kind is a dropdown: select the matching item instead of setting text.
+    if (SendMessageW(ds->editPermitKind, CB_SELECTSTRING, static_cast<WPARAM>(-1),
+                     reinterpret_cast<LPARAM>(Utf8ToWide(e.kind).c_str())) == CB_ERR)
+        SendMessageW(ds->editPermitKind, CB_SETCURSEL, 0, 0);
     SetWindowTextW(ds->editPermitTarget, Utf8ToWide(e.target).c_str());
     std::wstring engines;
     for (size_t i = 0; i < e.engines.size(); ++i) {
@@ -13092,6 +13108,21 @@ static void PermitFillSelectedRow(SettingsDlgState* ds) {
     SetWindowTextW(ds->editPermitEngine, engines.c_str());
     SetWindowTextW(ds->editPermitScope, Utf8ToWide(e.scope).c_str());
     SetWindowTextW(ds->editPermitNote, Utf8ToWide(e.note).c_str());
+}
+
+// Timer that polls an LLM permit draft while the permits page is open.
+static constexpr UINT_PTR kPermitDraftTimerId = 6123;
+
+// Copies a finished LLM draft into the form. Nothing is saved until the person presses Request.
+static void PermitApplyDraft(SettingsDlgState* ds, const nlohmann::json& fields) {
+    const std::string kind = fields.value("kind", std::string());
+    if (SendMessageW(ds->editPermitKind, CB_SELECTSTRING, static_cast<WPARAM>(-1),
+                     reinterpret_cast<LPARAM>(Utf8ToWide(kind).c_str())) == CB_ERR)
+        SendMessageW(ds->editPermitKind, CB_SETCURSEL, 0, 0);
+    SetWindowTextW(ds->editPermitTarget, Utf8ToWide(fields.value("target", std::string())).c_str());
+    SetWindowTextW(ds->editPermitEngine, Utf8ToWide(fields.value("engines", std::string())).c_str());
+    SetWindowTextW(ds->editPermitScope, Utf8ToWide(fields.value("scope", std::string())).c_str());
+    SetWindowTextW(ds->editPermitNote, Utf8ToWide(fields.value("note", std::string())).c_str());
 }
 
 static LRESULT CALLBACK SettingsTabSubclassProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam,
@@ -14170,6 +14201,39 @@ static void UpdateSettingsDialogTexts(HWND hwnd) {
     SetWindowTextW(ds->btnPermitReject, Tr(L"却下", L"Reject", L"Rechazar"));
     SetWindowTextW(ds->btnPermitRevoke, Tr(L"失効", L"Revoke", L"Revocar"));
     SetWindowTextW(ds->btnPermitRefresh, Tr(L"再読み込み", L"Refresh", L"Actualizar"));
+    if (ds->lblPermitDraft) SetWindowTextW(ds->lblPermitDraft, Tr(
+        L"やりたいこと（LLM が下書き）:", L"What you want (LLM drafts it):", L"Lo que quieres (el LLM lo redacta):"));
+    if (ds->btnPermitDraft) SetWindowTextW(ds->btnPermitDraft, Tr(
+        L"LLM で下書き", L"Draft with LLM", L"Redactar con LLM"));
+    if (ds->lblPermitKind) SetWindowTextW(ds->lblPermitKind, Tr(
+        L"種類 (kind):", L"Kind:", L"Tipo (kind):"));
+    if (ds->lblPermitTarget) SetWindowTextW(ds->lblPermitTarget, Tr(
+        L"対象 (target):", L"Target:", L"Destino (target):"));
+    if (ds->lblPermitEngine) SetWindowTextW(ds->lblPermitEngine, Tr(
+        L"エンジン (engines):", L"Engines:", L"Motores (engines):"));
+    if (ds->lblPermitScope) SetWindowTextW(ds->lblPermitScope, Tr(
+        L"範囲 (scope):", L"Scope:", L"Ámbito (scope):"));
+    if (ds->lblPermitNote) SetWindowTextW(ds->lblPermitNote, Tr(
+        L"メモ (note):", L"Note:", L"Nota (note):"));
+    if (ds->lblPermitHint) SetWindowTextW(ds->lblPermitHint, Tr(
+        L"種類: read_path = 読み取りを許す場所 / write_path = 書き込みを許す場所 / command = 実行を許すコマンド / network = 接続を許す先\r\n"
+        L"対象: 上の種類に合わせてパス・コマンド・ホストを書く。* と ? のワイルドカードが使えます。\r\n"
+        L"エンジン: この権限を使ってよいエンジン名を、カンマ区切りで書く。\r\n"
+        L"範囲: 空欄または global は全体に効きます。特定の範囲だけに限るときに書きます。\r\n"
+        L"メモ: 承認者への補足（任意）。\r\n\r\n"
+        L"使い方: 4つの欄を書いて「申請」で新しい行を作り、一覧の行を選んで「承認」「却下」「失効」を押します。",
+        L"Kind: read_path = where reading is allowed / write_path = where writing is allowed / command = commands that may run / network = hosts that may be reached\r\n"
+        L"Target: the path, command or host matching the kind. * and ? wildcards are supported.\r\n"
+        L"Engines: engine names allowed to use this rule, comma separated.\r\n"
+        L"Scope: leave empty or use global to apply everywhere; fill it to limit the rule to one scope.\r\n"
+        L"Note: optional comment for the approver.\r\n\r\n"
+        L"How to use: fill the fields, press Request to create a row, select a row in the list, then press Approve, Reject or Revoke.",
+        L"Tipo: read_path = dónde se permite leer / write_path = dónde se permite escribir / command = comandos permitidos / network = hosts permitidos\r\n"
+        L"Destino: ruta, comando o host según el tipo. Se admiten los comodines * y ?.\r\n"
+        L"Motores: nombres de motor permitidos, separados por comas.\r\n"
+        L"Ámbito: déjalo vacío o usa global para aplicarlo a todo; rellénalo para limitar la regla a un ámbito.\r\n"
+        L"Nota: comentario opcional para quien aprueba.\r\n\r\n"
+        L"Uso: rellena los campos, pulsa Solicitar para crear una fila, selecciona una fila y pulsa Aprobar, Rechazar o Revocar."));
     RefreshPowerPrivilegeText(ds);
     {
         const wchar_t* const tabNames[kSettingsTabCount] = {
@@ -15183,23 +15247,55 @@ static LRESULT CALLBACK SettingsWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPAR
             ds->lstPermitRows = CreateWindowExW(0, L"LISTBOX", L"",
                 WS_CHILD | WS_VISIBLE | WS_BORDER | WS_VSCROLL | LBS_NOTIFY | WS_TABSTOP,
                 18, 104, 500, 340, hwnd, (HMENU)IDC_SET_PERMIT_ROWS, hInst, nullptr);
-            ds->editPermitKind = CreateWindowExW(WS_EX_CLIENTEDGE, L"EDIT", L"", WS_CHILD | WS_VISIBLE | WS_TABSTOP,
-                532, 104, 200, 24, hwnd, (HMENU)IDC_SET_PERMIT_KIND, hInst, nullptr);
+            // Each field gets a short label above it (row pitch 48px); the full rules are in the
+            // hint block under the list.
+            ds->lblPermitKind = CreateWindowExW(0, L"STATIC", L"", WS_CHILD | WS_VISIBLE,
+                532, 84, 250, 18, hwnd, nullptr, hInst, nullptr);
+            // Kind is a fixed set, so it is a dropdown rather than free text.
+            ds->editPermitKind = CreateWindowExW(WS_EX_CLIENTEDGE, L"COMBOBOX", L"",
+                WS_CHILD | WS_VISIBLE | WS_TABSTOP | CBS_DROPDOWNLIST | WS_VSCROLL,
+                532, 104, 200, 160, hwnd, (HMENU)IDC_SET_PERMIT_KIND, hInst, nullptr);
+            for (const wchar_t* kind : { L"read_path", L"write_path", L"command", L"network" })
+                SendMessageW(ds->editPermitKind, CB_ADDSTRING, 0, reinterpret_cast<LPARAM>(kind));
+            SendMessageW(ds->editPermitKind, CB_SETCURSEL, 0, 0);
+            ds->lblPermitTarget = CreateWindowExW(0, L"STATIC", L"", WS_CHILD | WS_VISIBLE,
+                532, 132, 250, 18, hwnd, nullptr, hInst, nullptr);
             ds->editPermitTarget = CreateWindowExW(WS_EX_CLIENTEDGE, L"EDIT", L"", WS_CHILD | WS_VISIBLE | WS_TABSTOP,
-                532, 136, 200, 24, hwnd, (HMENU)IDC_SET_PERMIT_TARGET, hInst, nullptr);
+                532, 152, 200, 24, hwnd, (HMENU)IDC_SET_PERMIT_TARGET, hInst, nullptr);
+            ds->lblPermitEngine = CreateWindowExW(0, L"STATIC", L"", WS_CHILD | WS_VISIBLE,
+                532, 180, 250, 18, hwnd, nullptr, hInst, nullptr);
             ds->editPermitEngine = CreateWindowExW(WS_EX_CLIENTEDGE, L"EDIT", L"", WS_CHILD | WS_VISIBLE | WS_TABSTOP,
-                532, 168, 200, 24, hwnd, (HMENU)IDC_SET_PERMIT_ENGINE, hInst, nullptr);
+                532, 200, 200, 24, hwnd, (HMENU)IDC_SET_PERMIT_ENGINE, hInst, nullptr);
+            ds->lblPermitScope = CreateWindowExW(0, L"STATIC", L"", WS_CHILD | WS_VISIBLE,
+                532, 228, 250, 18, hwnd, nullptr, hInst, nullptr);
             ds->editPermitScope = CreateWindowExW(WS_EX_CLIENTEDGE, L"EDIT", L"", WS_CHILD | WS_VISIBLE | WS_TABSTOP,
-                532, 200, 200, 24, hwnd, (HMENU)IDC_SET_PERMIT_SCOPE, hInst, nullptr);
+                532, 248, 200, 24, hwnd, (HMENU)IDC_SET_PERMIT_SCOPE, hInst, nullptr);
+            ds->lblPermitNote = CreateWindowExW(0, L"STATIC", L"", WS_CHILD | WS_VISIBLE,
+                532, 276, 250, 18, hwnd, nullptr, hInst, nullptr);
             ds->editPermitNote = CreateWindowExW(WS_EX_CLIENTEDGE, L"EDIT", L"", WS_CHILD | WS_VISIBLE | WS_TABSTOP,
-                532, 232, 200, 24, hwnd, (HMENU)IDC_SET_PERMIT_NOTE, hInst, nullptr);
+                532, 296, 200, 24, hwnd, (HMENU)IDC_SET_PERMIT_NOTE, hInst, nullptr);
+            ds->lblPermitHint = CreateWindowExW(0, L"STATIC", L"", WS_CHILD | WS_VISIBLE,
+                18, 456, 500, 200, hwnd, nullptr, hInst, nullptr);
+            SendMessageW(ds->lblPermitHint, WM_SETFONT, (WPARAM)ds->dash->hFontUi, TRUE);
+            // LLM draft: a plain-language wish is turned into the four fields above. The draft
+            // is only proposed; it is saved only when the person presses Request.
+            ds->lblPermitDraft = CreateWindowExW(0, L"STATIC", L"", WS_CHILD | WS_VISIBLE,
+                532, 448, 250, 18, hwnd, nullptr, hInst, nullptr);
+            ds->editPermitDraft = CreateWindowExW(WS_EX_CLIENTEDGE, L"EDIT", L"", WS_CHILD | WS_VISIBLE | WS_TABSTOP | ES_AUTOHSCROLL,
+                532, 468, 200, 24, hwnd, (HMENU)IDC_SET_PERMIT_DRAFT_TEXT, hInst, nullptr);
+            ds->btnPermitDraft = CreateWindowExW(0, L"BUTTON", L"", WS_CHILD | WS_VISIBLE | BS_OWNERDRAW | WS_TABSTOP,
+                532, 500, 200, 28, hwnd, (HMENU)IDC_SET_PERMIT_DRAFT, hInst, nullptr);
+            ds->lblPermitDraftStatus = CreateWindowExW(0, L"STATIC", L"", WS_CHILD | WS_VISIBLE,
+                532, 534, 210, 60, hwnd, nullptr, hInst, nullptr);
+            for (HWND h : { ds->lblPermitDraft, ds->editPermitDraft, ds->btnPermitDraft, ds->lblPermitDraftStatus })
+                SendMessageW(h, WM_SETFONT, (WPARAM)ds->dash->hFontUi, TRUE);
             struct PermitBtn { HWND* slot; INT_PTR id; int x; int y; };
             PermitBtn permitBtns[] = {
-                { &ds->btnPermitRequest, IDC_SET_PERMIT_REQUEST, 532, 268 },
-                { &ds->btnPermitApprove, IDC_SET_PERMIT_APPROVE, 638, 268 },
-                { &ds->btnPermitReject, IDC_SET_PERMIT_REJECT, 532, 304 },
-                { &ds->btnPermitRevoke, IDC_SET_PERMIT_REVOKE, 638, 304 },
-                { &ds->btnPermitRefresh, IDC_SET_PERMIT_REFRESH, 532, 340 },
+                { &ds->btnPermitRequest, IDC_SET_PERMIT_REQUEST, 532, 340 },
+                { &ds->btnPermitApprove, IDC_SET_PERMIT_APPROVE, 638, 340 },
+                { &ds->btnPermitReject, IDC_SET_PERMIT_REJECT, 532, 376 },
+                { &ds->btnPermitRevoke, IDC_SET_PERMIT_REVOKE, 638, 376 },
+                { &ds->btnPermitRefresh, IDC_SET_PERMIT_REFRESH, 532, 412 },
             };
             for (const auto& b : permitBtns) {
                 *b.slot = CreateWindowExW(0, L"BUTTON", L"",
@@ -15213,6 +15309,9 @@ static LRESULT CALLBACK SettingsWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPAR
             SendMessageW(ds->editPermitEngine, WM_SETFONT, (WPARAM)ds->dash->hFontUi, TRUE);
             SendMessageW(ds->editPermitScope, WM_SETFONT, (WPARAM)ds->dash->hFontUi, TRUE);
             SendMessageW(ds->editPermitNote, WM_SETFONT, (WPARAM)ds->dash->hFontUi, TRUE);
+            for (HWND h : { ds->lblPermitKind, ds->lblPermitTarget, ds->lblPermitEngine,
+                            ds->lblPermitScope, ds->lblPermitNote })
+                SendMessageW(h, WM_SETFONT, (WPARAM)ds->dash->hFontUi, TRUE);
 
             // Sort the controls into their tab pages.
             {
@@ -15278,6 +15377,9 @@ static LRESULT CALLBACK SettingsWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPAR
                 permitPage.insert(permitPage.end(), {
                     ds->lstPermitRows, ds->editPermitKind, ds->editPermitTarget,
                     ds->editPermitEngine, ds->editPermitScope, ds->editPermitNote,
+                    ds->lblPermitKind, ds->lblPermitTarget, ds->lblPermitEngine,
+                    ds->lblPermitScope, ds->lblPermitNote, ds->lblPermitHint,
+                    ds->lblPermitDraft, ds->editPermitDraft, ds->btnPermitDraft, ds->lblPermitDraftStatus,
                     ds->btnPermitRequest, ds->btnPermitApprove, ds->btnPermitReject,
                     ds->btnPermitRevoke, ds->btnPermitRefresh });
             }
@@ -15301,6 +15403,28 @@ static LRESULT CALLBACK SettingsWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPAR
                 return 0;
             }
             break;
+        }
+        case WM_TIMER: {
+            if (wParam != kPermitDraftTimerId || !ds || ds->permitDraftId.empty()) break;
+            nlohmann::json resp;
+            if (!GuiIpcCall(ds->dash, {{"action", "permit_draft_get"}, {"draftId", ds->permitDraftId}}, resp) ||
+                !resp.is_object() || !resp.value("ok", false))
+                return 0;  // transient IPC failure: keep polling
+            const std::string state = resp.value("state", std::string());
+            if (state == "running") return 0;
+            KillTimer(hwnd, kPermitDraftTimerId);
+            ds->permitDraftId.clear();
+            if (state == "done" && resp.contains("fields") && resp["fields"].is_object()) {
+                PermitApplyDraft(ds, resp["fields"]);
+                SetWindowTextW(ds->lblPermitDraftStatus, Tr(
+                    L"下書きできました。内容を確認して「申請」を押してください。",
+                    L"Draft ready. Check the fields, then press Request.",
+                    L"Borrador listo. Revisa los campos y pulsa Solicitar."));
+            } else {
+                SetWindowTextW(ds->lblPermitDraftStatus, Utf8ToWide(resp.value("error",
+                    std::string("draft failed"))).c_str());
+            }
+            return 0;
         }
         case WM_COMMAND: {
             int id = LOWORD(wParam);
@@ -15367,6 +15491,31 @@ static LRESULT CALLBACK SettingsWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPAR
             }
             if (id == IDC_SET_PERMIT_ROWS && HIWORD(wParam) == LBN_SELCHANGE) {
                 PermitFillSelectedRow(ds);
+                return 0;
+            }
+            if (id == IDC_SET_PERMIT_DRAFT && HIWORD(wParam) == BN_CLICKED) {
+                const std::wstring wish = LlmEditUtf8(ds->editPermitDraft);
+                if (wish.find_first_not_of(L" \t") == std::wstring::npos) {
+                    SetWindowTextW(ds->lblPermitDraftStatus, Tr(
+                        L"先に「やりたいこと」を書いてください。",
+                        L"Write what you want first.",
+                        L"Escribe primero lo que quieres."));
+                    return 0;
+                }
+                nlohmann::json resp;
+                if (!GuiIpcCall(ds->dash, {{"action", "permit_draft"}, {"request", WideToUtf8(wish)}}, resp) ||
+                    !resp.is_object() || !resp.value("ok", false)) {
+                    SetWindowTextW(ds->lblPermitDraftStatus, Utf8ToWide(resp.is_object()
+                        ? resp.value("error", std::string("IPC request failed"))
+                        : std::string("IPC request failed")).c_str());
+                    return 0;
+                }
+                ds->permitDraftId = resp.value("draftId", std::string());
+                SetTimer(hwnd, kPermitDraftTimerId, 1500, nullptr);
+                SetWindowTextW(ds->lblPermitDraftStatus, Tr(
+                    L"下書き中です。数十秒かかることがあります…",
+                    L"Drafting… this can take a while.",
+                    L"Redactando… puede tardar un poco."));
                 return 0;
             }
             if (id >= IDC_SET_PERMIT_REQUEST && id <= IDC_SET_PERMIT_REFRESH &&
