@@ -124,6 +124,12 @@ The application icons are modeled on the character "Telephone Cat" (電話猫, D
 
 
 
+### v0.9.39
+- **Permits page**: every field has a label, and the rules are explained under the list. The kind is a dropdown (`read_path`, `write_path`, `command`, `network`).
+- **Draft with LLM**: describe what you want in plain language and press "Draft with LLM". A read-only worker LLM proposes the fields; they are filled in when it finishes. Nothing is saved until you check them and press Request.
+
+
+### v0.9.38
 ### v0.9.38
 - **Chat window**: Chat no longer has its own tray icon. Closing it ends Chat; the `--tray` option is removed. Open Chat from the toolbar or the Hancho dashboard tray menu ("Open Chat").
 - **Chat notifications**: new incoming Chat messages show a balloon on the Hancho dashboard's tray icon. Messages already waiting at dashboard start are not announced.
