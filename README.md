@@ -124,6 +124,10 @@ The application icons are modeled on the character "Telephone Cat" (電話猫, D
 
 
 
+### v0.9.42
+- **Async startup task loading**: the dashboard renders the window and initial task rows immediately on startup (`WM_PC_INITIAL_REFRESH`) and loads per-job token / cost usage from event logs on a background worker thread (`WM_PC_INITIAL_TASK_USAGE`), preventing UI freezes when many jobs are in the queue.
+- **Settings (Appearance tab)**: fixed layout overlap between the usage graph bar-size controls and the font rows.
+
 ### v0.9.41
 - **Usage graph bar size**: the 表示 tab sets the bar size for each range (1h, 4h, 12h, 24h). Bar count = range / size. Defaults: 1h 1 min (60 bars), 4h 10 min (24), 12h 30 min (24), 24h 1 h (24). Saved as `usage_bucket_1h_sec` etc. in `config.json`.
 - **Token usage graph**: the dashboard reads usage history from HanchoCore over IPC (refreshed every 2 seconds), so calls recorded by the core appear in 1h, 4h, 12h and 24h without restarting the dashboard. If the core cannot be reached, the dashboard falls back to its own data.

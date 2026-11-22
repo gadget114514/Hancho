@@ -36,6 +36,10 @@
 #include <map>
 #include <fstream>
 #include <sstream>
+#include <thread>
+#include <atomic>
+#include <mutex>
+#include <memory>
 #include <iomanip>
 #include <climits>
 #include <algorithm>
@@ -74,6 +78,12 @@ constexpr UINT WM_PC_IPC_EVENT        = WM_APP + 101;
 constexpr UINT WM_PC_CREATE_TERMVIEW  = WM_APP + 102;
 constexpr UINT WM_PC_DESTROY_TERMVIEW = WM_APP + 103;
 constexpr UINT WM_PC_TRAYICON         = WM_APP + 104;
+constexpr UINT WM_PC_INITIAL_REFRESH    = WM_APP + 105;
+constexpr UINT WM_PC_INITIAL_TASK_USAGE = WM_APP + 106;
+
+// 初回 usage ワーカースレッドのフェイルセーフタイムアウト (ms)
+constexpr uint64_t kInitialUsageTimeoutMs = 15000;
+
 constexpr UINT_PTR TIMER_REFRESH_ID   = 1;
 // Periodic dashboard / terminal-grid refresh interval (ms). User-configurable in the Settings dialog.
 constexpr int kDefaultRefreshIntervalMs = 2000;
@@ -973,6 +983,14 @@ struct DashboardState {
     std::vector<std::wstring> taskUsageTips;  // per task row: full engine / token details for the hover tip
     std::map<std::wstring, TaskUsageFileCache> taskUsageFileCache; // attempt events file -> parsed usage
     std::map<std::wstring, std::wstring> taskAttemptEventsPath;    // jobId:attempt -> resolved events file
+    bool initialTaskUsagePending = false;
+    bool initialUsageThreadStarted = false;
+    uint64_t initialUsageStartTickMs = 0;
+    std::atomic<bool> cancelInitialUsage{false};
+    std::thread initialUsageThread;
+    std::mutex initialUsageMutex;
+    std::map<std::wstring, TaskUsageFileCache> pendingUsageFileCache;
+    std::map<std::wstring, std::wstring> pendingAttemptEventsPath;
     ULONGLONG taskUsagePollUntilMs = 0;  // keep polling a task's events file briefly after it ends
     int lastFollowedProcId = -1;         // process the monitor pane last auto-followed
     // What the lists and KPI cards showed last time, so an idle refresh tick can skip redrawing them.
@@ -6536,8 +6554,9 @@ struct TaskOwnerUsage {
 
 // Reads the lines appended to one events file since the last refresh and folds the usage
 // events into its cache entry. A missing or shortened file resets the entry.
-static void TaskUsageAccumulateFile(DashboardState* st, const std::wstring& path, TaskOwnerUsage& out) {
-    TaskUsageFileCache& entry = st->taskUsageFileCache[path];
+static void TaskUsageAccumulateFile(std::map<std::wstring, TaskUsageFileCache>& usageCache,
+                                    const std::wstring& path, TaskOwnerUsage& out) {
+    TaskUsageFileCache& entry = usageCache[path];
     WIN32_FILE_ATTRIBUTE_DATA fad = {};
     if (!GetFileAttributesExW(path.c_str(), GetFileExInfoStandard, &fad)) {
         entry = TaskUsageFileCache();
@@ -6627,8 +6646,9 @@ static void TaskUsageAccumulateFile(DashboardState* st, const std::wstring& path
 }
 
 // Fallback: if .events.jsonl had no usage events (e.g. older agy runs), scan _stream.jsonl
-static void TaskUsageAccumulateStreamFile(DashboardState* st, const std::wstring& path, TaskOwnerUsage& out) {
-    TaskUsageFileCache& entry = st->taskUsageFileCache[path];
+static void TaskUsageAccumulateStreamFile(std::map<std::wstring, TaskUsageFileCache>& usageCache,
+                                          const std::wstring& path, TaskOwnerUsage& out) {
+    TaskUsageFileCache& entry = usageCache[path];
     WIN32_FILE_ATTRIBUTE_DATA fad = {};
     if (!GetFileAttributesExW(path.c_str(), GetFileExInfoStandard, &fad)) {
         entry = TaskUsageFileCache();
@@ -6691,20 +6711,25 @@ static void TaskUsageAccumulateStreamFile(DashboardState* st, const std::wstring
     if (entry.hasUsage) out.hasUsage = true;
 }
 
-static TaskOwnerUsage TaskOwnerUsageForJob(DashboardState* st, const std::string& jobId,
-                                           const std::string& jobJson, const std::string& command) {
+static TaskOwnerUsage TaskOwnerUsageForJob(
+    std::map<std::wstring, TaskUsageFileCache>& usageCache,
+    std::map<std::wstring, std::wstring>& eventsPathCache,
+    const std::string& jobId, const std::string& jobJson,
+    const std::string& command, bool deferUsage = false) {
     TaskOwnerUsage out;
     // Shows the worker engine before its first usage event arrives, and for plain commands
     // (empty when the command is not one of the known agent CLIs).
     out.engine = DetectAgentType(command, "");
+    if (deferUsage) return out;
+
     const std::wstring logsDir = GetLogsDirectoryWide();
     const std::wstring tqDir = PathJoinWide(logsDir, L"taskqueue");
     for (const auto& attemptJson : SplitJsonObjectArray(jobJson, "attempts")) {
         const int n = static_cast<int>(JsonGetInt(attemptJson, "n", 1));
         const std::wstring cacheKey = Utf8ToWide(jobId) + L":" + std::to_wstring(n);
         std::wstring eventsPath;
-        auto cached = st->taskAttemptEventsPath.find(cacheKey);
-        if (cached != st->taskAttemptEventsPath.end()) eventsPath = cached->second;
+        auto cached = eventsPathCache.find(cacheKey);
+        if (cached != eventsPathCache.end()) eventsPath = cached->second;
         const bool remote = !JsonGetString(attemptJson, "remote_host", "").empty();
         const int64_t pid = JsonGetInt(attemptJson, "process_id", 0);
         if (eventsPath.empty()) {
@@ -6721,16 +6746,16 @@ static TaskOwnerUsage TaskOwnerUsageForJob(DashboardState* st, const std::string
                 WIN32_FILE_ATTRIBUTE_DATA fad = {};
                 if (GetFileAttributesExW(jobEvents.c_str(), GetFileExInfoStandard, &fad)) eventsPath = jobEvents;
             }
-            if (!eventsPath.empty()) st->taskAttemptEventsPath[cacheKey] = eventsPath;
+            if (!eventsPath.empty()) eventsPathCache[cacheKey] = eventsPath;
         }
-        if (!eventsPath.empty()) TaskUsageAccumulateFile(st, eventsPath, out);
+        if (!eventsPath.empty()) TaskUsageAccumulateFile(usageCache, eventsPath, out);
         // Fallback: if .events.jsonl yielded no usage (e.g. agy runs before usage was normalized),
         // read the raw stream file to recover tokens and cost.
         if (!out.hasUsage && !remote && pid > 0) {
             auto streamFiles = ListDirectoryWide(
                 logsDir, L"proc_" + std::to_wstring(pid) + L"_*_stream.jsonl");
             if (!streamFiles.empty()) {
-                TaskUsageAccumulateStreamFile(st, streamFiles.front(), out);
+                TaskUsageAccumulateStreamFile(usageCache, streamFiles.front(), out);
             }
         }
     }
@@ -6784,6 +6809,52 @@ static bool TaskListHasLiveState(const std::string& json) {
     return false;
 }
 
+static void StartInitialTaskUsageWorker(DashboardState* st, const std::vector<std::string>& jobs) {
+    if (!st || !st->initialTaskUsagePending || st->initialUsageThreadStarted) return;
+
+    if (jobs.empty()) {
+        // ジョブが 0 件ならバックグラウンド集計は不要
+        st->initialTaskUsagePending = false;
+        st->initialUsageThreadStarted = true;
+        return;
+    }
+
+    st->initialUsageThreadStarted = true;
+    st->initialUsageStartTickMs = GetNowTickMs();
+    st->cancelInitialUsage.store(false, std::memory_order_relaxed);
+
+    HWND hwnd = st->hwndMain;
+    // スレッド内で安全に使えるようジョブ JSON 配列を値コピーして渡す
+    std::vector<std::string> jobsCopy = jobs;
+
+    st->initialUsageThread = std::thread([st, hwnd, jobsCopy = std::move(jobsCopy)]() {
+        std::map<std::wstring, TaskUsageFileCache> localUsageCache;
+        std::map<std::wstring, std::wstring> localEventsPath;
+        try {
+            for (const auto& j : jobsCopy) {
+                if (st->cancelInitialUsage.load(std::memory_order_relaxed)) return;
+                std::string jobId = JsonGetString(j, "id", "");
+                std::string cmd = JsonGetString(j, "command", "");
+                TaskOwnerUsageForJob(localUsageCache, localEventsPath, jobId, j, cmd, /*deferUsage=*/false);
+            }
+        } catch (...) {
+            // 例外発生時も完了通知を送って UI 側の pending 状態を必ず解除させる
+        }
+
+        if (st->cancelInitialUsage.load(std::memory_order_relaxed)) return;
+
+        {
+            std::lock_guard<std::mutex> lock(st->initialUsageMutex);
+            st->pendingUsageFileCache = std::move(localUsageCache);
+            st->pendingAttemptEventsPath = std::move(localEventsPath);
+        }
+
+        if (hwnd && IsWindow(hwnd)) {
+            PostMessageW(hwnd, WM_PC_INITIAL_TASK_USAGE, 0, 0);
+        }
+    });
+}
+
 static void RefreshTaskQueueData(DashboardState* st, bool force = false, bool useCachedList = false) {
     if (!st || !st->hwndTaskList) return;
     if (st->listDisplayMode == ListDisplayMode::ProcessOnly) return;
@@ -6810,6 +6881,9 @@ static void RefreshTaskQueueData(DashboardState* st, bool force = false, bool us
         InvalidateRect(st->hwndUsagePanel, nullptr, FALSE);
     }
     auto jobs = SplitJsonObjectArray(resp, "jobs");
+    if (st->initialTaskUsagePending && !st->initialUsageThreadStarted) {
+        StartInitialTaskUsageWorker(st, jobs);
+    }
 
     std::unordered_map<std::string, std::string> stateById;
     stateById.reserve(jobs.size());
@@ -7018,7 +7092,9 @@ static void RefreshTaskQueueData(DashboardState* st, bool force = false, bool us
         std::wstring resourcesStr = TaskQueueResourcesDisplay(j);
 
         // Who runs the job (the worker CLI) and the tokens / cost its attempts used.
-        TaskOwnerUsage ownerUsage = TaskOwnerUsageForJob(st, jobId, j, JsonGetString(j, "command", ""));
+        TaskOwnerUsage ownerUsage = TaskOwnerUsageForJob(
+            st->taskUsageFileCache, st->taskAttemptEventsPath,
+            jobId, j, JsonGetString(j, "command", ""), st->initialTaskUsagePending);
         std::wstring ownerUsageStr;
         if (!ownerUsage.engine.empty()) ownerUsageStr = Utf8ToWide(ownerUsage.engine);
         // Cost first: it is what the column is for, and it stays visible when the cell is narrow.
@@ -7395,6 +7471,11 @@ static void UpdateTriageFromCore(DashboardState* st);
 
 static void RefreshDashboardData(DashboardState* st) {
     if (!st) return;
+    if (st->initialTaskUsagePending && st->initialUsageThreadStarted &&
+        st->initialUsageStartTickMs > 0 &&
+        GetNowTickMs() - st->initialUsageStartTickMs > kInitialUsageTimeoutMs) {
+        st->initialTaskUsagePending = false;
+    }
     // Works while the dashboard is hidden in the tray too.
     SyncTermSessionNotifications(st);
     // Hidden in the tray: no one sees the lists, so only watch for finished processes (completion sound).
@@ -20799,7 +20880,8 @@ static LRESULT CALLBACK DashboardWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPA
             ApplyNativeThemeToWindow(hwnd);
 
             SetTimer(hwnd, TIMER_KPI_ANIM_ID, 60, nullptr);
-            RefreshDashboardData(st);
+            st->initialTaskUsagePending = true;
+            PostMessageW(hwnd, WM_PC_INITIAL_REFRESH, 0, 0);
             ApplyDashboardRefreshTimer(st);
             return 0;
         }
@@ -20962,6 +21044,36 @@ static LRESULT CALLBACK DashboardWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPA
                     st->selectedProcId = newId;
                 }
                 RefreshDashboardData(st);
+            }
+            return 0;
+        }
+
+        case WM_PC_INITIAL_REFRESH: {
+            if (st) {
+                RefreshDashboardData(st);
+            }
+            return 0;
+        }
+
+        case WM_PC_INITIAL_TASK_USAGE: {
+            if (st) {
+                {
+                    std::lock_guard<std::mutex> lock(st->initialUsageMutex);
+                    for (auto& kv : st->pendingUsageFileCache) {
+                        st->taskUsageFileCache[kv.first] = std::move(kv.second);
+                    }
+                    st->pendingUsageFileCache.clear();
+                    for (auto& kv : st->pendingAttemptEventsPath) {
+                        st->taskAttemptEventsPath[kv.first] = std::move(kv.second);
+                    }
+                    st->pendingAttemptEventsPath.clear();
+                }
+                st->initialTaskUsagePending = false;
+                if (st->initialUsageThread.joinable()) {
+                    st->initialUsageThread.join();
+                }
+                // キャッシュ済みの JSON リストを使って即座に usage 列を再構築・再描画する
+                RefreshTaskQueueData(st, /*force=*/true, /*useCachedList=*/!st->lastTaskListJson.empty());
             }
             return 0;
         }
@@ -21764,6 +21876,10 @@ static LRESULT CALLBACK DashboardWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPA
             KillTimer(hwnd, TIMER_KPI_ANIM_ID);
             KillTimer(hwnd, TIMER_QUIT_WAIT_ID);
             if (st) {
+                st->cancelInitialUsage.store(true, std::memory_order_relaxed);
+                if (st->initialUsageThread.joinable()) {
+                    st->initialUsageThread.join();
+                }
                 if (st->coreProcessHandle) {
                     CloseHandle(st->coreProcessHandle);
                     st->coreProcessHandle = nullptr;
