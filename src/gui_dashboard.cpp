@@ -15266,17 +15266,19 @@ static LRESULT CALLBACK SettingsWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPAR
                 ds->dash->restoreUsageGraph ? BST_CHECKED : BST_UNCHECKED, 0);
 
             // 表示 tab: bar size of the usage graph for each range (bar count = range / size).
-            // 表示 tab: usage graph bar size per range, in the free area right of the saturation combo.
-            // Row 1: range labels (x 260 + 108*i, y 288). Row 2: one dropdown per range (y 310).
+            // 表示 tab, usage graph bar size (below the saturation combo, above the font rows):
+            // heading at y 340, one row per range at y 366 + 28*i (label x 18, dropdown x 150).
+            ds->lblUsageBucketHead = CreateWindowExW(0, L"STATIC", Tr(L"使用量グラフの単位（1 本あたり）", L"Usage graph bar size", L"Tamaño de barra del gráfico de uso"),
+                WS_CHILD | WS_VISIBLE, 18, 340, 520, 20, hwnd, nullptr, hInst, nullptr);
+            SendMessageW(ds->lblUsageBucketHead, WM_SETFONT, (WPARAM)ds->dash->hFontUiBold, TRUE);
             const wchar_t* const bucketRangeNames[kUsageBucketRanges] = {L"1h", L"4h", L"12h", L"24h"};
             for (int i = 0; i < kUsageBucketRanges; ++i) {
-                const int x = 260 + i * 108;
+                const int y = 366 + i * 28;
                 ds->lblUsageBucket[i] = CreateWindowExW(0, L"STATIC", bucketRangeNames[i],
-                    WS_CHILD | WS_VISIBLE, x, 288, 100, 20, hwnd, nullptr, hInst, nullptr);
-                SendMessageW(ds->lblUsageBucket[i], WM_SETFONT, (WPARAM)ds->dash->hFontUiBold, TRUE);
+                    WS_CHILD | WS_VISIBLE, 18, y + 3, 120, 20, hwnd, nullptr, hInst, nullptr);
                 ds->cmbUsageBucket[i] = CreateWindowExW(WS_EX_CLIENTEDGE, L"COMBOBOX", L"",
                     WS_CHILD | WS_VISIBLE | WS_TABSTOP | WS_VSCROLL | CBS_DROPDOWNLIST,
-                    x, 310, 100, 220, hwnd, (HMENU)(INT_PTR)(IDC_SET_USAGE_BUCKET_1H + i), hInst, nullptr);
+                    150, y, 200, 220, hwnd, (HMENU)(INT_PTR)(IDC_SET_USAGE_BUCKET_1H + i), hInst, nullptr);
                 int selIndex = 0;
                 for (int sec : kUsageBucketChoicesSec) {
                     if (!UsageBucketValid(i, sec)) continue;
@@ -15520,15 +15522,15 @@ static LRESULT CALLBACK SettingsWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPAR
                 446, 362, 100, 26, hwnd, (HMENU)IDC_SET_WEBUI_TOKEN_ROLL, hInst, nullptr);
 
             ds->lblProcFont = CreateWindowExW(0, L"STATIC", L"", WS_CHILD | WS_VISIBLE,
-                18, 458, 530, 20, hwnd, nullptr, hInst, nullptr);
+                18, 500, 530, 20, hwnd, nullptr, hInst, nullptr);
             ds->cmbProcFont = CreateWindowExW(WS_EX_CLIENTEDGE, L"COMBOBOX", L"",
                 WS_CHILD | WS_VISIBLE | WS_TABSTOP | CBS_DROPDOWNLIST | WS_VSCROLL,
-                18, 480, 220, 300, hwnd, (HMENU)IDC_SET_PROC_FONT, hInst, nullptr);
+                18, 522, 220, 300, hwnd, (HMENU)IDC_SET_PROC_FONT, hInst, nullptr);
             ds->lblTaskFont = CreateWindowExW(0, L"STATIC", L"", WS_CHILD | WS_VISIBLE,
-                18, 514, 530, 20, hwnd, nullptr, hInst, nullptr);
+                18, 556, 530, 20, hwnd, nullptr, hInst, nullptr);
             ds->cmbTaskFont = CreateWindowExW(WS_EX_CLIENTEDGE, L"COMBOBOX", L"",
                 WS_CHILD | WS_VISIBLE | WS_TABSTOP | CBS_DROPDOWNLIST | WS_VSCROLL,
-                18, 536, 220, 300, hwnd, (HMENU)IDC_SET_TASK_FONT, hInst, nullptr);
+                18, 578, 220, 300, hwnd, (HMENU)IDC_SET_TASK_FONT, hInst, nullptr);
             for (int i = 0; i < kListFontSizeCount; ++i) {
                 std::wstring item = std::to_wstring(kListFontSizes[i]) + L" px";
                 SendMessageW(ds->cmbProcFont, CB_ADDSTRING, 0, reinterpret_cast<LPARAM>(item.c_str()));
@@ -15958,7 +15960,7 @@ static LRESULT CALLBACK SettingsWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPAR
                     ds->btnPastelBlue, ds->btnPastelOrange, ds->btnPastelPink, ds->btnPastelRed, ds->btnPastelGreen,
                     ds->btnDeepPurple, ds->btnPastelPurple, ds->btnDeepYellow, ds->btnPastelYellow,
                     ds->hwndSatLabel, ds->hwndSatCombo,
-                    ds->lblUsageBucket[0], ds->cmbUsageBucket[0],
+                    ds->lblUsageBucketHead, ds->lblUsageBucket[0], ds->cmbUsageBucket[0],
                     ds->lblUsageBucket[1], ds->cmbUsageBucket[1], ds->lblUsageBucket[2], ds->cmbUsageBucket[2],
                     ds->lblUsageBucket[3], ds->cmbUsageBucket[3],
                     ds->lblProcFont, ds->cmbProcFont, ds->lblTaskFont, ds->cmbTaskFont });
