@@ -15266,18 +15266,17 @@ static LRESULT CALLBACK SettingsWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPAR
                 ds->dash->restoreUsageGraph ? BST_CHECKED : BST_UNCHECKED, 0);
 
             // 表示 tab: bar size of the usage graph for each range (bar count = range / size).
-            ds->lblUsageBucketHead = CreateWindowExW(0, L"STATIC", Tr(L"使用量グラフの単位（1 本あたり）", L"Usage graph bar size", L"Tamaño de barra del gráfico de uso"),
-                WS_CHILD | WS_VISIBLE, 18, 360, 480, 20, hwnd, nullptr, hInst, nullptr);
-            SendMessageW(ds->lblUsageBucketHead, WM_SETFONT, (WPARAM)ds->dash->hFontUiBold, TRUE);
+            // 表示 tab: usage graph bar size per range, in the free area right of the saturation combo.
+            // Row 1: range labels (x 260 + 108*i, y 288). Row 2: one dropdown per range (y 310).
             const wchar_t* const bucketRangeNames[kUsageBucketRanges] = {L"1h", L"4h", L"12h", L"24h"};
             for (int i = 0; i < kUsageBucketRanges; ++i) {
-                const int y = 386 + i * 28;
-                ds->lblUsageBucket[i] = CreateWindowExW(0, L"STATIC", L"", WS_CHILD | WS_VISIBLE,
-                    18, y + 3, 260, 20, hwnd, nullptr, hInst, nullptr);
-                SetWindowTextW(ds->lblUsageBucket[i], (std::wstring(bucketRangeNames[i]) + Tr(L" の 1 本あたり", L" per bar", L" por barra")).c_str());
+                const int x = 260 + i * 108;
+                ds->lblUsageBucket[i] = CreateWindowExW(0, L"STATIC", bucketRangeNames[i],
+                    WS_CHILD | WS_VISIBLE, x, 288, 100, 20, hwnd, nullptr, hInst, nullptr);
+                SendMessageW(ds->lblUsageBucket[i], WM_SETFONT, (WPARAM)ds->dash->hFontUiBold, TRUE);
                 ds->cmbUsageBucket[i] = CreateWindowExW(WS_EX_CLIENTEDGE, L"COMBOBOX", L"",
                     WS_CHILD | WS_VISIBLE | WS_TABSTOP | WS_VSCROLL | CBS_DROPDOWNLIST,
-                    290, y, 200, 220, hwnd, (HMENU)(INT_PTR)(IDC_SET_USAGE_BUCKET_1H + i), hInst, nullptr);
+                    x, 310, 100, 220, hwnd, (HMENU)(INT_PTR)(IDC_SET_USAGE_BUCKET_1H + i), hInst, nullptr);
                 int selIndex = 0;
                 for (int sec : kUsageBucketChoicesSec) {
                     if (!UsageBucketValid(i, sec)) continue;
@@ -15959,7 +15958,7 @@ static LRESULT CALLBACK SettingsWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPAR
                     ds->btnPastelBlue, ds->btnPastelOrange, ds->btnPastelPink, ds->btnPastelRed, ds->btnPastelGreen,
                     ds->btnDeepPurple, ds->btnPastelPurple, ds->btnDeepYellow, ds->btnPastelYellow,
                     ds->hwndSatLabel, ds->hwndSatCombo,
-                    ds->lblUsageBucketHead, ds->lblUsageBucket[0], ds->cmbUsageBucket[0],
+                    ds->lblUsageBucket[0], ds->cmbUsageBucket[0],
                     ds->lblUsageBucket[1], ds->cmbUsageBucket[1], ds->lblUsageBucket[2], ds->cmbUsageBucket[2],
                     ds->lblUsageBucket[3], ds->cmbUsageBucket[3],
                     ds->lblProcFont, ds->cmbProcFont, ds->lblTaskFont, ds->cmbTaskFont });
