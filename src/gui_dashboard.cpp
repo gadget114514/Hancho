@@ -15959,6 +15959,9 @@ static LRESULT CALLBACK SettingsWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPAR
                     ds->btnPastelBlue, ds->btnPastelOrange, ds->btnPastelPink, ds->btnPastelRed, ds->btnPastelGreen,
                     ds->btnDeepPurple, ds->btnPastelPurple, ds->btnDeepYellow, ds->btnPastelYellow,
                     ds->hwndSatLabel, ds->hwndSatCombo,
+                    ds->lblUsageBucketHead, ds->lblUsageBucket[0], ds->cmbUsageBucket[0],
+                    ds->lblUsageBucket[1], ds->cmbUsageBucket[1], ds->lblUsageBucket[2], ds->cmbUsageBucket[2],
+                    ds->lblUsageBucket[3], ds->cmbUsageBucket[3],
                     ds->lblProcFont, ds->cmbProcFont, ds->lblTaskFont, ds->cmbTaskFont });
                 auto& colors = ds->tabPages[7];
                 colors.insert(colors.end(), { ds->lblListBg, ds->btnListBgReset });
