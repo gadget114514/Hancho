@@ -1,4 +1,4 @@
-# ww-run.ps1 — run one task card (ww-data\tasks\<id>-*.md) with agy, opencode, claude or codex, safely and visibly.
+﻿# ww-run.ps1 — run one task card (ww-data\tasks\<id>-*.md) with agy, opencode, claude or codex, safely and visibly.
 # The checkout root is detected (see Resolve-WwPaths); pass -Root when the current directory is
 # not inside the project.
 # Usage:  Tools\ww\ww-run.cmd 012                     (main checkout)
@@ -21,9 +21,14 @@ param(
     [switch]$Main,
     [string]$Base = "main",
     [ValidateSet("agy", "opencode", "claude", "codex")][string]$Engine = $(if ($env:WW_ENGINE) { $env:WW_ENGINE } else { "agy" }),
+    [string]$Provider = $env:WW_PROVIDER,
     [string]$Model = $env:WW_MODEL,
     [string]$Agent = $env:WW_AGENT,
     [switch]$JsonStdout = $(if ($env:WW_JSON_STDOUT -eq "1") { $true } else { $false }),
+    [switch]$NoEngineSwitch = $(if ($env:WW_NO_ENGINE_SWITCH -eq "1") { $true } else { $false }),
+    [switch]$Standalone = $(if ($env:WW_STANDALONE -eq "1" -or $env:WW_ALLOW_DIRECT -eq "1") { $true } else { $false }),
+    [switch]$AllowDirect,
+    [switch]$Force,
     [string]$Root = $env:WW_ROOT,
     [switch]$DryRun,
     [string]$Jobs = "",
@@ -66,11 +71,13 @@ MODES (one card per run; the same card never runs twice)
 
 OPTIONS
   -Engine      agy (default, or WW_ENGINE), opencode, claude, codex
-  -Model       engine model (or WW_MODEL)
+  -Provider    model provider (or WW_PROVIDER), e.g. opencode-go, anthropic
+  -Model       engine model (or WW_MODEL). If omitted, resolved from <data-dir>\llms.json
 -Agent       Claude Code agent (.claude/agents/<name>.md) for -Engine claude only (or WW_AGENT)
   -Extra       text appended to the prompt
   -Root        checkout root (or WW_ROOT); default: git top level of the current directory
   -JsonStdout  print the raw engine events on stdout (or WW_JSON_STDOUT=1)
+  -NoEngineSwitch disable automatic switch to the next approved worker engine/model on limit (or WW_NO_ENGINE_SWITCH=1)
   -DryRun      print the plan and the conflict check; change nothing
 
 HANCHO-CLI JOBS (-Jobs)
@@ -129,6 +136,16 @@ $taskRunFile = Join-Path $runDir "$Task.json"
 $taskLastFile = Join-Path $runDir "$Task.last.json"
 Set-Location $root
 
+# Resolve engine, provider and model using <data-dir>\llms.json when available
+$explicitEngine = if ($PSBoundParameters.ContainsKey('Engine') -or $env:WW_ENGINE) { $Engine } else { "" }
+$explicitProvider = if ($PSBoundParameters.ContainsKey('Provider') -or $env:WW_PROVIDER) { $Provider } else { "" }
+$explicitModel = if ($PSBoundParameters.ContainsKey('Model') -or $env:WW_MODEL) { $Model } else { "" }
+$resolvedWorker = Resolve-WorkerEngineAndModel -DataDir $data -Root $root `
+    -Engine $explicitEngine -Provider $explicitProvider -Model $explicitModel
+$Engine = $resolvedWorker.Engine
+$Provider = $resolvedWorker.Provider
+$Model = $resolvedWorker.Model
+
 if (@($Worktree, $Shared, $Main | Where-Object { $_ }).Count -gt 1) {
     Write-Host "[ww-run] -Shared, -Main and -Worktree cannot be combined" -ForegroundColor Red
     exit 1
@@ -160,7 +177,7 @@ if ($Jobs) {
         }
         $estMin = Get-EstimateMinutes -CardPath $c.FullName
         $estSec = if ($estMin) { [int]$estMin * 60 } else { 0 }
-        $list.Add((New-HanchoCliJob -Task $id -CardName $c.Name -Root $root -RunCmd $runCmd -Engine $Engine -Model $Model -Agent $Agent `
+        $list.Add((New-HanchoCliJob -Task $id -CardName $c.Name -Root $root -RunCmd $runCmd -Engine $Engine -Provider $Provider -Model $Model -Agent $Agent `
             -TimeoutSec $TimeoutSec -EstimateSec $estSec -Worktree:$Worktree -Edits $e -Reads $r))
         $declared += [pscustomobject]@{ Task = $id; Locks = (Get-RunLocks ([pscustomobject]@{ Shared = $true; Edits = $e; Reads = $r })) }
     }
@@ -204,6 +221,13 @@ if ($Jobs) {
     if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
     Write-Host "[ww-run] queued in '$Queue'. Wait: hancho-cli.exe taskqueue wait $Queue   Graph: hancho-cli.exe taskqueue graph $Queue"
     exit 0
+}
+
+# Hancho launch guard: ww runs must be supervised by Hancho unless explicitly allowed.
+$isHancho = [bool]($env:HANCHO_ACTIVE -or $env:PC_JOB_ID -or $env:HANCHO_EVENT_PIPE -or $env:HANCHO_WORKER_PERMITS -or $env:HANCHO_JOB_ID)
+if (-not $isHancho -and -not $Standalone -and -not $AllowDirect -and -not $Force -and -not $DryRun) {
+    Write-Host "[ww-run] REFUSED: ww runs must be launched via Hancho. Pass -Standalone (or -Force) to run directly." -ForegroundColor Red
+    exit 1
 }
 
 # 1. Resolve the task card. -DryRun still prints a plan when the card is missing.
@@ -339,8 +363,9 @@ if ($DryRun) {
     if ($Worktree -and $card) { $cardDisplay = "$promptCard (copied into the worktree from $cardPath)" }
     Write-Host "[ww-run] DRYRUN plan:"
     Write-Host "  engine      : $Engine"
+    if ($Provider) { Write-Host "  provider    : $Provider" }
     Write-Host "  model       : $(if ($Model) { $Model } elseif ($Engine -eq 'agy') { 'gemini-3.8-flash-medium (default)' } else { '(engine default)' })"
-    Write-Host "  command     : $(Get-EngineCommand -Engine $Engine -Model $Model -Agent $Agent -Resume $Resume)"
+    Write-Host "  command     : $(Get-EngineCommand -Engine $Engine -Model $Model -Provider $Provider -Agent $Agent -Resume $Resume)"
     if ($Agent) { Write-Host "  agent       : $Agent (.claude/agents/$Agent.md)" }
     Write-Host "  data dir    : $data"
     Write-Host "  mode        : $(if ($Worktree) { 'worktree' } elseif ($Shared) { 'shared' } else { 'main' })"
@@ -378,6 +403,8 @@ $record = @{
     Edits       = @($edits)
     Reads       = @($reads)
     Engine      = $Engine
+    Provider    = $Provider
+    Model       = $Model
     WorkerPid   = $null
     OpencodePid = $null
 }
@@ -400,114 +427,150 @@ try {
     "started $($start.ToString('s')) prompt: $prompt" | Set-Content -Encoding UTF8 $log
     [System.IO.File]::WriteAllText($promptFile, $prompt, $utf8)
 
-    # The prompt rides in a UTF-8 file so quotes/backslashes in it cannot break the command line.
-    # -EncodedCommand avoids cmd.exe quoting entirely; the child closes stdin immediately (below).
-    # stderr is left on the console (raw); JSON errors on stdout still reach the progress log.
-    $safePrompt = $promptFile.Replace("'", "''")
-    $engineCommand = Get-EngineCommand -Engine $Engine -Model $Model -Agent $Agent -Resume $Resume
-    # HOOK: ww-run.selftest.ps1 replaces the real engine with a fake one (a command line, not a path).
-    if ($env:WW_TEST_ENGINE_COMMAND) { $engineCommand = $env:WW_TEST_ENGINE_COMMAND }
-    $launch = "`$ProgressPreference='SilentlyContinue'; `$prompt = (Get-Content -LiteralPath '$safePrompt' -Raw -Encoding UTF8).TrimEnd(); $engineCommand; if (`$null -eq `$LASTEXITCODE) { exit 1 } else { exit `$LASTEXITCODE }"
-    $encoded = [Convert]::ToBase64String([System.Text.Encoding]::Unicode.GetBytes($launch))
-
-    $psi = New-Object System.Diagnostics.ProcessStartInfo
-    $psi.FileName = "powershell.exe"
-    $psi.Arguments = "-NoProfile -NonInteractive -ExecutionPolicy Bypass -EncodedCommand $encoded"
-    $psi.WorkingDirectory = $workDir
-    $psi.UseShellExecute = $false
-    $psi.RedirectStandardInput = $true
-    $psi.RedirectStandardOutput = $true
-    $psi.StandardOutputEncoding = [System.Text.Encoding]::UTF8
-    $psi.CreateNoWindow = $true
-    # 091-7: deny (not ask, never --auto) everything outside the project for opencode. Hancho
-    # passes approved permits as HANCHO_WORKER_PERMITS; turn them into allow rules here. The
-    # user's global config (~/.config/opencode/opencode.jsonc) is never read or written.
-    if ($Engine -eq 'opencode') {
-        $permission = @{
-            external_directory = @{ '*' = 'deny' }
-            read               = @{ '*.env' = 'deny'; '*.env.*' = 'deny' }
-            bash               = @{ '*' = 'allow' }
-            edit               = @{}
-            webfetch           = @{}
-        }
-        if ($env:HANCHO_WORKER_PERMITS) {
-            try {
-                $approved = ($env:HANCHO_WORKER_PERMITS | ConvertFrom-Json).permits
-                foreach ($p in $approved) {
-                    if (-not $p.target) { continue }
-                    switch ([string]$p.kind) {
-                        'read_path'  { $permission.external_directory[$p.target] = 'allow'; $permission.read[$p.target] = 'allow' }
-                        'write_path' { $permission.external_directory[$p.target] = 'allow'; $permission.edit[$p.target] = 'allow' }
-                        'command'    { $permission.bash[$p.target] = 'allow' }
-                        'network'    { $permission.webfetch[$p.target] = 'allow' }
-                    }
-                }
-            } catch { }
-        }
-        $psi.EnvironmentVariables['OPENCODE_PERMISSION'] = ($permission | ConvertTo-Json -Compress -Depth 8)
-    }
-    $proc = [System.Diagnostics.Process]::Start($psi)
-    $proc.StandardInput.Close()
-# Assign the job before anything else runs: children started before this point are not in it.
-$job = New-EngineJob -Proc $proc
-
-    $workerPid = Find-WorkerPid -Task $Task
-    if ($workerPid) {
-        $record.WorkerPid = $workerPid
-        $record.OpencodePid = $workerPid
-        $record | ConvertTo-Json | Set-Content -Encoding UTF8 $taskRunFile
-    }
-
-    # Read the stream until the run is over, not until stdout reaches EOF. The engine's children
-    # (MCP servers, shell tools) inherit stdout and can outlive the engine, so EOF may never come.
-    # The run is over when the launcher has exited and its buffered output is drained (3 s grace).
-    $reader = $proc.StandardOutput
-    $pending = $reader.ReadLineAsync()
-    $exitedAt = $null
+    $attempt = 1
+    $maxAttempts = if ($NoEngineSwitch) { 1 } else { 2 }
     while ($true) {
-        if ($pending.Wait(500)) {
-            $line = $pending.Result
-            if ($null -eq $line) { break }
-            $exitedAt = $null
-            [System.IO.File]::AppendAllText($events, $line + "`r`n", $utf8)
-            # 091-7: remember the engine session so a permission denial can be resumed with
-            # -Resume <id> (opencode run --session / claude --resume).
-            if ($line -match 'sessionID|session_id') {
+        # The prompt rides in a UTF-8 file so quotes/backslashes in it cannot break the command line.
+        # -EncodedCommand avoids cmd.exe quoting entirely; the child closes stdin immediately (below).
+        # stderr is left on the console (raw); JSON errors on stdout still reach the progress log.
+        $safePrompt = $promptFile.Replace("'", "''")
+        $engineCommand = Get-EngineCommand -Engine $Engine -Model $Model -Provider $Provider -Agent $Agent -Resume $Resume
+        # HOOK: ww-run.selftest.ps1 replaces the real engine with a fake one (a command line, not a path).
+        if ($env:WW_TEST_ENGINE_COMMAND) { $engineCommand = $env:WW_TEST_ENGINE_COMMAND }
+        $launch = "`$ProgressPreference='SilentlyContinue'; `$prompt = (Get-Content -LiteralPath '$safePrompt' -Raw -Encoding UTF8).TrimEnd(); $engineCommand; if (`$null -eq `$LASTEXITCODE) { exit 1 } else { exit `$LASTEXITCODE }"
+        $encoded = [Convert]::ToBase64String([System.Text.Encoding]::Unicode.GetBytes($launch))
+
+        $psi = New-Object System.Diagnostics.ProcessStartInfo
+        $psi.FileName = "powershell.exe"
+        $psi.Arguments = "-NoProfile -NonInteractive -ExecutionPolicy Bypass -EncodedCommand $encoded"
+        $psi.WorkingDirectory = $workDir
+        $psi.UseShellExecute = $false
+        $psi.RedirectStandardInput = $true
+        $psi.RedirectStandardOutput = $true
+        $psi.StandardOutputEncoding = [System.Text.Encoding]::UTF8
+        $psi.CreateNoWindow = $true
+        # 091-7: deny (not ask, never --auto) everything outside the project for opencode. Hancho
+        # passes approved permits as HANCHO_WORKER_PERMITS; turn them into allow rules here. The
+        # user's global config (~/.config/opencode/opencode.jsonc) is never read or written.
+        if ($Engine -eq 'opencode') {
+            $permission = @{
+                external_directory = @{ '*' = 'deny' }
+                read               = @{ '*.env' = 'deny'; '*.env.*' = 'deny' }
+                bash               = @{ '*' = 'allow' }
+                edit               = @{}
+                webfetch           = @{}
+            }
+            if ($env:HANCHO_WORKER_PERMITS) {
                 try {
-                    $ev = $line | ConvertFrom-Json
-                    $sid = if ($ev.sessionID) { [string]$ev.sessionID } elseif ($ev.session_id) { [string]$ev.session_id } else { "" }
-                    if ($sid -and $sid -ne [string]$record.SessionID) {
-                        $record.SessionID = $sid
-                        $record | ConvertTo-Json -Depth 8 | Set-Content -Encoding UTF8 $taskRunFile
-                        if (-not $Worktree) { $record | ConvertTo-Json -Depth 8 | Set-Content -Encoding UTF8 $runningFile }
+                    $approved = ($env:HANCHO_WORKER_PERMITS | ConvertFrom-Json).permits
+                    foreach ($p in $approved) {
+                        if (-not $p.target) { continue }
+                        switch ([string]$p.kind) {
+                            'read_path'  { $permission.external_directory[$p.target] = 'allow'; $permission.read[$p.target] = 'allow' }
+                            'write_path' { $permission.external_directory[$p.target] = 'allow'; $permission.edit[$p.target] = 'allow' }
+                            'command'    { $permission.bash[$p.target] = 'allow' }
+                            'network'    { $permission.webfetch[$p.target] = 'allow' }
+                        }
                     }
                 } catch { }
             }
-            if ($JsonStdout) {
-                [Console]::Out.WriteLine($line)
+            $psi.EnvironmentVariables['OPENCODE_PERMISSION'] = ($permission | ConvertTo-Json -Compress -Depth 8)
+        }
+        $proc = [System.Diagnostics.Process]::Start($psi)
+        $proc.StandardInput.Close()
+        # Assign the job before anything else runs: children started before this point are not in it.
+        $job = New-EngineJob -Proc $proc
+
+        $workerPid = Find-WorkerPid -Task $Task
+        if ($workerPid) {
+            $record.WorkerPid = $workerPid
+            $record.OpencodePid = $workerPid
+            $record | ConvertTo-Json | Set-Content -Encoding UTF8 $taskRunFile
+        }
+
+        # Read the stream until the run is over, not until stdout reaches EOF. The engine's children
+        # (MCP servers, shell tools) inherit stdout and can outlive the engine, so EOF may never come.
+        # The run is over when the launcher has exited and its buffered output is drained (3 s grace).
+        $reader = $proc.StandardOutput
+        $pending = $reader.ReadLineAsync()
+        $exitedAt = $null
+        while ($true) {
+            if ($pending.Wait(500)) {
+                $line = $pending.Result
+                if ($null -eq $line) { break }
+                $exitedAt = $null
+                [System.IO.File]::AppendAllText($events, $line + "`r`n", $utf8)
+                # 091-7: remember the engine session so a permission denial can be resumed with
+                # -Resume <id> (opencode run --session / claude --resume).
+                if ($line -match 'sessionID|session_id') {
+                    try {
+                        $ev = $line | ConvertFrom-Json
+                        $sid = if ($ev.sessionID) { [string]$ev.sessionID } elseif ($ev.session_id) { [string]$ev.session_id } else { "" }
+                        if ($sid -and $sid -ne [string]$record.SessionID) {
+                            $record.SessionID = $sid
+                            $record | ConvertTo-Json -Depth 8 | Set-Content -Encoding UTF8 $taskRunFile
+                            if (-not $Worktree) { $record | ConvertTo-Json -Depth 8 | Set-Content -Encoding UTF8 $runningFile }
+                        }
+                    } catch { }
+                }
+                if ($JsonStdout) {
+                    [Console]::Out.WriteLine($line)
+                }
+                $progressLine = Format-ProgressEvent -Line $line
+                if ($progressLine) {
+                    [System.IO.File]::AppendAllText($progress, $progressLine + "`r`n", $utf8)
+                    if (-not $JsonStdout) {
+                        Write-Host $progressLine
+                    }
+                }
+                $pending = $reader.ReadLineAsync()
+                continue
             }
-            $progressLine = Format-ProgressEvent -Line $line
-            if ($progressLine) {
-                [System.IO.File]::AppendAllText($progress, $progressLine + "`r`n", $utf8)
-                if (-not $JsonStdout) {
-                    Write-Host $progressLine
+            if ($proc.HasExited) {
+                if (-not $exitedAt) { $exitedAt = Get-Date }
+                if (((Get-Date) - $exitedAt).TotalSeconds -ge 3) { break }
+            }
+        }
+        # The launcher's exit code is the engine's. Then end whatever the engine left running (its
+        # children may still hold the stdout pipe); they are not part of the run any more.
+        if (-not $proc.HasExited) { $proc.WaitForExit(5000) | Out-Null }
+        Stop-EngineJob -Job $job
+        if (-not $proc.HasExited) { & taskkill /PID $proc.Id /T /F | Out-Null }
+        $proc.WaitForExit()
+        $exit = $proc.ExitCode
+
+        if ($exit -eq 0) { break }
+
+        # Check if engine switch is eligible on usage limit
+        if (-not $NoEngineSwitch -and $attempt -lt $maxAttempts) {
+            $tail = ""
+            if (Test-Path $events) {
+                try { $tail = (Get-Content $events -Tail 60 -ErrorAction SilentlyContinue) -join "`n" } catch {}
+            }
+            if (-not $tail -and (Test-Path $log)) {
+                try { $tail = (Get-Content $log -Tail 60 -ErrorAction SilentlyContinue) -join "`n" } catch {}
+            }
+            $hint = Get-LimitHint $tail
+            if ($hint) {
+                $next = Get-NextWorkerCandidate -DataDir $data -Root $root `
+                    -CurrentEngine $Engine -CurrentProvider $Provider -CurrentModel $Model
+                if ($next) {
+                    $swMsg = "[ww-run] engine switch: $Engine hit limit ('$hint'); switching to $($next.Engine) ($($next.EffectiveModel))"
+                    Write-Host $swMsg -ForegroundColor Yellow
+                    "[$(Get-Date -Format 's')] $swMsg" | Add-Content -Encoding UTF8 $log
+                    $Engine = $next.Engine
+                    $Provider = $next.Provider
+                    $Model = $next.Model
+                    $record.Engine = $Engine
+                    $record.Provider = $Provider
+                    $record.Model = $Model
+                    $attempt++
+                    continue
                 }
             }
-            $pending = $reader.ReadLineAsync()
-            continue
         }
-        if ($proc.HasExited) {
-            if (-not $exitedAt) { $exitedAt = Get-Date }
-            if (((Get-Date) - $exitedAt).TotalSeconds -ge 3) { break }
-        }
+        break
     }
-    # The launcher's exit code is the engine's. Then end whatever the engine left running (its
-    # children may still hold the stdout pipe); they are not part of the run any more.
-    if (-not $proc.HasExited) { $proc.WaitForExit(5000) | Out-Null }
-    Stop-EngineJob -Job $job
-    if (-not $proc.HasExited) { & taskkill /PID $proc.Id /T /F | Out-Null }
-    $proc.WaitForExit()
-    $exit = $proc.ExitCode
 } catch {
     $exit = 1
     $_ | Out-String | Add-Content $log
@@ -545,6 +608,8 @@ $job = New-EngineJob -Proc $proc
         Shared         = [bool]$Shared
         Worktree       = $(if ($Worktree) { $plan.Path } else { $null })
         Engine         = $Engine
+        Provider       = $Provider
+        Model          = $Model
     }
     $last | ConvertTo-Json | Set-Content -Encoding UTF8 $taskLastFile
     if (-not $Worktree) { $last | ConvertTo-Json | Set-Content -Encoding UTF8 $lastFile }

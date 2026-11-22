@@ -39,6 +39,19 @@ std::string ShortNodeName(const std::string& btId, const std::string& nodeKey) {
     return nodeKey;
 }
 
+std::string GroupStartTimestamp(const std::string& createdAt) {
+    const int64_t epoch = memory_inject_detail::ParseIsoEpoch(createdAt);
+    if (epoch <= 0) return std::string();
+    time_t t = static_cast<time_t>(epoch);
+    std::tm tmLocal = {};
+    if (!LocalTimeFromSec(&t, &tmLocal)) return std::string();
+    char buf[64] = {};
+    std::snprintf(buf, sizeof(buf), "%04d-%02d-%02d %02d:%02d:%02d",
+                  tmLocal.tm_year + 1900, tmLocal.tm_mon + 1, tmLocal.tm_mday,
+                  tmLocal.tm_hour, tmLocal.tm_min, tmLocal.tm_sec);
+    return buf;
+}
+
 nlohmann::json BuildAddBtJobJson(const std::string& jobId,
                                  const std::string& summary,
                                  const std::string& command,
@@ -403,6 +416,7 @@ BtRemainingInfo BtManager::GetRemainingInfo() const {
         group.summary = entry->tree->Summary();
         group.detail = entry->tree->Detail();
         group.taskqueue = entry->tree->TaskQueueName();
+        group.startTime = GroupStartTimestamp(entry->tree->CreatedAt());
         out.groups.push_back(std::move(group));
         if (!active) continue;  // nothing will start until it is retried
         out.pendingSec += entry->tree->PendingEstimateSec();

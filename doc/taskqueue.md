@@ -66,7 +66,7 @@ Jobs that a behavior tree adds carry the origin of the `bt_start` call. The dash
 | `blocked` | A success-dependency failed/cancelled. Fix it and `taskqueue_retry` the dependency; blocked dependents are requeued automatically. |
 | `running` | An attempt (one managed process) is executing. |
 | `planned` | A provisional row for an idle job/worker leaf of a running behavior tree. It is not a stored queue job; `taskqueue_list` emits it when `include_planned` is true (the desktop dashboard, the CLI, the web UI and MCP all ask for it by default; the CLI has `--no-planned`, MCP `includePlanned: false`), and it disappears when the tree moves to another branch or finishes. |
-| `running` / `waitingForLlm` / `paused` (task group) | The active task group (the BT root) is also a virtual row with id `group:<id>` and the group's current state. It is re-derived on every query and disappears together with its planned rows when the group finishes. |
+| `running` / `waitingForLlm` / `paused` (task group) | The active task group (the BT root) is also a virtual row with id `group:<id>` and the group's current state. It is re-derived on every query and disappears together with its planned rows when the group finishes. It has no attempts; `start_time` carries the tree's start time, and the dashboard opens the behavior-tree view when its details are requested. |
 | `succeeded` / `failed` / `cancelled` | Terminal states. Failed jobs auto-retry up to `maxAttempts`. |
 | `closed` | Terminal state set by hand (right-click → "Force state to closed", `taskqueue close <id>`): a stale or invalid row is dismissed without implying the work was cancelled. The scheduler never picks it up and it is not triaged, but it can be retried (single or bulk `taskqueue retry`). |
 

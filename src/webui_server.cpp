@@ -575,7 +575,7 @@ bool WebUiServer::HandleHttpRequest(const Runtime& runtime, const std::string& m
         std::string jsonResp;
         if (path == "/api/jobs" || path == "/api/taskqueue") {
             if (runtime.ipcHandler) {
-                jsonResp = runtime.ipcHandler("{\"action\":\"taskqueue_list\"}");
+                jsonResp = runtime.ipcHandler("{\"action\":\"taskqueue_list\",\"include_planned\":true}");
             } else {
                 jsonResp = "{\"ok\":false,\"error\":\"no IPC handler\"}";
             }

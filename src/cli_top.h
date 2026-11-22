@@ -1433,7 +1433,7 @@ inline int RunTopLoop(const std::vector<std::string>& args, bool jsonOutput) {
         // Tab-specific fetches:
         if (state.activeTab == TopTab::Queue) {
             std::string respQ, errQ;
-            if (SendIpcRequest("{\"action\":\"taskqueue_list\"}", respQ, errQ, false)) {
+            if (SendIpcRequest("{\"action\":\"taskqueue_list\",\"include_planned\":true}", respQ, errQ, false)) {
                 state.queueData = nlohmann::json::parse(respQ, nullptr, false);
             }
             std::string respRemQ, errRemQ;

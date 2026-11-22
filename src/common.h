@@ -38,6 +38,7 @@ inline void PostMessageW(HWND, unsigned int, A, B) {}
 #include <map>
 #include <cstdint>
 #include <ctime>
+#include <chrono>
 
 namespace pc {
 
@@ -143,6 +144,25 @@ int64_t JsonGetInt(const std::string& json, const std::string& key, int64_t defa
 bool JsonGetBool(const std::string& json, const std::string& key, bool defaultVal = false);
 
 uint64_t GetNowTickMs();
+
+#ifdef HANCHO_DEMO_BUILD
+bool IsDemoMode();
+void SetDemoMode(bool enabled, int64_t fixedNowSec = 0);
+void EnableDemoModeFromArgs(int64_t fixedNowSec = 0);
+std::string GetDummyLlmExecutableUtf8();
+int64_t GetNowEpochSec();
+int64_t GetNowEpochMs();
+#else
+inline bool IsDemoMode() { return false; }
+inline void SetDemoMode(bool, int64_t = 0) {}
+inline void EnableDemoModeFromArgs(int64_t = 0) {}
+inline int64_t GetNowEpochSec() { return static_cast<int64_t>(::time(nullptr)); }
+inline int64_t GetNowEpochMs() {
+    return std::chrono::duration_cast<std::chrono::milliseconds>(
+               std::chrono::system_clock::now().time_since_epoch()).count();
+}
+#endif
+
 std::string GetCurrentTimestampStr();
 int64_t ParseTimestampStrToEpoch(const std::string& s);
 // Parses a relative duration such as "30m", "6h" or "2d" into seconds.

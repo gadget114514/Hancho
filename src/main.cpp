@@ -13,6 +13,9 @@
 #include "ipc_client.h"
 #include "power.h"
 #include "platform/platform.h"
+#ifdef HANCHO_DEMO_BUILD
+#include "demo.h"
+#endif
 #include <shellapi.h>
 #include <atomic>
 #include <cstdlib>
@@ -75,7 +78,8 @@ OPTIONS (per launch):
                       Equivalent environment variable: HANCHO_LOG_DIR.
                       Consistency: pass the same --data-dir on every call, or embed
                       it once with `hancho-cli.exe mcp install --data-dir <path>`.
-                      Different data dirs are isolated dashboard instances.
+                       Different data dirs are isolated dashboard instances.
+
 
 WORKING MODEL (LLM orchestration):
   Hancho is the execution layer for a supervising LLM.
@@ -244,6 +248,10 @@ MCP SERVER SETUP:
   For the full machine-readable guide (agent.quick_start, decision, states):
     hancho-cli.exe help --json
 )";
+#ifdef HANCHO_DEMO_BUILD
+    std::cout << "  --demo              Demo build only: use a fixed demo time and expand demo data.\n"
+              << "  --demo-now <time>   Demo build only: local time YYYY-MM-DD HH:MM:SS to use as now.\n";
+#endif
 }
 
 // ---------------------------------------------------------------------------
@@ -811,9 +819,19 @@ int main() {
     std::vector<std::string> filtered;
     filtered.push_back(args.empty() ? "Hancho.exe" : args[0]);
     std::string dataDirArg;
+#ifdef HANCHO_DEMO_BUILD
+    bool demoEnabled = false;
+    int64_t demoNowSec = 0;
+#endif
     for (size_t i = 1; i < args.size(); ++i) {
         if (args[i] == "--data-dir" && i + 1 < args.size()) {
             dataDirArg = args[++i];
+#ifdef HANCHO_DEMO_BUILD
+        } else if (args[i] == "--demo") {
+            demoEnabled = true;
+        } else if (args[i] == "--demo-now" && i + 1 < args.size()) {
+            demoNowSec = ParseTimestampStrToEpoch(args[++i]);
+#endif
         } else if (args[i].rfind("--data-dir=", 0) == 0) {
             dataDirArg = args[i].substr(11);
         } else {
@@ -824,6 +842,15 @@ int main() {
     if (!dataDirArg.empty()) {
         SetDataDirectoryOverride(Utf8ToWide(dataDirArg));
     }
+#ifdef HANCHO_DEMO_BUILD
+    if (demoEnabled || IsDemoMode()) {
+        EnableDemoModeFromArgs(demoNowSec);
+        std::string demoErr;
+        if (!pc::demo::Prepare(demoErr)) {
+            fprintf(stderr, "demo setup failed: %s\n", demoErr.c_str());
+        }
+    }
+#endif
 
     std::string subcmd = (args.size() >= 2) ? args[1] : "gui";
 

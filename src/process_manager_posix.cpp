@@ -194,6 +194,7 @@ int ProcessManager::StartProcess(const StartProcessRequest& req, std::string& ou
     proc->supervisorGoal = req.supervisorGoal;
 
     std::map<std::string, std::string> childEnv = req.env;
+    childEnv["HANCHO_ACTIVE"] = "1";
     if (proc->jsonStream && childEnv.find("HANCHO_EVENT_PIPE") == childEnv.end()) {
         const std::string endpoint = WideToUtf8(logsDirW) + "/proc_" + std::to_string(proc->id) + "_events.sock";
         auto eventServer = platform::CreateIpcServer(endpoint);

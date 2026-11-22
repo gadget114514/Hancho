@@ -15,6 +15,9 @@
 #include "engine_health.h"
 #include "bt_templates.h"
 #include "power.h"
+#ifdef HANCHO_DEMO_BUILD
+#include "demo.h"
+#endif
 #include "triage_text.h"
 #include "nlohmann/json.hpp"
 #include <iostream>
@@ -23,6 +26,7 @@
 #include <cctype>
 #include <cmath>
 #include <cstdio>
+#include <cstdlib>
 #include <ctime>
 #include <time.h>
 #include <filesystem>
@@ -6513,6 +6517,10 @@ int RunCli(const std::vector<std::string>& rawArgs) {
     bool waitForCompletion = false;
     std::string dataDirArg;
     std::string remoteHost;
+#ifdef HANCHO_DEMO_BUILD
+    bool demoEnabled = false;
+    int64_t demoNowSec = 0;
+#endif
     for (size_t i = 1; i < rawArgs.size(); ++i) {
         if (rawArgs[i] == "--json" || rawArgs[i] == "-j") {
             jsonOutput = true;
@@ -6524,6 +6532,12 @@ int RunCli(const std::vector<std::string>& rawArgs) {
             remoteHost = rawArgs[++i];
         } else if (rawArgs[i].rfind("--host=", 0) == 0) {
             remoteHost = rawArgs[i].substr(7);
+#ifdef HANCHO_DEMO_BUILD
+        } else if (rawArgs[i] == "--demo") {
+            demoEnabled = true;
+        } else if (rawArgs[i] == "--demo-now" && i + 1 < rawArgs.size()) {
+            demoNowSec = ParseTimestampStrToEpoch(rawArgs[++i]);
+#endif
         } else {
             args.push_back(rawArgs[i]);
         }
@@ -6531,6 +6545,16 @@ int RunCli(const std::vector<std::string>& rawArgs) {
     if (!dataDirArg.empty()) {
         SetDataDirectoryOverride(Utf8ToWide(dataDirArg));
     }
+#ifdef HANCHO_DEMO_BUILD
+    if (demoEnabled || IsDemoMode()) {
+        EnableDemoModeFromArgs(demoNowSec);
+        std::string demoErr;
+        if (!pc::demo::Prepare(demoErr)) {
+            if (jsonOutput) std::cout << "{\"ok\":false,\"error\":" << nlohmann::json(demoErr).dump() << "}\n";
+            else std::cerr << "demo setup failed: " << demoErr << "\n";
+        }
+    }
+#endif
 
     std::string subcmd = (args.size() >= 2) ? args[1] : "";
     if (subcmd.empty()) {
@@ -6552,6 +6576,38 @@ int RunCli(const std::vector<std::string>& rawArgs) {
     std::ostringstream reqJson;
     int requestedId = 0;
 
+#ifdef HANCHO_DEMO_BUILD
+    if (subcmd == "demo") {
+        std::string action = args.size() >= 3 ? args[2] : "status";
+        if (action == "prepare") {
+            std::string demoErr;
+            bool ok = pc::demo::Prepare(demoErr);
+            if (jsonOutput) {
+                if (ok) std::cout << "{\"ok\":true,\"now\":" << nlohmann::json(GetCurrentTimestampStr()).dump() << "}\n";
+                else std::cout << "{\"ok\":false,\"error\":" << nlohmann::json(demoErr).dump() << "}\n";
+            } else if (ok) {
+                std::cout << "demo data prepared at " << GetCurrentTimestampStr() << "\n";
+            } else {
+                std::cerr << "demo setup failed: " << demoErr << "\n";
+            }
+            return ok ? 0 : 1;
+        }
+        if (action == "output") {
+            std::string scenario = args.size() >= 4 ? args[3] : "mixed";
+            int seed = args.size() >= 5 ? std::atoi(args[4].c_str()) : 0;
+            std::cout << pc::demo::BuildDummyLlmOutput(scenario, seed);
+            return 0;
+        }
+        if (jsonOutput) {
+            std::cout << "{\"ok\":true,\"demo\":" << (IsDemoMode() ? "true" : "false")
+                      << ",\"now\":" << nlohmann::json(GetCurrentTimestampStr()).dump() << "}\n";
+        } else {
+            std::cout << "demo mode: " << (IsDemoMode() ? "on" : "off")
+                      << ", now: " << GetCurrentTimestampStr() << "\n";
+        }
+        return 0;
+    }
+#endif
     if (subcmd == "export") return RunExportCommand(args, 2, jsonOutput);
     if (subcmd == "reset") return RunProjectReset(args, jsonOutput);
     if (subcmd == "top") return RunTopCommand(args, jsonOutput);

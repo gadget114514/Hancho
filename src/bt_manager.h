@@ -23,6 +23,7 @@ struct TaskGroupInfo {
     std::string summary;
     std::string detail;
     std::string taskqueue;
+    std::string startTime;
 };
 
 struct BtRemainingInfo {

@@ -24,8 +24,10 @@ eye on them:
 | `claude` | `claude -p <prompt> --output-format stream-json --verbose --dangerously-skip-permissions` | passed as `--model` when given |
 | `codex` | `codex exec --json --dangerously-bypass-approvals-and-sandbox <prompt>` | passed as `--model` when given |
 
-Set the engine with `-Engine` or `WW_ENGINE`, the model with `-Model` or `WW_MODEL`. The agent
+Set the engine with `-Engine` or `WW_ENGINE`, the provider with `-Provider` or `WW_PROVIDER`, and the model with `-Model` or `WW_MODEL`. When `-Model` is omitted, `ww-run` automatically checks Hancho's `<data-dir>/llms.json` and selects the highest-ranked `approved` and `enabled` worker candidate. The agent
 must be installed and on `PATH`. `-DryRun` prints the exact command.
+
+All `ww` commands (`ww-run`, `ww-watch`, and `-Jobs` generated Hancho tasks) include **automatic engine switch** by default. When an engine hits a usage limit (rate limit, quota, 429), `ww` automatically switches to the next approved candidate from `llms.json` (or the default fallback engine) and retries. Use `-NoEngineSwitch` (or `WW_NO_ENGINE_SWITCH=1`) to disable it.
 
 `claude.exe` and `codex.exe` are also what interactive sessions run as, so ww only counts a
 claude/codex process as a ww run when its command line carries a ww prompt
@@ -265,7 +267,8 @@ Tools\ww\ww-watch.cmd <card-id> [-Engine agy|opencode|claude|codex] [-Model <mod
 - `<card-id>` — card id such as `038-2`. If the id is an **index card** (has `NNN-n-*.md`
   children), `ww-watch` expands it depth-first and runs the leaves in name order.
 - `-Engine` — agent: `agy` (default), `opencode`, `claude` or `codex` (see [Agents](#agents-engines)). Also `WW_ENGINE`.
-- `-Model` — model for the agent; agy defaults to `gemini-3.8-flash-medium`, the others use their own default. Also `WW_MODEL`.
+- `-Provider` — model provider (e.g. `opencode-go`, `anthropic`, `google`). Also `WW_PROVIDER`.
+- `-Model` — model for the agent. If omitted, resolved from Hancho's `<data-dir>/llms.json` (or defaults to `gemini-3.8-flash-medium` for `agy`). Also `WW_MODEL`.
 - `-Agent <name>` — Claude Code agent (`.claude\agents\<name>.md`) to run with `-Engine claude`; passed as `claude --agent <name>`. Other engines refuse it. Also `WW_AGENT`, which `ww-watch` passes on too. `-Jobs` writes it into each hancho-cli job. Example: `ww-run.cmd 012 -Engine claude -Agent hancho-runner`.
 - `-Root` — project root (default: git top level of the current directory). Also `WW_ROOT`.
 - `-DryRun` — print the expansion tree and each leaf's splittable status; run nothing.

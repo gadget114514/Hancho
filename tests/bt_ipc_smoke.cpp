@@ -320,6 +320,39 @@ int main() {
                   rWaitEsc.contains("escalation"),
                   "bt_wait returns waitingForLlm and escalation packet");
 
+            // A waitingForLlm tree must stay visible in the task list, including when the
+            // caller asks for the colloquial "waiting" state rather than the exact state name.
+            auto hasWaitingGroup = [&](const char* stateFilter) {
+                json req = {{"action", "taskqueue_list"}, {"include_planned", true}};
+                if (stateFilter && *stateFilter) req["state"] = stateFilter;
+                json resp = h.Call(req);
+                if (!resp.value("ok", false) || !resp.contains("jobs") || !resp["jobs"].is_array()) return false;
+                for (const auto& job : resp["jobs"]) {
+                    if (job.value("id", "") == "group:ipc-escalate" &&
+                        job.value("state", "") == "waitingForLlm" && job.value("virtual", false)) return true;
+                }
+                return false;
+            };
+            Check(hasWaitingGroup(nullptr),
+                  "taskqueue_list shows the waitingForLlm task group without a state filter");
+            Check(hasWaitingGroup("waitingForLlm"),
+                  "taskqueue_list shows the waitingForLlm task group with state=waitingForLlm");
+            Check(hasWaitingGroup("waiting"),
+                  "taskqueue_list shows the waitingForLlm task group with the state=waiting alias");
+
+            {
+                json resp = h.Call({{"action", "taskqueue_list"}, {"include_planned", true}});
+                bool foundStart = false;
+                if (resp.value("ok", false) && resp.contains("jobs") && resp["jobs"].is_array()) {
+                    for (const auto& job : resp["jobs"]) {
+                        if (job.value("id", "") != "group:ipc-escalate") continue;
+                        const std::string start = job.value("start_time", "");
+                        foundStart = !start.empty() && start != "1970-01-01 00:00:00";
+                    }
+                }
+                Check(foundStart, "taskqueue_list group row carries the BT start time");
+            }
+
             // Missing rationale must be rejected
             json rNoRat = h.Call({
                 {"action", "bt_resume"},

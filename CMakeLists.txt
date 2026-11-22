@@ -1,5 +1,5 @@
 cmake_minimum_required(VERSION 3.20)
-project(Hancho VERSION 0.9.39 LANGUAGES CXX)
+project(Hancho VERSION 0.9.40 LANGUAGES CXX)
 
 set(CMAKE_CXX_STANDARD 20)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
@@ -16,6 +16,11 @@ set(PC_VERSION_DEFINITIONS
     PC_VERSION_MINOR=${PROJECT_VERSION_MINOR}
     PC_VERSION_PATCH=${PROJECT_VERSION_PATCH}
 )
+
+option(HANCHO_BUILD_DEMO "Build demo mode and deterministic dummy LLM test targets (not shipped)" OFF)
+if(HANCHO_BUILD_DEMO)
+    add_compile_definitions(HANCHO_DEMO_BUILD)
+endif()
 
 
 if(WIN32)
@@ -95,6 +100,10 @@ set(HANCHO_SOURCES
     src/term_server.cpp
     ${WCSP_SOURCES}
 )
+
+if(HANCHO_BUILD_DEMO)
+    list(APPEND HANCHO_SOURCES src/demo.cpp)
+endif()
 
 # The program code is compiled once and linked into both the main Hancho binary
 # and the Chat binary. Only the embedded app icon differs (HanchoChat.exe uses
@@ -212,6 +221,10 @@ add_executable(hancho-cli
     src/agent_template.rc
 )
 
+if(HANCHO_BUILD_DEMO)
+    target_sources(hancho-cli PRIVATE src/demo.cpp)
+endif()
+
 # Rebuild the embedded template when hancho-runner.md changes.
 set_source_files_properties(src/agent_template.rc PROPERTIES
     OBJECT_DEPENDS "${CMAKE_CURRENT_SOURCE_DIR}/tools/agents/hancho-runner.md")
@@ -237,6 +250,60 @@ target_link_libraries(hancho-cli PRIVATE
     ws2_32
     powrprof
 )
+
+if(HANCHO_BUILD_DEMO)
+    if(WIN32)
+        set(DEMO_PLATFORM_SOURCE src/platform/platform_windows.cpp)
+    else()
+        set(DEMO_PLATFORM_SOURCE src/platform/platform_posix.cpp)
+    endif()
+
+    add_executable(hancho-dummy
+        src/dummy_llm.cpp
+        src/demo.cpp
+        src/common.cpp
+        ${DEMO_PLATFORM_SOURCE}
+    )
+    target_include_directories(hancho-dummy PRIVATE src include)
+    if(MSVC)
+        target_compile_options(hancho-dummy PRIVATE /W4 /utf-8 /EHsc)
+    endif()
+    target_link_libraries(hancho-dummy PRIVATE
+        user32
+        shell32
+        advapi32
+        crypt32
+        ws2_32
+        powrprof
+    )
+
+    add_executable(demo_smoke
+        tests/demo_smoke.cpp
+        src/demo.cpp
+        src/llm_stream.cpp
+        src/llm_stream_claude.cpp
+        src/llm_stream_opencode.cpp
+        src/llm_stream_agy.cpp
+        src/llm_stream_codex.cpp
+        src/event_schema.cpp
+        src/event_adapter.cpp
+        src/common.cpp
+        ${DEMO_PLATFORM_SOURCE}
+    )
+    target_include_directories(demo_smoke PRIVATE src include)
+    if(MSVC)
+        target_compile_options(demo_smoke PRIVATE /W4 /utf-8 /EHsc)
+    endif()
+    target_link_libraries(demo_smoke PRIVATE
+        user32
+        shell32
+        advapi32
+        crypt32
+        ws2_32
+        powrprof
+    )
+    add_dependencies(demo_smoke hancho-dummy)
+endif()
 
 # wct: standalone WCSP terminal client for the console. It relays the remote
 # ConPTY to the current terminal unchanged (raw passthrough).

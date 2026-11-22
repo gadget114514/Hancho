@@ -66,7 +66,7 @@ hancho-cli.exe taskqueue wait main --since 0 --timeout-ms 30000
 | `blocked` | success 依存が失敗/キャンセル。依存を直して `taskqueue_retry` すると blocked の後続も自動で戻る。 |
 | `running` | 試行（1 つの managed process）が実行中。 |
 | `planned` | 実行中のビヘイビアツリーが後で起動する job/worker 葉の仮行。実際にはキューには保存されていない。`taskqueue_list` は `include_planned` が true のとき返す（デスクトップのダッシュボード・CLI・Web UI・MCP は既定で指定する。CLI は `--no-planned`、MCP は `includePlanned: false` で外せる）。ツリーが別の枝に進むか終了すると消える。 |
-| `running` / `waitingForLlm` / `paused`（タスクグループ） | 活動中のタスクグループ（BT のルート）も `id: group:<id>` の仮想行として出る。状態はグループの現在値で、問い合わせのたびに作り直され、グループが終わると予定行と一緒に消える。 |
+| `running` / `waitingForLlm` / `paused`（タスクグループ） | 活動中のタスクグループ（BT のルート）も `id: group:<id>` の仮想行として出る。状態はグループの現在値で、問い合わせのたびに作り直され、グループが終わると予定行と一緒に消える。試行は持たず、`start_time` にツリーの開始時刻が入る。ダッシュボードで詳細を開くとビヘイビアツリー表示が開く。 |
 | `succeeded` / `failed` / `cancelled` | 終了状態。failed は `maxAttempts` まで自動再実行。 |
 | `closed` | 手動で付ける終了状態（右クリック→「状態を closed にする」、`taskqueue close <id>`）。無効・陳腐化した行を、仕事をキャンセルしたとは言わずに片付ける。スケジューラは拾わず、トリアージの対象外ですが、再実行（単体・一括 `taskqueue retry`）はできます。 |
 

@@ -12,10 +12,12 @@
 
 param(
     [Parameter(Mandatory = $true)][string]$Task,
-    [string]$Engine = "agy",
-    [string]$Fallback = "opencode",
+    [string]$Engine = $(if ($env:WW_ENGINE) { $env:WW_ENGINE } else { "agy" }),
+    [string]$Provider = $env:WW_PROVIDER,
     [string]$Model = $env:WW_MODEL,
-    # Model for the fallback run only (e.g. opencode/gemini-4-hydrogen). Empty = same as -Model.
+    [string]$Fallback = $(if ($env:WW_FALLBACK_ENGINE) { $env:WW_FALLBACK_ENGINE } else { "opencode" }),
+    [string]$FallbackProvider = $env:WW_FALLBACK_PROVIDER,
+    # Model for the fallback run only (e.g. opencode/gemini-4-hydrogen). Empty = same as -Model or auto-resolved.
     [string]$FallbackModel = $env:WW_FALLBACK_MODEL,
     [string]$Extra = "",
     [string]$Root = $env:WW_ROOT,
@@ -27,35 +29,7 @@ param(
 )
 
 $ErrorActionPreference = "Stop"
-
-# Usage-limit wording seen from the engines. Only these make the wrapper fall back;
-# every other failure is the card's or the engine's own problem and is reported as is.
-$limitPatterns = @(
-    'rate[ _-]?limit',
-    'ratelimit',
-    'too many requests',
-    'quota',
-    'insufficient_quota',
-    'resource[ _-]?exhausted',
-    'usage limit',
-    'daily limit',
-    'weekly limit',
-    'limit reached',
-    'limit exceeded',
-    'exceeded your current',
-    'billing',
-    'http[^0-9]{0,12}429',
-    '"(code|status)"\s*:\s*429'
-)
-
-function Get-LimitHint([string]$text) {
-    if ([string]::IsNullOrEmpty($text)) { return $null }
-    foreach ($p in $limitPatterns) {
-        $m = [regex]::Match($text, $p, [System.Text.RegularExpressions.RegexOptions]::IgnoreCase)
-        if ($m.Success) { return $m.Value }
-    }
-    return $null
-}
+. (Join-Path $PSScriptRoot "ww-run.lib.ps1")
 
 function Get-RunLogTail([string]$task, [string]$root) {
     # The newest .log of this card in ww-data/logs holds the engine's last words.
@@ -87,23 +61,42 @@ if (-not (Test-Path $runCmd)) {
     exit 1
 }
 
-function Get-EngineArgs([string]$engine, [string]$engineModel) {
+# If llms.json is present, resolve default primary and fallback from approved candidates
+$llmCandidates = @(Get-ApprovedWorkerCandidates -Root $Root)
+if ($llmCandidates.Count -gt 0) {
+    if (-not $PSBoundParameters.ContainsKey('Engine') -and -not $env:WW_ENGINE) {
+        $Engine = $llmCandidates[0].Engine
+        if (-not $Provider) { $Provider = $llmCandidates[0].Provider }
+        if (-not $Model) { $Model = $llmCandidates[0].EffectiveModel }
+    }
+    if ($llmCandidates.Count -gt 1) {
+        if (-not $PSBoundParameters.ContainsKey('Fallback') -and -not $env:WW_FALLBACK_ENGINE) {
+            $Fallback = $llmCandidates[1].Engine
+            if (-not $FallbackProvider) { $FallbackProvider = $llmCandidates[1].Provider }
+            if (-not $FallbackModel) { $FallbackModel = $llmCandidates[1].EffectiveModel }
+        }
+    }
+}
+
+function Get-EngineArgs([string]$engine, [string]$engineProvider, [string]$engineModel) {
     $a = @($Task, "-Engine", $engine)
     if ($Root) { $a += @("-Root", $Root) }
     if ($Shared) { $a += "-Shared" }
     if ($Main) { $a += "-Main" }
     if ($Worktree) { $a += "-Worktree" }
     if ($JsonStdout) { $a += "-JsonStdout" }
+    if ($engineProvider) { $a += @("-Provider", $engineProvider) }
     if ($engineModel) { $a += @("-Model", $engineModel) }
     if ($Extra) { $a += @("-Extra", $Extra) }
     return $a
 }
 
 $fallbackModelEff = if ($FallbackModel) { $FallbackModel } else { $Model }
+$fallbackProviderEff = if ($FallbackProvider) { $FallbackProvider } else { $Provider }
 
 if ($DryRun) {
-    Write-Host "[ww-run-fallback] would run: $runCmd $((Get-EngineArgs $Engine $Model) -join ' ')"
-    Write-Host "[ww-run-fallback] fallback:  $runCmd $((Get-EngineArgs $Fallback $fallbackModelEff) -join ' ')"
+    Write-Host "[ww-run-fallback] would run: $runCmd $((Get-EngineArgs $Engine $Provider $Model) -join ' ')"
+    Write-Host "[ww-run-fallback] fallback:  $runCmd $((Get-EngineArgs $Fallback $fallbackProviderEff $fallbackModelEff) -join ' ')"
     exit 0
 }
 
@@ -111,8 +104,8 @@ $tempDir = [System.IO.Path]::GetTempPath()
 $outFile = Join-Path $tempDir ("wwfb-{0}-{1}.out" -f $Task, [guid]::NewGuid().ToString("N").Substring(0, 8))
 $errFile = Join-Path $tempDir ("wwfb-{0}-{1}.err" -f $Task, [guid]::NewGuid().ToString("N").Substring(0, 8))
 
-Write-Host "[ww-run-fallback] $Task with $Engine"
-$proc = Start-Process -FilePath $runCmd -ArgumentList (Get-EngineArgs $Engine $Model) -NoNewWindow -Wait -PassThru `
+Write-Host "[ww-run-fallback] $Task with $Engine$(if ($Provider) { " ($Provider)" })"
+$proc = Start-Process -FilePath $runCmd -ArgumentList (Get-EngineArgs $Engine $Provider $Model) -NoNewWindow -Wait -PassThru `
     -RedirectStandardOutput $outFile -RedirectStandardError $errFile
 $code = $proc.ExitCode
 
@@ -140,10 +133,10 @@ if (-not $hint) {
     exit $code
 }
 
-Write-FallbackNote "$Engine hit a usage limit ('$hint', exit code $code); retrying $Task with $Fallback ($fallbackModelEff)"
+Write-FallbackNote "$Engine hit a usage limit ('$hint', exit code $code); retrying $Task with $Fallback $(if ($fallbackProviderEff) { "($fallbackProviderEff) " })($fallbackModelEff)"
 
 # The fallback run streams its own events to stdout.
-& $runCmd (Get-EngineArgs $Fallback $fallbackModelEff)
+& $runCmd (Get-EngineArgs $Fallback $fallbackProviderEff $fallbackModelEff)
 $fallbackCode = $LASTEXITCODE
 Remove-Item $outFile, $errFile -ErrorAction SilentlyContinue
 if ($fallbackCode -eq 0) {

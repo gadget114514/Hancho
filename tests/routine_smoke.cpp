@@ -637,6 +637,46 @@ int main() {
               "--from-bt from MCP is stored as a proposal: " + fromBtMcp.dump());
     }
 
+    // 7. A routine whose BT fails mid-run (e.g. token exhaustion / 429 quota on a worker node) reports failed.
+    {
+        IpcTestHarness h;
+        const std::wstring inputsDir = PathJoinWide(projW, L"inputs");
+        CreateDirectoryW(inputsDir.c_str(), nullptr);
+        const std::wstring sampleTxt = PathJoinWide(inputsDir, L"sample.txt");
+        WriteFileAtomicWide(sampleTxt, "sample data\n");
+
+        json tokenFailBt = {
+            {"id", "routine-bt-token-fail"},
+            {"summary", "BT that fails mid-execution due to token exhaustion"},
+            {"inputs", json::array({"inputs/sample.txt"})},
+            {"root", {
+                {"type", "sequence"},
+                {"children", json::array({
+                    json{{"type", "job"}, {"id", "step1"}, {"summary", "First step succeeds"},
+                         {"command", "cmd.exe /c exit 0"}, {"timeoutSec", 30}},
+                    json{{"type", "job"}, {"id", "step2"}, {"summary", "Worker hits token limit / quota 429"},
+                         {"command", "cmd.exe /c echo HTTP 429: quota exceeded, resource exhausted >&2 & exit /b 1"}, {"timeoutSec", 30}}
+                })}
+            }}
+        };
+        json saveRes = h.Call({{"action", "routine_save"}, {"name", "token-fail-smoke"}, {"bt", tokenFailBt},
+                               {"scope", "project"}, {"cwd", projUtf8}, {"by", "user"}});
+        Check(saveRes.value("ok", false), "saved routine with token-fail sequence: " + saveRes.dump());
+
+        json runRes = h.Call({{"action", "routine_run"}, {"name", "token-fail-smoke"}, {"cwd", projUtf8},
+                              {"wait", true}, {"timeout_ms", 20000}});
+        Check(runRes.value("ok", false), "routine_run completed and returned response");
+        Check(runRes.value("state", std::string()) == "failed",
+              "routine state is failed when mid-BT node fails: " + runRes.dump().substr(0, 300));
+
+        std::string btId = runRes.value("btId", std::string());
+        if (!btId.empty()) {
+            json btInfo = h.Call({{"action", "bt_get"}, {"id", btId}});
+            Check(btInfo.value("ok", false) && btInfo.value("state", std::string()) == "failed",
+                  "underlying BT is also marked failed: " + btInfo.dump().substr(0, 300));
+        }
+    }
+
     if (g_failures > 0) DumpFilesForDiagnostics(tempDirW);
     RemoveDirRecursive(tempDirW);
     std::fprintf(stdout, "routine_smoke: %d passed, %d failed\n", g_passes, g_failures);

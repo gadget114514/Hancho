@@ -1,18 +1,20 @@
 ﻿{
+    "Started":  "2026-11-21T12:17:02",
+    "Log":  "D:\\wsgit\\Hancho\\ww-data\\logs\\096-20261121-121702.log",
+    "Engine":  "agy",
+    "ExitCode":  0,
+    "Task":  "096",
+    "Card":  "096-gui-dashboard-render-perf.md",
     "Worktree":  null,
-    "Minutes":  29.9,
-    "Engine":  "opencode",
-    "Shared":  false,
-    "Started":  "2026-11-20T12:36:06",
+    "Minutes":  7.7,
+    "Model":  "gemini-3.8-flash-medium",
+    "Ended":  "2026-11-21T12:24:45",
+    "Shared":  true,
+    "Provider":  "",
     "EditViolations":  [
 
                        ],
-    "Log":  "D:\\wsgit\\Hancho\\ww-data\\logs\\094-20261120-123606.log",
-    "Task":  "094",
-    "Ended":  "2026-11-20T13:05:58",
-    "Card":  "094-title-data-dir.md",
     "ReportsWritten":  [
-                           "094.md"
-                       ],
-    "ExitCode":  0
+                           "096.md"
+                       ]
 }

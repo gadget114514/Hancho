@@ -135,7 +135,7 @@ static void LoadUsageHistoryLocked() {
         if (p.epochSec <= 0) continue;
         g_usageHistory.push_back(std::move(p));
     }
-    int64_t now = static_cast<int64_t>(time(nullptr));
+    int64_t now = GetNowEpochSec();
     int64_t cutoff = now - kUsageRetentionSec;
     while (!g_usageHistory.empty() && g_usageHistory.front().epochSec < cutoff) g_usageHistory.pop_front();
     while (g_usageHistory.size() > kMaxUsagePoints) g_usageHistory.pop_front();
@@ -269,7 +269,7 @@ std::string GetUsageRoundTime() {
 
 void PruneUsageHistory(int64_t retentionSec, int64_t nowSec) {
     if (retentionSec <= 0) retentionSec = kUsageDiskRetentionSec;
-    int64_t now = nowSec > 0 ? nowSec : static_cast<int64_t>(time(nullptr));
+    int64_t now = nowSec > 0 ? nowSec : GetNowEpochSec();
     int64_t cutoff = now - retentionSec;
     int64_t roundCutoff = LastRoundBoundary(now, g_usageRoundMinutes.load());
     std::wstring path = UsageHistoryPathWide();
@@ -352,7 +352,7 @@ static std::string NormalizeDateFilter(const std::string& raw, bool isUntil) {
     while (!s.empty() && std::isspace(static_cast<unsigned char>(s.back()))) s.pop_back();
     if (s.empty()) return "";
 
-    int64_t nowSec = static_cast<int64_t>(time(nullptr));
+    int64_t nowSec = GetNowEpochSec();
 
     if (s == "today") {
         return DateToLocalStr(nowSec);
@@ -963,7 +963,7 @@ void RecordLlmUsagePoint(int64_t epochSec, const LlmUsagePoint& point) {
         return;
     }
     if (epochSec <= 0) {
-        epochSec = static_cast<int64_t>(time(nullptr));
+        epochSec = GetNowEpochSec();
     }
     LlmUsagePoint p = point;
     p.epochSec = epochSec;
@@ -1117,6 +1117,36 @@ std::vector<LlmUsagePoint> GetLlmUsageHistory(int64_t sinceEpochSec) {
     out.reserve(g_usageHistory.size());
     for (const auto& p : g_usageHistory) {
         if (p.epochSec >= sinceEpochSec) out.push_back(p);
+    }
+    return out;
+}
+
+// Reads usage_history.jsonl directly for sinceEpochSec <= epochSec < untilEpochSec.
+// Used for the older part of a range while the newer part comes from memory.
+std::vector<LlmUsagePoint> ReadUsageHistoryFile(int64_t sinceEpochSec, int64_t untilEpochSec) {
+    std::vector<LlmUsagePoint> out;
+    if (untilEpochSec <= sinceEpochSec) return out;
+    std::lock_guard<std::mutex> fileLock(g_usageFileMutex);
+    std::ifstream f(UsageHistoryPathWide());
+    if (!f) return out;
+    std::string line;
+    while (std::getline(f, line)) {
+        if (line.empty()) continue;
+        auto j = nlohmann::json::parse(line, nullptr, false);
+        if (!j.is_object()) continue;
+        LlmUsagePoint p;
+        p.epochSec = j.value("epochSec", (int64_t)0);
+        if (p.epochSec < sinceEpochSec || p.epochSec >= untilEpochSec) continue;
+        p.inputTokens = j.value("inputTokens", (uint64_t)0);
+        p.outputTokens = j.value("outputTokens", (uint64_t)0);
+        p.thinkingTokens = j.value("thinkingTokens", (uint64_t)0);
+        p.cacheReadTokens = j.value("cacheReadTokens", (uint64_t)0);
+        p.cacheWriteTokens = j.value("cacheWriteTokens", (uint64_t)0);
+        p.totalTokens = j.value("totalTokens", (uint64_t)0);
+        p.costUsd = j.value("costUsd", 0.0);
+        p.agentType = j.value("agentType", std::string());
+        p.model = j.value("model", std::string());
+        out.push_back(std::move(p));
     }
     return out;
 }
@@ -2187,7 +2217,7 @@ void LlmStreamTracker::IngestChunk(const char* data, size_t len) {
 
     // Recorded outside mutex_: it takes the global history lock and may do file I/O,
     // which must not block GetState()/GetEvents() callers.
-    int64_t nowEpoch = static_cast<int64_t>(time(nullptr));
+    int64_t nowEpoch = GetNowEpochSec();
     for (const auto& pt : usage) RecordLlmUsagePoint(nowEpoch, pt);
 }
 
@@ -2252,8 +2282,7 @@ void LlmStreamTracker::ApplyActivity(const LlmStreamEvent& ev) {
 }
 
 void LlmStreamTracker::ApplyPartialEvent(LlmStreamEvent& ev) {
-    ev.recvEpochMs = std::chrono::duration_cast<std::chrono::milliseconds>(
-        std::chrono::system_clock::now().time_since_epoch()).count();
+    ev.recvEpochMs = GetNowEpochMs();
     state_.updatedAt = GetCurrentTimestampStr();
     if (!ev.model.empty()) state_.model = ev.model;
 
@@ -2381,8 +2410,7 @@ void LlmStreamTracker::IngestAdapterLine(const std::string& line, uint64_t rawLi
     if (kind == "raw") {
         ev.seq = nextSeq_++;
         ev.timestamp = GetCurrentTimestampStr();
-        ev.recvEpochMs = std::chrono::duration_cast<std::chrono::milliseconds>(
-            std::chrono::system_clock::now().time_since_epoch()).count();
+        ev.recvEpochMs = GetNowEpochMs();
         state_.updatedAt = ev.timestamp;
         AppendAdapterEvent(ev, kind, std::move(data), rawLine);
         return;
@@ -2404,8 +2432,7 @@ void LlmStreamTracker::IngestExternalEventLine(const std::string& line) {
         ev.agentType = agentType_;
         ev.seq = nextSeq_++;
         ev.timestamp = GetCurrentTimestampStr();
-        ev.recvEpochMs = std::chrono::duration_cast<std::chrono::milliseconds>(
-            std::chrono::system_clock::now().time_since_epoch()).count();
+        ev.recvEpochMs = GetNowEpochMs();
         state_.updatedAt = ev.timestamp;
         AppendAdapterEvent(ev, "raw", std::move(data), streamLineNo_);
         return;
@@ -2419,8 +2446,7 @@ void LlmStreamTracker::IngestExternalEventLine(const std::string& line) {
         ev.agentType = agentType_;
         ev.seq = nextSeq_++;
         ev.timestamp = GetCurrentTimestampStr();
-        ev.recvEpochMs = std::chrono::duration_cast<std::chrono::milliseconds>(
-            std::chrono::system_clock::now().time_since_epoch()).count();
+        ev.recvEpochMs = GetNowEpochMs();
         state_.updatedAt = ev.timestamp;
         AppendAdapterEvent(ev, "raw", std::move(data), streamLineNo_);
         return;
@@ -2437,8 +2463,7 @@ void LlmStreamTracker::IngestExternalEventLine(const std::string& line) {
     if (kind == "raw") {
         ev.seq = nextSeq_++;
         ev.timestamp = GetCurrentTimestampStr();
-        ev.recvEpochMs = std::chrono::duration_cast<std::chrono::milliseconds>(
-            std::chrono::system_clock::now().time_since_epoch()).count();
+        ev.recvEpochMs = GetNowEpochMs();
         state_.updatedAt = ev.timestamp;
         AppendAdapterEvent(ev, kind, std::move(data), streamLineNo_);
         return;
@@ -2467,8 +2492,7 @@ void LlmStreamTracker::ApplyEvent(LlmStreamEvent& ev, const std::string& line) {
         onNormalizedEvent_();
     }
     ev.timestamp = GetCurrentTimestampStr();
-    ev.recvEpochMs = std::chrono::duration_cast<std::chrono::milliseconds>(
-        std::chrono::system_clock::now().time_since_epoch()).count();
+    ev.recvEpochMs = GetNowEpochMs();
     if (ev.agentType.empty() || ev.agentType == "generic") {
         if (!agentType_.empty()) ev.agentType = agentType_;
     }
@@ -2717,7 +2741,21 @@ void LlmStreamTracker::ApplyEvent(LlmStreamEvent& ev, const std::string& line) {
     }
 
     if (ev.transient) return;  // a usage chunk: counted above, not stored
-    if (!suppressNormalizedWrite_) AppendNormalizedEvent(ev);
+    if (!suppressNormalizedWrite_) {
+        AppendNormalizedEvent(ev);
+        // If an event of another type (such as agy's "message" or "tool_result") also carried
+        // usage tokens, emit a distinct normalized "usage" event so that the task-queue usage
+        // reader and memory ingest can see the tokens.
+        const bool hasTokens = (ev.totalTokens > 0 || ev.inputTokens > 0 || ev.outputTokens > 0 ||
+                                ev.thinkingTokens > 0 || ev.cacheReadTokens > 0 || ev.cacheWriteTokens > 0 ||
+                                ev.costUsd > 0.0);
+        if (ev.type != "usage" && ev.type != "step" && hasTokens) {
+            LlmStreamEvent usageEv = ev;
+            usageEv.type = "usage";
+            usageEv.content.clear();
+            AppendNormalizedEvent(usageEv);
+        }
+    }
     try {
         events_.push_back(ev);
     } catch (const std::bad_alloc&) {

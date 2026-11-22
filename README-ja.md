@@ -120,6 +120,12 @@ New-Item -ItemType Junction -Path .claude\skills\hancho -Target (Resolve-Path sk
 
 
 
+### v0.9.40
+- **使用量グラフ（24h）**: 24h の表示は、範囲の古い部分を `usage_history.jsonl` から、直近 12 時間をメモリから読みます。直近の呼び出しが 24h から抜けなくなりました。
+- **ww のエンジン自動切り替え**: `ww-run`・`ww-watch`・`-Jobs` のタスクは、エンジンが使用上限（レート制限・クォータ・429）に達すると、`llms.json` の次の承認済みエンジンに切り替えます。`-NoEngineSwitch` または `WW_NO_ENGINE_SWITCH=1` で無効にできます。`-Provider` と `-Model`（または `WW_PROVIDER` / `WW_MODEL`）でプロバイダーとモデルを指定します。
+- **判断待ちのタスクグループ**: `waitingForLlm` のタスクグループが「保留」「待機」のフィルターに残ります。ダッシュボードと Web UI の `taskqueue list` には予定中のジョブも含まれます。
+- **権限ページ**: 選んだ対象や行を、ボタンでコピーできます。
+
 ### v0.9.39
 - **権限ページ**: すべての欄にラベルを付け、一覧の下に書き方を表示します。種類はプルダウン（`read_path`・`write_path`・`command`・`network`）から選びます。
 - **LLM で下書き**: やりたいことを普通の言葉で書いて「LLM で下書き」を押すと、読み取り専用の worker LLM が欄を提案します。終わったら欄に入ります。確認して「申請」を押すまで保存されません。

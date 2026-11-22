@@ -701,7 +701,7 @@ static void FillFailureInputBase(TaskQueueFailureInput& in, const TaskQueueJob& 
     in.idleFirstEventSec = job.idle.firstEventSec;
     in.filesNewerConfigured = !job.success.filesNewer.empty();
     in.outputRegexConfigured = !job.success.outputRegex.empty();
-    in.nowEpochSec = static_cast<int64_t>(std::time(nullptr));
+    in.nowEpochSec = GetNowEpochSec();
     in.externalRules = LoadTaskQueueFailureRules(TaskQueueFailureRulesPath());
     in.command = job.command;
     ParseCommandEngineModel(job.command, job.name, in.engine, in.model);
@@ -1241,7 +1241,7 @@ TaskQueueFailureDiagnostic ClassifyTaskQueueFailure(const TaskQueueFailureInput&
 
     TaskQueueFailureDiagnostic d;
     d.detail = nlohmann::json::object();
-    const int64_t now = in.nowEpochSec > 0 ? in.nowEpochSec : static_cast<int64_t>(std::time(nullptr));
+    const int64_t now = in.nowEpochSec > 0 ? in.nowEpochSec : GetNowEpochSec();
     FillLastActivity(d, in, now);
 
     // 0. External rules from <data-dir>/failure-rules.json run first, so they can add a
@@ -2675,7 +2675,7 @@ TaskQueueCounts TaskQueueManager::GetJobCounts() const {
                             t.tm_isdst = -1;
                             time_t startEpoch = mktime(&t);
                             if (startEpoch != static_cast<time_t>(-1)) {
-                                time_t nowEpoch = time(nullptr);
+                                time_t nowEpoch = static_cast<time_t>(GetNowEpochSec());
                                 int64_t elapsed = static_cast<int64_t>(nowEpoch - startEpoch);
                                 int64_t rem = budget - elapsed;
                                 if (rem < 0) rem = 0;
@@ -4527,7 +4527,7 @@ std::string TaskQueueManager::TaskQueueList(const std::string& taskqueue, const 
     std::lock_guard<std::mutex> lock(mutex_);
     struct ListedJob { std::string queue; TaskQueueJob job; };
     std::vector<ListedJob> listed;
-    const int64_t cutoff = static_cast<int64_t>(time(nullptr)) - sinceSec;
+    const int64_t cutoff = GetNowEpochSec() - sinceSec;
     for (const auto& [name, tq] : queues_) {
         if (!taskqueue.empty() && name != taskqueue) continue;
         for (const auto& job : tq.jobs) {
@@ -4712,7 +4712,7 @@ std::string TaskQueueManager::TaskQueueRetryFailed(const std::string& taskqueue,
             return BuildError(outError);
         }
         cb = btRetryCb_;
-        const int64_t cutoff = static_cast<int64_t>(time(nullptr)) - sinceSec;
+        const int64_t cutoff = GetNowEpochSec() - sinceSec;
         for (auto& [name, tq] : queues_) {
             if (!taskqueue.empty() && name != taskqueue) continue;
             if (taskqueue.empty() && name == "plain") continue;
@@ -5481,7 +5481,7 @@ std::string TaskQueueManager::TaskQueuePurgeOlderThan(const std::string& taskque
         outError = "task queue not found: " + taskqueue;
         return BuildError(outError);
     }
-    const int64_t cutoff = static_cast<int64_t>(time(nullptr)) - maxAgeSec;
+    const int64_t cutoff = GetNowEpochSec() - maxAgeSec;
     const std::vector<std::string> finished = {"succeeded", "failed", "cancelled", "closed"};
     size_t purged = 0;
     for (auto& [name, tq] : queues_) {

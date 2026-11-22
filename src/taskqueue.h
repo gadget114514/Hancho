@@ -1151,7 +1151,7 @@ inline int64_t SinceEpoch(const std::string& since) {
     if (since.empty()) return 0;
     int64_t secs = 0;
     if (ParseDurationToSec(since, secs)) {
-        return static_cast<int64_t>(std::time(nullptr)) - secs;
+        return GetNowEpochSec() - secs;
     }
     int y = 0, mo = 0, d = 0;
     if (ParseDateFields(since, y, mo, d)) {

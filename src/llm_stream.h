@@ -168,6 +168,8 @@ struct LlmUsagePoint {
 
 void RecordLlmUsagePoint(int64_t epochSec, const LlmUsagePoint& point);
 std::vector<LlmUsagePoint> GetLlmUsageHistory(int64_t sinceEpochSec);
+// Points from usage_history.jsonl with sinceEpochSec <= epochSec < untilEpochSec (file, not memory).
+std::vector<LlmUsagePoint> ReadUsageHistoryFile(int64_t sinceEpochSec, int64_t untilEpochSec);
 void SetUsageHistoryPersistence(bool enabled);
 bool IsUsageHistoryPersistence();
 

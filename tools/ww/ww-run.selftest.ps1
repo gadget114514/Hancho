@@ -1,4 +1,4 @@
-# ww-run.selftest.ps1 — tests for the worktree run-planning logic in ww-run.lib.ps1 and the
+﻿# ww-run.selftest.ps1 — tests for the worktree run-planning logic in ww-run.lib.ps1 and the
 # -DryRun path of ww-run.ps1.
 # Run: powershell -NoProfile -ExecutionPolicy Bypass -File Tools\ww\ww-run.selftest.ps1
 # Prints PASS/FAIL per case and exits non-zero when any case fails.
@@ -365,6 +365,59 @@ $agentJob = New-HanchoCliJob -Task "908" -Root "C:\my proj" -RunCmd "C:\my proj\
 Check ($agentJob.command -match ' -Agent hancho-runner( |$)') "job command carries -Agent"
 Check (-not ((New-HanchoCliJob -Task "909" -Root "C:\my proj" -RunCmd "C:\my proj\tools\ww\ww-run.cmd" -Engine claude).command -match '-Agent')) "job without -Agent has no -Agent"
 
+Write-Host "`n== 6c. provider, model, and llms.json candidate resolution ==" -ForegroundColor Cyan
+Check ((Get-EngineCommand -Engine opencode -Provider opencode-go -Model hy4-flash-free) -match "--model 'opencode-go/hy4-flash-free'") "opencode command composes provider/model"
+Check ((Get-EngineCommand -Engine opencode -Model 'anthropic/claude-3-5-sonnet' -Provider 'other') -match "--model 'anthropic/claude-3-5-sonnet'") "opencode keeps slash-prefixed model as is"
+Check ((Get-EngineCommand -Engine opencode -Provider opencode-go) -match "--model 'opencode-go'") "opencode uses provider as model when model is empty"
+$jobWithProv = New-HanchoCliJob -Task "910" -Root "C:\proj" -RunCmd "C:\proj\tools\ww\ww-run.cmd" -Engine opencode -Provider opencode-go -Model hy4-flash-free
+Check ($jobWithProv.command -match ' -Provider opencode-go( |$)') "job command carries -Provider"
+Check ($jobWithProv.command -match ' -Model hy4-flash-free( |$)') "job command carries -Model"
+Check ($jobWithProv.engine_switch -eq $true) "job carries engine_switch=true"
+
+Check ((Get-LimitHint "error: HTTP 429 Too Many Requests") -ne $null) "Get-LimitHint detects 429"
+Check ((Get-LimitHint "insufficient_quota: you exceeded your current quota") -ne $null) "Get-LimitHint detects quota"
+Check ($null -eq (Get-LimitHint "syntax error at line 42")) "Get-LimitHint returns null for normal failure"
+
+$llmTestDir = Join-Path $base "llm-test"
+New-Item -ItemType Directory -Force $llmTestDir | Out-Null
+$llmTestJson = Join-Path $llmTestDir "llms.json"
+Set-Content -LiteralPath $llmTestJson -Encoding UTF8 -Value @'
+{
+  "worker": [
+    { "engine": "agy", "provider": "google", "model": "gemini-3.8-flash-medium", "rank": 1, "enabled": true, "status": "approved" },
+    { "engine": "opencode", "provider": "opencode-go", "model": "hy4-flash-free", "rank": 0, "enabled": true, "status": "approved" },
+    { "engine": "claude", "provider": "anthropic", "model": "sonnet", "rank": 2, "enabled": false, "status": "approved" },
+    { "engine": "codex", "provider": "openai", "model": "o3-mini", "rank": 3, "enabled": true, "status": "proposed" }
+  ]
+}
+'@
+$candidates = Get-ApprovedWorkerCandidates -ConfigPath $llmTestJson
+Check ($candidates.Count -eq 2) "only approved and enabled rows are returned"
+Check ($candidates[0].Engine -eq 'opencode' -and $candidates[0].Rank -eq 0) "candidates are sorted by rank ascending (rank 0 opencode first)"
+Check ($candidates[0].EffectiveModel -eq 'opencode-go/hy4-flash-free') "opencode effective model combines provider/model"
+Check ($candidates[1].Engine -eq 'agy' -and $candidates[1].Rank -eq 1) "rank 1 agy is second candidate"
+
+$resDefault = Resolve-WorkerEngineAndModel -ConfigPath $llmTestJson
+Check ($resDefault.FromConfig -eq $true) "Resolve-WorkerEngineAndModel resolves from config"
+Check ($resDefault.Engine -eq 'opencode' -and $resDefault.EffectiveModel -eq 'opencode-go/hy4-flash-free') "default resolution picks rank 0 candidate"
+
+$resAgy = Resolve-WorkerEngineAndModel -ConfigPath $llmTestJson -Engine agy
+Check ($resAgy.Engine -eq 'agy' -and $resAgy.Model -eq 'gemini-3.8-flash-medium') "resolves approved model for requested engine agy"
+
+$resExplicit = Resolve-WorkerEngineAndModel -ConfigPath $llmTestJson -Engine claude -Model 'claude-haiku-5-5'
+Check ($resExplicit.Engine -eq 'claude' -and $resExplicit.Model -eq 'claude-haiku-5-5') "explicit model is kept when requested"
+
+$nextFromOpencode = Get-NextWorkerCandidate -ConfigPath $llmTestJson -CurrentEngine 'opencode' -CurrentModel 'hy4-flash-free'
+Check ($nextFromOpencode.Engine -eq 'agy' -and $nextFromOpencode.Model -eq 'gemini-3.8-flash-medium') "Get-NextWorkerCandidate switches from rank 0 opencode to rank 1 agy"
+
+$fallbackDefault = Get-NextWorkerCandidate -CurrentEngine 'agy'
+Check ($fallbackDefault.Engine -eq 'opencode') "Get-NextWorkerCandidate falls back to opencode when agy and no config"
+
+$fbDryOut = & powershell.exe -NoProfile -ExecutionPolicy Bypass -File (Join-Path $PSScriptRoot "ww-run-fallback.ps1") 901 -Root $llmTestDir -DryRun
+$fbDryStr = $fbDryOut -join "`n"
+Check ([bool]($fbDryStr -match 'would run: .* -Engine opencode .* -Model opencode-go/hy4-flash-free')) "ww-run-fallback auto-selects rank 0 as primary from llms.json"
+Check ([bool]($fbDryStr -match 'fallback: .* -Engine agy .* -Model gemini-3.8-flash-medium')) "ww-run-fallback auto-selects rank 1 as fallback from llms.json"
+
 Write-Host "`n== 7. card estimate parsing ==" -ForegroundColor Cyan
 $estCard = Join-Path $base "estimate-card.md"
 Set-Content -LiteralPath $estCard -Value "# 907`n`n- Estimate 60 min; stop at 120.`n" -Encoding UTF8
@@ -510,7 +563,7 @@ $runOut = Join-Path $base "run-out.txt"
 try {
     $env:WW_TEST_ENGINE_COMMAND = "& powershell.exe -NoProfile -ExecutionPolicy Bypass -File '$fakeEngine'"
     # Started with redirected output and a deadline, so a regression fails here instead of hanging.
-    $runProc = Start-Process powershell -ArgumentList '-NoProfile', '-ExecutionPolicy', 'Bypass', '-File', (Join-Path $PSScriptRoot "ww-run.ps1"), '901', '-Root', $runRepo, '-Engine', 'claude' -PassThru -WindowStyle Hidden -RedirectStandardOutput $runOut
+    $runProc = Start-Process powershell -ArgumentList '-NoProfile', '-ExecutionPolicy', 'Bypass', '-File', (Join-Path $PSScriptRoot "ww-run.ps1"), '901', '-Root', $runRepo, '-Engine', 'claude', '-Standalone' -PassThru -WindowStyle Hidden -RedirectStandardOutput $runOut
     $finished = $runProc.WaitForExit(90000)
     if (-not $finished) { & taskkill /PID $runProc.Id /T /F | Out-Null }
     # Start-Process leaves ExitCode null on Windows PowerShell 5.1 (see ww-watch.ps1), so read the
@@ -527,6 +580,23 @@ Check (Test-Path $lastRecord) "last record is written (finally block reached)"
 $orphans = @(Get-CimInstance Win32_Process -Filter "Name='powershell.exe'" | Where-Object { $_.CommandLine -match 'ww-selftest-orphan' })
 Check ($orphans.Count -eq 0) "the child left behind by the engine was stopped"
 foreach ($o in $orphans) { & taskkill /PID $o.ProcessId /F | Out-Null }
+
+Write-Host "`n== 11. Hancho launch guard ==" -ForegroundColor Cyan
+$guardOut = & powershell.exe -NoProfile -ExecutionPolicy Bypass -File (Join-Path $PSScriptRoot "ww-run.ps1") 901 -Root $runRepo 2>&1
+$guardExit = $LASTEXITCODE
+Check ($guardExit -eq 1) "direct run without Hancho or -Standalone is refused with exit 1"
+Check ($guardOut -match "REFUSED: ww runs must be launched via Hancho") "refusal message explains Hancho requirement"
+
+$guardPassOut = & powershell.exe -NoProfile -ExecutionPolicy Bypass -File (Join-Path $PSScriptRoot "ww-run.ps1") 901 -Root $runRepo -Standalone -DryRun 2>&1
+Check ($LASTEXITCODE -eq 0) "direct run with -Standalone is accepted"
+
+$env:HANCHO_ACTIVE = "1"
+try {
+    $hanchoRunOut = & powershell.exe -NoProfile -ExecutionPolicy Bypass -File (Join-Path $PSScriptRoot "ww-run.ps1") 901 -Root $runRepo -DryRun 2>&1
+    Check ($LASTEXITCODE -eq 0) "run with HANCHO_ACTIVE=1 is accepted without -Standalone"
+} finally {
+    Remove-Item env:HANCHO_ACTIVE -ErrorAction SilentlyContinue
+}
 
 Write-Host "`n== summary ==" -ForegroundColor Cyan
 Write-Host "pass=$($script:pass) fail=$($script:fail)"

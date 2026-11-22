@@ -94,6 +94,25 @@ static std::string StripGroupRowPrefix(const std::string& id) {
     return id.rfind("group:", 0) == 0 ? id.substr(6) : id;
 }
 
+static std::string AsciiLower(std::string s) {
+    for (char& c : s) c = static_cast<char>(std::tolower(static_cast<unsigned char>(c)));
+    return s;
+}
+
+// A task group waiting for a decision is reported as "waitingForLlm". Callers often ask
+// for "waiting" instead, so treat that as an alias; otherwise the row silently disappears
+// from exactly the list a supervisor uses to decide whether to answer an escalation.
+static bool TaskGroupStateMatches(const std::string& filter, const std::string& state) {
+    if (filter.empty()) return true;
+    const std::string f = AsciiLower(filter);
+    const std::string s = AsciiLower(state);
+    if (f == s) return true;
+    if (f == "waiting" || f == "awaiting" || f == "awaiting_decision" || f == "awaitingdecision") {
+        return s == "waitingforllm" || s == "paused";
+    }
+    return false;
+}
+
 static std::string ExtractRawJsonValue(const std::string& json, const std::string& key) {
     std::string pattern = "\"" + key + "\"";
     size_t keyPos = json.find(pattern);
@@ -1785,7 +1804,7 @@ std::string IpcServer::HandleRequestJson(const std::string& reqJson) {
     }
     else if (action == "get_usage_history") {
         int sinceSec = static_cast<int>(JsonGetInt(reqJson, "since_sec", 86400));
-        int64_t since = static_cast<int64_t>(time(nullptr)) - sinceSec;
+        int64_t since = GetNowEpochSec() - sinceSec;
         std::vector<LlmUsagePoint> pts = GetLlmUsageHistory(since);
         oss << "{\"ok\":true,\"record_calls\":" << GetLlmUsageRecordCalls()
             << ",\"count\":" << pts.size() << ",\"points\":[";
@@ -2062,7 +2081,7 @@ std::string IpcServer::HandleRequestJson(const std::string& reqJson) {
                         for (const auto& g : info.groups) {
                             if (!tqFilter.empty() && g.taskqueue != tqFilter) continue;
                             if (!btFilter.empty() && g.id != btFilter) continue;
-                            if (!stateFilter.empty() && stateFilter != g.state) continue;
+                            if (!TaskGroupStateMatches(stateFilter, g.state)) continue;
                             nlohmann::json job;
                             job["id"] = "group:" + g.id;
                             job["summary"] = g.summary.empty() ? g.id : g.summary;
@@ -2070,6 +2089,7 @@ std::string IpcServer::HandleRequestJson(const std::string& reqJson) {
                             job["virtual"] = true;
                             job["taskqueue"] = g.taskqueue;
                             job["created_at"] = "";
+                            job["start_time"] = g.startTime;
                             job["group"] = {{"id", g.id}, {"detail", g.detail}};
                             // Group rows show the origin of the tree, like the jobs it adds.
                             const std::string groupOrigin = tqm_.BtOriginJson(g.id);

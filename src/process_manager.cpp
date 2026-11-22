@@ -260,6 +260,7 @@ int ProcessManager::StartProcess(const StartProcessRequest& req, std::string& ou
     // HANCHO_EVENT_PIPE: a per-process named pipe that the CLI (or a wrapper) can write
     // hancho.event/1 lines to. Only pipe-mode workers with streaming get one.
     std::map<std::string, std::string> childEnvVars = req.env;
+    childEnvVars["HANCHO_ACTIVE"] = "1";
     std::wstring eventPipeName;
     HANDLE hEventPipe = nullptr;
     if (req.mode == ExecMode::Pipe && (req.jsonStream || !req.agentType.empty()) &&
@@ -301,7 +302,7 @@ int ProcessManager::StartProcess(const StartProcessRequest& req, std::string& ou
 
     uint64_t now = GetNowTickMs();
      proc->startTimeStr = GetCurrentTimestampStr();
-     proc->startEpochSec = static_cast<int64_t>(time(nullptr));
+     proc->startEpochSec = GetNowEpochSec();
     proc->startTickMs = now;
     proc->lastOutputTickMs = now;
     proc->lastCpuActivityTickMs = now;
@@ -817,7 +818,7 @@ void ProcessManager::TerminateJobInternal(ManagedProcess& proc, ProcState finalS
     if (elapsedMs > pausedMs) elapsedMs -= pausedMs; else elapsedMs = 0;
     std::string endTimeStr = GetCurrentTimestampStr();
      proc.endTimeStr = endTimeStr;
-     proc.endEpochSec = static_cast<int64_t>(time(nullptr));
+     proc.endEpochSec = GetNowEpochSec();
     proc.restoredElapsedMs = elapsedMs;
 
     if (!reasonMsg.empty()) {
@@ -921,7 +922,7 @@ void ProcessManager::MonitorThreadFunc() {
                     if (elapsedMs > pausedMs) elapsedMs -= pausedMs; else elapsedMs = 0;
                     std::string endTimeStr = GetCurrentTimestampStr();
                     proc->endTimeStr = endTimeStr;
-     proc->endEpochSec = static_cast<int64_t>(time(nullptr));
+     proc->endEpochSec = GetNowEpochSec();
                     proc->restoredElapsedMs = elapsedMs;
                     if (!proc->logFilePathWide.empty()) {
                         std::ostringstream ftr;

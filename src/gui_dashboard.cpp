@@ -98,6 +98,8 @@ constexpr UINT_PTR TIMER_HINT_COUNTDOWN_ID = 4; // countdown for supervisor guid
 constexpr UINT_PTR TIMER_QUIT_WAIT_ID = 5;     // waits for the core to exit after "Quit Hancho"
 constexpr UINT_PTR TIMER_TRIAGE_LAYOUT_ID = 6; // coalesces expensive triage layout during resize/drag
 constexpr UINT_PTR TIMER_TRIAGE_SETTLE_ID = 7; // repaints children once after a resize/drag settles
+constexpr UINT_PTR TIMER_DASH_LAYOUT_ID = 8;   // coalesces expensive dashboard layout during splitter drag / resize
+constexpr UINT kDashLayoutThrottleMs    = 16;  // ~60fps smooth tracking
 constexpr UINT kEndBlinkTimerMs = 200;         // repaint period while a blink is running
 constexpr ULONGLONG kEndBlinkHalfPeriodMs = 400;  // on/off toggle period of the blink
 constexpr int kDefaultEndBlinkSec = 5;
@@ -880,6 +882,7 @@ struct DashboardState {
     std::string triageLlmMode = "uncertain";
     std::string triageLlmPermissions = "read_files";
     std::string currentTriageCardId;
+    bool triageBaselineDone = false; // older triage cards are never toasted on startup
     int chatUnread = 0;      // unread Chat messages (badge on the Chat toolbar button)
     uint64_t lastChatPollTickMs = 0;
     bool chatBaselineDone = false;   // older Chat messages are never announced
@@ -929,6 +932,11 @@ struct DashboardState {
     RECT rcTaskCaption = {};
     int taskCaptionExtraLeft = 0; // x where the failure summary starts (after the search button/edit)
     bool rowsSplitterDragging = false;
+    uint64_t lastSplitterLayoutTickMs = 0;  // timestamp of the last splitter drag layout
+    bool splitterLayoutPending = false;     // true if TIMER_DASH_LAYOUT_ID is active
+    POINT pendingSplitterPt = {};           // latest mouse coords buffered during drag
+    int lastToolbarWidth = -1;
+    int lastToolbarUsageOffset = -1;
     int lastTotalListHeight = 0;
     std::vector<std::string> taskJobIds;
     std::vector<std::string> taskJobStates;
@@ -1439,6 +1447,13 @@ static std::string TaskQueueListIpc(DashboardState* st, const std::string& taskq
     nlohmann::json resp;
     if (GuiIpcCall(st, req, resp, &outErr)) {
         return resp.dump();
+    }
+    // A read-only list is safe to retry in-process even after an IPC timeout. Going straight
+    // to TaskQueueManager here would drop the virtual task-group rows, so a waitingForLlm
+    // tree would disappear from the table for the ticks where IPC did not answer.
+    if (st && st->ipc) {
+        std::string direct = st->ipc->HandleRequestJson(req.dump());
+        if (!direct.empty()) return direct;
     }
     if (st && st->tqm) {
         return st->tqm->TaskQueueList(taskqueue, state, sinceSec, outErr, origin, bt,
@@ -3224,6 +3239,7 @@ static bool TickEndBlink(DashboardState* st) {
 }
 
 static void RefreshDashboardData(DashboardState* st);
+static void ShowBtDebugDialog(DashboardState* st, const std::string& selectTreeId = "");
 static void SyncTermSessionNotifications(DashboardState* st);
 static void SyncStreamPane(DashboardState* st);
 static void EnsureStreamPane(DashboardState* st);
@@ -4406,14 +4422,7 @@ static LRESULT CALLBACK PastRunsWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPAR
 static void ShowTaskQueueJobDetails(DashboardState* st, const std::string& jobId, int initialTab = 0) {
     if (!st || jobId.empty()) return;
     if (jobId.rfind("group:", 0) == 0) {
-        gui_platform::GetGuiPlatform()->ShowMessageBox(
-            st->hwndMain,
-            Tr(L"タスクグループ", L"Task Group", L"Grupo de tareas"),
-            Tr(L"これはタスクグループです。「予定 (未登録)」行はこのグループに属します。\nグループの状態や進み具合はタスクグループ表示で確認できます。\n失敗したグループは、再実行するか closed にするまで一覧に残ります。",
-               L"This is a task group. The \"planned\" rows belong to it.\nOpen the task group view to see its state and progress.\nA failed group stays in the list until you retry or close it.",
-               L"Este es un grupo de tareas. Las filas «previstas» le pertenecen.\nAbre la vista del grupo para ver su estado y progreso.\nUn grupo fallido permanece en la lista hasta que lo reintentes o cierres."),
-            gui_platform::MessageBoxType::Info,
-            false);
+        ShowBtDebugDialog(st, jobId.substr(6));
         return;
     }
     if (jobId.rfind("btplan:", 0) == 0) {
@@ -6515,7 +6524,11 @@ static void TaskUsageAccumulateFile(DashboardState* st, const std::wstring& path
                         entry.rateLimitResetsAtSec = data.value("resetsAt", int64_t{0});
                         continue;
                     }
-                    if (kind != "usage") continue;
+                    const bool isUsageKind = (kind == "usage");
+                    const bool hasUsageFields = (dataIt != ev.end() && dataIt->is_object() &&
+                        (dataIt->contains("inputTokens") || dataIt->contains("totalTokens") ||
+                         dataIt->contains("outputTokens") || dataIt->contains("cacheReadTokens")));
+                    if (!isUsageKind && !hasUsageFields) continue;
                     if (dataIt == ev.end() || !dataIt->is_object()) continue;
                     const auto& data = *dataIt;
                     const uint64_t inTok = data.value("inputTokens", uint64_t{0});
@@ -6524,7 +6537,8 @@ static void TaskUsageAccumulateFile(DashboardState* st, const std::wstring& path
                     const uint64_t cacheRead = data.value("cacheReadTokens", uint64_t{0});
                     const uint64_t cacheWrite = data.value("cacheWriteTokens", uint64_t{0});
                     uint64_t total = data.value("totalTokens", uint64_t{0});
-                    if (total == 0) total = inTok + outTok + thinkTok + cacheRead + cacheWrite;
+                    const uint64_t sumWithCache = inTok + outTok + thinkTok + cacheRead + cacheWrite;
+                    if (sumWithCache > total) total = sumWithCache;
                     const double cost = data.value("costUsd", 0.0);
                     entry.inputTokens += inTok;
                     entry.outputTokens += outTok;
@@ -6558,6 +6572,71 @@ static void TaskUsageAccumulateFile(DashboardState* st, const std::wstring& path
     }
 }
 
+// Fallback: if .events.jsonl had no usage events (e.g. older agy runs), scan _stream.jsonl
+static void TaskUsageAccumulateStreamFile(DashboardState* st, const std::wstring& path, TaskOwnerUsage& out) {
+    TaskUsageFileCache& entry = st->taskUsageFileCache[path];
+    WIN32_FILE_ATTRIBUTE_DATA fad = {};
+    if (!GetFileAttributesExW(path.c_str(), GetFileExInfoStandard, &fad)) {
+        entry = TaskUsageFileCache();
+    } else {
+        const uint64_t size = (static_cast<uint64_t>(fad.nFileSizeHigh) << 32) | fad.nFileSizeLow;
+        if (size < entry.offset) entry = TaskUsageFileCache();
+        if (size > entry.offset) {
+            std::ifstream in(path, std::ios::binary);
+            if (in) {
+                in.seekg(static_cast<std::streamoff>(entry.offset), std::ios::beg);
+                std::string chunk((std::istreambuf_iterator<char>(in)), std::istreambuf_iterator<char>());
+                size_t lineStart = 0;
+                while (lineStart < chunk.size()) {
+                    const size_t lineEnd = chunk.find('\n', lineStart);
+                    if (lineEnd == std::string::npos) break;
+                    std::string line = chunk.substr(lineStart, lineEnd - lineStart);
+                    lineStart = lineEnd + 1;
+                    if (!line.empty() && line.back() == '\r') line.pop_back();
+                    if (line.empty()) continue;
+                    nlohmann::json j = nlohmann::json::parse(line, nullptr, false);
+                    if (j.is_discarded() || !j.is_object()) continue;
+                    const nlohmann::json* u = nullptr;
+                    if (j.contains("step_update") && j["step_update"].is_object() &&
+                        j["step_update"].contains("usage") && j["step_update"]["usage"].is_object()) {
+                        u = &j["step_update"]["usage"];
+                    } else if (j.contains("usage") && j["usage"].is_object()) {
+                        u = &j["usage"];
+                    }
+                    if (u) {
+                        uint64_t inTok = u->value("input_tokens", u->value("inputTokens", uint64_t{0}));
+                        uint64_t outTok = u->value("output_tokens", u->value("outputTokens", uint64_t{0}));
+                        uint64_t thinkTok = u->value("thinking_tokens", u->value("thinkingTokens", uint64_t{0}));
+                        uint64_t cacheRead = u->value("cache_read_tokens", u->value("cacheReadTokens", uint64_t{0}));
+                        uint64_t cacheWrite = u->value("cache_write_tokens", u->value("cacheWriteTokens", uint64_t{0}));
+                        uint64_t total = u->value("total_tokens", u->value("totalTokens", uint64_t{0}));
+                        const uint64_t sumWithCache = inTok + outTok + thinkTok + cacheRead + cacheWrite;
+                        if (sumWithCache > total) total = sumWithCache;
+                        const double cost = u->value("cost_usd", u->value("costUsd", 0.0));
+                        entry.inputTokens += inTok;
+                        entry.outputTokens += outTok;
+                        entry.thinkingTokens += thinkTok;
+                        entry.cacheReadTokens += cacheRead;
+                        entry.cacheWriteTokens += cacheWrite;
+                        entry.totalTokens += total;
+                        entry.costUsd += cost;
+                        if (total > 0 || cost > 0.0) entry.hasUsage = true;
+                    }
+                }
+                entry.offset += lineStart;
+            }
+        }
+    }
+    out.inputTokens += entry.inputTokens;
+    out.outputTokens += entry.outputTokens;
+    out.thinkingTokens += entry.thinkingTokens;
+    out.cacheReadTokens += entry.cacheReadTokens;
+    out.cacheWriteTokens += entry.cacheWriteTokens;
+    out.totalTokens += entry.totalTokens;
+    out.costUsd += entry.costUsd;
+    if (entry.hasUsage) out.hasUsage = true;
+}
+
 static TaskOwnerUsage TaskOwnerUsageForJob(DashboardState* st, const std::string& jobId,
                                            const std::string& jobJson, const std::string& command) {
     TaskOwnerUsage out;
@@ -6572,13 +6651,13 @@ static TaskOwnerUsage TaskOwnerUsageForJob(DashboardState* st, const std::string
         std::wstring eventsPath;
         auto cached = st->taskAttemptEventsPath.find(cacheKey);
         if (cached != st->taskAttemptEventsPath.end()) eventsPath = cached->second;
+        const bool remote = !JsonGetString(attemptJson, "remote_host", "").empty();
+        const int64_t pid = JsonGetInt(attemptJson, "process_id", 0);
         if (eventsPath.empty()) {
             const std::wstring jobEvents = PathJoinWide(
                 tqDir, Utf8ToWide(SanitizeFileNameComponent(jobId)) + L"." + std::to_wstring(n) + L".events.jsonl");
             // Remote attempts keep their events in the job's own file; local ones are written by
             // the worker process as logs/proc_<pid>_<name>.events.jsonl (same source memory uses).
-            const bool remote = !JsonGetString(attemptJson, "remote_host", "").empty();
-            const int64_t pid = JsonGetInt(attemptJson, "process_id", 0);
             if (!remote && pid > 0) {
                 auto procFiles = ListDirectoryWide(
                     logsDir, L"proc_" + std::to_wstring(pid) + L"_*.events.jsonl");
@@ -6591,6 +6670,15 @@ static TaskOwnerUsage TaskOwnerUsageForJob(DashboardState* st, const std::string
             if (!eventsPath.empty()) st->taskAttemptEventsPath[cacheKey] = eventsPath;
         }
         if (!eventsPath.empty()) TaskUsageAccumulateFile(st, eventsPath, out);
+        // Fallback: if .events.jsonl yielded no usage (e.g. agy runs before usage was normalized),
+        // read the raw stream file to recover tokens and cost.
+        if (!out.hasUsage && !remote && pid > 0) {
+            auto streamFiles = ListDirectoryWide(
+                logsDir, L"proc_" + std::to_wstring(pid) + L"_*_stream.jsonl");
+            if (!streamFiles.empty()) {
+                TaskUsageAccumulateStreamFile(st, streamFiles.front(), out);
+            }
+        }
     }
     return out;
 }
@@ -6631,6 +6719,17 @@ static void UpdateTaskOriginCombo(DashboardState* st, const std::map<std::wstrin
     }
 }
 
+// States whose rows can change without the JSON itself changing (countdowns, blink, escalation
+// hint). A waitingForLlm task group is exactly such a row, so it must keep the list refreshing
+// even when no real job is running.
+static bool TaskListHasLiveState(const std::string& json) {
+    static const char* kLiveStates[] = {"running", "waitingForLlm", "paused", "planned"};
+    for (const char* state : kLiveStates) {
+        if (json.find(std::string("\"state\":\"") + state + "\"") != std::string::npos) return true;
+    }
+    return false;
+}
+
 static void RefreshTaskQueueData(DashboardState* st, bool force = false, bool useCachedList = false) {
     if (!st || !st->hwndTaskList) return;
     if (st->listDisplayMode == ListDisplayMode::ProcessOnly) return;
@@ -6645,7 +6744,7 @@ static void RefreshTaskQueueData(DashboardState* st, bool force = false, bool us
     int lang = static_cast<int>(g_uiLanguage);
     const bool settling = GetTickCount64() < st->taskUsagePollUntilMs;
     if (!force && !settling && resp == st->lastTaskListJson && lang == st->lastTaskListLang &&
-        resp.find("\"state\":\"running\"") == std::string::npos) {
+        !TaskListHasLiveState(resp)) {
         return;
     }
     const bool taskListChanged = (resp != st->lastTaskListJson);
@@ -6770,6 +6869,9 @@ static void RefreshTaskQueueData(DashboardState* st, bool force = false, bool us
         if (!notes.empty()) stateStr += L" \U0001F4DD";
         std::string attemptStart = LastAttemptField(j, "start");
         std::string attemptEnd = LastAttemptField(j, "end");
+        const bool groupRowForTime = jobId.rfind("group:", 0) == 0;
+        const std::string groupStart = (groupRowForTime && attemptStart.empty())
+                                           ? JsonGetString(j, "start_time", "") : std::string();
         // The column shows the time of day only, but the sort uses the full date and time.
         const int64_t startEpochSec = attemptStart.empty() ? 0 : ParseTimestampStrToEpoch(attemptStart);
         int64_t endEpochSec = attemptEnd.empty() ? 0 : ParseTimestampStrToEpoch(attemptEnd);
@@ -6788,7 +6890,7 @@ static void RefreshTaskQueueData(DashboardState* st, bool force = false, bool us
                 int estimateSec = static_cast<int>(JsonGetInt(j, "estimate_sec", 0));
                 int budgetSec = estimateSec > 0 ? estimateSec : timeoutSec;
                 const int64_t elapsed = startEpochSec > 0
-                    ? (std::max)(static_cast<int64_t>(0), static_cast<int64_t>(time(nullptr) - startEpochSec)) : -1;
+                    ? (std::max)(static_cast<int64_t>(0), (GetNowEpochSec() - startEpochSec)) : -1;
                 const std::string est = budgetSec > 0 ? AddSecondsToTimestamp(attemptStart, budgetSec) : std::string();
                 // The remaining time comes first, so it stays visible even when the column is narrow.
                 if (budgetSec > 0 && elapsed >= 0) {
@@ -6813,6 +6915,8 @@ static void RefreshTaskQueueData(DashboardState* st, bool force = false, bool us
                 // The estimated end of the running attempt, with its date.
                 if (budgetSec > 0 && startEpochSec > 0) endEpochSec = startEpochSec + budgetSec;
             }
+        } else if (!groupStart.empty()) {
+            startStr = Utf8ToWide(TimeOfDayText(groupStart));
         } else if (state == "pending" || state == "planned") {
             int timeoutSec = static_cast<int>(JsonGetInt(j, "timeout_sec", 0));
             int estimateSec = static_cast<int>(JsonGetInt(j, "estimate_sec", 0));
@@ -6826,7 +6930,7 @@ static void RefreshTaskQueueData(DashboardState* st, bool force = false, bool us
                 if (createdEpoch > 0) endEpochSec = createdEpoch + budgetSec;
             }
         }
-        row.startKey = startEpochSec;
+        row.startKey = startEpochSec > 0 ? startEpochSec : ParseTimestampStrToEpoch(groupStart);
         row.endKey = endEpochSec;
         // Follow a task only when its process has just started, so a selection made by hand is kept.
         if (state == "running") {
@@ -6976,7 +7080,10 @@ static void RefreshTaskQueueData(DashboardState* st, bool force = false, bool us
         row.cells[11] = std::move(ownerUsageStr);
         row.cells[12] = std::move(resourcesStr);
         if (!row.cells[10].empty()) ++originCounts[row.cells[10]];
-        if (!st->taskOriginFilter.empty() && row.cells[10] != st->taskOriginFilter) continue;
+        // Virtual BT rows have no origin of their own. An origin filter must never hide the
+        // task group a decision belongs to, otherwise a waitingForLlm tree vanishes from the list.
+        if (!st->taskOriginFilter.empty() && TaskRowIsRealJob(jobId) &&
+            row.cells[10] != st->taskOriginFilter) continue;
         if (!st->taskSearchText.empty()) {
             bool matches = false;
             for (const auto& cell : row.cells) {
@@ -7027,7 +7134,7 @@ static void RefreshTaskQueueData(DashboardState* st, bool force = false, bool us
         }
     }
     // Poll a little longer so a final usage / cost event written after the end is picked up.
-    if (justEnded) st->taskUsagePollUntilMs = GetTickCount64() + 5000;
+    if (justEnded) st->taskUsagePollUntilMs = GetTickCount64() + 15000;
     st->runningTaskJobs = std::move(nowRunning);
     st->taskJobStates = std::move(newJobStates);
     st->taskJobProcIds = std::move(newJobProcIds);
@@ -7852,14 +7959,21 @@ static void LayoutControls(DashboardState* st, int width, int height) {
     const int gap = 7;
     int xCur = margin;
     int yBar = kToolbarTop + usageOffset;
+    const bool toolbarMoved = (width != st->lastToolbarWidth || usageOffset != st->lastToolbarUsageOffset);
     for (const auto& b : buttons) {
         if (!b.hwnd) continue;
         if (xCur > margin && xCur + b.w > width - margin) {
             xCur = margin;
             yBar += kToolbarH + 4;
         }
-        MoveWindow(b.hwnd, xCur, yBar, b.w, kToolbarH, TRUE);
+        if (toolbarMoved) {
+            MoveWindow(b.hwnd, xCur, yBar, b.w, kToolbarH, TRUE);
+        }
         xCur += b.w + gap;
+    }
+    if (toolbarMoved) {
+        st->lastToolbarWidth = width;
+        st->lastToolbarUsageOffset = usageOffset;
     }
     st->processListTop = yBar + kToolbarH + 6;
 
@@ -8015,14 +8129,33 @@ static void LayoutControls(DashboardState* st, int width, int height) {
             return cap.left + 12;
         }
         int labelW = 0;
-        if (HDC hdc = GetDC(st->hwndMain)) {
-            HGDIOBJ of = SelectObject(hdc, st->hFontUiBold ? static_cast<HGDIOBJ>(st->hFontUiBold)
-                                                           : GetStockObject(DEFAULT_GUI_FONT));
-            SIZE sz = {};
-            GetTextExtentPoint32W(hdc, label, static_cast<int>(wcslen(label)), &sz);
-            SelectObject(hdc, of);
-            ReleaseDC(st->hwndMain, hdc);
-            labelW = sz.cx;
+        if (st && st->hwndMain) {
+            struct CaptionWidthEntry {
+                std::wstring text;
+                HFONT font = nullptr;
+                int width = 0;
+            };
+            static std::vector<CaptionWidthEntry> s_captionWidthCache;
+            bool found = false;
+            for (const auto& e : s_captionWidthCache) {
+                if (e.font == st->hFontUiBold && e.text == label) {
+                    labelW = e.width;
+                    found = true;
+                    break;
+                }
+            }
+            if (!found) {
+                if (HDC hdc = GetDC(st->hwndMain)) {
+                    HGDIOBJ of = SelectObject(hdc, st->hFontUiBold ? static_cast<HGDIOBJ>(st->hFontUiBold)
+                                                                   : GetStockObject(DEFAULT_GUI_FONT));
+                    SIZE sz = {};
+                    GetTextExtentPoint32W(hdc, label, static_cast<int>(wcslen(label)), &sz);
+                    SelectObject(hdc, of);
+                    ReleaseDC(st->hwndMain, hdc);
+                    labelW = sz.cx;
+                }
+                s_captionWidthCache.push_back({label, st->hFontUiBold, labelW});
+            }
         }
         const int h = (std::max)(18, capH - 4);
         const int y = cap.top + 2;
@@ -8065,6 +8198,396 @@ static void LayoutControls(DashboardState* st, int width, int height) {
 
     UpdateTaskListColumnWidths(st);
     LayoutTerminalViews(st);
+}
+
+static void ApplySplitterDragLayout(HWND hwnd, DashboardState* st, POINT pt) {
+    if (!st) return;
+
+    if (st->rowsSplitterDragging) {
+        if (st->lastTotalListHeight < kMinRowListH * 2) return;
+        int relY = pt.y - st->processListTop;
+        float ratio = static_cast<float>(relY) / static_cast<float>(st->lastTotalListHeight);
+        ratio = (std::clamp)(ratio, static_cast<float>(kMinRowListH) / static_cast<float>(st->lastTotalListHeight),
+                             1.0f - static_cast<float>(kMinRowListH) / static_cast<float>(st->lastTotalListHeight));
+        st->procRowRatio = ratio;
+
+        RECT rcClient = {};
+        GetClientRect(hwnd, &rcClient);
+        int width = rcClient.right;
+        int margin = 10;
+        int topList = st->processListTop;
+
+        int availForRows = st->lastTotalListHeight;
+        int procH = static_cast<int>(availForRows * st->procRowRatio);
+        if (procH < kMinRowListH) procH = kMinRowListH;
+        if (procH > availForRows - kMinRowListH) procH = availForRows - kMinRowListH;
+        int taskH = availForRows - procH;
+        if (taskH < kMinRowListH) {
+            taskH = kMinRowListH;
+            procH = availForRows - taskH;
+        }
+        int splitterTop = topList + procH;
+        int taskTop = splitterTop + kRowSplitterH;
+
+        RECT oldSplitter = st->rcRowsSplitter;
+        RECT oldTaskCaption = st->rcTaskCaption;
+
+        st->rcRowsSplitter = {margin, splitterTop, width - margin, splitterTop + kRowSplitterH};
+        st->rcProcCaption = {margin, topList, width - margin, topList + kListCaptionH};
+        st->rcTaskCaption = {margin, taskTop, width - margin, taskTop + kListCaptionH};
+
+        HDWP hdwp = BeginDeferWindowPos(5);
+        if (hdwp && st->hwndList) {
+            hdwp = DeferWindowPos(hdwp, st->hwndList, nullptr, margin, topList + kListCaptionH,
+                                  width - margin * 2, (std::max)(0, procH - kListCaptionH),
+                                  SWP_NOZORDER | SWP_NOACTIVATE | SWP_NOCOPYBITS);
+        }
+        if (hdwp && st->hwndTaskList) {
+            hdwp = DeferWindowPos(hdwp, st->hwndTaskList, nullptr, margin, taskTop + kListCaptionH,
+                                  width - margin * 2, (std::max)(0, taskH - kListCaptionH),
+                                  SWP_NOZORDER | SWP_NOACTIVATE | SWP_NOCOPYBITS);
+        }
+        if (hdwp && st->hwndSearchTaskBtn && IsWindowVisible(st->hwndSearchTaskBtn)) {
+            RECT rcBtn = {};
+            GetWindowRect(st->hwndSearchTaskBtn, &rcBtn);
+            MapWindowPoints(nullptr, hwnd, reinterpret_cast<POINT*>(&rcBtn), 2);
+            hdwp = DeferWindowPos(hdwp, st->hwndSearchTaskBtn, nullptr, rcBtn.left, taskTop + 2,
+                                  rcBtn.right - rcBtn.left, rcBtn.bottom - rcBtn.top,
+                                  SWP_NOZORDER | SWP_NOACTIVATE | SWP_NOCOPYBITS);
+        }
+        if (hdwp && st->hwndSearchTaskEdit && IsWindowVisible(st->hwndSearchTaskEdit)) {
+            RECT rcEdit = {};
+            GetWindowRect(st->hwndSearchTaskEdit, &rcEdit);
+            MapWindowPoints(nullptr, hwnd, reinterpret_cast<POINT*>(&rcEdit), 2);
+            hdwp = DeferWindowPos(hdwp, st->hwndSearchTaskEdit, nullptr, rcEdit.left, taskTop + 2,
+                                  rcEdit.right - rcEdit.left, rcEdit.bottom - rcEdit.top,
+                                  SWP_NOZORDER | SWP_NOACTIVATE | SWP_NOCOPYBITS);
+        }
+        if (hdwp && st->hwndTaskOriginCombo && IsWindowVisible(st->hwndTaskOriginCombo)) {
+            RECT rcCombo = {};
+            GetWindowRect(st->hwndTaskOriginCombo, &rcCombo);
+            MapWindowPoints(nullptr, hwnd, reinterpret_cast<POINT*>(&rcCombo), 2);
+            hdwp = DeferWindowPos(hdwp, st->hwndTaskOriginCombo, nullptr, rcCombo.left, taskTop + 2,
+                                  rcCombo.right - rcCombo.left, rcCombo.bottom - rcCombo.top,
+                                  SWP_NOZORDER | SWP_NOACTIVATE | SWP_NOCOPYBITS);
+        }
+        if (hdwp) EndDeferWindowPos(hdwp);
+
+        RECT rcDirty = {};
+        UnionRect(&rcDirty, &oldSplitter, &st->rcRowsSplitter);
+        rcDirty.top -= 2;
+        rcDirty.bottom += 2;
+        InvalidateRect(hwnd, &rcDirty, FALSE);
+
+        RECT rcCapDirty = {};
+        UnionRect(&rcCapDirty, &oldTaskCaption, &st->rcTaskCaption);
+        rcCapDirty.top -= 2;
+        rcCapDirty.bottom += 2;
+        InvalidateRect(hwnd, &rcCapDirty, FALSE);
+        return;
+    }
+
+    if (st->splitterDragging) {
+        RECT rcClient = {};
+        GetClientRect(hwnd, &rcClient);
+        int width = rcClient.right;
+        int height = rcClient.bottom;
+        int margin = 10;
+        int topList = st->processListTop;
+        int availVert = height - topList - kStatusBarH - margin;
+        int maxListH = (std::max)(kMinListH, availVert - kTabH - 2 - kMinTerminalH);
+
+        int areaH = pt.y - topList;
+        if (areaH < kMinListH) areaH = kMinListH;
+        if (areaH > maxListH) areaH = maxListH;
+        st->processListHeight = areaH;
+
+        RECT oldSplitter = st->rcSplitter;
+        RECT oldBanner = st->termBanners.empty() ? RECT{} : st->termBanners[0].rcBorder;
+        RECT oldRowsSplitter = st->rcRowsSplitter;
+        RECT oldTaskCaption = st->rcTaskCaption;
+        RECT oldStreamSplitter = st->rcStreamSplitter;
+
+        int listH = areaH;
+        int paneH = 0;
+        if (st->showStreamPane) {
+            int maxPaneH = areaH - kMinListH - kRowSplitterH;
+            if (maxPaneH >= kMinStreamPaneH) {
+                paneH = (std::clamp)(st->streamPaneHeight, kMinStreamPaneH, maxPaneH);
+                listH = areaH - paneH - kRowSplitterH;
+            }
+        }
+
+        int splitTop = topList + listH;
+        if (paneH > 0) {
+            st->rcStreamSplitter = {margin, splitTop, width - margin, splitTop + kRowSplitterH};
+            st->streamPaneBottom = topList + areaH;
+        } else {
+            st->rcStreamSplitter = {};
+            st->streamPaneBottom = 0;
+        }
+
+        st->rcSplitter = {margin, topList + areaH + 1, width - margin, topList + areaH + 1 + kSplitterH};
+        int tabTop = st->rcSplitter.bottom + 1;
+        int termTop = tabTop + kTabH + 2;
+        int termBottom = (std::max)(termTop + kMinTerminalH, height - kStatusBarH - 4);
+        st->rcTerminalArea = {margin, termTop, width - margin, termBottom};
+
+        int headerH = 26;
+        RECT rcCell = st->rcTerminalArea;
+        RECT rcBanner = {rcCell.left, rcCell.top, rcCell.right, rcCell.top + headerH};
+        if (!st->termBanners.empty()) {
+            st->termBanners[0].rcBanner = rcBanner;
+            st->termBanners[0].rcBorder = rcCell;
+        }
+
+        RECT rcTv = {rcCell.left + 2, rcCell.top + headerH, rcCell.right - 2, rcCell.bottom - 2};
+        int tvW = (std::max)(200L, rcTv.right - rcTv.left);
+        int tvH = (std::max)(120L, rcTv.bottom - rcTv.top);
+
+        HWND activeTerminalHwnd = nullptr;
+        if (!g_appTabs.empty() && g_activeAppTab >= 0 && g_activeAppTab < static_cast<int>(g_appTabs.size())) {
+            activeTerminalHwnd = g_appTabs[g_activeAppTab].hwnd;
+        }
+
+        HDWP hdwp = BeginDeferWindowPos(8);
+        if (st->listDisplayMode == ListDisplayMode::TwoRows) {
+            int availForRows = listH - kRowSplitterH;
+            if (availForRows >= kMinRowListH * 2) {
+                st->lastTotalListHeight = availForRows;
+                int procH = static_cast<int>(availForRows * st->procRowRatio);
+                if (procH < kMinRowListH) procH = kMinRowListH;
+                if (procH > availForRows - kMinRowListH) procH = availForRows - kMinRowListH;
+                int taskH = availForRows - procH;
+                if (taskH < kMinRowListH) {
+                    taskH = kMinRowListH;
+                    procH = availForRows - taskH;
+                }
+                int rSplitTop = topList + procH;
+                int taskTop = rSplitTop + kRowSplitterH;
+
+                st->rcRowsSplitter = {margin, rSplitTop, width - margin, rSplitTop + kRowSplitterH};
+                st->rcProcCaption = {margin, topList, width - margin, topList + kListCaptionH};
+                st->rcTaskCaption = {margin, taskTop, width - margin, taskTop + kListCaptionH};
+
+                if (hdwp && st->hwndList) {
+                    hdwp = DeferWindowPos(hdwp, st->hwndList, nullptr, margin, topList + kListCaptionH,
+                                          width - margin * 2, (std::max)(0, procH - kListCaptionH),
+                                          SWP_NOZORDER | SWP_NOACTIVATE | SWP_NOCOPYBITS);
+                }
+                if (hdwp && st->hwndTaskList) {
+                    hdwp = DeferWindowPos(hdwp, st->hwndTaskList, nullptr, margin, taskTop + kListCaptionH,
+                                          width - margin * 2, (std::max)(0, taskH - kListCaptionH),
+                                          SWP_NOZORDER | SWP_NOACTIVATE | SWP_NOCOPYBITS);
+                }
+                if (hdwp && st->hwndSearchTaskBtn && IsWindowVisible(st->hwndSearchTaskBtn)) {
+                    RECT rcBtn = {};
+                    GetWindowRect(st->hwndSearchTaskBtn, &rcBtn);
+                    MapWindowPoints(nullptr, hwnd, reinterpret_cast<POINT*>(&rcBtn), 2);
+                    hdwp = DeferWindowPos(hdwp, st->hwndSearchTaskBtn, nullptr, rcBtn.left, taskTop + 2,
+                                          rcBtn.right - rcBtn.left, rcBtn.bottom - rcBtn.top,
+                                          SWP_NOZORDER | SWP_NOACTIVATE | SWP_NOCOPYBITS);
+                }
+                if (hdwp && st->hwndSearchTaskEdit && IsWindowVisible(st->hwndSearchTaskEdit)) {
+                    RECT rcEdit = {};
+                    GetWindowRect(st->hwndSearchTaskEdit, &rcEdit);
+                    MapWindowPoints(nullptr, hwnd, reinterpret_cast<POINT*>(&rcEdit), 2);
+                    hdwp = DeferWindowPos(hdwp, st->hwndSearchTaskEdit, nullptr, rcEdit.left, taskTop + 2,
+                                          rcEdit.right - rcEdit.left, rcEdit.bottom - rcEdit.top,
+                                          SWP_NOZORDER | SWP_NOACTIVATE | SWP_NOCOPYBITS);
+                }
+                if (hdwp && st->hwndTaskOriginCombo && IsWindowVisible(st->hwndTaskOriginCombo)) {
+                    RECT rcCombo = {};
+                    GetWindowRect(st->hwndTaskOriginCombo, &rcCombo);
+                    MapWindowPoints(nullptr, hwnd, reinterpret_cast<POINT*>(&rcCombo), 2);
+                    hdwp = DeferWindowPos(hdwp, st->hwndTaskOriginCombo, nullptr, rcCombo.left, taskTop + 2,
+                                          rcCombo.right - rcCombo.left, rcCombo.bottom - rcCombo.top,
+                                          SWP_NOZORDER | SWP_NOACTIVATE | SWP_NOCOPYBITS);
+                }
+            }
+        } else if (st->listDisplayMode == ListDisplayMode::ProcessOnly) {
+            if (hdwp && st->hwndList) {
+                hdwp = DeferWindowPos(hdwp, st->hwndList, nullptr, margin, topList + kListCaptionH,
+                                      width - margin * 2, (std::max)(0, listH - kListCaptionH),
+                                      SWP_NOZORDER | SWP_NOACTIVATE | SWP_NOCOPYBITS);
+            }
+        } else { // TaskOnly
+            if (hdwp && st->hwndTaskList) {
+                hdwp = DeferWindowPos(hdwp, st->hwndTaskList, nullptr, margin, topList + kListCaptionH,
+                                      width - margin * 2, (std::max)(0, listH - kListCaptionH),
+                                      SWP_NOZORDER | SWP_NOACTIVATE | SWP_NOCOPYBITS);
+            }
+        }
+
+        if (hdwp && paneH > 0 && st->hwndStreamPane) {
+            hdwp = DeferWindowPos(hdwp, st->hwndStreamPane, nullptr, margin, splitTop + kRowSplitterH,
+                                  width - margin * 2, paneH,
+                                  SWP_NOZORDER | SWP_NOACTIVATE | SWP_NOCOPYBITS);
+        }
+        if (hdwp && st->hwndTab && !st->hideTerminalGrid) {
+            hdwp = DeferWindowPos(hdwp, st->hwndTab, nullptr, margin, tabTop, width - margin * 2, kTabH,
+                                  SWP_NOZORDER | SWP_NOACTIVATE | SWP_NOCOPYBITS);
+        }
+        if (hdwp && activeTerminalHwnd && !st->hideTerminalGrid && IsWindow(activeTerminalHwnd)) {
+            hdwp = DeferWindowPos(hdwp, activeTerminalHwnd, nullptr, rcTv.left, rcTv.top, tvW, tvH,
+                                  SWP_NOZORDER | SWP_NOACTIVATE | SWP_NOCOPYBITS);
+        }
+        if (hdwp) EndDeferWindowPos(hdwp);
+
+        RECT rcDirty = {};
+        UnionRect(&rcDirty, &oldSplitter, &st->rcSplitter);
+        rcDirty.top -= 2; rcDirty.bottom += 2;
+        InvalidateRect(hwnd, &rcDirty, FALSE);
+
+        if (oldBanner.bottom > oldBanner.top || rcBanner.bottom > rcBanner.top) {
+            RECT rcBannerDirty = {};
+            UnionRect(&rcBannerDirty, &oldBanner, &rcBanner);
+            rcBannerDirty.top -= 2; rcBannerDirty.bottom += 2;
+            InvalidateRect(hwnd, &rcBannerDirty, FALSE);
+        }
+        if (st->listDisplayMode == ListDisplayMode::TwoRows) {
+            if (oldRowsSplitter.bottom > oldRowsSplitter.top || st->rcRowsSplitter.bottom > st->rcRowsSplitter.top) {
+                RECT rcRowsDirty = {};
+                UnionRect(&rcRowsDirty, &oldRowsSplitter, &st->rcRowsSplitter);
+                rcRowsDirty.top -= 2; rcRowsDirty.bottom += 2;
+                InvalidateRect(hwnd, &rcRowsDirty, FALSE);
+            }
+            if (oldTaskCaption.bottom > oldTaskCaption.top || st->rcTaskCaption.bottom > st->rcTaskCaption.top) {
+                RECT rcCapDirty = {};
+                UnionRect(&rcCapDirty, &oldTaskCaption, &st->rcTaskCaption);
+                rcCapDirty.top -= 2; rcCapDirty.bottom += 2;
+                InvalidateRect(hwnd, &rcCapDirty, FALSE);
+            }
+        }
+        if (oldStreamSplitter.bottom > oldStreamSplitter.top || st->rcStreamSplitter.bottom > st->rcStreamSplitter.top) {
+            RECT rcStreamDirty = {};
+            UnionRect(&rcStreamDirty, &oldStreamSplitter, &st->rcStreamSplitter);
+            rcStreamDirty.top -= 2; rcStreamDirty.bottom += 2;
+            InvalidateRect(hwnd, &rcStreamDirty, FALSE);
+        }
+        return;
+    }
+
+    if (st->streamSplitterDragging) {
+        if (st->streamPaneBottom <= 0) return;
+        int newH = st->streamPaneBottom - pt.y - kRowSplitterH / 2;
+        if (newH < kMinStreamPaneH) newH = kMinStreamPaneH;
+        int areaH = st->processListHeight;
+        int maxPaneH = areaH - kMinListH - kRowSplitterH;
+        if (maxPaneH >= kMinStreamPaneH && newH > maxPaneH) newH = maxPaneH;
+        st->streamPaneHeight = newH;
+
+        RECT rcClient = {};
+        GetClientRect(hwnd, &rcClient);
+        int width = rcClient.right;
+        int margin = 10;
+        int topList = st->processListTop;
+
+        int paneH = (std::clamp)(st->streamPaneHeight, kMinStreamPaneH, (std::max)(kMinStreamPaneH, maxPaneH));
+        int listH = areaH - paneH - kRowSplitterH;
+        int splitTop = topList + listH;
+
+        RECT oldSplitter = st->rcStreamSplitter;
+        RECT oldRowsSplitter = st->rcRowsSplitter;
+        RECT oldTaskCaption = st->rcTaskCaption;
+
+        st->rcStreamSplitter = {margin, splitTop, width - margin, splitTop + kRowSplitterH};
+
+        HDWP hdwp = BeginDeferWindowPos(4);
+        if (hdwp && st->hwndStreamPane) {
+            hdwp = DeferWindowPos(hdwp, st->hwndStreamPane, nullptr, margin, splitTop + kRowSplitterH,
+                                  width - margin * 2, paneH,
+                                  SWP_NOZORDER | SWP_NOACTIVATE | SWP_NOCOPYBITS);
+        }
+        if (st->listDisplayMode == ListDisplayMode::TwoRows) {
+            int availForRows = listH - kRowSplitterH;
+            if (availForRows >= kMinRowListH * 2) {
+                st->lastTotalListHeight = availForRows;
+                int procH = static_cast<int>(availForRows * st->procRowRatio);
+                if (procH < kMinRowListH) procH = kMinRowListH;
+                if (procH > availForRows - kMinRowListH) procH = availForRows - kMinRowListH;
+                int taskH = availForRows - procH;
+                if (taskH < kMinRowListH) {
+                    taskH = kMinRowListH;
+                    procH = availForRows - taskH;
+                }
+                int rSplitTop = topList + procH;
+                int taskTop = rSplitTop + kRowSplitterH;
+
+                st->rcRowsSplitter = {margin, rSplitTop, width - margin, rSplitTop + kRowSplitterH};
+                st->rcProcCaption = {margin, topList, width - margin, topList + kListCaptionH};
+                st->rcTaskCaption = {margin, taskTop, width - margin, taskTop + kListCaptionH};
+
+                if (hdwp && st->hwndList) {
+                    hdwp = DeferWindowPos(hdwp, st->hwndList, nullptr, margin, topList + kListCaptionH,
+                                          width - margin * 2, (std::max)(0, procH - kListCaptionH),
+                                          SWP_NOZORDER | SWP_NOACTIVATE | SWP_NOCOPYBITS);
+                }
+                if (hdwp && st->hwndTaskList) {
+                    hdwp = DeferWindowPos(hdwp, st->hwndTaskList, nullptr, margin, taskTop + kListCaptionH,
+                                          width - margin * 2, (std::max)(0, taskH - kListCaptionH),
+                                          SWP_NOZORDER | SWP_NOACTIVATE | SWP_NOCOPYBITS);
+                }
+            }
+        } else if (st->listDisplayMode == ListDisplayMode::ProcessOnly) {
+            if (hdwp && st->hwndList) {
+                hdwp = DeferWindowPos(hdwp, st->hwndList, nullptr, margin, topList + kListCaptionH,
+                                      width - margin * 2, (std::max)(0, listH - kListCaptionH),
+                                      SWP_NOZORDER | SWP_NOACTIVATE | SWP_NOCOPYBITS);
+            }
+        } else { // TaskOnly
+            if (hdwp && st->hwndTaskList) {
+                hdwp = DeferWindowPos(hdwp, st->hwndTaskList, nullptr, margin, topList + kListCaptionH,
+                                      width - margin * 2, (std::max)(0, listH - kListCaptionH),
+                                      SWP_NOZORDER | SWP_NOACTIVATE | SWP_NOCOPYBITS);
+            }
+        }
+        if (hdwp) EndDeferWindowPos(hdwp);
+
+        RECT rcDirty = {};
+        UnionRect(&rcDirty, &oldSplitter, &st->rcStreamSplitter);
+        rcDirty.top -= 2; rcDirty.bottom += 2;
+        InvalidateRect(hwnd, &rcDirty, FALSE);
+
+        if (st->listDisplayMode == ListDisplayMode::TwoRows) {
+            if (oldRowsSplitter.bottom > oldRowsSplitter.top || st->rcRowsSplitter.bottom > st->rcRowsSplitter.top) {
+                RECT rcRowsDirty = {};
+                UnionRect(&rcRowsDirty, &oldRowsSplitter, &st->rcRowsSplitter);
+                rcRowsDirty.top -= 2; rcRowsDirty.bottom += 2;
+                InvalidateRect(hwnd, &rcRowsDirty, FALSE);
+            }
+            if (oldTaskCaption.bottom > oldTaskCaption.top || st->rcTaskCaption.bottom > st->rcTaskCaption.top) {
+                RECT rcCapDirty = {};
+                UnionRect(&rcCapDirty, &oldTaskCaption, &st->rcTaskCaption);
+                rcCapDirty.top -= 2; rcCapDirty.bottom += 2;
+                InvalidateRect(hwnd, &rcCapDirty, FALSE);
+            }
+        }
+        return;
+    }
+
+    if (st->usageSplitterDragging) {
+        int usageTop = kHeaderKpiBottom + 2;
+        int newH = pt.y - usageTop;
+        if (newH < 60) newH = 60;
+        if (newH > 400) newH = 400;
+        st->usagePanelHeight = newH;
+
+        RECT rcClient = {};
+        GetClientRect(hwnd, &rcClient);
+        RECT oldSplitter = st->rcUsageSplitter;
+
+        LayoutControls(st, rcClient.right, rcClient.bottom);
+
+        RECT rcDirty = {};
+        UnionRect(&rcDirty, &oldSplitter, &st->rcUsageSplitter);
+        rcDirty.top -= 2; rcDirty.bottom += 2;
+        InvalidateRect(hwnd, &rcDirty, FALSE);
+
+        RECT rcToolbar = {0, kToolbarTop, rcClient.right, st->processListTop};
+        InvalidateRect(hwnd, &rcToolbar, FALSE);
+        return;
+    }
 }
 
 static void CopyTextToClipboard(HWND hwnd, const std::wstring& text) {
@@ -8854,7 +9377,7 @@ static bool BtDebugIsFinished(const std::string& state) {
 
 // UTC "YYYY-MM-DDTHH:MM:SS" (the format of the state files' updatedAt) for now - ageSec.
 static std::string BtDebugUtcStamp(int64_t ageSec) {
-    std::time_t t = std::time(nullptr) - static_cast<std::time_t>(ageSec);
+    std::time_t t = static_cast<std::time_t>(GetNowEpochSec()) - static_cast<std::time_t>(ageSec);
     std::tm tmUtc = {};
     gmtime_s(&tmUtc, &t);
     char buf[32] = {};
@@ -9206,19 +9729,25 @@ static LRESULT CALLBACK BtDebugWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARA
 
 // Opens the debug view (or brings it forward). When a task-list row is selected, its job's node
 // is selected in the tree.
-static void ShowBtDebugDialog(DashboardState* st) {
+static void ShowBtDebugDialog(DashboardState* st, const std::string& selectTreeId) {
     if (!st) return;
     std::string jobId;
-    if (st->hwndTaskList) {
+    if (selectTreeId.empty() && st->hwndTaskList) {
         int idx = ListView_GetNextItem(st->hwndTaskList, -1, LVNI_SELECTED);
         if (idx >= 0 && idx < static_cast<int>(st->taskJobIds.size())) jobId = st->taskJobIds[idx];
     }
 
     if (g_btDebugWnd && IsWindow(g_btDebugWnd)) {
         auto* ds = reinterpret_cast<BtDebugDlgState*>(GetWindowLongPtrW(g_btDebugWnd, GWLP_USERDATA));
-        if (ds && !jobId.empty()) {
-            ds->pendingSelectJob = jobId;
-            BtDebugReload(ds, false);
+        if (ds) {
+            if (!selectTreeId.empty()) {
+                ds->pendingSelectKey = selectTreeId;
+                ds->pendingSelectJob.clear();
+                BtDebugReload(ds, false);
+            } else if (!jobId.empty()) {
+                ds->pendingSelectJob = jobId;
+                BtDebugReload(ds, false);
+            }
         }
         if (IsIconic(g_btDebugWnd)) ShowWindow(g_btDebugWnd, SW_RESTORE);
         SetForegroundWindow(g_btDebugWnd);
@@ -9246,6 +9775,7 @@ static void ShowBtDebugDialog(DashboardState* st) {
     ds->hFontUi = st->hFontUi;
     ds->dir = GetBehaviorTreesDirWide();
     ds->pendingSelectJob = jobId;
+    ds->pendingSelectKey = selectTreeId;
 
     RECT rcParent = {};
     GetWindowRect(st->hwndMain, &rcParent);
@@ -10692,7 +11222,7 @@ static void ReloadStreamDialogData(HWND hwnd, LlmStreamDlgState* ds) {
                     int64_t ep = ParseTimestampStrToEpoch(startStr);
                     if (ep > 0) {
                         ds->snap.startEpochSec = ep;
-                        int64_t nowSec = time(nullptr);
+                        int64_t nowSec = GetNowEpochSec();
                         if (jobState == "running") {
                             ds->snap.elapsedMs = static_cast<uint64_t>((std::max)(int64_t{0}, nowSec - ep) * 1000);
                         } else if (!endStr.empty()) {
@@ -11768,7 +12298,10 @@ static void LaunchIpmsgDialog() {
 // Only calls SetTimer when the period actually changes.
 static void ApplyDashboardRefreshTimer(DashboardState* st) {
     if (!st || !st->hwndMain) return;
-    const int ms = st->refreshIntervalMs * (st->runningTotalCount > 0 ? 1 : 2);
+    // A waitingForLlm task group is interactive even with no running process: keep the full
+    // refresh rate so its row (and the answer prompt) appears without a doubled delay.
+    const bool needFast = st->runningTotalCount > 0 || TaskListHasLiveState(st->lastTaskListJson);
+    const int ms = st->refreshIntervalMs * (needFast ? 1 : 2);
     if (ms == st->appliedRefreshMs) return;
     st->appliedRefreshMs = ms;
     SetTimer(st->hwndMain, TIMER_REFRESH_ID, static_cast<UINT>(ms), nullptr);
@@ -12159,10 +12692,11 @@ static void ApplyListTheme(DashboardState* st) {
 
 static void UpdateClock(DashboardState* st) {
     if (!st || !st->hwndClock) return;
-    SYSTEMTIME t = {};
-    GetLocalTime(&t);
+    time_t nowT = static_cast<time_t>(GetNowEpochSec());
+    std::tm t = {};
+    if (!LocalTimeFromSec(&nowT, &t)) return;
     wchar_t buf[16] = {};
-    swprintf_s(buf, L"%02d:%02d:%02d", t.wHour, t.wMinute, t.wSecond);
+    swprintf_s(buf, L"%02d:%02d:%02d", t.tm_hour, t.tm_min, t.tm_sec);
     wchar_t shown[16] = {};
     GetWindowTextW(st->hwndClock, shown, 16);
     if (wcscmp(shown, buf) == 0) return;  // called 4x a second; repaint only when the second changes
@@ -13000,6 +13534,7 @@ struct SettingsDlgState {
         std::vector<llm::Entry> llmVisibleRows;
         // 091-7 permits page
         HWND lstPermitRows = nullptr;
+        HWND lblPermitRows = nullptr;
         HWND editPermitKind = nullptr;
         HWND editPermitTarget = nullptr;
         HWND editPermitEngine = nullptr;
@@ -14201,6 +14736,8 @@ static void UpdateSettingsDialogTexts(HWND hwnd) {
     SetWindowTextW(ds->btnPermitReject, Tr(L"却下", L"Reject", L"Rechazar"));
     SetWindowTextW(ds->btnPermitRevoke, Tr(L"失効", L"Revoke", L"Revocar"));
     SetWindowTextW(ds->btnPermitRefresh, Tr(L"再読み込み", L"Refresh", L"Actualizar"));
+    if (ds->lblPermitRows) SetWindowTextW(ds->lblPermitRows, Tr(
+        L"登録済みの権限 [状態] 種類 対象 (範囲) - メモ", L"Permits [status] kind target (scope) - note", L"Permisos [estado] tipo destino (ámbito) - nota"));
     if (ds->lblPermitDraft) SetWindowTextW(ds->lblPermitDraft, Tr(
         L"やりたいこと（LLM が下書き）:", L"What you want (LLM drafts it):", L"Lo que quieres (el LLM lo redacta):"));
     if (ds->btnPermitDraft) SetWindowTextW(ds->btnPermitDraft, Tr(
@@ -15244,6 +15781,9 @@ static LRESULT CALLBACK SettingsWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPAR
             }
 
             // 091-7: permits page (same shape as the LLM page).
+            ds->lblPermitRows = CreateWindowExW(0, L"STATIC", L"", WS_CHILD | WS_VISIBLE,
+                18, 84, 500, 18, hwnd, nullptr, hInst, nullptr);
+            SendMessageW(ds->lblPermitRows, WM_SETFONT, (WPARAM)ds->dash->hFontUiBold, TRUE);
             ds->lstPermitRows = CreateWindowExW(0, L"LISTBOX", L"",
                 WS_CHILD | WS_VISIBLE | WS_BORDER | WS_VSCROLL | LBS_NOTIFY | WS_TABSTOP,
                 18, 104, 500, 340, hwnd, (HMENU)IDC_SET_PERMIT_ROWS, hInst, nullptr);
@@ -15380,6 +15920,7 @@ static LRESULT CALLBACK SettingsWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPAR
                     ds->lblPermitKind, ds->lblPermitTarget, ds->lblPermitEngine,
                     ds->lblPermitScope, ds->lblPermitNote, ds->lblPermitHint,
                     ds->lblPermitDraft, ds->editPermitDraft, ds->btnPermitDraft, ds->lblPermitDraftStatus,
+                    ds->lblPermitRows,
                     ds->btnPermitRequest, ds->btnPermitApprove, ds->btnPermitReject,
                     ds->btnPermitRevoke, ds->btnPermitRefresh });
             }
@@ -16371,7 +16912,7 @@ static void DrawUsagePanel(HWND hwnd, HDC hdc, DashboardState* st) {
             }
         }
     }
-    if (selStart > 0 && selEnd == 0) selEnd = static_cast<int64_t>(time(nullptr));
+    if (selStart > 0 && selEnd == 0) selEnd = GetNowEpochSec();
 
     HBRUSH bg = CreateSolidBrush(g_theme.panel);
     FillRect(hdc, &rc, bg);
@@ -16438,7 +16979,7 @@ static void DrawUsagePanel(HWND hwnd, HDC hdc, DashboardState* st) {
         DrawTextW(hdc, lbl, -1, &viewRc, DT_CENTER | DT_VCENTER | DT_SINGLELINE);
     }
 
-    int64_t now = static_cast<int64_t>(time(nullptr));
+    int64_t now = GetNowEpochSec();
     int64_t since = now - kUsageRangeSec[rangeIdx];
 
     struct KeyStat {
@@ -16489,7 +17030,17 @@ static void DrawUsagePanel(HWND hwnd, HDC hdc, DashboardState* st) {
         bucketSec = static_cast<double>(kUsageRangeSec[rangeIdx]) / nBuckets;
         if (bucketSec < 1.0) bucketSec = 1.0;
 
-        std::vector<LlmUsagePoint> points = GetLlmUsageHistory(since);
+        // Ranges longer than the memory window: the newest part comes from memory, the older part from the file.
+        constexpr int64_t kUsageMemoryWindowSec = 12 * 3600;
+        std::vector<LlmUsagePoint> points;
+        if (kUsageRangeSec[rangeIdx] > kUsageMemoryWindowSec) {
+            const int64_t memSince = now - kUsageMemoryWindowSec;
+            points = ReadUsageHistoryFile(since, memSince);
+            std::vector<LlmUsagePoint> recent = GetLlmUsageHistory(memSince);
+            points.insert(points.end(), recent.begin(), recent.end());
+        } else {
+            points = GetLlmUsageHistory(since);
+        }
         if (points.empty()) {
             // Daily rollups carry no intra-day timestamps except the real first event time.
             // Place each record once at its own first event time (never spread it over
@@ -16554,34 +17105,6 @@ static void DrawUsagePanel(HWND hwnd, HDC hdc, DashboardState* st) {
             valThink[bi][k] += p.thinkingTokens;
             valCache[bi][k] += p.cacheReadTokens + p.cacheWriteTokens;
             bucketTotal[bi] += pt;
-        }
-        // TEMP DEBUG (remove after use): dump live usage points and bucket totals for the 4h/24h view.
-        {
-            static size_t dbgLastPoints = static_cast<size_t>(-1);
-            if (points.size() != dbgLastPoints) {
-                dbgLastPoints = points.size();
-                FILE* df = nullptr;
-                if (fopen_s(&df, "C:\\Users\\bluen\\AppData\\Local\\Temp\\hancho_usage_debug.txt", "a") == 0 && df) {
-                    fprintf(df, "=== now=%lld since=%lld bucketSec=%.2f nBuckets=%d points=%zu\n",
-                            (long long)now, (long long)since, bucketSec, nBuckets, points.size());
-                    size_t shown = 0;
-                    for (const auto& p : points) {
-                        if (shown++ >= 500) break;
-                        fprintf(df, "pt epoch=%lld in=%llu out=%llu think=%llu cacheR=%llu cacheW=%llu total=%llu agent=%s model=%s\n",
-                                (long long)p.epochSec, (unsigned long long)p.inputTokens, (unsigned long long)p.outputTokens,
-                                (unsigned long long)p.thinkingTokens, (unsigned long long)p.cacheReadTokens,
-                                (unsigned long long)p.cacheWriteTokens, (unsigned long long)p.totalTokens,
-                                p.agentType.c_str(), p.model.c_str());
-                    }
-                    for (int bi = 0; bi < nBuckets; ++bi) {
-                        if (bucketTotal[bi] == 0) continue;
-                        fprintf(df, "bucket %d start=%lld total=%llu\n", bi,
-                                (long long)(since + static_cast<int64_t>(bi * bucketSec)),
-                                (unsigned long long)bucketTotal[bi]);
-                    }
-                    fclose(df);
-                }
-            }
         }
     } else if (rangeIdx == 4 || rangeIdx == 5) {
         // 7d or 30d: daily buckets from U1 daily rollups
@@ -16879,7 +17402,7 @@ static void DrawUsagePanel(HWND hwnd, HDC hdc, DashboardState* st) {
             }
 
             // Build overlay string: "total remaining [i.. o.. t.. c.. dur]"
-            int64_t nowEpoch = static_cast<int64_t>(time(nullptr));
+            int64_t nowEpoch = GetNowEpochSec();
             int64_t elapsed = (keys[i].lastEpochSec > 0) ? (nowEpoch - keys[i].lastEpochSec) : 0;
             int64_t e2 = elapsed;
             if (e2 < 0) e2 = 0;
@@ -16924,7 +17447,7 @@ static void DrawUsagePanel(HWND hwnd, HDC hdc, DashboardState* st) {
     struct tm tmv = {};
     time_t stv = static_cast<time_t>(since);
     localtime_s(&tmv, &stv);
-    time_t nowT = time(nullptr);
+    time_t nowT = static_cast<time_t>(GetNowEpochSec());
     struct tm nowTm = {};
     localtime_s(&nowTm, &nowT);
 
@@ -17200,6 +17723,10 @@ static LRESULT CALLBACK TriageChildSubclassProc(HWND child, UINT msg, WPARAM wPa
             SetFocus(ds->search);
             return 0;
         }
+        if (wParam == 'A' && (GetKeyState(VK_CONTROL) & 0x8000) && ds && child == ds->list) {
+            ListView_SetItemState(ds->list, -1, LVIS_SELECTED, LVIS_SELECTED);
+            return 0;
+        }
         if (wParam == 'C' && ds && child == ds->list &&
             ((GetKeyState(VK_CONTROL) & 0x8000) || (GetAsyncKeyState(VK_CONTROL) & 0x8000))) {
             CopyTriageListSelection(parent, ds, false);
@@ -17211,20 +17738,22 @@ static LRESULT CALLBACK TriageChildSubclassProc(HWND child, UINT msg, WPARAM wPa
 
 static void CopyTriageListSelection(HWND hwnd, TriageDlgState* ds, bool row) {
     if (!ds || !ds->list) return;
-    const int selected = ListView_GetNextItem(ds->list, -1, LVNI_SELECTED);
-    if (selected < 0) return;
     std::wstring text;
-    if (!row) {
-        wchar_t target[2048] = {};
-        ListView_GetItemText(ds->list, selected, 2, target, static_cast<int>(std::size(target)));
-        text = target;
-    } else {
-        const int columns = Header_GetItemCount(ListView_GetHeader(ds->list));
-        for (int c = 0; c < columns; ++c) {
-            wchar_t cell[2048] = {};
-            ListView_GetItemText(ds->list, selected, c, cell, static_cast<int>(std::size(cell)));
-            if (c) text += L"\t";
-            text += cell;
+    int idx = -1;
+    while ((idx = ListView_GetNextItem(ds->list, idx, LVNI_SELECTED)) >= 0) {
+        if (!text.empty()) text += L"\r\n";
+        if (!row) {
+            wchar_t target[2048] = {};
+            ListView_GetItemText(ds->list, idx, 2, target, static_cast<int>(std::size(target)));
+            text += target;
+        } else {
+            const int columns = Header_GetItemCount(ListView_GetHeader(ds->list));
+            for (int c = 0; c < columns; ++c) {
+                wchar_t cell[2048] = {};
+                ListView_GetItemText(ds->list, idx, c, cell, static_cast<int>(std::size(cell)));
+                if (c) text += L"\t";
+                text += cell;
+            }
         }
     }
     if (!text.empty()) CopyTextToClipboard(hwnd, text);
@@ -18445,7 +18974,7 @@ static LRESULT CALLBACK TriageWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM
         ds->modeLabel = CreateWindowExW(0, L"STATIC", L"", WS_CHILD | WS_VISIBLE, 0, 0, 900, 24, hwnd, nullptr, instance, nullptr);
         ds->emptyState = CreateWindowExW(0, L"STATIC", L"", WS_CHILD | SS_CENTER | SS_CENTERIMAGE,
             40, 120, 1000, 36, hwnd, nullptr, instance, nullptr);
-        ds->list = CreateWindowExW(WS_EX_CLIENTEDGE, WC_LISTVIEWW, L"", WS_CHILD | WS_VISIBLE | LVS_REPORT | LVS_SINGLESEL | LVS_SHOWSELALWAYS,
+        ds->list = CreateWindowExW(WS_EX_CLIENTEDGE, WC_LISTVIEWW, L"", WS_CHILD | WS_VISIBLE | LVS_REPORT | LVS_SHOWSELALWAYS,
             10, 42, 1100, 250, hwnd, reinterpret_cast<HMENU>(2901), instance, nullptr);
         ListView_SetExtendedListViewStyle(ds->list, LVS_EX_FULLROWSELECT | LVS_EX_INFOTIP | LVS_EX_DOUBLEBUFFER);
         MemoryListAddColumn(ds->list, 0, Tr(L"ライフサイクル", L"Lifecycle", L"Ciclo de vida"), 145);
@@ -18684,16 +19213,28 @@ static LRESULT CALLBACK TriageWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM
         }
         if (nm && nm->hwndFrom == ds->list && nm->code == NM_RCLICK) {
             auto* nmia = reinterpret_cast<NMITEMACTIVATE*>(lParam);
-            int selected = nmia ? nmia->iItem : -1;
-            if (selected < 0) selected = ListView_GetNextItem(ds->list, -1, LVNI_SELECTED);
-            if (selected >= 0) {
-                ListView_SetItemState(ds->list, selected, LVIS_SELECTED | LVIS_FOCUSED,
-                                      LVIS_SELECTED | LVIS_FOCUSED);
+            int clicked = nmia ? nmia->iItem : -1;
+            if (clicked >= 0) {
+                const bool isSel = (ListView_GetItemState(ds->list, clicked, LVIS_SELECTED) & LVIS_SELECTED) != 0;
+                if (!isSel) {
+                    ListView_SetItemState(ds->list, -1, 0, LVIS_SELECTED);
+                    ListView_SetItemState(ds->list, clicked, LVIS_SELECTED | LVIS_FOCUSED,
+                                          LVIS_SELECTED | LVIS_FOCUSED);
+                }
+            }
+            const int selCount = ListView_GetSelectedCount(ds->list);
+            if (selCount > 0) {
                 POINT pt = {};
                 GetCursorPos(&pt);
                 HMENU menu = CreatePopupMenu();
-                AppendMenuW(menu, MF_STRING, 3201, Tr(L"対象をコピー", L"Copy target", L"Copiar objetivo"));
-                AppendMenuW(menu, MF_STRING, 3202, Tr(L"行をコピー", L"Copy row", L"Copiar fila"));
+                std::wstring copyTargetText = (selCount > 1)
+                    ? (Tr(L"対象をコピー (", L"Copy targets (", L"Copiar objetivos (") + std::to_wstring(selCount) + Tr(L" 件)", L" items)", L" elementos)"))
+                    : Tr(L"対象をコピー", L"Copy target", L"Copiar objetivo");
+                std::wstring copyRowText = (selCount > 1)
+                    ? (Tr(L"行をコピー (", L"Copy rows (", L"Copiar filas (") + std::to_wstring(selCount) + Tr(L" 件)", L" items)", L" elementos)"))
+                    : Tr(L"行をコピー", L"Copy row", L"Copiar fila");
+                AppendMenuW(menu, MF_STRING, 3201, copyTargetText.c_str());
+                AppendMenuW(menu, MF_STRING, 3202, copyRowText.c_str());
                 AppendMenuW(menu, MF_SEPARATOR, 0, nullptr);
                 AppendMenuW(menu, MF_STRING, 3203, Tr(L"列幅を内容に合わせる", L"Fit columns to content", L"Ajustar columnas al contenido"));
                 const int cmd = TrackPopupMenu(menu, TPM_RETURNCMD | TPM_RIGHTBUTTON,
@@ -19776,6 +20317,21 @@ static void UpdateTriageFromCore(DashboardState* st) {
         PostMessageW(st->hwndHintHistory, WM_PC_TRIAGE_REFRESH, 0, 0);
 
     if (!st->showSupervisorHints || !response.contains("cards") || !response["cards"].is_array()) return;
+
+    // Baseline: older triage cards existing at startup are never toasted.
+    if (!st->triageBaselineDone) {
+        st->triageBaselineDone = true;
+        for (const auto& card : response["cards"]) {
+            if (!card.is_object()) continue;
+            const std::string id = card.value("id", std::string());
+            if (!id.empty()) {
+                st->seenAutoTriageCards.insert(id);
+                st->seenTriageCards.insert(id);
+            }
+        }
+        return;
+    }
+
     for (const auto& card : response["cards"]) {
         if (!card.is_object()) continue;
         const std::string id = card.value("id", std::string());
@@ -20224,7 +20780,13 @@ static LRESULT CALLBACK DashboardWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPA
         }
 
         case WM_TIMER: {
-            if (wParam == TIMER_REFRESH_ID && st) {
+            if (wParam == TIMER_DASH_LAYOUT_ID && st) {
+                KillTimer(hwnd, TIMER_DASH_LAYOUT_ID);
+                st->splitterLayoutPending = false;
+                st->lastSplitterLayoutTickMs = GetTickCount64();
+                ApplySplitterDragLayout(hwnd, st, st->pendingSplitterPt);
+                return 0;
+            } else if (wParam == TIMER_REFRESH_ID && st) {
                 UpdateClock(st);
                 // The core is shutting down after "Quit Hancho"; polling it
                 // now would only produce failed IPC calls.
@@ -20235,11 +20797,13 @@ static LRESULT CALLBACK DashboardWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPA
             } else if (wParam == TIMER_END_BLINK_ID && st) {
                 if (!TickEndBlink(st)) KillTimer(hwnd, TIMER_END_BLINK_ID);
             } else if (wParam == TIMER_KPI_ANIM_ID && st) {
-            if (st->activeRunningCount > 0) {
-                g_kpiBarPhase += 0.05f;
-                if (g_kpiBarPhase >= 1.0f) g_kpiBarPhase -= 1.0f;
-                InvalidateRect(hwnd, &st->kpiCardRects[1], FALSE);
-                InvalidateRect(hwnd, &st->kpiCardRects[9], FALSE);
+                const bool isDragging = st->rowsSplitterDragging || st->streamSplitterDragging ||
+                                        st->splitterDragging || st->usageSplitterDragging;
+                if (!isDragging && st->activeRunningCount > 0) {
+                    g_kpiBarPhase += 0.05f;
+                    if (g_kpiBarPhase >= 1.0f) g_kpiBarPhase -= 1.0f;
+                    InvalidateRect(hwnd, &st->kpiCardRects[1], FALSE);
+                    InvalidateRect(hwnd, &st->kpiCardRects[9], FALSE);
                 }
             } else if (wParam == TIMER_QUIT_WAIT_ID && st) {
                 auto finishQuit = [&] {
@@ -20362,86 +20926,44 @@ static LRESULT CALLBACK DashboardWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPA
         }
 
         case WM_MOUSEMOVE: {
-            if (st && st->rowsSplitterDragging) {
-                POINT pt = {GET_X_LPARAM(lParam), GET_Y_LPARAM(lParam)};
-                if (st->lastTotalListHeight >= kMinRowListH * 2) {
-                    int relY = pt.y - st->processListTop;
-                    float ratio = static_cast<float>(relY) / static_cast<float>(st->lastTotalListHeight);
-                    ratio = (std::clamp)(ratio, static_cast<float>(kMinRowListH) / static_cast<float>(st->lastTotalListHeight),
-                                         1.0f - static_cast<float>(kMinRowListH) / static_cast<float>(st->lastTotalListHeight));
-                    st->procRowRatio = ratio;
-                    RECT rcClient = {};
-                    GetClientRect(hwnd, &rcClient);
-                    LayoutControls(st, rcClient.right, rcClient.bottom);
-                    InvalidateRect(hwnd, nullptr, FALSE);
+            const bool isDragging = st && (st->rowsSplitterDragging || st->streamSplitterDragging ||
+                                           st->splitterDragging || st->usageSplitterDragging);
+            if (isDragging) {
+                st->pendingSplitterPt = {GET_X_LPARAM(lParam), GET_Y_LPARAM(lParam)};
+                const uint64_t now = GetTickCount64();
+                if (now - st->lastSplitterLayoutTickMs < kDashLayoutThrottleMs) {
+                    if (!st->splitterLayoutPending) {
+                        st->splitterLayoutPending = true;
+                        SetTimer(hwnd, TIMER_DASH_LAYOUT_ID, kDashLayoutThrottleMs, nullptr);
+                    }
+                    return 0;
                 }
-                return 0;
-            }
-            if (st && st->streamSplitterDragging) {
-                POINT pt = {GET_X_LPARAM(lParam), GET_Y_LPARAM(lParam)};
-                if (st->streamPaneBottom > 0) {
-                    int newH = st->streamPaneBottom - pt.y - kRowSplitterH / 2;
-                    if (newH < kMinStreamPaneH) newH = kMinStreamPaneH;
-                    st->streamPaneHeight = newH;
-                    RECT rcClient = {};
-                    GetClientRect(hwnd, &rcClient);
-                    LayoutControls(st, rcClient.right, rcClient.bottom);
-                    InvalidateRect(hwnd, nullptr, FALSE);
-                }
-                return 0;
-            }
-            if (st && st->splitterDragging) {
-                POINT pt = {GET_X_LPARAM(lParam), GET_Y_LPARAM(lParam)};
-                st->processListHeight = pt.y - st->processListTop;
-                if (st->processListHeight < kMinListH) st->processListHeight = kMinListH;
-                RECT rcClient = {};
-                GetClientRect(hwnd, &rcClient);
-                LayoutControls(st, rcClient.right, rcClient.bottom);
-                InvalidateRect(hwnd, nullptr, FALSE);
-                return 0;
-            }
-            if (st && st->usageSplitterDragging) {
-                POINT pt = {GET_X_LPARAM(lParam), GET_Y_LPARAM(lParam)};
-                int usageTop = kHeaderKpiBottom + 2;
-                int newH = pt.y - usageTop;
-                if (newH < 60) newH = 60;
-                if (newH > 400) newH = 400;
-                st->usagePanelHeight = newH;
-                RECT rcClient = {};
-                GetClientRect(hwnd, &rcClient);
-                LayoutControls(st, rcClient.right, rcClient.bottom);
-                InvalidateRect(hwnd, nullptr, FALSE);
+                st->lastSplitterLayoutTickMs = now;
+                ApplySplitterDragLayout(hwnd, st, st->pendingSplitterPt);
                 return 0;
             }
             break;
         }
 
         case WM_LBUTTONUP: {
-            if (st && st->rowsSplitterDragging) {
+            const bool wasDragging = st && (st->rowsSplitterDragging || st->streamSplitterDragging ||
+                                            st->splitterDragging || st->usageSplitterDragging);
+            if (wasDragging) {
+                if (st->splitterLayoutPending) {
+                    KillTimer(hwnd, TIMER_DASH_LAYOUT_ID);
+                    st->splitterLayoutPending = false;
+                }
                 st->rowsSplitterDragging = false;
-                if (GetCapture() == hwnd) ReleaseCapture();
-                SaveShellConfig(st);
-                InvalidateRect(hwnd, &st->rcRowsSplitter, FALSE);
-                return 0;
-            }
-            if (st && st->streamSplitterDragging) {
                 st->streamSplitterDragging = false;
-                if (GetCapture() == hwnd) ReleaseCapture();
-                SaveShellConfig(st);
-                InvalidateRect(hwnd, &st->rcStreamSplitter, FALSE);
-                return 0;
-            }
-            if (st && st->splitterDragging) {
                 st->splitterDragging = false;
-                if (GetCapture() == hwnd) ReleaseCapture();
-                SaveShellConfig(st);
-                InvalidateRect(hwnd, &st->rcSplitter, FALSE);
-                return 0;
-            }
-            if (st && st->usageSplitterDragging) {
                 st->usageSplitterDragging = false;
                 if (GetCapture() == hwnd) ReleaseCapture();
-                InvalidateRect(hwnd, &st->rcUsageSplitter, FALSE);
+
+                RECT rcClient = {};
+                GetClientRect(hwnd, &rcClient);
+                LayoutControls(st, rcClient.right, rcClient.bottom);
+                SaveShellConfig(st);
+                InvalidateRect(hwnd, nullptr, FALSE);
                 return 0;
             }
             break;
@@ -20449,10 +20971,23 @@ static LRESULT CALLBACK DashboardWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPA
 
         case WM_CAPTURECHANGED: {
             if (st) {
+                if (st->splitterLayoutPending) {
+                    KillTimer(hwnd, TIMER_DASH_LAYOUT_ID);
+                    st->splitterLayoutPending = false;
+                }
+                const bool wasDragging = st->rowsSplitterDragging || st->streamSplitterDragging ||
+                                         st->splitterDragging || st->usageSplitterDragging;
                 st->splitterDragging = false;
                 st->rowsSplitterDragging = false;
                 st->usageSplitterDragging = false;
                 st->streamSplitterDragging = false;
+                if (wasDragging) {
+                    RECT rcClient = {};
+                    GetClientRect(hwnd, &rcClient);
+                    LayoutControls(st, rcClient.right, rcClient.bottom);
+                    SaveShellConfig(st);
+                    InvalidateRect(hwnd, nullptr, FALSE);
+                }
             }
             break;
         }

@@ -154,7 +154,7 @@ std::string OneLine(const std::string& s, size_t maxLen) {
 }
 
 int64_t NowEpoch() {
-    return static_cast<int64_t>(std::time(nullptr));
+    return GetNowEpochSec();
 }
 
 bool IsAsciiAlnum(unsigned char c);

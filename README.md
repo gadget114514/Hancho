@@ -124,6 +124,12 @@ The application icons are modeled on the character "Telephone Cat" (電話猫, D
 
 
 
+### v0.9.40
+- **Token usage graph (24h)**: the 24h view reads the older part of the window from `usage_history.jsonl` and the last 12 hours from memory, so recent calls are no longer missing from 24h.
+- **ww engine switch**: `ww-run`, `ww-watch` and `-Jobs` tasks switch to the next approved engine from `llms.json` when an engine hits a usage limit (rate limit, quota, 429). Use `-NoEngineSwitch` or `WW_NO_ENGINE_SWITCH=1` to turn it off. `-Provider` and `-Model` (or `WW_PROVIDER` / `WW_MODEL`) choose the provider and model.
+- **Task groups waiting for a decision**: `waitingForLlm` task groups stay in the "pending" / "waiting" filters, and `taskqueue list` includes planned jobs in the dashboard and Web UI.
+- **Permits page**: copy the selected targets or rows with a button.
+
 ### v0.9.39
 - **Permits page**: every field has a label, and the rules are explained under the list. The kind is a dropdown (`read_path`, `write_path`, `command`, `network`).
 - **Draft with LLM**: describe what you want in plain language and press "Draft with LLM". A read-only worker LLM proposes the fields; they are filled in when it finishes. Nothing is saved until you check them and press Request.

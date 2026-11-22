@@ -410,6 +410,7 @@ TASK QUEUE:
   taskqueue list [<name>] [--state <state>] [--since <period>] [--origin <self|label|session>] [--bt <id>]
       List jobs with state, queue, summary and blockedBy. --since keeps only
       jobs updated within the period (30m, 6h, 2d), e.g. --since 6h.
+      --state waiting は waitingForLlm と paused のタスクグループにも一致します（waiting・awaiting・awaiting_decision は同じ扱い）。
       --bt <id> lists every job of a behavior tree across its parallel branch queues.
       --origin self keeps only the jobs this session added.
 

@@ -1,4 +1,4 @@
-# ww-run.lib.ps1 — pure helpers for ww-run.ps1: worktree naming, the per-task duplicate rule
+﻿# ww-run.lib.ps1 — pure helpers for ww-run.ps1: worktree naming, the per-task duplicate rule
 # and the tracked-files pre-flight. Dot-source this file; it defines functions only and has no
 # side effects, so ww-run.selftest.ps1 can exercise the decisions without starting a run.
 
@@ -52,8 +52,9 @@ function Test-WorkerProcess([object]$Proc) {
     $cmd = [string]$Proc.CommandLine
     $wwPrompt = $cmd -match 'Execute\s+\S*tasks[\\/]'
     $claudePrint = [bool]($wwPrompt -and $cmd -match '\s(-p|--print)\s')
+    $agyWorker = [bool]($wwPrompt -and $cmd -match '\s(-p|--print)\s')
     switch ($name) {
-        'agy.exe'      { return $true }
+        'agy.exe'      { return $agyWorker }
         'opencode.exe' { return [bool]($cmd -match '\srun\s') }
         'claude.exe'   { return $claudePrint }
         'claude.cmd'   { return $claudePrint }
@@ -83,11 +84,250 @@ function Get-WorkerRuns {
 }
 function Get-OpencodeRuns { Get-WorkerRuns }
 
+# Look for Hancho's per-role LLM candidate lists (<data-dir>/llms.json).
+function Find-HanchoLlmConfigPath {
+    param([string]$DataDir = "", [string]$Root = "")
+    $candidates = @()
+    if ($DataDir) { $candidates += (Join-Path $DataDir "llms.json") }
+    if ($env:HANCHO_DATA_DIR) { $candidates += (Join-Path $env:HANCHO_DATA_DIR "llms.json") }
+    if ($env:HANCHO_LOG_DIR) { $candidates += (Join-Path $env:HANCHO_LOG_DIR "llms.json") }
+    if ($Root) {
+        $candidates += (Join-Path $Root "ww-data\llms.json")
+        $candidates += (Join-Path $Root ".hancho\llms.json")
+        $candidates += (Join-Path $Root "llms.json")
+    }
+    $candidates += (Join-Path "ww-data" "llms.json")
+    $candidates += (Join-Path ".hancho" "llms.json")
+    $candidates += "llms.json"
+
+    foreach ($p in $candidates) {
+        if ($p -and (Test-Path $p -PathType Leaf)) {
+            return (Resolve-Path $p).Path
+        }
+    }
+    return $null
+}
+
+# Read approved and enabled worker candidate rows from <data-dir>/llms.json, sorted by rank ascending.
+function Get-ApprovedWorkerCandidates {
+    param(
+        [string]$DataDir = "",
+        [string]$Root = "",
+        [string]$ConfigPath = "",
+        [string]$Engine = "",
+        [string]$Provider = "",
+        [string]$Model = ""
+    )
+    $path = if ($ConfigPath) { $ConfigPath } else { Find-HanchoLlmConfigPath -DataDir $DataDir -Root $Root }
+    if (-not $path -or -not (Test-Path $path -PathType Leaf)) {
+        return @()
+    }
+    try {
+        $json = Get-Content -Path $path -Raw -Encoding UTF8 -ErrorAction Stop | ConvertFrom-Json
+    } catch {
+        return @()
+    }
+    if (-not $json -or -not $json.worker) { return @() }
+
+    $rows = @($json.worker)
+    $results = @()
+    foreach ($r in $rows) {
+        if (-not $r) { continue }
+        $status = if ($r.status) { [string]$r.status } else { "proposed" }
+        if ($status -ne "approved") { continue }
+        if ($r.PSObject.Properties['enabled'] -and $r.enabled -eq $false) { continue }
+
+        $eng = if ($r.engine) { [string]$r.engine } else { "" }
+        $prov = if ($r.provider) { [string]$r.provider } else { "" }
+        $m = if ($r.model) { [string]$r.model } else { "" }
+        $rank = if ($r.PSObject.Properties['rank'] -and $null -ne $r.rank) { [int]$r.rank } else { 0 }
+
+        if ($Engine -and $eng -ne $Engine) { continue }
+        if ($Provider -and $prov -ne $Provider) { continue }
+        if ($Model -and $m -ne $Model -and "$prov/$m" -ne $Model) { continue }
+
+        # Effective model for the engine CLI (e.g. opencode uses provider/model)
+        $effModel = $m
+        if ($eng -eq 'opencode' -and $prov -and $m -and ($m -notmatch '/')) {
+            $effModel = "$prov/$m"
+        }
+
+        $results += [pscustomobject]@{
+            Engine         = $eng
+            Provider       = $prov
+            Model          = $m
+            EffectiveModel = $effModel
+            Rank           = $rank
+            Note           = [string]$r.note
+            Status         = $status
+        }
+    }
+
+    return @($results | Sort-Object -Property Rank)
+}
+
+# Resolve the best matching worker candidate from <data-dir>/llms.json or fallback to defaults.
+function Resolve-WorkerEngineAndModel {
+    param(
+        [string]$DataDir = "",
+        [string]$Root = "",
+        [string]$ConfigPath = "",
+        [string]$Engine = "",
+        [string]$Provider = "",
+        [string]$Model = ""
+    )
+    $candidates = Get-ApprovedWorkerCandidates -DataDir $DataDir -Root $Root -ConfigPath $ConfigPath `
+                                                -Engine $Engine -Provider $Provider -Model $Model
+
+    if ($candidates.Count -gt 0) {
+        $best = $candidates[0]
+        $resolvedEngine = if ($Engine) { $Engine } else { $best.Engine }
+        $resolvedProvider = if ($Provider) { $Provider } else { $best.Provider }
+        $resolvedModel = if ($Model) {
+            if ($resolvedEngine -eq 'opencode' -and $resolvedProvider -and ($Model -notmatch '/')) {
+                "$resolvedProvider/$Model"
+            } else {
+                $Model
+            }
+        } else {
+            $best.EffectiveModel
+        }
+        return [pscustomobject]@{
+            Engine         = $resolvedEngine
+            Provider       = $resolvedProvider
+            Model          = $resolvedModel
+            EffectiveModel = $resolvedModel
+            FromConfig     = $true
+            Candidate      = $best
+            AllCandidates  = $candidates
+        }
+    }
+
+    # Fallback to engine defaults when not in llms.json
+    $resEngine = if ($Engine) { $Engine } else { "agy" }
+    $resProvider = $Provider
+    $resModel = $Model
+    if (-not $resModel -and $resEngine -eq 'agy') {
+        $resModel = 'gemini-3.8-flash-medium'
+    }
+    if ($resEngine -eq 'opencode' -and $resProvider -and $resModel -and ($resModel -notmatch '/')) {
+        $resModel = "$resProvider/$resModel"
+    }
+
+    return [pscustomobject]@{
+        Engine         = $resEngine
+        Provider       = $resProvider
+        Model          = $resModel
+        EffectiveModel = $resModel
+        FromConfig     = $false
+        Candidate      = $null
+        AllCandidates  = @()
+    }
+}
+
+# Usage-limit wording seen from LLM engines (rate limit, quota, 429, etc.).
+$script:WwLimitPatterns = @(
+    'rate[ _-]?limit',
+    'ratelimit',
+    'too many requests',
+    'quota',
+    'insufficient_quota',
+    'resource[ _-]?exhausted',
+    'usage limit',
+    'daily limit',
+    'weekly limit',
+    'limit reached',
+    'limit exceeded',
+    'exceeded your current',
+    'billing',
+    'http[^0-9]{0,12}429',
+    '"(code|status)"\s*:\s*429'
+)
+
+function Get-LimitHint([string]$text) {
+    if ([string]::IsNullOrEmpty($text)) { return $null }
+    foreach ($p in $script:WwLimitPatterns) {
+        $m = [regex]::Match($text, $p, [System.Text.RegularExpressions.RegexOptions]::IgnoreCase)
+        if ($m.Success) { return $m.Value }
+    }
+    return $null
+}
+
+# Find the next candidate to switch to from <data-dir>/llms.json or fallback defaults.
+function Get-NextWorkerCandidate {
+    param(
+        [string]$DataDir = "",
+        [string]$Root = "",
+        [string]$ConfigPath = "",
+        [string]$CurrentEngine = "",
+        [string]$CurrentProvider = "",
+        [string]$CurrentModel = ""
+    )
+    $candidates = @(Get-ApprovedWorkerCandidates -DataDir $DataDir -Root $Root -ConfigPath $ConfigPath)
+    if ($candidates.Count -gt 1) {
+        $currIdx = -1
+        for ($i = 0; $i -lt $candidates.Count; $i++) {
+            $c = $candidates[$i]
+            if ($c.Engine -eq $CurrentEngine) {
+                if (-not $CurrentModel -or $c.Model -eq $CurrentModel -or $c.EffectiveModel -eq $CurrentModel) {
+                    $currIdx = $i
+                    break
+                }
+            }
+        }
+        if ($currIdx -ge 0 -and ($currIdx + 1) -lt $candidates.Count) {
+            return $candidates[$currIdx + 1]
+        }
+        # If the current wasn't matched exactly, return the first one that has a different engine or model
+        foreach ($c in $candidates) {
+            if ($c.Engine -ne $CurrentEngine -or ($CurrentModel -and $c.EffectiveModel -ne $CurrentModel)) {
+                return $c
+            }
+        }
+    }
+
+    # Fallback default pair when llms.json is not configured
+    if ($CurrentEngine -eq 'agy') {
+        return [pscustomobject]@{
+            Engine         = 'opencode'
+            Provider       = ''
+            Model          = ''
+            EffectiveModel = ''
+            Rank           = 1
+            Note           = 'default fallback'
+            Status         = 'approved'
+        }
+    } elseif ($CurrentEngine -eq 'opencode') {
+        return [pscustomobject]@{
+            Engine         = 'agy'
+            Provider       = ''
+            Model          = 'gemini-3.8-flash-medium'
+            EffectiveModel = 'gemini-3.8-flash-medium'
+            Rank           = 1
+            Note           = 'default fallback'
+            Status         = 'approved'
+        }
+    }
+    return $null
+}
+
 # The command ww-run runs (inside a child powershell) for each engine. $Model is passed only when
 # set; agy has a default model. The prompt is read from a UTF-8 file into $prompt by the caller.
 function Get-EngineCommand {
-    param([Parameter(Mandatory = $true)][string]$Engine, [string]$Model = "", [string]$Agent = "", [string]$Resume = "")
-    $m = $Model.Replace("'", "''")
+    param(
+        [Parameter(Mandatory = $true)][string]$Engine,
+        [string]$Model = "",
+        [string]$Provider = "",
+        [string]$Agent = "",
+        [string]$Resume = ""
+    )
+    $effModel = $Model
+    if ($Provider -and $Engine -eq 'opencode' -and $effModel -and ($effModel -notmatch '/')) {
+        $effModel = "$Provider/$effModel"
+    } elseif ($Provider -and -not $effModel -and $Engine -eq 'opencode') {
+        $effModel = $Provider
+    }
+    $m = $effModel.Replace("'", "''")
     $resumeId = $Resume.Replace("'", "''")
     $opencodeResume = if ($Resume) { " --session '$resumeId'" } else { "" }
     $claudeResume = if ($Resume) { " --resume '$resumeId'" } else { "" }
@@ -95,10 +335,10 @@ function Get-EngineCommand {
     if ($Agent -and $Engine -ne 'claude') { throw "-Agent is only supported with -Engine claude (engine: $Engine)" }
     if ($Agent -and $Agent -notmatch '^[A-Za-z0-9][A-Za-z0-9_-]*$') { throw "invalid agent name '$Agent' (letters, digits, '-' and '_')" }
     switch ($Engine) {
-        'opencode' { return "& opencode.cmd run --format json$(if ($Model) { " --model '$m'" })$opencodeResume `$prompt" }
-        'agy'      { return "& agy.exe -p `$prompt --output-format stream-json --model '$(if ($Model) { $m } else { 'gemini-3.8-flash-medium' })' --dangerously-skip-permissions --print-timeout 180m" }
-        'claude'   { return "& claude -p `$prompt --output-format stream-json --verbose --dangerously-skip-permissions$(if ($Model) { " --model '$m'" })$(if ($Agent) { " --agent $Agent" })$claudeResume" }
-        'codex'    { return "& codex exec --json --dangerously-bypass-approvals-and-sandbox$(if ($Model) { " --model '$m'" }) `$prompt" }
+        'opencode' { return "& opencode.cmd run --format json$(if ($effModel) { " --model '$m'" })$opencodeResume `$prompt" }
+        'agy'      { return "& agy.exe -p `$prompt --output-format stream-json --model '$(if ($effModel) { $m } else { 'gemini-3.8-flash-medium' })' --dangerously-skip-permissions --print-timeout 180m" }
+        'claude'   { return "& claude -p `$prompt --output-format stream-json --verbose --dangerously-skip-permissions$(if ($effModel) { " --model '$m'" })$(if ($Agent) { " --agent $Agent" })$claudeResume" }
+        'codex'    { return "& codex exec --json --dangerously-bypass-approvals-and-sandbox$(if ($effModel) { " --model '$m'" }) `$prompt" }
     }
     throw "unknown engine '$Engine' (agy, opencode, claude, codex)"
 }
@@ -284,6 +524,7 @@ function New-HanchoCliJob {
         [Parameter(Mandatory = $true)][string]$Root,
         [Parameter(Mandatory = $true)][string]$RunCmd,
         [string]$Engine = "agy",
+        [string]$Provider = "",
         [string]$Model = "",
         [string]$Agent = "",
         [int]$TimeoutSec = 7200,
@@ -294,15 +535,17 @@ function New-HanchoCliJob {
     )
     $title = if ($CardName) { [System.IO.Path]::GetFileNameWithoutExtension($CardName) } else { $Task }
     $parts = @((Format-CmdArg $RunCmd), $Task, $(if ($Worktree) { "-Worktree" } else { "-Shared" }), "-Engine", $Engine)
+    if ($Provider) { $parts += @("-Provider", (Format-CmdArg $Provider)) }
     if ($Model) { $parts += @("-Model", (Format-CmdArg $Model)) }
     if ($Agent) { $parts += @("-Agent", (Format-CmdArg $Agent)) }
     $parts += @("-Root", (Format-CmdArg $Root), "-JsonStdout")
     $job = [ordered]@{
-        id         = "ww-$Task"
-        summary    = "ww card $title"
-        timeoutSec = $TimeoutSec
-        cwd        = $Root
-        command    = ($parts -join ' ')
+        id            = "ww-$Task"
+        summary       = "ww card $title"
+        timeoutSec    = $TimeoutSec
+        cwd           = $Root
+        command       = ($parts -join ' ')
+        engine_switch = $true
     }
     if ($EstimateSec -gt 0) { $job.estimateSec = $EstimateSec }
     if (-not $Worktree) {

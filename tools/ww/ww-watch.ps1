@@ -1,4 +1,4 @@
-# ww-watch.ps1 — run a task card with stall detection and the split-first retry policy.
+﻿# ww-watch.ps1 — run a task card with stall detection and the split-first retry policy.
 # Usage: Tools\ww\ww-watch.cmd 038-2   [-StallMinutes 8] [-PollSeconds 30] [-MaxRetries 2] [-MinCpuDelta 2.0] [-DryRun]
 # Exit: 0 ok | 1 pre-flight/ambiguous card | 2 other failure | 3 human decision required | 4 split required
 param(
@@ -8,9 +8,14 @@ param(
     [int]$MaxRetries = 2,
     [double]$MinCpuDelta = 2.0,
     [ValidateSet("agy", "opencode", "claude", "codex")][string]$Engine = $(if ($env:WW_ENGINE) { $env:WW_ENGINE } else { "agy" }),
+    [string]$Provider = $env:WW_PROVIDER,
     [string]$Model = $env:WW_MODEL,
     [string]$Agent = $env:WW_AGENT,
     [string]$Root = $env:WW_ROOT,
+    [switch]$NoEngineSwitch = $(if ($env:WW_NO_ENGINE_SWITCH -eq "1") { $true } else { $false }),
+    [switch]$Standalone = $(if ($env:WW_STANDALONE -eq "1" -or $env:WW_ALLOW_DIRECT -eq "1") { $true } else { $false }),
+    [switch]$AllowDirect,
+    [switch]$Force,
     [switch]$DryRun
 )
 
@@ -26,6 +31,13 @@ $runScript = if ($env:WW_RUN_SCRIPT) { $env:WW_RUN_SCRIPT } else { Join-Path $PS
 $stateFile = Join-Path $data "stall-state.json"
 $reportDir = Join-Path $data "reports"
 Set-Location $root
+
+# Hancho launch guard: ww runs must be supervised by Hancho unless explicitly allowed.
+$isHancho = [bool]($env:HANCHO_ACTIVE -or $env:PC_JOB_ID -or $env:HANCHO_EVENT_PIPE -or $env:HANCHO_WORKER_PERMITS -or $env:HANCHO_JOB_ID)
+if (-not $isHancho -and -not $Standalone -and -not $AllowDirect -and -not $Force -and -not $DryRun) {
+    Write-Host "[ww-watch] REFUSED: ww runs must be launched via Hancho. Pass -Standalone (or -Force) to run directly." -ForegroundColor Red
+    exit 1
+}
 
 # ---------- state (retry counters survive across invocations) ----------
 function Load-State {
@@ -82,8 +94,11 @@ function Invoke-Leaf([string]$id, $card) {
 
         $env:WW_ROOT = $root
         if ($Engine) { $env:WW_ENGINE = $Engine }
+        if ($Provider) { $env:WW_PROVIDER = $Provider }
         if ($Model) { $env:WW_MODEL = $Model }
         if ($Agent) { $env:WW_AGENT = $Agent }
+        if ($NoEngineSwitch) { $env:WW_NO_ENGINE_SWITCH = "1" }
+        if ($Standalone -or $AllowDirect -or $Force) { $env:WW_STANDALONE = "1" }
         $argList = @("-NoProfile", "-ExecutionPolicy", "Bypass", "-File", $runScript, $id)
         if ($extra) { $argList += "`"$extra`"" }
         $proc = Start-Process -FilePath "powershell" -ArgumentList $argList -PassThru -NoNewWindow

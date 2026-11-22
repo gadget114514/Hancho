@@ -11,6 +11,10 @@
 #include <cstring>
 #include <cstdio>
 #include <filesystem>
+#include <atomic>
+#include <chrono>
+#include <cstdlib>
+#include <mutex>
 
 namespace pc {
 
@@ -361,12 +365,109 @@ uint64_t GetNowTickMs() {
     return GetTickCount64();
 }
 
-std::string GetCurrentTimestampStr() {
-    SYSTEMTIME st = {};
-    GetLocalTime(&st);
+#ifdef HANCHO_DEMO_BUILD
+namespace {
+std::atomic<bool> g_demoMode{false};
+std::atomic<int64_t> g_demoFixedNowSec{0};
+int64_t g_demoBaseSec = 0;
+std::chrono::steady_clock::time_point g_demoStart{};
+std::once_flag g_demoEnvOnce;
+
+std::string EpochToTimestampLocal(int64_t epoch) {
+    time_t t = static_cast<time_t>(epoch);
+    std::tm tm = {};
+    if (!LocalTimeFromSec(&t, &tm)) return "";
     char buf[64] = {};
     snprintf(buf, sizeof(buf), "%04d-%02d-%02d %02d:%02d:%02d",
-             st.wYear, st.wMonth, st.wDay, st.wHour, st.wMinute, st.wSecond);
+             tm.tm_year + 1900, tm.tm_mon + 1, tm.tm_mday, tm.tm_hour, tm.tm_min, tm.tm_sec);
+    return buf;
+}
+
+void ApplyDemoEnvOnce() {
+    std::call_once(g_demoEnvOnce, [] {
+        const char* v = std::getenv("HANCHO_DEMO");
+        if (!v) return;
+        std::string s(v);
+        if (s != "1" && s != "true" && s != "TRUE") return;
+        int64_t fixed = 0;
+        const char* n = std::getenv("HANCHO_DEMO_NOW");
+        if (n) fixed = ParseTimestampStrToEpoch(n);
+        SetDemoMode(true, fixed);
+    });
+}
+} // namespace
+
+bool IsDemoMode() {
+    ApplyDemoEnvOnce();
+    return g_demoMode.load();
+}
+
+void SetDemoMode(bool enabled, int64_t fixedNowSec) {
+    g_demoFixedNowSec.store(enabled ? fixedNowSec : 0);
+    if (enabled) {
+        g_demoBaseSec = fixedNowSec > 0 ? fixedNowSec : ParseTimestampStrToEpoch("2026-11-21 15:00:00");
+        if (g_demoBaseSec <= 0) g_demoBaseSec = static_cast<int64_t>(::time(nullptr));
+        g_demoStart = std::chrono::steady_clock::now();
+    }
+    g_demoMode.store(enabled);
+}
+
+void EnableDemoModeFromArgs(int64_t fixedNowSec) {
+#ifdef _WIN32
+    _putenv_s("HANCHO_DEMO", "1");
+    if (fixedNowSec > 0) {
+        std::string nowStr = EpochToTimestampLocal(fixedNowSec);
+        if (!nowStr.empty()) _putenv_s("HANCHO_DEMO_NOW", nowStr.c_str());
+    }
+#else
+    setenv("HANCHO_DEMO", "1", 1);
+    if (fixedNowSec > 0) {
+        std::string nowStr = EpochToTimestampLocal(fixedNowSec);
+        if (!nowStr.empty()) setenv("HANCHO_DEMO_NOW", nowStr.c_str(), 1);
+    }
+#endif
+    SetDemoMode(true, fixedNowSec);
+}
+
+int64_t GetNowEpochSec() {
+    ApplyDemoEnvOnce();
+    if (!g_demoMode.load()) return static_cast<int64_t>(::time(nullptr));
+    int64_t fixed = g_demoFixedNowSec.load();
+    if (fixed > 0) return fixed;
+    return g_demoBaseSec + std::chrono::duration_cast<std::chrono::seconds>(
+               std::chrono::steady_clock::now() - g_demoStart).count();
+}
+
+int64_t GetNowEpochMs() {
+    ApplyDemoEnvOnce();
+    if (!g_demoMode.load()) {
+        return std::chrono::duration_cast<std::chrono::milliseconds>(
+                   std::chrono::system_clock::now().time_since_epoch()).count();
+    }
+    int64_t fixed = g_demoFixedNowSec.load();
+    if (fixed > 0) return fixed * 1000;
+    return g_demoBaseSec * 1000 + std::chrono::duration_cast<std::chrono::milliseconds>(
+               std::chrono::steady_clock::now() - g_demoStart).count();
+}
+
+std::string GetDummyLlmExecutableUtf8() {
+    std::filesystem::path p(Utf8ToWide(GetExecutablePathUtf8()));
+#ifdef _WIN32
+    p.replace_filename(L"hancho-dummy.exe");
+#else
+    p.replace_filename(L"hancho-dummy");
+#endif
+    return WideToUtf8(p.wstring());
+}
+#endif
+
+std::string GetCurrentTimestampStr() {
+    time_t t = static_cast<time_t>(GetNowEpochSec());
+    std::tm st = {};
+    if (!LocalTimeFromSec(&t, &st)) return "";
+    char buf[64] = {};
+    snprintf(buf, sizeof(buf), "%04d-%02d-%02d %02d:%02d:%02d",
+             st.tm_year + 1900, st.tm_mon + 1, st.tm_mday, st.tm_hour, st.tm_min, st.tm_sec);
     return buf;
 }
 

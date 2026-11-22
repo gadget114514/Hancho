@@ -1,4 +1,5 @@
 #include "worker_engines.h"
+#include "common.h"
 #include "permit_config.h"
 #include "platform/platform.h"
 #include "nlohmann/json.hpp"
@@ -235,6 +236,19 @@ void WorkerEngineRegistry::ResetToBuiltins() {
     codex.permissionArgs = "--dangerously-bypass-approvals-and-sandbox";
     codex.advicePermissionArgs = "--sandbox read-only";
     engines_["codex"] = std::move(codex);
+
+#ifdef HANCHO_DEMO_BUILD
+    WorkerEngineDef dummy;
+    dummy.command = "{dummy} --scenario mixed --seed 1";
+    dummy.defaultModel = "demo-model";
+    dummy.stream = "claude";
+    dummy.models.push_back("demo-model");
+    dummy.capabilities.jsonStream = true;
+    dummy.capabilities.reportsUsage = true;
+    dummy.capabilities.reportsSubagents = true;
+    engines_["dummy"] = std::move(dummy);
+    defaultEngine_ = "dummy";
+#endif
 }
 
 bool WorkerEngineRegistry::LoadFromJson(const std::string& jsonText, std::string& err) {
@@ -472,6 +486,10 @@ bool WorkerEngineRegistry::BuildCommand(const std::string& engine,
 
     ReplaceAll(cmd, "{permissionArgs}", permissionArgsOverride ? *permissionArgsOverride : def.permissionArgs);
     ReplaceAll(cmd, "{permitArgs}", permitArgsOverride ? *permitArgsOverride : def.permitArgs);
+
+#ifdef HANCHO_DEMO_BUILD
+    ReplaceAll(cmd, "{dummy}", QuoteCommandArg(GetDummyLlmExecutableUtf8()));
+#endif
 
     int timeoutMin = timeoutSec > 0 ? (timeoutSec + 59) / 60 : 30;
     if (timeoutMin < 1) timeoutMin = 1;
