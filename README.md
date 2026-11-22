@@ -124,6 +124,11 @@ The application icons are modeled on the character "Telephone Cat" (電話猫, D
 
 
 
+### v0.9.41
+- **Usage graph bar size**: the 表示 tab sets the bar size for each range (1h, 4h, 12h, 24h). Bar count = range / size. Defaults: 1h 1 min (60 bars), 4h 10 min (24), 12h 30 min (24), 24h 1 h (24). Saved as `usage_bucket_1h_sec` etc. in `config.json`.
+- **Token usage graph**: the dashboard reads usage history from HanchoCore over IPC (refreshed every 2 seconds), so calls recorded by the core appear in 1h, 4h, 12h and 24h without restarting the dashboard. If the core cannot be reached, the dashboard falls back to its own data.
+- **Installer upgrade**: installing a new version removes the old `HanchoCore.exe` and `HanchoDashboard.exe` copies, so the next launch uses the new build.
+
 ### v0.9.40
 - **Token usage graph (24h)**: the 24h view reads the older part of the window from `usage_history.jsonl` and the last 12 hours from memory, so recent calls are no longer missing from 24h.
 - **ww engine switch**: `ww-run`, `ww-watch` and `-Jobs` tasks switch to the next approved engine from `llms.json` when an engine hits a usage limit (rate limit, quota, 429). Use `-NoEngineSwitch` or `WW_NO_ENGINE_SWITCH=1` to turn it off. `-Provider` and `-Model` (or `WW_PROVIDER` / `WW_MODEL`) choose the provider and model.

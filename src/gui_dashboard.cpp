@@ -683,6 +683,10 @@ enum ControlId {
     IDC_SET_LIST_BG_COMPLETED = 6047,
     IDC_SET_LIST_BG_TIMEOUT = 6048,
     IDC_SET_LIST_BG_FAILED = 6049,
+    IDC_SET_USAGE_BUCKET_1H = 6200,   // 6200..6203: usage graph bucket size per range
+    IDC_SET_USAGE_BUCKET_4H = 6201,
+    IDC_SET_USAGE_BUCKET_12H = 6202,
+    IDC_SET_USAGE_BUCKET_24H = 6203,
     IDC_SET_LIST_BG_RESET = 6050,
     IDC_SET_END_BLINK_ENABLED = 6051,
     IDC_SET_END_BLINK_SECONDS = 6052,
@@ -830,6 +834,25 @@ struct TaskUsageFileCache {
     int64_t rateLimitResetsAtSec = 0;
 };
 
+// Usage graph: each range (1h, 4h, 12h, 24h) is cut into buckets of usageBucketSec seconds,
+// so the bar count is range / size. Set in the settings dialog (表示 tab) and config.json.
+constexpr int kUsageBucketRanges = 4;
+static const int64_t kUsageBucketRangeSec[kUsageBucketRanges] = {3600, 4 * 3600, 12 * 3600, 86400};
+static const int kUsageBucketDefaultSec[kUsageBucketRanges] = {60, 600, 1800, 3600};
+static const int kUsageBucketChoicesSec[] = {60, 120, 180, 300, 600, 900, 1200, 1800, 3600};
+static const char* const kUsageBucketConfigKeys[kUsageBucketRanges] = {
+    "usage_bucket_1h_sec", "usage_bucket_4h_sec", "usage_bucket_12h_sec", "usage_bucket_24h_sec"};
+static bool UsageBucketValid(int rangeIdx, int sec) {
+    if (rangeIdx < 0 || rangeIdx >= kUsageBucketRanges || sec <= 0) return false;
+    const int64_t range = kUsageBucketRangeSec[rangeIdx];
+    return range % sec == 0 && range / sec <= 96;
+}
+static std::wstring UsageBucketChoiceText(int sec) {
+    if (sec % 3600 == 0) return std::to_wstring(sec / 3600) + Tr(L" 時間", L" h", L" h");
+    if (sec % 60 == 0) return std::to_wstring(sec / 60) + Tr(L" 分", L" min", L" min");
+    return std::to_wstring(sec) + L" s";
+}
+
 struct DashboardState {
     ProcessManager* pm = nullptr;
     IpcServer* ipc = nullptr;
@@ -900,9 +923,14 @@ struct DashboardState {
     bool showUsagePanel = true;
     int usagePanelHeight = 170;
     int usageRangeIndex = 3; // 0: 1h, 1: 4h, 2: 12h, 3: 24h (default), 4: 7d, 5: 30d
+    // Usage points fetched from the core (see FetchUsagePointsIpc); cached for a few seconds.
+    int usageCacheRange = -1;
+    uint64_t usageCacheMs = 0;
+    std::vector<LlmUsagePoint> usageCachePoints;
     int usageGraphMode = 0; // 0: token kinds (default), 1: by provider/model
     int ganttRangeIndex = 2; // Task Gantt job count: 0: 3, 1: 5, 2: 10 (default)
     bool restoreUsageGraph = true;
+    int usageBucketSec[kUsageBucketRanges] = {60, 600, 1800, 3600};  // per range, see kUsageBucketDefaultSec
     int64_t llmMaxEvents = kDefaultLlmMaxEvents;  // events kept per stream tracker; -1 = unlimited
     bool resourceLocks = true; // task queue resource locks (doc/resource-locks.md)
     bool showHiddenTasks = false; // include internal (e.g. Chat handler) jobs in the task list
@@ -1184,6 +1212,32 @@ static bool GuiIpcCall(DashboardState* st, const nlohmann::json& req, nlohmann::
     if (outResp.is_discarded()) {
         if (outError) *outError = "Invalid JSON response: " + resp;
         return false;
+    }
+    return true;
+}
+
+// Usage points recorded by the core (HanchoCore keeps the live history; this dashboard process
+// only has its own). Returns false when the core cannot be reached, so the caller can fall back.
+static bool FetchUsagePointsIpc(DashboardState* st, int64_t sinceSec, std::vector<LlmUsagePoint>& out) {
+    nlohmann::json req = {{"action", "get_usage_history"}, {"since_sec", sinceSec}};
+    nlohmann::json resp;
+    if (!GuiIpcCall(st, req, resp, nullptr)) return false;
+    if (!resp.is_object() || !resp.value("ok", false) || !resp.contains("points") || !resp["points"].is_array()) return false;
+    out.clear();
+    for (const auto& j : resp["points"]) {
+        if (!j.is_object()) continue;
+        LlmUsagePoint p;
+        p.epochSec = j.value("epoch", (int64_t)0);
+        p.inputTokens = j.value("input", (uint64_t)0);
+        p.outputTokens = j.value("output", (uint64_t)0);
+        p.thinkingTokens = j.value("thinking", (uint64_t)0);
+        // The core sends read+write cache combined; the graph only needs the sum.
+        p.cacheReadTokens = j.value("cache", (uint64_t)0);
+        p.totalTokens = j.value("total", (uint64_t)0);
+        p.costUsd = j.value("cost", 0.0);
+        p.agentType = j.value("agent", std::string());
+        p.model = j.value("model", std::string());
+        out.push_back(std::move(p));
     }
     return true;
 }
@@ -12444,6 +12498,10 @@ static void LoadShellConfig(DashboardState* st) {
     st->restoreUsageGraph = JsonGetBool(content, "restore_usage_graph", true);
     SetUsageHistoryPersistence(st->restoreUsageGraph);
     SetUsageRoundTime(JsonGetString(content, "usage_round_time", "05:00"));
+    for (int i = 0; i < kUsageBucketRanges; ++i) {
+        const int sec = static_cast<int>(JsonGetInt(content, kUsageBucketConfigKeys[i], kUsageBucketDefaultSec[i]));
+        st->usageBucketSec[i] = UsageBucketValid(i, sec) ? sec : kUsageBucketDefaultSec[i];
+    }
     st->llmMaxEvents = ClampLlmMaxEvents(JsonGetInt(content, "llm_max_events", kDefaultLlmMaxEvents));
     SetLlmMaxEvents(st->llmMaxEvents);
     st->resourceLocks = JsonGetBool(content, "resource_locks", true);
@@ -12579,6 +12637,10 @@ static void SaveShellConfig(const DashboardState* st) {
         << "  \"usage_graph_mode\": " << st->usageGraphMode << ",\n"
         << "  \"restore_usage_graph\": " << (st->restoreUsageGraph ? "true" : "false") << ",\n"
         << "  \"usage_round_time\": \"" << GetUsageRoundTime() << "\",\n"
+        << "  \"usage_bucket_1h_sec\": " << st->usageBucketSec[0] << ",\n"
+        << "  \"usage_bucket_4h_sec\": " << st->usageBucketSec[1] << ",\n"
+        << "  \"usage_bucket_12h_sec\": " << st->usageBucketSec[2] << ",\n"
+        << "  \"usage_bucket_24h_sec\": " << st->usageBucketSec[3] << ",\n"
         << "  \"llm_max_events\": " << st->llmMaxEvents << ",\n"
         << "  \"resource_locks\": " << (st->resourceLocks ? "true" : "false") << ",\n"
         << "  \"memory_max_bytes\": " << st->memoryMaxBytes << ",\n"
@@ -13448,6 +13510,9 @@ struct SettingsDlgState {
      HWND chkHideEnded = nullptr;
      HWND chkUsageGraph = nullptr;
      HWND chkRestoreUsageGraph = nullptr;
+    HWND lblUsageBucketHead = nullptr;
+    HWND lblUsageBucket[kUsageBucketRanges] = {};
+    HWND cmbUsageBucket[kUsageBucketRanges] = {};
       HWND chkResourceLocks = nullptr;
       HWND chkShowHiddenTasks = nullptr;
       HWND chkActivityStyle = nullptr;
@@ -15200,6 +15265,31 @@ static LRESULT CALLBACK SettingsWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPAR
             SendMessageW(ds->chkRestoreUsageGraph, BM_SETCHECK,
                 ds->dash->restoreUsageGraph ? BST_CHECKED : BST_UNCHECKED, 0);
 
+            // 表示 tab: bar size of the usage graph for each range (bar count = range / size).
+            ds->lblUsageBucketHead = CreateWindowExW(0, L"STATIC", Tr(L"使用量グラフの単位（1 本あたり）", L"Usage graph bar size", L"Tamaño de barra del gráfico de uso"),
+                WS_CHILD | WS_VISIBLE, 18, 360, 480, 20, hwnd, nullptr, hInst, nullptr);
+            SendMessageW(ds->lblUsageBucketHead, WM_SETFONT, (WPARAM)ds->dash->hFontUiBold, TRUE);
+            const wchar_t* const bucketRangeNames[kUsageBucketRanges] = {L"1h", L"4h", L"12h", L"24h"};
+            for (int i = 0; i < kUsageBucketRanges; ++i) {
+                const int y = 386 + i * 28;
+                ds->lblUsageBucket[i] = CreateWindowExW(0, L"STATIC", L"", WS_CHILD | WS_VISIBLE,
+                    18, y + 3, 260, 20, hwnd, nullptr, hInst, nullptr);
+                SetWindowTextW(ds->lblUsageBucket[i], (std::wstring(bucketRangeNames[i]) + Tr(L" の 1 本あたり", L" per bar", L" por barra")).c_str());
+                ds->cmbUsageBucket[i] = CreateWindowExW(WS_EX_CLIENTEDGE, L"COMBOBOX", L"",
+                    WS_CHILD | WS_VISIBLE | WS_TABSTOP | WS_VSCROLL | CBS_DROPDOWNLIST,
+                    290, y, 200, 220, hwnd, (HMENU)(INT_PTR)(IDC_SET_USAGE_BUCKET_1H + i), hInst, nullptr);
+                int selIndex = 0;
+                for (int sec : kUsageBucketChoicesSec) {
+                    if (!UsageBucketValid(i, sec)) continue;
+                    const LRESULT idx = SendMessageW(ds->cmbUsageBucket[i], CB_ADDSTRING, 0,
+                        reinterpret_cast<LPARAM>(UsageBucketChoiceText(sec).c_str()));
+                    if (idx == CB_ERR) continue;
+                    SendMessageW(ds->cmbUsageBucket[i], CB_SETITEMDATA, idx, static_cast<LPARAM>(sec));
+                    if (sec == ds->dash->usageBucketSec[i]) selIndex = static_cast<int>(idx);
+                }
+                SendMessageW(ds->cmbUsageBucket[i], CB_SETCURSEL, selIndex, 0);
+            }
+
             ds->chkResourceLocks = CreateWindowExW(0, L"BUTTON", L"", WS_CHILD | WS_VISIBLE | BS_AUTOCHECKBOX,
                 18, 242, 520, 24, hwnd, (HMENU)IDC_SET_RESOURCE_LOCKS, hInst, nullptr);
             SendMessageW(ds->chkResourceLocks, BM_SETCHECK,
@@ -16152,6 +16242,21 @@ static LRESULT CALLBACK SettingsWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPAR
                 if (HIWORD(wParam) == EN_KILLFOCUS) CommitEventRetention(ds);
                 return 0;
             }
+            if (id >= IDC_SET_USAGE_BUCKET_1H && id <= IDC_SET_USAGE_BUCKET_24H) {
+                if (HIWORD(wParam) == CBN_SELCHANGE) {
+                    const int i = id - IDC_SET_USAGE_BUCKET_1H;
+                    const LRESULT sel = SendMessageW(ds->cmbUsageBucket[i], CB_GETCURSEL, 0, 0);
+                    if (sel != CB_ERR) {
+                        const int sec = static_cast<int>(SendMessageW(ds->cmbUsageBucket[i], CB_GETITEMDATA, sel, 0));
+                        if (UsageBucketValid(i, sec)) {
+                            ds->dash->usageBucketSec[i] = sec;
+                            SaveShellConfig(ds->dash);
+                            InvalidateRect(ds->dash->hwndUsagePanel, nullptr, FALSE);
+                        }
+                    }
+                }
+                return 0;
+            }
             if (id == IDC_SET_RESTORE_USAGE_GRAPH) {
                 ds->dash->restoreUsageGraph =
                     (SendMessageW(ds->chkRestoreUsageGraph, BM_GETCHECK, 0, 0) == BST_CHECKED);
@@ -17019,21 +17124,27 @@ static void DrawUsagePanel(HWND hwnd, HDC hdc, DashboardState* st) {
     if (rangeIdx <= 3) {
         // 1h / 4h / 12h / 24h: live U0 points. Buckets are aligned to the axis: bucket i covers
         // [since + i*bucketSec, since + (i+1)*bucketSec), so bars line up with the labels.
-        int gx0_tmp = 58;
-        int colW_tmp = (w - 24) / 3;
-        if (colW_tmp < 1) colW_tmp = 1;
-        int graphW_tmp = (12 + colW_tmp - 8) - gx0_tmp;
-        if (graphW_tmp < 1) graphW_tmp = 1;
-        nBuckets = graphW_tmp / 7;
-        if (nBuckets < 12) nBuckets = 12;
-        if (nBuckets > 96) nBuckets = 96;
-        bucketSec = static_cast<double>(kUsageRangeSec[rangeIdx]) / nBuckets;
-        if (bucketSec < 1.0) bucketSec = 1.0;
+        // Bucket size comes from the settings (表示 tab); the bar count is range / size.
+        bucketSec = static_cast<double>(st->usageBucketSec[rangeIdx]);
+        nBuckets = static_cast<int>(kUsageRangeSec[rangeIdx] / st->usageBucketSec[rangeIdx]);
+        if (nBuckets < 1) nBuckets = 1;
 
         // Ranges longer than the memory window: the newest part comes from memory, the older part from the file.
         constexpr int64_t kUsageMemoryWindowSec = 12 * 3600;
+        constexpr int64_t kUsageCoreRefreshMs = 2000;
         std::vector<LlmUsagePoint> points;
-        if (kUsageRangeSec[rangeIdx] > kUsageMemoryWindowSec) {
+        // Prefer the core's live history, refreshed at most every 2 seconds per range.
+        const uint64_t nowMs = GetNowEpochMs();
+        const bool cacheFresh = st->usageCacheRange == rangeIdx && st->usageCacheMs != 0 &&
+                                nowMs - st->usageCacheMs < static_cast<uint64_t>(kUsageCoreRefreshMs);
+        if (cacheFresh) {
+            points = st->usageCachePoints;
+        } else if (FetchUsagePointsIpc(st, kUsageRangeSec[rangeIdx], points)) {
+            st->usageCacheRange = rangeIdx;
+            st->usageCacheMs = nowMs;
+            st->usageCachePoints = points;
+        } else if (kUsageRangeSec[rangeIdx] > kUsageMemoryWindowSec) {
+            // Core unreachable: this process's own memory for the newest 12 hours, the file for the rest.
             const int64_t memSince = now - kUsageMemoryWindowSec;
             points = ReadUsageHistoryFile(since, memSince);
             std::vector<LlmUsagePoint> recent = GetLlmUsageHistory(memSince);

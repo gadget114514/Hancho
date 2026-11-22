@@ -120,6 +120,11 @@ New-Item -ItemType Junction -Path .claude\skills\hancho -Target (Resolve-Path sk
 
 
 
+### v0.9.41
+- **使用量グラフの単位**: 表示タブで範囲ごと（1h・4h・12h・24h）に 1 本あたりの時間を選べます。本数は範囲 ÷ 単位です。既定値は 1h が 1 分（60 本）、4h が 10 分（24 本）、12h が 30 分（24 本）、24h が 1 時間（24 本）です。`config.json` の `usage_bucket_1h_sec` などに保存されます。
+- **使用量グラフ**: ダッシュボードは使用量の履歴を IPC で HanchoCore から読みます（2 秒ごとに更新）。そのため、Core が記録した呼び出しは、ダッシュボードを再起動せずに 1h・4h・12h・24h に出ます。Core に接続できないときは、ダッシュボード自身のデータを使います。
+- **インストーラーのアップグレード**: 新しい版を入れるとき、古い `HanchoCore.exe` と `HanchoDashboard.exe` のコピーを消すので、次の起動から新しい版が使われます。
+
 ### v0.9.40
 - **使用量グラフ（24h）**: 24h の表示は、範囲の古い部分を `usage_history.jsonl` から、直近 12 時間をメモリから読みます。直近の呼び出しが 24h から抜けなくなりました。
 - **ww のエンジン自動切り替え**: `ww-run`・`ww-watch`・`-Jobs` のタスクは、エンジンが使用上限（レート制限・クォータ・429）に達すると、`llms.json` の次の承認済みエンジンに切り替えます。`-NoEngineSwitch` または `WW_NO_ENGINE_SWITCH=1` で無効にできます。`-Provider` と `-Model`（または `WW_PROVIDER` / `WW_MODEL`）でプロバイダーとモデルを指定します。

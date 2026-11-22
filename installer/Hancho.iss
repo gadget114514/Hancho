@@ -100,6 +100,11 @@ Root: HKCU; Subkey: "Software\Microsoft\Windows\CurrentVersion\Run"; ValueType: 
 [Run]
 Filename: "{app}\{#MyAppExeName}"; Description: "{cm:LaunchProgram,{#StringChange(MyAppName, '&', '&&')}}"; Flags: nowait postinstall skipifsilent
 
+[InstallDelete]
+; Role copies of Hancho.exe (created at launch). Remove stale ones so the next launch recreates them from the new Hancho.exe.
+Type: files; Name: "{app}\HanchoCore.exe"
+Type: files; Name: "{app}\HanchoDashboard.exe"
+
 [UninstallDelete]
 Type: filesandordirs; Name: "{app}\logs"
 Type: files; Name: "{app}\HanchoCore.exe"
