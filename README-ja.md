@@ -120,6 +120,9 @@ New-Item -ItemType Junction -Path .claude\skills\hancho -Target (Resolve-Path sk
 
 
 
+### v0.9.44
+- **失敗分類の修正**: 普通の（LLM でない）ジョブの出力に、ジョブ JSON のキー `"on_permission_denied"` のような権限らしい識別子が含まれているだけで、`permission_denied` と判定されて `waitingForPermit` で止まる不具合を直しました。今は通常の失敗として扱われ、behavior tree のフォールバックの枝に進みます。ログ行による権限拒否の判定は単語単位で照合し、LLM ワーカーのジョブだけに適用します。
+
 ### v0.9.43
 - **表示スケール設定**: 設定の表示タブに「表示スケール (DPI)」を追加しました。Windows に従う / 100%（96 DPI）/ 125%（120 DPI）/ 150%（144 DPI）から選べます。一覧のフォント、ツールバーのボタン、余白がまとめて拡大縮小されます。`config.json` の `display_scale_dpi` に保存されます。
 - **ドキュメント**: ダッシュボードのグラフ画像を更新しました。
