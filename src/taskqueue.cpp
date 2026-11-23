@@ -1235,6 +1235,13 @@ TaskQueueFailureDiagnostic ClassifyTaskQueueFailure(const TaskQueueFailureInput&
         "401 unauthorized|authentication failed|not authenticated|unauthorized request)";
     static const char* kPermissionPattern =
         "(permission denied|permission_denied|access is denied|not permitted|eacces|operation not permitted)";
+    // The log-line form of the same wording. It only applies to LLM worker jobs and needs
+    // word boundaries: a plain job that prints job JSON such as "on_permission_denied":""
+    // (taskqueue_smoke.exe, 2026-11-23 lineage-100-1-test-1) must fail as a normal failure,
+    // not be parked in waitingForPermit.
+    static const char* kPermissionLogPattern =
+        "\\b(permission denied|permission_denied|access is denied|not permitted|eacces|operation not permitted)\\b";
+    const bool workerJob = !in.engine.empty() || !DetectAgentType(in.command, in.jobName).empty();
     static const char* kTurnPattern =
         "(max_turns|maximum number of turns|turn limit|context length|context window|maximum context|"
         "prompt is too long|too many tokens|token limit)";
@@ -1446,7 +1453,7 @@ TaskQueueFailureDiagnostic ClassifyTaskQueueFailure(const TaskQueueFailureInput&
             if (permissionEvent) AddEventEvidence(d, in.eventsFile, EventSeqOf(*permissionEvent));
             return d;
         }
-        int line = FindLogLineNoCase(in, kPermissionPattern);
+        int line = workerJob ? FindLogLineNoCase(in, kPermissionLogPattern) : 0;
         if (line > 0) {
             PermissionDenial fallback;
             FillPermissionDiagnostic(d, in, fallback, "", "high", "log");
@@ -1539,7 +1546,7 @@ TaskQueueFailureDiagnostic ClassifyTaskQueueFailure(const TaskQueueFailureInput&
             if (permissionEvent) AddEventEvidence(d, in.eventsFile, EventSeqOf(*permissionEvent));
             return d;
         }
-        int line = FindLogLineNoCase(in, kPermissionPattern);
+        int line = workerJob ? FindLogLineNoCase(in, kPermissionLogPattern) : 0;
         if (line > 0) {
             PermissionDenial fallback;
             FillPermissionDiagnostic(d, in, fallback, "", "high", "log");
