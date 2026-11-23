@@ -15,24 +15,40 @@
 ### バージョン
 - バージョンは `CMakeLists.txt` の `project(... VERSION x.y.z)` だけで管理する。C++ の `PC_VERSION`、exe の VERSIONINFO（`src/version_info.rc2`）、インストーラー（`installer/build_installer.cmd` が `/DMyAppVersion` で渡す）はすべてここから決まる。
 
+## ブランチ
+
+- `main`: 開発の本線。次のマイナー版（今は 0.10 系）に向けた変更が入る。
+- `stable`: 安定版の系統。今は v0.9.43（2026-11-23 に決定）。0.9.x の不具合修正だけを入れ、新機能は入れない。
+- 複数のコミットにまたがる作業はトピックブランチ（例: `feature/task-lineage`）で進め、そろってから `main` にマージする。1 コミットで済む小さな修正は `main` に直接入れてよい。
+- `stable` で直した不具合が `main` にもあるなら、修正コミットだけを `main` に cherry-pick する。リリースのコミット（バージョンやリリースノートの変更）は持ち込まない。
+- 計画や決定事項は `doc/` に Markdown で残す（例: `doc/task-lineage-plan.md`）。
+
 ## リリース
 
-「version x.y.z でリリース」「リリースして」と言われたら、以下を確認を挟まず最後まで順に実行する（この依頼自体が commit、`main` への push、インストール、GitHub リリース公開の許可にあたる）。バージョンの指定がなければ、現在のパッチ番号を 1 上げる。途中で失敗したら、そこで止めて報告する。
+「version x.y.z でリリース」「リリースして」と言われたら、以下を確認を挟まず最後まで順に実行する（この依頼自体が commit、リリース元ブランチへの push、インストール、GitHub リリース公開の許可にあたる）。途中で失敗したら、そこで止めて報告する。
 
-1. **事前確認**: `git fetch` して `main` が `origin/main` より遅れていないこと、タグ `vx.y.z` がまだないことを確認する。未コミットの変更はリリースに含める。ただし内容を確認し、無関係なファイルや一時ファイルは含めない（`git add -A` は使わない）。
+### リリース元ブランチとバージョン
+- 「stable でリリース」と言われたとき、または指定されたバージョンが `stable` の系統（今は 0.9.x）のときは、`stable` から出す。それ以外は `main` から出す。以下の `<branch>` はこのリリース元ブランチを指す。
+- バージョンの指定がなければ、`<branch>` の `CMakeLists.txt` にある現在のパッチ番号を 1 上げる。
+- `<branch>` に切り替えてから始める。未コミットの変更が別ブランチの作業らしいときは、切り替える前に止めて確認する。
+
+### 手順
+1. **事前確認**: `git fetch` して `<branch>` が `origin/<branch>` より遅れていないこと、タグ `vx.y.z` がまだないことを確認する。未コミットの変更はリリースに含める。ただし内容を確認し、無関係なファイルや一時ファイルは含めない（`git add -A` は使わない）。
 2. **バージョンとノート**:
    - `CMakeLists.txt` の `project(... VERSION x.y.z)` を更新する。
    - `README.md` と `README-ja.md` の「リリースノート」の先頭に `### vx.y.z` を追加する。ダウンロードは Releases ページへのリンクだけにしているので、個別リリースへのリンクは追加しない。
-   - 前回のタグ以降の変更から `dist/release-notes-vx.y.z.md` を書く（形式は `dist` にある前回のファイルに合わせ、英語と日本語の両方を入れる）。
+   - `<branch>` 上の前回のタグ以降の変更から `dist/release-notes-vx.y.z.md` を書く（形式は `dist` にある前回のファイルに合わせ、英語と日本語の両方を入れる）。
    - これらのファイルは改行コードを保って編集する（`sed -i` は全行の改行を変えることがあるので使わない）。
 3. **ビルド**: `cmake --build build --config Release --target Hancho HanchoChat HanchoTerm wct hancho-cli` を実行し、`build\Release\hancho-cli.exe --version` が `x.y.z` を返すことを確認する。
-4. **コミットと push**: 変更をコミットして `git push origin main` する。
+4. **コミットと push**: 変更をコミットして `git push origin <branch>` する。
 5. **パッケージ**:
    - `dist\Hancho-vx.y.z-win64\` を新しく作り、次をコピーする: `build\Release` の `Hancho.exe`、`HanchoChat.exe`、`HanchoTerm.exe`、`hancho-cli.exe`、`wct.exe`、`conpty.dll`、`OpenConsole.exe`、およびルートの `LICENSE`、`README.md`、`README-ja.md`、`doc\`、`tools\`、`skills\`。
    - PowerShell の `Compress-Archive -Path <そのフォルダ> -DestinationPath dist\Hancho-vx.y.z-win64.zip` で zip を作る。
    - `installer\build_installer.cmd` で `dist\Hancho-vx.y.z-win64-setup.exe` を作る。
-6. **GitHub リリース**: `gh release create vx.y.z <setup.exe> <zip> --target main --title "Hancho vx.y.z" --notes-file dist/release-notes-vx.y.z.md` を実行し、タグが push したコミットを指していること、アセットが 2 つあることを確認する。
+6. **GitHub リリース**: `gh release create vx.y.z <setup.exe> <zip> --target <branch> --title "Hancho vx.y.z" --notes-file dist/release-notes-vx.y.z.md` を実行し、タグが push したコミットを指していること、アセットが 2 つあることを確認する。
+   - 公開済みのリリースにもっと新しいバージョンがあるとき（例: 0.10.0 の公開後に 0.9.44 を出すとき）は `--latest=false` を付け、「Latest」を奪わないようにする。
 7. **インストール**: setup.exe を `/VERYSILENT /SUPPRESSMSGBOXES /NORESTART /NOCLOSEAPPLICATIONS /LOG=dist\install-x.y.z.log` で実行する。終了コードが 0 で、`%LOCALAPPDATA%\Programs\Hancho\hancho-cli.exe --version` が `x.y.z` を返すことを確認する。
    - ダッシュボードが起動中だとインストーラーは終了コード 1 で中止する。動作中のジョブを巻き込むおそれがあるので、ダッシュボードは勝手に閉じない。閉じてもらうよう頼み、閉じたら再実行する。
+8. **stable からのリリースの後始末**: `main` のリリースノート（`README.md`、`README-ja.md`）にも `### vx.y.z` を追加してコミットする。修正コミットが `main` にまだなければ cherry-pick する。終わったら元のブランチに戻る。
 
 最後に、各手順の結果とリリースの URL を報告する。画面で確認していない変更があれば、そのことも伝える。
