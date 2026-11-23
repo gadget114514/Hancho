@@ -124,6 +124,10 @@ The application icons are modeled on the character "Telephone Cat" (電話猫, D
 
 
 
+### v0.9.43
+- **Display scale setting**: the Appearance tab has a "Display scale (DPI)" dropdown: follow Windows, 100% (96 DPI), 125% (120 DPI) or 150% (144 DPI). The list fonts, toolbar buttons and margins scale together; saved as `display_scale_dpi` in `config.json`.
+- **Docs**: updated the dashboard graph screenshot.
+
 ### v0.9.42
 - **Async startup task loading**: the dashboard renders the window and initial task rows immediately on startup (`WM_PC_INITIAL_REFRESH`) and loads per-job token / cost usage from event logs on a background worker thread (`WM_PC_INITIAL_TASK_USAGE`), preventing UI freezes when many jobs are in the queue.
 - **Settings (Appearance tab)**: fixed layout overlap between the usage graph bar-size controls and the font rows.
