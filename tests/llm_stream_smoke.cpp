@@ -598,6 +598,56 @@ int main() {
     SetDataDirectoryOverride(origDataDir);
     std::filesystem::remove_all(std::filesystem::path(testDataDir), ec);
 
+    // 6. OpenCode run without --model: the model comes from opencode.log of the same session.
+    {
+        const std::string logText =
+            "timestamp=t level=INFO run=r message=created id=ses_A model=undefined\n"
+            "timestamp=t level=INFO run=r message=stream providerID=opencode-go modelID=tiny-title session.id=ses_A small=true agent=title mode=primary\n"
+            "timestamp=t level=INFO run=r message=stream providerID=other modelID=big-b session.id=ses_B small=false agent=build mode=primary\n"
+            "timestamp=t level=INFO run=r message=stream providerID=opencode-go modelID=hy4-flash-free session.id=ses_A small=false agent=build mode=primary\n"
+            "timestamp=t level=INFO run=r message=stream providerID=other modelID=big-c session.id=ses_AB small=false agent=build mode=primary\n";
+        Check(FindOpenCodeModelInLog(logText, "ses_A") == "opencode-go/hy4-flash-free",
+              "opencode log: model of the session, title model (small=true) skipped");
+        Check(FindOpenCodeModelInLog(logText, "ses_B") == "other/big-b", "opencode log: other session's model");
+        Check(FindOpenCodeModelInLog(logText, "ses_X").empty(), "opencode log: unknown session gives no model");
+        Check(FindOpenCodeModelInLog(logText.substr(0, logText.find('\n') + 1), "ses_A").empty(),
+              "opencode log: created line (model=undefined) gives no model");
+
+        // End to end: a tracker with no --model reads the fake opencode.log under USERPROFILE.
+        std::filesystem::path fakeHome = std::filesystem::temp_directory_path() / L"hancho_opencode_home_smoke";
+        std::filesystem::path logDir = fakeHome / L".local" / L"share" / L"opencode" / L"log";
+        std::filesystem::create_directories(logDir, ec);
+        {
+            std::ofstream lf(logDir / L"opencode.log", std::ios::binary);
+            lf << logText;
+        }
+        std::wstring oldHome;
+        {
+            wchar_t* buf = nullptr;
+            size_t n = 0;
+            if (_wdupenv_s(&buf, &n, L"USERPROFILE") == 0 && buf) oldHome = buf;
+            free(buf);
+        }
+        _wputenv_s(L"USERPROFILE", fakeHome.wstring().c_str());
+
+        LlmStreamTracker oc;
+        oc.Init(2, "opencode", "", "", "", "");
+        Feed(oc, R"({"type":"step_start","sessionID":"ses_A","part":{"messageID":"msg_1","sessionID":"ses_A","type":"step-start"}})");
+        Feed(oc, R"({"type":"step_finish","sessionID":"ses_A","part":{"messageID":"msg_1","sessionID":"ses_A","type":"step-finish","reason":"stop","tokens":{"total":120,"input":100,"output":20,"reasoning":0,"cache":{"write":0,"read":0}},"cost":0}})");
+        LlmAgentState ocst = oc.GetState();
+        Check(ocst.model == "opencode-go/hy4-flash-free",
+              "opencode tracker without --model: model from opencode.log (got '" + ocst.model + "')");
+        Check(ocst.totalTokens == 120, "opencode tracker: free model step tokens counted (120)");
+        bool pointHasModel = false;
+        for (const auto& p : GetLlmUsageHistory(0)) {
+            if (p.agentType == "opencode" && p.totalTokens == 120) pointHasModel = p.model == "opencode-go/hy4-flash-free";
+        }
+        Check(pointHasModel, "opencode tracker: the usage point carries the model");
+
+        _wputenv_s(L"USERPROFILE", oldHome.c_str());
+        std::filesystem::remove_all(fakeHome, ec);
+    }
+
     if (g_failures == 0) std::printf("ALL PASS\n");
     else std::printf("%d check(s) failed\n", g_failures);
     return g_failures == 0 ? 0 : 1;

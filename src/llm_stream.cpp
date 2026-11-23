@@ -1182,6 +1182,76 @@ static std::string ReadAgyModelFromTranscript(const std::string& conversationId)
     return "";
 }
 
+// Value of "key=" up to the next space in a logfmt line (key must start the line or follow a space).
+static std::string LogfmtValue(const std::string& line, const std::string& key) {
+    const std::string needle = key + "=";
+    size_t pos = 0;
+    while ((pos = line.find(needle, pos)) != std::string::npos) {
+        if (pos == 0 || line[pos - 1] == ' ') break;
+        pos += needle.size();
+    }
+    if (pos == std::string::npos) return "";
+    size_t start = pos + needle.size();
+    size_t end = line.find_first_of(" \r\n", start);
+    if (end == std::string::npos) end = line.size();
+    std::string v = line.substr(start, end - start);
+    if (v.size() >= 2 && v.front() == '"' && v.back() == '"') v = v.substr(1, v.size() - 2);
+    return v;
+}
+
+std::string FindOpenCodeModelInLog(const std::string& logText, const std::string& sessionId) {
+    std::string found;
+    size_t start = 0;
+    while (start < logText.size()) {
+        size_t end = logText.find('\n', start);
+        if (end == std::string::npos) end = logText.size();
+        std::string line = logText.substr(start, end - start);
+        start = end + 1;
+        if (line.find("message=stream") == std::string::npos) continue;
+        if (LogfmtValue(line, "message") != "stream") continue;
+        if (LogfmtValue(line, "small") == "true") continue;
+        if (!sessionId.empty() && LogfmtValue(line, "session.id") != sessionId) continue;
+        std::string model = LogfmtValue(line, "modelID");
+        if (model.empty() || model == "undefined") continue;
+        std::string provider = LogfmtValue(line, "providerID");
+        found = (provider.empty() || provider == "undefined") ? model : provider + "/" + model;
+    }
+    return found;
+}
+
+// Reads the tail of opencode's own log and finds the model of sessionId there.
+static std::string ReadOpenCodeModelFromLog(const std::string& sessionId) {
+    if (sessionId.empty()) return "";
+    std::filesystem::path logPath;
+#ifdef _WIN32
+    const wchar_t* home = _wgetenv(L"USERPROFILE");
+    if (!home) return "";
+    logPath = std::filesystem::path(home) / L".local" / L"share" / L"opencode" / L"log" / L"opencode.log";
+#else
+    const char* xdg = std::getenv("XDG_DATA_HOME");
+    const char* home = std::getenv("HOME");
+    if (xdg && *xdg) {
+        logPath = std::filesystem::path(xdg) / "opencode" / "log" / "opencode.log";
+    } else if (home) {
+        logPath = std::filesystem::path(home) / ".local" / "share" / "opencode" / "log" / "opencode.log";
+    } else {
+        return "";
+    }
+#endif
+    std::ifstream f(logPath, std::ios::binary);
+    if (!f) return "";
+    constexpr std::streamoff kTailBytes = 4 * 1024 * 1024;
+    f.seekg(0, std::ios::end);
+    std::streamoff size = f.tellg();
+    if (size <= 0) return "";
+    std::streamoff from = size > kTailBytes ? size - kTailBytes : 0;
+    f.seekg(from);
+    std::string text(static_cast<size_t>(size - from), '\0');
+    f.read(text.data(), static_cast<std::streamsize>(text.size()));
+    text.resize(static_cast<size_t>(f.gcount()));
+    return FindOpenCodeModelInLog(text, sessionId);
+}
+
 static std::string MatchAgentKeyword(const std::string& lowerText) {
     if (WordMatches(lowerText, "claude")) return "claude";
     if (WordMatches(lowerText, "agy") || WordMatches(lowerText, "antigravity")) return "agy";
@@ -2236,8 +2306,9 @@ void LlmStreamTracker::ProcessLine(const std::string& line) {
             while (!v.empty() && (v.back() == ' ' || v.back() == '"')) v.pop_back();
             return v;
         };
-        std::string m = extractAfter("llm.model=");
-        if (m.empty()) m = extractAfter("modelID=");
+        // "message=stream" lines name provider and model; small=true ones are the title model.
+        std::string m = FindOpenCodeModelInLog(line, "");
+        if (m.empty()) m = extractAfter("llm.model=");
         if (!m.empty()) state_.model = m;
     }
     std::vector<LlmStreamEvent> parsed;
@@ -2535,6 +2606,21 @@ void LlmStreamTracker::ApplyEvent(LlmStreamEvent& ev, const std::string& line) {
             (lastAgyModelProbeMs_ == 0 || nowMs - lastAgyModelProbeMs_ >= kAgyModelProbeIntervalMs)) {
             lastAgyModelProbeMs_ = nowMs;
             std::string m = ReadAgyModelFromTranscript(conversationId_);
+            if (!m.empty()) state_.model = m;
+        }
+    }
+    // OpenCode run without --model (its configured default) does not name the model in its
+    // JSON stream either; its own opencode.log does, per session. Probe before the usage of
+    // this event is recorded, and always on a step that carries usage.
+    const bool isOpenCode = (ev.agentType == "opencode" || agentType_ == "opencode");
+    if (isOpenCode && state_.model.empty()) {
+        const std::string& sid = !ev.sessionId.empty() ? ev.sessionId : state_.sessionId;
+        const bool hasUsage = ev.totalTokens > 0 || ev.inputTokens > 0 || ev.outputTokens > 0 || ev.costUsd > 0.0;
+        uint64_t nowMs = GetNowTickMs();
+        if (!sid.empty() && (hasUsage || lastOpenCodeModelProbeMs_ == 0 ||
+                             nowMs - lastOpenCodeModelProbeMs_ >= kOpenCodeModelProbeIntervalMs)) {
+            lastOpenCodeModelProbeMs_ = nowMs;
+            std::string m = ReadOpenCodeModelFromLog(sid);
             if (!m.empty()) state_.model = m;
         }
     }
