@@ -124,6 +124,11 @@ The application icons are modeled on the character "Telephone Cat" (電話猫, D
 
 
 
+### v0.9.45
+- **Dashboard task list performance**: the list now updates only the cells that changed when the job order is unchanged, instead of rebuilding all rows on every tick. Column widths grow only when a changed cell needs it. Finished-job token / cost usage is computed once and cached (keyed by job ID and attempt count, recalculated on retry), and sort keys are computed once before sorting. The default dashboard refresh interval is now 5 seconds (user-configurable).
+- **OpenCode usage attribution**: when an opencode run has no `--model`, Hancho now reads the provider and model from opencode's own log for that session, so its tokens are no longer recorded under `(unknown)`. Session-title calls (`small=true`) are ignored.
+- **Test stability**: the task-queue smoke tests clear the process-finished callback before destroying the queue manager, removing a rare shutdown-time use-after-free.
+
 ### v0.9.44
 - **Failure classifier fix**: a plain (non-LLM) job whose output merely contains a permission-like identifier, such as the job JSON key `"on_permission_denied"`, is no longer classified as `permission_denied` and parked in `waitingForPermit`; it now fails normally so behavior trees take their fallback branch. The log-line permission rule matches whole words only and applies only to LLM worker jobs.
 

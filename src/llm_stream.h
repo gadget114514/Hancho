@@ -134,6 +134,8 @@ bool ParseLlmStreamLine(const std::string& line, const std::string& defaultAgent
 // Returns false if the line is not a JSON object.
 bool ParseLlmStreamLines(const std::string& line, const std::string& defaultAgentType, std::vector<LlmStreamEvent>& outEvents);
 
+std::string FindOpenCodeModelInLog(const std::string& logText, const std::string& sessionId);
+
 // Format events as JSON array or human-readable summary
 std::string LlmEventsToJson(const std::vector<LlmStreamEvent>& events, const LlmAgentState& state);
 // The sub-agent list as a JSON array (used by LlmEventsToJson and the IPC agent state).
@@ -382,6 +384,7 @@ private:
     int attempt_ = 0;
     std::string conversationId_;
     uint64_t lastAgyModelProbeMs_ = 0;
+    uint64_t lastOpenCodeLogProbeMs_ = 0;
     std::vector<LlmUsagePoint> pendingUsage_;  // recorded by IngestChunk after releasing mutex_
     std::string streamFilePath_;
     std::wstring streamFilePathWide_;
@@ -421,6 +424,7 @@ private:
     static constexpr size_t kMaxSubagents = 4096;
     static constexpr size_t kMaxToolUseOwners = 4096;
     static constexpr uint64_t kAgyModelProbeIntervalMs = 5000;
+    static constexpr uint64_t kOpenCodeLogProbeIntervalMs = 1000;
     // Claude tool_result lines (file contents etc.) routinely exceed 64KB.
     static constexpr size_t kMaxLineBytes = 16 * 1024 * 1024;
 };

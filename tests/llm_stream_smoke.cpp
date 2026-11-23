@@ -593,6 +593,63 @@ int main() {
     Check(q12m.groups.size() >= 1, "QueryUsageStats: 12m query returned at least 1 month group");
     Check(q12m.totalTokens == 6350, "QueryUsageStats: 12m query totalTokens matches");
 
+    std::printf("--- Part I: OpenCode model from log ---\n");
+    const std::string fakeLog =
+        "2026-11-23 INFO message=stream providerID=opencode-go modelID=hy4-flash-free session.id=ses_a small=false\n"
+        "2026-11-23 INFO message=stream providerID=opencode-go modelID=title-model session.id=ses_a small=true\n"
+        "2026-11-23 INFO message=stream providerID=opencode-go modelID=other-model session.id=ses_b small=false\n";
+    Check(FindOpenCodeModelInLog(fakeLog, "ses_a") == "opencode-go/hy4-flash-free",
+          "opencode log parser: skips the small=true title model");
+    Check(FindOpenCodeModelInLog(fakeLog, "ses_b") == "opencode-go/other-model",
+          "opencode log parser: keeps sessions apart");
+    Check(FindOpenCodeModelInLog(fakeLog, "ses_missing").empty(),
+          "opencode log parser: unknown session yields no model");
+    Check(FindOpenCodeModelInLog(fakeLog, "") == "opencode-go/hy4-flash-free",
+          "opencode log parser: no session filter takes the first real model");
+
+    wchar_t tmpHomeW[MAX_PATH] = {};
+    GetTempPathW(MAX_PATH, tmpHomeW);
+    const std::wstring fakeHome = std::wstring(tmpHomeW) + L"hancho_opencode_home_" +
+                                  std::to_wstring(GetCurrentProcessId());
+    const std::wstring logDir = std::wstring(fakeHome) + L"/.local/share/opencode/log";
+    std::filesystem::create_directories(std::filesystem::path(logDir), ec);
+    {
+        std::ofstream out(std::filesystem::path(logDir) / L"opencode.log", std::ios::binary);
+        out << fakeLog;
+    }
+    const char* oldProfile = std::getenv("USERPROFILE");
+    const std::string savedProfile = oldProfile ? oldProfile : "";
+    _putenv_s("USERPROFILE", WideToUtf8(fakeHome).c_str());
+
+    LlmStreamTracker oc;
+    oc.Init(2, "opencode", "", "", "", "");
+    Feed(oc, R"({"type":"step_start","sessionID":"ses_a","part":{"messageID":"msg1"}})");
+    Feed(oc, R"({"type":"step_finish","sessionID":"ses_a","part":{"messageID":"msg1","reason":"stop","tokens":{"total":1234,"input":800,"output":400,"reasoning":0,"cache":{"read":34,"write":0}},"cost":0.01}})");
+    const LlmAgentState ocState = oc.GetState();
+    Check(ocState.model == "opencode-go/hy4-flash-free",
+          "opencode run without --model gets its model from opencode.log (state)");
+    Check(ocState.totalTokens == 1234, "opencode run: step tokens are counted");
+
+    const std::string month = std::string(GetCurrentTimestampStr()).substr(0, 7);
+    std::ifstream ocDaily(std::filesystem::path(GetDailyUsagePathWide(month)));
+    bool ocUsageFound = false;
+    bool ocUsageModelOk = false;
+    bool ocUsageTokensOk = false;
+    std::string ocLine;
+    while (std::getline(ocDaily, ocLine)) {
+        auto j = nlohmann::json::parse(ocLine, nullptr, false);
+        if (j.is_discarded() || j.value("model", std::string()) != "opencode-go/hy4-flash-free") continue;
+        ocUsageFound = true;
+        ocUsageModelOk = j.value("engine", std::string()) == "opencode";
+        ocUsageTokensOk = j.value("totalTokens", (uint64_t)0) == 1234;
+    }
+    Check(ocUsageFound, "opencode run: saved daily usage record carries the log-derived model");
+    Check(ocUsageModelOk, "opencode run: saved daily usage record engine is opencode");
+    Check(ocUsageTokensOk, "opencode run: saved daily usage record token count is 1234");
+
+    _putenv_s("USERPROFILE", savedProfile.c_str());
+    std::filesystem::remove_all(std::filesystem::path(fakeHome), ec);
+
     // Clean up temporary test data directory
     SetUsageHistoryPersistence(false);
     SetDataDirectoryOverride(origDataDir);

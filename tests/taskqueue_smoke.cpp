@@ -2546,6 +2546,7 @@ int main() {
         const std::string shutStatus = powerTqm.PowerStatusJson();
         Check(!JsonGetBool(shutStatus, "armed", true), "power: shutdown flag cleared");
 
+        powerPm.SetProcessFinishedCallback(nullptr);
         powerTqm.SetSuspendCallback(nullptr);
         powerTqm.ShutdownTaskQueueManager();
         SetDataDirectoryOverride(dir);
@@ -2666,6 +2667,7 @@ int main() {
             }
         }
 
+        hangPm.SetProcessFinishedCallback(nullptr);
         hangTqm.ShutdownTaskQueueManager();
     }
 

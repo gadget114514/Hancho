@@ -86,7 +86,7 @@ constexpr uint64_t kInitialUsageTimeoutMs = 15000;
 
 constexpr UINT_PTR TIMER_REFRESH_ID   = 1;
 // Periodic dashboard / terminal-grid refresh interval (ms). User-configurable in the Settings dialog.
-constexpr int kDefaultRefreshIntervalMs = 2000;
+constexpr int kDefaultRefreshIntervalMs = 5000;
 constexpr int kMinRefreshIntervalMs = 100;
 constexpr int kMaxRefreshIntervalMs = 60000;
 static int ClampRefreshIntervalMs(int ms) {
@@ -863,6 +863,25 @@ struct TaskUsageFileCache {
     int64_t rateLimitResetsAtSec = 0;
 };
 
+// The engine / token / cost totals for one job, as shown in the Owner / Cost column.
+struct TaskOwnerUsage {
+    std::string engine;
+    std::string model;
+    uint64_t inputTokens = 0;
+    uint64_t outputTokens = 0;
+    uint64_t thinkingTokens = 0;
+    uint64_t cacheReadTokens = 0;
+    uint64_t cacheWriteTokens = 0;
+    uint64_t totalTokens = 0;
+    double costUsd = 0.0;
+    bool hasUsage = false;
+    bool hasRateLimit = false;
+    std::string rateLimitWindow;
+    std::string rateLimitStatus;
+    double rateLimitUtilization = -1.0;
+    int64_t rateLimitResetsAtSec = 0;
+};
+
 // Usage graph: each range (1h, 4h, 12h, 24h) is cut into buckets of usageBucketSec seconds,
 // so the bar count is range / size. Set in the settings dialog (表示 tab) and config.json.
 constexpr int kUsageBucketRanges = 4;
@@ -1002,6 +1021,7 @@ struct DashboardState {
     std::vector<std::wstring> taskUsageTips;  // per task row: full engine / token details for the hover tip
     std::map<std::wstring, TaskUsageFileCache> taskUsageFileCache; // attempt events file -> parsed usage
     std::map<std::wstring, std::wstring> taskAttemptEventsPath;    // jobId:attempt -> resolved events file
+    std::map<std::wstring, TaskOwnerUsage> taskOwnerUsageCache;    // jobId:attemptCount -> settled job usage
     bool initialTaskUsagePending = false;
     bool initialUsageThreadStarted = false;
     uint64_t initialUsageStartTickMs = 0;
@@ -2938,7 +2958,8 @@ static void UpdateTaskListHeaders(DashboardState* st) {
 // One row of the task list: the cells to show plus the values a sort compares.
 // The two time columns keep the full date and time, because the column itself
 // only shows the time of day.
-static bool MeasureTaskFitColumns(DashboardState* st);
+static bool MeasureTaskFitColumns(DashboardState* st, const std::vector<std::wstring>* newRows = nullptr,
+                                  const std::vector<size_t>* changedCells = nullptr);
 static void UpdateTaskListColumnWidths(DashboardState* st);
 
 struct TaskListRow {
@@ -6553,25 +6574,6 @@ static std::wstring TriageCardStatusLabel(const nlohmann::json& card);
 
 static std::wstring FormatCompactTokens(uint64_t v);  // defined with the usage panel
 
-// Owner engine and token usage summed over a job's attempts, from their .events.jsonl files.
-struct TaskOwnerUsage {
-    std::string engine;
-    std::string model;
-    uint64_t inputTokens = 0;
-    uint64_t outputTokens = 0;
-    uint64_t thinkingTokens = 0;
-    uint64_t cacheReadTokens = 0;
-    uint64_t cacheWriteTokens = 0;
-    uint64_t totalTokens = 0;
-    double costUsd = 0.0;
-    bool hasUsage = false;
-    bool hasRateLimit = false;
-    std::string rateLimitWindow;
-    std::string rateLimitStatus;
-    double rateLimitUtilization = -1.0;
-    int64_t rateLimitResetsAtSec = 0;
-};
-
 // Reads the lines appended to one events file since the last refresh and folds the usage
 // events into its cache entry. A missing or shortened file resets the entry.
 static void TaskUsageAccumulateFile(std::map<std::wstring, TaskUsageFileCache>& usageCache,
@@ -6930,17 +6932,27 @@ static void RefreshTaskQueueData(DashboardState* st, bool force = false, bool us
         if (st == "pending") return depsSatisfied(jobJson) ? 2 : 3;
         return 4;
     };
-    std::stable_sort(jobs.begin(), jobs.end(), [&](const std::string& a, const std::string& b) {
-        int ra = jobRank(a);
-        int rb = jobRank(b);
-        if (ra != rb) return ra < rb;
-        std::string ca = JsonGetString(a, "created_at", "");
-        std::string cb = JsonGetString(b, "created_at", "");
-        if (!ca.empty() || !cb.empty()) {
-            if (ca != cb) return ca > cb;
+    std::vector<size_t> jobOrder(jobs.size());
+    for (size_t i = 0; i < jobOrder.size(); ++i) jobOrder[i] = i;
+    std::vector<int> jobRanks(jobs.size());
+    std::vector<std::string> jobCreatedAts(jobs.size());
+    for (size_t i = 0; i < jobs.size(); ++i) {
+        jobRanks[i] = jobRank(jobs[i]);
+        jobCreatedAts[i] = JsonGetString(jobs[i], "created_at", "");
+    }
+    std::stable_sort(jobOrder.begin(), jobOrder.end(), [&](size_t a, size_t b) {
+        if (jobRanks[a] != jobRanks[b]) return jobRanks[a] < jobRanks[b];
+        if (!jobCreatedAts[a].empty() || !jobCreatedAts[b].empty()) {
+            if (jobCreatedAts[a] != jobCreatedAts[b]) return jobCreatedAts[a] > jobCreatedAts[b];
         }
         return false;
     });
+    {
+        std::vector<std::string> sortedJobs;
+        sortedJobs.reserve(jobs.size());
+        for (size_t i : jobOrder) sortedJobs.push_back(std::move(jobs[i]));
+        jobs = std::move(sortedJobs);
+    }
 
     // Work out every row first; the list is rebuilt only when some row's text differs from last time.
     std::vector<TaskListRow> rows;  // one entry per job, in the order the list shows them
@@ -7112,9 +7124,17 @@ static void RefreshTaskQueueData(DashboardState* st, bool force = false, bool us
         std::wstring resourcesStr = TaskQueueResourcesDisplay(j);
 
         // Who runs the job (the worker CLI) and the tokens / cost its attempts used.
-        TaskOwnerUsage ownerUsage = TaskOwnerUsageForJob(
-            st->taskUsageFileCache, st->taskAttemptEventsPath,
-            jobId, j, JsonGetString(j, "command", ""), st->initialTaskUsagePending);
+        const std::wstring ownerKey = Utf8ToWide(jobId) + L":" + std::to_wstring(attemptsOfRow.size());
+        TaskOwnerUsage ownerUsage;
+        auto ownerCached = st->taskOwnerUsageCache.find(ownerKey);
+        if (ownerCached != st->taskOwnerUsageCache.end()) {
+            ownerUsage = ownerCached->second;
+        } else {
+            ownerUsage = TaskOwnerUsageForJob(
+                st->taskUsageFileCache, st->taskAttemptEventsPath,
+                jobId, j, JsonGetString(j, "command", ""), st->initialTaskUsagePending);
+            if (!settling && !st->initialTaskUsagePending) st->taskOwnerUsageCache[ownerKey] = ownerUsage;
+        }
         std::wstring ownerUsageStr;
         if (!ownerUsage.engine.empty()) ownerUsageStr = Utf8ToWide(ownerUsage.engine);
         // Cost first: it is what the column is for, and it stays visible when the cell is narrow.
@@ -7300,6 +7320,23 @@ static void RefreshTaskQueueData(DashboardState* st, bool force = false, bool us
         return;
     }
     st->taskFailureSummary = std::move(failureSummary);
+
+    const bool sameRows = newJobIds == st->taskJobIds &&
+        st->lastTaskRows.size() == newRows.size() &&
+        ListView_GetItemCount(st->hwndTaskList) == static_cast<int>(newJobIds.size());
+    if (sameRows) {
+        std::vector<size_t> changedCells;
+        for (size_t i = 0; i < newRows.size(); ++i) {
+            if (newRows[i] == st->lastTaskRows[i]) continue;
+            ListView_SetItemText(st->hwndTaskList, static_cast<int>(i / kTaskListColumns),
+                                 static_cast<int>(i % kTaskListColumns), newRows[i].data());
+            changedCells.push_back(i);
+        }
+        st->lastTaskRows = std::move(newRows);
+        if (MeasureTaskFitColumns(st, &st->lastTaskRows, &changedCells)) UpdateTaskListColumnWidths(st);
+        InvalidateRect(st->hwndTaskList, nullptr, FALSE);
+        return;
+    }
 
     // Rebuilding the list drops the highlight, so remember every selected job and select them again.
     std::vector<std::string> keepSelectedJobs;
@@ -7813,22 +7850,32 @@ static constexpr int kTaskFitColMax[4] = {220, 200, 110, 280};
 // Measures the widest text (header included) of each fit column. Returns true when a width
 // changed enough to lay the columns out again; small shrinks are ignored so the columns do
 // not wobble as the remaining time ticks down.
-static bool MeasureTaskFitColumns(DashboardState* st) {
+static bool MeasureTaskFitColumns(DashboardState* st, const std::vector<std::wstring>* newRows,
+                                  const std::vector<size_t>* changedCells) {
     if (!st || !st->hwndTaskList) return false;
     constexpr int kPad = 18;  // the list view's cell margins
+    const bool incremental = (newRows != nullptr && changedCells != nullptr);
     const size_t rowCount = st->lastTaskRows.size() / kTaskListColumns;
     bool changed = false;
     for (int k = 0; k < 4; ++k) {
         const int col = kTaskFitCols[k];
         // The header can carry a sort mark, so leave room for it.
         int need = ListView_GetStringWidth(st->hwndTaskList, (std::wstring(TaskColumnTitle(col)) + L" ▲").c_str());
-        for (size_t r = 0; r < rowCount; ++r) {
-            const std::wstring& cell = st->lastTaskRows[r * kTaskListColumns + col];
-            if (!cell.empty()) need = (std::max)(need, ListView_GetStringWidth(st->hwndTaskList, cell.c_str()));
+        if (incremental) {
+            for (size_t idx : *changedCells) {
+                if (idx % kTaskListColumns != static_cast<size_t>(col)) continue;
+                const std::wstring& cell = (*newRows)[idx];
+                if (!cell.empty()) need = (std::max)(need, ListView_GetStringWidth(st->hwndTaskList, cell.c_str()));
+            }
+        } else {
+            for (size_t r = 0; r < rowCount; ++r) {
+                const std::wstring& cell = st->lastTaskRows[r * kTaskListColumns + col];
+                if (!cell.empty()) need = (std::max)(need, ListView_GetStringWidth(st->hwndTaskList, cell.c_str()));
+            }
         }
         need = (std::min)(need + kPad, kTaskFitColMax[k]);
         int& cur = st->taskFitColW[k];
-        if (need > cur || need < cur - 24) {
+        if (incremental ? (need > cur) : (need > cur || need < cur - 24)) {
             cur = need;
             changed = true;
         }
@@ -15133,9 +15180,9 @@ static void UpdateSettingsDialogTexts(HWND hwnd) {
         L"Events kept per process (100-100000, -1 = unlimited: may use up memory):",
         L"Eventos guardados por proceso (100-100000, -1 = sin límite: puede agotar la memoria):"));
     SetWindowTextW(ds->lblRefreshInterval, Tr(
-        L"ダッシュボード更新間隔 (ms, 100〜60000, 既定 2000):",
-        L"Dashboard update interval (ms, 100-60000, default 2000):",
-        L"Intervalo de actualización del panel (ms, 100-60000, predeterminado 2000):"));
+        L"ダッシュボード更新間隔 (ms, 100〜60000, 既定 5000):",
+        L"Dashboard update interval (ms, 100-60000, default 5000):",
+        L"Intervalo de actualización del panel (ms, 100-60000, predeterminado 5000):"));
     if (ds->lblUsageRefreshInterval) {
         SetWindowTextW(ds->lblUsageRefreshInterval, Tr(
             L"使用量グラフ更新間隔 (ms, 1000〜60000, 既定 5000):",
