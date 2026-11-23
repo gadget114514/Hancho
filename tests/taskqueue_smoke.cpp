@@ -321,6 +321,39 @@ int main() {
             in.events.push_back(event("run.ended", 79, R"({"status":"error","permissionDenials":3})"));
             classified(in, "permission_denied", "fix_spec");
         }
+        // 2026-11-23 lineage-100-1-test-1: a plain job whose output prints job JSON with the
+        // key "on_permission_denied" failed and was parked as permission_denied. The log-line
+        // permission rule is word-bounded and only applies to LLM worker jobs.
+        {
+            TaskQueueFailureInput in = makeBase();
+            in.command = "build\\Release\\taskqueue_smoke.exe";
+            in.endKind = "failed";
+            in.exitCode = 1;
+            in.logText = "[PASS] job json {\"on_permission_denied\":\"\"}\n[FAIL] something else\n";
+            auto d = ClassifyTaskQueueFailure(in);
+            Check(d.failureClass != "permission_denied",
+                  "plain job log with on_permission_denied is not permission_denied (got " + d.failureClass + ")");
+            in.logText = "Error: Permission denied\n";
+            Check(ClassifyTaskQueueFailure(in).failureClass != "permission_denied",
+                  "plain job log wording alone does not park the job as permission_denied");
+        }
+        {
+            TaskQueueFailureInput in = makeBase();
+            in.engine = "claude";
+            in.endKind = "failed";
+            in.exitCode = 1;
+            in.logText = "[PASS] job json {\"on_permission_denied\":\"\"}\n";
+            Check(ClassifyTaskQueueFailure(in).failureClass != "permission_denied",
+                  "worker log key on_permission_denied is not a permission denial");
+            in.logText = "starting\nError: Permission denied: C:/secret/file.txt\nfinished\n";
+            auto d = classified(in, "permission_denied", "fix_spec");
+            Check(d.detail.value("source", std::string()) == "log", "worker permission denial source is the log");
+            bool pointsAtLine = false;
+            for (const auto& e : d.evidence) {
+                if (e.IsLog() && e.line == 101) pointsAtLine = true;
+            }
+            Check(pointsAtLine, "worker permission denial evidence names the log line");
+        }
         {
             TaskQueueFailureInput in = makeBase();
             in.endKind = "completed";
