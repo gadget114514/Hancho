@@ -109,6 +109,13 @@ hancho-cli.exe taskqueue list main --no-planned
 hancho-cli.exe taskqueue why A
 hancho-cli.exe taskqueue takeover --id A --reason "worker が 3 回ハングしたので引き取って実装する"
 hancho-cli.exe taskqueue complete --id A --reason "修正してテストも通した" --report reports/taken-over.md
+
+# 失敗した非 BT ジョブを内容を変えてやり直す（supersedes と理由を結び付ける）
+hancho-cli.exe taskqueue supersede A --reason "タイムアウトが短すぎた" --timeout-sec 3600
+
+# CI ワンショット: キューが空になるまで待ち JUnit XML を出力（既定で引き継がれたジョブは除外）
+hancho-cli.exe run --file jobs.json --exit-on-drain --report junit.xml
+hancho-cli.exe run --file jobs.json --exit-on-drain --count-superseded
 ```
 
 活動中のタスクグループ（BT のルート）は `group:<id>` の仮想行として
@@ -117,6 +124,24 @@ hancho-cli.exe taskqueue complete --id A --reason "修正してテストも通�
 待機中なら `bt resume` で答えます。`--no-planned` は両方を隠します。
 
 **失敗診断と引き取り:** `taskqueue why <id>` は直近の失敗を説明します。`class`（例: worker が `idle.firstEventSec`（worker ジョブの既定 180 秒）以内に正規化イベントを出さなかった場合は `startup_hang`。終了理由は `startup_timed_out`）、`confidence`、`summary`、`evidence`、`likelyCauses`（`[{id, why}]`。例: `no_model`、`same_engine_nesting`、`waiting_for_input`）、`nextSteps`（`[{action, change?, needsApproval?, question?}]`）、`supervisorNote` が入ります。同じ失敗レコードは `taskqueue get --json` の `failure` にもあります。`nextSteps` の順に試します。同じ設定で 1 回 → 設定変更（`retry_with_change`。モデルの変更は `taskqueue update --approve-model-change --reason "..."` が必要）→ escalate。自分で引き取るなら、先に `taskqueue takeover --id <id> --reason "..."` で終端状態 `takenOver` と `takeover` レコードを残し、`taskqueue complete --id <id> --reason "..." [--report <path>] [--result succeeded|failed]` で結果を戻します（`succeeded` で後続が進みます）。BT なら `bt resume --answer takeover --rationale "..."` で答えます。triage カードの候補にも `retry_with_change` が出ます。
+
+**タスク（意図と経過ログでジョブ・BT をまとめる）:**
+
+```powershell
+hancho-cli.exe task create --title "認証バグ修正" --intent "トークン更新の不具合を修正する" --json
+hancho-cli.exe taskqueue add --file jobs.json --taskqueue main --task task_1
+hancho-cli.exe bt start --file plan.json --task task_1
+hancho-cli.exe task note task_1 --text "ログ確認後、リフレッシュ再試行方式に変更"
+hancho-cli.exe task list --state running
+hancho-cli.exe taskqueue list --task task_1
+hancho-cli.exe task show task_1 --log-limit 50 --json
+hancho-cli.exe task wait task_1 --timeout-ms 300000
+hancho-cli.exe task close task_1 --result succeeded --reason "全認証テスト通過"
+hancho-cli.exe task reopen task_1 --reason "追加の回帰が見つかった"
+hancho-cli.exe task purge --older-than 604800
+```
+
+タスクのレコードは `<data-dir>/tasks/`（`<id>.json` と `<id>.log.jsonl`）に保存されます。タスクの状態（`open`, `running`, `failed`, `cancelled`, `succeeded`, `closed`）は、明示的に閉じられていない限り、中の各系譜の最新ジョブから計算されます。`run --exit-on-drain` も既定では系譜基準（`superseded_by` を持つジョブを除外）で判定し、`--count-superseded` を付けると従来の全ジョブ基準になります。
 
 **クイック修正（小さな決定的編集）:**
 

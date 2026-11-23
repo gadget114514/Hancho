@@ -31,7 +31,7 @@ hancho-cli.exe taskqueue wait main --since 0 --timeout-ms 30000
 | `summary` (required) | One line, <=200 chars. Substituted for `{summary}` and exported as `PC_JOB_SUMMARY`. |
 | `timeoutSec` (required) | Per-job limit. Never summed. Must be <= the queue `maxTimeoutSec` (default 7200). |
 | `estimateSec` (optional) | Expected duration used by the dashboard's remaining/ETA display. It does not change the enforced `timeoutSec`. |
-| `dependsOn` | `["A"]` (same as `on: success`) or `[{ "id": "A", "on": "done" }]`. Cross-queue ids are allowed. |
+| `dependsOn` | `["A"]` (same as `on: success`) or `[{ "id": "A", "on": "done" }]`. Cross-queue ids are allowed. If a dependency has `supersededBy`, its state is evaluated from the latest job in its lineage so `blocked` dependents resume when the superseding job succeeds. |
 | `idle` | `{ "outputSec": 720, "cpuSec": 720 }`; both must be set (output **and** CPU idle). |
 | `maxAttempts`, `retryDelaySec` | Automatic retries (default 2) and delay between attempts. |
 | `defer` | `{ "exitCodes": [75], "delaySec": 60, "limit": 60 }` (the default). An attempt that exits with one of `exitCodes` means "nothing ran, try again later" (75 = EX_TEMPFAIL, e.g. `ww-run` refusing an overlapping card): the attempt is recorded as `deferred`, the job goes back to pending and starts again after `delaySec`, without using up `maxAttempts`. After `limit` deferrals (`0` = no limit) the exit code is an ordinary failure. `{ "exitCodes": [] }` turns it off. The graph shows `retry_in_sec`. |
@@ -42,6 +42,8 @@ hancho-cli.exe taskqueue wait main --since 0 --timeout-ms 30000
 | `resources` | `{ "write": [...], "read": [...] }`: paths/globs (relative to `cwd`; a bare file name `Foo.cs` means `**/Foo.cs`) or `@name` locks. Jobs whose sets overlap (write/write, write/read) never run together, across all queues; read/read may. On by default (Settings checkbox). See [resource-locks.md](resource-locks.md). |
 | `instructionsFile` / `instructionsText` | Optional instructions captured into the job and materialized per revision. |
 | `memory` | `{ "inject": true, "budgetChars": 1500, "scopes": ["job","file","project"] }` — inject `memory_brief` into the instructions at launch. Off by default. The brief is expanded at `{memory}`, or appended when the placeholder is absent. The file scope comes from `resources` and the previous run's `filesEdited`. The injected ids are recorded as `memory_refs` on the attempt. `includeAgentNotes: false` leaves out L2 notes written by agents. |
+| `taskId` | Optional task record id (`task_...`), set via `taskqueue add --task <id>`, `bt start --task <id>`, or inherited from `supersedes`. Jobs without a task record form an implicit single-lineage task. |
+| `supersedes`, `supersedeReason` | Link a redo job to an existing unsuccessful job (`supersedes` = target job id, `supersedeReason` <= 2000 bytes). Hancho keeps the lineage linear (re-attaching to the latest job if needed), sets `supersededBy` on the replaced job, and inherits its `taskId`. Use `taskqueue supersede` to clone with changes; use `taskqueue retry` to requeue unchanged. |
 
 **Origin: which session added a job**
 
@@ -98,5 +100,19 @@ When the rules leave the failure undecided (`class: "unknown"` or `confidence: "
 **Events and environment:** each attempt receives `PC_JOB_ID`, `PC_ATTEMPT`, `PC_JOB_SUMMARY`, `PC_JOB_INSTRUCTIONS`, `PC_JOB_INSTRUCTIONS_REV`, plus `PC_PREV_REASON`, `PC_PREV_EXIT`, `PC_PREV_TAIL` on retries. Events are appended to `logs/taskqueue-<name>.events.jsonl`; `notifyFile` is updated for `jobFailed`, `taskqueueStalled` and `taskqueueDrained`.
 
 **Plain Runs (outside queues):** Executions started outside a task queue (`hancho-cli run`, direct IPC / manual invocations) have their minimal state persisted to `logs/taskqueues/plain.json` and are included in `memory rebuild` inputs without impacting queue scheduling. See [plain-runs.md](plain-runs.md) for details.
+
+**Tasks and lineage:**
+
+A task record groups jobs and behavior trees under a shared `title`, `intent`, and append-only progress log (`<data-dir>/tasks/<id>.json` and `<id>.log.jsonl`). Create one with `hancho-cli task create --title "..." --intent "..."` (MCP `task_create`), attach jobs via `taskqueue add --task <id>` or `bt start --task <id>`, record decisions with `task note <id> --text "..."`, and finish with `task close <id> --result succeeded|failed --reason "..."` (reopenable via `task reopen`, old closed tasks removable via `task purge --older-than <sec>`). Size limits: `title` 200 B, `intent` 16 KB, `note` 4 KB, `close`/`reopen` `reason` 2000 B, `supersedeReason` 2000 B.
+
+A task's state is computed from the latest job of each lineage inside it (using `removedJobs` if jobs were purged):
+1. Explicitly closed → `closed` (with `result` and `reason`).
+2. Zero jobs → `open`.
+3. Any lineage's latest job is `pending` / `waiting` / `running` / `planned` / `waitingForPermit`, or `takenOver` without completion → `running` (`paused: true` if any job is paused).
+4. Any is `failed` / `blocked` / `closed`, or `takenOver` with `result: failed` → `failed`.
+5. Any is `cancelled` → `cancelled`.
+6. All remaining are `succeeded`, or `takenOver` with `result: succeeded` → `succeeded`.
+
+When running queues in CI with `hancho-cli run --file <jobs.json> --exit-on-drain [--report <junit.xml>]`, superseded jobs (those with `superseded_by`) are excluded from the exit code and JUnit report by default; pass `--count-superseded` to include every job.
 
 **GUI:** click the view mode toggle button (leftmost toolbar button) or press **Ctrl+T** to cycle between **Two Rows** (Processes + Tasks), **Processes Only**, and **Tasks Only**. In Two Rows mode, drag the horizontal splitter bar to adjust relative heights. Running jobs are listed first and highlighted; failed rows use a muted red and timed-out rows a muted amber (theme colors).

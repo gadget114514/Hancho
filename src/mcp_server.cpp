@@ -551,7 +551,8 @@ int RunMcpServer() {
                 << "\"jobs\":{\"type\":\"array\",\"description\":\"Job objects: id, command, summary, timeoutSec (required); cwd, env, dependsOn (['id'] or [{id,on}]), idle {outputSec,cpuSec}, maxAttempts, retryDelaySec, success {exitCode,filesNewer,outputRegex,testReport (JUnit/NUnit XML path: newer than the attempt, >=1 test, none failed),contentFile+minBytes+contentRegex (one file such as a report must be newer, large enough and match the regex; a headings-only file is not success),engineResult (the engine's final result must not report an error even if the exit code is 0)}, killExclude, resources {write:[...],read:[...]} (paths/globs relative to cwd or @name locks; @name:{root} is one lock per git checkout/worktree of cwd, @name:{cwd} one per cwd; a bare file name such as Foo.cs means **/Foo.cs; jobs with overlapping write/write or write/read never run together, read/read may), defer {exitCodes,delaySec,limit} (default [75],60,60: an attempt exiting with one of exitCodes means nothing ran; the job is re-run after delaySec without using up maxAttempts; {exitCodes:[]} turns it off), priority, suspendWhenDone, suspendDelaySec, suspendHibernate, instructionsFile or instructionsText. Do not set hidden on jobs you register: it is reserved for Hancho's internal jobs and hides the row unless Show hidden tasks is on.\",\"items\":{\"type\":\"object\"}},"
                 << "\"concurrency\":{\"type\":\"integer\",\"description\":\"Max jobs running at the same time for this queue (default 1)\"},"
                 << "\"notifyFile\":{\"type\":\"string\",\"description\":\"Optional file updated on jobFailed / taskqueueStalled / taskqueueDrained\"},"
-                << "\"originLabel\":{\"type\":\"string\",\"description\":\"Optional short name for the work these jobs belong to (e.g. 'release v2.9.2'), shown in the dashboard's Origin column. Your session id and working folder are recorded automatically.\"}"
+                << "\"originLabel\":{\"type\":\"string\",\"description\":\"Optional short name for the work these jobs belong to (e.g. 'release v2.9.2'), shown in the dashboard's Origin column. Your session id and working folder are recorded automatically.\"},"
+                << "\"task\":{\"type\":\"string\",\"description\":\"Optional task id to attach these jobs to (must exist and not be closed).\"}"
                 << "},\"required\":[\"taskqueue\",\"jobs\"]}"
                 << "},"
                 << "{"
@@ -580,6 +581,7 @@ int RunMcpServer() {
                 << "\"since\":{\"type\":\"string\",\"description\":\"Optional time window: only jobs updated within this period, e.g. 30m, 6h, 2d\"},"
                 << "\"origin\":{\"type\":\"string\",\"description\":\"Optional: 'self' for only the jobs your session added, or an origin label or session id (prefix)\"},"
                 << "\"bt\":{\"type\":\"string\",\"description\":\"Optional behavior-tree id: list every job of that tree across its parallel branch queues\"},"
+                << "\"task\":{\"type\":\"string\",\"description\":\"Optional task id: list only jobs belonging to this task\"},"
                 << "\"includePlanned\":{\"type\":\"boolean\",\"description\":\"Include provisional planned rows for idle job/worker leaves of running behavior trees (default true; set false to omit)\"}"
                 << "}}"
                 << "},"
@@ -603,6 +605,31 @@ int RunMcpServer() {
                 << "\"resetAttempts\":{\"type\":\"boolean\",\"description\":\"Reset the attempt counter (default true)\"},"
                 << "\"refreshInstructions\":{\"type\":\"boolean\",\"description\":\"Reload instructions from the source file (default true)\"}"
                 << "}}"
+                << "},"
+                << "{"
+                << "\"name\":\"taskqueue_supersede\","
+                << "\"description\":\"Clone a finished, unsuccessful non-BT job into a new job with optional changes, linking it via supersedes and a reason. Keeps the same queue and task. Cannot be used on behavior tree jobs (use bt_retry).\","
+                << "\"inputSchema\":{\"type\":\"object\",\"properties\":{"
+                << "\"id\":{\"type\":\"string\",\"description\":\"Job id to supersede\"},"
+                << "\"reason\":{\"type\":\"string\",\"description\":\"Why this job is being redone with changes (max 2000 bytes)\"},"
+                << "\"newId\":{\"type\":\"string\",\"description\":\"Optional new job id (default: <id>-s<N>)\"},"
+                << "\"summary\":{\"type\":\"string\"},"
+                << "\"command\":{\"type\":\"string\"},"
+                << "\"cwd\":{\"type\":\"string\"},"
+                << "\"timeoutSec\":{\"type\":\"integer\"},"
+                << "\"idle\":{\"type\":\"object\"},"
+                << "\"maxAttempts\":{\"type\":\"integer\"},"
+                << "\"retryDelaySec\":{\"type\":\"integer\"},"
+                << "\"defer\":{\"type\":\"object\"},"
+                << "\"success\":{\"type\":\"object\"},"
+                << "\"env\":{\"type\":\"object\"},"
+                << "\"killExclude\":{\"type\":\"array\",\"items\":{\"type\":\"string\"}},"
+                << "\"resources\":{\"type\":\"object\"},"
+                << "\"priority\":{\"type\":\"integer\"},"
+                << "\"instructionsFile\":{\"type\":\"string\"},"
+                << "\"instructionsText\":{\"type\":\"string\"},"
+                << "\"patch\":{\"type\":\"object\",\"description\":\"Optional extra job fields to override\"}"
+                << "},\"required\":[\"id\",\"reason\"]}"
                 << "},"
                 << "{"
                 << "\"name\":\"taskqueue_update\","
@@ -725,6 +752,73 @@ int RunMcpServer() {
                 << "}}"
                 << "},"
                 << "{"
+                << "\"name\":\"task_create\","
+                << "\"description\":\"Create a task record to group jobs and behavior trees with a shared title, intent and progress log. Returns the new task id.\","
+                << "\"inputSchema\":{\"type\":\"object\",\"properties\":{"
+                << "\"title\":{\"type\":\"string\",\"description\":\"Short task title (max 200 bytes)\"},"
+                << "\"intent\":{\"type\":\"string\",\"description\":\"Why this task exists and what you plan to do (max 16 KB)\"},"
+                << "\"id\":{\"type\":\"string\",\"description\":\"Optional task id (must start with 'task_', alphanumeric/'_'/'-', max 64 chars)\"},"
+                << "\"originLabel\":{\"type\":\"string\",\"description\":\"Optional short name for the Origin column\"}"
+                << "},\"required\":[\"title\"]}"
+                << "},"
+                << "{"
+                << "\"name\":\"task_show\","
+                << "\"description\":\"Show a task record, computed state, jobs/lineages and recent progress log entries.\","
+                << "\"inputSchema\":{\"type\":\"object\",\"properties\":{"
+                << "\"id\":{\"type\":\"string\",\"description\":\"Task id\"},"
+                << "\"logLimit\":{\"type\":\"integer\",\"description\":\"Max recent log entries to return (default 200)\"}"
+                << "},\"required\":[\"id\"]}"
+                << "},"
+                << "{"
+                << "\"name\":\"task_list\","
+                << "\"description\":\"List task records with computed state, optionally filtered by state.\","
+                << "\"inputSchema\":{\"type\":\"object\",\"properties\":{"
+                << "\"state\":{\"type\":\"string\",\"enum\":[\"open\",\"running\",\"failed\",\"cancelled\",\"succeeded\",\"closed\"],\"description\":\"Optional state filter\"},"
+                << "\"limit\":{\"type\":\"integer\",\"description\":\"Max tasks to return\"}"
+                << "}}"
+                << "},"
+                << "{"
+                << "\"name\":\"task_note\","
+                << "\"description\":\"Append a note entry to a task's progress log (max 4 KB).\","
+                << "\"inputSchema\":{\"type\":\"object\",\"properties\":{"
+                << "\"id\":{\"type\":\"string\",\"description\":\"Task id\"},"
+                << "\"text\":{\"type\":\"string\",\"description\":\"Note text to append\"}"
+                << "},\"required\":[\"id\",\"text\"]}"
+                << "},"
+                << "{"
+                << "\"name\":\"task_close\","
+                << "\"description\":\"Close a task with a final result (succeeded or failed) and reason. Closed tasks cannot accept new jobs.\","
+                << "\"inputSchema\":{\"type\":\"object\",\"properties\":{"
+                << "\"id\":{\"type\":\"string\",\"description\":\"Task id\"},"
+                << "\"result\":{\"type\":\"string\",\"enum\":[\"succeeded\",\"failed\"],\"description\":\"Final result\"},"
+                << "\"reason\":{\"type\":\"string\",\"description\":\"Reason for closing (max 2000 bytes)\"}"
+                << "},\"required\":[\"id\",\"result\",\"reason\"]}"
+                << "},"
+                << "{"
+                << "\"name\":\"task_reopen\","
+                << "\"description\":\"Reopen a closed task with a reason.\","
+                << "\"inputSchema\":{\"type\":\"object\",\"properties\":{"
+                << "\"id\":{\"type\":\"string\",\"description\":\"Task id\"},"
+                << "\"reason\":{\"type\":\"string\",\"description\":\"Reason for reopening (max 2000 bytes)\"}"
+                << "},\"required\":[\"id\",\"reason\"]}"
+                << "},"
+                << "{"
+                << "\"name\":\"task_purge\","
+                << "\"description\":\"Remove closed task records older than the given age in seconds.\","
+                << "\"inputSchema\":{\"type\":\"object\",\"properties\":{"
+                << "\"olderThanSec\":{\"type\":\"integer\",\"description\":\"Minimum age in seconds since closed\"}"
+                << "},\"required\":[\"olderThanSec\"]}"
+                << "},"
+                << "{"
+                << "\"name\":\"task_wait\","
+                << "\"description\":\"Wait until all running/pending jobs of a task finish or timeoutMs elapses, then return the task_show payload.\","
+                << "\"inputSchema\":{\"type\":\"object\",\"properties\":{"
+                << "\"id\":{\"type\":\"string\",\"description\":\"Task id\"},"
+                << "\"timeoutMs\":{\"type\":\"integer\",\"description\":\"Max wait in milliseconds (default 30000; negative = no limit)\"},"
+                << "\"logLimit\":{\"type\":\"integer\",\"description\":\"Max recent log entries to return (default 200)\"}"
+                << "},\"required\":[\"id\"]}"
+                << "},"
+                << "{"
                 << "\"name\":\"bt_validate\","
                 << "\"description\":\"Validate a behavior tree without running it; returns lint warnings in warnings[] (--strict turns them into errors).\","
                 << "\"inputSchema\":{\"type\":\"object\",\"properties\":{"
@@ -741,6 +835,7 @@ int RunMcpServer() {
                 << "\"file\":{\"type\":\"string\",\"description\":\"Path to a behavior tree JSON file\"},"
                 << "\"paused\":{\"type\":\"boolean\",\"description\":\"Register the tree paused without creating any jobs (default false)\"}"
                 << ",\"originLabel\":{\"type\":\"string\",\"description\":\"Optional short name shown as the Origin of the jobs this tree adds\"}"
+                << ",\"task\":{\"type\":\"string\",\"description\":\"Optional task id to attach this behavior tree and its jobs to (must exist and not be closed)\"}"
                 << "}}"
                 << "},"
                 << "{"
@@ -1677,6 +1772,7 @@ int RunMcpServer() {
                        << ",\"jobs\":" << (jobsRaw.empty() ? "[]" : jobsRaw)
                        << ",\"concurrency\":" << JsonGetInt(argsJson, "concurrency", 0)
                        << ",\"notify_file\":\"" << JsonEscape(notifyFile) << "\""
+                       << ",\"task\":\"" << JsonEscape(JsonGetString(argsJson, "task", "")) << "\""
                        << ",\"origin\":" << BuildCallerOriginJson(mcpClient, JsonGetString(argsJson, "originLabel", "")) << "}";
             }
             else if (toolName == "taskqueue_list") {
@@ -1690,6 +1786,7 @@ int RunMcpServer() {
                                                          JsonGetBool(argsJson, "include_planned", true));
                 ipcReq << ",\"origin\":\"" << JsonEscape(originFilter) << "\""
                        << ",\"bt\":\"" << JsonEscape(JsonGetString(argsJson, "bt", "")) << "\""
+                       << ",\"task\":\"" << JsonEscape(JsonGetString(argsJson, "task", "")) << "\""
                        << ",\"include_planned\":" << (includePlanned ? "true" : "false") << "}";
             }
             else if (toolName == "taskqueue_get") {
@@ -1712,6 +1809,28 @@ int RunMcpServer() {
                        << ",\"since\":\"" << JsonEscape(JsonGetString(argsJson, "since", "")) << "\""
                        << ",\"reset_attempts\":" << (resetAttempts ? "true" : "false")
                        << ",\"refresh_instructions\":" << (refreshInstr ? "true" : "false") << "}";
+            }
+            else if (toolName == "taskqueue_supersede") {
+                std::string newId = JsonGetString(argsJson, "newId", "");
+                if (newId.empty()) newId = JsonGetString(argsJson, "new_id", "");
+                nlohmann::json patchObj = nlohmann::json::parse(argsJson, nullptr, false);
+                if (!patchObj.is_object()) patchObj = nlohmann::json::object();
+                if (patchObj.contains("patch") && patchObj["patch"].is_object()) {
+                    for (auto it = patchObj["patch"].begin(); it != patchObj["patch"].end(); ++it) {
+                        if (!patchObj.contains(it.key())) patchObj[it.key()] = it.value();
+                    }
+                    patchObj.erase("patch");
+                }
+                patchObj.erase("id");
+                patchObj.erase("reason");
+                patchObj.erase("newId");
+                patchObj.erase("new_id");
+                ipcReq << "{\"action\":\"taskqueue_supersede\""
+                       << ",\"id\":\"" << JsonEscape(JsonGetString(argsJson, "id", "")) << "\""
+                       << ",\"reason\":\"" << JsonEscape(JsonGetString(argsJson, "reason", "")) << "\""
+                       << ",\"new_id\":\"" << JsonEscape(newId) << "\""
+                       << ",\"patch\":" << patchObj.dump()
+                       << ",\"origin\":" << BuildCallerOriginJson(mcpClient, "") << "}";
             }
             else if (toolName == "taskqueue_update") {
                 ipcReq << "{\"action\":\"taskqueue_update\""
@@ -2006,6 +2125,23 @@ int RunMcpServer() {
                     continue;
                 }
                 ipcReq << ipmsgReq.dump();
+            }
+            else if (toolName.rfind("task_", 0) == 0) {
+                auto argsObj = nlohmann::json::parse(argsJson, nullptr, false);
+                if (argsObj.is_discarded() || !argsObj.is_object()) {
+                    argsObj = nlohmann::json::object();
+                }
+                argsObj["action"] = toolName;
+                if (toolName == "task_create" || toolName == "task_note") {
+                    std::string label = argsObj.value("originLabel", std::string());
+                    argsObj.erase("originLabel");
+                    argsObj["origin"] = nlohmann::json::parse(BuildCallerOriginJson(mcpClient, label), nullptr, false);
+                }
+                if (toolName == "task_wait") {
+                    waits.Start(rpcId, toolName, argsObj, PendingLongCalls::Mode::Poll, "timedOut", "timeout_ms");
+                    continue;
+                }
+                ipcReq << argsObj.dump();
             }
             else if (toolName.rfind("bt_", 0) == 0) {
                 auto argsObj = nlohmann::json::parse(argsJson, nullptr, false);

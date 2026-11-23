@@ -3,6 +3,7 @@
 #include "process_manager.h"
 #include "parse_util.h"
 #include "engine_health.h"
+#include "task_store.h"
 #include "nlohmann/json.hpp"
 #include <string>
 #include <vector>
@@ -668,6 +669,15 @@ struct TaskQueueJob {
     int permissionResumeLimit = 2;
     TaskQueueBtRef bt;
     TaskQueueOrigin origin;
+    // Task lineage (doc/task-lineage-plan.md). A job added to redo a failed job names it in
+    // `supersedes`; every job of one lineage shares `taskId` (the first job's id). The redone
+    // job records the job that took over in `supersededBy`. Empty taskId = the job is its own task.
+    std::string supersedes;
+    std::string taskId;
+    std::string supersededBy;
+    // Why this job redoes `supersedes` (JSON `supersede_reason`, at most 2000 bytes). Kept on the
+    // job that took over, so the reason stays readable after the session that wrote it is gone.
+    std::string supersedeReason;
 };
 
 // ---------------------------------------------------------------------------
@@ -689,6 +699,7 @@ struct TaskQueueRunJob {
     std::string failureSummary;
     std::string blockedBy;
     bool interrupted = false;
+    std::string supersededBy;
 
     bool Unfinished() const {
         return state.empty() || state == "pending" || state == "running" ||
@@ -707,12 +718,27 @@ inline bool TaskQueueRunDrained(const std::vector<TaskQueueRunJob>& jobs) {
     return true;
 }
 
+inline std::vector<TaskQueueRunJob> TaskQueueRunCountedJobs(const std::vector<TaskQueueRunJob>& jobs,
+                                                            bool countSuperseded = false) {
+    if (countSuperseded) return jobs;
+    std::vector<TaskQueueRunJob> out;
+    out.reserve(jobs.size());
+    for (const auto& job : jobs) {
+        if (job.supersededBy.empty()) out.push_back(job);
+    }
+    return out;
+}
+
 // 0 = every job succeeded (an empty queue counts as success)
 // 1 = at least one job failed or was blocked
 // 2 = a job was cancelled, or an interrupted attempt left it unfinished
-inline int TaskQueueRunExitCode(const std::vector<TaskQueueRunJob>& jobs) {
+// By default, superseded jobs (those with non-empty supersededBy) are excluded so
+// only the latest job of each lineage determines the outcome.
+inline int TaskQueueRunExitCode(const std::vector<TaskQueueRunJob>& jobs,
+                                bool countSuperseded = false) {
     bool failure = false;
     for (const auto& job : jobs) {
+        if (!countSuperseded && !job.supersededBy.empty()) continue;
         if (job.Cancelled()) return 2;
         if (job.Failed() || job.Unfinished()) failure = true;
     }
@@ -750,25 +776,28 @@ inline std::string TaskQueueRunFailureMessage(const TaskQueueRunJob& job) {
     return oss.str();
 }
 
-// Minimal JUnit XML: one testcase per job. Failed/blocked jobs get <failure message>,
-// cancelled or unfinished jobs get <skipped message>. Everything is escaped.
+// Minimal JUnit XML: one testcase per job (excluding superseded jobs unless countSuperseded).
+// Failed/blocked jobs get <failure message>, cancelled or unfinished jobs get <skipped message>.
+// Everything is escaped.
 inline std::string TaskQueueRunJUnitXml(const std::string& suiteName,
-                                        const std::vector<TaskQueueRunJob>& jobs) {
+                                        const std::vector<TaskQueueRunJob>& jobs,
+                                        bool countSuperseded = false) {
+    const std::vector<TaskQueueRunJob> counted = TaskQueueRunCountedJobs(jobs, countSuperseded);
     size_t failures = 0;
     size_t skipped = 0;
-    for (const auto& job : jobs) {
+    for (const auto& job : counted) {
         if (job.Cancelled() || job.Unfinished()) ++skipped;
         else if (job.Failed()) ++failures;
     }
     std::ostringstream oss;
     oss << "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n";
     oss << "<testsuites name=\"" << TaskQueueRunXmlEscape(suiteName) << "\""
-        << " tests=\"" << jobs.size() << "\" failures=\"" << failures << "\""
+        << " tests=\"" << counted.size() << "\" failures=\"" << failures << "\""
         << " errors=\"0\" skipped=\"" << skipped << "\" time=\"0.000\">\n";
     oss << "  <testsuite name=\"" << TaskQueueRunXmlEscape(suiteName) << "\""
-        << " tests=\"" << jobs.size() << "\" failures=\"" << failures << "\""
+        << " tests=\"" << counted.size() << "\" failures=\"" << failures << "\""
         << " errors=\"0\" skipped=\"" << skipped << "\" time=\"0.000\">\n";
-    for (const auto& job : jobs) {
+    for (const auto& job : counted) {
         const std::string name = job.id.empty() ? job.name : job.id;
         oss << "    <testcase classname=\"" << TaskQueueRunXmlEscape(suiteName) << "\""
             << " name=\"" << TaskQueueRunXmlEscape(name) << "\" time=\"0.000\"";
@@ -797,6 +826,9 @@ inline TaskQueueRunJob TaskQueueRunJobFromJson(const nlohmann::json& job) {
     out.state = job.value("state", std::string());
     if (job.contains("blocked_by") && job["blocked_by"].is_string()) {
         out.blockedBy = job["blocked_by"].get<std::string>();
+    }
+    if (job.contains("superseded_by") && job["superseded_by"].is_string()) {
+        out.supersededBy = job["superseded_by"].get<std::string>();
     }
     if (job.contains("attempts") && job["attempts"].is_array() && !job["attempts"].empty()) {
         const auto& attempt = job["attempts"].back();
@@ -891,7 +923,7 @@ public:
     // ({"ok":true,...} or {"ok":false,"error":"..."}).
     // originJson: optional {"label","client","session","hostSession","cwd","pid"} recorded on every added job.
     std::string TaskQueueAdd(const std::string& taskqueue, const std::string& jobsJson, int64_t concurrency, const std::string& notifyFile, std::string& outError,
-                             const std::string& originJson = "");
+                             const std::string& originJson = "", const std::string& taskId = "");
     // Internal entry point used only by the BT layer to add a BT-managed job.
     // The job inherits the origin recorded for its tree with SetBtOrigin.
     std::string AddBtJob(const std::string& taskqueue, const std::string& jobJson, const TaskQueueBtRef& ref, std::string& outError);
@@ -904,7 +936,7 @@ public:
     // (session ids also match by prefix); "pid:<n>" matches the origin process id.
     std::string TaskQueueList(const std::string& taskqueue, const std::string& state, int64_t sinceSec, std::string& outError,
                               const std::string& origin = "", const std::string& btId = "",
-                              bool includeHidden = false);
+                              bool includeHidden = false, const std::string& taskId = "");
     static TaskQueueOrigin ParseOriginJson(const std::string& json);
     static std::string OriginToJson(const TaskQueueOrigin& origin);
     static bool OriginMatches(const TaskQueueOrigin& origin, const std::string& filter);
@@ -916,6 +948,11 @@ public:
     // within the last sinceSec seconds; sinceSec <= 0 means no time limit). Returns the retried ids.
     std::string TaskQueueRetryFailed(const std::string& taskqueue, int64_t sinceSec, bool resetAttempts, bool refreshInstructions, std::string& outError);
     std::string TaskQueueRetryFailed(const std::string& taskqueue, int64_t sinceSec, bool resetAttempts, bool refreshInstructions, TaskQueueCaller caller, std::string& outError);
+    // Clone a finished, unsuccessful non-BT job into a new job with optional changes,
+    // linking it via `supersedes` and `supersedeReason` on the same queue and task.
+    std::string TaskQueueSupersede(const std::string& id, const std::string& reason,
+                                   const std::string& newId, const std::string& patchJson,
+                                   const std::string& originJson, std::string& outError);
     std::string TaskQueueUpdate(const std::string& id, const std::string& patchJson, std::string& outError);
     std::string TaskQueueUpdate(const std::string& id, const std::string& patchJson, TaskQueueCaller caller, std::string& outError);
     std::string TaskQueueCancel(const std::string& id, std::string& outError);
@@ -949,6 +986,31 @@ public:
     std::string TaskQueueLink(const std::string& job, const std::string& dependsOn, const std::string& on, std::string& outError);
     std::string TaskQueueUnlink(const std::string& job, const std::string& dependsOn, std::string& outError);
     std::string TaskQueueGraph(const std::string& taskqueue, const std::string& root, std::string& outError);
+
+    // Task records (doc/task-lineage-plan.md, card 100-2a). The string results use the same
+    // {"ok":...} shape as the job calls. A task's state is computed from its jobs (TaskState).
+    // An empty result or a non-positive limit means the default.
+    std::string TaskCreate(const std::string& title, const std::string& intent, const std::string& id,
+                           const std::string& originJson, std::string& outError);
+    std::string TaskShow(const std::string& id, int64_t logLimit, std::string& outError);
+    std::string TaskList(const std::string& stateFilter, int64_t limit, std::string& outError,
+                         int64_t sinceVersion = -1);
+    std::string TaskNote(const std::string& id, const std::string& text, const std::string& session,
+                         std::string& outError);
+    std::string TaskClose(const std::string& id, const std::string& result, const std::string& reason,
+                          std::string& outError);
+    std::string TaskReopen(const std::string& id, const std::string& reason, std::string& outError);
+    std::string TaskPurgeOlderThan(int64_t olderThanSec, std::string& outError);
+    std::string TaskWait(const std::string& id, int timeoutMs, int64_t logLimit, std::string& outError);
+    // Returns true if task id exists and is not closed; otherwise sets outError.
+    bool ValidateTaskActive(const std::string& id, std::string& outError) const;
+    // {"state":..., "paused":true when a latest job is paused, "result"/"reason" when closed}.
+    // Works for a task without a record too (the implicit task of a lineage's first job).
+    nlohmann::json TaskState(const std::string& taskId) const;
+    // Appends one entry to a task's log. Does nothing when taskId has no record. Takes only the
+    // task store's lock, so it is safe to call with or without mutex_ held.
+    void TaskLog(const std::string& taskId, const std::string& kind, const std::string& jobId,
+                 const std::string& btId, const std::string& text, const std::string& session);
 
     // Scheduler hooks
     void OnProcessFinished(int processId, int exitCode, const std::string& endKind);
@@ -1026,6 +1088,10 @@ private:
     void RebuildJobIndexLocked() const;
     TaskQueueJob* FindJob(const std::string& id, TaskQueue** outQueue);
     const TaskQueueJob* FindJobConst(const std::string& id) const;
+    // Follow supersededBy links to the newest existing job in the dependency's lineage.
+    const TaskQueueJob* ResolveDepJobLocked(const std::string& depId, const TaskQueue* extraQueue = nullptr) const;
+    // Compact {"id","title","state"} summary for TaskQueueList / TaskQueueGet (no "title" for implicit tasks).
+    std::string TaskSummaryJsonLocked(const TaskQueueJob& job) const;
     // Requeues one job (caller holds mutex_, has validated the state, and saves the queue).
     void RequeueJobLocked(TaskQueue& tq, TaskQueueJob& job, bool resetAttempts, bool refreshInstructions);
 
@@ -1067,7 +1133,12 @@ private:
     void EmitEventLocked(TaskQueue& tq, const std::string& type, const std::string& jobId, int64_t attempt,
                          const TaskQueueFailureDiagnostic* failure = nullptr);
     static std::string BuildError(const std::string& msg);
+    // Task records. Callers hold mutex_ (lock order: mutex_ -> the store's own lock).
+    // Before jobs leave a queue, their ids, states and lineage are kept on the task record.
+    void RecordRemovedJobsLocked(const std::vector<TaskQueueJob>& gone);
+    nlohmann::json TaskStateLocked(const std::string& taskId) const;
 
+    TaskStore taskStore_;
     ProcessManager* pm_ = nullptr;
     RemoteStartCallback remoteStartCb_;
     RemotePollCallback remotePollCb_;

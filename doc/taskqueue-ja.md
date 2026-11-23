@@ -31,7 +31,7 @@ hancho-cli.exe taskqueue wait main --since 0 --timeout-ms 30000
 | `summary` (必須) | 1 行・200 文字以内。`{summary}` に置換され、`PC_JOB_SUMMARY` にも入る。 |
 | `timeoutSec` (必須) | ジョブ単位の制限。合算しない。キューの `maxTimeoutSec`（既定 7200）以下。 |
 | `estimateSec` (任意) | ダッシュボードの残り時間・ETA 表示に使う見積もり秒数。強制される `timeoutSec` は変えない。 |
-| `dependsOn` | `["A"]`（= `on: success`）または `[{ "id": "A", "on": "done" }]`。別キューの id も可。 |
+| `dependsOn` | `["A"]`（= `on: success`）または `[{ "id": "A", "on": "done" }]`。別キューの id も可。依存先ジョブに `supersededBy` がある場合は系譜の最新ジョブの状態で判定され、引き継ぎ先が成功すると `blocked` の後続が再起動する。 |
 | `idle` | `{ "outputSec": 720, "cpuSec": 720 }`。両方指定必須（出力と CPU の両方が止まったときだけ kill）。 |
 | `maxAttempts`, `retryDelaySec` | 自動再実行（既定 2）と試行間の待ち。 |
 | `defer` | `{ "exitCodes": [75], "delaySec": 60, "limit": 60 }`（既定値）。`exitCodes` のどれかで終わった試行は「何も実行していない、後で再試行」の意味（75 = EX_TEMPFAIL。例: 重なるカードを `ww-run` が拒否した）。試行は `deferred` として記録され、ジョブは pending に戻って `delaySec` 後に再び起動します。`maxAttempts` は消費しません。`limit` 回（`0` = 無制限）を超えるとその終了コードは通常の失敗になります。`{ "exitCodes": [] }` で無効。graph に `retry_in_sec` が出ます。 |
@@ -42,6 +42,8 @@ hancho-cli.exe taskqueue wait main --since 0 --timeout-ms 30000
 | `resources` | `{ "write": [...], "read": [...] }`。パス/glob（`cwd` 基準。ファイル名だけの `Foo.cs` は `**/Foo.cs`）または `@name` ロック。集合が重なる（write/write、write/read）ジョブはキューをまたいでも同時に実行しない。read 同士は並列可。デフォルトはオン（設定画面のチェックボックス）。[resource-locks-ja.md](resource-locks-ja.md) を参照。 |
 | `instructionsFile` / `instructionsText` | 任意の指示書。ジョブに複製され、版ごとに実体化される。 |
 | `memory` | `{ "inject": true, "budgetChars": 1500, "scopes": ["job","file","project"] }` — 起動時に `memory_brief` を指示書へ注入する。既定はオフ。`{memory}` の位置に展開し、プレースホルダがなければ末尾に足す。ファイルスコープは `resources` と前回の `filesEdited` から決める。注入した id は試行の `memory_refs` に残る。`includeAgentNotes: false` でエージェントが書いた L2 ノートを除ける。 |
+| `taskId` | 任意のタスクレコード id（`task_...`）。`taskqueue add --task <id>` / `bt start --task <id>` で指定、または `supersedes` から引き継ぐ。タスク未指定のジョブは暗黙の単一系譜タスクとして扱われる。 |
+| `supersedes`, `supersedeReason` | 失敗・未成功ジョブを内容を変えてやり直す際の引き継ぎ元 id と理由（2000 バイト上限）。系譜は一本の鎖として保たれ、元ジョブに `supersededBy` が付き、同じ `taskId` を引き継ぐ。内容を変えて複製するには `taskqueue supersede`、同じ内容の再実行には `taskqueue retry` を使う。 |
 
 **発行元: どのセッションが追加したジョブか**
 
@@ -98,5 +100,19 @@ hancho-cli.exe taskqueue wait main --since 0 --timeout-ms 30000
 **イベントと環境変数:** 各試行に `PC_JOB_ID`, `PC_ATTEMPT`, `PC_JOB_SUMMARY`, `PC_JOB_INSTRUCTIONS`, `PC_JOB_INSTRUCTIONS_REV`、再実行時は `PC_PREV_REASON`, `PC_PREV_EXIT`, `PC_PREV_TAIL`。イベントは `logs/taskqueue-<name>.events.jsonl` に追記され、`notifyFile` は `jobFailed` / `taskqueueStalled` / `taskqueueDrained` で更新されます。
 
 **キューの外の実行（Plain Runs）:** `hancho-cli run` や手動起動など、タスクキュー外のプロセスも最小状態が `logs/taskqueues/plain.json` に保存され、`memory rebuild` の入力となります。既存キューのスケジューリングには影響しません。詳細は [plain-runs-ja.md](plain-runs-ja.md) を参照。
+
+**タスクと系譜:**
+
+タスクのレコードは複数のジョブやビヘイビアツリーを共通の `title`、`intent`、追記専用の経過ログでまとめます（`<data-dir>/tasks/<id>.json` と `<id>.log.jsonl`）。`hancho-cli task create --title "..." --intent "..."`（MCP `task_create`）で作成し、`taskqueue add --task <id>` / `bt start --task <id>` で紐づけ、`task note <id> --text "..."` で判断を記録し、`task close <id> --result succeeded|failed --reason "..."` で閉じます（`task reopen` で再開、`task purge --older-than <sec>` で古い完了タスクを削除）。サイズ上限: `title` 200 バイト、`intent` 16 KB、`note` 4 KB、`close` / `reopen` の `reason` 2000 バイト、`supersedeReason` 2000 バイト。
+
+タスクの状態は、属する各系譜の最新ジョブ（削除済みジョブは `removedJobs` を使用）から次の優先順で計算されます:
+1. 明示的に閉じられている → `closed`（`result` と `reason` を併記）。
+2. ジョブが 0 件 → `open`。
+3. いずれかの系譜の最新ジョブが `pending` / `waiting` / `running` / `planned` / `waitingForPermit`、または未完了の `takenOver` → `running`（一時停止中があれば `paused: true`）。
+4. いずれかが `failed` / `blocked` / `closed`、または `result: failed` の `takenOver` → `failed`。
+5. いずれかが `cancelled` → `cancelled`。
+6. 残りがすべて `succeeded`、または `result: succeeded` の `takenOver` → `succeeded`。
+
+CI で `hancho-cli run --file <jobs.json> --exit-on-drain [--report <junit.xml>]` を実行する場合、既定では `superseded_by` を持つ引き継がれたジョブは終了コードと JUnit レポートから除外され、系譜の最新ジョブだけで判定されます。従来の全ジョブ基準に戻すには `--count-superseded` を指定します。
 
 **GUI:** 左端の表示切替ボタン、または **Ctrl+T** で **2行同時表示 (Two Rows)**、**プロセスのみ (Processes Only)**、**タスクのみ (Tasks Only)** を順次トグル切り替え。2行表示時は水平スプリッターバーをドラッグして各領域の高さを自在に調整できます。実行中は上位・強調表示、失敗は低彩度の赤、タイムアウトは低彩度のアンバー（テーマ色）。

@@ -2019,6 +2019,56 @@ std::string IpcServer::HandleRequestJson(const std::string& reqJson) {
         }
         return out.dump();
     }
+    else if (action.rfind("task_", 0) == 0) {
+        nlohmann::json req = nlohmann::json::parse(reqJson, nullptr, false);
+        if (!req.is_object()) req = nlohmann::json::object();
+        std::string err;
+        std::string resp;
+        if (action == "task_create") {
+            resp = tqm_.TaskCreate(JsonGetString(reqJson, "title", ""),
+                                   JsonGetString(reqJson, "intent", ""),
+                                   JsonGetString(reqJson, "id", ""),
+                                   ExtractRawJsonValue(reqJson, "origin"), err);
+        } else if (action == "task_show") {
+            const int64_t logLimit = req.contains("logLimit") ? req.value("logLimit", int64_t(200))
+                                                              : req.value("log_limit", int64_t(200));
+            resp = tqm_.TaskShow(JsonGetString(reqJson, "id", ""), logLimit, err);
+        } else if (action == "task_list") {
+            const int64_t sinceVer = req.contains("since_version") ? req.value("since_version", int64_t(-1))
+                                                                 : req.value("sinceVersion", int64_t(-1));
+            resp = tqm_.TaskList(JsonGetString(reqJson, "state", ""),
+                                 req.value("limit", int64_t(0)), err, sinceVer);
+        } else if (action == "task_note") {
+            std::string session = JsonGetString(reqJson, "session", "");
+            if (session.empty() && req.contains("origin") && req["origin"].is_object()) {
+                session = req["origin"].value("session", std::string());
+            }
+            resp = tqm_.TaskNote(JsonGetString(reqJson, "id", ""),
+                                 JsonGetString(reqJson, "text", ""),
+                                 session, err);
+        } else if (action == "task_close") {
+            resp = tqm_.TaskClose(JsonGetString(reqJson, "id", ""),
+                                  JsonGetString(reqJson, "result", ""),
+                                  JsonGetString(reqJson, "reason", ""), err);
+        } else if (action == "task_reopen") {
+            resp = tqm_.TaskReopen(JsonGetString(reqJson, "id", ""),
+                                   JsonGetString(reqJson, "reason", ""), err);
+        } else if (action == "task_purge") {
+            const int64_t olderThanSec = req.contains("older_than_sec")
+                ? req.value("older_than_sec", int64_t(-1))
+                : req.value("olderThanSec", int64_t(-1));
+            resp = tqm_.TaskPurgeOlderThan(olderThanSec, err);
+        } else if (action == "task_wait") {
+            const int timeoutMs = req.contains("timeout_ms") ? req.value("timeout_ms", 30000)
+                                                             : req.value("timeoutMs", 30000);
+            const int64_t logLimit = req.contains("logLimit") ? req.value("logLimit", int64_t(200))
+                                                              : req.value("log_limit", int64_t(200));
+            resp = tqm_.TaskWait(JsonGetString(reqJson, "id", ""), timeoutMs, logLimit, err);
+        } else {
+            return "{\"ok\":false,\"error\":\"unknown task action: " + JsonEscape(action) + "\"}";
+        }
+        return resp;
+    }
     else if (action == "failure_diagnose" || action.rfind("taskqueue_", 0) == 0) {
         std::string err;
         std::string resp;
@@ -2059,7 +2109,8 @@ std::string IpcServer::HandleRequestJson(const std::string& reqJson) {
                                      jobsRaw,
                                      JsonGetInt(reqJson, "concurrency", 0),
                                      JsonGetString(reqJson, "notify_file", ""), err,
-                                     ExtractRawJsonValue(reqJson, "origin"));
+                                     ExtractRawJsonValue(reqJson, "origin"),
+                                     JsonGetString(reqJson, "task", ""));
         } else if (action == "taskqueue_list") {
             int64_t sinceSec = 0;
             const std::string sinceStr = JsonGetString(reqJson, "since", "");
@@ -2069,12 +2120,13 @@ std::string IpcServer::HandleRequestJson(const std::string& reqJson) {
                 const std::string tqFilter = JsonGetString(reqJson, "taskqueue", "");
                 const std::string stateFilter = JsonGetString(reqJson, "state", "");
                 const std::string btFilter = JsonGetString(reqJson, "bt", "");
+                const std::string taskFilter = JsonGetString(reqJson, "task", "");
                 resp = tqm_.TaskQueueList(tqFilter, stateFilter, sinceSec, err,
                                           JsonGetString(reqJson, "origin", ""), btFilter,
-                                          JsonGetBool(reqJson, "include_hidden", false));
+                                          JsonGetBool(reqJson, "include_hidden", false), taskFilter);
                 // Virtual task-group rows and their provisional leaves, derived from the live
                 // state on every query. Nothing is stored, so a finished group drops both rows.
-                if (err.empty() && btm_ && JsonGetBool(reqJson, "include_planned", false)) {
+                if (err.empty() && btm_ && taskFilter.empty() && JsonGetBool(reqJson, "include_planned", false)) {
                     nlohmann::json doc = nlohmann::json::parse(resp, nullptr, false);
                     if (doc.is_object() && doc.contains("jobs") && doc["jobs"].is_array()) {
                         BtRemainingInfo info = btm_->GetRemainingInfo();
@@ -2166,6 +2218,14 @@ std::string IpcServer::HandleRequestJson(const std::string& reqJson) {
             } else {
                 err = "taskqueue_retry requires an id, or failed=true for bulk retry";
             }
+        } else if (action == "taskqueue_supersede") {
+            const std::string id = JsonGetString(reqJson, "id", "");
+            const std::string reason = JsonGetString(reqJson, "reason", "");
+            std::string newId = JsonGetString(reqJson, "new_id", "");
+            if (newId.empty()) newId = JsonGetString(reqJson, "newId", "");
+            const std::string patch = ExtractRawJsonValue(reqJson, "patch");
+            const std::string origin = ExtractRawJsonValue(reqJson, "origin");
+            resp = tqm_.TaskQueueSupersede(id, reason, newId, patch, origin, err);
         } else if (action == "taskqueue_update") {
             resp = tqm_.TaskQueueUpdate(JsonGetString(reqJson, "id", ""),
                                         ExtractRawJsonValue(reqJson, "patch"), TaskQueueCaller::External, err);
@@ -2488,6 +2548,17 @@ std::string IpcServer::HandleRequestJson(const std::string& reqJson) {
             std::string btJson, err;
             if (!extractBtPayload(btJson, err)) {
                 return "{\"ok\":false,\"error\":\"" + JsonEscape(err) + "\"}";
+            }
+            const std::string taskId = JsonGetString(reqJson, "task", "");
+            if (!taskId.empty()) {
+                if (!tqm_.ValidateTaskActive(taskId, err)) {
+                    return "{\"ok\":false,\"error\":\"" + JsonEscape(err) + "\"}";
+                }
+                auto btDef = json::parse(btJson, nullptr, false);
+                if (btDef.is_object()) {
+                    btDef["taskId"] = taskId;
+                    btJson = btDef.dump();
+                }
             }
             // Jobs the tree adds carry the origin of whoever started it; set it before
             // Start, which may already add the first jobs.
@@ -2932,12 +3003,23 @@ std::string IpcServer::HandleRequestJson(const std::string& reqJson) {
                 return resp.is_discarded() ? "{\"ok\":false,\"error\":\"invalid routine response\"}" : resp.dump();
             }
             const std::string runId = resp["runId"].get<std::string>();
-            const std::string btText = resp["bt"].get<std::string>();
+            std::string btText = resp["bt"].get<std::string>();
             const std::string taskqueue = resp["taskqueue"].get<std::string>();
             const bool wasStale = resp.value("state", std::string()) == "stale";
             json inputDiff = json::object();
             for (const char* key : {"state", "added", "removed", "changed", "absorbed"}) {
                 if (resp.contains(key)) inputDiff[key] = resp[key];
+            }
+            const std::string taskId = JsonGetString(reqJson, "task", "");
+            if (!taskId.empty()) {
+                if (!tqm_.ValidateTaskActive(taskId, err)) {
+                    return "{\"ok\":false,\"error\":\"" + JsonEscape(err) + "\"}";
+                }
+                auto btDef = json::parse(btText, nullptr, false);
+                if (btDef.is_object()) {
+                    btDef["taskId"] = taskId;
+                    btText = btDef.dump();
+                }
             }
             if (req.contains("origin") && req["origin"].is_object()) {
                 tqm_.SetBtOrigin(runId, req["origin"].dump());

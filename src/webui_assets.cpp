@@ -263,9 +263,15 @@ const char kIndexHtml_0[] = R"HTML_0(<!DOCTYPE html>
           <input type="text" id="input-tq-search" placeholder="Filter jobs by key, name, queue, command...">
         </div>
 
+        <div class="filter-pills" id="tq-view-mode-pills" style="margin-right: 8px;">
+          <button class="pill active" data-view="jobs">Jobs</button>
+          <button class="pill" data-view="tasks">Tasks</button>
+        </div>
+
         <div class="filter-pills" id="tq-filter-pills">
           <button class="pill active" data-filter="all">All</button>
-          <button class="pill" data-filter="running">Running</button>
+)HTML_0";
+const char kIndexHtml_1[] = R"HTML_1(          <button class="pill" data-filter="running">Running</button>
           <button class="pill" data-filter="pending">Pending</button>
           <button class="pill" data-filter="succeeded">Succeeded</button>
           <button class="pill" data-filter="failed">Failed</button>
@@ -279,10 +285,10 @@ const char kIndexHtml_0[] = R"HTML_0(<!DOCTYPE html>
             <tr>
               <th style="width: 110px;">State</th>
               <th style="width: 170px;">Job Key / ID</th>
+              <th style="width: 160px;">Task</th>
               <th style="width: 180px;">Name</th>
               <th style="width: 110px;">Queue</th>
-)HTML_0";
-const char kIndexHtml_1[] = R"HTML_1(              <th>Command</th>
+              <th>Command</th>
               <th style="width: 80px;">Exit</th>
               <th style="width: 90px;">Duration</th>
               <th style="width: 150px;">Started</th>
@@ -292,7 +298,7 @@ const char kIndexHtml_1[] = R"HTML_1(              <th>Command</th>
             </tr>
           </thead>
           <tbody id="tq-tbody">
-            <tr class="empty-row"><td colspan="11">Loading task queue...</td></tr>
+            <tr class="empty-row"><td colspan="12">Loading task queue...</td></tr>
           </tbody>
         </table>
       </div>
@@ -532,7 +538,8 @@ const char kIndexHtml_1[] = R"HTML_1(              <th>Command</th>
                 <th style="width: 190px; text-align: center;">Actions</th>
               </tr>
             </thead>
-            <tbody id="mem-tbody">
+)HTML_1";
+const char kIndexHtml_2[] = R"HTML_2(            <tbody id="mem-tbody">
               <tr class="empty-row"><td colspan="7">Loading memory records...</td></tr>
             </tbody>
           </table>
@@ -591,8 +598,7 @@ const char kIndexHtml_1[] = R"HTML_1(              <th>Command</th>
             <input type="text" id="form-proc-cmd" class="form-input" placeholder="e.g. bash -c 'echo hello; sleep 5'">
           </div>
           <div class="form-group">
-)HTML_1";
-const char kIndexHtml_2[] = R"HTML_2(            <label for="form-proc-name">Process / Job Name:</label>
+            <label for="form-proc-name">Process / Job Name:</label>
             <input type="text" id="form-proc-name" class="form-input" placeholder="e.g. my-worker">
           </div>
           <div class="form-group">
@@ -659,6 +665,23 @@ const char kIndexHtml_2[] = R"HTML_2(            <label for="form-proc-name">Pro
         <div class="modal-footer" id="job-modal-footer">
           <button id="btn-job-modal-retry" class="btn btn-primary">Retry</button>
           <button id="btn-job-modal-cancel" class="btn btn-danger">Cancel</button>
+          <button class="btn modal-close-btn">Close</button>
+        </div>
+      </div>
+    </div>
+
+    <!-- MODAL: TASK DETAILS -->
+    <div id="modal-task-details" class="modal hidden">
+      <div class="modal-backdrop"></div>
+      <div class="modal-dialog modal-lg">
+        <div class="modal-header">
+          <h3 id="task-modal-title">Task Details</h3>
+          <button class="btn-close modal-close-btn">&times;</button>
+        </div>
+        <div class="modal-body" id="task-modal-body">
+          <!-- Filled dynamically -->
+        </div>
+        <div class="modal-footer">
           <button class="btn modal-close-btn">Close</button>
         </div>
       </div>
@@ -1214,8 +1237,8 @@ body {
 .badge-blocked { background-color: var(--blocked-bg); color: var(--blocked); }
 .badge-completed, .badge-succeeded { background-color: var(--success-bg); color: var(--success); }
 .badge-failed { background-color: var(--error-bg); color: var(--error); }
- .badge-cancelled { background-color: var(--cancelled-bg); color: var(--cancelled); }
- .badge-taken-over { background-color: var(--taken-over-bg); color: var(--taken-over); border: 1px solid var(--taken-over); }
+.badge-cancelled { background-color: var(--cancelled-bg); color: var(--cancelled); }
+.badge-taken-over { background-color: var(--taken-over-bg); color: var(--taken-over); border: 1px solid var(--taken-over); }
 .badge-l1 { background-color: var(--l1-bg); color: var(--l1-color); }
 .badge-l2 { background-color: var(--l2-bg); color: var(--l2-color); }
 .badge-l3 { background-color: var(--l3-bg); color: var(--l3-color); }
@@ -1336,7 +1359,8 @@ body {
   padding: 4px;
 }
 
-.event-card {
+)CSS_0";
+const char kStyleCss_1[] = R"CSS_1(.event-card {
   background-color: var(--bg-card);
   border: 1px solid var(--border-color);
   border-radius: var(--radius-md);
@@ -1352,8 +1376,7 @@ body {
 }
 
 .event-card-body {
-)CSS_0";
-const char kStyleCss_1[] = R"CSS_1(  font-family: var(--font-mono);
+  font-family: var(--font-mono);
   font-size: 0.78rem;
   color: var(--text-secondary);
   background-color: #121217;
@@ -1732,6 +1755,54 @@ const char kStyleCss_1[] = R"CSS_1(  font-family: var(--font-mono);
   color: var(--text-muted);
   font-size: 0.85rem;
 }
+
+/* Task Lineage & Details */
+.task-heading-row {
+  background-color: rgba(56, 189, 248, 0.06);
+  cursor: pointer;
+}
+.task-heading-row:hover {
+  background-color: rgba(56, 189, 248, 0.12);
+}
+.row-superseded {
+  opacity: 0.62;
+}
+.task-link {
+  color: var(--accent, #38bdf8);
+  cursor: pointer;
+  text-decoration: underline;
+  text-decoration-style: dotted;
+}
+.task-link:hover {
+  text-decoration-style: solid;
+}
+.task-intent-box {
+  background: var(--bg-secondary, #1a1b26);
+  border: 1px solid var(--border-color, #2e2f42);
+  border-radius: 6px;
+  padding: 10px 12px;
+  white-space: pre-wrap;
+  word-break: break-word;
+  font-size: 0.84rem;
+  margin: 6px 0 12px;
+  max-height: 220px;
+  overflow-y: auto;
+}
+.task-log-list {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  max-height: 260px;
+  overflow-y: auto;
+  margin-top: 6px;
+}
+.task-log-entry {
+  font-size: 0.8rem;
+  padding: 6px 8px;
+  background: var(--bg-secondary, #1a1b26);
+  border-radius: 4px;
+  border-left: 3px solid var(--accent, #38bdf8);
+}
 )CSS_1";
 static const std::string& GetStyleCss() {
     static const std::string s = std::string(kStyleCss_0) + kStyleCss_1;
@@ -1777,6 +1848,9 @@ const char kAppJs_0[] = R"JS_0(/**
 
     // Task Queue
     jobs: [],
+    tasks: [],
+    tqViewMode: 'jobs',
+    expandedTasks: {},
     tqFilter: 'all',
     tqSearch: '',
     tqCounts: { total: 0, running: 0, waiting: 0, pending: 0, blocked: 0, succeeded: 0, failed: 0, cancelled: 0 },
@@ -1851,6 +1925,7 @@ const char kAppJs_0[] = R"JS_0(/**
   const elTqTbody = document.getElementById('tq-tbody');
   const elInputTqSearch = document.getElementById('input-tq-search');
   const elTqFilterPills = document.getElementById('tq-filter-pills');
+  const elTqViewModePills = document.getElementById('tq-view-mode-pills');
   const elBtnTqPause = document.getElementById('btn-tq-pause');
   const elBtnTqResume = document.getElementById('btn-tq-resume');
   const elBtnTqPurge = document.getElementById('btn-tq-purge');
@@ -1920,6 +1995,10 @@ const char kAppJs_0[] = R"JS_0(/**
   const elJobModalBody = document.getElementById('job-modal-body');
   const elBtnJobModalRetry = document.getElementById('btn-job-modal-retry');
   const elBtnJobModalCancel = document.getElementById('btn-job-modal-cancel');
+
+  const elModalTaskDetails = document.getElementById('modal-task-details');
+  const elTaskModalTitle = document.getElementById('task-modal-title');
+  const elTaskModalBody = document.getElementById('task-modal-body');
 
   const elModalMemDetails = document.getElementById('modal-mem-details');
   const elMemModalBody = document.getElementById('mem-modal-body');
@@ -2030,7 +2109,8 @@ const char kAppJs_0[] = R"JS_0(/**
     if (!data) return;
 
     // Process list response
-    if (data.processes && Array.isArray(data.processes)) {
+)JS_0";
+const char kAppJs_1[] = R"JS_1(    if (data.processes && Array.isArray(data.processes)) {
       state.processes = data.processes;
       elBadgeProcCount.textContent = state.processes.length;
       renderProcessesTable();
@@ -2039,11 +2119,26 @@ const char kAppJs_0[] = R"JS_0(/**
     }
 
     // Task queue jobs list response
-    if (data.jobs && Array.isArray(data.jobs)) {
+    if (data.jobs && Array.isArray(data.jobs) && !data.task) {
       state.jobs = data.jobs;
       elBadgeTqCount.textContent = state.jobs.length;
       renderTaskQueueTable();
       checkFailuresFromJobs();
+      return;
+    }
+
+    // Task list response
+    if (data.tasks && Array.isArray(data.tasks)) {
+      state.tasks = data.tasks;
+      if (state.activeTab === 'taskqueue') {
+        renderTaskQueueTable();
+      }
+      return;
+    }
+
+    // Task show response
+    if (data.ok && data.task && Array.isArray(data.jobs) && Array.isArray(data.log)) {
+      renderTaskDetailsModal(data);
       return;
     }
 
@@ -2071,8 +2166,7 @@ const char kAppJs_0[] = R"JS_0(/**
     }
 
     // Agent Stream events
-)JS_0";
-const char kAppJs_1[] = R"JS_1(    if (data.events && Array.isArray(data.events)) {
+    if (data.events && Array.isArray(data.events)) {
       state.monitorEvents = data.events;
       renderMonitorEvents();
       return;
@@ -2137,8 +2231,7 @@ const char kAppJs_1[] = R"JS_1(    if (data.events && Array.isArray(data.events)
       renderRoutineDetail(data);
       return;
     }
-)JS_1";
-const char kAppJs_1a[] = R"JS_1a(    if (data.name && (data.status === 'proposed' || data.status === 'approved' || data.status === 'rejected') && data.engine !== undefined) {
+    if (data.name && (data.status === 'proposed' || data.status === 'approved' || data.status === 'rejected') && data.engine !== undefined) {
       elRoutineStatus.textContent = `routine ${data.name}: ${data.status}` +
         (data.rationale ? ` - ${data.rationale}` : '');
       state.selectedRoutine = data.name;
@@ -2204,6 +2297,7 @@ const char kAppJs_1a[] = R"JS_1a(    if (data.name && (data.status === 'proposed
       sendWsRequest({ action: 'list' });
     } else if (state.activeTab === 'taskqueue') {
       sendWsRequest({ action: 'taskqueue_list', include_planned: true });
+      sendWsRequest({ action: 'task_list' });
       sendWsRequest({ action: 'taskqueue_resource_locks' });
     } else if (state.activeTab === 'monitor') {
       sendWsRequest({ action: 'list' });
@@ -2262,8 +2356,7 @@ const char kAppJs_1a[] = R"JS_1a(    if (data.name && (data.status === 'proposed
     sendWsRequest({ action: 'routine_reject', name: name, reason: reason });
   }
 
-)JS_1a";
-const char kAppJs_1c[] = R"JS_1c(  function renderRoutinesTable() {
+  function renderRoutinesTable() {
     if (!elRoutineTbody) return;
     if (state.routines.length === 0) {
       elRoutineTbody.innerHTML = '<tr class="empty-row"><td colspan="5">No routines saved yet.</td></tr>';
@@ -2333,7 +2426,8 @@ const char kAppJs_1c[] = R"JS_1c(  function renderRoutinesTable() {
           html += `<tr><td>${escapeHtml(j.node || '')}</td><td>${escapeHtml(j.command || '')}</td></tr>`;
         });
         html += '</tbody></table>';
-      }
+)JS_1";
+const char kAppJs_2[] = R"JS_2(      }
       html += `<div>承認: <button id="routine-detail-approve" class="btn btn-xs">Approve</button> ` +
         `<button id="routine-detail-reject" class="btn btn-xs">Reject</button></div>`;
     }
@@ -2354,7 +2448,6 @@ const char kAppJs_1c[] = R"JS_1c(  function renderRoutinesTable() {
     html += '</tbody></table>';
     elRoutineDetail.innerHTML = html;
     const approveBtn = document.getElementById('routine-detail-approve');
-
     if (approveBtn) approveBtn.addEventListener('click', () => approveRoutine(data.name));
     const rejectBtn = document.getElementById('routine-detail-reject');
     if (rejectBtn) rejectBtn.addEventListener('click', () => rejectRoutine(data.name));
@@ -2452,7 +2545,7 @@ const char kAppJs_1c[] = R"JS_1c(  function renderRoutinesTable() {
     if (s === 'blocked') return 'badge badge-blocked';
     if (s === 'completed' || s === 'succeeded') return 'badge badge-completed';
     if (s === 'failed' || s === 'timed_out' || s === 'idle_timed_out' || s === 'startup_timed_out') return 'badge badge-failed';
-    if (s === 'cancelled' || s === 'killed' || s === 'closed') return 'badge badge-cancelled';
+    if (s === 'cancelled' || s === 'killed') return 'badge badge-cancelled';
     if (s === 'takenover') return 'badge badge-taken-over';
     if (s === 'waitingforpermit') return 'badge badge-blocked';
     return 'badge';
@@ -2486,7 +2579,7 @@ const char kAppJs_1c[] = R"JS_1c(  function renderRoutinesTable() {
 
     if (filtered.length === 0) {
       const msg = state.processes.length === 0 ? 'No processes found.' : 'No processes match the filter.';
-      elProcTbody.innerHTML = `<tr class="empty-row"><td colspan="9">${escapeHtml(msg)}</td></tr>`;
+      elProcTbody.innerHTML = `<tr class="empty-row"><td colspan="10">${escapeHtml(msg)}</td></tr>`;
       return;
     }
 
@@ -2515,6 +2608,7 @@ const char kAppJs_1c[] = R"JS_1c(  function renderRoutinesTable() {
         <td>${mem}</td>
         <td>${exitCode}</td>
         <td>${started}</td>
+        <td>${ended}</td>
         <td style="text-align: center;">
           <button class="btn btn-sm btn-proc-logs" data-id="${id}">Logs</button>
           ${isRunning
@@ -2587,8 +2681,7 @@ const char kAppJs_1c[] = R"JS_1c(  function renderRoutinesTable() {
     }
   }
 
-)JS_1c";
-const char kAppJs_1b[] = R"JS_1b(  // ==========================================
+  // ==========================================
   // PANE 2: TASK QUEUE
   // ==========================================
   function updateTqKpis() {
@@ -2601,6 +2694,132 @@ const char kAppJs_1b[] = R"JS_1b(  // ==========================================
     elKpiTqSucceeded.textContent = c.succeeded || 0;
     elKpiTqFailed.textContent = c.failed || 0;
     elKpiTqCancelled.textContent = c.cancelled || 0;
+  }
+
+  function getTaskRecordById(taskId) {
+    if (!taskId) return null;
+    return state.tasks.find(t => t.id === taskId) || null;
+  }
+
+  function getJobTaskInfo(job) {
+    if (job.task && typeof job.task === 'object') {
+      const id = job.task.id || '';
+      const rec = getTaskRecordById(id);
+      return {
+        id: id,
+        title: job.task.title || (rec ? rec.title : '') || '',
+        state: job.task.state || (rec ? rec.state : '') || '',
+        hasRecord: !!(job.task.title || rec)
+      };
+    }
+    const id = job.task_id || job.taskId || '';
+    const rec = getTaskRecordById(id);
+    return {
+      id: id,
+      title: rec ? (rec.title || '') : '',
+      state: rec ? (rec.state || '') : '',
+      hasRecord: !!rec
+    };
+  }
+
+  function jobStateSymbol(st) {
+    const s = (st || '').toLowerCase();
+    if (s === 'succeeded' || s === 'completed') return '✓';
+    if (s === 'failed' || s === 'blocked' || s === 'timed_out' || s === 'idle_timed_out' || s === 'startup_timed_out') return '✗';
+    if (s === 'running' || s === 'waitingforllm' || s === 'paused') return '▶';
+    if (s === 'cancelled' || s === 'closed' || s === 'takenover' || s === 'killed') return '−';
+    return '·';
+  }
+
+  function formatTaskResultsCompact(jobs) {
+)JS_2";
+const char kAppJs_3[] = R"JS_3(    const syms = jobs.map(j => jobStateSymbol(j.state));
+    if (syms.length <= 8) return syms.join('');
+    let out = '';
+    let i = 0;
+    while (i < syms.length) {
+      const sym = syms[i];
+      let j = i + 1;
+      while (j < syms.length && syms[j] === sym) j++;
+      const run = j - i;
+      if (out) out += ' ';
+      out += sym + (run > 1 ? '×' + run : '');
+      i = j;
+    }
+    return out;
+  }
+
+  function buildJobRowHtml(job, indent) {
+    const key = escapeHtml(job.key || job.id || '-');
+    const name = escapeHtml(job.name || job.summary || '(unnamed)');
+    const queue = escapeHtml(job.taskqueue || job.queue || 'default');
+    const cmd = escapeHtml(job.command || job.commandLine || job.cmd || '-');
+    const stateBadge = `<span class="${getBadgeClass(job.state)}">${escapeHtml(job.state || 'unknown')}</span>`;
+    const attempts = Array.isArray(job.attempts) ? job.attempts : [];
+    const lastAttempt = attempts.length ? attempts[attempts.length - 1] : null;
+    const exitValue = job.exit_code !== undefined ? job.exit_code
+      : (lastAttempt && lastAttempt.exit_code !== undefined ? lastAttempt.exit_code : job.exitCode);
+    const exitCode = exitValue !== undefined ? exitValue : '-';
+
+    const isRunning = (job.state || '').toLowerCase() === 'running';
+    const isFailed = (job.state || '').toLowerCase() === 'failed';
+    const supBy = job.superseded_by || job.supersededBy || '';
+    const supFrom = job.supersedes || '';
+    const isSuperseded = !!supBy;
+
+    const { start: startAt, end: endAt } = taskAttemptTimes(job);
+    const started = startAt ? formatDateTime(startAt) : '-';
+    const ended = endAt ? formatDateTime(endAt) : (isRunning ? 'running' : '-');
+    let durationSec = job.duration_sec !== undefined ? job.duration_sec
+      : (job.durationSec !== undefined ? job.durationSec
+      : (job.elapsed_sec !== undefined ? job.elapsed_sec : job.elapsedSec));
+    if (durationSec === undefined && startAt && endAt) {
+      const startDate = parseTimestamp(startAt);
+      const endDate = parseTimestamp(endAt);
+      if (startDate && endDate) {
+        durationSec = Math.max(0, (endDate.getTime() - startDate.getTime()) / 1000);
+      }
+    }
+    const duration = formatDuration(durationSec);
+    const updatedRaw = job.updated_at || job.updatedAt || job.created_at || job.createdAt;
+    const updated = formatDateTime(updatedRaw);
+
+    const taskInfo = getJobTaskInfo(job);
+    let taskCell = '<span class="text-muted">-</span>';
+    if (taskInfo.id) {
+      const taskLabel = taskInfo.title ? `${taskInfo.title} (${taskInfo.id})` : taskInfo.id;
+      if (taskInfo.hasRecord) {
+        taskCell = `<a class="task-link" data-task-id="${escapeHtml(taskInfo.id)}" title="${escapeHtml(taskLabel)}">${escapeHtml(taskInfo.title || taskInfo.id)}</a>`;
+      } else {
+        taskCell = `<span class="text-muted" title="${escapeHtml(taskLabel)}">${escapeHtml(taskInfo.id)}</span>`;
+      }
+    }
+
+    let lineageBadge = '';
+    if (supFrom) lineageBadge += ` <span class="text-muted" title="Supersedes ${escapeHtml(supFrom)}">↩ ${escapeHtml(supFrom)}</span>`;
+    if (supBy) lineageBadge += ` <span class="text-muted" title="Superseded by ${escapeHtml(supBy)}">→ ${escapeHtml(supBy)}</span>`;
+
+    const padStyle = indent ? ' style="padding-left: 26px;"' : '';
+    const rowClass = isSuperseded ? ' class="row-superseded"' : '';
+
+    return `<tr${rowClass} data-job-key="${key}">
+      <td>${stateBadge}</td>
+      <td class="job-key font-mono"${padStyle} title="${key}">${indent ? '↳ ' : ''}${key}${lineageBadge}</td>
+      <td class="job-task">${taskCell}</td>
+      <td class="job-name" title="${name}">${name}</td>
+      <td>${queue}</td>
+      <td class="job-cmd" title="${cmd}">${cmd}</td>
+      <td>${exitCode}</td>
+      <td>${duration}</td>
+      <td title="${escapeHtml(startAt)}">${started}</td>
+      <td title="${escapeHtml(endAt)}">${ended}</td>
+      <td>${updated}</td>
+      <td style="text-align: center;">
+        <button class="btn btn-sm btn-job-details" data-key="${key}">Details</button>
+        ${isFailed ? `<button class="btn btn-sm btn-primary btn-job-retry" data-key="${key}">Retry</button>` : ''}
+        ${isRunning ? `<button class="btn btn-sm btn-danger btn-job-cancel" data-key="${key}">Cancel</button>` : ''}
+      </td>
+    </tr>`;
   }
 
   function renderTaskQueueTable() {
@@ -2622,75 +2841,148 @@ const char kAppJs_1b[] = R"JS_1b(  // ==========================================
         const name = (job.name || '').toLowerCase();
         const queue = (job.taskqueue || job.queue || '').toLowerCase();
         const cmd = (job.commandLine || job.cmd || '').toLowerCase();
-        if (!key.includes(q) && !name.includes(q) && !queue.includes(q) && !cmd.includes(q)) {
+        const taskInfo = getJobTaskInfo(job);
+        const taskText = (taskInfo.id + ' ' + taskInfo.title).toLowerCase();
+        if (!key.includes(q) && !name.includes(q) && !queue.includes(q) && !cmd.includes(q) && !taskText.includes(q)) {
           return false;
         }
       }
       return true;
     });
 
-)JS_1b";
-const char kAppJs_2[] = R"JS_2(    if (filtered.length === 0) {
-      const msg = state.jobs.length === 0 ? 'No jobs in queue.' : 'No jobs match current filter.';
-      elTqTbody.innerHTML = `<tr class="empty-row"><td colspan="11">${escapeHtml(msg)}</td></tr>`;
-      return;
-    }
-
     let html = '';
-    for (const job of filtered) {
-      const key = escapeHtml(job.key || job.id || '-');
-      const name = escapeHtml(job.name || job.summary || '(unnamed)');
-      const queue = escapeHtml(job.taskqueue || job.queue || 'default');
-      const cmd = escapeHtml(job.command || job.commandLine || job.cmd || '-');
-      const stateBadge = `<span class="${getBadgeClass(job.state)}">${escapeHtml(job.state || 'unknown')}</span>`;
-      const attempts = Array.isArray(job.attempts) ? job.attempts : [];
-      const lastAttempt = attempts.length ? attempts[attempts.length - 1] : null;
-      const exitValue = job.exit_code !== undefined ? job.exit_code
-        : (lastAttempt && lastAttempt.exit_code !== undefined ? lastAttempt.exit_code : job.exitCode);
-      const exitCode = exitValue !== undefined ? exitValue : '-';
 
-      const isRunning = (job.state || '').toLowerCase() === 'running';
-      const isFailed = (job.state || '').toLowerCase() === 'failed';
+    if (state.tqViewMode === 'tasks') {
+      // Group jobs by effective task id
+      const supMap = {};
+      const expMap = {};
+      for (const j of state.jobs) {
+        const jid = j.id || j.key || '';
+        const tid = j.task_id || j.taskId || (j.task && j.task.id) || '';
+        if (jid && j.supersedes) supMap[jid] = j.supersedes;
+        if (jid && tid) expMap[jid] = tid;
+      }
+      function resolveTaskId(job) {
+        const tid = job.task_id || job.taskId || (job.task && job.task.id) || '';
+        if (tid) return tid;
+        let cur = job.id || job.key || '';
+        for (let step = 0; step < 128; step++) {
+          if (expMap[cur]) return expMap[cur];
+          if (!supMap[cur] || supMap[cur] === cur) break;
+          cur = supMap[cur];
+        }
+        return cur;
+      }
 
-      const { start: startAt, end: endAt } = taskAttemptTimes(job);
-      const started = startAt ? formatDateTime(startAt) : '-';
-      const ended = endAt ? formatDateTime(endAt) : (isRunning ? 'running' : '-');
-      let durationSec = job.duration_sec !== undefined ? job.duration_sec
-        : (job.durationSec !== undefined ? job.durationSec
-        : (job.elapsed_sec !== undefined ? job.elapsed_sec : job.elapsedSec));
-      if (durationSec === undefined && startAt && endAt) {
-        const startDate = parseTimestamp(startAt);
-        const endDate = parseTimestamp(endAt);
-        if (startDate && endDate) {
-          durationSec = Math.max(0, (endDate.getTime() - startDate.getTime()) / 1000);
+      const groupMap = {};
+      const groupOrder = [];
+      function ensureGroup(id) {
+        if (!groupMap[id]) {
+          const rec = getTaskRecordById(id);
+          groupMap[id] = {
+            id: id,
+            title: rec ? (rec.title || '') : '',
+            state: rec ? (rec.state || 'open') : '',
+            hasRecord: !!rec,
+            jobs: []
+          };
+          groupOrder.push(id);
+        }
+        return groupMap[id];
+      }
+
+      for (const t of state.tasks) {
+        if (!t || !t.id) continue;
+        const st = (t.state || '').toLowerCase();
+        if (filter !== 'all' && st !== filter) continue;
+        if (q) {
+          const txt = (t.id + ' ' + (t.title || '')).toLowerCase();
+          if (!txt.includes(q)) continue;
+        }
+        ensureGroup(t.id);
+      }
+
+      for (const job of filtered) {
+        const tid = resolveTaskId(job);
+        const g = ensureGroup(tid);
+        const info = getJobTaskInfo(job);
+        if (!g.title && info.title) g.title = info.title;
+        if (!g.state && info.state) g.state = info.state;
+        if (info.hasRecord) g.hasRecord = true;
+        g.jobs.push(job);
+      }
+
+      if (groupOrder.length === 0) {
+        const msg = (state.jobs.length === 0 && state.tasks.length === 0) ? 'No tasks or jobs in queue.' : 'No tasks match current filter.';
+        elTqTbody.innerHTML = `<tr class="empty-row"><td colspan="12">${escapeHtml(msg)}</td></tr>`;
+        return;
+      }
+
+      for (const gid of groupOrder) {
+        const g = groupMap[gid];
+        if (!g.hasRecord && g.jobs.length === 1) {
+          html += buildJobRowHtml(g.jobs[0], false);
+          continue;
+        }
+        const taskState = g.state || (g.jobs.length ? (g.jobs[g.jobs.length - 1].state || 'open') : 'open');
+        const defaultExp = taskState === 'running' || taskState === 'failed' || taskState === 'open';
+        const expanded = state.expandedTasks[gid] !== undefined ? state.expandedTasks[gid] : defaultExp;
+        const arrow = expanded ? '▾' : '▸';
+        const compact = formatTaskResultsCompact(g.jobs);
+        const titleText = g.title ? `${g.title} (${gid})` : gid;
+        const stateBadge = `<span class="${getBadgeClass(taskState)}">${escapeHtml(taskState)}</span>`;
+        const detailsBtn = g.hasRecord
+          ? `<button class="btn btn-sm btn-task-details" data-task-id="${escapeHtml(gid)}">Task Details</button>`
+          : '';
+
+        html += `<tr class="task-heading-row" data-task-id="${escapeHtml(gid)}">
+          <td>${stateBadge}</td>
+          <td class="font-mono" colspan="2"><strong>${arrow} ${escapeHtml(titleText)}</strong></td>
+          <td colspan="3"><span class="font-mono">${escapeHtml(compact)}</span> <span class="text-muted">(${g.jobs.length} job${g.jobs.length === 1 ? '' : 's'})</span></td>
+          <td colspan="5"></td>
+          <td style="text-align: center;">${detailsBtn}</td>
+        </tr>`;
+
+        if (expanded) {
+          for (const job of g.jobs) {
+            html += buildJobRowHtml(job, true);
+          }
         }
       }
-      const duration = formatDuration(durationSec);
-      const updatedRaw = job.updated_at || job.updatedAt || job.created_at || job.createdAt;
-      const updated = formatDateTime(updatedRaw);
-
-      html += `<tr data-job-key="${key}">
-        <td>${stateBadge}</td>
-        <td class="job-key font-mono" title="${key}">${key}</td>
-        <td class="job-name" title="${name}">${name}</td>
-        <td>${queue}</td>
-        <td class="job-cmd" title="${cmd}">${cmd}</td>
-        <td>${exitCode}</td>
-        <td>${duration}</td>
-        <td title="${escapeHtml(startAt)}">${started}</td>
-        <td title="${escapeHtml(endAt)}">${ended}</td>
-        <td>${updated}</td>
-        <td style="text-align: center;">
-          <button class="btn btn-sm btn-job-details" data-key="${key}">Details</button>
-          ${isFailed ? `<button class="btn btn-sm btn-primary btn-job-retry" data-key="${key}">Retry</button>` : ''}
-          ${isRunning ? `<button class="btn btn-sm btn-danger btn-job-cancel" data-key="${key}">Cancel</button>` : ''}
-        </td>
-      </tr>`;
+    } else {
+      if (filtered.length === 0) {
+        const msg = state.jobs.length === 0 ? 'No jobs in queue.' : 'No jobs match current filter.';
+        elTqTbody.innerHTML = `<tr class="empty-row"><td colspan="12">${escapeHtml(msg)}</td></tr>`;
+        return;
+      }
+      for (const job of filtered) {
+        html += buildJobRowHtml(job, false);
+      }
     }
 
     elTqTbody.innerHTML = html;
 
     // Attach listeners
+    elTqTbody.querySelectorAll('.task-heading-row').forEach(row => {
+      row.addEventListener('click', function() {
+        const tid = this.getAttribute('data-task-id');
+        if (!tid) return;
+        const cur = state.expandedTasks[tid];
+        const gRowState = (this.querySelector('.badge') ? this.querySelector('.badge').textContent : '').toLowerCase();
+        const defExp = gRowState === 'running' || gRowState === 'failed' || gRowState === 'open';
+        state.expandedTasks[tid] = cur !== undefined ? !cur : !defExp;
+        renderTaskQueueTable();
+      });
+    });
+
+    elTqTbody.querySelectorAll('.btn-task-details, .task-link').forEach(el => {
+      el.addEventListener('click', function(e) {
+        e.stopPropagation();
+        const tid = this.getAttribute('data-task-id');
+        if (tid) openTaskDetails(tid);
+      });
+    });
+
     elTqTbody.querySelectorAll('.btn-job-details').forEach(btn => {
       btn.addEventListener('click', function(e) {
         e.stopPropagation();
@@ -2703,7 +2995,10 @@ const char kAppJs_2[] = R"JS_2(    if (filtered.length === 0) {
         e.stopPropagation();
         const key = this.getAttribute('data-key');
         sendWsRequest({ action: 'taskqueue_retry', id: key });
-        setTimeout(() => sendWsRequest({ action: 'taskqueue_list', include_planned: true }), 200);
+        setTimeout(() => {
+          sendWsRequest({ action: 'taskqueue_list', include_planned: true });
+          sendWsRequest({ action: 'task_list' });
+        }, 200);
       });
     });
 
@@ -2712,9 +3007,96 @@ const char kAppJs_2[] = R"JS_2(    if (filtered.length === 0) {
         e.stopPropagation();
         const key = this.getAttribute('data-key');
         sendWsRequest({ action: 'taskqueue_cancel', id: key });
-        setTimeout(() => sendWsRequest({ action: 'taskqueue_list', include_planned: true }), 200);
+        setTimeout(() => {
+          sendWsRequest({ action: 'taskqueue_list', include_planned: true });
+)JS_3";
+const char kAppJs_4[] = R"JS_4(          sendWsRequest({ action: 'task_list' });
+        }, 200);
       });
     });
+  }
+
+  function openTaskDetails(taskId) {
+    if (!taskId) return;
+    elTaskModalTitle.textContent = `Task: ${taskId}`;
+    elTaskModalBody.innerHTML = '<div class="empty-message">Loading task details...</div>';
+    elModalTaskDetails.classList.remove('hidden');
+    sendWsRequest({ action: 'task_show', id: taskId, log_limit: 200 });
+  }
+
+  function renderTaskDetailsModal(data) {
+    const t = data.task || {};
+    const status = data.status || {};
+    const jobs = Array.isArray(data.jobs) ? data.jobs : [];
+    const log = Array.isArray(data.log) ? data.log : [];
+    const st = status.state || t.state || 'open';
+
+    elTaskModalTitle.textContent = `Task: ${t.title || t.id || '-'}`;
+
+    let html = '';
+    const fields = [
+      ['Task ID', t.id || '-'],
+      ['Title', t.title || '-'],
+      ['State', st + (status.paused ? ' (paused)' : '')],
+      ['Created At', t.createdAt || '-'],
+      ['Updated At', t.updatedAt || '-']
+    ];
+    if (t.closed && typeof t.closed === 'object') {
+      fields.push(['Closed', `${t.closed.result || '-'} (${t.closed.at || '-'}) - ${t.closed.reason || ''}`]);
+    }
+    if (data.repeatedFailures > 0) {
+      fields.push(['Repeated Failures', String(data.repeatedFailures)]);
+    }
+
+    for (const [k, v] of fields) {
+      html += `<div class="detail-row">
+        <div class="detail-label">${escapeHtml(k)}:</div>
+        <div class="detail-value">${escapeHtml(String(v))}</div>
+      </div>`;
+    }
+
+    html += `<div class="mt-3"><strong>Intent</strong></div>
+      <pre class="task-intent-box">${escapeHtml(t.intent || '(none)')}</pre>`;
+
+    html += `<div class="mt-3"><strong>Jobs (${jobs.length})</strong></div>`;
+    if (jobs.length === 0) {
+      html += `<div class="text-muted" style="padding: 6px 0;">No jobs yet.</div>`;
+    } else {
+      html += `<div class="task-log-list">`;
+      for (const j of jobs) {
+        const lineage = [
+          j.supersedes ? `↩ ${j.supersedes}` : '',
+          j.supersededBy ? `→ ${j.supersededBy}` : ''
+        ].filter(Boolean).join(' ');
+        html += `<div class="task-log-entry">
+          <span class="${getBadgeClass(j.state)}">${escapeHtml(j.state || '')}</span>
+          <strong class="font-mono">${escapeHtml(j.id || '')}</strong>
+          <span>${escapeHtml(j.name || '')}</span>
+          <span class="text-muted">[${escapeHtml(j.taskqueue || 'default')}] ${escapeHtml(lineage)}</span>
+        </div>`;
+      }
+      html += `</div>`;
+    }
+
+    html += `<div class="mt-3"><strong>Progress Log (${log.length})</strong></div>`;
+    if (log.length === 0) {
+      html += `<div class="text-muted" style="padding: 6px 0;">No log entries.</div>`;
+    } else {
+      html += `<div class="task-log-list">`;
+      for (const entry of log) {
+        const ref = [entry.job ? `job:${entry.job}` : '', entry.bt ? `bt:${entry.bt}` : ''].filter(Boolean).join(' ');
+        html += `<div class="task-log-entry">
+          <span class="text-muted font-mono">${escapeHtml(entry.at || '')}</span>
+          <strong>[${escapeHtml(entry.kind || '')}]</strong>
+          ${ref ? `<span class="text-muted font-mono">${escapeHtml(ref)}</span>` : ''}
+          <div>${escapeHtml(entry.text || '')}</div>
+        </div>`;
+      }
+      html += `</div>`;
+    }
+
+    elTaskModalBody.innerHTML = html;
+    elModalTaskDetails.classList.remove('hidden');
   }
 
   function openJobDetailsModal(key) {
@@ -2943,7 +3325,8 @@ const char kAppJs_2[] = R"JS_2(    if (filtered.length === 0) {
     const keys = Object.keys(classes);
 
     if (keys.length === 0) {
-      elDiagClassesContainer.innerHTML = '<div class="empty-message">No failure categories currently reported.</div>';
+)JS_4";
+const char kAppJs_5[] = R"JS_5(      elDiagClassesContainer.innerHTML = '<div class="empty-message">No failure categories currently reported.</div>';
       return;
     }
 
@@ -2964,8 +3347,7 @@ const char kAppJs_2[] = R"JS_2(    if (filtered.length === 0) {
   function renderDiagnosedCards() {
     const q = state.diagSearch.toLowerCase().trim();
     const failedJobs = state.jobs.filter(j => {
-)JS_2";
-const char kAppJs_3[] = R"JS_3(      const s = (j.state || '').toLowerCase();
+      const s = (j.state || '').toLowerCase();
       return s === 'failed' || s === 'timed_out' || s === 'idle_timed_out' || s === 'startup_timed_out';
     });
 
@@ -3264,7 +3646,8 @@ const char kAppJs_3[] = R"JS_3(      const s = (j.state || '').toLowerCase();
   });
 
   elBtnProcResetIds.addEventListener('click', () => {
-    if (confirm('Reset process IDs? (Only applies when no processes are active)')) {
+)JS_5";
+const char kAppJs_6[] = R"JS_6(    if (confirm('Reset process IDs? (Only applies when no processes are active)')) {
       sendWsRequest({ action: 'reset_ids' });
       setTimeout(() => sendWsRequest({ action: 'list' }), 200);
     }
@@ -3292,6 +3675,17 @@ const char kAppJs_3[] = R"JS_3(      const s = (j.state || '').toLowerCase();
     renderTaskQueueTable();
   });
 
+  if (elTqViewModePills) {
+    elTqViewModePills.addEventListener('click', (e) => {
+      const pill = e.target.closest('.pill');
+      if (!pill) return;
+      state.tqViewMode = pill.getAttribute('data-view') || 'jobs';
+      elTqViewModePills.querySelectorAll('.pill').forEach(p => p.classList.remove('active'));
+      pill.classList.add('active');
+      renderTaskQueueTable();
+    });
+  }
+
   elTqFilterPills.addEventListener('click', (e) => {
     const pill = e.target.closest('.pill');
     if (!pill) return;
@@ -3308,8 +3702,7 @@ const char kAppJs_3[] = R"JS_3(      const s = (j.state || '').toLowerCase();
       if (!st) return;
       state.tqFilter = st;
       elTqFilterPills.querySelectorAll('.pill').forEach(p => {
-)JS_3";
-const char kAppJs_4[] = R"JS_4(        if (p.getAttribute('data-filter') === st) p.classList.add('active');
+        if (p.getAttribute('data-filter') === st) p.classList.add('active');
         else p.classList.remove('active');
       });
       renderTaskQueueTable();
@@ -3447,9 +3840,9 @@ const char kAppJs_4[] = R"JS_4(        if (p.getAttribute('data-filter') === st)
   setupAutoRefresh();
   connectWs();
 })();
-)JS_4";
+)JS_6";
 static const std::string& GetAppJs() {
-    static const std::string s = std::string(kAppJs_0) + kAppJs_1 + kAppJs_1a + kAppJs_1c + kAppJs_1b + kAppJs_2 + kAppJs_3 + kAppJs_4;
+    static const std::string s = std::string(kAppJs_0) + kAppJs_1 + kAppJs_2 + kAppJs_3 + kAppJs_4 + kAppJs_5 + kAppJs_6;
     return s;
 }
 

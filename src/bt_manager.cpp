@@ -286,6 +286,14 @@ std::string BtManager::LookupQueueNameForBtLocked(const std::string& btId) const
     return "bt-" + btId;
 }
 
+std::string BtManager::LookupTaskIdForBtLocked(const std::string& btId) const {
+    auto it = trees_.find(btId);
+    if (it != trees_.end() && it->second && it->second->tree) {
+        return it->second->tree->TaskId();
+    }
+    return "";
+}
+
 std::string BtManager::UniqueJobId(const std::string& proposedId) const {
     TaskQueueJob existing;
     if (!tqm_.GetJobSnapshot(proposedId, existing)) return proposedId;
@@ -314,6 +322,8 @@ std::string BtManager::StartJob(const BtJobSpec& spec) {
         spec.resources,
         spec.success,
         spec.idle);
+    const std::string taskId = LookupTaskIdForBtLocked(spec.btId);
+    if (!taskId.empty()) jobJson["task_id"] = taskId;
 
     TaskQueueBtRef ref;
     ref.id = spec.btId;
@@ -384,6 +394,8 @@ std::string BtManager::StartWorker(const BtWorkerSpec& spec) {
         spec.resources,
         spec.success,
         spec.idle);
+    const std::string taskId = LookupTaskIdForBtLocked(spec.btId);
+    if (!taskId.empty()) jobJson["task_id"] = taskId;
 
     TaskQueueBtRef ref;
     ref.id = spec.btId;
@@ -458,6 +470,15 @@ void BtManager::PersistEntryLocked(TreeEntry& entry) {
                 ej["value"] = ev.varValue;
             }
             ej["timestamp"] = FormatEpochMsIso(ev.timestampMs);
+
+            // Task log (100-2b): a BT that belongs to a task records its start and end there.
+            // TaskLog does nothing when the task has no record.
+            if (!entry.tree->TaskId().empty() &&
+                (ev.type == "btStarted" || ev.type == "btSucceeded" ||
+                 ev.type == "btFailed" || ev.type == "btCancelled")) {
+                tqm_.TaskLog(entry.tree->TaskId(), ev.type == "btStarted" ? "bt_started" : "bt_finished",
+                             "", entry.tree->Id(), ev.state, "");
+            }
 
             std::string line = ej.dump();
             AppendToLogFileWide(evFileW, line + "\r\n");

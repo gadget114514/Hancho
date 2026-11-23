@@ -1,4 +1,5 @@
 #include "../src/taskqueue.h"
+#include "../src/task_lineage_view.h"
 #include "../src/chain_guard.h"
 #include "../src/common.h"
 #include "../src/llm_stream.h"
@@ -1112,9 +1113,9 @@ int main() {
 
         auto listIds = [&](const std::string& filter) {
             std::string resp = tqm.TaskQueueList("originq", "", 0, err, filter);
-            int n = 0;
-            for (size_t p = resp.find("{\"id\":"); p != std::string::npos; p = resp.find("{\"id\":", p + 1)) ++n;
-            return n;
+            auto j = nlohmann::json::parse(resp, nullptr, false);
+            if (!j.is_object() || !j.contains("jobs") || !j["jobs"].is_array()) return -1;
+            return static_cast<int>(j["jobs"].size());
         };
         Check(listIds("121bb3dd") == 1, "origin filter matches session prefix");
         Check(listIds("local_9f76") == 1, "origin filter matches host session");
@@ -2145,6 +2146,52 @@ int main() {
         std::string escapedXml = TaskQueueRunJUnitXml("q", {amp});
         Check(escapedXml.find("a&amp;b&lt;c&gt;") != std::string::npos,
               "JUnit XML escapes the job id");
+
+        // 100-6: superseded jobs are excluded by default; --count-superseded includes them.
+        auto parsedSup = TaskQueueRunJobFromJson(nlohmann::json::parse(
+            R"({"id":"A","state":"failed","superseded_by":"A2"})", nullptr, false));
+        Check(parsedSup.supersededBy == "A2",
+              "100-6: TaskQueueRunJobFromJson reads superseded_by");
+
+        TaskQueueRunJob supFailed;
+        supFailed.id = "A";
+        supFailed.state = "failed";
+        supFailed.supersededBy = "A2";
+        TaskQueueRunJob supSucceeded;
+        supSucceeded.id = "A2";
+        supSucceeded.state = "succeeded";
+        const std::vector<TaskQueueRunJob> lineageOk = {supFailed, supSucceeded};
+        Check(TaskQueueRunDrained(lineageOk), "100-6: A failed (superseded) + A2 succeeded is drained");
+        Check(TaskQueueRunExitCode(lineageOk) == 0,
+              "100-6: A failed -> A2 succeeded exits 0 by default");
+        Check(TaskQueueRunExitCode(lineageOk, true) == 1,
+              "100-6: A failed -> A2 succeeded exits 1 with countSuperseded=true");
+
+        const std::string lineageXmlDefault = TaskQueueRunJUnitXml("q", lineageOk);
+        Check(lineageXmlDefault.find("tests=\"1\"") != std::string::npos &&
+                  lineageXmlDefault.find("failures=\"0\"") != std::string::npos &&
+                  lineageXmlDefault.find("name=\"A2\"") != std::string::npos &&
+                  lineageXmlDefault.find("name=\"A\"") == std::string::npos,
+              "100-6: JUnit excludes superseded job A by default: " + lineageXmlDefault);
+
+        const std::string lineageXmlAll = TaskQueueRunJUnitXml("q", lineageOk, true);
+        Check(lineageXmlAll.find("tests=\"2\"") != std::string::npos &&
+                  lineageXmlAll.find("failures=\"1\"") != std::string::npos &&
+                  lineageXmlAll.find("name=\"A\"") != std::string::npos &&
+                  lineageXmlAll.find("name=\"A2\"") != std::string::npos,
+              "100-6: JUnit includes superseded job A with countSuperseded=true: " + lineageXmlAll);
+
+        TaskQueueRunJob supCancelled;
+        supCancelled.id = "C";
+        supCancelled.state = "cancelled";
+        supCancelled.supersededBy = "C2";
+        TaskQueueRunJob supCancelledOk;
+        supCancelledOk.id = "C2";
+        supCancelledOk.state = "succeeded";
+        Check(TaskQueueRunExitCode({supCancelled, supCancelledOk}) == 0,
+              "100-6: cancelled job superseded by succeeded exits 0 by default");
+        Check(TaskQueueRunExitCode({supCancelled, supCancelledOk}, true) == 2,
+              "100-6: cancelled job superseded by succeeded exits 2 with countSuperseded=true");
     }
 
     {
@@ -2454,8 +2501,8 @@ int main() {
         CreateDirectoryW(powerDir.c_str(), nullptr);
         SetDataDirectoryOverride(powerDir);
 
-        ProcessManager powerPm;
         TaskQueueManager powerTqm;
+        ProcessManager powerPm;
         powerTqm.SetProcessManager(&powerPm);
         powerPm.SetProcessFinishedCallback([&powerTqm](int pid, int ec, const std::string& kind) {
             powerTqm.OnProcessFinished(pid, ec, kind);
@@ -2514,14 +2561,16 @@ int main() {
         Check(!JsonGetBool(shutStatus, "armed", true), "power: shutdown flag cleared");
 
         powerTqm.SetSuspendCallback(nullptr);
+        powerPm.SetProcessFinishedCallback(nullptr);
         powerTqm.ShutdownTaskQueueManager();
+        powerTqm.SetProcessManager(nullptr);
         SetDataDirectoryOverride(dir);
     }
 
     // --- 090-2 Hang Detection tests ------------------------------------------
     {
-        ProcessManager hangPm;
         TaskQueueManager hangTqm;
+        ProcessManager hangPm;
         hangTqm.SetProcessManager(&hangPm);
         hangPm.SetProcessFinishedCallback([&hangTqm](int pid, int ec, const std::string& kind) {
             hangTqm.OnProcessFinished(pid, ec, kind);
@@ -2633,13 +2682,15 @@ int main() {
             }
         }
 
+        hangPm.SetProcessFinishedCallback(nullptr);
         hangTqm.ShutdownTaskQueueManager();
+        hangTqm.SetProcessManager(nullptr);
     }
 
     // 090-3: takeover / complete with recorded decision and dependent propagation.
     {
-        ProcessManager toPm;
         TaskQueueManager toTqm;
+        ProcessManager toPm;
         toTqm.SetProcessManager(&toPm);
         toPm.SetProcessFinishedCallback([&toTqm](int pid, int ec, const std::string& kind) {
             toTqm.OnProcessFinished(pid, ec, kind);
@@ -2723,7 +2774,9 @@ int main() {
 
         TaskQueueCounts counts = toTqm.GetJobCounts();
         Check(counts.takenOver >= 2, "counts include takenOver jobs");
+        toPm.SetProcessFinishedCallback(nullptr);
         toTqm.ShutdownTaskQueueManager();
+        toTqm.SetProcessManager(nullptr);
     }
 
     // ------------------------------------------------------------------
@@ -2812,8 +2865,8 @@ int main() {
         Check(hasEngineDown, "0916: engine_down added to nextSteps");
 
         // (1/2) held job does not start; a different engine is unaffected.
-        ProcessManager ehPm;
         TaskQueueManager ehTqm;
+        ProcessManager ehPm;
         ehTqm.SetProcessManager(&ehPm);
         ehPm.SetProcessFinishedCallback([&ehTqm](int pid, int ec, const std::string& kind) {
             ehTqm.OnProcessFinished(pid, ec, kind);
@@ -2890,8 +2943,805 @@ int main() {
         Check(JsonGetBool(addPlain, "ok", false), "0916: plain job added: " + errAdd + " " + addPlain);
         Check(WaitForState(ehTqm, "EH-PLAIN", "succeeded", 8000),
               "0916: plain job without engine/model is unaffected");
+        ehPm.SetProcessFinishedCallback(nullptr);
         ehTqm.ShutdownTaskQueueManager();
+        ehTqm.SetProcessManager(nullptr);
         SetDataDirectoryOverride(dir);
+    }
+
+    // Task lineage data layer (100-1): `supersedes` links a redo to the failed job it replaces.
+    {
+        const std::string lineageState =
+            "{\"name\":\"lineageq\",\"concurrency\":1,\"paused\":false,\"version\":1,"
+            "\"notify_file\":\"\",\"max_timeout_sec\":7200,\"default_max_attempts\":1,\"jobs\":["
+            "{\"id\":\"LA\",\"taskqueue\":\"lineageq\",\"summary\":\"a\",\"command\":\"cmd /c exit 1\","
+            "\"timeout_sec\":30,\"max_attempts\":1,\"state\":\"failed\"},"
+            "{\"id\":\"LS\",\"taskqueue\":\"lineageq\",\"summary\":\"s\",\"command\":\"cmd /c exit 0\","
+            "\"timeout_sec\":30,\"max_attempts\":1,\"state\":\"succeeded\"},"
+            "{\"id\":\"LP\",\"taskqueue\":\"lineageq\",\"summary\":\"p\",\"command\":\"cmd /c exit 0\","
+            "\"timeout_sec\":30,\"max_attempts\":1,\"state\":\"pending\",\"paused\":true},"
+            "{\"id\":\"LBT\",\"taskqueue\":\"lineageq\",\"summary\":\"bt\",\"command\":\"cmd /c exit 1\","
+            "\"timeout_sec\":30,\"max_attempts\":1,\"state\":\"failed\",\"bt\":{\"id\":\"btx\",\"node\":\"n\",\"run\":1}}"
+            "]}";
+        WriteFileAtomicWide(TaskQueueManager::GetTaskQueueFileWide("lineageq"), lineageState);
+        std::string errL;
+        TaskQueueManager lq;
+        ProcessManager lqPm;
+        lq.SetProcessManager(&lqPm);
+        lqPm.SetProcessFinishedCallback([&lq](int pid, int ec, const std::string& kind) {
+            lq.OnProcessFinished(pid, ec, kind);
+        });
+        auto addRaw = [&](TaskQueueManager& target, const std::string& jobs) {
+            std::string e;
+            return target.TaskQueueAdd("lineageq", jobs, 1, "", e);
+        };
+
+        // Without `supersedes` the three lineage keys stay out of the output.
+        const std::string addPlain = addRaw(lq,
+            R"J([{"id":"LN","summary":"n","command":"cmd /c exit 1","timeout_sec":30,"max_attempts":1}])J");
+        Check(JsonGetBool(addPlain, "ok", false) && addPlain.find("\"lineage\"") == std::string::npos,
+              "100-1: plain add has no lineage in its response");
+        const nlohmann::json plainJob = ParseJobJson(lq.TaskQueueGet("LN", false, 0, errL));
+        Check(plainJob.is_object() && !plainJob.contains("supersedes") && !plainJob.contains("task_id") &&
+                  !plainJob.contains("superseded_by"),
+              "100-1: plain job JSON has no lineage keys");
+
+        // A camelCase `supersedes` redoes the failed job LA. task_id / superseded_by are ignored.
+        const std::string addRedo = addRaw(lq,
+            R"J([{"id":"LB","summary":"redo a","command":"cmd /c exit 1","timeout_sec":30,"max_attempts":1,)J"
+            R"J("supersedes":"LA","task_id":"ZZ","superseded_by":"ZZ"}])J");
+        Check(JsonGetBool(addRedo, "ok", false), "100-1: redo add accepted: " + addRedo);
+        const nlohmann::json redoResp = nlohmann::json::parse(addRedo, nullptr, false);
+        Check(redoResp.is_object() && redoResp.contains("lineage") && redoResp["lineage"].size() == 1 &&
+                  redoResp["lineage"][0].value("id", "") == "LB" &&
+                  redoResp["lineage"][0].value("supersedes", "") == "LA" &&
+                  redoResp["lineage"][0].value("task_id", "") == "LA",
+              "100-1: add response reports the lineage link");
+        Check(WaitForState(lq, "LB", "failed", 8000), "100-1: redo job LB finishes");
+        const nlohmann::json laJob = ParseJobJson(lq.TaskQueueGet("LA", false, 0, errL));
+        const nlohmann::json lbJob = ParseJobJson(lq.TaskQueueGet("LB", false, 0, errL));
+        Check(lbJob.value("supersedes", "") == "LA" && lbJob.value("task_id", "") == "LA" &&
+                  !lbJob.contains("superseded_by"),
+              "100-1: LB records supersedes LA and task_id LA, ignoring caller task_id/superseded_by");
+        Check(laJob.value("superseded_by", "") == "LB" && !laJob.contains("supersedes"),
+              "100-1: LA records superseded_by LB");
+
+        // The lineage survives a save and reload.
+        lqPm.SetProcessFinishedCallback(nullptr);
+        lq.ShutdownTaskQueueManager();
+        lq.SetProcessManager(nullptr);
+        TaskQueueManager reloadedL;
+        ProcessManager reloadedPm;
+        reloadedL.SetProcessManager(&reloadedPm);
+        reloadedPm.SetProcessFinishedCallback([&reloadedL](int pid, int ec, const std::string& kind) {
+            reloadedL.OnProcessFinished(pid, ec, kind);
+        });
+        const nlohmann::json laReloaded = ParseJobJson(reloadedL.TaskQueueGet("LA", false, 0, errL));
+        const nlohmann::json lbReloaded = ParseJobJson(reloadedL.TaskQueueGet("LB", false, 0, errL));
+        Check(laReloaded.value("superseded_by", "") == "LB" &&
+                  lbReloaded.value("supersedes", "") == "LA" && lbReloaded.value("task_id", "") == "LA",
+              "100-1: lineage survives save and reload");
+
+        // Superseding the older LA takes over the newest job LB: the chain stays one line.
+        const std::string addChain = addRaw(reloadedL,
+            R"J([{"id":"LC","summary":"redo again","command":"cmd /c exit 1","timeout_sec":30,"max_attempts":1,"supersedes":"LA"}])J");
+        Check(JsonGetBool(addChain, "ok", false), "100-1: chained redo accepted: " + addChain);
+        const nlohmann::json chainResp = nlohmann::json::parse(addChain, nullptr, false);
+        Check(chainResp.is_object() && chainResp.contains("lineage") &&
+                  chainResp["lineage"][0].value("supersedes", "") == "LB" &&
+                  chainResp["lineage"][0].value("task_id", "") == "LA",
+              "100-1: stale target is rewritten to the newest job of the lineage");
+        Check(WaitForState(reloadedL, "LC", "failed", 8000), "100-1: chained job LC finishes");
+        const nlohmann::json lbChained = ParseJobJson(reloadedL.TaskQueueGet("LB", false, 0, errL));
+        const nlohmann::json lcChained = ParseJobJson(reloadedL.TaskQueueGet("LC", false, 0, errL));
+        Check(lbChained.value("superseded_by", "") == "LC" && lcChained.value("supersedes", "") == "LB" &&
+                  lcChained.value("task_id", "") == "LA",
+              "100-1: LB.superseded_by == LC, LC.supersedes == LB, task_id stays LA");
+
+        // Invalid links are rejected, and nothing is added.
+        const char* errorCases[][2] = {
+            {R"J([{"id":"LE1","summary":"e","command":"cmd /c exit 1","timeout_sec":30,"max_attempts":1,"supersedes":"LS"}])J",
+             "can only supersede"},
+            {R"J([{"id":"LE1","summary":"e","command":"cmd /c exit 1","timeout_sec":30,"max_attempts":1,"supersedes":"LP"}])J",
+             "can only supersede"},
+            {R"J([{"id":"LE1","summary":"e","command":"cmd /c exit 1","timeout_sec":30,"max_attempts":1,"supersedes":"NOPE"}])J",
+             "unknown supersedes job"},
+            {R"J([{"id":"LE1","summary":"e","command":"cmd /c exit 1","timeout_sec":30,"max_attempts":1,"supersedes":"LBT"}])J",
+             "use bt_retry"},
+            {R"J([{"id":"LE1","summary":"e","command":"cmd /c exit 1","timeout_sec":30,"max_attempts":1},)J"
+             R"J({"id":"LE2","summary":"e","command":"cmd /c exit 1","timeout_sec":30,"max_attempts":1,"supersedes":"LE1"}])J",
+             "must name an existing job"},
+            {R"J([{"id":"LE1","summary":"e","command":"cmd /c exit 1","timeout_sec":30,"max_attempts":1,"supersedes":"LC"},)J"
+             R"J({"id":"LE2","summary":"e","command":"cmd /c exit 1","timeout_sec":30,"max_attempts":1,"supersedes":"LC"}])J",
+             "already superseded"},
+        };
+        for (const auto& errCase : errorCases) {
+            const std::string resp = addRaw(reloadedL, errCase[0]);
+            Check(!JsonGetBool(resp, "ok", true) && resp.find(errCase[1]) != std::string::npos,
+                  std::string("100-1: rejected with '") + errCase[1] + "': " + resp);
+        }
+        Check(GetState(reloadedL, "LE1").empty() && GetState(reloadedL, "LE2").empty(),
+              "100-1: rejected links add no jobs");
+        Check(ParseJobJson(reloadedL.TaskQueueGet("LA", false, 0, errL)).value("superseded_by", "") == "LB",
+              "100-1: rejected links do not change the lineage");
+
+        // The redo reason (100-1 5b): kept on the job, reported in the response, survives a reload.
+        const std::string addReason = addRaw(reloadedL,
+            R"J([{"id":"LD","summary":"redo with reason","command":"cmd /c exit 1","timeout_sec":30,"max_attempts":1,"supersedes":"LC","supersede_reason":"the path was wrong"}])J");
+        Check(JsonGetBool(addReason, "ok", false), "100-1: redo with reason accepted: " + addReason);
+        const nlohmann::json reasonResp = nlohmann::json::parse(addReason, nullptr, false);
+        Check(reasonResp.is_object() && reasonResp.contains("lineage") &&
+                  reasonResp["lineage"][0].value("reason", "") == "the path was wrong" &&
+                  reasonResp.contains("warnings") && reasonResp["warnings"].empty(),
+              "100-1: lineage response carries the reason and no warning");
+        Check(WaitForState(reloadedL, "LD", "failed", 8000), "100-1: reason job LD finishes");
+        reloadedPm.SetProcessFinishedCallback(nullptr);
+        reloadedL.ShutdownTaskQueueManager();
+        reloadedL.SetProcessManager(nullptr);
+        TaskQueueManager finalL;
+        ProcessManager finalPm;
+        finalL.SetProcessManager(&finalPm);
+        finalPm.SetProcessFinishedCallback([&finalL](int pid, int ec, const std::string& kind) {
+            finalL.OnProcessFinished(pid, ec, kind);
+        });
+        Check(ParseJobJson(finalL.TaskQueueGet("LD", false, 0, errL)).value("supersede_reason", "") ==
+                  "the path was wrong",
+              "100-1: supersede_reason survives save and reload");
+
+        // Redoing LD without a reason still succeeds, with a warning.
+        const std::string addNoReason = addRaw(finalL,
+            R"J([{"id":"LE3","summary":"redo no reason","command":"cmd /c exit 1","timeout_sec":30,"max_attempts":1,"supersedes":"LD"}])J");
+        Check(JsonGetBool(addNoReason, "ok", false), "100-1: redo without reason still accepted: " + addNoReason);
+        const nlohmann::json noReasonResp = nlohmann::json::parse(addNoReason, nullptr, false);
+        bool sawNoReasonWarning = false;
+        if (noReasonResp.is_object() && noReasonResp.contains("warnings")) {
+            for (const auto& w : noReasonResp["warnings"]) {
+                if (w.value("job", "") == "LE3" && w.value("warning", "") == "supersede_without_reason")
+                    sawNoReasonWarning = true;
+            }
+        }
+        Check(sawNoReasonWarning, "100-1: missing reason gives a supersede_without_reason warning");
+
+        // A reason without `supersedes` is dropped silently, even when it is longer than the limit.
+        const std::string addDropped = addRaw(finalL,
+            R"J([{"id":"LF","summary":"f","command":"cmd /c exit 1","timeout_sec":30,"max_attempts":1,"supersede_reason":")J" +
+            std::string(2001, 'x') + R"J("}])J");
+        Check(JsonGetBool(addDropped, "ok", false) && addDropped.find("\"lineage\"") == std::string::npos,
+              "100-1: reason without supersedes is dropped, not an error");
+        Check(!ParseJobJson(finalL.TaskQueueGet("LF", false, 0, errL)).contains("supersede_reason"),
+              "100-1: dropped reason is not stored");
+
+        // A reason over 2000 bytes on a redo is rejected, and nothing is added.
+        const std::string addLong = addRaw(finalL,
+            R"J([{"id":"LG","summary":"g","command":"cmd /c exit 1","timeout_sec":30,"max_attempts":1,"supersedes":"LD","supersede_reason":")J" +
+            std::string(2001, 'x') + R"J("}])J");
+        Check(!JsonGetBool(addLong, "ok", true) && addLong.find("supersede_reason exceeds 2000 bytes") != std::string::npos,
+              "100-1: reason over 2000 bytes is rejected");
+        Check(GetState(finalL, "LG").empty(), "100-1: rejected long reason adds no job");
+        finalPm.SetProcessFinishedCallback(nullptr);
+        finalL.ShutdownTaskQueueManager();
+        finalL.SetProcessManager(nullptr);
+    }
+
+    // Task records (card 100-2a): a task is a Hancho record with its own id, state and log.
+    {
+        const std::string ts = std::to_string(GetNowEpochSec());
+        const std::string tq = "taskq" + ts;
+        std::string e;
+        TaskQueueManager tm;
+        ProcessManager tPm;
+        tm.SetProcessManager(&tPm);
+        tPm.SetProcessFinishedCallback([&tm](int pid, int ec, const std::string& kind) {
+            tm.OnProcessFinished(pid, ec, kind);
+        });
+        auto parse = [](const std::string& s) { return nlohmann::json::parse(s, nullptr, false); };
+        auto jobJson = [](const std::string& id, const std::string& command, const std::string& extra) {
+            return "[{\"id\":\"" + id + "\",\"summary\":\"s\",\"command\":\"" + command +
+                   "\",\"timeout_sec\":30,\"max_attempts\":1" + extra + "}]";
+        };
+        auto addTask = [&](const std::string& jobs, const std::string& task) {
+            std::string err;
+            return tm.TaskQueueAdd(tq, jobs, 1, "", err, "", task);
+        };
+
+        // Create: automatic and explicit ids, and the id and size checks.
+        const nlohmann::json autoT = parse(tm.TaskCreate("first", "intent", "", "", e));
+        Check(autoT.value("ok", false) && autoT.value("id", std::string()).rfind("task_", 0) == 0,
+              "100-2a: task create picks an automatic task_ id");
+        const std::string tA = "task_a" + ts;
+        const std::string tB = "task_b" + ts;
+        const std::string tC = "task_c" + ts;
+        Check(parse(tm.TaskCreate("A", "", tA, "", e)).value("ok", false), "100-2a: task create with --id");
+        Check(!parse(tm.TaskCreate("A again", "", tA, "", e)).value("ok", true), "100-2a: duplicate task id is rejected");
+        Check(parse(tm.TaskCreate("B", "", tB, "", e)).value("ok", false), "100-2a: second task created");
+        Check(parse(tm.TaskCreate("C", "", tC, "", e)).value("ok", false), "100-2a: third task created");
+        Check(!parse(tm.TaskCreate("bad", "", "nope", "", e)).value("ok", true), "100-2a: task id must start with task_");
+        Check(!parse(tm.TaskCreate("bad", "", "task_a b", "", e)).value("ok", true), "100-2a: task id rejects spaces");
+        Check(!parse(tm.TaskCreate("bad", "", "task_" + std::string(60, 'x'), "", e)).value("ok", true),
+              "100-2a: task id over 64 characters is rejected");
+        Check(!parse(tm.TaskCreate(std::string(201, 'x'), "", "", "", e)).value("ok", true),
+              "100-2a: title over 200 bytes is rejected");
+        Check(!parse(tm.TaskCreate("big", std::string(16 * 1024 + 1, 'x'), "", "", e)).value("ok", true),
+              "100-2a: intent over 16 KB is rejected");
+        Check(tm.TaskState(tA).value("state", std::string()) == "open", "100-2a: a task with no jobs is open");
+
+        // add --task: a failing job, then a redo that succeeds. The lineage decides the task state.
+        const std::string j1 = "TK1_" + ts;
+        const std::string j2 = "TK2_" + ts;
+        Check(parse(addTask(jobJson(j1, "cmd /c exit 1", ""), tA)).value("ok", false), "100-2a: add --task to an open task");
+        Check(WaitForState(tm, j1, "failed", 8000), "100-2a: first job of task A fails");
+        Check(tm.TaskState(tA).value("state", std::string()) == "failed", "100-2a: a task whose latest job failed is failed");
+        Check(parse(addTask(jobJson(j2, "cmd /c exit 0", ",\"supersedes\":\"" + j1 + "\",\"supersede_reason\":\"retry\""), tA))
+                  .value("ok", false),
+              "100-2a: redo joins task A");
+        Check(WaitForState(tm, j2, "succeeded", 8000), "100-2a: redo in task A succeeds");
+        Check(tm.TaskState(tA).value("state", std::string()) == "succeeded",
+              "100-2a: the newest job of the lineage decides: succeeded");
+
+        // A redo may not cross tasks: j4 belongs to C, and a redo of it under A is rejected.
+        const std::string j4 = "TK4_" + ts;
+        Check(parse(addTask(jobJson(j4, "cmd /c exit 1", ""), tC)).value("ok", false), "100-2a: job for task C added");
+        Check(WaitForState(tm, j4, "failed", 8000), "100-2a: job of task C fails");
+        const nlohmann::json cross = parse(addTask(jobJson("TK3_" + ts, "cmd /c exit 0",
+                                                           ",\"supersedes\":\"" + j4 + "\""), tA));
+        Check(!cross.value("ok", true) && cross.value("error", std::string()).find("belongs to task") != std::string::npos,
+              "100-2a: supersedes a job of another task is rejected");
+
+        // Closed, hidden, reserved and missing tasks take no job.
+        Check(parse(tm.TaskClose(tB, "failed", "gave up", e)).value("ok", false), "100-2a: task B closed");
+        Check(tm.TaskState(tB).value("state", std::string()) == "closed" &&
+                  tm.TaskState(tB).value("result", std::string()) == "failed",
+              "100-2a: a closed task reports its result");
+        Check(!parse(addTask(jobJson("TK5_" + ts, "cmd /c exit 0", ""), tB)).value("ok", true),
+              "100-2a: a closed task takes no new job");
+        Check(!parse(tm.TaskClose(tB, "failed", "again", e)).value("ok", true), "100-2a: a closed task cannot close again");
+        Check(parse(tm.TaskReopen(tB, "more work", e)).value("ok", false) && tm.TaskState(tB).value("state", std::string()) == "open",
+              "100-2a: reopen returns the task to its computed state");
+        Check(!parse(addTask(jobJson("TK6_" + ts, "cmd /c exit 0", ",\"hidden\":true"), tA)).value("ok", true),
+              "100-2a: a hidden job cannot join a task");
+        Check(!parse(addTask(jobJson("task_x" + ts, "cmd /c exit 0", ""), "")).value("ok", true),
+              "100-2a: a job id starting with task_ is reserved");
+        Check(!parse(addTask(jobJson("TK7_" + ts, "cmd /c exit 0", ""), "task_missing" + ts)).value("ok", true),
+              "100-2a: a missing task takes no job");
+
+        // Close A: the result is recorded, and a reopen goes back to the computed state.
+        Check(parse(tm.TaskClose(tA, "succeeded", "all done", e)).value("ok", false), "100-2a: task A closed");
+        Check(tm.TaskState(tA).value("state", std::string()) == "closed" &&
+                  tm.TaskState(tA).value("result", std::string()) == "succeeded",
+              "100-2a: closed task A reports succeeded");
+        Check(parse(tm.TaskReopen(tA, "found more", e)).value("ok", false) &&
+                  tm.TaskState(tA).value("state", std::string()) == "succeeded",
+              "100-2a: reopened task A is succeeded again");
+
+        // Removing the newest job keeps the state: the removed job stays on the task record.
+        Check(parse(tm.TaskQueueRemove(j2, false, e)).value("ok", false), "100-2a: newest job removed");
+        Check(tm.TaskState(tA).value("state", std::string()) == "succeeded",
+              "100-2a: state survives removal of the newest job");
+        const nlohmann::json shownA = parse(tm.TaskShow(tA, 0, e));
+        Check(shownA.value("ok", false) && shownA["task"].value("removedJobs", nlohmann::json::array()).size() == 1,
+              "100-2a: removed job is recorded on the task");
+
+        // The log: the kinds written automatically, and the note from the supervisor.
+        Check(parse(tm.TaskNote(tA, "checked the redo", "sess-1", e)).value("ok", false), "100-2a: task note accepted");
+        const nlohmann::json logA = parse(tm.TaskShow(tA, 0, e));
+        std::vector<std::string> kinds;
+        for (const auto& entry : logA["log"]) kinds.push_back(entry.value("kind", std::string()));
+        auto hasKind = [&kinds](const std::string& k) {
+            return std::find(kinds.begin(), kinds.end(), k) != kinds.end();
+        };
+        Check(hasKind("created") && hasKind("job_added") && hasKind("superseded") && hasKind("note") &&
+                  hasKind("closed") && hasKind("reopened"),
+              "100-2a: log holds created, job_added, superseded, note, closed and reopened");
+
+        // Save and reload: the state and the log come back.
+        tPm.SetProcessFinishedCallback(nullptr);
+        tm.ShutdownTaskQueueManager();
+        tm.SetProcessManager(nullptr);
+        TaskQueueManager reloaded;
+        ProcessManager reloadPm;
+        reloaded.SetProcessManager(&reloadPm);
+        reloadPm.SetProcessFinishedCallback([&reloaded](int pid, int ec, const std::string& kind) {
+            reloaded.OnProcessFinished(pid, ec, kind);
+        });
+        Check(reloaded.TaskState(tA).value("state", std::string()) == "succeeded" &&
+                  parse(reloaded.TaskShow(tA, 0, e))["log"].size() == logA["log"].size(),
+              "100-2a: task state and log survive save and reload");
+
+        // Purge: only closed tasks older than the limit go.
+        Check(parse(reloaded.TaskClose(tB, "failed", "old", e)).value("ok", false), "100-2a: task B closed for purge");
+        Sleep(2100);
+        Check(parse(reloaded.TaskPurgeOlderThan(1, e)).value("purged", 0) >= 1 &&
+                  !parse(reloaded.TaskShow(tB, 0, e)).value("ok", true),
+              "100-2a: purge removes an old closed task");
+        Check(parse(reloaded.TaskShow(tA, 0, e)).value("ok", false), "100-2a: purge keeps an open task");
+        reloadPm.SetProcessFinishedCallback(nullptr);
+        reloaded.ShutdownTaskQueueManager();
+        reloaded.SetProcessManager(nullptr);
+    }
+
+    {
+        // 100-2b: a BT job of a task carries task_id; events carry it; the task log takes BT entries;
+        // external taskqueue_add ignores a task_id in the job JSON; a hidden job cannot join a task.
+        const std::string ts2 = std::to_string(GetCurrentProcessId());
+        TaskQueueManager bm;
+        ProcessManager bPm;
+        bm.SetProcessManager(&bPm);
+        bPm.SetProcessFinishedCallback([&bm](int pid, int ec, const std::string& kind) {
+            bm.OnProcessFinished(pid, ec, kind);
+        });
+        std::string bErr;
+        const std::string taskB = "task_bt" + ts2;
+        Check(JsonGetBool(bm.TaskCreate("bt task", "", taskB, "", bErr), "ok", false),
+              "100-2b: task for a BT created: " + bErr);
+
+        TaskQueueBtRef btRef;
+        btRef.id = "bt-task-" + ts2;
+        btRef.node = "n1";
+        btRef.run = 1;
+        const std::string btJobId = "BTT1-" + ts2;
+        const std::string btQueue = "btq-task-" + ts2;
+        const std::string btJob = "{\"id\":\"" + btJobId + "\",\"command\":\"cmd /c exit 0\",\"summary\":\"bt task job\","
+                                  "\"timeoutSec\":30,\"task_id\":\"" + taskB + "\"}";
+        Check(JsonGetBool(bm.AddBtJob(btQueue, btJob, btRef, bErr), "ok", false),
+              "100-2b: BT job with task_id added: " + bErr);
+        Check(bm.TaskQueueGet(btJobId, false, 0, bErr).find("\"task_id\":\"" + taskB + "\"") != std::string::npos,
+              "100-2b: the BT job belongs to the task");
+        Check(WaitForState(bm, btJobId, "succeeded", 8000), "100-2b: BT job of the task succeeds");
+        const std::string btEvents = ReadFileUtf8Wide(TaskQueueManager::GetTaskEventsFileWide(btQueue));
+        Check(btEvents.find("\"task_id\":\"" + taskB + "\"") != std::string::npos,
+              "100-2b: job events carry task_id");
+
+        // The BT entries of the task log: written by TaskLog for a task with a record only.
+        bm.TaskLog(taskB, "bt_started", "", btRef.id, "running", "");
+        bm.TaskLog(taskB, "bt_finished", "", btRef.id, "succeeded", "");
+        bm.TaskLog("task_nosuch" + ts2, "bt_started", "", btRef.id, "running", "");
+        const nlohmann::json shownB = nlohmann::json::parse(bm.TaskShow(taskB, 0, bErr), nullptr, false);
+        std::string btKinds;
+        for (const auto& entry : shownB["log"]) btKinds += entry.value("kind", std::string()) + " ";
+        Check(btKinds.find("bt_started") != std::string::npos && btKinds.find("bt_finished") != std::string::npos,
+              "100-2b: task log holds bt_started and bt_finished");
+        Check(!JsonGetBool(bm.TaskShow("task_nosuch" + ts2, 0, bErr), "ok", true),
+              "100-2b: TaskLog does not create a record");
+
+        // External add: task_id in the JSON is ignored (only the task argument links a job).
+        const std::string extJob = "[{\"id\":\"EXT-" + ts2 + "\",\"command\":\"cmd /c exit 0\",\"summary\":\"x\","
+                                   "\"timeout_sec\":30,\"max_attempts\":1,\"task_id\":\"" + taskB + "\"}]";
+        Check(JsonGetBool(bm.TaskQueueAdd("btq-ext-" + ts2, extJob, 1, "", bErr), "ok", false),
+              "100-2b: external job with a task_id JSON field added");
+        Check(bm.TaskQueueGet("EXT-" + ts2, false, 0, bErr).find(taskB) == std::string::npos,
+              "100-2b: external taskqueue_add ignores task_id");
+
+        // A hidden job cannot belong to a task.
+        const std::string hiddenJob = "{\"id\":\"HID-" + ts2 + "\",\"command\":\"cmd /c exit 0\",\"summary\":\"h\","
+                                      "\"timeoutSec\":30,\"hidden\":true,\"task_id\":\"" + taskB + "\"}";
+        TaskQueueBtRef hiddenRef = btRef;
+        hiddenRef.id = "bt-hidden-" + ts2;
+        Check(!JsonGetBool(bm.AddBtJob("btq-hid-" + ts2, hiddenJob, hiddenRef, bErr), "ok", true),
+              "100-2b: a hidden BT job with a task_id is rejected");
+
+        bPm.SetProcessFinishedCallback(nullptr);
+        bm.ShutdownTaskQueueManager();
+        bm.SetProcessManager(nullptr);
+    }
+
+    {
+        // 100-3: automatic task log entries for takeover, takeover_completed, cancel, and close.
+        auto parse = [](const std::string& raw) {
+            nlohmann::json j = nlohmann::json::parse(raw, nullptr, false);
+            return j.is_object() ? j : nlohmann::json::object();
+        };
+        auto countKind = [](const nlohmann::json& shown, const std::string& kind) {
+            int n = 0;
+            for (const auto& entry : shown.value("log", nlohmann::json::array())) {
+                if (entry.value("kind", std::string()) == kind) ++n;
+            }
+            return n;
+        };
+        const std::string ts3 = std::to_string(GetCurrentProcessId());
+        TaskQueueManager lm;
+        ProcessManager lPm;
+        lm.SetProcessManager(&lPm);
+        lPm.SetProcessFinishedCallback([&lm](int pid, int ec, const std::string& kind) {
+            lm.OnProcessFinished(pid, ec, kind);
+        });
+        std::string lErr;
+        const std::string taskL = "task_log1003_" + ts3;
+        const std::string qL = "lq-1003-" + ts3;
+        Check(parse(lm.TaskCreate("100-3 log test", "", taskL, "", lErr)).value("ok", false),
+              "100-3: task created");
+
+        const std::string jTake = "L1003-TAKE-" + ts3;
+        const std::string jCancel = "L1003-CAN-" + ts3;
+        const std::string jClose = "L1003-CLS-" + ts3;
+        const std::string jobsJson = "["
+            "{\"id\":\"" + jTake + "\",\"command\":\"cmd /c exit 1\",\"summary\":\"take\",\"timeout_sec\":30,\"max_attempts\":1},"
+            "{\"id\":\"" + jCancel + "\",\"command\":\"cmd /c exit 0\",\"summary\":\"cancel\",\"timeout_sec\":30,\"max_attempts\":1,\"depends_on\":[\"" + jTake + "\"]},"
+            "{\"id\":\"" + jClose + "\",\"command\":\"cmd /c exit 0\",\"summary\":\"close\",\"timeout_sec\":30,\"max_attempts\":1,\"depends_on\":[\"" + jTake + "\"]}"
+            "]";
+        Check(parse(lm.TaskQueueAdd(qL, jobsJson, 1, "", lErr, "", taskL)).value("ok", false),
+              "100-3: jobs added to task");
+        Check(WaitForState(lm, jTake, "failed", 8000), "100-3: takeover target job fails");
+
+        const nlohmann::json beforeTake = parse(lm.TaskShow(taskL, 0, lErr));
+        Check(countKind(beforeTake, "takeover") == 0 && countKind(beforeTake, "takeover_completed") == 0 &&
+                  countKind(beforeTake, "job_cancelled") == 0,
+              "100-3: no takeover/cancel log entries yet");
+
+        Check(parse(lm.TaskQueueCancel(jCancel, lErr)).value("ok", false), "100-3: job cancel succeeds");
+        const nlohmann::json afterCancel = parse(lm.TaskShow(taskL, 0, lErr));
+        Check(countKind(afterCancel, "job_cancelled") == 1,
+              "100-3: job cancel logs 1 job_cancelled entry");
+
+        Check(parse(lm.TaskQueueClose(jClose, lErr)).value("ok", false), "100-3: job close succeeds");
+        const nlohmann::json afterClose = parse(lm.TaskShow(taskL, 0, lErr));
+        Check(countKind(afterClose, "job_cancelled") == 2,
+              "100-3: job close logs 1 more job_cancelled entry");
+
+        Check(parse(lm.TaskQueueTakeover(jTake, "alice", "manual fix", lErr)).value("ok", false),
+              "100-3: takeover succeeds");
+        const nlohmann::json afterTake = parse(lm.TaskShow(taskL, 0, lErr));
+        Check(countKind(afterTake, "takeover") == 1 &&
+                  afterTake["log"].back().value("text", std::string()).find("alice") != std::string::npos &&
+                  afterTake["log"].back().value("text", std::string()).find("manual fix") != std::string::npos,
+              "100-3: takeover logs 1 takeover entry with by and reason");
+
+        Check(parse(lm.TaskQueueComplete(jTake, "done", "succeeded", "fixed by hand", lErr)).value("ok", false),
+              "100-3: takeover complete succeeds");
+        const nlohmann::json afterComplete = parse(lm.TaskShow(taskL, 0, lErr));
+        Check(countKind(afterComplete, "takeover_completed") == 1 &&
+                  afterComplete["log"].back().value("text", std::string()).find("succeeded") != std::string::npos &&
+                  afterComplete["log"].back().value("text", std::string()).find("fixed by hand") != std::string::npos,
+              "100-3: takeover complete logs 1 takeover_completed entry with result and reason");
+
+        lPm.SetProcessFinishedCallback(nullptr);
+        lm.ShutdownTaskQueueManager();
+        lm.SetProcessManager(nullptr);
+    }
+
+    {
+        // 100-4: dependency resolution across supersedes + task summary & task filter in TaskQueueList/Get.
+        auto parse = [](const std::string& raw) {
+            nlohmann::json j = nlohmann::json::parse(raw, nullptr, false);
+            return j.is_object() ? j : nlohmann::json::object();
+        };
+        const std::string ts4 = std::to_string(GetCurrentProcessId());
+        TaskQueueManager dm;
+        ProcessManager dPm;
+        dm.SetProcessManager(&dPm);
+        dPm.SetProcessFinishedCallback([&dm](int pid, int ec, const std::string& kind) {
+            dm.OnProcessFinished(pid, ec, kind);
+        });
+        std::string dErr;
+        const std::string taskNamed = "task_1004_" + ts4;
+        const std::string qD = "dq-1004-" + ts4;
+        Check(parse(dm.TaskCreate("100-4 named task", "test list & deps", taskNamed, "", dErr)).value("ok", false),
+              "100-4: named task created");
+
+        const std::string jA = "D1004-A-" + ts4;
+        const std::string jB = "D1004-B-" + ts4;
+        const std::string jA2 = "D1004-A2-" + ts4;
+        const std::string jImp = "D1004-IMP-" + ts4;
+
+        const std::string abJson = "["
+            "{\"id\":\"" + jA + "\",\"command\":\"cmd /c exit 1\",\"summary\":\"A fails\",\"timeout_sec\":30,\"max_attempts\":1},"
+            "{\"id\":\"" + jB + "\",\"command\":\"cmd /c exit 0\",\"summary\":\"B waits on A\",\"timeout_sec\":30,\"max_attempts\":1,\"depends_on\":[\"" + jA + "\"]}"
+            "]";
+        Check(parse(dm.TaskQueueAdd(qD, abJson, 1, "", dErr, "", taskNamed)).value("ok", false),
+              "100-4: A and B added to named task");
+        Check(WaitForState(dm, jA, "failed", 8000), "100-4: A fails");
+        Check(WaitForState(dm, jB, "blocked", 8000), "100-4: B becomes blocked after A fails");
+
+        // Add A2 superseding A; B should unblock and succeed once A2 succeeds.
+        const std::string a2Json = "["
+            "{\"id\":\"" + jA2 + "\",\"command\":\"cmd /c exit 0\",\"summary\":\"A2 succeeds\",\"timeout_sec\":30,\"max_attempts\":1,"
+            "\"supersedes\":\"" + jA + "\",\"supersede_reason\":\"fix A\"}"
+            "]";
+        Check(parse(dm.TaskQueueAdd(qD, a2Json, 1, "", dErr, "", taskNamed)).value("ok", false),
+              "100-4: A2 superseding A added");
+        Check(WaitForState(dm, jA2, "succeeded", 8000), "100-4: A2 succeeds");
+        Check(WaitForState(dm, jB, "succeeded", 8000), "100-4: B unblocks and succeeds after A2 succeeds");
+
+        // Add an implicit-task job (no task argument).
+        const std::string impJson = "[{\"id\":\"" + jImp + "\",\"command\":\"cmd /c exit 0\",\"summary\":\"implicit\",\"timeout_sec\":30,\"max_attempts\":1}]";
+        Check(parse(dm.TaskQueueAdd(qD, impJson, 1, "", dErr)).value("ok", false),
+              "100-4: implicit job added");
+        Check(WaitForState(dm, jImp, "succeeded", 8000), "100-4: implicit job succeeds");
+
+        // TaskQueueGet includes task object: with title for named task, without title for implicit task.
+        const nlohmann::json getB = parse(dm.TaskQueueGet(jB, false, 0, dErr));
+        Check(getB.value("ok", false) && getB.contains("job") && getB["job"].contains("task") &&
+                  getB["job"]["task"].value("id", std::string()) == taskNamed &&
+                  getB["job"]["task"].value("title", std::string()) == "100-4 named task" &&
+                  getB["job"]["task"].value("state", std::string()) == "succeeded",
+              "100-4: TaskQueueGet named task job carries task{id,title,state}");
+
+        const nlohmann::json getImp = parse(dm.TaskQueueGet(jImp, false, 0, dErr));
+        Check(getImp.value("ok", false) && getImp.contains("job") && getImp["job"].contains("task") &&
+                  getImp["job"]["task"].value("id", std::string()) == jImp &&
+                  !getImp["job"]["task"].contains("title") &&
+                  getImp["job"]["task"].value("state", std::string()) == "succeeded",
+              "100-4: TaskQueueGet implicit task job carries task{id,state} without title");
+
+        // TaskQueueList with task filter returns only that task's jobs, each carrying task{...}.
+        const nlohmann::json listNamed = parse(dm.TaskQueueList("", "", 0, dErr, "", "", false, taskNamed));
+        Check(listNamed.value("ok", false) && listNamed["jobs"].size() == 3,
+              "100-4: TaskQueueList task filter returns 3 jobs for named task");
+        bool allNamedOk = true;
+        for (const auto& j : listNamed["jobs"]) {
+            if (!j.contains("task") || j["task"].value("id", std::string()) != taskNamed ||
+                j["task"].value("title", std::string()) != "100-4 named task" ||
+                j["task"].value("state", std::string()) != "succeeded") {
+                allNamedOk = false;
+            }
+        }
+        Check(allNamedOk, "100-4: TaskQueueList named task jobs all carry matching task field");
+
+        const nlohmann::json listImp = parse(dm.TaskQueueList("", "", 0, dErr, "", "", false, jImp));
+        Check(listImp.value("ok", false) && listImp["jobs"].size() == 1 &&
+                  listImp["jobs"][0].value("id", std::string()) == jImp &&
+                  listImp["jobs"][0].contains("task") &&
+                  !listImp["jobs"][0]["task"].contains("title"),
+              "100-4: TaskQueueList task filter returns only the implicit task job without title");
+
+        dPm.SetProcessFinishedCallback(nullptr);
+        dm.ShutdownTaskQueueManager();
+        dm.SetProcessManager(nullptr);
+    }
+
+    // ------------------------------------------------------------------
+    // Card 100-5: Dashboard task-lineage view pure row builder & TaskList version
+    // ------------------------------------------------------------------
+    {
+        // 1. Compact result formatting
+        Check(FormatTaskResultsCompact({"failed", "failed", "succeeded"}) == "\xE2\x9C\x97\xE2\x9C\x97\xE2\x9C\x93",
+              "100-5: FormatTaskResultsCompact short (✗✗✓)");
+        std::vector<std::string> many(6, "failed");
+        many.push_back("succeeded");
+        many.push_back("failed");
+        many.push_back("succeeded");
+        Check(FormatTaskResultsCompact(many, 8) == "\xE2\x9C\x97\xC3\x97" "6 \xE2\x9C\x93 \xE2\x9C\x97 \xE2\x9C\x93",
+              "100-5: FormatTaskResultsCompact run-length (✗×6 ✓ ✗ ✓)");
+
+        // 2. BuildTaskDisplayRows: 2-level Task view, auto-expand/collapse, implicit single job, superseded dimming, MoreJobs
+        std::vector<nlohmann::json> tasks = {
+            {{"id", "task_run"}, {"title", "Running task"}, {"state", "running"}, {"updatedAt", "2026-11-23T10:05:00Z"}},
+            {{"id", "task_done"}, {"title", "Done task"}, {"state", "succeeded"}, {"updatedAt", "2026-11-23T10:04:00Z"}}
+        };
+        std::vector<nlohmann::json> jobs = {
+            {{"id", "j_run"}, {"task_id", "task_run"}, {"state", "running"}, {"created_at", "2026-11-23T10:05:00Z"}},
+            {{"id", "j_done_2"}, {"task_id", "task_done"}, {"state", "succeeded"}, {"supersedes", "j_done_1"}, {"created_at", "2026-11-23T10:04:00Z"}},
+            {{"id", "j_done_1"}, {"task_id", "task_done"}, {"state", "failed"}, {"superseded_by", "j_done_2"}, {"created_at", "2026-11-23T10:03:00Z"}},
+            {{"id", "j_imp"}, {"state", "succeeded"}, {"created_at", "2026-11-23T10:02:00Z"}},
+            {{"id", "group:bt_1"}, {"state", "running"}, {"created_at", "2026-11-23T10:01:00Z"}}
+        };
+
+        TaskViewCounts counts;
+        std::unordered_map<std::string, bool> overrides;
+        std::unordered_set<std::string> showAll;
+        auto rows = BuildTaskDisplayRows(jobs, tasks, /*taskViewMode=*/true, overrides, showAll, counts, 8);
+        Check(counts.totalTasks == 3 && counts.runningTasks == 1 && counts.succeededTasks == 2,
+              "100-5: TaskViewCounts counts explicit + implicit tasks (excluding pure virtual BT)");
+        Check(counts.totalJobs == 4 && counts.runningJobs == 1 && counts.succeededJobs == 2 && counts.failedJobs == 1,
+              "100-5: TaskViewCounts counts real jobs");
+
+        // Expected order: task_run (heading, expanded) -> j_run (indent 1) -> task_done (heading, collapsed) -> j_imp (implicit, no heading, indent 0) -> group:bt_1 (indent 0)
+        Check(rows.size() == 5, "100-5: collapsed succeeded task hides children; implicit single job has no heading");
+        Check(rows[0].kind == TaskDisplayRowKind::TaskHeading && rows[0].taskId == "task_run" && rows[0].expanded,
+              "100-5: running task auto-expanded");
+        Check(rows[1].kind == TaskDisplayRowKind::Job && rows[1].jobId == "j_run" && rows[1].indent == 1,
+              "100-5: child job indented");
+        Check(rows[2].kind == TaskDisplayRowKind::TaskHeading && rows[2].taskId == "task_done" && !rows[2].expanded &&
+                  rows[2].resultsCompact == "\xE2\x9C\x97\xE2\x9C\x93" && rows[2].jobCount == 2,
+              "100-5: succeeded task auto-collapsed with compact result ✗✓ and jobCount=2");
+        Check(rows[3].kind == TaskDisplayRowKind::Job && rows[3].jobId == "j_imp" && rows[3].indent == 0,
+              "100-5: implicit single job renders flat without heading");
+        Check(rows[4].kind == TaskDisplayRowKind::Job && rows[4].jobId == "group:bt_1" && rows[4].indent == 0,
+              "100-5: virtual BT row renders flat");
+
+        // Expand task_done via override: superseded job is marked isSuperseded=true
+        overrides["task_done"] = true;
+        auto expandedRows = BuildTaskDisplayRows(jobs, tasks, true, overrides, showAll, counts, 8);
+        bool foundSuperseded = false;
+        for (const auto& r : expandedRows) {
+            if (r.kind == TaskDisplayRowKind::Job && r.jobId == "j_done_1" && r.isSuperseded &&
+                r.supersededBy == "j_done_2" && r.indent == 1) {
+                foundSuperseded = true;
+            }
+        }
+        Check(foundSuperseded, "100-5: expanded task marks superseded failure with isSuperseded & supersededBy");
+
+        // Older jobs summary ("MoreJobs") when exceeding maxVisibleJobsPerTask=1
+        auto cappedRows = BuildTaskDisplayRows(jobs, tasks, true, overrides, showAll, counts, 1);
+        bool foundMore = false;
+        for (const auto& r : cappedRows) {
+            if (r.kind == TaskDisplayRowKind::MoreJobs && r.taskId == "task_done" && r.hiddenJobCount == 1 && r.indent == 1) {
+                foundMore = true;
+            }
+        }
+        Check(foundMore, "100-5: MoreJobs row summarizes older hidden jobs");
+
+        // Job view (flat)
+        auto flatRows = BuildTaskDisplayRows(jobs, tasks, /*taskViewMode=*/false, overrides, showAll, counts, 8);
+        Check(flatRows.size() == jobs.size() && flatRows[0].indent == 0 && flatRows[0].taskTitle == "Running task",
+              "100-5: Job view is flat with taskTitle populated");
+
+        // 3. TaskList version & since_version
+        auto parse = [](const std::string& raw) {
+            nlohmann::json j = nlohmann::json::parse(raw, nullptr, false);
+            return j.is_object() ? j : nlohmann::json::object();
+        };
+        std::error_code vEc;
+        std::filesystem::create_directories(dir + L"\\v1005", vEc);
+        SetDataDirectoryOverride(dir + L"\\v1005");
+        ProcessManager vPm;
+        TaskQueueManager vTm;
+        vTm.SetProcessManager(&vPm);
+        std::string vErr;
+        const nlohmann::json cRes = parse(vTm.TaskCreate("v test", "intent", "", "", vErr));
+        Check(cRes.value("ok", false), "100-5: TaskCreate for version check");
+        const nlohmann::json l1 = parse(vTm.TaskList("", 0, vErr));
+        Check(l1.value("ok", false) && l1.contains("version") && l1["version"].is_number_integer(),
+              "100-5: TaskList returns version");
+        const int64_t ver1 = l1.value("version", int64_t(-1));
+        const nlohmann::json l2 = parse(vTm.TaskList("", 0, vErr, ver1));
+        Check(l2.value("ok", false) && l2.value("unchanged", false) && l2.value("version", int64_t(-1)) == ver1,
+              "100-5: TaskList with matching since_version returns unchanged:true");
+        vTm.TaskNote(cRes.value("id", std::string()), "bump version", "", vErr);
+        const nlohmann::json l3 = parse(vTm.TaskList("", 0, vErr, ver1));
+        Check(l3.value("ok", false) && !l3.value("unchanged", false) && l3.value("version", int64_t(-1)) > ver1,
+              "100-5: TaskList with stale since_version returns updated tasks and higher version");
+        vTm.ShutdownTaskQueueManager();
+        vTm.SetProcessManager(nullptr);
+    }
+
+    // Card 100-7: TaskQueueSupersede (cloning, id numbering, BT rejection, task inheritance).
+    {
+        auto parse = [](const std::string& raw) {
+            nlohmann::json j = nlohmann::json::parse(raw, nullptr, false);
+            return j.is_object() ? j : nlohmann::json::object();
+        };
+        TaskQueueManager supTm;
+        ProcessManager supPm;
+        supTm.SetProcessManager(&supPm);
+        supPm.SetProcessFinishedCallback([&supTm](int pid, int ec, const std::string& kind) {
+            supTm.OnProcessFinished(pid, ec, kind);
+        });
+
+        std::string sErr;
+        const nlohmann::json tc = parse(supTm.TaskCreate("100-7 supersede task", "test supersede", "", "", sErr));
+        Check(tc.value("ok", false), "100-7: TaskCreate succeeds");
+        const std::string tId = tc.value("id", std::string());
+
+        const std::string jobsJson = R"([{
+            "id": "sup-orig",
+            "command": "cmd /c exit 1",
+            "summary": "original summary",
+            "timeoutSec": 45,
+            "maxAttempts": 1,
+            "priority": 3,
+            "env": {"FOO": "bar"}
+        }])";
+        Check(parse(supTm.TaskQueueAdd("q100-7", jobsJson, 1, "", sErr, "", tId)).value("ok", false),
+              "100-7: TaskQueueAdd orig succeeds");
+        Check(WaitForState(supTm, "sup-orig", "failed", 8000), "100-7: sup-orig fails");
+
+        // Reject missing reason or >2000 byte reason.
+        Check(!parse(supTm.TaskQueueSupersede("sup-orig", "", "", "{}", "", sErr)).value("ok", true),
+              "100-7: empty reason rejected");
+        Check(!parse(supTm.TaskQueueSupersede("sup-orig", std::string(2001, 'x'), "", "{}", "", sErr)).value("ok", true),
+              "100-7: >2000 byte reason rejected");
+
+        // Supersede with command & timeout override; default id -> sup-orig-s1.
+        const nlohmann::json sup1 = parse(supTm.TaskQueueSupersede(
+            "sup-orig", "fix command and timeout", "",
+            R"({"command":"cmd /c exit 0","timeoutSec":60})",
+            R"({"session":"sess-sup-1"})", sErr));
+        Check(sup1.value("ok", false), "100-7: TaskQueueSupersede succeeds: " + sErr);
+        Check(sup1.value("id", std::string()) == "sup-orig-s1", "100-7: default id is sup-orig-s1");
+        Check(sup1.value("supersedes", std::string()) == "sup-orig", "100-7: supersedes points to sup-orig");
+        Check(sup1.value("taskqueue", std::string()) == "q100-7", "100-7: same queue preserved");
+        Check(sup1.value("task_id", std::string()) == tId, "100-7: task_id inherited");
+        const nlohmann::json j1 = sup1.value("job", nlohmann::json::object());
+        Check(j1.value("summary", std::string()) == "original summary", "100-7: summary cloned");
+        Check(j1.value("priority", 0) == 3, "100-7: priority cloned");
+        Check(j1.value("max_attempts", 0) == 1, "100-7: max_attempts cloned");
+        Check(j1.contains("env") && j1["env"].value("FOO", std::string()) == "bar", "100-7: env cloned");
+        Check(j1.value("timeout_sec", 0) == 60, "100-7: timeoutSec overridden");
+        Check(j1.value("command", std::string()) == "cmd /c exit 0", "100-7: command overridden");
+        Check(j1.value("supersede_reason", std::string()) == "fix command and timeout",
+              "100-7: supersede_reason recorded");
+        Check(WaitForState(supTm, "sup-orig-s1", "succeeded", 8000), "100-7: sup-orig-s1 succeeds");
+
+        // Superseding a succeeded job is rejected.
+        Check(!parse(supTm.TaskQueueSupersede("sup-orig-s1", "again", "", "{}", "", sErr)).value("ok", true),
+              "100-7: cannot supersede succeeded job");
+
+        // ID collision numbering: sup-num -> sup-num-s1 (fails) -> sup-num-s2 (superseding sup-num again).
+        const std::string numJobs = R"([{"id":"sup-num","command":"cmd /c exit 1","summary":"num","timeoutSec":30,"maxAttempts":1}])";
+        Check(parse(supTm.TaskQueueAdd("q100-7", numJobs, 1, "", sErr)).value("ok", false),
+              "100-7: implicit task job added");
+        Check(WaitForState(supTm, "sup-num", "failed", 8000), "100-7: sup-num fails");
+        const nlohmann::json n1 = parse(supTm.TaskQueueSupersede("sup-num", "try 2", "", "{}", "", sErr));
+        Check(n1.value("ok", false) && n1.value("id", std::string()) == "sup-num-s1" &&
+                  n1.value("task_id", std::string()) == "sup-num",
+              "100-7: first implicit supersede gets -s1 and inherits implicit task_id");
+        Check(WaitForState(supTm, "sup-num-s1", "failed", 8000), "100-7: sup-num-s1 fails");
+        const nlohmann::json n2 = parse(supTm.TaskQueueSupersede("sup-num", "try 3", "", R"({"command":"cmd /c exit 0"})", "", sErr));
+        Check(n2.value("ok", false) && n2.value("id", std::string()) == "sup-num-s2" &&
+                  n2.value("supersedes", std::string()) == "sup-num-s1",
+              "100-7: second supersede skips -s1 collision to -s2 and walks to head sup-num-s1");
+        Check(WaitForState(supTm, "sup-num-s2", "succeeded", 8000), "100-7: sup-num-s2 succeeds");
+
+        // Explicit newId starting with task_ is rejected.
+        Check(!parse(supTm.TaskQueueSupersede("sup-num-s2", "bad", "task_bad", "{}", "", sErr)).value("ok", true),
+              "100-7: task_ prefix for newId rejected");
+
+        // BT-managed job is rejected.
+        TaskQueueBtRef btRef;
+        btRef.id = "bt-100-7";
+        btRef.node = "leaf";
+        btRef.run = 1;
+        Check(parse(supTm.AddBtJob("q100-7",
+                                   R"({"id":"sup-bt-job","command":"cmd /c exit 1","summary":"bt job","timeoutSec":30})",
+                                   btRef, sErr)).value("ok", false),
+              "100-7: AddBtJob succeeds");
+        Check(WaitForState(supTm, "sup-bt-job", "failed", 8000), "100-7: sup-bt-job fails");
+        const nlohmann::json btSup = parse(supTm.TaskQueueSupersede("sup-bt-job", "try", "", "{}", "", sErr));
+        Check(!btSup.value("ok", true) && sErr.find("behavior tree") != std::string::npos,
+              "100-7: BT-managed job rejected");
+
+        supPm.SetProcessFinishedCallback(nullptr);
+        supTm.ShutdownTaskQueueManager();
+        supTm.SetProcessManager(nullptr);
+    }
+
+    // Card 100-8: repeatedFailures count in TaskShow and TaskQueueGet.
+    {
+        ProcessManager rfPm;
+        TaskQueueManager rfTm;
+        rfTm.SetProcessManager(&rfPm);
+        rfPm.SetProcessFinishedCallback([&rfTm](int pid, int exitCode, const std::string& endKind) {
+            rfTm.OnProcessFinished(pid, exitCode, endKind);
+        });
+        std::string rErr;
+        auto parse = [](const std::string& s) { return nlohmann::json::parse(s, nullptr, false); };
+
+        const nlohmann::json created = parse(rfTm.TaskCreate("100-8 repeat", "test repeatedFailures", "", "{}", rErr));
+        const std::string taskId = created.value("id", std::string());
+        Check(!taskId.empty(), "100-8: task created");
+        Check(parse(rfTm.TaskShow(taskId, 0, rErr)).value("repeatedFailures", -1) == 0,
+              "100-8: TaskShow repeatedFailures is 0 initially");
+
+        Check(parse(rfTm.TaskQueueAdd("q100-8",
+                                      R"([{"id":"rf-1","command":"cmd /c exit 1","summary":"rf1","timeoutSec":30,"maxAttempts":1}])",
+                                      1, "", rErr, "", taskId)).value("ok", false),
+              "100-8: rf-1 added");
+        Check(WaitForState(rfTm, "rf-1", "failed", 8000), "100-8: rf-1 fails");
+        Check(parse(rfTm.TaskShow(taskId, 0, rErr)).value("repeatedFailures", -1) == 1 &&
+                  parse(rfTm.TaskQueueGet("rf-1", false, 0, rErr))["job"].value("repeatedFailures", -1) == 1,
+              "100-8: repeatedFailures is 1 after 1st failure");
+
+        Check(parse(rfTm.TaskQueueAdd("q100-8",
+                                      R"([{"id":"rf-2","command":"cmd /c exit 1","summary":"rf2","timeoutSec":30,"maxAttempts":1,"supersedes":"rf-1"}])",
+                                      1, "", rErr, "", taskId)).value("ok", false),
+              "100-8: rf-2 added");
+        Check(WaitForState(rfTm, "rf-2", "failed", 8000), "100-8: rf-2 fails");
+        Check(parse(rfTm.TaskShow(taskId, 0, rErr)).value("repeatedFailures", -1) == 2 &&
+                  parse(rfTm.TaskQueueGet("rf-2", false, 0, rErr))["job"].value("repeatedFailures", -1) == 2,
+              "100-8: repeatedFailures is 2 after 2nd failure");
+
+        Check(parse(rfTm.TaskQueueAdd("q100-8",
+                                      R"([{"id":"rf-3","command":"cmd /c exit 1","summary":"rf3","timeoutSec":30,"maxAttempts":1,"supersedes":"rf-2"}])",
+                                      1, "", rErr, "", taskId)).value("ok", false),
+              "100-8: rf-3 added");
+        Check(WaitForState(rfTm, "rf-3", "failed", 8000), "100-8: rf-3 fails");
+        Check(parse(rfTm.TaskShow(taskId, 0, rErr)).value("repeatedFailures", -1) == 3 &&
+                  parse(rfTm.TaskQueueGet("rf-3", false, 0, rErr))["job"].value("repeatedFailures", -1) == 3,
+              "100-8: repeatedFailures is 3 after 3rd failure");
+
+        rfPm.SetProcessFinishedCallback(nullptr);
+        rfTm.ShutdownTaskQueueManager();
+        rfTm.SetProcessManager(nullptr);
     }
 
     std::printf("%s (%d failures)\n", g_failures == 0 ? "ALL PASSED" : "FAILURES", g_failures);

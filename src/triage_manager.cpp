@@ -371,6 +371,12 @@ void TriageManager::Refresh() {
         fresh.push_back(std::move(card));
     }
 
+    struct LineageLogEntry {
+        std::string taskId;
+        std::string jobId;
+        std::string text;
+    };
+    std::vector<LineageLogEntry> lineageLogs;
     std::vector<std::tuple<std::string, std::string, std::string>> automatic;
     {
         std::lock_guard<std::mutex> lock(mutex_);
@@ -417,7 +423,22 @@ void TriageManager::Refresh() {
         language_ = language.empty() ? "en" : language;
         const json before = store_;
         ApplyTriageKindSettings(store_, fresh, config, inputs.now);
-        MergeTriageCards(store_, fresh, inputs.now);
+        const std::vector<std::string> addedCardIds = MergeTriageCards(store_, fresh, inputs.now);
+        for (const std::string& addedId : addedCardIds) {
+            for (const auto& card : store_["cards"]) {
+                if (GetString(card, "id") != addedId ||
+                    GetString(card, "kind") != "lineage_repeated_failure") continue;
+                const json target = GetObject(card, "target");
+                const std::string jobId = GetString(target, "jobId");
+                const std::string taskId = GetString(target, "taskId");
+                const long long failedCount = GetNumber(target, "failedCount", 0);
+                const std::string rootId = GetString(target, "lineageRoot");
+                lineageLogs.push_back({taskId, jobId,
+                    "lineage repeated failure (" + std::to_string(failedCount) +
+                    " failed jobs, root: " + rootId + ")"});
+                break;
+            }
+        }
         json supervisorJobs = json::array();
         for (const auto& job : jobs) {
             if (GetString(job, "taskqueue") == "_supervisor") supervisorJobs.push_back(job);
@@ -441,6 +462,15 @@ void TriageManager::Refresh() {
         if (store_ != before) SaveLocked();
     }
 
+    for (auto& entry : lineageLogs) {
+        if (entry.taskId.empty() && !entry.jobId.empty()) {
+            TaskQueueJob snapshot;
+            if (tqm_.GetJobSnapshot(entry.jobId, snapshot)) entry.taskId = snapshot.taskId;
+        }
+        if (!entry.taskId.empty()) {
+            tqm_.TaskLog(entry.taskId, "lineage_repeated_failure", entry.jobId, "", entry.text, "");
+        }
+    }
     for (const auto& [cardId, candidateId, by] : automatic) {
         DecideInternal(cardId, candidateId, "Automatic triage recommendation", json::object(), by);
     }
@@ -1014,10 +1044,12 @@ std::string TriageManager::DecideInternal(const std::string& id, const std::stri
         return Error("unsupported candidate: " + candidateId).dump();
     }
 
+    std::string targetTaskId;
     const std::string jobId = CardTargetJob(card);
     if (!jobId.empty()) {
         TaskQueueJob jobSnapshot;
         if (tqm_.GetJobSnapshot(jobId, jobSnapshot)) {
+            targetTaskId = jobSnapshot.taskId;
             const std::string actor = by == "human" ? "human" : by == "hancho-auto" ? "hancho" : "llm";
             const std::string line = "[triage] " + actor + " (" + by + ") chose " + candidateId + ": " + reason;
             const std::string notes = jobSnapshot.notes.empty() ? line : jobSnapshot.notes + "\n" + line;
@@ -1072,6 +1104,10 @@ std::string TriageManager::DecideInternal(const std::string& id, const std::stri
         }
         updated = *found;
         SaveLocked();
+    }
+    if (!targetTaskId.empty()) {
+        const std::string logText = reason.empty() ? candidateId : (candidateId + ": " + reason);
+        tqm_.TaskLog(targetTaskId, "triage_decided", jobId, "", logText, "");
     }
     return json{{"ok", true}, {"card", std::move(updated)}, {"result", result}}.dump();
 }

@@ -166,6 +166,12 @@ struct LlmUsagePoint {
     std::string model;
 };
 
+// OpenCode's JSON stream has no model. Its log (opencode.log) has one line per model call:
+//   message=stream providerID=P modelID=M session.id=S small=false agent=build ...
+// Returns "P/M" from the last such line of sessionId (any session when empty), or "".
+// small=true lines (the title model) are skipped.
+std::string FindOpenCodeModelInLog(const std::string& logText, const std::string& sessionId);
+
 void RecordLlmUsagePoint(int64_t epochSec, const LlmUsagePoint& point);
 std::vector<LlmUsagePoint> GetLlmUsageHistory(int64_t sinceEpochSec);
 // Points from usage_history.jsonl with sinceEpochSec <= epochSec < untilEpochSec (file, not memory).
@@ -382,6 +388,7 @@ private:
     int attempt_ = 0;
     std::string conversationId_;
     uint64_t lastAgyModelProbeMs_ = 0;
+    uint64_t lastOpenCodeModelProbeMs_ = 0;
     std::vector<LlmUsagePoint> pendingUsage_;  // recorded by IngestChunk after releasing mutex_
     std::string streamFilePath_;
     std::wstring streamFilePathWide_;
@@ -421,6 +428,7 @@ private:
     static constexpr size_t kMaxSubagents = 4096;
     static constexpr size_t kMaxToolUseOwners = 4096;
     static constexpr uint64_t kAgyModelProbeIntervalMs = 5000;
+    static constexpr uint64_t kOpenCodeModelProbeIntervalMs = 1000;
     // Claude tool_result lines (file contents etc.) routinely exceed 64KB.
     static constexpr size_t kMaxLineBytes = 16 * 1024 * 1024;
 };

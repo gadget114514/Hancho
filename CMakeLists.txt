@@ -40,6 +40,7 @@ set(HANCHO_SOURCES
     src/platform/platform_windows.cpp
     src/process_manager.cpp
     src/taskqueue.cpp
+    src/task_store.cpp
     src/routine.cpp
     src/triage.cpp
     src/triage_manager.cpp
@@ -430,6 +431,7 @@ add_dependencies(wct_smoke wct)
 add_executable(taskqueue_smoke
     tests/taskqueue_smoke.cpp
     src/taskqueue.cpp
+    src/task_store.cpp
     src/worker_engines.cpp
     src/worker_probe.cpp
     src/engine_health.cpp
@@ -883,6 +885,7 @@ add_executable(bt_integration_smoke
     src/engine_health.cpp
     src/platform/platform_windows.cpp
     src/taskqueue.cpp
+    src/task_store.cpp
     src/triage.cpp
     src/memory_record.cpp
     src/memory_search.cpp
@@ -966,6 +969,7 @@ add_executable(bt_ipc_smoke
     src/engine_health.cpp
     src/platform/platform_windows.cpp
     src/taskqueue.cpp
+    src/task_store.cpp
     src/routine.cpp
     src/triage.cpp
     src/triage_manager.cpp
@@ -1054,6 +1058,7 @@ add_executable(routine_smoke
     src/engine_health.cpp
     src/platform/platform_windows.cpp
     src/taskqueue.cpp
+    src/task_store.cpp
     src/triage.cpp
     src/triage_manager.cpp
     src/memory_record.cpp
@@ -1324,6 +1329,7 @@ add_executable(webui_config_smoke
     src/engine_health.cpp
     src/platform/platform_windows.cpp
     src/taskqueue.cpp
+    src/task_store.cpp
     src/routine.cpp
     src/triage.cpp
     src/triage_manager.cpp
@@ -1464,6 +1470,7 @@ else()
         src/platform/platform_posix.cpp
         src/process_manager_posix.cpp
         src/taskqueue.cpp
+        src/task_store.cpp
         src/routine.cpp
         src/llm_config.cpp
         src/permit_config.cpp

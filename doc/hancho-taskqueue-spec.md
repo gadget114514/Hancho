@@ -239,6 +239,8 @@ Job ──1:N── Attempt ──1:1── ManagedProcess (既存)
 - `suspendWhenDone` / `suspendDelaySec` / `suspendHibernate`: このジョブが終了し、他の全ジョブ (running/waiting/pending) と Hancho 管理プロセスがアイドルになった後、`suspendDelaySec` (0 = 既定 10 秒) 後に PC をサスペンドする。`suspendHibernate` は休止。`hancho-cli power suspend --after-job <id>` と MCP `power_suspend` で後から指定でき、`power status` / `power cancel` で確認・解除する。
 - `shutdownWhenDone` / `shutdownDelaySec`: このジョブと他の全ジョブ・管理プロセスが終わった後に PC をシャットダウンする（`shutdownDelaySec` 0 = 既定 10 秒）。suspend と同時に armed なら shutdown が優先。`hancho-cli power shutdown --after-job <id>` / MCP `power_shutdown` で後から指定できる。シャットダウン権限が必要。
 - `killExclude`: ツリー kill で除外するイメージ名 (共有の常駐プロセスを巻き込まないため)。
+- `taskId`: 任意のタスクレコード id (`task_...`)。`taskqueue add --task` / `bt start --task` で指定、または `supersedes` から引き継ぐ。未指定のジョブは暗黙の単一系譜タスクとして扱う。
+- `supersedes` / `supersededBy` / `supersedeReason`: 内容を変えてやり直す際の系譜リンク（1 本の鎖に保たれ、`supersedeReason` は 2000 バイト上限）。`dependsOn` で依存先に `supersededBy` がある場合は系譜の最新ジョブの状態で判定し、引き継ぎ先が成功すれば `blocked` の後続を再開する。
 
 ### 5.3 Attempt
 ```json
@@ -279,6 +281,19 @@ Job ──1:N── Attempt ──1:1── ManagedProcess (既存)
 - PC はサマリの意味も解釈しない。
 
 例: `"command": "tools\\run.cmd {instructions} {summary}"`、`"summary": "Apply placement rules and bake test stage"`
+
+### 5.6 Task（タスクと系譜）
+複数のジョブと BT を共通の意図・経過ログで束ねるレコード（`<data-dir>/tasks/<id>.json` と追記専用ログ `<id>.log.jsonl`）。
+
+- **レコード項目**: `id`（`task_<N>` または `task_` 始まりの 64 文字以内）、`title`（上限 200 B）、`intent`（上限 16 KB）、`createdAt`、`updatedAt`、`origin`、`closed`（`{result, reason, at}` または null）、`removedJobs`（purge されたジョブの `{id, state, supersedes, supersededBy}`）。
+- **サイズ上限**: `title` 200 B、`intent` 16 KB、`note` 4 KB、`close` / `reopen` の `reason` 2000 B、`supersedeReason` 2000 B。
+- **状態の決め方**: 系譜ごとの最新ジョブ（`supersededBy` をたどり、`removedJobs` も参照）から次の優先順で計算する。
+  1. 明示的に閉じられている → `closed`（`result` と `reason`）。
+  2. ジョブが 0 件 → `open`。
+  3. いずれかが `pending` / `waiting` / `running` / `planned` / `waitingForPermit`、または未完了の `takenOver` → `running`（一時停止中があれば `paused: true`）。
+  4. いずれかが `failed` / `blocked` / `closed`、または `result: failed` の `takenOver` → `failed`。
+  5. いずれかが `cancelled` → `cancelled`。
+  6. 残りがすべて `succeeded`、または `result: succeeded` の `takenOver` → `succeeded`。
 
 ## 6. 状態遷移
 ```
@@ -355,10 +370,12 @@ takenOver ──(taskqueue complete --reason [--result succeeded|failed])──>
 | ツール | 引数 | 戻り値 / 動作 |
 |---|---|---|
 | `start_process` (変更) | 既存のまま | 連鎖・待ち合わせなら 8.3 のエラー。単一コマンドなら従来通り (タスクキュー外) |
-| `taskqueue_add` | `taskqueue`, `jobs[]`, `concurrency?`, `notifyFile?` | 追加したジョブ id。連鎖・循環・重複 id・未知の依存・`summary` / `timeoutSec` なし・上限超過があれば全体を追加しない |
-| `taskqueue_list` | `taskqueue?`, `state?` | ジョブ一覧 (状態・attempt 数・最後の reason・blockedBy) |
+| `taskqueue_add` | `taskqueue`, `jobs[]`, `concurrency?`, `notifyFile?`, `task?` | 追加したジョブ id。連鎖・循環・重複 id・未知の依存・`summary` / `timeoutSec` なし・上限超過・存在しない/閉じた `task` があれば全体を追加しない。`supersedes` / `supersedeReason` で系譜に連結 |
+| `taskqueue_list` | `taskqueue?`, `state?`, `task?` | ジョブ一覧 (状態・attempt 数・最後の reason・blockedBy・`task` 情報) |
 | `taskqueue_get` | `id`, `includeInstructions?` (既定 true), `rev?` | 全情報と attempt 履歴、指示書の本文 (指定の版)、`sourceChanged` / `sourceMissing` |
 | `taskqueue_retry` | `id`, `resetAttempts?` (既定 true), `refreshInstructions?` (既定 true) | 指示書を元ファイルから取り込み直し、failed/blocked/cancelled を pending に戻す |
+| `taskqueue_supersede` | `id`, `reason`, `newId?`, `summary?`, `command?`, `timeoutSec?`, `instructionsFile?`, `instructionsText?`, `patch?` | 終了済みで未成功の非 BT ジョブを内容を変えて複製し、`supersedes` と理由付きで同じキュー・同じタスクへ追加 |
+| `task_create` / `task_show` / `task_list` / `task_note` / `task_close` / `task_reopen` / `task_purge` / `task_wait` | 各サブコマンド引数 | タスクの作成・詳細（状態/ジョブ/経過ログ）・一覧・メモ追記・クローズ・再開・古い完了タスク削除・全アクティブジョブ完了待ち |
 | `taskqueue_update` | `id`, 変更可能フィールド (summary, instructionsFile, instructionsText, command, timeoutSec, idle, maxAttempts, success, env)。依存は 11.1 で変更する | pending/failed/blocked のときだけ。同じ検証 (連鎖・上限) を行う |
 | `taskqueue_cancel` | `id` | running ならツリー kill して cancelled |
 | `taskqueue_takeover` | `id`, `reason` | failed/blocked/waiting/pending/running ジョブを `takenOver` にし、`takeover` レコード `{by, reason, at}` を保存。running ならプロセスツリーを停止し、後続は complete まで pending のまま |
@@ -389,7 +406,7 @@ takenOver ──(taskqueue complete --reason [--result succeeded|failed])──>
 - `start_process` のツール説明文に「複数のコマンドを順に実行するときは `taskqueue_add` を使う。`&&` は拒否される」と書く (AI エージェントが最初から正しい方を選べるように)。
 
 ## 12. CLI
-`pc taskqueue add --file jobs.json`、`pc taskqueue list main`、`pc taskqueue retry <id>`、`pc taskqueue cancel <id>`、`pc run "<cmd>" [--allow-chain]`。jobs.json は `taskqueue_add` の引数と同じ形式。`hancho-cli.exe` の場合は failure 診断を `taskqueue why <id>`（`class` / `likelyCauses` / `nextSteps` / `supervisorNote` を表示）で読み、引き取りを `taskqueue takeover --id <id> --reason "..."`、結果の戻しを `taskqueue complete --id <id> --reason "..." [--report <path>] [--result succeeded|failed]` で行う。両コマンドとも `--reason` は必須。`taskqueue update --id <id> --patch <json>` でコマンドの `--model` を変えるには `--approve-model-change --reason "..."` が要る。
+`pc taskqueue add --file jobs.json [--task <id>]`、`pc taskqueue list main [--task <id>]`、`pc taskqueue retry <id>`、`pc taskqueue supersede <id> --reason "..."`、`pc taskqueue cancel <id>`、`pc run --file queue.json --exit-on-drain [--count-superseded]`、`pc task <create|show|list|note|close|reopen|purge|wait>`、`pc run "<cmd>" [--allow-chain]`。jobs.json は `taskqueue_add` の引数と同じ形式。`hancho-cli.exe` の場合は failure 診断を `taskqueue why <id>`（`class` / `likelyCauses` / `nextSteps` / `supervisorNote` を表示）で読み、引き取りを `taskqueue takeover --id <id> --reason "..."`、結果の戻しを `taskqueue complete --id <id> --reason "..." [--report <path>] [--result succeeded|failed]` で行う。両コマンドとも `--reason` は必須。`taskqueue update --id <id> --patch <json>` でコマンドの `--model` を変えるには `--approve-model-change --reason "..."` が要る。
 
 ## 13. GUI
 既存ダッシュボード (暗色テーマ、上部カウンタ、ツールバー、表) の見た目と操作感に合わせる。描画は既存と同じ Direct2D。

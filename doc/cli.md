@@ -155,6 +155,13 @@ hancho-cli.exe taskqueue list main --no-planned
 hancho-cli.exe taskqueue why A
 hancho-cli.exe taskqueue takeover --id A --reason "Worker hung three times; implementing it here"
 hancho-cli.exe taskqueue complete --id A --reason "Fixed and tested" --report reports/taken-over.md
+
+# Redo a finished unsuccessful non-BT job with changes (links supersedes + reason)
+hancho-cli.exe taskqueue supersede A --reason "Timeout too short" --timeout-sec 3600
+
+# CI one-shot: run queue until drain, write JUnit XML (superseded jobs excluded by default)
+hancho-cli.exe run --file jobs.json --exit-on-drain --report junit.xml
+hancho-cli.exe run --file jobs.json --exit-on-drain --count-superseded
 ```
 
 The task list also shows the active task group (the behavior-tree root) as a
@@ -164,6 +171,24 @@ and the `planned` rows are re-derived on every query and are not stored jobs;
 one with `bt resume`.
 
 **Failure diagnosis and takeover:** `taskqueue why <id>` explains the last failed attempt: `class` (for example `startup_hang` when a worker emitted no normalized events within `idle.firstEventSec`, default 180 s for worker jobs; the end reason is `startup_timed_out`), `confidence`, `summary`, `evidence`, `likelyCauses` (`[{id, why}]`, e.g. `no_model`, `same_engine_nesting`, `waiting_for_input`), `nextSteps` (`[{action, change?, needsApproval?, question?}]`) and `supervisorNote`. The same failure record is in `taskqueue get --json` under `failure`. Follow `nextSteps` in order: retry unchanged once, then retry with a change (`retry_with_change`; changing a model needs `taskqueue update --approve-model-change --reason "..."`), then escalate. If you take the job over yourself, record it first with `taskqueue takeover --id <id> --reason "..."` (the job becomes the terminal state `takenOver` with a `takeover` record) and return the result with `taskqueue complete --id <id> --reason "..." [--report <path>] [--result succeeded|failed]`; dependents advance on `succeeded`. In a BT, answer an escalate with `bt resume --answer takeover --rationale "..."`. The triage card also offers `retry_with_change` as a candidate.
+
+**Tasks (grouping jobs & behavior trees with intent and progress log):**
+
+```powershell
+hancho-cli.exe task create --title "Fix auth bug" --intent "Reproduce and fix token refresh" --json
+hancho-cli.exe taskqueue add --file jobs.json --taskqueue main --task task_1
+hancho-cli.exe bt start --file plan.json --task task_1
+hancho-cli.exe task note task_1 --text "Switched to refresh-token retry after inspecting logs"
+hancho-cli.exe task list --state running
+hancho-cli.exe taskqueue list --task task_1
+hancho-cli.exe task show task_1 --log-limit 50 --json
+hancho-cli.exe task wait task_1 --timeout-ms 300000
+hancho-cli.exe task close task_1 --result succeeded --reason "All auth tests pass"
+hancho-cli.exe task reopen task_1 --reason "Follow-up regression found"
+hancho-cli.exe task purge --older-than 604800
+```
+
+Task records are stored under `<data-dir>/tasks/` (`<id>.json` and `<id>.log.jsonl`). A task's state (`open`, `running`, `failed`, `cancelled`, `succeeded`, `closed`) is computed from the latest job of each lineage inside it (unless explicitly closed). `run --exit-on-drain` also evaluates lineages by default (excluding jobs with `superseded_by`); pass `--count-superseded` to count every job as before.
 
 **Quick fix (tiny deterministic edits):**
 
@@ -386,7 +411,7 @@ hancho-cli.exe export list
 | `cli_exit_codes`, `environment_variables` | Exit codes and `HANCHO_LOG_DIR` |
 | `data_dir_option`, `effective_data_dir` | Per-invocation `--data-dir`, its resolved absolute path for this call, and project consistency rules |
 | `common_examples` | Ready-to-run `hancho-cli.exe` commands |
-| `commands` | Every command and option, including `taskqueue add/list/get/retry/cancel/pause/resume/pause-job/resume-job/graph/wait/purge`, `mcp install/uninstall` and `agent uninstall-template` |
+| `commands` | Every command and option, including `task create/show/list/note/close/reopen/purge/wait`, `taskqueue add/list/get/retry/supersede/cancel/pause/resume/pause-job/resume-job/graph/wait/purge`, `mcp install/uninstall` and `agent uninstall-template` |
 | `setup.mcp` | MCP registration, a ready-to-use config, and `auto_install` / `uninstall` (`argv` + `command`) |
 | `agent` | `working_model` (supervisor → Hancho → worker LLM), `data_dir_consistency`, `decision`, `states`, `quick_start` |
 | `leaving` | Graduation steps, JSON / JSONL data formats, keep-or-delete-data behavior, and the release checklist |

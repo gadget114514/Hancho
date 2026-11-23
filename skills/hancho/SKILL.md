@@ -151,6 +151,7 @@ hancho-cli.exe power status
 - **supervisor の文脈を小さく保つ。** 詳細な指示は worker に渡し、成果物とログの末尾だけ読む。
 - **1文字修正にコーディングエージェントを起動しない。** `quickfix --file <path> --find <text> --replace <text>` を使う。決定的で数秒〜数十秒で終わる。
 - **supervisor 自身にコードを書かせない。** 監督はパッチ/置換/ジョブを出す。適用は `quickfix` か worker ジョブにやらせる。
+- **作業はタスクでまとめる。** 作業を始める前に `task create` でタスクを作り、ジョブや BT は `--task <id>` で付ける。判断と理由は `task note <id> --text "..."` に書き、内容を変えたやり直しは `taskqueue supersede <jobId> --reason "..."`、終わったら `task close <id> --result succeeded|failed --reason "..."` で閉じる。
 - **モデル / provider を勝手に変えない。** `taskqueue update` で `--model` を変えるには `--approve-model-change --reason "..."` が必要。監督は変更せず、カードを判断待ちに残す。
 - **data-dir を1つに固定する。** 例: `<project>/.hancho`。毎回 `--data-dir` を付けるか、`hancho-cli.exe mcp install --data-dir .hancho` で埋め込む。
 
@@ -215,10 +216,27 @@ hancho-cli.exe quickfix --file src/Foo.cs --find "old" --replace "new" --all --c
 
 `--find` が見つからない、または `--check`（正規表現）に一致しないとジョブは失敗します。`--check-literal` でリテラル一致。ローカル PowerShell で実行し、LLM は使いません。大きな変更だけ worker ジョブにしてください。
 
+### タスク（作業単位・経過ログ）
+
+```powershell
+hancho-cli.exe task create --title "Fix auth bug" --intent "..." --json
+hancho-cli.exe taskqueue add --file jobs.json --taskqueue main --task <taskId>
+hancho-cli.exe bt start --file plan.json --task <taskId>
+hancho-cli.exe task note <taskId> --text "判断と理由をここに残す"
+hancho-cli.exe task show <taskId> --json
+hancho-cli.exe task wait <taskId> --timeout-ms 300000
+hancho-cli.exe task close <taskId> --result succeeded --reason "..."
+```
+
+- 作業を始める前に `task create` でタスクを作り、以降の `taskqueue add` / `bt start` には `--task <taskId>` を付ける（MCP は `task_create` / `task_note` / `task_close`、`taskqueue_add` / `bt_start` の `task`）。
+- 方針の切り替えや調査結果など、判断と理由は `task note` に書く（セッションが消えてもタスクの経過ログに残る）。
+- 失敗ジョブを**同じ内容**で再実行するときは `taskqueue retry <id>`、**内容を変えて**やり直すときは `taskqueue supersede <id> --reason "..."`（MCP `taskqueue_supersede`）を使う。
+- 作業が終わったら `task close` で結果（`succeeded` / `failed`）と理由を記録する。
+
 ### タスクキュー（順番・依存）
 
 ```powershell
-hancho-cli.exe taskqueue add --file jobs.json --taskqueue main
+hancho-cli.exe taskqueue add --file jobs.json --taskqueue main --task <taskId>
 hancho-cli.exe taskqueue list main --json
 hancho-cli.exe taskqueue graph main
 hancho-cli.exe taskqueue wait main --since 0 --timeout-ms 300000
@@ -226,6 +244,7 @@ hancho-cli.exe taskqueue get build --json
 hancho-cli.exe taskqueue why build
 hancho-cli.exe taskqueue retry build
 hancho-cli.exe taskqueue retry --failed --since 6h
+hancho-cli.exe taskqueue supersede build --reason "timeout was too short" --timeout-sec 3600
 
 # 実行を止める: pause は再開できる。停止（取り消し）は cancel。
 hancho-cli.exe taskqueue pause-job build

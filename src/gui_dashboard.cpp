@@ -1,6 +1,7 @@
 #include <winsock2.h>
 #include "parse_util.h"
 #include "gui_dashboard.h"
+#include "task_lineage_view.h"
 #include "gui_theme.h"
 #include "gui_ipmsg.h"
 #include "term_client.h"
@@ -86,7 +87,7 @@ constexpr uint64_t kInitialUsageTimeoutMs = 15000;
 
 constexpr UINT_PTR TIMER_REFRESH_ID   = 1;
 // Periodic dashboard / terminal-grid refresh interval (ms). User-configurable in the Settings dialog.
-constexpr int kDefaultRefreshIntervalMs = 2000;
+constexpr int kDefaultRefreshIntervalMs = 5000;
 constexpr int kMinRefreshIntervalMs = 100;
 constexpr int kMaxRefreshIntervalMs = 60000;
 static int ClampRefreshIntervalMs(int ms) {
@@ -668,6 +669,7 @@ enum ControlId {
     IDC_BTN_REEVAL_PLANNED = 1053,
     IDC_SAVE_SNAPSHOT = 1054,  // Ctrl+Shift+S / tray menu: save a PNG of the dashboard window
     IDC_COMBO_TASK_ORIGIN = 1055,  // origin filter for the task list (shown with the task search bar)
+    IDC_BTN_TASK_VIEW_MODE = 1056, // toggle between Task view (2-level) and Job view (flat)
     IDC_SET_LANG_JA = 6001,
     IDC_SET_LANG_EN = 6002,
     IDC_SET_LANG_ES = 6003,
@@ -1029,12 +1031,21 @@ struct DashboardState {
     // Inline search bars in the process / task list captions.
     HWND hwndSearchProcBtn = nullptr;
     HWND hwndSearchTaskBtn = nullptr;
+    HWND hwndBtnTaskViewMode = nullptr;
     HWND hwndSearchProcEdit = nullptr;
     HWND hwndSearchTaskEdit = nullptr;
     bool showProcSearch = false;
     bool showTaskSearch = false;
+    bool taskViewMode = true;  // true = 2-level task view, false = flat job view
     std::wstring procSearchText;
     std::wstring taskSearchText;
+    int64_t lastTasksVersion = -1;
+    std::vector<nlohmann::json> cachedTasks;
+    std::unordered_map<std::string, bool> taskExpandedOverrides;
+    std::unordered_set<std::string> taskShowAllJobs;
+    std::vector<pc::TaskDisplayRow> taskDisplayRows;
+    pc::TaskViewCounts taskViewCounts;
+    std::string selectedTaskId;
     // Origin filter: the combo sits next to the task search bar. Empty filter = every origin.
     HWND hwndTaskOriginCombo = nullptr;
     std::wstring taskOriginFilter;
@@ -1550,6 +1561,45 @@ static std::string TaskQueueListIpc(DashboardState* st, const std::string& taskq
     if (st && st->tqm) {
         return st->tqm->TaskQueueList(taskqueue, state, sinceSec, outErr, origin, bt,
                                       st->showHiddenTasks);
+    }
+    return "";
+}
+
+static std::string TaskListIpc(DashboardState* st, int64_t sinceVersion, std::string& outErr) {
+    nlohmann::json req = {
+        {"action", "task_list"},
+        {"since_version", sinceVersion}
+    };
+    nlohmann::json resp;
+    if (GuiIpcCall(st, req, resp, &outErr)) {
+        return resp.dump();
+    }
+    if (st && st->ipc) {
+        std::string direct = st->ipc->HandleRequestJson(req.dump());
+        if (!direct.empty()) return direct;
+    }
+    if (st && st->tqm) {
+        return st->tqm->TaskList("", 0, outErr, sinceVersion);
+    }
+    return "";
+}
+
+static std::string TaskShowIpc(DashboardState* st, const std::string& taskId, int64_t logLimit, std::string& outErr) {
+    nlohmann::json req = {
+        {"action", "task_show"},
+        {"id", taskId},
+        {"log_limit", logLimit}
+    };
+    nlohmann::json resp;
+    if (GuiIpcCall(st, req, resp, &outErr)) {
+        return resp.dump();
+    }
+    if (st && st->ipc) {
+        std::string direct = st->ipc->HandleRequestJson(req.dump());
+        if (!direct.empty()) return direct;
+    }
+    if (st && st->tqm) {
+        return st->tqm->TaskShow(taskId, logLimit, outErr);
     }
     return "";
 }
@@ -2571,26 +2621,48 @@ static void DrawDashboardCanvas(DashboardState* st, HDC hdcWindow, const RECT* u
                                 st->hFontUiBold, st->hFontKpiVal);
                 }
             } else {
-                // Bottom Row: Tasks
+                // Bottom Row: Tasks (task-based primary counts, job-based secondary counts)
+                const pc::TaskViewCounts& tc = st->taskViewCounts;
+                const bool hasTaskCounts = (tc.totalTasks > 0 || tc.totalJobs > 0);
                 if (col == 0) {
+                    const int primary = hasTaskCounts ? tc.totalTasks : tqCounts.total;
+                    std::wstring sub = hasTaskCounts
+                        ? (Tr(L"ジョブ ", L"jobs ", L"trabajos ") + std::to_wstring(tc.totalJobs))
+                        : L"";
                     DrawKpiCard(hdc, rcCard, Tr(L"タスク総数", L"TOTAL TASKS", L"TAREAS TOTALES"),
-                                std::to_wstring(tqCounts.total), KpiAccent(0), st->hFontUiBold, st->hFontKpiVal);
+                                std::to_wstring(primary), KpiAccent(0), st->hFontUiBold, st->hFontKpiVal,
+                                -1.0f, sub);
                 } else if (col == 1) {
+                    const int primary = hasTaskCounts ? tc.runningTasks : tqCounts.running;
+                    std::wstring sub = hasTaskCounts
+                        ? (Tr(L"ジョブ ", L"jobs ", L"trabajos ") + std::to_wstring(tqCounts.running))
+                        : L"";
                     DrawKpiCard(hdc, rcCard, Tr(L"稼働中タスク", L"RUNNING TASKS", L"TAREAS EN EJECUCIÓN"),
-                                std::to_wstring(tqCounts.running), KpiAccent(1), st->hFontUiBold, st->hFontKpiVal,
-                                (tqCounts.running > 0 ? g_kpiBarPhase : -1.0f));
+                                std::to_wstring(primary), KpiAccent(1), st->hFontUiBold, st->hFontKpiVal,
+                                (primary > 0 ? g_kpiBarPhase : -1.0f), sub);
                 } else if (col == 2) {
-                    std::wstring sub = (tqCounts.pending > 0) ? (L"(+" + std::to_wstring(tqCounts.pending) + L")") : L"";
+                    const int primary = hasTaskCounts ? tc.waitingTasks : tqCounts.waiting;
+                    std::wstring sub = hasTaskCounts
+                        ? (Tr(L"ジョブ ", L"jobs ", L"trabajos ") + std::to_wstring(tqCounts.waiting + tqCounts.pending))
+                        : ((tqCounts.pending > 0) ? (L"(+" + std::to_wstring(tqCounts.pending) + L")") : L"");
                     DrawKpiCard(hdc, rcCard, Tr(L"実行待ちタスク", L"WAITING TASKS", L"TAREAS EN ESPERA"),
-                                std::to_wstring(tqCounts.waiting), KpiAccent(2), st->hFontUiBold, st->hFontKpiVal,
+                                std::to_wstring(primary), KpiAccent(2), st->hFontUiBold, st->hFontKpiVal,
                                 -1.0f, sub);
                 } else if (col == 3) {
+                    const int primary = hasTaskCounts ? tc.succeededTasks : tqCounts.succeeded;
+                    std::wstring sub = hasTaskCounts
+                        ? (Tr(L"ジョブ ", L"jobs ", L"trabajos ") + std::to_wstring(tqCounts.succeeded))
+                        : L"";
                     DrawKpiCard(hdc, rcCard, Tr(L"タスク成功 (OK)", L"SUCCEEDED TASKS", L"TAREAS EXITOSAS"),
-                                std::to_wstring(tqCounts.succeeded), KpiAccent(3), st->hFontUiBold, st->hFontKpiVal);
+                                std::to_wstring(primary), KpiAccent(3), st->hFontUiBold, st->hFontKpiVal,
+                                -1.0f, sub);
                 } else if (col == 4) {
-                    std::wstring sub = (tqCounts.cancelled > 0) ? (L"(" + std::to_wstring(tqCounts.cancelled) + L")") : L"";
+                    const int primary = hasTaskCounts ? (tc.failedTasks + tc.cancelledTasks) : (tqCounts.failed + tqCounts.cancelled);
+                    std::wstring sub = hasTaskCounts
+                        ? (Tr(L"ジョブ ", L"jobs ", L"trabajos ") + std::to_wstring(tqCounts.failed + tqCounts.cancelled))
+                        : ((tqCounts.cancelled > 0) ? (L"(" + std::to_wstring(tqCounts.cancelled) + L")") : L"");
                     DrawKpiCard(hdc, rcCard, Tr(L"タスク失敗/中断", L"FAILED / CANCELLED", L"FALLIDAS / CANCELADAS"),
-                                std::to_wstring(tqCounts.failed + tqCounts.cancelled), KpiAccent(4), st->hFontUiBold, st->hFontKpiVal,
+                                std::to_wstring(primary), KpiAccent(4), st->hFontUiBold, st->hFontKpiVal,
                                 -1.0f, sub);
                 } else if (col == 5) {
                     std::wstring sub = (tqCounts.blocked > 0) ? (L"(" + std::to_wstring(tqCounts.blocked) + L")") : L"";
@@ -2888,19 +2960,19 @@ static void UpdateListHeaderSortIndicator(DashboardState* st) {
 }
 
 // Task list columns: ID, Summary, Kind, State, Triage, Start, End, Running, Depends, Queue,
-// Origin, Owner / Cost, Resources. The Kind column says whether the row is a task group,
-// one of its provisional (planned) tasks, or a normal task.
-static constexpr int kTaskListColumns = 13;
+// Origin, Owner / Cost, Resources, Task. The Kind column says whether the row is a task heading,
+// a BT virtual row, one of its provisional (planned) rows, or a normal job.
+static constexpr int kTaskListColumns = 14;
 
 static const wchar_t* TaskColumnTitle(int index) {
     static const wchar_t* const ja[kTaskListColumns] = {
-        L"ID", L"サマリ", L"種別", L"状態", L"判断", L"開始時刻", L"終了 / 残り時間", L"実行中", L"依存 / 理由", L"キュー", L"発行元", L"担当 / コスト", L"リソース"
+        L"ID", L"サマリ", L"種別", L"状態", L"判断 / 結果", L"開始時刻", L"終了 / 残り時間", L"実行中", L"依存 / 理由", L"キュー", L"発行元", L"担当 / コスト", L"リソース", L"タスク"
     };
     static const wchar_t* const en[kTaskListColumns] = {
-        L"ID", L"Summary", L"Kind", L"State", L"Triage", L"Start", L"End / Left", L"Running", L"Depends / Reason", L"Queue", L"Origin", L"Owner / Cost", L"Resources"
+        L"ID", L"Summary", L"Kind", L"State", L"Triage / Result", L"Start", L"End / Left", L"Running", L"Depends / Reason", L"Queue", L"Origin", L"Owner / Cost", L"Resources", L"Task"
     };
     static const wchar_t* const es[kTaskListColumns] = {
-        L"ID", L"Resumen", L"Tipo", L"Estado", L"Triaje", L"Inicio", L"Fin / Restante", L"En curso", L"Dependencias", L"Cola", L"Origen", L"Responsable / Coste", L"Recursos"
+        L"ID", L"Resumen", L"Tipo", L"Estado", L"Triaje / Resultado", L"Inicio", L"Fin / Restante", L"En curso", L"Dependencias", L"Cola", L"Origen", L"Responsable / Coste", L"Recursos", L"Tarea"
     };
     if (g_uiLanguage == UiLanguage::Spanish) return es[index];
     if (g_uiLanguage == UiLanguage::English) return en[index];
@@ -2940,6 +3012,9 @@ static void UpdateTaskListHeaders(DashboardState* st) {
 // only shows the time of day.
 static bool MeasureTaskFitColumns(DashboardState* st);
 static void UpdateTaskListColumnWidths(DashboardState* st);
+// Columns of the task list sized to their text: ID, State, Start, End.
+static constexpr int kTaskFitCols[4] = {0, 3, 5, 6};
+static constexpr int kTaskFitColMax[4] = {220, 200, 110, 280};
 
 struct TaskListRow {
     std::wstring cells[kTaskListColumns];
@@ -2950,6 +3025,8 @@ struct TaskListRow {
     std::wstring usageTip; // full engine / token / cost details, for the Owner / Cost hover tip
     std::string kind;      // running / timeout / failed / other, for the row colour
     int procId = 0;
+    int indent = 0;
+    bool isSuperseded = false;
 };
 
 // Compares two texts the way the list shows them, ignoring case.
@@ -3004,6 +3081,7 @@ static int CompareTaskRows(const TaskListRow& a, const TaskListRow& b, int col) 
         case 10: // Origin
         case 11: // Owner / Cost
         case 12: // Resources
+        case 13: // Task
             cmp = CompareCellText(a.cells[col], b.cells[col]);
             break;
         case 5:  // Start: the full date and time of the last attempt
@@ -6782,6 +6860,10 @@ static TaskOwnerUsage TaskOwnerUsageForJob(
     return out;
 }
 
+// Usage of finished jobs, keyed by "<job id>:<attempt count>" (a retry adds an attempt, so it
+// gets a new key). Only the dashboard's UI thread reads and writes it.
+static std::unordered_map<std::string, TaskOwnerUsage> g_finishedTaskUsage;
+
 static std::wstring FormatTaskCost(double costUsd) {
     wchar_t buf[32] = {};
     if (costUsd > 0.0 && costUsd < 0.01) swprintf_s(buf, L"$%.4f", costUsd);
@@ -6875,6 +6957,16 @@ static void StartInitialTaskUsageWorker(DashboardState* st, const std::vector<st
     });
 }
 
+static std::wstring TaskStateLabelWide(const std::string& state) {
+    if (state == "open") return Tr(L"オープン", L"Open", L"Abierta");
+    if (state == "running") return Tr(L"実行中", L"Running", L"En curso");
+    if (state == "failed") return Tr(L"失敗", L"Failed", L"Fallida");
+    if (state == "cancelled") return Tr(L"中断", L"Cancelled", L"Cancelada");
+    if (state == "succeeded") return Tr(L"成功", L"Succeeded", L"Exitosa");
+    if (state == "closed") return Tr(L"クローズ", L"Closed", L"Cerrada");
+    return Utf8ToWide(state);
+}
+
 static void RefreshTaskQueueData(DashboardState* st, bool force = false, bool useCachedList = false) {
     if (!st || !st->hwndTaskList) return;
     if (st->listDisplayMode == ListDisplayMode::ProcessOnly) return;
@@ -6883,12 +6975,31 @@ static void RefreshTaskQueueData(DashboardState* st, bool force = false, bool us
     // this tick instead of asking the core for the same JSON a second time.
     std::string resp = useCachedList ? st->lastTaskListJson
                                      : TaskQueueListIpc(st, "", "", 0, err);
+    bool tasksChanged = false;
+    if (!useCachedList) {
+        std::string taskErr;
+        std::string taskResp = TaskListIpc(st, st->lastTasksVersion, taskErr);
+        if (!taskResp.empty()) {
+            nlohmann::json tj = nlohmann::json::parse(taskResp, nullptr, false);
+            if (tj.is_object() && tj.value("ok", false)) {
+                const int64_t newVer = tj.value("version", st->lastTasksVersion);
+                if (!tj.value("unchanged", false) && tj.contains("tasks") && tj["tasks"].is_array()) {
+                    st->cachedTasks.clear();
+                    for (const auto& item : tj["tasks"]) {
+                        if (item.is_object()) st->cachedTasks.push_back(item);
+                    }
+                    st->lastTasksVersion = newVer;
+                    tasksChanged = true;
+                }
+            }
+        }
+    }
     // Nothing to do when the queue is unchanged and no job is running (only running rows show a
     // countdown). Just after a job ends, keep polling its events file for a moment: the final
     // usage / cost line can land slightly after the job's state changes.
     int lang = static_cast<int>(g_uiLanguage);
     const bool settling = GetTickCount64() < st->taskUsagePollUntilMs;
-    if (!force && !settling && resp == st->lastTaskListJson && lang == st->lastTaskListLang &&
+    if (!force && !settling && !tasksChanged && resp == st->lastTaskListJson && lang == st->lastTaskListLang &&
         !TaskListHasLiveState(resp)) {
         return;
     }
@@ -6930,27 +7041,97 @@ static void RefreshTaskQueueData(DashboardState* st, bool force = false, bool us
         if (st == "pending") return depsSatisfied(jobJson) ? 2 : 3;
         return 4;
     };
-    std::stable_sort(jobs.begin(), jobs.end(), [&](const std::string& a, const std::string& b) {
-        int ra = jobRank(a);
-        int rb = jobRank(b);
-        if (ra != rb) return ra < rb;
-        std::string ca = JsonGetString(a, "created_at", "");
-        std::string cb = JsonGetString(b, "created_at", "");
-        if (!ca.empty() || !cb.empty()) {
-            if (ca != cb) return ca > cb;
+    // Work out each job's sort key once. Reading them inside the comparator re-scanned the job
+    // JSON about n log n times, which got slow with hundreds of jobs.
+    {
+        struct JobSortKey {
+            int rank;
+            std::string createdAt;
+            size_t index;
+        };
+        std::vector<JobSortKey> keys;
+        keys.reserve(jobs.size());
+        for (size_t i = 0; i < jobs.size(); ++i) {
+            keys.push_back({jobRank(jobs[i]), JsonGetString(jobs[i], "created_at", ""), i});
         }
-        return false;
-    });
+        std::stable_sort(keys.begin(), keys.end(), [](const JobSortKey& a, const JobSortKey& b) {
+            if (a.rank != b.rank) return a.rank < b.rank;
+            if (a.createdAt != b.createdAt) return a.createdAt > b.createdAt;
+            return false;
+        });
+        std::vector<std::string> sorted;
+        sorted.reserve(jobs.size());
+        for (const auto& k : keys) sorted.push_back(std::move(jobs[k.index]));
+        jobs = std::move(sorted);
+    }
 
     // Work out every row first; the list is rebuilt only when some row's text differs from last time.
-    std::vector<TaskListRow> rows;  // one entry per job, in the order the list shows them
+    std::vector<nlohmann::json> parsedJobs;
+    parsedJobs.reserve(jobs.size());
+    for (const auto& j : jobs) {
+        nlohmann::json pj = nlohmann::json::parse(j, nullptr, false);
+        if (pj.is_object()) parsedJobs.push_back(std::move(pj));
+    }
+
+    pc::TaskViewCounts newCounts;
+    std::vector<pc::TaskDisplayRow> displayRows = pc::BuildTaskDisplayRows(
+        parsedJobs, st->cachedTasks, st->taskViewMode,
+        st->taskExpandedOverrides, st->taskShowAllJobs, newCounts);
+    st->taskViewCounts = newCounts;
+
+    std::vector<TaskListRow> rows;  // one entry per visible row, in the order the list shows them
     std::unordered_set<std::string> nowRunning;  // jobs running now, to spot the ones that just ended
     std::map<std::string, int> failureCounts;   // failure class -> jobs, for the list caption
     std::map<std::wstring, int> originCounts;   // origin text -> jobs, for the origin filter combo
     std::vector<DashboardState::TaskOriginJob> originJobs;  // the jobs the origin filter keeps
-    rows.reserve(jobs.size());
-    for (const auto& j : jobs) {
+    std::vector<pc::TaskDisplayRow> keptDisplayRows;
+    rows.reserve(displayRows.size());
+    keptDisplayRows.reserve(displayRows.size());
+    for (const auto& drow : displayRows) {
+        if (drow.kind == pc::TaskDisplayRowKind::TaskHeading) {
+            TaskListRow row;
+            row.id = "task:" + drow.taskId;
+            row.indent = drow.indent;
+            row.kind = (drow.taskState == "running") ? "running"
+                     : (drow.taskState == "failed") ? "failed"
+                     : "taskHeading";
+            row.cells[0] = (drow.expanded ? L"\x25BE " : L"\x25B8 ") + Utf8ToWide(drow.taskId);
+            row.cells[1] = Utf8ToWide(drow.taskTitle.empty() ? drow.taskId : drow.taskTitle);
+            row.cells[2] = std::wstring(Tr(L"タスク", L"Task", L"Tarea")) + L" (" + std::to_wstring(drow.jobCount) + L")";
+            row.cells[3] = TaskStateLabelWide(drow.taskState);
+            row.cells[4] = Utf8ToWide(drow.resultsCompact);
+            row.cells[5] = L"-";
+            row.cells[6] = L"-";
+            row.cells[13] = row.cells[1];
+            if (!st->taskSearchText.empty()) {
+                bool matches = false;
+                for (const auto& cell : row.cells) {
+                    if (WideContainsCi(cell, st->taskSearchText)) { matches = true; break; }
+                }
+                if (!matches) continue;
+            }
+            rows.push_back(std::move(row));
+            keptDisplayRows.push_back(drow);
+            continue;
+        }
+        if (drow.kind == pc::TaskDisplayRowKind::MoreJobs) {
+            TaskListRow row;
+            row.id = "more:" + drow.taskId;
+            row.indent = drow.indent;
+            row.kind = "other";
+            row.cells[0] = L"";
+            row.cells[1] = Tr(L"\x2026 ほか ", L"\x2026 ", L"\x2026 ") + std::to_wstring(drow.hiddenJobCount) +
+                           Tr(L" 件 (クリックで展開)", L" more (click to expand)", L" más (clic para expandir)");
+            row.cells[2] = L"...";
+            rows.push_back(std::move(row));
+            keptDisplayRows.push_back(drow);
+            continue;
+        }
+
+        const std::string j = drow.jobJson.dump();
         TaskListRow row;
+        row.indent = drow.indent;
+        row.isSuperseded = drow.isSuperseded;
         std::string jobId = JsonGetString(j, "id", "");
         std::string state = JsonGetString(j, "state", "");
         std::string lastReason = LastAttemptReason(j);
@@ -6987,13 +7168,13 @@ static void RefreshTaskQueueData(DashboardState* st, bool force = false, bool us
         std::wstring summaryStr = Utf8ToWide(JsonGetString(j, "summary", ""));
         std::wstring kindStr;
         if (jobId.rfind("group:", 0) == 0) {
-            summaryStr = Tr(L"[タスクグループ] ", L"[Task Group] ", L"[Grupo de tareas] ") + summaryStr;
-            kindStr = Tr(L"グループ", L"Group", L"Grupo");
+            summaryStr = Tr(L"[BT] ", L"[BT] ", L"[BT] ") + summaryStr;
+            kindStr = L"BT";
         } else if (jobId.rfind("btplan:", 0) == 0) {
-            summaryStr = Tr(L"[グループの予定] ", L"[Group plan] ", L"[Plan del grupo] ") + summaryStr;
-            kindStr = Tr(L"予定 (グループ)", L"Planned (group)", L"Previsto (grupo)");
+            summaryStr = Tr(L"[BT 予定] ", L"[BT Plan] ", L"[Plan BT] ") + summaryStr;
+            kindStr = Tr(L"予定 (BT)", L"Planned (BT)", L"Previsto (BT)");
         } else {
-            kindStr = Tr(L"タスク", L"Task", L"Tarea");
+            kindStr = Tr(L"ジョブ", L"Job", L"Trabajo");
         }
         std::string notes = JsonGetString(j, "notes", "");
         if (!notes.empty()) summaryStr += L"  [notes: " + Utf8ToWide(notes) + L"]";
@@ -7112,9 +7293,25 @@ static void RefreshTaskQueueData(DashboardState* st, bool force = false, bool us
         std::wstring resourcesStr = TaskQueueResourcesDisplay(j);
 
         // Who runs the job (the worker CLI) and the tokens / cost its attempts used.
-        TaskOwnerUsage ownerUsage = TaskOwnerUsageForJob(
-            st->taskUsageFileCache, st->taskAttemptEventsPath,
-            jobId, j, JsonGetString(j, "command", ""), st->initialTaskUsagePending);
+        // A finished job's usage no longer changes, so it is worked out once and kept: looking it up
+        // searches the logs folder for every attempt, which made each refresh slow with many jobs.
+        // A job that was running on the last refresh is left out until the settle window ends,
+        // because its final usage line can land a little after it finishes.
+        const bool usageFinal = (state == "succeeded" || state == "failed" || state == "cancelled" ||
+                                 state == "takenOver" || state == "closed") &&
+                                !settling && !st->initialTaskUsagePending &&
+                                !st->runningTaskJobs.count(jobId);
+        const std::string usageKey = jobId + ":" + std::to_string(attemptsOfRow.size());
+        TaskOwnerUsage ownerUsage;
+        auto finishedUsage = usageFinal ? g_finishedTaskUsage.find(usageKey) : g_finishedTaskUsage.end();
+        if (finishedUsage != g_finishedTaskUsage.end()) {
+            ownerUsage = finishedUsage->second;
+        } else {
+            ownerUsage = TaskOwnerUsageForJob(
+                st->taskUsageFileCache, st->taskAttemptEventsPath,
+                jobId, j, JsonGetString(j, "command", ""), st->initialTaskUsagePending);
+            if (usageFinal) g_finishedTaskUsage[usageKey] = ownerUsage;
+        }
         std::wstring ownerUsageStr;
         if (!ownerUsage.engine.empty()) ownerUsageStr = Utf8ToWide(ownerUsage.engine);
         // Cost first: it is what the column is for, and it stays visible when the cell is narrow.
@@ -7216,6 +7413,28 @@ static void RefreshTaskQueueData(DashboardState* st, bool force = false, bool us
             }
         }
 
+        if (!drow.supersedes.empty()) {
+            if (!depsStr.empty()) depsStr += L" ";
+            depsStr += L"\x21A9 " + Utf8ToWide(pc::ShortJobRef(drow.supersedes)); // ↩
+        }
+        if (!drow.supersededBy.empty()) {
+            if (!depsStr.empty()) depsStr += L" ";
+            depsStr += L"\x2192 " + Utf8ToWide(pc::ShortJobRef(drow.supersededBy)); // →
+        }
+        std::wstring taskColStr;
+        if (!drow.taskTitle.empty() || drow.hasTaskRecord) {
+            taskColStr = Utf8ToWide(drow.taskTitle.empty() ? drow.taskId : drow.taskTitle);
+            if (!drow.taskState.empty()) {
+                taskColStr += L" (" + TaskStateLabelWide(drow.taskState) + L")";
+            }
+        } else if (!drow.taskId.empty() && drow.taskId != jobId) {
+            taskColStr = Utf8ToWide(drow.taskId);
+            if (!drow.taskState.empty()) {
+                taskColStr += L" (" + TaskStateLabelWide(drow.taskState) + L")";
+            }
+        } else {
+            taskColStr = L"-";
+        }
         row.cells[0] = std::move(idStr);
         row.cells[1] = std::move(summaryStr);
         row.cells[2] = std::move(kindStr);
@@ -7229,6 +7448,7 @@ static void RefreshTaskQueueData(DashboardState* st, bool force = false, bool us
         row.cells[10] = std::move(originStr);
         row.cells[11] = std::move(ownerUsageStr);
         row.cells[12] = std::move(resourcesStr);
+        row.cells[13] = std::move(taskColStr);
         if (!row.cells[10].empty()) ++originCounts[row.cells[10]];
         // Virtual BT rows have no origin of their own. An origin filter must never hide the
         // task group a decision belongs to, otherwise a waitingForLlm tree vanishes from the list.
@@ -7246,12 +7466,17 @@ static void RefreshTaskQueueData(DashboardState* st, bool force = false, bool us
         }
         if (!st->taskOriginFilter.empty()) originJobs.push_back({jobId, state, jobPaused});
         rows.push_back(std::move(row));
+        keptDisplayRows.push_back(drow);
     }
     st->taskOriginJobs = std::move(originJobs);
     UpdateTaskOriginCombo(st, originCounts);
 
-    // The header click picks the column, so the order is applied to the rows here.
-    SortTaskRows(rows, st->taskSortColumn, st->taskSortDirection);
+    // The header click picks the column, so in flat Job view sort the rows here.
+    // In 2-level Task view, keep tasks grouped with their children.
+    if (!st->taskViewMode) {
+        SortTaskRows(rows, st->taskSortColumn, st->taskSortDirection);
+    }
+    st->taskDisplayRows = std::move(keptDisplayRows);
 
     std::vector<std::string> newJobIds;
     std::vector<std::string> newJobStates;
@@ -7299,6 +7524,34 @@ static void RefreshTaskQueueData(DashboardState* st, bool force = false, bool us
         ListView_GetItemCount(st->hwndTaskList) == static_cast<int>(newJobIds.size())) {
         return;
     }
+    // Same jobs in the same order (the usual case: only a countdown or a state moved): rewrite
+    // just the cells that changed. Rebuilding every row each refresh was what made the list heavy.
+    if (newJobIds == st->taskJobIds && failureSummary == st->taskFailureSummary &&
+        newRows.size() == st->lastTaskRows.size() &&
+        ListView_GetItemCount(st->hwndTaskList) == static_cast<int>(newJobIds.size())) {
+        bool fitColumnGrew = false;
+        for (size_t i = 0; i < newRows.size(); ++i) {
+            if (newRows[i] == st->lastTaskRows[i]) continue;
+            st->lastTaskRows[i] = std::move(newRows[i]);
+            const int row = static_cast<int>(i / kTaskListColumns);
+            const int col = static_cast<int>(i % kTaskListColumns);
+            ListView_SetItemText(st->hwndTaskList, row, col, st->lastTaskRows[i].data());
+            // Widen a fit column when its new text no longer fits. Shrinking waits for a full rebuild,
+            // so this does not measure every row on every tick.
+            for (int k = 0; k < 4; ++k) {
+                if (kTaskFitCols[k] != col || st->taskFitColW[k] <= 0) continue;
+                const int need = (std::min)(
+                    ListView_GetStringWidth(st->hwndTaskList, st->lastTaskRows[i].c_str()) + 18,
+                    kTaskFitColMax[k]);
+                if (need > st->taskFitColW[k]) {
+                    st->taskFitColW[k] = need;
+                    fitColumnGrew = true;
+                }
+            }
+        }
+        if (fitColumnGrew) UpdateTaskListColumnWidths(st);
+        return;
+    }
     st->taskFailureSummary = std::move(failureSummary);
 
     // Rebuilding the list drops the highlight, so remember every selected job and select them again.
@@ -7323,9 +7576,10 @@ static void RefreshTaskQueueData(DashboardState* st, bool force = false, bool us
     for (int row = 0; row < static_cast<int>(st->taskJobIds.size()); ++row) {
         std::wstring* cells = &st->lastTaskRows[static_cast<size_t>(row) * kTaskListColumns];
         LVITEMW lvi = {};
-        lvi.mask = LVIF_TEXT;
+        lvi.mask = LVIF_TEXT | LVIF_INDENT;
         lvi.iItem = row;
         lvi.iSubItem = 0;
+        lvi.iIndent = (row < static_cast<int>(rows.size())) ? rows[row].indent : 0;
         lvi.pszText = cells[0].data();
         ListView_InsertItem(st->hwndTaskList, &lvi);
         for (int col = 1; col < kTaskListColumns; ++col) {
@@ -7806,10 +8060,6 @@ static void RefreshDashboardData(DashboardState* st) {
     }
 }
 
-// Columns of the task list sized to their text: ID, State, Start, End.
-static constexpr int kTaskFitCols[4] = {0, 3, 5, 6};
-static constexpr int kTaskFitColMax[4] = {220, 200, 110, 280};
-
 // Measures the widest text (header included) of each fit column. Returns true when a width
 // changed enough to lay the columns out again; small shrinks are ignored so the columns do
 // not wobble as the remaining time ticks down.
@@ -7866,17 +8116,17 @@ static void UpdateTaskListColumnWidths(DashboardState* st) {
     // (Resources) takes the rounding remainder.
     widths[1] = rest * 45 / 100;
     int other = rest - widths[1];
-    // Triage, Running, Depends, Queue, Origin, Owner / Cost, Resources.
-    constexpr int kFlex[7] = {4, 7, 8, 9, 10, 11, 12};
-    const int base[7] = {150, 190, 110, 62, 150, 140, 200};
+    // Triage, Running, Depends, Queue, Origin, Owner / Cost, Resources, Task.
+    constexpr int kFlex[8] = {4, 7, 8, 9, 10, 11, 12, 13};
+    const int base[8] = {150, 190, 110, 62, 150, 140, 180, 150};
     int baseSum = 0;
     for (int b : base) baseSum += b;
     int assigned = 0;
-    for (int k = 0; k < 6; ++k) {
+    for (int k = 0; k < 7; ++k) {
         widths[kFlex[k]] = static_cast<int>(static_cast<int64_t>(other) * base[k] / baseSum);
         assigned += widths[kFlex[k]];
     }
-    widths[kFlex[6]] = other - assigned;
+    widths[kFlex[7]] = other - assigned;
 
     for (int i = 0; i < kTaskListColumns; ++i) ListView_SetColumnWidth(st->hwndTaskList, i, widths[i]);
 }
@@ -8336,6 +8586,21 @@ static void LayoutControls(DashboardState* st, int width, int height) {
                         st->hwndSearchProcEdit, st->showProcSearch);
     st->taskCaptionExtraLeft = layoutCaptionSearch(st->rcTaskCaption, TaskListCaptionText(), st->hwndSearchTaskBtn,
                                                    st->hwndSearchTaskEdit, st->showTaskSearch);
+    if (st->hwndBtnTaskViewMode) {
+        const int capH = st->rcTaskCaption.bottom - st->rcTaskCaption.top;
+        const int bw = 84;
+        const int bh = (std::max)(18, capH - 4);
+        if (capH > 0 && st->taskCaptionExtraLeft + bw + 8 <= st->rcTaskCaption.right) {
+            SetWindowTextW(st->hwndBtnTaskViewMode,
+                st->taskViewMode ? Tr(L"タスク表示", L"Tasks", L"Tareas")
+                                 : Tr(L"ジョブ表示", L"Jobs", L"Trabajos"));
+            MoveWindow(st->hwndBtnTaskViewMode, st->taskCaptionExtraLeft, st->rcTaskCaption.top + 2, bw, bh, TRUE);
+            ShowWindow(st->hwndBtnTaskViewMode, SW_SHOW);
+            st->taskCaptionExtraLeft += bw + 8;
+        } else {
+            ShowWindow(st->hwndBtnTaskViewMode, SW_HIDE);
+        }
+    }
     // The origin combo follows the task search edit while the search bar is open.
     if (st->hwndTaskOriginCombo) {
         const int capH = st->rcTaskCaption.bottom - st->rcTaskCaption.top;
@@ -8407,6 +8672,14 @@ static void ApplySplitterDragLayout(HWND hwnd, DashboardState* st, POINT pt) {
             GetWindowRect(st->hwndSearchTaskBtn, &rcBtn);
             MapWindowPoints(nullptr, hwnd, reinterpret_cast<POINT*>(&rcBtn), 2);
             hdwp = DeferWindowPos(hdwp, st->hwndSearchTaskBtn, nullptr, rcBtn.left, taskTop + 2,
+                                  rcBtn.right - rcBtn.left, rcBtn.bottom - rcBtn.top,
+                                  SWP_NOZORDER | SWP_NOACTIVATE | SWP_NOCOPYBITS);
+        }
+        if (hdwp && st->hwndBtnTaskViewMode && IsWindowVisible(st->hwndBtnTaskViewMode)) {
+            RECT rcBtn = {};
+            GetWindowRect(st->hwndBtnTaskViewMode, &rcBtn);
+            MapWindowPoints(nullptr, hwnd, reinterpret_cast<POINT*>(&rcBtn), 2);
+            hdwp = DeferWindowPos(hdwp, st->hwndBtnTaskViewMode, nullptr, rcBtn.left, taskTop + 2,
                                   rcBtn.right - rcBtn.left, rcBtn.bottom - rcBtn.top,
                                   SWP_NOZORDER | SWP_NOACTIVATE | SWP_NOCOPYBITS);
         }
@@ -10008,6 +10281,7 @@ struct LlmStreamDlgState {
     bool treeMode = false;                  // sub-agents present: time-ordered tree instead of newest-first
     bool rebuilding = false;                // true while the list is being refilled (ignore its notifications)
     std::string goalJobKey;            // cache of the task queue job used for the goal / end condition
+    std::string selectedTaskId;        // selected TaskHeading row id, when showing task intent & log
     std::string goalJobSummary;
     std::wstring goalJobSuccess;       // "exit 0, output /re/ ..."
     std::wstring goalJobResources;     // "write: ... / read: ..." or "(none)"
@@ -11451,6 +11725,82 @@ static void ReloadStreamDialogData(HWND hwnd, LlmStreamDlgState* ds) {
             }
         }
 
+        if (!foundJob && !ds->selectedTaskId.empty() && ds->dash) {
+            std::string tErr;
+            std::string taskResp = TaskShowIpc(ds->dash, ds->selectedTaskId, 200, tErr);
+            nlohmann::json tj = nlohmann::json::parse(taskResp, nullptr, false);
+            if (tj.is_object() && tj.value("ok", false) && tj.contains("task") && tj["task"].is_object()) {
+                const auto& rec = tj["task"];
+                const auto& status = tj.value("status", nlohmann::json::object());
+                const std::string title = rec.value("title", ds->selectedTaskId);
+                const std::string intent = rec.value("intent", std::string());
+                const std::string state = status.value("state", std::string());
+
+                std::wstringstream hdr;
+                hdr << Tr(L"タスクID: ", L"Task ID: ", L"ID de tarea: ") << Utf8ToWide(ds->selectedTaskId)
+                    << L"  |  " << TaskStateLabelWide(state) << L"\r\n";
+                hdr << Tr(L"タイトル: ", L"Title: ", L"Título: ") << Utf8ToWide(title) << L"\r\n";
+                if (rec.contains("closed") && rec["closed"].is_object()) {
+                    const auto& cl = rec["closed"];
+                    hdr << Tr(L"クローズ: ", L"Closed: ", L"Cerrada: ")
+                        << Utf8ToWide(cl.value("result", std::string())) << L" — "
+                        << Utf8ToWide(cl.value("reason", std::string())) << L"\r\n";
+                }
+                hdr << Tr(L"意図: ", L"Intent: ", L"Intención: ")
+                    << (intent.empty() ? Tr(L"(なし)", L"(none)", L"(ninguno)") : Utf8ToWide(intent));
+                if (ds->hwndHeader) {
+                    SetWindowTextW(ds->hwndHeader, hdr.str().c_str());
+                }
+
+                std::wstringstream preview;
+                preview << Tr(L"=== タスク意図 ===", L"=== Task Intent ===", L"=== Intención de tarea ===") << L"\r\n"
+                        << (intent.empty() ? Tr(L"(なし)", L"(none)", L"(ninguno)") : Utf8ToWide(intent))
+                        << L"\r\n\r\n"
+                        << Tr(L"=== 経過ログ ===", L"=== Task Log ===", L"=== Registro ===") << L"\r\n";
+
+                if (ds->hwndList) {
+                    SendMessageW(ds->hwndList, WM_SETREDRAW, FALSE, 0);
+                    ListView_DeleteAllItems(ds->hwndList);
+                    const auto& logArr = tj.value("log", nlohmann::json::array());
+                    int rowIdx = 0;
+                    for (const auto& entry : logArr) {
+                        if (!entry.is_object()) continue;
+                        const std::string at = entry.value("at", std::string());
+                        const std::string kind = entry.value("kind", std::string());
+                        const std::string job = entry.value("job", std::string());
+                        const std::string bt = entry.value("bt", std::string());
+                        const std::string text = entry.value("text", std::string());
+                        std::wstring timeW = Utf8ToWide(TimeOfDayText(at));
+                        std::wstring kindW = Utf8ToWide(kind);
+                        std::wstring detailW;
+                        if (!job.empty()) detailW += L"[" + Utf8ToWide(job) + L"] ";
+                        if (!bt.empty()) detailW += L"[BT:" + Utf8ToWide(bt) + L"] ";
+                        detailW += Utf8ToWide(text);
+
+                        LVITEMW lvi = {};
+                        lvi.mask = LVIF_TEXT;
+                        lvi.iItem = rowIdx;
+                        lvi.iSubItem = 0;
+                        lvi.pszText = timeW.data();
+                        ListView_InsertItem(ds->hwndList, &lvi);
+                        ListView_SetItemText(ds->hwndList, rowIdx, 1, const_cast<wchar_t*>(L""));
+                        ListView_SetItemText(ds->hwndList, rowIdx, 2, kindW.data());
+                        ListView_SetItemText(ds->hwndList, rowIdx, 3, detailW.data());
+                        ++rowIdx;
+
+                        preview << timeW << L" [" << kindW << L"] " << detailW << L"\r\n";
+                    }
+                    SendMessageW(ds->hwndList, WM_SETREDRAW, TRUE, 0);
+                    InvalidateRect(ds->hwndList, nullptr, FALSE);
+                }
+                if (ds->hwndEditPreview) {
+                    SetWindowTextW(ds->hwndEditPreview, preview.str().c_str());
+                }
+                ds->lastEventCount = 0;
+                ds->lastEventSeq = 0;
+                return;
+            }
+        }
         if (!foundJob) {
             if (ds->wsClient) {
                 ds->wsClient->Close();
@@ -12240,8 +12590,10 @@ static void EnsureStreamPane(DashboardState* st) {
 static void SyncStreamPane(DashboardState* st) {
     if (!st || !st->streamPane || !st->hwndStreamPane || !IsWindowVisible(st->hwndStreamPane)) return;
     LlmStreamDlgState* ds = st->streamPane;
-    if (ds->procId == st->selectedProcId && ds->goalJobKey == st->selectedJobKey) return;
+    if (ds->procId == st->selectedProcId && ds->goalJobKey == st->selectedJobKey &&
+        ds->selectedTaskId == st->selectedTaskId) return;
     ds->procId = st->selectedProcId;
+    ds->selectedTaskId = st->selectedTaskId;
     ds->lastEventCount = static_cast<size_t>(-1);  // force the list to rebuild
     if (ds->hwndEditPreview) SetWindowTextW(ds->hwndEditPreview, L"");
     ReloadStreamDialogData(st->hwndStreamPane, ds);
@@ -12562,6 +12914,7 @@ static void LoadShellConfig(DashboardState* st) {
     st->hideEndedProcesses = JsonGetBool(content, "hide_ended", false);
     st->hideProcessList = JsonGetBool(content, "hide_process_list", false);
     st->hideTerminalGrid = JsonGetBool(content, "hide_terminal_grid", true);
+    st->taskViewMode = JsonGetBool(content, "task_view_mode", true);
     st->notifyTerminalSessions = JsonGetBool(content, "terminal_notify", true);
     // The standalone dashboard no longer embeds the WCSP client. Terminals are
     // shown by the separate terminal client window (Hancho.exe terminal).
@@ -12749,6 +13102,7 @@ static void SaveShellConfig(const DashboardState* st) {
         << "  \"memory_max_bytes\": " << st->memoryMaxBytes << ",\n"
         << "  \"process_list_font_px\": " << st->processListFontPx << ",\n"
         << "  \"task_list_font_px\": " << st->taskListFontPx << ",\n"
+        << "  \"task_view_mode\": " << (st->taskViewMode ? "true" : "false") << ",\n"
         << "  \"display_scale_dpi\": " << st->displayScaleDpi << ",\n"
        << "  \"show_supervisor_hints\": " << (st->showSupervisorHints ? "true" : "false") << ",\n"
        << "  \"hint_auto_dismiss_sec\": " << st->hintAutoDismissSec << ",\n"
@@ -18260,6 +18614,19 @@ static std::wstring TriageOutcomeText(const nlohmann::json& card) {
     return text;
 }
 
+// Card times are local "YYYY-MM-DD HH:MM:SS". Drop the year when it is this year so the
+// column stays narrow; other years keep the full text.
+static std::wstring TriageTimeText(const std::string& stamp) {
+    std::wstring text = Utf8ToWide(stamp);
+    if (text.size() > 5 && text[4] == L'-') {
+        time_t now = time(nullptr);
+        struct tm lt = {};
+        localtime_s(&lt, &now);
+        if (text.compare(0, 4, std::to_wstring(lt.tm_year + 1900)) == 0) text.erase(0, 5);
+    }
+    return text;
+}
+
 static std::wstring TriageColumnText(const nlohmann::json& card, int column) {
     switch (column) {
     case 0: return TriageCardStatusLabel(card);
@@ -18271,8 +18638,8 @@ static std::wstring TriageColumnText(const nlohmann::json& card, int column) {
     case 6: return TriageDecisionText(card);
     case 7: return TriageOutcomeText(card);
     case 8: return TriageReviewStatus(card);
-    case 9: return Utf8ToWide(card.value("createdAt", std::string()));
-    case 10: return Utf8ToWide(card.value("updatedAt", card.value("createdAt", std::string())));
+    case 9: return TriageTimeText(card.value("createdAt", std::string()));
+    case 10: return TriageTimeText(card.value("updatedAt", card.value("createdAt", std::string())));
     default: return L"";
     }
 }
@@ -18800,8 +19167,8 @@ static void TriageReload(TriageDlgState* ds, const nlohmann::json* response = nu
         cells.push_back(TriageDecisionText(card));
         cells.push_back(TriageOutcomeText(card));
         cells.push_back(TriageReviewStatus(card));
-        cells.push_back(Utf8ToWide(card.value("createdAt", std::string())));
-        cells.push_back(Utf8ToWide(card.value("updatedAt", card.value("createdAt", std::string()))));
+        cells.push_back(TriageTimeText(card.value("createdAt", std::string())));
+        cells.push_back(TriageTimeText(card.value("updatedAt", card.value("createdAt", std::string()))));
         return cells;
     };
     std::vector<std::string> newIds(ds->rows.size());
@@ -19244,8 +19611,14 @@ static LRESULT CALLBACK TriageWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM
         MemoryListAddColumn(ds->list, 6, Tr(L"判断", L"Decision", L"Decisión"), 210);
         MemoryListAddColumn(ds->list, 7, Tr(L"結果", L"Outcome", L"Resultado"), 260);
         MemoryListAddColumn(ds->list, 8, Tr(L"確認", L"Review", L"Revisión"), 85);
-        MemoryListAddColumn(ds->list, 9, Tr(L"発生", L"Created", L"Creado"), 140);
-        MemoryListAddColumn(ds->list, 10, Tr(L"更新", L"Updated", L"Actualizado"), 140);
+        MemoryListAddColumn(ds->list, 9, Tr(L"発生", L"Created", L"Creado"), 115);
+        MemoryListAddColumn(ds->list, 10, Tr(L"更新", L"Updated", L"Actualizado"), 115);
+        {
+            // Show the issue time first so each card reads in time order; the column
+            // indexes (sorting, cell text) stay the same, only the display order changes.
+            int order[11] = {9, 0, 1, 2, 3, 4, 5, 6, 7, 8, 10};
+            ListView_SetColumnOrderArray(ds->list, 11, order);
+        }
         ListView_SetBkColor(ds->list, g_theme.panel); ListView_SetTextBkColor(ds->list, g_theme.panel); ListView_SetTextColor(ds->list, g_theme.listText);
         ds->infoLabel = CreateWindowExW(0, L"STATIC",
             Tr(L"■ 情報（要約・目的・原因・背景・環境・条件・理由）", L"■ Information (summary, intent, cause, background, environment, conditions, reason)",
@@ -20762,6 +21135,9 @@ static LRESULT CALLBACK DashboardWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPA
                 WS_CHILD | BS_OWNERDRAW, 0, 0, 24, 20, hwnd, (HMENU)IDC_BTN_SEARCH_PROC, nullptr, nullptr);
             st->hwndSearchTaskBtn = CreateWindowExW(0, L"BUTTON", L"🔍",
                 WS_CHILD | BS_OWNERDRAW, 0, 0, 24, 20, hwnd, (HMENU)IDC_BTN_SEARCH_TASK, nullptr, nullptr);
+            st->hwndBtnTaskViewMode = CreateWindowExW(0, L"BUTTON",
+                Tr(L"タスク表示", L"Tasks", L"Tareas"),
+                WS_CHILD | BS_OWNERDRAW, 0, 0, 84, 20, hwnd, (HMENU)IDC_BTN_TASK_VIEW_MODE, nullptr, nullptr);
             st->hwndSearchProcEdit = CreateWindowExW(WS_EX_CLIENTEDGE, L"EDIT", L"",
                 WS_CHILD | ES_AUTOHSCROLL, 0, 0, 160, 20, hwnd, (HMENU)IDC_EDIT_SEARCH_PROC, nullptr, nullptr);
             st->hwndSearchTaskEdit = CreateWindowExW(WS_EX_CLIENTEDGE, L"EDIT", L"",
@@ -20872,7 +21248,7 @@ static LRESULT CALLBACK DashboardWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPA
             ListView_SetTextBkColor(st->hwndTaskList, g_theme.panel);
             ListView_SetTextColor(st->hwndTaskList, g_theme.listText);
             {
-                const int taskDefaultWidths[kTaskListColumns] = {90, 350, 104, 100, 150, 105, 115, 190, 110, 82, 150, 140, 200};
+                const int taskDefaultWidths[kTaskListColumns] = {90, 320, 104, 100, 150, 105, 115, 190, 110, 82, 150, 140, 180, 160};
                 for (int i = 0; i < kTaskListColumns; ++i) {
                     LVCOLUMNW lvc = {};
                     lvc.mask = LVCF_TEXT | LVCF_WIDTH | LVCF_SUBITEM;
@@ -20907,7 +21283,7 @@ static LRESULT CALLBACK DashboardWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPA
                 st->hwndBtnGridView,
                 st->hwndBtnToggleList, st->hwndBtnToggleTerm, st->hwndBtnTermSessions, st->hwndBtnStreamPane, st->hwndBtnBtView, st->hwndBtnHideTray, st->hwndBtnRefresh,
                 st->hwndBtnReevalPlanned, st->hwndBtnHint, st->hwndBtnHistory, st->hwndBtnIpmsg, st->hwndClock,
-                st->hwndBtnViewTasks, st->hwndList, st->hwndTaskList, st->hwndTab
+                st->hwndBtnViewTasks, st->hwndBtnTaskViewMode, st->hwndList, st->hwndTaskList, st->hwndTab
             };
             for (HWND h : uiCtrls) {
                 if (h) SendMessageW(h, WM_SETFONT, (WPARAM)st->hFontUi, TRUE);
@@ -21352,6 +21728,7 @@ static LRESULT CALLBACK DashboardWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPA
                 else if (dis->hwndItem == st->hwndBtnToggleTerm) latched = !st->hideTerminalGrid;
                 else if (dis->hwndItem == st->hwndSearchProcBtn) latched = st->showProcSearch;
                 else if (dis->hwndItem == st->hwndSearchTaskBtn) latched = st->showTaskSearch;
+                else if (dis->hwndItem == st->hwndBtnTaskViewMode) latched = st->taskViewMode;
             }
             bool pressed = (dis->itemState & ODS_SELECTED) != 0 || latched;
             COLORREF bg = pressed ? g_theme.border : g_theme.panel;
@@ -21493,6 +21870,15 @@ static LRESULT CALLBACK DashboardWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPA
                 }
             } else if (id == IDC_BTN_REEVAL_PLANNED) {
                 RefreshTaskQueueData(st, true);
+            } else if (id == IDC_BTN_TASK_VIEW_MODE) {
+                st->taskViewMode = !st->taskViewMode;
+                if (st->hwndBtnTaskViewMode) {
+                    SetWindowTextW(st->hwndBtnTaskViewMode,
+                        st->taskViewMode ? Tr(L"タスク表示", L"Tasks", L"Tareas")
+                                         : Tr(L"ジョブ表示", L"Jobs", L"Trabajos"));
+                }
+                SaveShellConfig(st);
+                RefreshTaskQueueData(st, true);
             } else if (id == IDC_BTN_STREAM_PANE) {
                 st->showStreamPane = !st->showStreamPane;
                 if (st->showStreamPane && st->hideProcessList) st->hideProcessList = false;
@@ -21624,11 +22010,27 @@ static LRESULT CALLBACK DashboardWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPA
                         RefreshTaskQueueData(st, true);
                     }
                 } else if (nmhdr->code == LVN_ITEMCHANGED) {
-                    // Selecting a task shows its process in the monitor pane below.
+                    // Selecting a task or job shows its details in the monitor pane below.
                     auto* nmlv = reinterpret_cast<NMLISTVIEW*>(lParam);
                     bool newlySelected = (nmlv->uNewState & LVIS_SELECTED) && !(nmlv->uOldState & LVIS_SELECTED);
                     int idx = nmlv->iItem;
-                    if (newlySelected && idx >= 0 && idx < static_cast<int>(st->taskJobIds.size())) {
+                    if (newlySelected && idx >= 0 && idx < static_cast<int>(st->taskDisplayRows.size())) {
+                        const auto& drow = st->taskDisplayRows[idx];
+                        if (drow.kind == pc::TaskDisplayRowKind::TaskHeading) {
+                            st->selectedTaskId = drow.taskId;
+                            st->selectedJobKey.clear();
+                            st->selectedProcId = 0;
+                            SyncStreamPane(st);
+                        } else if (drow.kind == pc::TaskDisplayRowKind::Job) {
+                            st->selectedTaskId.clear();
+                            st->selectedJobKey = drow.jobId;
+                            int pid = (idx < static_cast<int>(st->taskJobProcIds.size())) ? st->taskJobProcIds[idx] : 0;
+                            st->selectedProcId = pid;
+                            st->lastFollowedProcId = pid;
+                            SyncStreamPane(st);
+                        }
+                    } else if (newlySelected && idx >= 0 && idx < static_cast<int>(st->taskJobIds.size())) {
+                        st->selectedTaskId.clear();
                         std::string jobId = st->taskJobIds[idx];
                         st->selectedJobKey = jobId;
                         int pid = (idx < static_cast<int>(st->taskJobProcIds.size())) ? st->taskJobProcIds[idx] : 0;
@@ -21636,26 +22038,52 @@ static LRESULT CALLBACK DashboardWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPA
                         st->lastFollowedProcId = pid;
                         SyncStreamPane(st);
                     }
+                } else if (nmhdr->code == NM_CLICK) {
+                    auto* nmia = reinterpret_cast<NMITEMACTIVATE*>(lParam);
+                    int idx = nmia->iItem;
+                    if (idx >= 0 && idx < static_cast<int>(st->taskDisplayRows.size())) {
+                        const auto& drow = st->taskDisplayRows[idx];
+                        if (drow.kind == pc::TaskDisplayRowKind::TaskHeading && nmia->iSubItem == 0) {
+                            st->taskExpandedOverrides[drow.taskId] = !drow.expanded;
+                            RefreshTaskQueueData(st, true);
+                        } else if (drow.kind == pc::TaskDisplayRowKind::MoreJobs) {
+                            st->taskShowAllJobs.insert(drow.taskId);
+                            RefreshTaskQueueData(st, true);
+                        }
+                    }
                 } else if (nmhdr->code == NM_RCLICK) {
                     auto* nmia = reinterpret_cast<NMITEMACTIVATE*>(lParam);
                     int idx = nmia->iItem;
                     if (idx >= 0 && idx < static_cast<int>(st->taskJobIds.size())) {
-                        // Keep a multi-selection when the clicked row is already selected;
-                        // otherwise make the clicked row the only selection.
-                        if (!(ListView_GetItemState(st->hwndTaskList, idx, LVIS_SELECTED) & LVIS_SELECTED)) {
-                            ListView_SetItemState(st->hwndTaskList, -1, 0, LVIS_SELECTED);
-                            ListView_SetItemState(st->hwndTaskList, idx, LVIS_SELECTED | LVIS_FOCUSED,
-                                                  LVIS_SELECTED | LVIS_FOCUSED);
+                        const bool isJob = (idx >= static_cast<int>(st->taskDisplayRows.size())) ||
+                                           (st->taskDisplayRows[idx].kind == pc::TaskDisplayRowKind::Job);
+                        if (isJob) {
+                            // Keep a multi-selection when the clicked row is already selected;
+                            // otherwise make the clicked row the only selection.
+                            if (!(ListView_GetItemState(st->hwndTaskList, idx, LVIS_SELECTED) & LVIS_SELECTED)) {
+                                ListView_SetItemState(st->hwndTaskList, -1, 0, LVIS_SELECTED);
+                                ListView_SetItemState(st->hwndTaskList, idx, LVIS_SELECTED | LVIS_FOCUSED,
+                                                      LVIS_SELECTED | LVIS_FOCUSED);
+                            }
+                            POINT ptScreen = {};
+                            GetCursorPos(&ptScreen);
+                            std::wstring cell = TaskListCellText(st->hwndTaskList, idx, nmia->iSubItem);
+                            ShowTaskQueueContextMenu(st, st->taskJobIds[idx], ptScreen, cell);
                         }
-                        POINT ptScreen = {};
-                        GetCursorPos(&ptScreen);
-                        std::wstring cell = TaskListCellText(st->hwndTaskList, idx, nmia->iSubItem);
-                        ShowTaskQueueContextMenu(st, st->taskJobIds[idx], ptScreen, cell);
                     }
                 } else if (nmhdr->code == NM_DBLCLK) {
                     auto* nmia = reinterpret_cast<NMITEMACTIVATE*>(lParam);
                     int idx = nmia->iItem;
-                    if (idx >= 0 && idx < static_cast<int>(st->taskJobIds.size())) {
+                    if (idx >= 0 && idx < static_cast<int>(st->taskDisplayRows.size()) &&
+                        st->taskDisplayRows[idx].kind == pc::TaskDisplayRowKind::TaskHeading) {
+                        const auto& drow = st->taskDisplayRows[idx];
+                        st->taskExpandedOverrides[drow.taskId] = !drow.expanded;
+                        RefreshTaskQueueData(st, true);
+                    } else if (idx >= 0 && idx < static_cast<int>(st->taskDisplayRows.size()) &&
+                               st->taskDisplayRows[idx].kind == pc::TaskDisplayRowKind::MoreJobs) {
+                        st->taskShowAllJobs.insert(st->taskDisplayRows[idx].taskId);
+                        RefreshTaskQueueData(st, true);
+                    } else if (idx >= 0 && idx < static_cast<int>(st->taskJobIds.size())) {
                         if (nmia->iSubItem == 3) {
                             auto triage = st->triageJobs.find(st->taskJobIds[idx]);
                             if (triage != st->triageJobs.end())
@@ -21718,8 +22146,14 @@ static LRESULT CALLBACK DashboardWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPA
                         } else if (kind == "takenOver") {
                             // Close to cancelled/idle, but tinted so it is distinguishable.
                             lvcd->clrTextBk = BlendColor(MutedRowColor(g_theme.rowIdle), g_theme.accent, 0.30f);
+                        } else if (kind == "taskHeading") {
+                            lvcd->clrTextBk = BlendColor(g_theme.panel, g_theme.accent, 0.08f);
                         } else {
                             lvcd->clrTextBk = g_theme.panel;
+                        }
+                        if (idx >= 0 && idx < static_cast<int>(st->taskDisplayRows.size()) &&
+                            st->taskDisplayRows[idx].isSuperseded) {
+                            lvcd->clrText = g_theme.muted;
                         }
                         if (idx >= 0 && idx < static_cast<int>(st->taskJobIds.size()) &&
                             IsEndBlinkOn(st, st->taskEndBlinkUntil, st->taskJobIds[idx])) {

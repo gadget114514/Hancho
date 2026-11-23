@@ -251,6 +251,11 @@
           <input type="text" id="input-tq-search" placeholder="Filter jobs by key, name, queue, command...">
         </div>
 
+        <div class="filter-pills" id="tq-view-mode-pills" style="margin-right: 8px;">
+          <button class="pill active" data-view="jobs">Jobs</button>
+          <button class="pill" data-view="tasks">Tasks</button>
+        </div>
+
         <div class="filter-pills" id="tq-filter-pills">
           <button class="pill active" data-filter="all">All</button>
           <button class="pill" data-filter="running">Running</button>
@@ -267,6 +272,7 @@
             <tr>
               <th style="width: 110px;">State</th>
               <th style="width: 170px;">Job Key / ID</th>
+              <th style="width: 160px;">Task</th>
               <th style="width: 180px;">Name</th>
               <th style="width: 110px;">Queue</th>
               <th>Command</th>
@@ -279,7 +285,7 @@
             </tr>
           </thead>
           <tbody id="tq-tbody">
-            <tr class="empty-row"><td colspan="11">Loading task queue...</td></tr>
+            <tr class="empty-row"><td colspan="12">Loading task queue...</td></tr>
           </tbody>
         </table>
       </div>
@@ -645,6 +651,23 @@
         <div class="modal-footer" id="job-modal-footer">
           <button id="btn-job-modal-retry" class="btn btn-primary">Retry</button>
           <button id="btn-job-modal-cancel" class="btn btn-danger">Cancel</button>
+          <button class="btn modal-close-btn">Close</button>
+        </div>
+      </div>
+    </div>
+
+    <!-- MODAL: TASK DETAILS -->
+    <div id="modal-task-details" class="modal hidden">
+      <div class="modal-backdrop"></div>
+      <div class="modal-dialog modal-lg">
+        <div class="modal-header">
+          <h3 id="task-modal-title">Task Details</h3>
+          <button class="btn-close modal-close-btn">&times;</button>
+        </div>
+        <div class="modal-body" id="task-modal-body">
+          <!-- Filled dynamically -->
+        </div>
+        <div class="modal-footer">
           <button class="btn modal-close-btn">Close</button>
         </div>
       </div>

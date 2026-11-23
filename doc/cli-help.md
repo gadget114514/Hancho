@@ -389,8 +389,15 @@ LEAVING HANCHO (graduation):
   per-release review of that table.
 
 TASK QUEUE:
+  run --file <jobs.json> [--taskqueue <name>] [--exit-on-drain] [--report <junit.xml>] [--count-superseded]
+      CI one-shot: register the queue, wait until no job is pending or running, write a
+      JUnit report, then exit 0 (all succeeded), 1 (failure/blocked) or 2 (cancelled/
+      interrupted). --report implies waiting. By default, superseded jobs (jobs with
+      superseded_by) are excluded from the exit code and JUnit report; pass
+      --count-superseded to include all jobs.
+
   taskqueue add --file <jobs.json> [--taskqueue <name>] [--concurrency <n>] [--notify-file <path>]
-                [--origin-label <text>]
+                [--origin-label <text>] [--task <id>]
       Register jobs (array, or an object with "jobs"/"taskqueue"/"concurrency").
       Each job records its origin: the caller's session id (CLAUDE_CODE_SESSION_ID
       or PC_ORIGIN_SESSION), working folder and pid, plus --origin-label (or
@@ -407,7 +414,7 @@ TASK QUEUE:
       overlapping card) goes back to pending after delaySec without using up
       maxAttempts; after limit deferrals (0 = no limit) it is an ordinary failure.
 
-  taskqueue list [<name>] [--state <state>] [--since <period>] [--origin <self|label|session>] [--bt <id>]
+  taskqueue list [<name>] [--state <state>] [--since <period>] [--origin <self|label|session>] [--bt <id>] [--task <id>] [--no-planned]
       List jobs with state, queue, summary and blockedBy. --since keeps only
       jobs updated within the period (30m, 6h, 2d), e.g. --since 6h.
       --state waiting also matches waitingForLlm and paused task groups (waiting, awaiting, awaiting_decision are aliases).
@@ -420,6 +427,9 @@ TASK QUEUE:
       Retry every failed job at once, optionally only one queue and only jobs
       that failed within the period, e.g. `taskqueue retry --failed --since 6h`
       retries the failures of the last 6 hours. Blocked dependents resume.
+  taskqueue supersede <id> --reason "..." [--id <newId>] [--command ...] [--summary ...] [--timeout-sec N] [--instructions-file ...] [--patch <json>]
+      Clone a finished, unsuccessful non-BT job into a new job with changes,
+      linking it with supersedes and reason on the same queue and task.
   taskqueue cancel <id>
   taskqueue takeover --id <id> --reason "..."    (record that the supervisor takes the job over)
   taskqueue complete --id <id> --reason "..." [--report <path>] [--result succeeded|failed]
@@ -433,8 +443,18 @@ TASK QUEUE:
   taskqueue purge [<name>] --older-than-days <N>   (finished jobs not updated for N days; all queues if <name> omitted)
   reset [--yes]                                    (delete ALL project data in the data directory; lists targets without --yes; refused while running)
 
+TASKS (group jobs and behavior trees under a shared intent and progress log):
+  task create --title "..." [--intent "..." | --intent-file <path>] [--id <id>] [--json]
+  task show <id> [--log-limit N] [--json]
+  task list [--state open|running|failed|cancelled|succeeded|closed] [--limit N] [--json]
+  task note <id> --text "..."
+  task close <id> --result succeeded|failed --reason "..."
+  task reopen <id> --reason "..."
+  task purge --older-than <sec>
+  task wait <id> [--timeout-ms N]
+
 BEHAVIOR TREES (for LLM agents; next step depends on results):
-  bt validate|start --file <bt.json>    Check / register and run a behavior tree
+  bt validate|start --file <bt.json> [--task <id>]    Check / register and run a behavior tree
   bt validate --file <bt.json> [--strict]
       Check a tree without running it. warnings[] are returned as warnings;
       --strict turns every warning into an error (ok/valid = false).
@@ -561,8 +581,10 @@ SETUP FOR LLM AGENTS:
                   send_process_input, wait_process, kill_process
       Worker:     run_worker, wait_worker, get_worker_stream, get_worker_state,
                   update_worker_info, worker_probe, worker_health
+      Task:       task_create, task_show, task_list, task_note, task_close,
+                  task_reopen, task_purge, task_wait
       Task queue: taskqueue_add, taskqueue_list, taskqueue_get, taskqueue_retry,
-                  taskqueue_update, taskqueue_cancel, taskqueue_pause, taskqueue_resume,
+                  taskqueue_supersede, taskqueue_update, taskqueue_cancel, taskqueue_pause, taskqueue_resume,
                   taskqueue_pause_job, taskqueue_resume_job, taskqueue_wait,
                   taskqueue_purge, taskqueue_link, taskqueue_unlink, taskqueue_graph
       Behavior tree: bt_validate (strict), bt_template (name), bt_start, bt_get,

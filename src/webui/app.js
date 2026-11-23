@@ -35,6 +35,9 @@
 
     // Task Queue
     jobs: [],
+    tasks: [],
+    tqViewMode: 'jobs',
+    expandedTasks: {},
     tqFilter: 'all',
     tqSearch: '',
     tqCounts: { total: 0, running: 0, waiting: 0, pending: 0, blocked: 0, succeeded: 0, failed: 0, cancelled: 0 },
@@ -109,6 +112,7 @@
   const elTqTbody = document.getElementById('tq-tbody');
   const elInputTqSearch = document.getElementById('input-tq-search');
   const elTqFilterPills = document.getElementById('tq-filter-pills');
+  const elTqViewModePills = document.getElementById('tq-view-mode-pills');
   const elBtnTqPause = document.getElementById('btn-tq-pause');
   const elBtnTqResume = document.getElementById('btn-tq-resume');
   const elBtnTqPurge = document.getElementById('btn-tq-purge');
@@ -178,6 +182,10 @@
   const elJobModalBody = document.getElementById('job-modal-body');
   const elBtnJobModalRetry = document.getElementById('btn-job-modal-retry');
   const elBtnJobModalCancel = document.getElementById('btn-job-modal-cancel');
+
+  const elModalTaskDetails = document.getElementById('modal-task-details');
+  const elTaskModalTitle = document.getElementById('task-modal-title');
+  const elTaskModalBody = document.getElementById('task-modal-body');
 
   const elModalMemDetails = document.getElementById('modal-mem-details');
   const elMemModalBody = document.getElementById('mem-modal-body');
@@ -297,11 +305,26 @@
     }
 
     // Task queue jobs list response
-    if (data.jobs && Array.isArray(data.jobs)) {
+    if (data.jobs && Array.isArray(data.jobs) && !data.task) {
       state.jobs = data.jobs;
       elBadgeTqCount.textContent = state.jobs.length;
       renderTaskQueueTable();
       checkFailuresFromJobs();
+      return;
+    }
+
+    // Task list response
+    if (data.tasks && Array.isArray(data.tasks)) {
+      state.tasks = data.tasks;
+      if (state.activeTab === 'taskqueue') {
+        renderTaskQueueTable();
+      }
+      return;
+    }
+
+    // Task show response
+    if (data.ok && data.task && Array.isArray(data.jobs) && Array.isArray(data.log)) {
+      renderTaskDetailsModal(data);
       return;
     }
 
@@ -460,6 +483,7 @@
       sendWsRequest({ action: 'list' });
     } else if (state.activeTab === 'taskqueue') {
       sendWsRequest({ action: 'taskqueue_list', include_planned: true });
+      sendWsRequest({ action: 'task_list' });
       sendWsRequest({ action: 'taskqueue_resource_locks' });
     } else if (state.activeTab === 'monitor') {
       sendWsRequest({ action: 'list' });
@@ -857,6 +881,131 @@
     elKpiTqCancelled.textContent = c.cancelled || 0;
   }
 
+  function getTaskRecordById(taskId) {
+    if (!taskId) return null;
+    return state.tasks.find(t => t.id === taskId) || null;
+  }
+
+  function getJobTaskInfo(job) {
+    if (job.task && typeof job.task === 'object') {
+      const id = job.task.id || '';
+      const rec = getTaskRecordById(id);
+      return {
+        id: id,
+        title: job.task.title || (rec ? rec.title : '') || '',
+        state: job.task.state || (rec ? rec.state : '') || '',
+        hasRecord: !!(job.task.title || rec)
+      };
+    }
+    const id = job.task_id || job.taskId || '';
+    const rec = getTaskRecordById(id);
+    return {
+      id: id,
+      title: rec ? (rec.title || '') : '',
+      state: rec ? (rec.state || '') : '',
+      hasRecord: !!rec
+    };
+  }
+
+  function jobStateSymbol(st) {
+    const s = (st || '').toLowerCase();
+    if (s === 'succeeded' || s === 'completed') return '✓';
+    if (s === 'failed' || s === 'blocked' || s === 'timed_out' || s === 'idle_timed_out' || s === 'startup_timed_out') return '✗';
+    if (s === 'running' || s === 'waitingforllm' || s === 'paused') return '▶';
+    if (s === 'cancelled' || s === 'closed' || s === 'takenover' || s === 'killed') return '−';
+    return '·';
+  }
+
+  function formatTaskResultsCompact(jobs) {
+    const syms = jobs.map(j => jobStateSymbol(j.state));
+    if (syms.length <= 8) return syms.join('');
+    let out = '';
+    let i = 0;
+    while (i < syms.length) {
+      const sym = syms[i];
+      let j = i + 1;
+      while (j < syms.length && syms[j] === sym) j++;
+      const run = j - i;
+      if (out) out += ' ';
+      out += sym + (run > 1 ? '×' + run : '');
+      i = j;
+    }
+    return out;
+  }
+
+  function buildJobRowHtml(job, indent) {
+    const key = escapeHtml(job.key || job.id || '-');
+    const name = escapeHtml(job.name || job.summary || '(unnamed)');
+    const queue = escapeHtml(job.taskqueue || job.queue || 'default');
+    const cmd = escapeHtml(job.command || job.commandLine || job.cmd || '-');
+    const stateBadge = `<span class="${getBadgeClass(job.state)}">${escapeHtml(job.state || 'unknown')}</span>`;
+    const attempts = Array.isArray(job.attempts) ? job.attempts : [];
+    const lastAttempt = attempts.length ? attempts[attempts.length - 1] : null;
+    const exitValue = job.exit_code !== undefined ? job.exit_code
+      : (lastAttempt && lastAttempt.exit_code !== undefined ? lastAttempt.exit_code : job.exitCode);
+    const exitCode = exitValue !== undefined ? exitValue : '-';
+
+    const isRunning = (job.state || '').toLowerCase() === 'running';
+    const isFailed = (job.state || '').toLowerCase() === 'failed';
+    const supBy = job.superseded_by || job.supersededBy || '';
+    const supFrom = job.supersedes || '';
+    const isSuperseded = !!supBy;
+
+    const { start: startAt, end: endAt } = taskAttemptTimes(job);
+    const started = startAt ? formatDateTime(startAt) : '-';
+    const ended = endAt ? formatDateTime(endAt) : (isRunning ? 'running' : '-');
+    let durationSec = job.duration_sec !== undefined ? job.duration_sec
+      : (job.durationSec !== undefined ? job.durationSec
+      : (job.elapsed_sec !== undefined ? job.elapsed_sec : job.elapsedSec));
+    if (durationSec === undefined && startAt && endAt) {
+      const startDate = parseTimestamp(startAt);
+      const endDate = parseTimestamp(endAt);
+      if (startDate && endDate) {
+        durationSec = Math.max(0, (endDate.getTime() - startDate.getTime()) / 1000);
+      }
+    }
+    const duration = formatDuration(durationSec);
+    const updatedRaw = job.updated_at || job.updatedAt || job.created_at || job.createdAt;
+    const updated = formatDateTime(updatedRaw);
+
+    const taskInfo = getJobTaskInfo(job);
+    let taskCell = '<span class="text-muted">-</span>';
+    if (taskInfo.id) {
+      const taskLabel = taskInfo.title ? `${taskInfo.title} (${taskInfo.id})` : taskInfo.id;
+      if (taskInfo.hasRecord) {
+        taskCell = `<a class="task-link" data-task-id="${escapeHtml(taskInfo.id)}" title="${escapeHtml(taskLabel)}">${escapeHtml(taskInfo.title || taskInfo.id)}</a>`;
+      } else {
+        taskCell = `<span class="text-muted" title="${escapeHtml(taskLabel)}">${escapeHtml(taskInfo.id)}</span>`;
+      }
+    }
+
+    let lineageBadge = '';
+    if (supFrom) lineageBadge += ` <span class="text-muted" title="Supersedes ${escapeHtml(supFrom)}">↩ ${escapeHtml(supFrom)}</span>`;
+    if (supBy) lineageBadge += ` <span class="text-muted" title="Superseded by ${escapeHtml(supBy)}">→ ${escapeHtml(supBy)}</span>`;
+
+    const padStyle = indent ? ' style="padding-left: 26px;"' : '';
+    const rowClass = isSuperseded ? ' class="row-superseded"' : '';
+
+    return `<tr${rowClass} data-job-key="${key}">
+      <td>${stateBadge}</td>
+      <td class="job-key font-mono"${padStyle} title="${key}">${indent ? '↳ ' : ''}${key}${lineageBadge}</td>
+      <td class="job-task">${taskCell}</td>
+      <td class="job-name" title="${name}">${name}</td>
+      <td>${queue}</td>
+      <td class="job-cmd" title="${cmd}">${cmd}</td>
+      <td>${exitCode}</td>
+      <td>${duration}</td>
+      <td title="${escapeHtml(startAt)}">${started}</td>
+      <td title="${escapeHtml(endAt)}">${ended}</td>
+      <td>${updated}</td>
+      <td style="text-align: center;">
+        <button class="btn btn-sm btn-job-details" data-key="${key}">Details</button>
+        ${isFailed ? `<button class="btn btn-sm btn-primary btn-job-retry" data-key="${key}">Retry</button>` : ''}
+        ${isRunning ? `<button class="btn btn-sm btn-danger btn-job-cancel" data-key="${key}">Cancel</button>` : ''}
+      </td>
+    </tr>`;
+  }
+
   function renderTaskQueueTable() {
     const q = state.tqSearch.toLowerCase().trim();
     const filter = state.tqFilter.toLowerCase();
@@ -876,74 +1025,148 @@
         const name = (job.name || '').toLowerCase();
         const queue = (job.taskqueue || job.queue || '').toLowerCase();
         const cmd = (job.commandLine || job.cmd || '').toLowerCase();
-        if (!key.includes(q) && !name.includes(q) && !queue.includes(q) && !cmd.includes(q)) {
+        const taskInfo = getJobTaskInfo(job);
+        const taskText = (taskInfo.id + ' ' + taskInfo.title).toLowerCase();
+        if (!key.includes(q) && !name.includes(q) && !queue.includes(q) && !cmd.includes(q) && !taskText.includes(q)) {
           return false;
         }
       }
       return true;
     });
 
-    if (filtered.length === 0) {
-      const msg = state.jobs.length === 0 ? 'No jobs in queue.' : 'No jobs match current filter.';
-      elTqTbody.innerHTML = `<tr class="empty-row"><td colspan="11">${escapeHtml(msg)}</td></tr>`;
-      return;
-    }
-
     let html = '';
-    for (const job of filtered) {
-      const key = escapeHtml(job.key || job.id || '-');
-      const name = escapeHtml(job.name || job.summary || '(unnamed)');
-      const queue = escapeHtml(job.taskqueue || job.queue || 'default');
-      const cmd = escapeHtml(job.command || job.commandLine || job.cmd || '-');
-      const stateBadge = `<span class="${getBadgeClass(job.state)}">${escapeHtml(job.state || 'unknown')}</span>`;
-      const attempts = Array.isArray(job.attempts) ? job.attempts : [];
-      const lastAttempt = attempts.length ? attempts[attempts.length - 1] : null;
-      const exitValue = job.exit_code !== undefined ? job.exit_code
-        : (lastAttempt && lastAttempt.exit_code !== undefined ? lastAttempt.exit_code : job.exitCode);
-      const exitCode = exitValue !== undefined ? exitValue : '-';
 
-      const isRunning = (job.state || '').toLowerCase() === 'running';
-      const isFailed = (job.state || '').toLowerCase() === 'failed';
+    if (state.tqViewMode === 'tasks') {
+      // Group jobs by effective task id
+      const supMap = {};
+      const expMap = {};
+      for (const j of state.jobs) {
+        const jid = j.id || j.key || '';
+        const tid = j.task_id || j.taskId || (j.task && j.task.id) || '';
+        if (jid && j.supersedes) supMap[jid] = j.supersedes;
+        if (jid && tid) expMap[jid] = tid;
+      }
+      function resolveTaskId(job) {
+        const tid = job.task_id || job.taskId || (job.task && job.task.id) || '';
+        if (tid) return tid;
+        let cur = job.id || job.key || '';
+        for (let step = 0; step < 128; step++) {
+          if (expMap[cur]) return expMap[cur];
+          if (!supMap[cur] || supMap[cur] === cur) break;
+          cur = supMap[cur];
+        }
+        return cur;
+      }
 
-      const { start: startAt, end: endAt } = taskAttemptTimes(job);
-      const started = startAt ? formatDateTime(startAt) : '-';
-      const ended = endAt ? formatDateTime(endAt) : (isRunning ? 'running' : '-');
-      let durationSec = job.duration_sec !== undefined ? job.duration_sec
-        : (job.durationSec !== undefined ? job.durationSec
-        : (job.elapsed_sec !== undefined ? job.elapsed_sec : job.elapsedSec));
-      if (durationSec === undefined && startAt && endAt) {
-        const startDate = parseTimestamp(startAt);
-        const endDate = parseTimestamp(endAt);
-        if (startDate && endDate) {
-          durationSec = Math.max(0, (endDate.getTime() - startDate.getTime()) / 1000);
+      const groupMap = {};
+      const groupOrder = [];
+      function ensureGroup(id) {
+        if (!groupMap[id]) {
+          const rec = getTaskRecordById(id);
+          groupMap[id] = {
+            id: id,
+            title: rec ? (rec.title || '') : '',
+            state: rec ? (rec.state || 'open') : '',
+            hasRecord: !!rec,
+            jobs: []
+          };
+          groupOrder.push(id);
+        }
+        return groupMap[id];
+      }
+
+      for (const t of state.tasks) {
+        if (!t || !t.id) continue;
+        const st = (t.state || '').toLowerCase();
+        if (filter !== 'all' && st !== filter) continue;
+        if (q) {
+          const txt = (t.id + ' ' + (t.title || '')).toLowerCase();
+          if (!txt.includes(q)) continue;
+        }
+        ensureGroup(t.id);
+      }
+
+      for (const job of filtered) {
+        const tid = resolveTaskId(job);
+        const g = ensureGroup(tid);
+        const info = getJobTaskInfo(job);
+        if (!g.title && info.title) g.title = info.title;
+        if (!g.state && info.state) g.state = info.state;
+        if (info.hasRecord) g.hasRecord = true;
+        g.jobs.push(job);
+      }
+
+      if (groupOrder.length === 0) {
+        const msg = (state.jobs.length === 0 && state.tasks.length === 0) ? 'No tasks or jobs in queue.' : 'No tasks match current filter.';
+        elTqTbody.innerHTML = `<tr class="empty-row"><td colspan="12">${escapeHtml(msg)}</td></tr>`;
+        return;
+      }
+
+      for (const gid of groupOrder) {
+        const g = groupMap[gid];
+        if (!g.hasRecord && g.jobs.length === 1) {
+          html += buildJobRowHtml(g.jobs[0], false);
+          continue;
+        }
+        const taskState = g.state || (g.jobs.length ? (g.jobs[g.jobs.length - 1].state || 'open') : 'open');
+        const defaultExp = taskState === 'running' || taskState === 'failed' || taskState === 'open';
+        const expanded = state.expandedTasks[gid] !== undefined ? state.expandedTasks[gid] : defaultExp;
+        const arrow = expanded ? '▾' : '▸';
+        const compact = formatTaskResultsCompact(g.jobs);
+        const titleText = g.title ? `${g.title} (${gid})` : gid;
+        const stateBadge = `<span class="${getBadgeClass(taskState)}">${escapeHtml(taskState)}</span>`;
+        const detailsBtn = g.hasRecord
+          ? `<button class="btn btn-sm btn-task-details" data-task-id="${escapeHtml(gid)}">Task Details</button>`
+          : '';
+
+        html += `<tr class="task-heading-row" data-task-id="${escapeHtml(gid)}">
+          <td>${stateBadge}</td>
+          <td class="font-mono" colspan="2"><strong>${arrow} ${escapeHtml(titleText)}</strong></td>
+          <td colspan="3"><span class="font-mono">${escapeHtml(compact)}</span> <span class="text-muted">(${g.jobs.length} job${g.jobs.length === 1 ? '' : 's'})</span></td>
+          <td colspan="5"></td>
+          <td style="text-align: center;">${detailsBtn}</td>
+        </tr>`;
+
+        if (expanded) {
+          for (const job of g.jobs) {
+            html += buildJobRowHtml(job, true);
+          }
         }
       }
-      const duration = formatDuration(durationSec);
-      const updatedRaw = job.updated_at || job.updatedAt || job.created_at || job.createdAt;
-      const updated = formatDateTime(updatedRaw);
-
-      html += `<tr data-job-key="${key}">
-        <td>${stateBadge}</td>
-        <td class="job-key font-mono" title="${key}">${key}</td>
-        <td class="job-name" title="${name}">${name}</td>
-        <td>${queue}</td>
-        <td class="job-cmd" title="${cmd}">${cmd}</td>
-        <td>${exitCode}</td>
-        <td>${duration}</td>
-        <td title="${escapeHtml(startAt)}">${started}</td>
-        <td title="${escapeHtml(endAt)}">${ended}</td>
-        <td>${updated}</td>
-        <td style="text-align: center;">
-          <button class="btn btn-sm btn-job-details" data-key="${key}">Details</button>
-          ${isFailed ? `<button class="btn btn-sm btn-primary btn-job-retry" data-key="${key}">Retry</button>` : ''}
-          ${isRunning ? `<button class="btn btn-sm btn-danger btn-job-cancel" data-key="${key}">Cancel</button>` : ''}
-        </td>
-      </tr>`;
+    } else {
+      if (filtered.length === 0) {
+        const msg = state.jobs.length === 0 ? 'No jobs in queue.' : 'No jobs match current filter.';
+        elTqTbody.innerHTML = `<tr class="empty-row"><td colspan="12">${escapeHtml(msg)}</td></tr>`;
+        return;
+      }
+      for (const job of filtered) {
+        html += buildJobRowHtml(job, false);
+      }
     }
 
     elTqTbody.innerHTML = html;
 
     // Attach listeners
+    elTqTbody.querySelectorAll('.task-heading-row').forEach(row => {
+      row.addEventListener('click', function() {
+        const tid = this.getAttribute('data-task-id');
+        if (!tid) return;
+        const cur = state.expandedTasks[tid];
+        const gRowState = (this.querySelector('.badge') ? this.querySelector('.badge').textContent : '').toLowerCase();
+        const defExp = gRowState === 'running' || gRowState === 'failed' || gRowState === 'open';
+        state.expandedTasks[tid] = cur !== undefined ? !cur : !defExp;
+        renderTaskQueueTable();
+      });
+    });
+
+    elTqTbody.querySelectorAll('.btn-task-details, .task-link').forEach(el => {
+      el.addEventListener('click', function(e) {
+        e.stopPropagation();
+        const tid = this.getAttribute('data-task-id');
+        if (tid) openTaskDetails(tid);
+      });
+    });
+
     elTqTbody.querySelectorAll('.btn-job-details').forEach(btn => {
       btn.addEventListener('click', function(e) {
         e.stopPropagation();
@@ -956,7 +1179,10 @@
         e.stopPropagation();
         const key = this.getAttribute('data-key');
         sendWsRequest({ action: 'taskqueue_retry', id: key });
-        setTimeout(() => sendWsRequest({ action: 'taskqueue_list', include_planned: true }), 200);
+        setTimeout(() => {
+          sendWsRequest({ action: 'taskqueue_list', include_planned: true });
+          sendWsRequest({ action: 'task_list' });
+        }, 200);
       });
     });
 
@@ -965,9 +1191,95 @@
         e.stopPropagation();
         const key = this.getAttribute('data-key');
         sendWsRequest({ action: 'taskqueue_cancel', id: key });
-        setTimeout(() => sendWsRequest({ action: 'taskqueue_list', include_planned: true }), 200);
+        setTimeout(() => {
+          sendWsRequest({ action: 'taskqueue_list', include_planned: true });
+          sendWsRequest({ action: 'task_list' });
+        }, 200);
       });
     });
+  }
+
+  function openTaskDetails(taskId) {
+    if (!taskId) return;
+    elTaskModalTitle.textContent = `Task: ${taskId}`;
+    elTaskModalBody.innerHTML = '<div class="empty-message">Loading task details...</div>';
+    elModalTaskDetails.classList.remove('hidden');
+    sendWsRequest({ action: 'task_show', id: taskId, log_limit: 200 });
+  }
+
+  function renderTaskDetailsModal(data) {
+    const t = data.task || {};
+    const status = data.status || {};
+    const jobs = Array.isArray(data.jobs) ? data.jobs : [];
+    const log = Array.isArray(data.log) ? data.log : [];
+    const st = status.state || t.state || 'open';
+
+    elTaskModalTitle.textContent = `Task: ${t.title || t.id || '-'}`;
+
+    let html = '';
+    const fields = [
+      ['Task ID', t.id || '-'],
+      ['Title', t.title || '-'],
+      ['State', st + (status.paused ? ' (paused)' : '')],
+      ['Created At', t.createdAt || '-'],
+      ['Updated At', t.updatedAt || '-']
+    ];
+    if (t.closed && typeof t.closed === 'object') {
+      fields.push(['Closed', `${t.closed.result || '-'} (${t.closed.at || '-'}) - ${t.closed.reason || ''}`]);
+    }
+    if (data.repeatedFailures > 0) {
+      fields.push(['Repeated Failures', String(data.repeatedFailures)]);
+    }
+
+    for (const [k, v] of fields) {
+      html += `<div class="detail-row">
+        <div class="detail-label">${escapeHtml(k)}:</div>
+        <div class="detail-value">${escapeHtml(String(v))}</div>
+      </div>`;
+    }
+
+    html += `<div class="mt-3"><strong>Intent</strong></div>
+      <pre class="task-intent-box">${escapeHtml(t.intent || '(none)')}</pre>`;
+
+    html += `<div class="mt-3"><strong>Jobs (${jobs.length})</strong></div>`;
+    if (jobs.length === 0) {
+      html += `<div class="text-muted" style="padding: 6px 0;">No jobs yet.</div>`;
+    } else {
+      html += `<div class="task-log-list">`;
+      for (const j of jobs) {
+        const lineage = [
+          j.supersedes ? `↩ ${j.supersedes}` : '',
+          j.supersededBy ? `→ ${j.supersededBy}` : ''
+        ].filter(Boolean).join(' ');
+        html += `<div class="task-log-entry">
+          <span class="${getBadgeClass(j.state)}">${escapeHtml(j.state || '')}</span>
+          <strong class="font-mono">${escapeHtml(j.id || '')}</strong>
+          <span>${escapeHtml(j.name || '')}</span>
+          <span class="text-muted">[${escapeHtml(j.taskqueue || 'default')}] ${escapeHtml(lineage)}</span>
+        </div>`;
+      }
+      html += `</div>`;
+    }
+
+    html += `<div class="mt-3"><strong>Progress Log (${log.length})</strong></div>`;
+    if (log.length === 0) {
+      html += `<div class="text-muted" style="padding: 6px 0;">No log entries.</div>`;
+    } else {
+      html += `<div class="task-log-list">`;
+      for (const entry of log) {
+        const ref = [entry.job ? `job:${entry.job}` : '', entry.bt ? `bt:${entry.bt}` : ''].filter(Boolean).join(' ');
+        html += `<div class="task-log-entry">
+          <span class="text-muted font-mono">${escapeHtml(entry.at || '')}</span>
+          <strong>[${escapeHtml(entry.kind || '')}]</strong>
+          ${ref ? `<span class="text-muted font-mono">${escapeHtml(ref)}</span>` : ''}
+          <div>${escapeHtml(entry.text || '')}</div>
+        </div>`;
+      }
+      html += `</div>`;
+    }
+
+    elTaskModalBody.innerHTML = html;
+    elModalTaskDetails.classList.remove('hidden');
   }
 
   function openJobDetailsModal(key) {
@@ -1543,6 +1855,17 @@
     state.tqSearch = e.target.value;
     renderTaskQueueTable();
   });
+
+  if (elTqViewModePills) {
+    elTqViewModePills.addEventListener('click', (e) => {
+      const pill = e.target.closest('.pill');
+      if (!pill) return;
+      state.tqViewMode = pill.getAttribute('data-view') || 'jobs';
+      elTqViewModePills.querySelectorAll('.pill').forEach(p => p.classList.remove('active'));
+      pill.classList.add('active');
+      renderTaskQueueTable();
+    });
+  }
 
   elTqFilterPills.addEventListener('click', (e) => {
     const pill = e.target.closest('.pill');

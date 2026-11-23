@@ -41,14 +41,28 @@ hancho-cli.exe mcp uninstall --delete-data-dir           # データディレク
 | `wait_process` | 終了待機（`id`, `wait_ms`）。 |
 | `kill_process` | プロセスツリーを強制終了（`id`; `0` で全実行中）。タスクキュー由来の試行は killed として再実行判定されます。 |
 
+**タスク操作**
+
+| ツール | 説明 |
+| :--- | :--- |
+| `task_create` | タスクのレコードを作成（`title` 上限 200 バイト、任意 `intent` 上限 16 KB、任意 `id` `task_` 始まり、任意 `originLabel`）。タスク id を返す。 |
+| `task_show` | タスクのレコード、計算された状態、ジョブと系譜、直近の経過ログを表示（`id`, 任意 `logLimit` 既定 200）。 |
+| `task_list` | タスク一覧と計算された状態（`state?`: `open`\|`running`\|`failed`\|`cancelled`\|`succeeded`\|`closed`, `limit?`）。 |
+| `task_note` | タスクの経過ログにメモを追記（`id`, `text` 上限 4 KB）。 |
+| `task_close` | タスクを結果（`succeeded`\|`failed`）と理由（上限 2000 バイト）付きで閉じる。閉じたタスクには新規ジョブを追加できない。 |
+| `task_reopen` | 閉じたタスクを理由付きで開き直す（`id`, `reason` 上限 2000 バイト）。 |
+| `task_purge` | 閉じてから `olderThanSec` 秒以上経過したタスクを削除する。 |
+| `task_wait` | タスクの実行中・待機中ジョブがすべて終わるか `timeoutMs` が経過するまで待ち、`task_show` と同じ形を返す（`id`, `timeoutMs?`, `logLimit?`）。 |
+
 **タスクキュー操作**
 
 | ツール | 説明 |
 | :--- | :--- |
-| `taskqueue_add` | ジョブ登録（`taskqueue`, `jobs[]`, `concurrency?`, `notifyFile?`）。各ジョブに `id`, `command`, `summary`, `timeoutSec` が必要。 |
-| `taskqueue_list` | ジョブ一覧（`taskqueue?`, `state?`, `includePlanned?`。既定 true で、BT の未起動葉を `planned` 行として含む）。活動中のタスクグループ（BT のルート）も `group:<id>` の仮想行として `running` / `waitingForLlm` / `paused` の状態で返す。`includePlanned: false` は両方を隠す。読むときは `bt_get`、答えるときは `bt_resume` を使う。 |
+| `taskqueue_add` | ジョブ登録（`taskqueue`, `jobs[]`, `concurrency?`, `notifyFile?`, `task?`）。各ジョブに `id`, `command`, `summary`, `timeoutSec` が必要。任意の `supersedes` と `supersedeReason` で既存ジョブの系譜・タスクに引き継ぐ。 |
+| `taskqueue_list` | ジョブ一覧（`taskqueue?`, `state?`, `task?`, `includePlanned?`。既定 true で、BT の未起動葉を `planned` 行として含む）。各ジョブに `task`（`id`, `state`, タスクレコードがあれば `title`）が付く。活動中のタスクグループ（BT のルート）も `group:<id>` の仮想行として `running` / `waitingForLlm` / `paused` の状態で返す。`includePlanned: false` は両方を隠す。読むときは `bt_get`、答えるときは `bt_resume` を使う。 |
 | `taskqueue_get` | ジョブ詳細・試行履歴・指示書（`id`, `includeInstructions?`, `rev?`）。 |
 | `taskqueue_retry` | failed/blocked/cancelled を再実行（`id`, `resetAttempts?`, `refreshInstructions?`）。blocked の後続も再キュー。一括: `id` を省いて `failed: true` にすると失敗ジョブをすべて再実行（`taskqueue`, `since`（例: `6h`）で絞り込み可）。 |
+| `taskqueue_supersede` | 終了済みで未成功の非 BT ジョブを内容を変えて複製し、`supersedes` と理由付きで同じキュー・同じタスクに追加（`id`, 必須 `reason`, 任意 `newId?`, `summary?`, `command?`, `timeoutSec?`, `instructionsFile?`, `instructionsText?`, `patch?` 等）。 |
 | `taskqueue_update` | pending/failed/blocked のジョブを更新。 |
 | `taskqueue_cancel` | ジョブをキャンセル（実行中は kill、再実行しない）。 |
 | `taskqueue_pause` / `taskqueue_resume` | キューの新規開始を停止 / 再開。 |
@@ -65,7 +79,7 @@ hancho-cli.exe mcp uninstall --delete-data-dir           # データディレク
 | `bt_validate` | BT を実行せずに検証（`bt` オブジェクトまたは `file` パス）。`warnings[]` は致命的ではなく、`strict: true` を付けると各警告がエラーに昇格して `ok` / `valid` が false になる。`bt_start` も同じ `warnings` を返す。 |
 | `bt_template` | ハング対策入りテンプレートの一覧、または 1 つを返す（`name`: `resilient-worker` または `card-sequence`。省略時は一覧）。検証前に `<...>` を実値へ置き換える。`{engine}` / `{model}` は実行時プレースホルダ。 |
 
-ほかの BT ツール (`bt_start`, `bt_get`, `bt_list`, `bt_wait`, `bt_resume`, `bt_retry`, `bt_update`, `bt_cancel`, `bt_pause`) は変更なし。警告コードとテンプレートの実出力は [behavior-tree-ja.md](behavior-tree-ja.md) を参照。
+ほかの BT ツール (`bt_start` は任意の `task` を受け取る、`bt_get`, `bt_list`, `bt_wait`, `bt_resume`, `bt_retry`, `bt_update`, `bt_cancel`, `bt_pause`) は変更なし。警告コードとテンプレートの実出力は [behavior-tree-ja.md](behavior-tree-ja.md) を参照。
 
 **LLM リスト操作**
 

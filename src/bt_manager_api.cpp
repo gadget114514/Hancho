@@ -485,6 +485,14 @@ std::string BtManager::Resume(const std::string& id,
     }
 
     PersistEntryLocked(entry);
+    // Task log (100-3): record escalation answer on the BT's task if it has a record.
+    if (!entry.tree->TaskId().empty()) {
+        std::string text = answer;
+        if (!rationale.empty()) {
+            text += (text.empty() ? "" : ": ") + rationale;
+        }
+        tqm_.TaskLog(entry.tree->TaskId(), "escalate_answered", "", entry.tree->Id(), text, "");
+    }
     return BuildTreeResponseJson(*entry.tree, TreeView::Summary).dump();
 }
 

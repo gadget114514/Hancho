@@ -579,6 +579,22 @@ bool WebUiServer::HandleHttpRequest(const Runtime& runtime, const std::string& m
             } else {
                 jsonResp = "{\"ok\":false,\"error\":\"no IPC handler\"}";
             }
+        } else if (path == "/api/tasks") {
+            if (runtime.ipcHandler) {
+                jsonResp = runtime.ipcHandler("{\"action\":\"task_list\"}");
+            } else {
+                jsonResp = "{\"ok\":false,\"error\":\"no IPC handler\"}";
+            }
+        } else if (path.rfind("/api/tasks/", 0) == 0 && path.size() > 11) {
+            if (runtime.ipcHandler) {
+                std::string taskId = path.substr(11);
+                nlohmann::json req;
+                req["action"] = "task_show";
+                req["id"] = taskId;
+                jsonResp = runtime.ipcHandler(req.dump());
+            } else {
+                jsonResp = "{\"ok\":false,\"error\":\"no IPC handler\"}";
+            }
         } else if (path == "/api/status" || path == "/api/info") {
             nlohmann::json info;
             info["ok"] = true;

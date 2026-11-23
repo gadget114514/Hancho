@@ -42,15 +42,29 @@ You can also run the server directly with `Hancho.exe mcp`. It connects to the d
 | `wait_process` | Wait for exit (`id`, `wait_ms`). |
 | `kill_process` | Kill a process tree (`id`; `0` = all). A killed task-queue attempt is retried by the scheduler. |
 
+**Task tools**
+
+| Tool | Description |
+| :--- | :--- |
+| `task_create` | Create a task record (`title` max 200 bytes, optional `intent` max 16 KB, optional `id` starting with `task_`, optional `originLabel`). Returns the task id. |
+| `task_show` | Show a task record, computed state, jobs/lineages, and recent progress log entries (`id`, optional `logLimit` default 200). |
+| `task_list` | List task records with computed state (`state?`: `open`\|`running`\|`failed`\|`cancelled`\|`succeeded`\|`closed`, `limit?`). |
+| `task_note` | Append a note to a task's progress log (`id`, `text` max 4 KB). |
+| `task_close` | Close a task with `result` (`succeeded`\|`failed`) and `reason` (max 2000 bytes). Closed tasks reject new jobs. |
+| `task_reopen` | Reopen a closed task (`id`, `reason` max 2000 bytes). |
+| `task_purge` | Remove closed task records older than `olderThanSec` seconds. |
+| `task_wait` | Wait until all active jobs of a task finish or `timeoutMs` elapses, then return the `task_show` payload (`id`, `timeoutMs?`, `logLimit?`). |
+
 **Task queue tools**
 
 | Tool | Description |
 | :--- | :--- |
-| `taskqueue_add` | Register jobs (`taskqueue`, `jobs[]`, `concurrency?`, `notifyFile?`). Each job needs `id`, `command`, `summary`, `timeoutSec`. |
+| `taskqueue_add` | Register jobs (`taskqueue`, `jobs[]`, `concurrency?`, `notifyFile?`, `task?`). Each job needs `id`, `command`, `summary`, `timeoutSec`; optional `supersedes` and `supersedeReason` link a redo job into the existing job's lineage and task. |
 | `quickfix` | Apply one exact file edit as a deterministic task-queue job (`file`, `find`, `replace`, optional `all`, `check`, `checkLiteral`, `cwd`, `timeoutSec`, `id`, `summary`, `queue`). No LLM; fails when `find` is absent or `check` does not match. Use it for tiny fixes instead of a coding agent. |
-| `taskqueue_list` | List jobs (`taskqueue?`, `state?`, `includePlanned?`, default true: provisional `planned` rows for idle BT leaves). Also returns the active task group (the BT root) as a virtual `group:<id>` row with state `running`, `waitingForLlm` or `paused`; `includePlanned: false` hides both. Read it with `bt_get` and answer with `bt_resume`. |
+| `taskqueue_list` | List jobs (`taskqueue?`, `state?`, `task?`, `includePlanned?`, default true: provisional `planned` rows for idle BT leaves). Each job includes `task` (`id`, `state`, and `title` when backed by a task record). Also returns the active task group (the BT root) as a virtual `group:<id>` row with state `running`, `waitingForLlm` or `paused`; `includePlanned: false` hides both. Read it with `bt_get` and answer with `bt_resume`. |
 | `taskqueue_get` | Full job, attempts and instructions (`id`, `includeInstructions?`, `rev?`). |
 | `taskqueue_retry` | Retry failed/blocked/cancelled (`id`, `resetAttempts?`, `refreshInstructions?`); blocked dependents are requeued. Bulk: `failed: true` with no `id` retries all failed jobs, optionally limited by `taskqueue` and `since` (e.g. `6h`). |
+| `taskqueue_supersede` | Clone a finished, unsuccessful non-BT job into a new job with changes (`id`, required `reason`, optional `newId?`, `summary?`, `command?`, `timeoutSec?`, `instructionsFile?`, `instructionsText?`, `patch?`, etc.), linking via `supersedes` on the same queue and task. |
 | `taskqueue_update` | Update a pending/failed/blocked job. |
 | `taskqueue_cancel` | Cancel a job (kills a running attempt, no retry). |
 | `taskqueue_pause` / `taskqueue_resume` | Stop/restart starting new jobs in a queue. |
@@ -67,7 +81,7 @@ You can also run the server directly with `Hancho.exe mcp`. It connects to the d
 | `bt_validate` | Validate a tree (`bt` object or `file` path) without running it. `warnings[]` are non-fatal; `strict: true` promotes every warning to an error (`ok`/`valid` false). The same `warnings` are returned by `bt_start`. |
 | `bt_template` | List hang-safe templates or return one full template (`name`: `resilient-worker` or `card-sequence`; omit to list). Replace `<...>` placeholders before validation; `{engine}` / `{model}` are runtime placeholders. |
 
-Other BT tools (`bt_start`, `bt_get`, `bt_list`, `bt_wait`, `bt_resume`, `bt_retry`, `bt_update`, `bt_cancel`, `bt_pause`) are unchanged. See [behavior-tree.md](behavior-tree.md) for the warning codes and the template output.
+Other BT tools (`bt_start` with optional `task`, `bt_get`, `bt_list`, `bt_wait`, `bt_resume`, `bt_retry`, `bt_update`, `bt_cancel`, `bt_pause`) are unchanged. See [behavior-tree.md](behavior-tree.md) for the warning codes and the template output.
 
 **LLM list tools**
 
