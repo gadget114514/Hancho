@@ -124,6 +124,9 @@ The application icons are modeled on the character "Telephone Cat" (電話猫, D
 
 
 
+### v0.9.44
+- **Failure classifier fix**: a plain (non-LLM) job whose output merely contains a permission-like identifier, such as the job JSON key `"on_permission_denied"`, is no longer classified as `permission_denied` and parked in `waitingForPermit`; it now fails normally so behavior trees take their fallback branch. The log-line permission rule matches whole words only and applies only to LLM worker jobs.
+
 ### v0.9.43
 - **Display scale setting**: the Appearance tab has a "Display scale (DPI)" dropdown: follow Windows, 100% (96 DPI), 125% (120 DPI) or 150% (144 DPI). The list fonts, toolbar buttons and margins scale together; saved as `display_scale_dpi` in `config.json`.
 - **Docs**: updated the dashboard graph screenshot.
