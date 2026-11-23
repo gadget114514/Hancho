@@ -597,6 +597,24 @@ constexpr int kMinListFontPx = 9;
 constexpr int kMaxListFontPx = 24;
 constexpr int kListFontSizes[] = {10, 11, 12, 13, 14, 16, 18, 20, 22, 24};
 constexpr int kListFontSizeCount = static_cast<int>(sizeof(kListFontSizes) / sizeof(kListFontSizes[0]));
+static float g_displayScale = 1.0f;
+static int S(int value) { return static_cast<int>(value * g_displayScale + 0.5f); }
+static void UpdateDisplayScale(HWND hwnd, int dpi) {
+    if (dpi <= 0) {
+        using GetDpiForWindowFn = UINT(WINAPI*)(HWND);
+        HMODULE user32 = GetModuleHandleW(L"user32.dll");
+        auto getDpi = user32 ? reinterpret_cast<GetDpiForWindowFn>(
+            GetProcAddress(user32, "GetDpiForWindow")) : nullptr;
+        dpi = getDpi ? static_cast<int>(getDpi(hwnd)) : 0;
+        if (dpi <= 0) {
+            HDC dc = GetDC(nullptr);
+            dpi = dc ? GetDeviceCaps(dc, LOGPIXELSX) : 0;
+            if (dc) ReleaseDC(nullptr, dc);
+        }
+        if (dpi <= 0) dpi = 96;
+    }
+    g_displayScale = 96.0f / static_cast<float>(dpi);
+}
 
 static int ClampListFontPx(int px) {
     return (std::max)(kMinListFontPx, (std::min)(kMaxListFontPx, px));
@@ -703,6 +721,7 @@ enum ControlId {
     IDC_SET_TAB = 6053,
     IDC_SET_PROC_FONT = 6054,
     IDC_SET_TASK_FONT = 6055,
+    IDC_SET_DISPLAY_MODE = 6091,
     IDC_SET_SHOW_SUPERVISOR_HINTS = 6056,
     IDC_SET_HINT_AUTO_DISMISS_SEC = 6057,
     IDC_SET_SUPERVISOR_COMMAND = 6058,
@@ -1074,6 +1093,7 @@ struct DashboardState {
     HFONT hFontKpiVal = nullptr;
     int processListFontPx = kDefaultListFontPx;
     int taskListFontPx = kDefaultListFontPx;
+    int displayScaleDpi = 0;  // 0 = follow Windows; otherwise 96 / 120 / 144
     HFONT hFontProcList = nullptr;
     HFONT hFontTaskList = nullptr;
     HFONT hFontTermCanvas = nullptr;   // monospace font for the parent-drawn terminal preview
@@ -8049,19 +8069,19 @@ static COLORREF GanttSegmentOutlineColor(COLORREF fill) {
 
 static void LayoutControls(DashboardState* st, int width, int height) {
     if (!st) return;
-    int margin = 10;
+    int margin = S(10);
 
-    st->rcKpiArea = {margin, kHeaderKpiTop, width - margin, kHeaderKpiBottom};
+    st->rcKpiArea = {margin, S(kHeaderKpiTop), width - margin, S(kHeaderKpiBottom)};
 
     int usageOffset = 0;
     if (st->showUsagePanel) {
         if (st->usagePanelHeight < 60) st->usagePanelHeight = 60;
-        int usageTop = kHeaderKpiBottom + 2;
+        int usageTop = S(kHeaderKpiBottom + 2);
         st->rcUsagePanel = {margin, usageTop, width - margin, usageTop + st->usagePanelHeight};
-        st->rcUsageSplitter = {margin, usageTop + st->usagePanelHeight, width - margin, usageTop + st->usagePanelHeight + 12};
-        usageOffset = st->usagePanelHeight + 12;
+        st->rcUsageSplitter = {margin, usageTop + st->usagePanelHeight, width - margin, usageTop + st->usagePanelHeight + S(12)};
+        usageOffset = st->usagePanelHeight + S(12);
         if (st->hwndUsagePanel) {
-            MoveWindow(st->hwndUsagePanel, margin, usageTop, (std::max)(200, width - margin * 2), st->usagePanelHeight, TRUE);
+            MoveWindow(st->hwndUsagePanel, margin, usageTop, (std::max)(S(200), width - margin * 2), st->usagePanelHeight, TRUE);
             ShowWindow(st->hwndUsagePanel, SW_SHOW);
         }
     } else {
@@ -8073,36 +8093,36 @@ static void LayoutControls(DashboardState* st, int width, int height) {
     // Toolbar buttons flow into multiple rows when the window is too narrow.
     struct ToolbarButton { HWND hwnd; int w; };
     const ToolbarButton buttons[] = {
-        {st->hwndBtnViewTasks, 150},
-        {st->hwndBtnSettings, 90},
-        {st->hwndBtnKillAll, 74},
-        {st->hwndBtnGridView, 28},
-        {st->hwndBtnToggleList, 28},
-        {st->hwndBtnToggleTerm, 30},
-        {st->hwndBtnTermSessions, 28},
-        {st->hwndBtnStreamPane, 28},
-        {st->hwndBtnBtView, 34},
-        {st->hwndBtnUsage, 28},
-        {st->hwndBtnHideTray, 28},
-        {st->hwndBtnRefresh, 28},
-        {st->hwndBtnReevalPlanned, 56},
-        {st->hwndBtnHint, 28},
-        {st->hwndBtnHistory, 28},
-        {st->hwndBtnIpmsg, 28},
-        {st->hwndClock, 80}
+        {st->hwndBtnViewTasks, S(150)},
+        {st->hwndBtnSettings, S(90)},
+        {st->hwndBtnKillAll, S(74)},
+        {st->hwndBtnGridView, S(28)},
+        {st->hwndBtnToggleList, S(28)},
+        {st->hwndBtnToggleTerm, S(30)},
+        {st->hwndBtnTermSessions, S(28)},
+        {st->hwndBtnStreamPane, S(28)},
+        {st->hwndBtnBtView, S(34)},
+        {st->hwndBtnUsage, S(28)},
+        {st->hwndBtnHideTray, S(28)},
+        {st->hwndBtnRefresh, S(28)},
+        {st->hwndBtnReevalPlanned, S(56)},
+        {st->hwndBtnHint, S(28)},
+        {st->hwndBtnHistory, S(28)},
+        {st->hwndBtnIpmsg, S(28)},
+        {st->hwndClock, S(80)}
     };
-    const int gap = 7;
+    const int gap = S(7);
     int xCur = margin;
-    int yBar = kToolbarTop + usageOffset;
+    int yBar = S(kToolbarTop) + usageOffset;
     const bool toolbarMoved = (width != st->lastToolbarWidth || usageOffset != st->lastToolbarUsageOffset);
     for (const auto& b : buttons) {
         if (!b.hwnd) continue;
         if (xCur > margin && xCur + b.w > width - margin) {
             xCur = margin;
-            yBar += kToolbarH + 4;
+            yBar += S(kToolbarH + 4);
         }
         if (toolbarMoved) {
-            MoveWindow(b.hwnd, xCur, yBar, b.w, kToolbarH, TRUE);
+            MoveWindow(b.hwnd, xCur, yBar, b.w, S(kToolbarH), TRUE);
         }
         xCur += b.w + gap;
     }
@@ -8110,7 +8130,7 @@ static void LayoutControls(DashboardState* st, int width, int height) {
         st->lastToolbarWidth = width;
         st->lastToolbarUsageOffset = usageOffset;
     }
-    st->processListTop = yBar + kToolbarH + 6;
+    st->processListTop = yBar + S(kToolbarH + 6);
 
     int topList = st->processListTop;
     st->rcStreamSplitter = {};
@@ -12451,8 +12471,8 @@ static void ApplyListFonts(DashboardState* st) {
     };
     HFONT oldProc = st->hFontProcList;
     HFONT oldTask = st->hFontTaskList;
-    st->hFontProcList = makeFont(st->processListFontPx);
-    st->hFontTaskList = makeFont(st->taskListFontPx);
+    st->hFontProcList = makeFont(ClampListFontPx(S(st->processListFontPx)));
+    st->hFontTaskList = makeFont(ClampListFontPx(S(st->taskListFontPx)));
     if (st->hwndList) {
         SendMessageW(st->hwndList, WM_SETFONT, reinterpret_cast<WPARAM>(st->hFontProcList), TRUE);
         InvalidateRect(st->hwndList, nullptr, TRUE);
@@ -12600,6 +12620,8 @@ static void LoadShellConfig(DashboardState* st) {
         JsonGetInt(content, "process_list_font_px", kDefaultListFontPx)));
     st->taskListFontPx = ClampListFontPx(static_cast<int>(
         JsonGetInt(content, "task_list_font_px", kDefaultListFontPx)));
+    st->displayScaleDpi = static_cast<int>(JsonGetInt(content, "display_scale_dpi", 0));
+    UpdateDisplayScale(st->hwndMain, st->displayScaleDpi);
     st->refreshIntervalMs = ClampRefreshIntervalMs(
         static_cast<int>(JsonGetInt(content, "refresh_interval_ms", kDefaultRefreshIntervalMs)));
     SettingsManager::Instance().SetTabGridRefreshIntervalMs(st->refreshIntervalMs);
@@ -12727,6 +12749,7 @@ static void SaveShellConfig(const DashboardState* st) {
         << "  \"memory_max_bytes\": " << st->memoryMaxBytes << ",\n"
         << "  \"process_list_font_px\": " << st->processListFontPx << ",\n"
         << "  \"task_list_font_px\": " << st->taskListFontPx << ",\n"
+        << "  \"display_scale_dpi\": " << st->displayScaleDpi << ",\n"
        << "  \"show_supervisor_hints\": " << (st->showSupervisorHints ? "true" : "false") << ",\n"
        << "  \"hint_auto_dismiss_sec\": " << st->hintAutoDismissSec << ",\n"
        << "  \"triage_mode\": \"" << JsonEscape(st->triageMode) << "\",\n"
@@ -13652,10 +13675,12 @@ struct SettingsDlgState {
         HWND lblWebUiUrl = nullptr;
        HWND editWebUiUrl = nullptr;
        nlohmann::json webuiConfig;
-      HWND lblProcFont = nullptr;
-      HWND cmbProcFont = nullptr;
-       HWND lblTaskFont = nullptr;
-       HWND cmbTaskFont = nullptr;
+       HWND lblProcFont = nullptr;
+       HWND cmbProcFont = nullptr;
+        HWND lblTaskFont = nullptr;
+        HWND cmbTaskFont = nullptr;
+        HWND lblDisplayMode = nullptr;
+        HWND cmbDisplayMode = nullptr;
        HWND hwndAboutTitle = nullptr;
        HWND hwndAboutVersion = nullptr;
        HWND hwndAboutDesc = nullptr;
@@ -15182,6 +15207,17 @@ static void UpdateSettingsDialogTexts(HWND hwnd) {
         else sel = 3;
         SendMessageW(ds->hwndSatCombo, CB_SETCURSEL, sel, 0);
     }
+    if (ds->lblDisplayMode) {
+        SetWindowTextW(ds->lblDisplayMode, Tr(L"表示スケール (DPI):", L"Display scale (DPI):", L"Escala de visualización (DPI):"));
+    }
+    if (ds->cmbDisplayMode) {
+        static const int kDpiChoices[] = {0, 96, 120, 144};
+        int sel = 0;
+        for (int i = 0; i < 4; ++i) {
+            if (kDpiChoices[i] == ds->dash->displayScaleDpi) { sel = i; break; }
+        }
+        SendMessageW(ds->cmbDisplayMode, CB_SETCURSEL, sel, 0);
+    }
     if (ds->lblProcFont) {
         SetWindowTextW(ds->lblProcFont, Tr(L"プロセス一覧の文字サイズ (px):", L"Process list font size (px):", L"Tamaño de letra de la lista de procesos (px):"));
     }
@@ -15602,6 +15638,16 @@ static LRESULT CALLBACK SettingsWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPAR
                 WS_CHILD | WS_VISIBLE | WS_TABSTOP,
                 446, 362, 100, 26, hwnd, (HMENU)IDC_SET_WEBUI_TOKEN_ROLL, hInst, nullptr);
 
+            ds->lblDisplayMode = CreateWindowExW(0, L"STATIC", L"", WS_CHILD | WS_VISIBLE,
+                18, 440, 530, 20, hwnd, nullptr, hInst, nullptr);
+            ds->cmbDisplayMode = CreateWindowExW(WS_EX_CLIENTEDGE, L"COMBOBOX", L"",
+                WS_CHILD | WS_VISIBLE | WS_TABSTOP | CBS_DROPDOWNLIST | WS_VSCROLL,
+                18, 462, 220, 300, hwnd, (HMENU)IDC_SET_DISPLAY_MODE, hInst, nullptr);
+            SendMessageW(ds->cmbDisplayMode, CB_ADDSTRING, 0, (LPARAM)L"Windows");
+            SendMessageW(ds->cmbDisplayMode, CB_ADDSTRING, 0, (LPARAM)L"100% (96 DPI)");
+            SendMessageW(ds->cmbDisplayMode, CB_ADDSTRING, 0, (LPARAM)L"125% (120 DPI)");
+            SendMessageW(ds->cmbDisplayMode, CB_ADDSTRING, 0, (LPARAM)L"150% (144 DPI)");
+
             ds->lblProcFont = CreateWindowExW(0, L"STATIC", L"", WS_CHILD | WS_VISIBLE,
                 18, 500, 530, 20, hwnd, nullptr, hInst, nullptr);
             ds->cmbProcFont = CreateWindowExW(WS_EX_CLIENTEDGE, L"COMBOBOX", L"",
@@ -15889,7 +15935,7 @@ static LRESULT CALLBACK SettingsWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPAR
                              ds->lblWebUiAllowedHosts, ds->editWebUiAllowedHosts,
                              ds->lblWebUiPort, ds->editWebUiPort, ds->lblWebUiUrl, ds->editWebUiUrl,
                              ds->lblWebUiToken, ds->editWebUiToken, ds->btnWebUiTokenRoll,
-                             ds->lblProcFont, ds->cmbProcFont, ds->lblTaskFont, ds->cmbTaskFont };
+                             ds->lblDisplayMode, ds->cmbDisplayMode, ds->lblProcFont, ds->cmbProcFont, ds->lblTaskFont, ds->cmbTaskFont };
              for (HWND h : ctrls) SendMessageW(h, WM_SETFONT, (WPARAM)ds->dash->hFontUi, TRUE);
              for (HWND h : ds->chkTriageKinds) if (h) SendMessageW(h, WM_SETFONT, (WPARAM)ds->dash->hFontUi, TRUE);
              for (HWND h : ds->chkTriageLlmPermissions) if (h) SendMessageW(h, WM_SETFONT, (WPARAM)ds->dash->hFontUi, TRUE);
@@ -16515,6 +16561,22 @@ static LRESULT CALLBACK SettingsWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPAR
             if (id == IDC_SET_LIST_BG_RESET) {
                 for (int k = 0; k < kListRowKeyCount; ++k) g_listRowBgSet[ListRowMode()][k] = false;
                 ApplyListRowBgChange(ds, hwnd);
+                return 0;
+            }
+            if (id == IDC_SET_DISPLAY_MODE && HIWORD(wParam) == CBN_SELCHANGE) {
+                static const int kDpiChoices[] = {0, 96, 120, 144};
+                const int sel = static_cast<int>(SendMessageW(ds->cmbDisplayMode, CB_GETCURSEL, 0, 0));
+                if (sel >= 0 && sel < 4) {
+                    ds->dash->displayScaleDpi = kDpiChoices[sel];
+                    UpdateDisplayScale(ds->dash->hwndMain, ds->dash->displayScaleDpi);
+                    ApplyListFonts(ds->dash);
+                    RECT rc = {};
+                    if (GetClientRect(ds->dash->hwndMain, &rc)) {
+                        LayoutControls(ds->dash, rc.right, rc.bottom);
+                    }
+                    RefreshDashboardData(ds->dash);
+                    SaveShellConfig(ds->dash);
+                }
                 return 0;
             }
             if ((id == IDC_SET_PROC_FONT || id == IDC_SET_TASK_FONT) && HIWORD(wParam) == CBN_SELCHANGE) {
