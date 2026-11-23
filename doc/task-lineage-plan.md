@@ -104,12 +104,13 @@ MCP にも同じ操作（`task_create` / `task_show` / `task_list` / `task_note`
 
 ## カード
 
-Hancho 経由で worker（claude / haiku）に実装させる。1 枚ごとに BT（実装 → ビルド → テスト、失敗時は修正ループ）で回す。
+Hancho 経由で worker に実装させる。worker は claude / haiku。haiku がトークン切れ（`rate_limited`）などで使えないときは agy / `gemini-4-hydrogen-medium`、次に opencode / `opencode/hy4-flash-free` に切り替える（Hancho の LLM リスト `worker` に 1〜3 位で登録・承認済み）。
+100-2 〜 100-10 の詳細と、未決定・懸念への仮の決定は `doc/task-lineage-cards.md`。全カードを 1 つの BT `lineage-all2` で順に回す（カードごとに実装 → ビルド → テスト、失敗時は修正ループ、直せなければ escalate）。
 100-2 ができたら、以降のカードは Hancho のタスクとして作り、supervisor の判断はその経過ログに残す。
 
 | カード | 内容 | 状態 |
 |---|---|---|
-| 100-1 | 系譜のデータ層: `supersedes` / `taskId` / `supersededBy` / `supersedeReason`、保存・読み込み、`taskqueue_add` での検証と結び付け、テスト。詳細は `doc/task-lineage-100-1.md` | 着手（2026-11-23、BT `lineage-100-1` → `lineage-100-1b`） |
+| 100-1 | 系譜のデータ層: `supersedes` / `taskId` / `supersededBy` / `supersedeReason`、保存・読み込み、`taskqueue_add` での検証と結び付け、テスト。詳細は `doc/task-lineage-100-1.md` | 実装済み・テスト修正中（2026-11-23。`lineage-100-1` はテストの誤判定で止まったため取り消し、`lineage-all2` の最初の段で続ける） |
 | 100-2 | タスクのレコード: 保存、`task create/show/list/note/close`（CLI・MCP）、`taskqueue add --task`、`bt start --task`、状態の計算、経過ログ（作成・ジョブ追加・やり直しの自動記録） | 未着手 |
 | 100-3 | 経過ログへの自動記録: escalate への回答、引き取り、トリアージの判断、キャンセル | 未着手 |
 | 100-4 | `taskqueue list` / `get` / MCP の出力にタスク（title・状態）を足す | 未着手 |
@@ -138,6 +139,12 @@ Hancho 経由で worker（claude / haiku）に実装させる。1 枚ごとに B
     - 定期実行（`routine`）が起動するジョブ・BT は、自動でタスクを作らず暗黙のタスクのままでよいか。
     - リモート実行ジョブのタスク情報はコア側だけで持ち、リモートホストには同期しない方針でよいか。
 11. **タスクのライフサイクル（開き直し・掃除）**: 完了タスクが溜まり続けると一覧が重くなるため、古いタスクを掃除する手段（`task purge` やアーカイブ）が必要か。また、誤って閉じたタスクを開き直せるようにするか（`task reopen`）が未定。
+
+## 開発中に見つかった不具合
+
+- **失敗分類の誤判定で、普通のジョブが許可待ちのまま止まる（0.9.43 にもある）**: `src/taskqueue.cpp` の失敗分類は、ログの行を `kPermissionPattern`（`permission_denied` などの正規表現）で探して `permission_denied` に分類する。LLM ではない普通のジョブでも、ログに JSON のキー `on_permission_denied` が出るだけで一致し、ジョブが `waitingForPermit` で止まる。BT では失敗として扱われないので、修正ループに進まない。`taskqueue_smoke` が失敗したときに実際に起きた（2026-11-23、`lineage-100-1-test-1`）。
+  - 今の回避策: BT のテストは出力をファイルに書き出し（`> build\test-logs\<id>.txt`）、成功判定は `contentFile` / `contentRegex` で行う。
+  - 直し方の案: ログ行による判定を LLM の worker ジョブだけに限る、または単語の境界で一致させる。`stable` にも直す必要がある。
 
 ## 未決定
 
