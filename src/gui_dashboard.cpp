@@ -7809,7 +7809,13 @@ static void RefreshTaskQueueData(DashboardState* st, bool force = false, bool us
         row.procId = static_cast<int>(latestPid);
 
         std::wstring idStr = Utf8ToWide(jobId);
-        std::wstring summaryStr = Utf8ToWide(DisplayText(st, JsonGetString(j, "summary", ""), ""));
+        // Card 106-5: a summary that was written in the display language shows its original text.
+        std::string summaryText = JsonGetString(j, "summary", "");
+        const nlohmann::json jobObj = nlohmann::json::parse(j, nullptr, false);
+        if (jobObj.is_object() && jobObj.contains("summarySource")) {
+            summaryText = pc::EnglishFieldForDisplay(jobObj, "summary", LanguageCode(g_uiLanguage));
+        }
+        std::wstring summaryStr = Utf8ToWide(DisplayText(st, summaryText, ""));
         std::wstring kindStr;
         if (jobId.rfind("group:", 0) == 0 || jobId.rfind("direction:", 0) == 0) {
             summaryStr = L"[direction] " + summaryStr;

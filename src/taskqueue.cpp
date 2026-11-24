@@ -8,6 +8,7 @@
 #include "llm_config.h"
 #include "permit_config.h"
 #include "worker_engines.h"
+#include "translation_store.h"
 #include "platform/platform.h"
 #include <sstream>
 #include <algorithm>
@@ -2411,6 +2412,14 @@ static TaskQueueJob ParseJob(const std::string& j) {
     job.taskqueue = JsonFieldStr(j, "taskqueue", "");
     job.name = JsonFieldStr(j, "name", "");
     job.summary = JsonFieldStr(j, "summary", "");
+    job.summaryLang = JsonFieldStr(j, "summaryLang", "");
+    {
+        const nlohmann::json src = nlohmann::json::parse(JsonFieldObj(j, "summarySource"), nullptr, false);
+        if (src.is_object()) {
+            job.summarySourceLang = src.value("lang", std::string());
+            job.summarySource = src.value("text", std::string());
+        }
+    }
     job.instructions = ParseInstructions(JsonFieldObj(j, "instructions"));
     job.command = JsonFieldStr(j, "command", "");
     job.cwd = JsonFieldStr(j, "cwd", "");
@@ -3532,6 +3541,11 @@ std::string TaskQueueManager::JobToJson(const TaskQueueJob& job, bool includeIns
         << ",\"taskqueue\":\"" << JsonEscape(job.taskqueue) << "\""
         << ",\"name\":\"" << JsonEscape(job.name) << "\""
         << ",\"summary\":\"" << JsonEscape(job.summary) << "\"";
+    if (!job.summaryLang.empty()) oss << ",\"summaryLang\":\"" << JsonEscape(job.summaryLang) << "\"";
+    if (!job.summarySource.empty()) {
+        oss << ",\"summarySource\":{\"lang\":\"" << JsonEscape(job.summarySourceLang) << "\",\"text\":\""
+            << JsonEscape(job.summarySource) << "\"}";
+    }
     if (includeInstructions) {
         oss << ",\"instructions\":" << InstructionsToJson(job.instructions);
     } else {
@@ -4473,6 +4487,28 @@ static bool IsWorkerJob(const TaskQueueJob& job, const std::string& rawJson = ""
 // Job definition parsing + validation
 // ---------------------------------------------------------------------------
 
+// Card 106-5: copies the result of NormalizeEnglishField on a job summary back into the job.
+static void CopySummaryNormalization(TaskQueueJob& job, const nlohmann::json& obj) {
+    job.summary = obj.value("summary", job.summary);
+    job.summaryLang = obj.value("summaryLang", job.summaryLang);
+    auto src = obj.find("summarySource");
+    if (src != obj.end() && src->is_object()) {
+        job.summarySourceLang = src->value("lang", std::string());
+        job.summarySource = src->value("text", std::string());
+    }
+}
+
+// Card 106-5: applies a landed English translation to a foreign job summary, or asks for one again
+// while it is pending. Returns true when the summary changed.
+static bool RefreshJobSummaryTranslation(TaskQueueJob& job) {
+    if (job.summaryLang.empty() || job.summaryLang == "en") return false;
+    const std::string before = job.summary;
+    nlohmann::json obj = {{"summary", job.summary}};
+    NormalizeEnglishField(obj, "summary", job.summaryLang, "", ActiveTranslationStore());
+    CopySummaryNormalization(job, obj);
+    return job.summary != before;
+}
+
 static bool ParseNewJob(const std::string& rawJson, const std::string& taskqueue,
                         int defaultMaxAttempts, int maxTimeoutSec,
                         TaskQueueJob& job, std::string& err) {
@@ -4497,6 +4533,14 @@ static bool ParseNewJob(const std::string& rawJson, const std::string& taskqueue
     if (job.summary.size() > 200) {
         err = "job '" + job.id + "': summary must be 200 characters or less";
         return false;
+    }
+    // Card 106-5: a summary that is not English is kept as the original, and its English translation
+    // replaces it once the core has one. source_lang names the language of Latin-script text.
+    const std::string summarySourceLang = JsonFieldStr(j, "source_lang", "");
+    if (IsForeignText(job.summary, summarySourceLang)) {
+        nlohmann::json obj = {{"summary", job.summary}};
+        NormalizeEnglishField(obj, "summary", summarySourceLang, "", ActiveTranslationStore());
+        CopySummaryNormalization(job, obj);
     }
     job.command = JsonFieldStr(j, "command", "");
     if (job.command.empty()) {
@@ -5166,6 +5210,25 @@ std::string TaskQueueManager::TaskQueueList(const std::string& taskqueue, const 
     outError.clear();
     const int64_t effectiveLimit = (finishedLimit < 0) ? GetTaskListRecentCount() : finishedLimit;
     std::lock_guard<std::mutex> lock(mutex_);
+    // Card 106-5: the sweep. A job summary whose English translation has landed is replaced here, and
+    // a pending one is asked for again. Done on each list, so no thread is needed. A changed queue is
+    // saved and its version moves, so watchers see the new summary.
+    for (auto& entry : queues_) {
+        TaskQueue& queue = entry.second;
+        bool changed = false;
+        for (auto& job : queue.jobs) {
+            if (RefreshJobSummaryTranslation(job)) {
+                job.cachedJsonFull_.clear();
+                job.cachedJsonNoInstr_.clear();
+                changed = true;
+            }
+        }
+        if (changed) {
+            queue.version++;
+            SaveQueue(queue);
+            cv_.notify_all();
+        }
+    }
 
     struct TaskSearchInfo { std::string title; std::string intent; };
     struct DirSearchInfo { std::string title; std::string cardTitle; };
@@ -5670,6 +5733,15 @@ std::string TaskQueueManager::TaskQueueUpdate(const std::string& id, const std::
             return BuildError(outError);
         }
         job->summary = s;
+        job->summaryLang.clear();
+        job->summarySourceLang.clear();
+        job->summarySource.clear();
+        const std::string sourceLang = JsonFieldStr(patchJson, "source_lang", "");
+        if (IsForeignText(s, sourceLang)) {
+            nlohmann::json obj = {{"summary", s}};
+            NormalizeEnglishField(obj, "summary", sourceLang, "", ActiveTranslationStore());
+            CopySummaryNormalization(*job, obj);
+        }
     }
     if (HasJsonKey(patchJson, "command")) {
         std::string c = JsonFieldStr(patchJson, "command", "");
