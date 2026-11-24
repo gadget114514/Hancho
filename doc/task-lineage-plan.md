@@ -27,7 +27,7 @@
 | 系譜 | やり直し（`supersedes`）でつながったジョブの列 | 最新のジョブ |
 | タスク | supervisor がやろうとしていること。ジョブと系譜を持ち、意図と経過ログを持つ | 中の系譜の結果から決まる（下記） |
 
-画面・API では「タスクキュー」と紛らわしいので、呼び名は未決定 4 で決める。
+用語は `doc/terminology.md` に合わせる。タスク（task）とジョブ（job）の間には direction（キューへの 1 回の登録。BT 1 本、または `taskqueue add` 1 回分）があり、階層は task → direction → job → attempt。呼び名（未決定 4）は task に決まった。
 
 ## 決定事項
 
@@ -104,7 +104,7 @@ MCP にも同じ操作（`task_create` / `task_show` / `task_list` / `task_note`
 
 ## カード
 
-Hancho 経由で worker に実装させる。worker は claude / haiku。haiku がトークン切れ（`rate_limited`）などで使えないときは agy / `gemini-4-hydrogen-medium`、次に opencode / `opencode/hy4-flash-free` に切り替える（Hancho の LLM リスト `worker` に 1〜3 位で登録・承認済み）。
+Hancho 経由で worker に実装させる。agent は claude / haiku。haiku がトークン切れ（`rate_limited`）などで使えないときは agy / `gemini-4-hydrogen-medium`、次に opencode / `opencode/hy4-flash-free` に切り替える（Hancho の agent list（今の LLM リスト `worker`）に 1〜3 位で登録・承認済み）。
 100-2 〜 100-10 の詳細と、未決定・懸念への仮の決定は `doc/task-lineage-cards.md`。全カードを 1 つの BT `lineage-all2` で順に回す（カードごとに実装 → ビルド → テスト、失敗時は修正ループ、直せなければ escalate）。
 100-2 ができたら、以降のカードは Hancho のタスクとして作り、supervisor の判断はその経過ログに残す。
 
@@ -125,7 +125,7 @@ Hancho 経由で worker に実装させる。worker は claude / haiku。haiku �
 
 重要な順。対策が決まったら「決定事項」に移す。
 
-1. **BT の「タスクグループ」と名前・見出し行がぶつかる**: 今のタスク一覧には、実行中の BT が `group:<id>` の仮想行（タスクグループ）として出る。新しいタスクとの関係を決めないと、一覧に 2 種類の見出し行が並ぶ。案: BT の実行をタスクの一部にする／タスクなしで起動した BT を暗黙のタスクとして扱う。
+1. **BT の「タスクグループ」と名前・見出し行がぶつかる**: 今のタスク一覧には、実行中の BT が `group:<id>` の仮想行（タスクグループ）として出る。新しいタスクとの関係を決めないと、一覧に 2 種類の見出し行が並ぶ。案: BT の実行をタスクの一部にする／タスクなしで起動した BT を暗黙のタスクとして扱う。→ 用語集（`doc/terminology.md`）で、BT の実行は task の下の direction とし、仮想行は 0.10.0 で `direction:<id>` に変えることにした。
 2. **stable（0.9.x）に戻すと系譜が消える**: 0.9.x と 0.10 は同じデータディレクトリを使う。0.9.x に戻すと、キューを保存したときに知らないフィールド（`supersedes` / `task_id` など）が落ち、系譜とタスクとのつながりが消える。
 3. **ジョブの purge**: ジョブが削除されると、タスクの状態を計算する材料がなくなる。消える前に結果をタスク側に写しておく必要がある（未決定 5 の一部）。
 4. **状態の対応表がない**: 最新ジョブが `cancelled` / `blocked` / `waitingForPermit` / `takenOver` / 一時停止中のとき、タスクの状態をどうするか未定。
@@ -144,14 +144,14 @@ Hancho 経由で worker に実装させる。worker は claude / haiku。haiku �
 
 - **失敗分類の誤判定で、普通のジョブが許可待ちのまま止まる（0.9.43 にもある）**: `src/taskqueue.cpp` の失敗分類は、ログの行を `kPermissionPattern`（`permission_denied` などの正規表現）で探して `permission_denied` に分類する。LLM ではない普通のジョブでも、ログに JSON のキー `on_permission_denied` が出るだけで一致し、ジョブが `waitingForPermit` で止まる。BT では失敗として扱われないので、修正ループに進まない。`taskqueue_smoke` が失敗したときに実際に起きた（2026-11-23、`lineage-100-1-test-1`）。
   - 今の回避策: BT のテストは出力をファイルに書き出し（`> build\test-logs\<id>.txt`）、成功判定は `contentFile` / `contentRegex` で行う。
-  - 直し方の案: ログ行による判定を LLM の worker ジョブだけに限る、または単語の境界で一致させる。`stable` にも直す必要がある。
+  - 直し方の案: ログ行による判定を agent のジョブ（LLM を動かすジョブ）だけに限る、または単語の境界で一致させる。`stable` にも直す必要がある。
 
 ## 未決定
 
 1. やり直しジョブは主にどの経路で追加されるか（supervisor が手で `taskqueue_add` / BT のフォールバック / トリアージからの再投入）。これで `supersedes` を自動で付ける場所が決まる。
 2. Web UI（`src/webui/app.js`）の一覧も同じ表示に合わせるか。
 3. `run --exit-on-drain` のタスク・系譜基準を既定にするか、フラグにするか。
-4. 画面・API での「タスク」の呼び名（「タスクキュー」との混同を避ける）。
+4. ~~画面・API での「タスク」の呼び名~~ → 決定: task（`doc/terminology.md`）。
 5. タスクのレコードの保存場所と、ジョブの purge との関係（例: `<data-dir>/tasks/<id>.json`、ジョブが消えてもタスクと経過ログは残すか）。
 6. `dependsOn` の解決を系譜の最新ジョブ基準にするか、ジョブ単位のままにするか。
 7. TUI（`hancho-cli top`）もタスク表示に対応するか。

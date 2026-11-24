@@ -2,26 +2,28 @@
 
 状態: 実装済み（カード 101-1〜101-6）
 
+用語は `doc/terminology.md` に合わせる（agent = エンジン + モデル、agent ノード = 今の `"type": "worker"`、exec ノード = 今の `"type": "job"`）。
+
 ## 問題
 
-開発中の smoke テストが何度も落ち、ワーカーが障害の原因を見つけられないとき、別のモデルに切り替えると解決することが多い。
-今の Hancho のエンジン切り替え（091-3 の `engines` / `switchEngineOn`）は、主に「動かない」系の失敗（`startup_hang`、`auth_error`、`probe_failed`）を想定している。
+開発中の smoke テストが何度も落ち、worker（修正を任せた agent）が障害の原因を見つけられないとき、別のモデルに切り替えると解決することが多い。
+今の Hancho の候補（agent）の切り替え（091-3 の `engines` / `switchEngineOn`）は、主に「動かない」系の失敗（`startup_hang`、`auth_error`、`probe_failed`）を想定している。
 「動いたが直せなかった」（修正失敗）を切り替えの理由として扱う仕組みがない。
 
 - トークン切れ（`rate_limited`）は、雛形では切り替えずに待つ設定になっている（`src/bt_templates.h`）。
-- ワーカーが「原因を見つけられなかった」と報告する専用の窓口がない。
+- worker が「原因を見つけられなかった」と報告する専用の窓口がない。
 
 ## 現状の仕組み（調査結果）
 
 - ジョブが失敗した後の切り替えは `TrySwitchEngine`（`src/behavior_tree_runtime.cpp` の 443 行付近）。判定は `ShouldSwitchEngine` で、失敗クラスが `switchEngineOn` に含まれ、次の候補があるかだけを見る（`src/behavior_tree_exec.cpp:255`）。
 - `switchEngineOn` には任意のクラス文字列を書ける（`src/behavior_tree_parse.cpp:543`）。`failure-rules.json` で足した独自クラスも使える。
-- ワーカーの合否は `success` 条件（`exitCode`、`outputRegex`、`testReport`、`contentFile`、`engineResult` など）で決まる。`testReport` は失敗したテスト名の先頭数件を失敗の詳細に入れる。
+- agent ノードの合否は `success` 条件（`exitCode`、`outputRegex`、`testReport`、`contentFile`、`engineResult` など）で決まる。`testReport` は失敗したテスト名の先頭数件を失敗の詳細に入れる。
 - `incomplete` クラスは、計画の TODO が残ったまま止まったときだけ付く（`src/taskqueue.cpp:1634`）。
-- つまり、smoke テストをワーカーのノードの `success.testReport` に入れていれば、`switchEngineOn` に `success_check_failed` を足すだけで切り替わる。ただし 1 回目の失敗ですぐ切り替わる。
+- つまり、smoke テストをagent ノードの `success.testReport` に入れていれば、`switchEngineOn` に `success_check_failed` を足すだけで切り替わる。ただし 1 回目の失敗ですぐ切り替わる。
 
 ## 今すぐできること（コード変更なし）
 
-### ワーカーの自己申告
+### worker の自己申告
 1. プロンプトで指示する: 原因を特定できなければ `HANCHO-RESULT: root_cause_not_found` を 1 行出力し、0 以外で終了する。
 2. `<data-dir>/failure-rules.json` にクラスを足す:
    ```json
@@ -47,12 +49,12 @@
     { "class": "root_cause_not_found", "after": 1 }
   ]
   ```
-  回数は候補（エンジン・モデル）ごとに数え、切り替えたら 0 に戻す。それまでは同じ候補でリトライする（`maxRetries` の範囲内）。
+  回数は候補（agent。エンジンとモデルの組）ごとに数え、切り替えたら 0 に戻す。それまでは同じ候補でリトライする（`maxRetries` の範囲内）。
 
 ### 2. smoke テストが別ノードのとき
-- カードの雛形では、ビルドやテストはワーカーの後の別ジョブ。ワーカーのノードは成功で終わっているので切り替えが起きない。
-- 案: 「修正 → テスト」を 1 つのループとして扱う構造（BT ノードの型、または雛形）を用意し、テストの失敗をワーカーのノードの失敗として数える。
-- それまでは、smoke テストをワーカーのノードの `success.testReport` / `outputRegex` に入れる書き方を推奨する。
+- カードの雛形では、ビルドやテストは agent ノードの後の別の exec ノード。agent ノードは成功で終わっているので切り替えが起きない。
+- 案: 「修正 → テスト」を 1 つのループとして扱う構造（BT ノードの型、または雛形）を用意し、テストの失敗をagent ノードの失敗として数える。
+- それまでは、smoke テストをagent ノードの `success.testReport` / `outputRegex` に入れる書き方を推奨する。
 
 ### 3. 行き詰まりと前進を区別する
 - 前回と同じテストが落ちている → 行き詰まり（修正失敗）。違うテストが落ちている → 前進している。
@@ -60,8 +62,8 @@
 - 前進しているあいだは同じモデルで続けさせたい。
 
 ### 4. 切り替え先への引き継ぎ
-- 切り替え先のモデルには、前のモデルが立てた仮説と試した差分（試したが効かなかったこと）を渡す。同じ試行を繰り返させない。
-- 自己申告のとき、ワーカーに「疑ったこと・試したこと・除外できたこと」を短く書かせ、次の候補のプロンプトに添える。
+- 切り替え先の agent には、前の agent が立てた仮説と試した差分（試したが効かなかったこと）を渡す。同じ試行を繰り返させない。
+- 自己申告のとき、worker に「疑ったこと・試したこと・除外できたこと」を短く書かせ、次の候補のプロンプトに添える。
 - task-lineage（`doc/task-lineage-plan.md`）のタスクの経過ログに残すと、ほかの場面でも追える。
 
 ### 5. 前のモデルの変更をどうするか
