@@ -60,6 +60,7 @@ set(HANCHO_SOURCES
     src/remote_client.cpp
     src/remote_hosts.cpp
     src/cli.cpp
+    src/card_markdown.cpp
     src/memory_cli.cpp
     src/mcp_server.cpp
     src/llm_stream.cpp
@@ -207,6 +208,7 @@ add_custom_target(HanchoCore
 add_executable(hancho-cli
     src/cli_main.cpp
     src/cli.cpp
+    src/card_markdown.cpp
     src/triage_text.cpp
     src/ipc_client.cpp
     src/ephemeral_core.cpp
@@ -445,8 +447,10 @@ add_dependencies(wct_smoke wct)
 add_executable(taskqueue_smoke
     tests/taskqueue_smoke.cpp
     src/taskqueue.cpp
+    src/translation_store.cpp
     src/task_store.cpp
     src/direction_store.cpp
+    src/card_markdown.cpp
     src/worker_engines.cpp
     src/worker_probe.cpp
     src/engine_health.cpp
@@ -974,6 +978,7 @@ add_executable(bt_integration_smoke
     src/engine_health.cpp
     src/platform/platform_windows.cpp
     src/taskqueue.cpp
+    src/translation_store.cpp
     src/task_store.cpp
     src/direction_store.cpp
     src/triage.cpp
@@ -1654,6 +1659,7 @@ else()
     add_executable(hancho-cli
         src/cli_main_posix.cpp
         src/cli.cpp
+        src/card_markdown.cpp
         src/ephemeral_core.cpp
         src/ipc_client_posix.cpp
         src/remote_client.cpp

@@ -619,6 +619,12 @@ struct TaskQueueJob {
     int num = 0; // transient numeric id (process correlation)
     std::string name;
     std::string summary;
+    // Card 106-5: summaryLang is the language of summary while it is not English yet, and "en" once
+    // an English translation has replaced it. summarySource / summarySourceLang keep the original
+    // text after that. All empty for a summary that was English from the start.
+    std::string summaryLang;
+    std::string summarySourceLang;
+    std::string summarySource;
     TaskQueueInstructions instructions;
     std::string command;
     std::string cwd;

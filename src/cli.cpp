@@ -20,6 +20,7 @@
 #include "demo.h"
 #endif
 #include "triage_text.h"
+#include "card_markdown.h"
 #include "nlohmann/json.hpp"
 #include <iostream>
 #include <sstream>
@@ -2787,6 +2788,9 @@ CARDS (task cards stored as planned directions inside a task):
   card remove <number> --task <id>
   card run (<number> | --ready [--max <n>]) --task <id> [--force]
   card redo <number> --task <id> [--body "..." | --body-file <md>] [--params <json>] [--reason "..."] [--run] [--force]
+  card import --task <id> --file <md> [--dry-run] [--translate-cards <all|title|off>]
+  card export --task <id> [--file <md>] [--lang <en|ja|es>]
+  card translate --task <id> [--translate-cards <all|title|off>]
 
 BEHAVIOR TREES (for LLM agents; next step depends on results):
   bt validate|start --file <bt.json> [--task <id>]    Check / register and run a behavior tree
@@ -8284,7 +8288,7 @@ if (subcmd == "start" || subcmd == "run") {
                     if (a == "--task" || a == "--number" || a == "--id" || a == "--title" ||
                         a == "--body" || a == "--body-file" || a == "--after" ||
                         a == "--template" || a == "--params" || a == "--max" ||
-                        a == "--reason" || a == "--origin-label" || a == "--data-dir") {
+                        a == "--reason" || a == "--origin-label" || a == "--data-dir" || a == "--file") {
                         ++i;
                     }
                     continue;
@@ -8320,7 +8324,10 @@ if (subcmd == "start" || subcmd == "run") {
                 << "  edit    <number> --task <id> [--title \"...\"] [--body \"...\" | --body-file <md>] [--after <n1,n2>] [--template <name>] [--params <json>]\n"
                 << "  remove  <number> --task <id>\n"
                 << "  run     (<number> | --ready [--max <n>]) --task <id> [--force]\n"
-                << "  redo    <number> --task <id> [--body \"...\" | --body-file <md>] [--params <json>] [--reason \"...\"] [--run] [--force]\n";
+                << "  redo    <number> --task <id> [--body \"...\" | --body-file <md>] [--params <json>] [--reason \"...\"] [--run] [--force]\n"
+                << "  import  --task <id> --file <md> [--dry-run]\n"
+                << "  export  --task <id> [--file <md>] [--lang <en|ja|es>]\n"
+                << "  translate --task <id> [--translate-cards <all|title|off>]\n";
             return 0;
         }
         nlohmann::json req = nlohmann::json::object();
@@ -8481,9 +8488,120 @@ if (subcmd == "start" || subcmd == "run") {
             req["origin"] = nlohmann::json::parse(
                 BuildCallerOriginJson("hancho-cli-cli", argVal("--origin-label", "")), nullptr, false);
             subcmd = "card_redo";
+        } else if (op == "import" || op == "export" || op == "translate") {
+            const std::string taskId = argVal("--task", "");
+            if (taskId.empty()) return failWith("card " + op + " requires --task <id>.");
+            const std::string cardLang = DisplayLangSetting();
+            const std::string originLabel = argVal("--origin-label", "");
+            const CardMarkdownSend cardSend = [&](const nlohmann::json& q, nlohmann::json& outResp,
+                                                  std::string& outErr) -> bool {
+                nlohmann::json sent = q;
+                const std::string act = sent.value("action", std::string());
+                if (act == "card_add" || act == "card_edit") {
+                    sent["origin"] = nlohmann::json::parse(
+                        BuildCallerOriginJson("hancho-cli-cli", originLabel), nullptr, false);
+                }
+                std::string raw;
+                const bool sentOk = remoteHost.empty()
+                    ? SendIpcRequest(sent.dump(), raw, outErr, true)
+                    : remote::CallHost(remoteHost, sent.dump(), raw, outErr);
+                if (!sentOk) return false;
+                outResp = nlohmann::json::parse(raw, nullptr, false);
+                if (outResp.is_discarded() || !outResp.is_object()) {
+                    outErr = "invalid response from hancho: " + raw;
+                    return false;
+                }
+                return true;
+            };
+            if (op == "import") {
+                const std::string file = argVal("--file", "");
+                if (file.empty()) return failWith("card import requires --file <md>.");
+                const std::wstring absW = ResolveAbsolutePathWide(Utf8ToWide(file));
+                std::ifstream ifs(absW, std::ios::binary);
+                if (!ifs) return failWith("cannot open file: " + file);
+                std::ostringstream mdss;
+                mdss << ifs.rdbuf();
+                const bool dryRun = hasFlag("--dry-run");
+                const std::string translateCards = argVal("--translate-cards", "");
+                if (!translateCards.empty() && translateCards != "all" && translateCards != "title" &&
+                    translateCards != "off") {
+                    return failWith("--translate-cards must be all, title or off.");
+                }
+                const CardMarkdownImportResult res =
+                    ImportCardMarkdown(taskId, mdss.str(), dryRun, cardLang, cardSend, translateCards);
+                if (jsonOutput) {
+                    std::cout << CardMarkdownImportResultJson(res).dump() << "\n";
+                } else {
+                    for (const auto& a : res.actions) std::cout << "  " << a << "\n";
+                    for (const auto& w : res.warnings) {
+                        std::cout << CliTr(cardLang, "警告: ", "Warning: ", "Advertencia: ") << w << "\n";
+                    }
+                    for (const auto& e : res.errors) {
+                        std::cerr << CliTr(cardLang, "エラー: ", "Error: ", "Error: ") << e << "\n";
+                    }
+                    if (dryRun) {
+                        std::cout << CliTr(cardLang, "--dry-run のため何も書き込んでいない。\n",
+                                           "--dry-run: nothing was written.\n",
+                                           "--dry-run: no se escribió nada.\n");
+                    }
+                    std::cout << CliTr(cardLang, "追加 ", "Added ", "Añadidos ") << res.added
+                              << CliTr(cardLang, ", 上書き ", ", updated ", ", actualizados ") << res.updated
+                              << CliTr(cardLang, ", 飛ばし ", ", skipped ", ", omitidos ") << res.skipped << "\n";
+                }
+                return res.ok ? 0 : 1;
+            }
+            if (op == "translate") {
+                // card 106-5: translate the stored non-English titles and bodies to English.
+                const std::string translateCards = argVal("--translate-cards", "");
+                if (!translateCards.empty() && translateCards != "all" && translateCards != "title" &&
+                    translateCards != "off") {
+                    return failWith("--translate-cards must be all, title or off.");
+                }
+                const CardTranslateResult tr = TranslateCardsInTask(taskId, translateCards, cardLang, cardSend);
+                if (jsonOutput) {
+                    std::cout << nlohmann::json{{"ok", tr.ok}, {"updated", tr.updated}, {"pending", tr.pending},
+                                                {"actions", tr.actions}, {"warnings", tr.warnings},
+                                                {"errors", tr.errors}}.dump() << "\n";
+                } else {
+                    for (const auto& a : tr.actions) std::cout << "  " << a << "\n";
+                    for (const auto& e : tr.errors) {
+                        std::cerr << CliTr(cardLang, "エラー: ", "Error: ", "Error: ") << e << "\n";
+                    }
+                    std::cout << CliTr(cardLang, "訳した ", "Translated ", "Traducidos ") << tr.updated
+                              << CliTr(cardLang, ", まだ訳せない ", ", still pending ", ", pendientes ")
+                              << tr.pending << "\n";
+                }
+                return tr.ok ? 0 : 1;
+            }
+            // card 106-5: export writes the stored English unless --lang asks for another language.
+            // The global --lang flag (display language) is taken by the caller, so it is read here too.
+            const std::string exportLang = langGiven ? NormalizeDisplayLang(langArg) : std::string("en");
+            const std::string file = argVal("--file", "");
+            std::string md;
+            std::string exportErr;
+            if (!ExportCardMarkdown(taskId, exportLang, cardSend, md, exportErr)) return failWith(exportErr);
+            if (file.empty()) {
+                if (jsonOutput) {
+                    std::cout << nlohmann::json{{"ok", true}, {"markdown", md}}.dump() << "\n";
+                } else {
+                    std::cout << md;
+                }
+                return 0;
+            }
+            const std::wstring absW = ResolveAbsolutePathWide(Utf8ToWide(file));
+            std::ofstream ofs(absW, std::ios::binary);
+            if (!ofs) return failWith("cannot write file: " + file);
+            ofs << md;
+            ofs.close();
+            if (jsonOutput) {
+                std::cout << nlohmann::json{{"ok", true}, {"file", file}}.dump() << "\n";
+            } else {
+                std::cout << CliTr(cardLang, "書き出した: ", "Exported to ", "Exportado a ") << file << "\n";
+            }
+            return 0;
         } else {
             return failWith("unknown card command: " + op +
-                            " (add, list, show, edit, remove, run, redo)");
+                            " (add, list, show, edit, remove, run, redo, import, export)");
         }
         reqJson << req.dump();
     }

@@ -5,10 +5,12 @@
 #include "../src/llm_stream.h"
 #include "../src/llm_config.h"
 #include "../src/memory_search.h"
+#include "../src/card_markdown.h"
 #include <windows.h>
 #include <ctime>
 #include <cstdio>
 #include <cwctype>
+#include <map>
 #include <set>
 #include <string>
 
@@ -54,6 +56,429 @@ static bool WaitForState(TaskQueueManager& tqm, const std::string& id, const std
         Sleep(100);
     }
     return GetState(tqm, id) == want;
+}
+
+// ---- card 104-4: Markdown import and export (src/card_markdown.cpp) ----
+
+namespace {
+
+// An in-memory stand-in for the card_* requests of one task.
+struct FakeCardTask {
+    std::string taskId = "task_md";
+    std::map<std::string, nlohmann::json> cards;  // number -> {title, body, state, after, directionId}
+    int nextId = 1;
+    int writes = 0;
+};
+
+CardMarkdownSend MakeFakeCardSend(FakeCardTask& t) {
+    return [&t](const nlohmann::json& req, nlohmann::json& resp, std::string& err) -> bool {
+        err.clear();
+        const std::string action = req.value("action", std::string());
+        const std::string num = req.value("number", std::string());
+        auto fail = [&resp](const std::string& msg) {
+            resp = {{"ok", false}, {"error", msg}};
+            return true;
+        };
+        if (action == "card_list") {
+            nlohmann::json list = nlohmann::json::array();
+            for (const auto& [n, c] : t.cards) {
+                list.push_back({{"number", n}, {"title", c["title"]}, {"state", c["state"]},
+                                {"after", c["after"]}, {"directionId", c["directionId"]}});
+            }
+            resp = {{"ok", true}, {"taskId", t.taskId}, {"cards", list}};
+            return true;
+        }
+        if (action == "card_show") {
+            const std::string id = req.value("id", std::string());
+            for (const auto& [n, c] : t.cards) {
+                if (c["directionId"] == id) {
+                    resp = {{"ok", true}, {"card", {{"number", n}, {"body", c["body"]}}}};
+                    return true;
+                }
+            }
+            return fail("card not found: " + id);
+        }
+        if (action == "card_add") {
+            if (t.cards.count(num) > 0) return fail("card '" + num + "' already exists");
+            nlohmann::json after = nlohmann::json::array();
+            if (req.contains("after")) after = req["after"];
+            for (const auto& dep : after) {
+                if (t.cards.count(dep.get<std::string>()) == 0) return fail("unknown dependency " + dep.get<std::string>());
+            }
+            t.cards[num] = {{"title", req.value("title", std::string())},
+                            {"body", req.value("body", std::string())},
+                            {"state", "planned"}, {"after", after},
+                            {"directionId", "dir_" + std::to_string(t.nextId++)}};
+            ++t.writes;
+            resp = {{"ok", true}, {"number", num}};
+            return true;
+        }
+        if (action == "card_edit") {
+            auto it = t.cards.find(num);
+            if (it == t.cards.end()) return fail("card not found: " + num);
+            if (it->second["state"] != "planned") return fail("only a planned card can be edited");
+            if (req.contains("title")) it->second["title"] = req["title"];
+            if (req.contains("body")) it->second["body"] = req["body"];
+            if (req.contains("after")) {
+                for (const auto& dep : req["after"]) {
+                    const std::string d = dep.get<std::string>();
+                    if (d == num || t.cards.count(d) == 0) return fail("bad dependency " + d);
+                }
+                it->second["after"] = req["after"];
+            }
+            ++t.writes;
+            resp = {{"ok", true}, {"number", num}};
+            return true;
+        }
+        return fail("unknown action " + action);
+    };
+}
+
+// number -> {title, body, after, state}: what an import should have stored.
+nlohmann::json SnapshotTask(const FakeCardTask& t) {
+    nlohmann::json out = nlohmann::json::object();
+    for (const auto& [n, c] : t.cards) {
+        out[n] = {{"title", c["title"]}, {"body", c["body"]}, {"after", c["after"]}, {"state", c["state"]}};
+    }
+    return out;
+}
+
+nlohmann::json ParsedCard(const CardMarkdownParseResult& pr, const std::string& number) {
+    for (const auto& c : pr.cards) {
+        if (c.number == number) {
+            return {{"title", c.title}, {"body", c.body}, {"after", c.after}, {"state", c.state}};
+        }
+    }
+    return nullptr;
+}
+
+bool HasWarning(const std::vector<std::string>& warnings, const std::string& needle) {
+    for (const auto& w : warnings) {
+        if (w.find(needle) != std::string::npos) return true;
+    }
+    return false;
+}
+
+// A 102-x style document: a 依存 chain, a body 前提 line, and the common promise after ---.
+const char* const kCardDocChain =
+    "# 102 タスクカード\n"
+    "\n"
+    "依存: 102-2 → 102-3 → 102-6\n"
+    "\n"
+    "## 102-2: 最初の title\n"
+    "102-2 の本文。\n"
+    "\n"
+    "## 102-3 二番目の title\n"
+    "前提: 102-2\n"
+    "102-3 の本文。\n"
+    "\n"
+    "## 102-6: 六番目\n"
+    "前提: 102-3, 103-2\n"
+    "本文 6。\n"
+    "\n"
+    "---\n"
+    "\n"
+    "各タスクカードとも（100-x と同じ）:\n"
+    "- 共通の約束 1\n"
+    "- 共通の約束 2\n";
+
+// A 103-x style document: a card table with a 前提 column and ranges.
+const char* const kCardDocTable =
+    "## 一覧\n"
+    "\n"
+    "| 番号 | title | 前提 |\n"
+    "|---|---|---|\n"
+    "| 103-1 | Alpha | なし |\n"
+    "| 103-2 | Beta | 103-1 |\n"
+    "| 103-3 | Gamma | 103-1〜103-2 |\n"
+    "\n"
+    "## 103-1 Alpha\n"
+    "alpha body\n"
+    "\n"
+    "## 103-2: Beta [planned]\n"
+    "beta body\n"
+    "\n"
+    "## 103-3: Gamma\n"
+    "gamma body\n";
+
+// A task-card-store style 依存 bullet with several chains and a range.
+const char* const kCardDocBullets =
+    "- 依存: 103-2 → 104-1 → 104-2 → 104-3、104-1 → 104-4、104-2 → 104-5、104-1〜104-5 → 104-6。\n"
+    "\n"
+    "## 104-1: a\n"
+    "x\n"
+    "\n"
+    "## 104-2: b\n"
+    "\n"
+    "## 104-3: c\n"
+    "\n"
+    "## 104-4: d\n"
+    "\n"
+    "## 104-5: e\n"
+    "\n"
+    "## 104-6: f\n";
+
+void TestCardMarkdown() {
+    // Parsing: numbers, titles, dependencies, body and the common promise.
+    {
+        const CardMarkdownParseResult pr = ParseCardMarkdown(kCardDocChain, "en");
+        Check(pr.cards.size() == 3, "104-4: chain doc yields three cards");
+        Check(ParsedCard(pr, "102-2")["title"] == "最初の title", "104-4: heading with colon keeps its title");
+        Check(ParsedCard(pr, "102-3")["title"] == "二番目の title", "104-4: heading without colon keeps its title");
+        Check(ParsedCard(pr, "102-2")["after"] == nlohmann::json::array(), "104-4: chain head has no prerequisite");
+        Check(ParsedCard(pr, "102-3")["after"] == nlohmann::json::array({"102-2"}),
+              "104-4: 依存 chain makes 102-2 a prerequisite of 102-3");
+        Check(ParsedCard(pr, "102-6")["after"] == nlohmann::json::array({"102-3", "103-2"}),
+              "104-4: chain edge and 前提 line merge, external 103-2 is kept for the import step");
+        Check(ParsedCard(pr, "102-6")["body"].get<std::string>().find("前提") == std::string::npos,
+              "104-4: 前提 line is removed from the body");
+        Check(ParsedCard(pr, "102-2")["body"] ==
+                  "102-2 の本文。\n\n各タスクカードとも（100-x と同じ）:\n- 共通の約束 1\n- 共通の約束 2",
+              "104-4: common promise is appended to every card body");
+    }
+    {
+        const CardMarkdownParseResult pr = ParseCardMarkdown(kCardDocTable, "en");
+        Check(pr.cards.size() == 3, "104-4: table doc yields three cards");
+        Check(ParsedCard(pr, "103-1")["title"] == "Alpha" && ParsedCard(pr, "103-2")["title"] == "Beta",
+              "104-4: space-separated and colon headings both read titles");
+        Check(ParsedCard(pr, "103-2")["state"] == "planned" && ParsedCard(pr, "103-2")["title"] == "Beta",
+              "104-4: a trailing [state] is read and not kept in the title");
+        Check(ParsedCard(pr, "103-3")["after"] == nlohmann::json::array({"103-1", "103-2"}),
+              "104-4: 前提 column range 103-1〜103-2 is expanded");
+        Check(ParsedCard(pr, "103-2")["after"] == nlohmann::json::array({"103-1"}),
+              "104-4: 前提 column single number is read");
+        Check(ParsedCard(pr, "103-1")["after"] == nlohmann::json::array(), "104-4: なし means no prerequisite");
+        Check(ParsedCard(pr, "103-2")["body"] == "beta body", "104-4: card body excludes the heading");
+    }
+    {
+        const CardMarkdownParseResult pr = ParseCardMarkdown(kCardDocBullets, "en");
+        Check(ParsedCard(pr, "104-1")["after"] == nlohmann::json::array({"103-2"}),
+              "104-4: bullet 依存 chain gives the prerequisite across 、");
+        Check(ParsedCard(pr, "104-3")["after"] == nlohmann::json::array({"104-2"}),
+              "104-4: chain split into adjacent pairs");
+        Check(ParsedCard(pr, "104-6")["after"] ==
+                  nlohmann::json::array({"104-1", "104-2", "104-3", "104-4", "104-5"}),
+              "104-4: range 104-1〜104-5 → 104-6 expands to five prerequisites");
+        Check(ParsedCard(pr, "104-5")["after"] == nlohmann::json::array({"104-2"}),
+              "104-4: 104-2 → 104-5 is one pair");
+    }
+
+    // Import: new cards, dependencies, external dependency warning.
+    {
+        FakeCardTask t;
+        t.cards["103-2"] = {{"title", "external"}, {"body", ""}, {"state", "planned"},
+                            {"after", nlohmann::json::array()}, {"directionId", "dir_9"}};
+        const CardMarkdownImportResult r = ImportCardMarkdown(t.taskId, kCardDocChain, false, "en", MakeFakeCardSend(t));
+        Check(r.ok && r.added == 3 && r.updated == 0 && r.skipped == 0,
+              "104-4: import adds three cards: " + nlohmann::json(CardMarkdownImportResultJson(r)).dump());
+        Check(t.cards.count("102-6") == 1 && t.cards["102-6"]["after"] == nlohmann::json::array({"102-3", "103-2"}),
+              "104-4: imported dependencies are stored (103-2 exists in the task)");
+        Check(t.cards["102-2"]["body"] == ParsedCard(ParseCardMarkdown(kCardDocChain, "en"), "102-2")["body"],
+              "104-4: imported body matches the parsed body");
+    }
+    {
+        FakeCardTask t;
+        const CardMarkdownImportResult r = ImportCardMarkdown(t.taskId, kCardDocChain, false, "en", MakeFakeCardSend(t));
+        Check(r.ok && HasWarning(r.warnings, "103-2"),
+              "104-4: dependency outside the task gives a warning and import continues");
+        Check(t.cards.count("102-6") == 1 && t.cards["102-6"]["after"] == nlohmann::json::array({"102-3"}),
+              "104-4: the external dependency is dropped from the stored card");
+    }
+
+    // Existing cards: planned is overwritten, a run card is skipped with a warning.
+    {
+        FakeCardTask t;
+        t.cards["102-2"] = {{"title", "old"}, {"body", "old body"}, {"state", "succeeded"},
+                            {"after", nlohmann::json::array()}, {"directionId", "dir_1"}};
+        t.cards["102-3"] = {{"title", "old3"}, {"body", "old3"}, {"state", "planned"},
+                            {"after", nlohmann::json::array()}, {"directionId", "dir_2"}};
+        const CardMarkdownImportResult r = ImportCardMarkdown(t.taskId, kCardDocChain, false, "en", MakeFakeCardSend(t));
+        Check(r.skipped == 1 && r.updated == 1 && HasWarning(r.warnings, "102-2"),
+              "104-4: a run card is skipped with a warning and a planned one is overwritten");
+        Check(t.cards["102-2"]["body"] == "old body" && t.cards["102-2"]["state"] == "succeeded",
+              "104-4: the run card is not changed");
+        Check(t.cards["102-3"]["title"] == "二番目の title", "104-4: the planned card takes the new title");
+    }
+
+    // Dry run writes nothing.
+    {
+        FakeCardTask t;
+        const CardMarkdownImportResult r = ImportCardMarkdown(t.taskId, kCardDocChain, true, "en", MakeFakeCardSend(t));
+        Check(r.dryRun && r.added == 3 && t.writes == 0 && t.cards.empty(),
+              "104-4: --dry-run reports the plan and writes nothing");
+    }
+
+    // Round trip: import -> export -> import gives the same cards.
+    {
+        FakeCardTask first;
+        first.cards["103-2"] = {{"title", "external"}, {"body", ""}, {"state", "planned"},
+                                {"after", nlohmann::json::array()}, {"directionId", "dir_9"}};
+        ImportCardMarkdown(first.taskId, kCardDocChain, false, "en", MakeFakeCardSend(first));
+        std::string md;
+        std::string err;
+        Check(ExportCardMarkdown(first.taskId, "en", MakeFakeCardSend(first), md, err) &&
+                  md.find("## 102-3: 二番目の title [planned]") != std::string::npos,
+              "104-4: export writes the heading with the state: " + err);
+
+        FakeCardTask second;
+        second.cards["103-2"] = first.cards["103-2"];
+        const CardMarkdownImportResult r = ImportCardMarkdown(second.taskId, md, false, "en", MakeFakeCardSend(second));
+        Check(r.ok && r.warnings.empty(), "104-4: re-import of the export is clean");
+        Check(SnapshotTask(first) == SnapshotTask(second),
+              "104-4: import -> export -> import gives the same cards");
+    }
+    {
+        FakeCardTask first;
+        ImportCardMarkdown(first.taskId, kCardDocTable, false, "en", MakeFakeCardSend(first));
+        ImportCardMarkdown(first.taskId, kCardDocBullets, false, "en", MakeFakeCardSend(first));
+        std::string md;
+        std::string err;
+        ExportCardMarkdown(first.taskId, "en", MakeFakeCardSend(first), md, err);
+        FakeCardTask second;
+        ImportCardMarkdown(second.taskId, md, false, "en", MakeFakeCardSend(second));
+        Check(SnapshotTask(first) == SnapshotTask(second),
+              "104-4: the table and bullet docs also round-trip through export");
+    }
+
+    std::printf("%s\n", "104-4: card Markdown tests done");
+}
+
+} // namespace
+
+// card 106-5: a fake core for the card import, export and translate paths. translate_get answers
+// two fixed translations (Japanese -> English and back); every request is recorded.
+struct FakeCardCore {
+    std::vector<nlohmann::json> requests;
+    nlohmann::json cards = nlohmann::json::array();
+
+    CardMarkdownSend Send() {
+        return [this](const nlohmann::json& req, nlohmann::json& resp, std::string&) -> bool {
+            requests.push_back(req);
+            const std::string action = req.value("action", std::string());
+            if (action == "card_list") {
+                resp = {{"ok", true}, {"cards", cards}};
+            } else if (action == "card_show") {
+                resp = {{"ok", true}, {"card", {{"body", ""}}}};
+            } else if (action == "translate_get") {
+                const std::string lang = req.value("lang", std::string());
+                nlohmann::json items = nlohmann::json::array();
+                for (const auto& t : req.at("texts")) {
+                    const std::string text = t.get<std::string>();
+                    std::string tr;
+                    if (lang == "en" && text == "ビルドを直す") tr = "Fix the build";
+                    if (lang == "ja" && text == "Fix the build") tr = "ビルドを直す";
+                    nlohmann::json item = {{"text", text}, {"translated", nullptr}, {"state", "pending"}};
+                    if (!tr.empty()) {
+                        item["translated"] = tr;
+                        item["state"] = "translated";
+                    }
+                    items.push_back(item);
+                }
+                resp = {{"ok", true}, {"lang", lang}, {"items", items}};
+            } else {
+                resp = {{"ok", true}, {"number", req.value("number", std::string())}};
+            }
+            return true;
+        };
+    }
+};
+
+// The first recorded request with this action (and field, when given). Null when none.
+static nlohmann::json FindCardRequest(const FakeCardCore& core, const std::string& action,
+                                      const std::string& field = "") {
+    for (const auto& r : core.requests) {
+        if (r.value("action", std::string()) != action) continue;
+        if (!field.empty() && r.value("field", std::string()) != field) continue;
+        return r;
+    }
+    return nlohmann::json();
+}
+
+static void TestCardMarkdownForms() {
+    // 106-5: English and Spanish dependency labels, table columns and range separators.
+    const std::string doc =
+        "| No | Title | Depends on |\n"
+        "|---|---|---|\n"
+        "| 100-2 | second | 100-1 |\n"
+        "\n"
+        "## 100-1: first\n"
+        "## 100-2: second\n"
+        "## 100-3: third\n"
+        "## 100-4: fourth\n"
+        "## 100-5: fifth\n"
+        "## 100-6: sixth\n"
+        "## 100-7: seventh\n"
+        "## 100-8: eighth\n"
+        "## 101-1: target\n"
+        "Depends on: 100-1 to 100-3\n"
+        "## 101-2: other\n"
+        "Requisitos: 100-4..100-5\n"
+        "## 101-3: more\n"
+        "Depende de: 100-6 \xE2\x80\x93 100-7\n"
+        "## 101-4: last\n"
+        "Requires: 100-8\n";
+    const CardMarkdownParseResult pr = ParseCardMarkdown(doc, "en");
+    Check(ParsedCard(pr, "101-1")["after"] == nlohmann::json::array({"100-1", "100-2", "100-3"}),
+          "106-5: Depends on with 'to' expands the range");
+    Check(ParsedCard(pr, "101-2")["after"] == nlohmann::json::array({"100-4", "100-5"}),
+          "106-5: Requisitos with '..' expands the range");
+    Check(ParsedCard(pr, "101-3")["after"] == nlohmann::json::array({"100-6", "100-7"}),
+          "106-5: Depende de with an en dash expands the range");
+    Check(ParsedCard(pr, "101-4")["after"] == nlohmann::json::array({"100-8"}),
+          "106-5: Requires: reads one dependency");
+    Check(ParsedCard(pr, "100-2")["after"] == nlohmann::json::array({"100-1"}),
+          "106-5: an English 'Depends on' table column is read");
+}
+
+static void TestCardMarkdownTranslation() {
+    const std::string md = "## 201-1: ビルドを直す\n本文です\n";
+
+    // Import, default config: the foreign title is sent in English, the body is not translated yet.
+    FakeCardCore all;
+    ImportCardMarkdown("t1", md, false, "en", all.Send(), "");
+    Check(FindCardRequest(all, "card_add").value("title", std::string()) == "Fix the build",
+          "106-5: card import stores the English title");
+    Check(FindCardRequest(all, "card_add").value("body", std::string()) == "本文です",
+          "106-5: a body without a translation keeps the original");
+
+    // --translate-cards off: nothing is asked and the Japanese title is kept.
+    FakeCardCore off;
+    ImportCardMarkdown("t1", md, false, "en", off.Send(), "off");
+    Check(FindCardRequest(off, "card_add").value("title", std::string()) == "ビルドを直す",
+          "106-5: --translate-cards off keeps the original title");
+    Check(FindCardRequest(off, "translate_get").is_null(), "106-5: --translate-cards off asks for no translation");
+
+    // --translate-cards title: the title is translated and the body is never asked for.
+    FakeCardCore titleOnly;
+    ImportCardMarkdown("t1", md, false, "en", titleOnly.Send(), "title");
+    Check(FindCardRequest(titleOnly, "card_add").value("title", std::string()) == "Fix the build",
+          "106-5: --translate-cards title still translates the title");
+    Check(FindCardRequest(titleOnly, "translate_get", "card.body").is_null(),
+          "106-5: --translate-cards title asks for no body translation");
+
+    // Export: English by default, the translation with --lang ja.
+    FakeCardCore exp;
+    exp.cards = nlohmann::json::parse(
+        R"([{"number":"201-1","title":"Fix the build","directionId":"d1","state":"planned"}])");
+    std::string enMd;
+    std::string enErr;
+    Check(ExportCardMarkdown("t1", "en", exp.Send(), enMd, enErr) &&
+              enMd.find("## 201-1: Fix the build") != std::string::npos,
+          "106-5: card export writes the English title by default");
+    std::string jaMd;
+    std::string jaErr;
+    Check(ExportCardMarkdown("t1", "ja", exp.Send(), jaMd, jaErr) &&
+              jaMd.find("## 201-1: ビルドを直す") != std::string::npos,
+          "106-5: card export --lang ja writes the translation");
+
+    // card translate: a stored Japanese title is translated and written back with card_edit.
+    FakeCardCore tr;
+    tr.cards = nlohmann::json::parse(
+        R"([{"number":"201-1","title":"ビルドを直す","directionId":"d1","state":"planned"}])");
+    const CardTranslateResult res = TranslateCardsInTask("t1", "", "en", tr.Send());
+    Check(res.ok && res.updated == 1, "106-5: card translate updates one stored card");
+    Check(FindCardRequest(tr, "card_edit").value("title", std::string()) == "Fix the build",
+          "106-5: card translate writes the English title with card_edit");
 }
 
 int main() {
@@ -5125,6 +5550,10 @@ int main() {
               titleResp.find("summary is not English") == std::string::npos,
               "106-1: a Japanese title is reported and an English summary is not");
     }
+
+    TestCardMarkdown();
+    TestCardMarkdownForms();
+    TestCardMarkdownTranslation();
 
     std::printf("%s (%d failures)\n", g_failures == 0 ? "ALL PASSED" : "FAILURES", g_failures);
     return g_failures == 0 ? 0 : 1;
