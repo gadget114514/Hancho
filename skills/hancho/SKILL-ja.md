@@ -255,7 +255,24 @@ hancho-cli.exe card remove 102-3 --task <taskId>                      # planned 
 ```
 
 - カードは `card` テンプレート（`hancho-cli.exe bt template card --json`）で BT（agent → build → test → 失敗なら fix ループ）に展開される。`build` / `test` / `engines` は `--params` またはタスクの `--card-defaults` から補われる。
-- MCP は `card_add` / `card_list` / `card_show` / `card_edit` / `card_remove` / `card_run` / `card_redo`。Markdown からの一括取り込み（`card import`）が使える環境では `card import --task <taskId> --file doc/xxx-cards.md` も利用できる。
+- MCP は `card_add` / `card_list` / `card_show` / `card_edit` / `card_remove` / `card_run` / `card_redo`。
+- Markdown からの一括取り込み・書き出し: `card import --task <taskId> --file doc/xxx-cards.md [--dry-run]`、`card export --task <taskId> [--file <md>] [--lang <en|ja|es>]`。`--dry-run` は書き込まずに確認だけする。
+- `card translate --task <taskId> [--translate-cards <all|title|off>]` で、タスクのカードの英語以外のタイトル・本文を英語に訳す。`card import` も同じ `--translate-cards` を取る。
+
+### 翻訳（保存は英語、表示は好みの言語）
+
+要約・自動メモ・カード本文は英語で保存し、元の文面も残す。翻訳は表示と書き出しの時だけ行う。
+
+```powershell
+hancho-cli.exe translate get --lang ja --field card.title "Add card list"   # キャッシュ済みの訳。無ければバックグラウンドで訳を依頼
+hancho-cli.exe translate status                                             # 翻訳ワーカーの進み具合
+hancho-cli.exe translate clear --lang ja                                    # 指定言語のキャッシュを捨てる
+```
+
+- 言語は `en` / `ja` / `es`。ダッシュボードと Web UI は、タイトルとジョブ要約を訳して表示する。
+- CLI の `--lang` はキャッシュを読むだけ（CLI から新しい翻訳は走らない）。
+- MCP は `translate_get` / `translate_status` / `translate_clear`。
+- 要約とタイトルは作成時に英語で書く。英語以外の要約・タイトルが保存されると core が警告する。
 
 ### タスクキュー（順番・依存）
 
