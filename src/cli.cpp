@@ -2277,12 +2277,28 @@ DATA DIRECTORY (per invocation):
          so every MCP tool call for the project uses the same directory.
       3. Pass the same --data-dir on every direct hancho-cli call.
       4. Relative paths resolve against the caller's current directory. MCP clients
-         normally start the server in the project root; if the cwd is uncertain,
-         put an absolute path in the MCP config.
+         normally start the server in the project root. Keep the relative .hancho
+         in a config that goes into git (.mcp.json) so it works on every clone;
+         use an absolute path only in a per-machine config (Claude Code local scope).
       5. Different data dirs are isolated (own dashboard instance, Named Pipe and
          mutex); they never share processes or queues.
       6. Verify: hancho-cli.exe --data-dir <path> help --json prints
          "effective_data_dir", and the dashboard status bar shows the same path.
+      7. The data dir is chosen in this order: --data-dir, the HANCHO_LOG_DIR
+         environment variable, <folder of the exe>\logs. Hancho does not look for
+         .hancho by itself, so an MCP server registered for all projects without
+         --data-dir (Claude Code user scope) makes every project share
+         <install folder>\logs.
+      8. Per-project registration: register the server under the same name
+         "hancho" for the project; Claude Code uses the narrowest scope that has
+         the name (local > project > user), so the user-scope entry stays for
+         other projects:
+           hancho-cli.exe mcp install --client claude --data-dir .hancho
+             (project scope: writes .mcp.json in the current folder)
+           claude mcp add hancho --scope local -- <Hancho.exe> mcp --data-dir <abs path>
+             (local scope: only you, only this project)
+         Restart the agent session afterwards. Jobs in the old data dir are not
+         moved, so switch when nothing is running there.
 
 HOW TO USE HANCHO (process vs task):
   `start` only launches and supervises one process. It is NOT a Hancho task:
@@ -3645,8 +3661,10 @@ void PrintCliUsageJson() {
         "Choose one project-local directory, for example <project>/.hancho.",
         "Register the MCP server once with it: hancho-cli.exe mcp install --data-dir .hancho. This embeds --data-dir into the project's MCP config, so every MCP tool call for that project uses the same directory.",
         "Pass the same --data-dir on every direct hancho-cli invocation.",
-        "Relative paths resolve against the caller's current directory; use an absolute path in the MCP config if the cwd is uncertain.",
-        "Different data directories are isolated: each has its own dashboard instance, Named Pipe and mutex, and they never share processes or queues."
+        "Relative paths resolve against the caller's current directory (MCP clients normally start the server in the project root). Keep the relative .hancho in a config that goes into git (.mcp.json); use an absolute path only in a per-machine config (Claude Code local scope).",
+        "Different data directories are isolated: each has its own dashboard instance, Named Pipe and mutex, and they never share processes or queues.",
+        "The data dir is chosen in this order: --data-dir, the HANCHO_LOG_DIR environment variable, <folder of the exe>\\logs. Hancho does not look for .hancho by itself, so an MCP server registered for all projects without --data-dir (Claude Code user scope) makes every project share <install folder>\\logs.",
+        "Per-project registration: register the server under the same name 'hancho' for the project. Claude Code uses the narrowest scope that has the name (local > project > user). Project scope: hancho-cli.exe mcp install --client claude --data-dir .hancho (writes .mcp.json). Local scope: claude mcp add hancho --scope local -- <Hancho.exe> mcp --data-dir <abs path>. Restart the agent session afterwards; jobs in the old data dir are not moved."
       ],
     "verify": "hancho-cli.exe --data-dir <path> help --json returns effective_data_dir; the dashboard status bar shows the same path.",
     "llm_stream": {

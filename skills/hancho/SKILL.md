@@ -431,6 +431,14 @@ hancho-cli.exe mcp install --client opencode   # claude なら --client claude
 hancho-cli.exe mcp install --data-dir .hancho --dry-run --json
 ```
 
+data-dir は `--data-dir` → 環境変数 `HANCHO_LOG_DIR` → `<exe のフォルダ>\logs` の順に決まる。カレントの `.hancho` は自動では使わない。MCP を全プロジェクト向け（Claude Code の user スコープ）に `--data-dir` なしで登録すると、全プロジェクトが `<インストール先>\logs` を共有する。
+
+- プロジェクトごとに分けるには、同じ名前 `hancho` をそのプロジェクトに登録する。Claude Code は local > project > user の順で狭いスコープを優先する。
+  - project スコープ: `hancho-cli.exe mcp install --client claude --data-dir .hancho`（カレントの `.mcp.json` に書く）
+  - local スコープ: `claude mcp add hancho --scope local -- <Hancho.exe> mcp --data-dir <絶対パス>`
+- git に入る `.mcp.json` では相対パスの `.hancho` のままにする（どこに clone しても使える）。相対パスはサーバーの起動フォルダ（ふつうはプロジェクトのルート）から解決されるので、エージェントはルートで起動する。絶対パスは git に入らない local スコープでだけ使う。`.hancho/` は git に入れない（`routines/` だけ残すなら `.hancho/*` と `!.hancho/routines/`）。登録を変えたらセッションを開き直す。
+- data-dir が違えば別の Hancho（キュー、BT、履歴、ダッシュボードが別）。実行中の BT やジョブがある間は切り替えない。今どこを使っているかはダッシュボードのタイトル（`Hancho - <data-dir>`）でわかる。
+
 主なツール: `start_process`、`list_processes`、`get_process_output`、`wait_process`、`send_process_input`、`kill_process`、`taskqueue_*`、`bt_*`、`run_worker` / `wait_worker`、`triage_list/get/decide`、`power_suspend/shutdown/cancel/status`、`memory_*`、`usage_*`、`chat_*`。
 
 ## よくある失敗

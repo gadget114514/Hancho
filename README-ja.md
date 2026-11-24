@@ -61,6 +61,24 @@ hancho-cli.exe --version
 hancho-cli.exe mcp install --client opencode   # Claude なら --client claude
 ```
 
+**プロジェクトごとのデータディレクトリ。** Hancho のデータディレクトリ（ログ、状態、タスクキュー、BT）は、`--data-dir`、環境変数 `HANCHO_LOG_DIR`、`<exe のフォルダ>\logs` の順に決まります。カレントフォルダの `.hancho` を自分で探すことはありません。そのため、すべてのプロジェクト向けに `--data-dir` なしで MCP を登録すると（たとえば Claude Code の user スコープ）、どのプロジェクトも `%LOCALAPPDATA%\Programs\Hancho\logs` を共有します。
+
+プロジェクトごとに分けるには、そのプロジェクトに同じ名前 `hancho` で登録します。Claude Code は名前が見つかったいちばん狭いスコープを使う（local > project > user）ので、user スコープの登録はほかのプロジェクトのために残せます。
+
+```powershell
+# project スコープ: カレントフォルダの .mcp.json に書く（git で共有される）
+hancho-cli.exe mcp install --client claude --data-dir .hancho
+
+# local スコープ: 自分だけ、このプロジェクトだけ（~/.claude.json に入る）
+claude mcp add hancho --scope local -- "$env:LOCALAPPDATA\Programs\Hancho\Hancho.exe" mcp --data-dir D:\path\to\project\.hancho
+```
+
+- git に入る `.mcp.json` では、相対パスの `.hancho` のままにしてください。どこに clone しても使えます。相対パスは MCP クライアントがサーバーを起動したフォルダから解決され、ふつうはプロジェクトのルートです。エージェントはプロジェクトのルートで起動してください。git に入らない local スコープなら、絶対パスでもかまいません。
+- `.hancho/` にはログや状態が入るので、git には入れないでください（このリポジトリは `.hancho/*` を無視し、`.hancho/routines/` だけを残しています）。
+- 登録を変えたら、エージェントのセッションを開き直してください。`.mcp.json` のサーバーは、Claude Code が最初に一度使ってよいか確認します。
+- そのプロジェクトで `hancho-cli` を直接呼ぶときも、同じ `--data-dir` を付けます。
+- データディレクトリが違えば別の Hancho です。タスクキュー、BT、履歴、ダッシュボードはそれぞれ別になります。古いディレクトリのジョブは移らないので、そこで何も動いていないときに切り替えてください。
+
 **2. エージェントがスキルを探す場所に置く。** このリポジトリからなら（セットアップ後は同じものが `%LOCALAPPDATA%\Programs\Hancho\skills\hancho` にあります）:
 
 ```powershell

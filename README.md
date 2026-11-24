@@ -64,6 +64,24 @@ hancho-cli.exe --version
 hancho-cli.exe mcp install --client opencode   # or --client claude
 ```
 
+**Data directory per project.** Hancho picks its data directory (logs, state, task queues, BTs) in this order: `--data-dir`, then the `HANCHO_LOG_DIR` environment variable, then `<folder of the exe>\logs`. It does not look for `.hancho` in the current folder by itself. So an MCP server registered for all projects without `--data-dir` (for example in the user scope of Claude Code) makes every project share `%LOCALAPPDATA%\Programs\Hancho\logs`.
+
+To give one project its own data directory, register the server for that project under the same name `hancho`. Claude Code uses the narrowest scope that has the name (local > project > user), so the user-scope entry stays for other projects:
+
+```powershell
+# project scope: writes .mcp.json in the current folder (shared through git)
+hancho-cli.exe mcp install --client claude --data-dir .hancho
+
+# local scope: only you, only this project (kept in ~/.claude.json)
+claude mcp add hancho --scope local -- "$env:LOCALAPPDATA\Programs\Hancho\Hancho.exe" mcp --data-dir D:\path\to\project\.hancho
+```
+
+- In `.mcp.json`, which goes into git, keep the relative `.hancho` so the file works on every clone. A relative path resolves against the folder the MCP client starts the server in, which is normally the project root; start the agent there. In the local scope, which is per machine and not in git, an absolute path is safe.
+- `.hancho/` holds logs and state, so keep it out of git (this repository ignores `.hancho/*` and only keeps `.hancho/routines/`).
+- Restart the agent session after changing the registration. Claude Code asks once before it uses a server from `.mcp.json`.
+- Pass the same `--data-dir` to direct `hancho-cli` calls in that project.
+- A different data directory is a separate Hancho: its own task queues, BTs, history and dashboard. Jobs in the old directory are not moved, so switch when nothing is running there.
+
 **2. Put the skill where your agent looks for skills.** From this repository (after the setup, the same folder is at `%LOCALAPPDATA%\Programs\Hancho\skills\hancho`):
 
 ```powershell
