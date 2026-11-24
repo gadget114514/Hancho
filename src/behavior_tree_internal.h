@@ -315,8 +315,14 @@ struct BehaviorTree::Impl {
     bool AdvanceEngineCandidate(BehaviorTree& bt, BtNode& node, const std::string& failureClass,
                                 const std::string& detail, int64_t nowMs,
                                 const json& handoff, const std::vector<std::string>& failSignature,
-                                bool relaunch);
+                                bool relaunch, const std::string& why = std::string(),
+                                bool ignoreSwitchEngineOn = false);
     bool ShouldSwitchEngine(const BtNode& node, const std::string& failureClass) const;
+    // Advances to the next candidate when the failed attempt's engine is now marked down
+    // and a later candidate is approved and up, whatever switchEngineOn says. switchLimits
+    // still apply.
+    bool TrySwitchFromDownEngine(BehaviorTree& bt, BtNode& node, const std::string& failureClass,
+                                 const std::string& detail, int64_t nowMs, const json& handoff);
     // 091-6: hold a leaf while its engine is down instead of failing it.
     bool HoldForEngine(BehaviorTree& bt, BtNode& node, const std::string& engine,
                        const std::string& model, int64_t nowMs);
