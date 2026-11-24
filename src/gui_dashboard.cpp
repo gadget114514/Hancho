@@ -18365,6 +18365,11 @@ struct TriageDlgState {
     std::wstring filterKey = L"pendingTask";  // default filter: task triage awaiting decision
     std::wstring searchText;
     std::string selectedId;
+    // The open card stays in the list after it leaves the filter (e.g. a toast card the BT resolves
+    // seconds later), until the person changes the filter or search. keepSelectedOnce covers a card
+    // opened from outside (the toast), which may already be out of the filter on the first load.
+    std::wstring shownFilterSearch;
+    bool keepSelectedOnce = false;
     int sortColumn = -1;
     bool sortDescending = true;
     nlohmann::json counts = nlohmann::json::object();
@@ -19167,6 +19172,11 @@ static void TriageReload(TriageDlgState* ds, const nlohmann::json* response = nu
     if (hiddenChanged) SaveTriageHiddenCards(ds->dash);
     ds->rows.clear();
     int filterTotal = 0;
+    const std::wstring filterSearch = filter + L"\n" + ds->searchText;
+    const bool keepSelected = !ds->selectedId.empty() &&
+        (ds->keepSelectedOnce || filterSearch == ds->shownFilterSearch);
+    ds->keepSelectedOnce = false;
+    ds->shownFilterSearch = filterSearch;
     for (const auto& card : ds->allCards) {
         const std::string state = card.value("state", std::string());
         const std::string kind = card.value("kind", std::string());
@@ -19184,9 +19194,10 @@ static void TriageReload(TriageDlgState* ds, const nlohmann::json* response = nu
         else if (filter == L"follow_up") match = lifecycle == "follow_up";
         else if (filter == L"done") match = lifecycle == "done";
         else match = state == WideToUtf8(filter);
-        if (!match || ds->dash->hiddenTriageCards.count(card.value("id", std::string()))) continue;
+        const bool kept = keepSelected && card.value("id", std::string()) == ds->selectedId;
+        if ((!match && !kept) || ds->dash->hiddenTriageCards.count(card.value("id", std::string()))) continue;
         ++filterTotal;
-        if (!TriageSearchMatches(card, ds->searchText)) continue;
+        if (!kept && !TriageSearchMatches(card, ds->searchText)) continue;
         ds->rows.push_back(card);
     }
     ds->searchMatches = static_cast<int>(ds->rows.size());
@@ -20341,7 +20352,7 @@ static void ShowTriageDialog(DashboardState* st, const std::wstring& filter, con
     if (st->hwndHintHistory && IsWindow(st->hwndHintHistory)) {
         auto* ds = reinterpret_cast<TriageDlgState*>(GetWindowLongPtrW(st->hwndHintHistory, GWLP_USERDATA));
         if (ds) {
-            ds->filterKey = filter; ds->selectedId = selectId;
+            ds->filterKey = filter; ds->selectedId = selectId; ds->keepSelectedOnce = !selectId.empty();
             static const std::wstring filters[] = {L"pending", L"pendingProcess", L"pendingTask", L"autoUnreviewed",
                 L"handling", L"running", L"waiting", L"follow_up", L"done", L"open", L"all", L"acted", L"ignored", L"resolved"};
             for (size_t i = 0; i < std::size(filters); ++i) if (filters[i] == filter) SendMessageW(ds->filter, CB_SETCURSEL, i, 0);
@@ -20351,7 +20362,7 @@ static void ShowTriageDialog(DashboardState* st, const std::wstring& filter, con
         ShowWindow(st->hwndHintHistory, SW_SHOW); SetForegroundWindow(st->hwndHintHistory); return;
     }
     auto* ds = new TriageDlgState(); ds->dash = st; ds->fontUi = st->hFontUi;
-    ds->filterKey = filter; ds->selectedId = selectId;
+    ds->filterKey = filter; ds->selectedId = selectId; ds->keepSelectedOnce = !selectId.empty();
     ds->activeTile = TriageTileForFilter(filter);
     static bool registered = false; const HINSTANCE instance = GetModuleHandleW(nullptr);
     if (!registered) {
