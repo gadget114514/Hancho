@@ -3,6 +3,7 @@
 #include "common.h"
 #include "ipc_client.h"
 #include "nlohmann/json.hpp"
+#include "task_lineage_view.h"
 
 #include <algorithm>
 #include <cctype>
@@ -13,6 +14,7 @@
 #include <map>
 #include <sstream>
 #include <string>
+#include <unordered_map>
 #include <vector>
 
 #ifdef _WIN32
@@ -54,6 +56,7 @@ enum class TopKey {
     JobStop,
     JobRetry,
     JobCancel,
+    ToggleTaskGroup,
     Unknown
 };
 
@@ -127,6 +130,7 @@ struct TopState {
     nlohmann::json processData;
     nlohmann::json countsData;
     nlohmann::json queueData;
+    nlohmann::json tasksData;
     nlohmann::json monitorStream;
     nlohmann::json monitorState;
     nlohmann::json diagBreakdown;
@@ -134,6 +138,9 @@ struct TopState {
     nlohmann::json diagJobDetail;
     nlohmann::json memoryStats;
     nlohmann::json memoryRecords;
+
+    bool queueGroupByTask = false;
+    std::unordered_map<std::string, bool> taskExpandedOverrides;
 
     void NextTab() {
         int next = (static_cast<int>(activeTab) + 1) % static_cast<int>(TopTab::Count);
@@ -219,6 +226,7 @@ inline TopKey ParseKeySequence(const std::string& seq) {
         if (c == 'e' || c == 'E') return TopKey::JobRetry;
         if (c == 'c' || c == 'C') return TopKey::JobCancel;
         if (c == 'x' || c == 'X') return TopKey::JobCancel;
+        if (c == 't' || c == 'T') return TopKey::ToggleTaskGroup;
         if (c == 'u' || c == 'U') return TopKey::Refresh;
         if (c == '1') return TopKey::TabProcesses;
         if (c == '2') return TopKey::TabQueue;
@@ -361,7 +369,7 @@ private:
 #endif
 };
 
-// Remote host and job attribution helpers (card 062-3, doc/remote-hosts.md)
+// Remote host and job attribution helpers (card 062-3, doc/obsoleted/remote-hosts.md)
 inline std::string GetJobHost(const nlohmann::json& job) {
     if (!job.is_object()) return "";
     if (job.contains("host") && job["host"].is_string()) {
@@ -462,7 +470,36 @@ inline void MergeRemoteProcesses(nlohmann::json& localProcs, const nlohmann::jso
     }
 }
 
-// Request builders for interactive operations (cards 062-3, doc/tui-design-ja.md)
+inline std::vector<pc::TaskDisplayRow> BuildQueueDisplayRows(const TopState& state) {
+    std::vector<nlohmann::json> jobs;
+    if (state.queueData.contains("jobs") && state.queueData["jobs"].is_array()) {
+        for (const auto& j : state.queueData["jobs"]) {
+            if (j.is_object()) jobs.push_back(j);
+        }
+    }
+    std::vector<nlohmann::json> tasks;
+    if (state.tasksData.contains("tasks") && state.tasksData["tasks"].is_array()) {
+        for (const auto& t : state.tasksData["tasks"]) {
+            if (t.is_object()) tasks.push_back(t);
+        }
+    }
+    pc::TaskViewCounts counts;
+    return pc::BuildTaskDisplayRows(jobs, tasks, state.queueGroupByTask, state.taskExpandedOverrides, {}, counts);
+}
+
+inline bool GetSelectedQueueJob(const TopState& state, nlohmann::json& outJob) {
+    const auto rows = BuildQueueDisplayRows(state);
+    if (state.selectedRow >= 0 && state.selectedRow < static_cast<int>(rows.size())) {
+        const auto& row = rows[static_cast<size_t>(state.selectedRow)];
+        if (row.kind == pc::TaskDisplayRowKind::Job && row.jobJson.is_object()) {
+            outJob = row.jobJson;
+            return true;
+        }
+    }
+    return false;
+}
+
+// Request builders for interactive operations (cards 062-3, doc/obsoleted/tui-design-ja.md)
 inline bool BuildJobStopRequest(const TopState& state, std::string& outReq, std::string& outDesc) {
     if (state.activeTab == TopTab::Processes) {
         if (state.processData.contains("processes") && state.processData["processes"].is_array() &&
@@ -479,9 +516,8 @@ inline bool BuildJobStopRequest(const TopState& state, std::string& outReq, std:
             }
         }
     } else if (state.activeTab == TopTab::Queue) {
-        if (state.queueData.contains("jobs") && state.queueData["jobs"].is_array() &&
-            state.selectedRow >= 0 && state.selectedRow < static_cast<int>(state.queueData["jobs"].size())) {
-            const auto& j = state.queueData["jobs"][static_cast<size_t>(state.selectedRow)];
+        nlohmann::json j;
+        if (GetSelectedQueueJob(state, j)) {
             std::string jid = j.value("id", j.value("key", ""));
             std::string host = GetJobHost(j);
             std::string st = j.value("state", "");
@@ -560,9 +596,8 @@ inline bool BuildJobStopRequest(const TopState& state, std::string& outReq, std:
 
 inline bool BuildJobRetryRequest(const TopState& state, std::string& outReq, std::string& outDesc) {
     if (state.activeTab == TopTab::Queue) {
-        if (state.queueData.contains("jobs") && state.queueData["jobs"].is_array() &&
-            state.selectedRow >= 0 && state.selectedRow < static_cast<int>(state.queueData["jobs"].size())) {
-            const auto& j = state.queueData["jobs"][static_cast<size_t>(state.selectedRow)];
+        nlohmann::json j;
+        if (GetSelectedQueueJob(state, j)) {
             std::string jid = j.value("id", j.value("key", ""));
             std::string host = GetJobHost(j);
             if (!jid.empty()) {
@@ -599,9 +634,8 @@ inline bool BuildJobRetryRequest(const TopState& state, std::string& outReq, std
 
 inline bool BuildJobCancelRequest(const TopState& state, std::string& outReq, std::string& outDesc) {
     if (state.activeTab == TopTab::Queue) {
-        if (state.queueData.contains("jobs") && state.queueData["jobs"].is_array() &&
-            state.selectedRow >= 0 && state.selectedRow < static_cast<int>(state.queueData["jobs"].size())) {
-            const auto& j = state.queueData["jobs"][static_cast<size_t>(state.selectedRow)];
+        nlohmann::json j;
+        if (GetSelectedQueueJob(state, j)) {
             std::string jid = j.value("id", j.value("key", ""));
             std::string host = GetJobHost(j);
             if (!jid.empty()) {
@@ -828,103 +862,200 @@ inline std::string RenderScreen(const TopState& state, int width, int height, bo
                 << "  |  Pending: " << code("\x1b[33m") << state.countsData.value("pending", 0) << reset()
                 << "  |  Succeeded: " << code("\x1b[36m") << state.countsData.value("succeeded", 0) << reset()
                 << "  |  Failed: " << code("\x1b[31;1m") << state.countsData.value("failed", 0) << reset()
-                << "  |  Total: " << state.countsData.value("total", 0) << "\n";
+                << "  |  Total: " << state.countsData.value("total", 0)
+                << "  " << code("\x1b[90m") << (state.queueGroupByTask ? "[View: Tasks | t: Jobs]" : "[View: Jobs | t: Tasks]") << reset() << "\n";
         } else {
-            out << "Running: 0  |  Waiting: 0  |  Pending: 0  |  Succeeded: 0  |  Failed: 0\n";
+            out << "Running: 0  |  Waiting: 0  |  Pending: 0  |  Succeeded: 0  |  Failed: 0  "
+                << code("\x1b[90m") << (state.queueGroupByTask ? "[View: Tasks | t: Jobs]" : "[View: Jobs | t: Tasks]") << reset() << "\n";
         }
         linesRendered++;
 
-        out << " " << bold("  JOB ID         QUEUE             STATE        DURATION    SUMMARY") << "\n";
-        out << code("\x1b[90m") << " -------------- ----------------- ------------ ----------- ----------------------------------------" << reset() << "\n";
+        if (state.queueGroupByTask) {
+            out << " " << bold("  TASK / JOB             QUEUE          STATE       RESULTS/DUR SUMMARY") << "\n";
+            out << code("\x1b[90m") << " ------------------------ -------------- ----------- ----------- --------------------------------" << reset() << "\n";
+        } else {
+            out << " " << bold("  JOB ID       TASK             QUEUE          STATE       DURATION  SUMMARY") << "\n";
+            out << code("\x1b[90m") << " ------------ ---------------- -------------- ----------- --------- ----------------------------" << reset() << "\n";
+        }
         linesRendered += 2;
 
-        if (state.queueData.contains("jobs") && state.queueData["jobs"].is_array() && !state.queueData["jobs"].empty()) {
-            const auto& jobs = state.queueData["jobs"];
+        const auto rows = BuildQueueDisplayRows(state);
+        if (!rows.empty()) {
             int maxTableRows = std::max(2, height - linesRendered - 8);
-            int displayCount = std::min(static_cast<int>(jobs.size()), maxTableRows);
+            int displayCount = std::min(static_cast<int>(rows.size()), maxTableRows);
 
             for (int i = 0; i < displayCount; ++i) {
-                const auto& j = jobs[static_cast<size_t>(i)];
-                std::string jid = j.value("id", j.value("key", "-"));
-                std::string rawQueue = j.value("taskqueue", j.value("queue", "default"));
-                std::string host = GetJobHost(j);
-                std::string queueCol = FormatQueueColumn(rawQueue, host);
-                std::string st = j.value("state", "pending");
-                std::string dur = j.value("duration_str", "");
-                if (dur.empty() && j.contains("durationSec")) {
-                    dur = std::to_string(j["durationSec"].get<int64_t>()) + "s";
-                }
-                std::string summary = j.value("summary", j.value("commandLine", ""));
-
+                const auto& r = rows[static_cast<size_t>(i)];
                 bool isSel = (i == state.selectedRow);
                 std::ostringstream row;
-                row << (isSel ? ">" : " ") << " "
-                    << PadOrTruncate(jid, 14) << " "
-                    << PadOrTruncate(queueCol, 17) << " "
-                    << PadOrTruncate(st, 12) << " "
-                    << PadOrTruncate(dur, 11) << " "
-                    << PadOrTruncate(summary, static_cast<size_t>(std::max(10, width - 62)));
+                row << (isSel ? ">" : " ") << " ";
+
+                if (state.queueGroupByTask) {
+                    if (r.kind == pc::TaskDisplayRowKind::TaskHeading) {
+                        std::string label = std::string(r.expanded ? "v " : "> ") +
+                                            (!r.taskTitle.empty() ? r.taskTitle : r.taskId);
+                        std::string countStr = std::to_string(r.jobCount) + (r.jobCount == 1 ? " job" : " jobs");
+                        row << PadOrTruncate(label, 24) << " "
+                            << PadOrTruncate("-", 14) << " "
+                            << PadOrTruncate(r.taskState, 11) << " "
+                            << PadOrTruncate(r.resultsCompact.empty() ? "-" : r.resultsCompact, 11) << " "
+                            << PadOrTruncate(countStr + (!r.taskTitle.empty() ? (" (" + r.taskId + ")") : ""),
+                                             static_cast<size_t>(std::max(10, width - 66)));
+                    } else if (r.kind == pc::TaskDisplayRowKind::DirectionHeading) {
+                        std::string indentStr(static_cast<size_t>(r.indent) * 2, ' ');
+                        std::string dirLabel = indentStr + std::string(r.expanded ? "v " : "> ") +
+                                               (!r.directionTitle.empty() ? r.directionTitle : ("direction:" + r.directionId));
+                        std::string kindCol = "dir:" + (r.directionKind.empty() ? "jobs" : r.directionKind);
+                        std::string countStr = std::to_string(r.jobCount) + (r.jobCount == 1 ? " job" : " jobs");
+                        row << PadOrTruncate(dirLabel, 24) << " "
+                            << PadOrTruncate(kindCol, 14) << " "
+                            << PadOrTruncate(r.directionState, 11) << " "
+                            << PadOrTruncate(r.resultsCompact.empty() ? "-" : r.resultsCompact, 11) << " "
+                            << PadOrTruncate(countStr + " (direction:" + r.directionId + ")",
+                                             static_cast<size_t>(std::max(10, width - 66)));
+                    } else if (r.kind == pc::TaskDisplayRowKind::MoreJobs) {
+                        std::string indentStr(static_cast<size_t>(std::max(1, r.indent)) * 2, ' ');
+                        row << PadOrTruncate(indentStr + "... (+" + std::to_string(r.hiddenJobCount) + " older)", 24);
+                    } else {
+                        const auto& j = r.jobJson;
+                        std::string jid = j.value("id", j.value("key", "-"));
+                        std::string rawQueue = j.value("taskqueue", j.value("queue", "default"));
+                        std::string host = GetJobHost(j);
+                        std::string queueCol = FormatQueueColumn(rawQueue, host);
+                        std::string st = j.value("state", "pending");
+                        std::string dur = j.value("duration_str", "");
+                        if (dur.empty() && j.contains("durationSec")) {
+                            dur = std::to_string(j["durationSec"].get<int64_t>()) + "s";
+                        }
+                        std::string summary = j.value("summary", j.value("commandLine", ""));
+                        if (!r.supersedes.empty()) summary = "[<- " + pc::ShortJobRef(r.supersedes) + "] " + summary;
+                        if (!r.supersededBy.empty()) summary = "[-> " + pc::ShortJobRef(r.supersededBy) + "] " + summary;
+
+                        std::string indentStr(static_cast<size_t>(r.indent) * 2, ' ');
+                        row << PadOrTruncate(indentStr + jid, 24) << " "
+                            << PadOrTruncate(queueCol, 14) << " "
+                            << PadOrTruncate(st, 11) << " "
+                            << PadOrTruncate(dur, 11) << " "
+                            << PadOrTruncate(summary, static_cast<size_t>(std::max(10, width - 66)));
+                    }
+                } else {
+                    const auto& j = r.jobJson;
+                    std::string jid = j.value("id", j.value("key", "-"));
+                    std::string taskCol = !r.taskTitle.empty() ? r.taskTitle
+                                        : ((r.hasTaskRecord || (!r.taskId.empty() && r.taskId != jid)) ? r.taskId : "-");
+                    std::string rawQueue = j.value("taskqueue", j.value("queue", "default"));
+                    std::string host = GetJobHost(j);
+                    std::string queueCol = FormatQueueColumn(rawQueue, host);
+                    std::string st = j.value("state", "pending");
+                    std::string dur = j.value("duration_str", "");
+                    if (dur.empty() && j.contains("durationSec")) {
+                        dur = std::to_string(j["durationSec"].get<int64_t>()) + "s";
+                    }
+                    std::string summary = j.value("summary", j.value("commandLine", ""));
+
+                    row << PadOrTruncate(jid, 12) << " "
+                        << PadOrTruncate(taskCol, 16) << " "
+                        << PadOrTruncate(queueCol, 14) << " "
+                        << PadOrTruncate(st, 11) << " "
+                        << PadOrTruncate(dur, 9) << " "
+                        << PadOrTruncate(summary, static_cast<size_t>(std::max(10, width - 69)));
+                }
 
                 if (isSel && useColor) {
                     out << "\x1b[1;36m" << row.str() << "\x1b[0m\n";
+                } else if (r.isSuperseded && useColor) {
+                    out << "\x1b[90m" << row.str() << "\x1b[0m\n";
                 } else {
                     out << row.str() << "\n";
                 }
                 linesRendered++;
             }
 
-            // Detail subpane for selected job
-            if (state.selectedRow >= 0 && state.selectedRow < static_cast<int>(jobs.size())) {
-                const auto& sel = jobs[static_cast<size_t>(state.selectedRow)];
-                std::string jid = sel.value("id", sel.value("key", "-"));
-                std::string name = sel.value("name", "");
-                std::string rawQueue = sel.value("taskqueue", sel.value("queue", "default"));
-                std::string host = GetJobHost(sel);
-                std::string queueCol = FormatQueueColumn(rawQueue, host);
-                std::string st = sel.value("state", "pending");
-                std::string summary = sel.value("summary", "");
-                std::string cmd = sel.value("commandLine", sel.value("cmd", ""));
-                std::string blockedBy = sel.value("blockedBy", "");
-                int attempts = sel.value("attemptsCount", 0);
-                int maxAttempts = sel.value("maxAttempts", 1);
-                int timeoutSec = sel.value("timeoutSec", 0);
-                int remotePid = 0;
-                if (sel.contains("attempts") && sel["attempts"].is_array() && !sel["attempts"].empty()) {
-                    const auto& lastAtt = sel["attempts"].back();
-                    if (lastAtt.is_object() && lastAtt.contains("remote_process_id")) {
-                        remotePid = lastAtt.value("remote_process_id", 0);
-                    }
-                }
-
+            // Detail subpane for selected row
+            if (state.selectedRow >= 0 && state.selectedRow < static_cast<int>(rows.size())) {
+                const auto& selRow = rows[static_cast<size_t>(state.selectedRow)];
                 out << code("\x1b[90m") << divLine << reset() << "\n";
                 linesRendered++;
-                out << bold("[Job Detail: " + jid + "]")
-                    << "  Queue: " << queueCol
-                    << "  State: " << colorState(st)
-                    << "  Attempts: " << attempts << "/" << maxAttempts;
-                if (!host.empty()) out << "  Host: " << host;
-                if (timeoutSec > 0) out << "  Timeout: " << timeoutSec << "s";
-                out << "\n";
-                linesRendered++;
-                if (remotePid > 0) {
-                    out << "   Remote PID: " << remotePid << "\n";
+
+                if (selRow.kind == pc::TaskDisplayRowKind::TaskHeading) {
+                    out << bold("[Task Detail: " + selRow.taskId + "]")
+                        << "  State: " << colorState(selRow.taskState)
+                        << "  Jobs: " << selRow.jobCount;
+                    if (!selRow.resultsCompact.empty()) out << "  Results: " << selRow.resultsCompact;
+                    out << "\n";
                     linesRendered++;
-                }
-                if (!name.empty() && name != jid) {
-                    out << "   Name: " << name << "\n";
+                    if (!selRow.taskTitle.empty()) {
+                        out << "   Title: " << PadOrTruncate(selRow.taskTitle, static_cast<size_t>(std::max(10, width - 12))) << "\n";
+                        linesRendered++;
+                    }
+                } else if (selRow.kind == pc::TaskDisplayRowKind::DirectionHeading) {
+                    out << bold("[Direction Detail: direction:" + selRow.directionId + "]")
+                        << "  Kind: " << (selRow.directionKind.empty() ? "jobs" : selRow.directionKind)
+                        << "  State: " << colorState(selRow.directionState)
+                        << "  Jobs: " << selRow.jobCount;
+                    if (!selRow.resultsCompact.empty()) out << "  Results: " << selRow.resultsCompact;
+                    out << "\n";
                     linesRendered++;
-                }
-                if (!summary.empty()) {
-                    out << "   Summary: " << PadOrTruncate(summary, static_cast<size_t>(std::max(10, width - 14))) << "\n";
+                    if (!selRow.directionTitle.empty()) {
+                        out << "   Title: " << PadOrTruncate(selRow.directionTitle, static_cast<size_t>(std::max(10, width - 12))) << "\n";
+                        linesRendered++;
+                    }
+                } else if (selRow.kind == pc::TaskDisplayRowKind::Job) {
+                    const auto& sel = selRow.jobJson;
+                    std::string jid = sel.value("id", sel.value("key", "-"));
+                    std::string name = sel.value("name", "");
+                    std::string rawQueue = sel.value("taskqueue", sel.value("queue", "default"));
+                    std::string host = GetJobHost(sel);
+                    std::string queueCol = FormatQueueColumn(rawQueue, host);
+                    std::string st = sel.value("state", "pending");
+                    std::string summary = sel.value("summary", "");
+                    std::string cmd = sel.value("commandLine", sel.value("cmd", ""));
+                    std::string blockedBy = sel.value("blockedBy", "");
+                    int attempts = sel.value("attemptsCount", 0);
+                    int maxAttempts = sel.value("maxAttempts", 1);
+                    int timeoutSec = sel.value("timeoutSec", 0);
+                    int remotePid = 0;
+                    if (sel.contains("attempts") && sel["attempts"].is_array() && !sel["attempts"].empty()) {
+                        const auto& lastAtt = sel["attempts"].back();
+                        if (lastAtt.is_object() && lastAtt.contains("remote_process_id")) {
+                            remotePid = lastAtt.value("remote_process_id", 0);
+                        }
+                    }
+
+                    out << bold("[Job Detail: " + jid + "]")
+                        << "  Queue: " << queueCol
+                        << "  State: " << colorState(st)
+                        << "  Attempts: " << attempts << "/" << maxAttempts;
+                    if (!host.empty()) out << "  Host: " << host;
+                    if (timeoutSec > 0) out << "  Timeout: " << timeoutSec << "s";
+                    out << "\n";
                     linesRendered++;
-                }
-                if (!cmd.empty()) {
-                    out << "   Command: " << PadOrTruncate(cmd, static_cast<size_t>(std::max(10, width - 14))) << "\n";
-                    linesRendered++;
-                }
-                if (!blockedBy.empty()) {
-                    out << "   Blocked By: " << code("\x1b[35m") << blockedBy << reset() << "\n";
-                    linesRendered++;
+                    if (selRow.hasTaskRecord || (!selRow.taskId.empty() && selRow.taskId != jid)) {
+                        out << "   Task: " << (selRow.taskTitle.empty() ? selRow.taskId : (selRow.taskTitle + " (" + selRow.taskId + ")"));
+                        if (!selRow.taskState.empty()) out << " [" << selRow.taskState << "]";
+                        out << "\n";
+                        linesRendered++;
+                    }
+                    if (remotePid > 0) {
+                        out << "   Remote PID: " << remotePid << "\n";
+                        linesRendered++;
+                    }
+                    if (!name.empty() && name != jid) {
+                        out << "   Name: " << name << "\n";
+                        linesRendered++;
+                    }
+                    if (!summary.empty()) {
+                        out << "   Summary: " << PadOrTruncate(summary, static_cast<size_t>(std::max(10, width - 14))) << "\n";
+                        linesRendered++;
+                    }
+                    if (!cmd.empty()) {
+                        out << "   Command: " << PadOrTruncate(cmd, static_cast<size_t>(std::max(10, width - 14))) << "\n";
+                        linesRendered++;
+                    }
+                    if (!blockedBy.empty()) {
+                        out << "   Blocked By: " << code("\x1b[35m") << blockedBy << reset() << "\n";
+                        linesRendered++;
+                    }
                 }
             }
         } else {
@@ -1347,6 +1478,8 @@ inline std::string RenderScreen(const TopState& state, int width, int height, bo
             << "|  1 .. 5            Switch directly to view (1-Proc .. 5-Mem)    |\n"
             << "|  Up / Down (k / j) Navigate / select item in active view        |\n"
             << "|  Left / Right      Switch monitored process (Monitor tab)       |\n"
+            << "|  t / T             Toggle task grouping (Queue tab)             |\n"
+            << "|  Enter             Expand / collapse task group (Queue tab)     |\n"
             << "|  s / S             Stop selected process or job                 |\n"
             << "|  r / R / e         Retry / rerun selected job                   |\n"
             << "|  c / C / x         Cancel selected job                          |\n"
@@ -1363,7 +1496,9 @@ inline std::string RenderScreen(const TopState& state, int width, int height, bo
     if (!state.statusMessage.empty()) {
         out << code("\x1b[33m") << state.statusMessage << reset() << "\n";
     } else {
-        if (state.activeTab == TopTab::Queue || state.activeTab == TopTab::Diagnostics) {
+        if (state.activeTab == TopTab::Queue) {
+            out << "[Tab/1-5] View  [Up/Down] Select  [t] Task View  [s] Stop  [r] Retry  [c] Cancel  [?] Help  [q] Quit\n";
+        } else if (state.activeTab == TopTab::Diagnostics) {
             out << "[Tab/1-5] View  [Up/Down] Select  [s] Stop  [r] Retry  [c] Cancel  [Space] Refresh  [?] Help  [q] Quit\n";
         } else if (state.activeTab == TopTab::Processes) {
             out << "[Tab/1-5] View  [Up/Down] Select  [s] Stop  [Space/r] Refresh  [?] Help  [q] Quit\n";
@@ -1435,6 +1570,10 @@ inline int RunTopLoop(const std::vector<std::string>& args, bool jsonOutput) {
             std::string respQ, errQ;
             if (SendIpcRequest("{\"action\":\"taskqueue_list\",\"include_planned\":true}", respQ, errQ, false)) {
                 state.queueData = nlohmann::json::parse(respQ, nullptr, false);
+            }
+            std::string respT, errT;
+            if (SendIpcRequest("{\"action\":\"task_list\"}", respT, errT, false)) {
+                state.tasksData = nlohmann::json::parse(respT, nullptr, false);
             }
             std::string respRemQ, errRemQ;
             if (SendIpcRequest("{\"action\":\"remote_taskqueues\"}", respRemQ, errRemQ, false)) {
@@ -1653,8 +1792,8 @@ inline int RunTopLoop(const std::vector<std::string>& args, bool jsonOutput) {
                 int maxRow = 0;
                 if (state.activeTab == TopTab::Processes && state.processData.contains("processes") && state.processData["processes"].is_array()) {
                     maxRow = static_cast<int>(state.processData["processes"].size()) - 1;
-                } else if (state.activeTab == TopTab::Queue && state.queueData.contains("jobs") && state.queueData["jobs"].is_array()) {
-                    maxRow = static_cast<int>(state.queueData["jobs"].size()) - 1;
+                } else if (state.activeTab == TopTab::Queue) {
+                    maxRow = static_cast<int>(BuildQueueDisplayRows(state).size()) - 1;
                 } else if (state.activeTab == TopTab::Diagnostics && state.failedJobsData.contains("jobs") && state.failedJobsData["jobs"].is_array()) {
                     maxRow = static_cast<int>(state.failedJobsData["jobs"].size()) - 1;
                 } else if (state.activeTab == TopTab::Memory) {
@@ -1691,6 +1830,26 @@ inline int RunTopLoop(const std::vector<std::string>& args, bool jsonOutput) {
                 }
                 break;
             }
+            case TopKey::ToggleTaskGroup:
+                if (state.activeTab == TopTab::Queue) {
+                    state.queueGroupByTask = !state.queueGroupByTask;
+                    state.selectedRow = 0;
+                    state.statusMessage = state.queueGroupByTask ? "Switched to Tasks view" : "Switched to Jobs view";
+                }
+                break;
+            case TopKey::Enter:
+                if (state.activeTab == TopTab::Queue && state.queueGroupByTask) {
+                    const auto rows = BuildQueueDisplayRows(state);
+                    if (state.selectedRow >= 0 && state.selectedRow < static_cast<int>(rows.size())) {
+                        const auto& r = rows[static_cast<size_t>(state.selectedRow)];
+                        if (r.kind == pc::TaskDisplayRowKind::TaskHeading && !r.taskId.empty()) {
+                            state.taskExpandedOverrides[r.taskId] = !r.expanded;
+                        } else if (r.kind == pc::TaskDisplayRowKind::DirectionHeading && !r.directionId.empty()) {
+                            state.taskExpandedOverrides["direction:" + r.directionId] = !r.expanded;
+                        }
+                    }
+                }
+                break;
             case TopKey::Help:
                 state.showHelp = !state.showHelp;
                 break;

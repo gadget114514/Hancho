@@ -6,7 +6,7 @@ Parent: 055-ranker-plugin.md
 
 ## 目的
 
-データディレクトリの設定で外部ランカープラグインを指定し、stdin/stdout の JSON プロトコルで呼べるようにする（`doc/design-v3.md` 3.8 埋め込み検索）。
+データディレクトリの設定で外部ランカープラグインを指定し、stdin/stdout の JSON プロトコルで呼べるようにする（`doc/obsoleted/design-v3.md` 3.8 埋め込み検索）。
 
 ## やること
 
@@ -20,7 +20,7 @@ Parent: 055-ranker-plugin.md
 
 ## 参照
 
-- `doc/design-v3.md` 3.8
+- `doc/obsoleted/design-v3.md` 3.8
 - 親カード `ww-data/tasks/055-ranker-plugin.md`
 
 ## Authorised edits
@@ -33,8 +33,8 @@ Parent: 055-ranker-plugin.md
 
 ## Read-only
 
-- `doc/design-v3.md`
-- `doc/design-v3-en.md`
+- `doc/obsoleted/design-v3.md`
+- `doc/obsoleted/design-v3-en.md`
 
 ## 検証
 

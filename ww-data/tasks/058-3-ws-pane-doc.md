@@ -10,12 +10,12 @@ Parent: 058-remote-stream.md
 
 ## 目的
 
-流れてきたデータをダッシュボードの監視ペインに反映させ、常時ストリーミングの完成まで行う（`doc/design-v3.md` 2.5）。
+流れてきたデータをダッシュボードの監視ペインに反映させ、常時ストリーミングの完成まで行う（`doc/obsoleted/design-v3.md` 2.5）。
 
 ## やること
 
 - [ ] 手元のダッシュボードのリモートジョブの監視ペインを、流れてきたデータで更新する。
-- [ ] `doc/remote-hosts.md` の「1 接続 1 要求」の制限を書き換える。
+- [ ] `doc/obsoleted/remote-hosts.md` の「1 接続 1 要求」の制限を書き換える。
 - [ ] スモークテストを追加する。
 
 ## 完了条件
@@ -24,8 +24,8 @@ Parent: 058-remote-stream.md
 
 ## 参照
 
-- `doc/design-v3.md` 2.5
-- `doc/remote-hosts.md`
+- `doc/obsoleted/design-v3.md` 2.5
+- `doc/obsoleted/remote-hosts.md`
 - 親カード `ww-data/tasks/058-remote-stream.md`
 
 ## Authorised edits
@@ -36,8 +36,8 @@ Parent: 058-remote-stream.md
 
 ## Read-only
 
-- `doc/design-v3.md`
-- `doc/design-v3-en.md`
+- `doc/obsoleted/design-v3.md`
+- `doc/obsoleted/design-v3-en.md`
 
 ## 検証
 

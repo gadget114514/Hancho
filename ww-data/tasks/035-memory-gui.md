@@ -5,7 +5,7 @@ Splittable: no
 
 ## 目的
 
-メモリを人が見て判断できる画面と、注入の効果を測る集計を追加する（`doc/design-v3.md` 3.11, 3.12）。
+メモリを人が見て判断できる画面と、注入の効果を測る集計を追加する（`doc/obsoleted/design-v3.md` 3.11, 3.12）。
 
 ## やること
 
@@ -21,8 +21,8 @@ Splittable: no
 
 ## 参照
 
-- `doc/design-v3.md` 3.11, 3.12
-- `doc/design-v3-en.md` Section 3
+- `doc/obsoleted/design-v3.md` 3.11, 3.12
+- `doc/obsoleted/design-v3-en.md` Section 3
 
 ## Authorised edits
 
@@ -34,8 +34,8 @@ Splittable: no
 
 ## Read-only
 
-- `doc/design-v3.md`
-- `doc/design-v3-en.md`
+- `doc/obsoleted/design-v3.md`
+- `doc/obsoleted/design-v3-en.md`
 
 ## 検証
 

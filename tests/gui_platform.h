@@ -1,6 +1,6 @@
 #pragma once
 
-// GUI Platform Services Layer (doc/design-v3.md 2.3, 2.4, Card 060-4 / 060d)
+// GUI Platform Services Layer (doc/obsoleted/design-v3.md 2.3, 2.4, Card 060-4 / 060d)
 //
 // Separates non-drawing, non-IPC OS-dependent desktop facilities:
 //   - System clipboard (copying text)

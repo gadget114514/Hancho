@@ -22,15 +22,39 @@ json NodeToJson(const BtNode& node, bool forceQueue = false) {
         if (node.hasFailureDiagnostic) st["failure"] = node.failureDiagnostic;
         if (!node.lastEngine.empty()) st["engine"] = node.lastEngine;
         if (!node.lastModel.empty()) st["model"] = node.lastModel;
-        if (!node.engineCandidates.empty()) {
-            st["engineCandidateIndex"] = node.engineCandidateIndex;
+        if (!node.engineCandidates.empty() || !node.engineAttempts.empty()) {
+            if (!node.engineCandidates.empty()) {
+                st["engineCandidateIndex"] = node.engineCandidateIndex;
+            }
             json attempts = json::array();
             for (const auto& a : node.engineAttempts) {
-                attempts.push_back(json{{"engine", a.engine}, {"model", a.model},
-                                        {"result", a.result}, {"failureClass", a.failureClass},
-                                        {"detail", a.detail}, {"list", a.list}, {"entry", a.entry}});
+                json aj{{"engine", a.engine}, {"model", a.model},
+                        {"result", a.result}, {"failureClass", a.failureClass},
+                        {"detail", a.detail}, {"list", a.list}, {"entry", a.entry}};
+                if (a.handoff.is_object() && !a.handoff.empty()) {
+                    aj["handoff"] = a.handoff;
+                }
+                if (!a.failSignature.empty()) {
+                    aj["failSignature"] = a.failSignature;
+                }
+                attempts.push_back(std::move(aj));
             }
             st["engineAttempts"] = std::move(attempts);
+        }
+        if (!node.switchFailCounts.empty()) {
+            st["switchFailCounts"] = node.switchFailCounts;
+        }
+        if (node.lastHandoff.is_object() && !node.lastHandoff.empty()) {
+            st["lastHandoff"] = node.lastHandoff;
+        }
+        if (!node.recentFailSignatures.empty()) {
+            st["recentFailSignatures"] = node.recentFailSignatures;
+        }
+        if (node.firstStartMs > 0) {
+            st["firstStartMs"] = node.firstStartMs;
+        }
+        if (!node.switchStoppedReason.empty()) {
+            st["switchStoppedReason"] = node.switchStoppedReason;
         }
         if (node.waitingForEngine) {
             st["waitingForEngine"] = true;
@@ -111,6 +135,13 @@ json DefaultsToJson(const BtDefaults& d) {
     if (d.hasWorkerIdle()) worker["idle"] = IdleToJson(d.workerIdle);
     if (d.workerMaxAttempts > 0) worker["maxAttempts"] = d.workerMaxAttempts;
     if (d.hasWorkerProbe) worker["probe"] = d.workerProbe;
+    if (d.workerSwitchLimits.configured) {
+        worker["switchLimits"] = {
+            {"maxCandidates", d.workerSwitchLimits.maxCandidates},
+            {"maxSec", d.workerSwitchLimits.maxSec},
+            {"stopOnSameSymptom", d.workerSwitchLimits.stopOnSameSymptom}
+        };
+    }
     if (!worker.empty()) out["worker"] = std::move(worker);
     if (d.hasJobIdle()) out["job"] = {{"idle", IdleToJson(d.jobIdle)}};
     return out;
@@ -145,6 +176,13 @@ void BehaviorTree::Impl::RestoreNodeStatus(BehaviorTree& bt,
         node.lastEngine = st.value("engine", std::string());
         node.lastModel = st.value("model", std::string());
         node.engineCandidateIndex = st.value("engineCandidateIndex", 0);
+        if (st.contains("switchFailCounts") && st["switchFailCounts"].is_object()) {
+            for (auto it = st["switchFailCounts"].begin(); it != st["switchFailCounts"].end(); ++it) {
+                if (it.value().is_number_integer()) {
+                    node.switchFailCounts[it.key()] = it.value().get<int>();
+                }
+            }
+        }
         node.waitingForEngine = st.value("waitingForEngine", false);
         node.engineWaitUntilMs = st.value("engineWaitUntilMs", static_cast<int64_t>(0));
         if (st.contains("engineAttempts") && st["engineAttempts"].is_array()) {
@@ -158,9 +196,32 @@ void BehaviorTree::Impl::RestoreNodeStatus(BehaviorTree& bt,
                 att.detail = a.value("detail", std::string());
                 att.list = a.value("list", std::string());
                 att.entry = a.value("entry", std::string());
+                if (a.contains("handoff") && a["handoff"].is_object()) {
+                    att.handoff = a["handoff"];
+                }
+                if (a.contains("failSignature") && a["failSignature"].is_array()) {
+                    for (const auto& sig : a["failSignature"]) {
+                        if (sig.is_string()) att.failSignature.push_back(sig.get<std::string>());
+                    }
+                }
                 node.engineAttempts.push_back(std::move(att));
             }
         }
+        if (st.contains("lastHandoff") && st["lastHandoff"].is_object()) {
+            node.lastHandoff = st["lastHandoff"];
+        }
+        if (st.contains("recentFailSignatures") && st["recentFailSignatures"].is_array()) {
+            for (const auto& sig : st["recentFailSignatures"]) {
+                if (!sig.is_array()) continue;
+                std::vector<std::string> vec;
+                for (const auto& item : sig) {
+                    if (item.is_string()) vec.push_back(item.get<std::string>());
+                }
+                node.recentFailSignatures.push_back(std::move(vec));
+            }
+        }
+        node.firstStartMs = st.value("firstStartMs", static_cast<int64_t>(0));
+        node.switchStoppedReason = st.value("switchStoppedReason", std::string());
         node.takenOver = st.value("takenOver", false);
         if (st.contains("takeover") && st["takeover"].is_object()) node.takeover = st["takeover"];
         if (node.type == "catch") {
@@ -298,6 +359,8 @@ std::string BehaviorTree::ToStateJson() const {
     out["id"] = id_;
     if (!summary_.empty()) out["summary"] = summary_;
     if (!intent_.empty()) out["intent"] = intent_;
+    if (!taskId_.empty()) out["taskId"] = taskId_;
+    if (!directionId_.empty()) out["directionId"] = directionId_;
     if (!taskqueue_.empty()) out["taskqueue"] = taskqueue_;
     if (!cwd_.empty()) out["cwd"] = cwd_;
     out["state"] = state_;
@@ -608,8 +671,17 @@ void CopyNodeDefinitionRecursive(BtNode& dst, const BtNode& src) {
     dst.model = src.model;
     dst.engineCandidates = src.engineCandidates;
     dst.switchEngineOn = src.switchEngineOn;
+    dst.switchLimits = src.switchLimits;
+    dst.switchFailCounts = src.switchFailCounts;
     dst.engineCandidateIndex = src.engineCandidateIndex;
     dst.engineAttempts = src.engineAttempts;
+    dst.lastHandoff = src.lastHandoff;
+    dst.onSwitch = src.onSwitch;
+    dst.blame = src.blame;
+    dst.failLineRegex = src.failLineRegex;
+    dst.recentFailSignatures = src.recentFailSignatures;
+    dst.firstStartMs = src.firstStartMs;
+    dst.switchStoppedReason = src.switchStoppedReason;
     dst.probeTimeoutSec = src.probeTimeoutSec;
     dst.prompt = src.prompt;
     dst.promptFile = src.promptFile;

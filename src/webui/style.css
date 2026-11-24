@@ -1007,3 +1007,51 @@ body {
   color: var(--text-muted);
   font-size: 0.85rem;
 }
+
+/* Task Lineage & Details */
+.task-heading-row {
+  background-color: rgba(56, 189, 248, 0.06);
+  cursor: pointer;
+}
+.task-heading-row:hover {
+  background-color: rgba(56, 189, 248, 0.12);
+}
+.row-superseded {
+  opacity: 0.62;
+}
+.task-link {
+  color: var(--accent, #38bdf8);
+  cursor: pointer;
+  text-decoration: underline;
+  text-decoration-style: dotted;
+}
+.task-link:hover {
+  text-decoration-style: solid;
+}
+.task-intent-box {
+  background: var(--bg-secondary, #1a1b26);
+  border: 1px solid var(--border-color, #2e2f42);
+  border-radius: 6px;
+  padding: 10px 12px;
+  white-space: pre-wrap;
+  word-break: break-word;
+  font-size: 0.84rem;
+  margin: 6px 0 12px;
+  max-height: 220px;
+  overflow-y: auto;
+}
+.task-log-list {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  max-height: 260px;
+  overflow-y: auto;
+  margin-top: 6px;
+}
+.task-log-entry {
+  font-size: 0.8rem;
+  padding: 6px 8px;
+  background: var(--bg-secondary, #1a1b26);
+  border-radius: 4px;
+  border-left: 3px solid var(--accent, #38bdf8);
+}

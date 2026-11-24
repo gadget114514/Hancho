@@ -10,6 +10,7 @@
 #include <fstream>
 #include <iomanip>
 #include <sstream>
+#include <unordered_map>
 #include <unordered_set>
 #include <vector>
 
@@ -455,9 +456,11 @@ json BuildJobFailureCard(const json& job, const TriageInputs& in) {
     if (retryDelay > 0) AddItem(info["conditions"], "retryDelaySec", retryDelay,
                                  "retry delay: " + std::to_string(retryDelay) + "s");
     const json concurrency = ConcurrencyAtFailure(in.jobs, jobId, last);
-    AddItem(info["environment"], "concurrencyAtFailure", concurrency,
-            "concurrent jobs at failure: " + std::to_string(concurrency.value("count", 0)) +
-            " (" + concurrency.value("ids", json::array()).dump() + ")");
+    if (concurrency.is_object()) {
+        AddItem(info["environment"], "concurrencyAtFailure", concurrency,
+                "concurrent jobs at failure: " + std::to_string(concurrency.value("count", 0)) +
+                " (" + concurrency.value("ids", json::array()).dump() + ")");
+    }
 
     AddItem(info["reason"], "attemptReason", attemptReason, "attempt reason: " + attemptReason);
     const json detail = Object(failure, "detail");
@@ -833,6 +836,116 @@ nlohmann::json BuildTriageCandidates(const TriageInputs& in) {
                  {"name", String(job, "name", jobId)}, {"resourceWait", resourceWait}},
                 info, candidates, "wait", "medium", "Let the resource scheduler continue while recording the wait.", in.now));
         }
+    }
+
+    // 100-8: Detect repeated failures along a job lineage (default threshold 3, configurable via
+    // `lineage_repeat_failures`) and emit one human-escalation card per lineage.
+    long long repeatThreshold = 3;
+    if (in.config.is_object() && in.config.contains("lineage_repeat_failures") &&
+        in.config["lineage_repeat_failures"].is_number()) {
+        const long long configured = in.config["lineage_repeat_failures"].get<long long>();
+        if (configured >= 1) repeatThreshold = configured;
+    }
+    std::unordered_map<std::string, const json*> jobById;
+    std::vector<std::string> jobOrder;
+    for (const auto& job : jobs) {
+        if (!job.is_object() || Bool(job, "virtual") || String(job, "taskqueue") == "_triage") continue;
+        const std::string jobId = String(job, "id");
+        if (jobId.empty()) continue;
+        if (jobById.emplace(jobId, &job).second) jobOrder.push_back(jobId);
+    }
+    auto lineageRootOf = [&](const std::string& startId) {
+        std::string cur = startId;
+        std::unordered_set<std::string> seen;
+        while (!cur.empty() && seen.insert(cur).second) {
+            const auto it = jobById.find(cur);
+            if (it == jobById.end()) break;
+            const std::string prev = String(*(it->second), "supersedes");
+            if (prev.empty() || jobById.find(prev) == jobById.end()) break;
+            cur = prev;
+        }
+        return cur;
+    };
+    std::unordered_map<std::string, std::vector<const json*>> lineages;
+    std::vector<std::string> rootOrder;
+    for (const std::string& jobId : jobOrder) {
+        const std::string rootId = lineageRootOf(jobId);
+        if (rootId.empty()) continue;
+        auto [it, inserted] = lineages.emplace(rootId, std::vector<const json*>{});
+        if (inserted) rootOrder.push_back(rootId);
+        it->second.push_back(jobById[jobId]);
+    }
+    for (const std::string& rootId : rootOrder) {
+        const auto& chain = lineages[rootId];
+        long long failedCount = 0;
+        const json* latestFailed = nullptr;
+        const json* latestJob = chain.back();
+        json lineageJobIds = json::array();
+        for (const json* j : chain) {
+            lineageJobIds.push_back(String(*j, "id"));
+            if (String(*j, "state") == "failed") {
+                ++failedCount;
+                latestFailed = j;
+            }
+        }
+        if (failedCount < repeatThreshold || !latestFailed) continue;
+        if (const auto rootIt = jobById.find(rootId); rootIt != jobById.end()) {
+            const json* cur = rootIt->second;
+            std::unordered_set<std::string> seen;
+            while (cur && seen.insert(String(*cur, "id")).second) {
+                const std::string nextId = String(*cur, "superseded_by");
+                if (nextId.empty()) break;
+                const auto nextIt = jobById.find(nextId);
+                if (nextIt == jobById.end()) break;
+                cur = nextIt->second;
+            }
+            if (cur) latestJob = cur;
+        }
+        const std::string targetJobId = String(*latestJob, "id", String(*latestFailed, "id"));
+        const std::string taskId = String(*latestJob, "task_id");
+        const std::string key = "lineage:" + rootId;
+        json info = {{"intent", json::array()}, {"cause", json::array()}, {"background", json::array()},
+                     {"environment", json::array()}, {"conditions", json::array()},
+                     {"reason", json::array()}};
+        AddItem(info["intent"], "summary", String(*latestJob, "summary"), String(*latestJob, "summary"));
+        AddItem(info["cause"], "lineageRepeatedFailure",
+                {{"failedCount", failedCount}, {"threshold", repeatThreshold}, {"rootId", rootId}},
+                "failed " + std::to_string(failedCount) + " times in lineage " + rootId);
+        AddItem(info["background"], "lineageRoot", rootId, "lineage root: " + rootId);
+        AddItem(info["background"], "lineageJobs", lineageJobIds, "lineage jobs: " + lineageJobIds.dump());
+        AddItem(info["background"], "jobName", String(*latestJob, "name", targetJobId),
+                "name: " + String(*latestJob, "name", targetJobId));
+        AddItem(info["background"], "queue", String(*latestJob, "taskqueue"),
+                "queue: " + String(*latestJob, "taskqueue"));
+        AddItem(info["conditions"], "failedCount", failedCount,
+                "failed jobs in lineage: " + std::to_string(failedCount));
+        AddItem(info["conditions"], "lineageThreshold", repeatThreshold,
+                "threshold: " + std::to_string(repeatThreshold));
+        const std::string rationale =
+            "The same lineage has failed repeatedly; a human should inspect the pattern and decide.";
+        AddItem(info["reason"], "recommendationRationale",
+                {{"key", "lineageRepeatedFailure"},
+                 {"params", {{"failedCount", failedCount}, {"threshold", repeatThreshold}}}},
+                "recommendation: " + rationale);
+
+        json candidates = json::array();
+        AddCandidate(candidates, "ignore", "Ignore", "Record that this failure needs no action.", false);
+        AddCandidate(candidates, "cancel", "Cancel", "Cancel this job.", false);
+
+        json target = {{"jobId", targetJobId},
+                       {"lineageRoot", rootId},
+                       {"queue", String(*latestJob, "taskqueue")},
+                       {"name", String(*latestJob, "name", targetJobId)},
+                       {"failedCount", failedCount},
+                       {"threshold", repeatThreshold}};
+        if (!taskId.empty()) target["taskId"] = taskId;
+
+        json card = BuildSimpleCard(key, "lineage_repeated_failure", target, info, candidates,
+                                    "", "low", rationale, in.now);
+        card["recommendation"]["rationaleKey"] = "lineageRepeatedFailure";
+        card["recommendation"]["rationaleParams"] = {{"failedCount", failedCount}, {"threshold", repeatThreshold}};
+        card["flags"]["needsHuman"] = true;
+        fresh.push_back(std::move(card));
     }
 
     for (const auto& failure : btFailures) {

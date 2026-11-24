@@ -6,7 +6,7 @@ Parent: 061-linux-gui.md
 
 ## 目的
 
-Linux / macOS 向けのダッシュボードを **ブラウザ UI** とすることを確定させ、ネイティブ GUI（Qt、GTK、Tauri など）は **ペンディング** とする（`doc/design-v3-todo.md` 8、`doc/design-v3.md` §7 決定 2026-11-11）。
+Linux / macOS 向けのダッシュボードを **ブラウザ UI** とすることを確定させ、ネイティブ GUI（Qt、GTK、Tauri など）は **ペンディング** とする（`doc/obsoleted/design-v3-todo.md` 8、`doc/obsoleted/design-v3.md` §7 決定 2026-11-11）。
 
 ## やること
 
@@ -22,8 +22,8 @@ Linux / macOS 向けのダッシュボードを **ブラウザ UI** とするこ
 
 ## 参照
 
-- `doc/design-v3-todo.md` 8
-- `doc/design-v3.md` 2.4, §7
+- `doc/obsoleted/design-v3-todo.md` 8
+- `doc/obsoleted/design-v3.md` 2.4, §7
 - 親カード `ww-data/tasks/061-linux-gui.md`
 
 ## Authorised edits
@@ -33,8 +33,8 @@ Linux / macOS 向けのダッシュボードを **ブラウザ UI** とするこ
 
 ## Read-only
 
-- `doc/design-v3.md`
-- `doc/design-v3-en.md`
+- `doc/obsoleted/design-v3.md`
+- `doc/obsoleted/design-v3-en.md`
 
 ## 検証
 

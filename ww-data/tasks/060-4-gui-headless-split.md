@@ -10,7 +10,7 @@ Parent: 060-gui-ipc-client.md
 
 ## 目的
 
-コア単体の運用を壊さず、GUI を Linux / macOS 向けにも移植できる構成にしておく（`doc/design-v3.md` 2.3, 2.4）。
+コア単体の運用を壊さず、GUI を Linux / macOS 向けにも移植できる構成にしておく（`doc/obsoleted/design-v3.md` 2.3, 2.4）。
 
 ## やること
 
@@ -24,7 +24,7 @@ Parent: 060-gui-ipc-client.md
 
 ## 参照
 
-- `doc/design-v3.md` 2.3, 2.4
+- `doc/obsoleted/design-v3.md` 2.3, 2.4
 - 親カード `ww-data/tasks/060-gui-ipc-client.md`
 
 ## Authorised edits
@@ -35,8 +35,8 @@ Parent: 060-gui-ipc-client.md
 
 ## Read-only
 
-- `doc/design-v3.md`
-- `doc/design-v3-en.md`
+- `doc/obsoleted/design-v3.md`
+- `doc/obsoleted/design-v3-en.md`
 
 ## 検証
 

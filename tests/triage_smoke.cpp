@@ -574,5 +574,84 @@ int main() {
               "shared triage catalog formatting and fallback behavior");
     }
 
+    // 17. Card 100-8: Repeated failures in one lineage emit one human-escalation card at threshold
+    //     (default 3), never at 2, and never duplicate for the same lineage.
+    {
+        auto makeFailedJob = [](const std::string& id, const std::string& supersedes,
+                                const std::string& supersededBy) {
+            return json{{"id", id},
+                        {"name", "Build"},
+                        {"summary", "Build project"},
+                        {"taskqueue", "main"},
+                        {"state", "failed"},
+                        {"task_id", "task_100_8"},
+                        {"supersedes", supersedes},
+                        {"superseded_by", supersededBy},
+                        {"attempts", json::array({{{"n", 1}, {"reason", "exit_code"},
+                                                   {"failure", {{"class", "nonzero_exit"},
+                                                                {"confidence", "high"},
+                                                                {"summary", "Failed"}}}}})},
+                        {"failure", {{"class", "nonzero_exit"}, {"confidence", "high"},
+                                     {"summary", "Failed"}}}};
+        };
+        auto countLineageCards = [](const json& cards) {
+            int count = 0;
+            for (const auto& c : cards)
+                if (c.value("kind", std::string()) == "lineage_repeated_failure") ++count;
+            return count;
+        };
+
+        // 2 failed jobs -> no lineage_repeated_failure card.
+        TriageInputs in2;
+        in2.jobs = json::array({makeFailedJob("L1", "", "L2"), makeFailedJob("L2", "L1", "")});
+        in2.now = now;
+        const json cards2 = BuildTriageCandidates(in2);
+        Check(countLineageCards(cards2) == 0,
+              "100-8: 2 failed jobs in lineage emit no repeated-failure card");
+
+        // With config lineage_repeat_failures = 2, 2 failed jobs emit 1 card.
+        in2.config = {{"lineage_repeat_failures", 2}};
+        const json cardsCfg2 = BuildTriageCandidates(in2);
+        Check(countLineageCards(cardsCfg2) == 1,
+              "100-8: lineage_repeat_failures=2 emits card at 2nd failure");
+
+        // 3rd failed job with default threshold 3 -> 1 card, escalate (needsHuman), candidates ignore+cancel.
+        TriageInputs in3;
+        in3.jobs = json::array({makeFailedJob("L1", "", "L2"),
+                                makeFailedJob("L2", "L1", "L3"),
+                                makeFailedJob("L3", "L2", "")});
+        in3.now = now;
+        const json cards3 = BuildTriageCandidates(in3);
+        const json linCard = FindCard(cards3, "lineage:L1");
+        bool hasIgnore = false, hasCancel = false;
+        for (const auto& cand : linCard.value("candidates", json::array())) {
+            if (cand.value("id", std::string()) == "ignore") hasIgnore = true;
+            if (cand.value("id", std::string()) == "cancel") hasCancel = true;
+        }
+        std::string by, whyNot;
+        const std::string autoChoice = TriageAutoChoice(json::object(), linCard, "auto", by, whyNot);
+        Check(countLineageCards(cards3) == 1 &&
+              linCard.value("kind", std::string()) == "lineage_repeated_failure" &&
+              linCard["recommendation"].value("candidateId", std::string("x")).empty() &&
+              linCard["flags"].value("needsHuman", false) &&
+              hasIgnore && hasCancel && autoChoice.empty() &&
+              TriageLabel("ja", "kind", "lineage_repeated_failure") != "lineage_repeated_failure",
+              "100-8: 3rd failure emits 1 escalate card with ignore/cancel candidates");
+
+        // 4th failed job in the same lineage merged into store -> no duplicate card.
+        json store = {{"schema", "hancho.triage/1"}, {"cards", json::array()}};
+        MergeTriageCards(store, cards3, now);
+        TriageInputs in4;
+        in4.jobs = json::array({makeFailedJob("L1", "", "L2"),
+                                makeFailedJob("L2", "L1", "L3"),
+                                makeFailedJob("L3", "L2", "L4"),
+                                makeFailedJob("L4", "L3", "")});
+        in4.now = now;
+        const json cards4 = BuildTriageCandidates(in4);
+        MergeTriageCards(store, cards4, now);
+        Check(countLineageCards(store["cards"]) == 1,
+              "100-8: 4th failure in same lineage does not duplicate card");
+    }
+
     return g_failures == 0 ? 0 : 1;
 }

@@ -5,7 +5,7 @@ Splittable: no
 
 ## 目的
 
-Windows の Direct2D GUI をコアの外に出し、`Hancho.exe --headless` と GUI を独立させた状態にする（`doc/design-v3.md` 2.3 段階 A、`doc/design-v3-todo.md` 8 の前提）。
+Windows の Direct2D GUI をコアの外に出し、`Hancho.exe --headless` と GUI を独立させた状態にする（`doc/obsoleted/design-v3.md` 2.3 段階 A、`doc/obsoleted/design-v3-todo.md` 8 の前提）。
 
 ## やること
 
@@ -23,8 +23,8 @@ Windows の Direct2D GUI をコアの外に出し、`Hancho.exe --headless` と 
 
 ## 参照
 
-- `doc/design-v3.md` 2.3, 2.4
-- `doc/design-v3-todo.md` 8
+- `doc/obsoleted/design-v3.md` 2.3, 2.4
+- `doc/obsoleted/design-v3-todo.md` 8
 
 ## Authorised edits
 
@@ -37,8 +37,8 @@ Windows の Direct2D GUI をコアの外に出し、`Hancho.exe --headless` と 
 
 ## Read-only
 
-- `doc/design-v3.md`
-- `doc/design-v3-en.md`
+- `doc/obsoleted/design-v3.md`
+- `doc/obsoleted/design-v3-en.md`
 
 ## 検証
 

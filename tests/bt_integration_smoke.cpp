@@ -391,6 +391,64 @@ int main() {
               "091-1: bt_get compact text shows failure class/cause");
     }
 
+    // 103-1: BT direction record, job direction_id, and reuse of existing directionId.
+    {
+        TestHarness h;
+        json btDef = {
+            {"id", "bt-dir-103"},
+            {"summary", "BT direction test"},
+            {"root", {
+                {"type", "job"},
+                {"id", "step1"},
+                {"summary", "echo step1"},
+                {"command", "cmd.exe /c echo ok"},
+                {"timeoutSec", 30}
+            }}
+        };
+        json startResp = json::parse(h.btm->Start(btDef.dump()), nullptr, false);
+        Check(startResp.value("ok", false), "103-1: BT starts");
+        const std::string btDirId = startResp.value("directionId", std::string());
+        Check(!btDirId.empty() && btDirId.rfind("dir_", 0) == 0,
+              "103-1: BT gets a dir_ directionId");
+
+        nlohmann::json dirRec;
+        Check(h.tqm.DirectionGet(btDirId, dirRec) &&
+                  dirRec.value("kind", std::string()) == "bt" &&
+                  dirRec.value("btId", std::string()) == "bt-dir-103",
+              "103-1: BT direction record stored with kind=bt and btId");
+
+        json waitResp1 = json::parse(h.btm->Wait("bt-dir-103", 0, 8000), nullptr, false);
+        Check(waitResp1.value("ok", false) && waitResp1.value("state", "") == "succeeded",
+              "103-1: bt-dir-103 succeeds");
+        std::string qErr;
+        json listResp = json::parse(h.tqm.TaskQueueList("", "", 0, qErr, "", "bt-dir-103", true),
+                                    nullptr, false);
+        Check(listResp.value("ok", false) && listResp["jobs"].size() == 1 &&
+                  listResp["jobs"][0].value("direction_id", std::string()) == btDirId,
+              "103-1: BT job carries BT's direction_id");
+
+        // Reusing an explicit directionId in BT definition preserves it.
+        json btDef2 = {
+            {"id", "bt-dir-103-reuse"},
+            {"directionId", btDirId},
+            {"summary", "reused dir"},
+            {"root", {
+                {"type", "job"},
+                {"id", "step2"},
+                {"summary", "echo step2"},
+                {"command", "cmd.exe /c echo ok"},
+                {"timeoutSec", 30}
+            }}
+        };
+        json startResp2 = json::parse(h.btm->Start(btDef2.dump()), nullptr, false);
+        Check(startResp2.value("ok", false) &&
+                  startResp2.value("directionId", std::string()) == btDirId,
+              "103-1: BT reuses existing directionId");
+        json waitResp2 = json::parse(h.btm->Wait("bt-dir-103-reuse", 0, 8000), nullptr, false);
+        Check(waitResp2.value("ok", false) && waitResp2.value("state", "") == "succeeded",
+              "103-1: bt-dir-103-reuse succeeds");
+    }
+
     RunPart2IntegrationTests(tempDirW, tempDirUtf8);
 
     RemoveDirRecursive(tempDirW);

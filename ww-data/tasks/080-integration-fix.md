@@ -5,7 +5,7 @@ Splittable: no
 
 ## 目的
 
-`ww` キューの 31 枚（050〜073）がそれぞれ独立に作ったコードは、カード間で前提が合わず **Release ビルドが通らない**。このカード群で境界を 1 箇所に集約し、ビルドとテストを通す（`doc/design-v3-todo.md` 7 の実装 Mystic 行Cleanup）。
+`ww` キューの 31 枚（050〜073）がそれぞれ独立に作ったコードは、カード間で前提が合わず **Release ビルドが通らない**。このカード群で境界を 1 箇所に集約し、ビルドとテストを通す（`doc/obsoleted/design-v3-todo.md` 7 の実装 Mystic 行Cleanup）。
 
 ## やること
 
@@ -23,7 +23,7 @@ Splittable: no
 ## 参照
 
 - `ww-data/tasks/`（050〜073）
-- `doc/design-v3.md`
+- `doc/obsoleted/design-v3.md`
 
 ## Authorised edits
 

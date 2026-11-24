@@ -10,7 +10,7 @@ Parent: 072-runrecord-plain-process.md
 
 ## 目的
 
-保存した状態から L1 の RunRecord を作り、集計と作り直しにも含める（`doc/design-v3.md` §7 決定 2026-11-11、`doc/design-v3-todo.md` 7）。
+保存した状態から L1 の RunRecord を作り、集計と作り直しにも含める（`doc/obsoleted/design-v3.md` §7 決定 2026-11-11、`doc/obsoleted/design-v3-todo.md` 7）。
 
 ## やること
 
@@ -28,8 +28,8 @@ Parent: 072-runrecord-plain-process.md
 
 ## 参照
 
-- `doc/design-v3.md` 3.3, 3.7, §7
-- `doc/design-v3-todo.md` 7
+- `doc/obsoleted/design-v3.md` 3.3, 3.7, §7
+- `doc/obsoleted/design-v3-todo.md` 7
 - 親カード `ww-data/tasks/072-runrecord-plain-process.md`
 
 ## Authorised edits
@@ -42,8 +42,8 @@ Parent: 072-runrecord-plain-process.md
 
 ## Read-only
 
-- `doc/design-v3.md`
-- `doc/design-v3-en.md`
+- `doc/obsoleted/design-v3.md`
+- `doc/obsoleted/design-v3-en.md`
 
 ## 検証
 

@@ -10,7 +10,7 @@ Parent: 061-linux-gui.md
 
 ## 目的
 
-Windows 版ダッシュボードの主要機能をブラウザ UI に実装する（`doc/design-v3-todo.md` 8）。
+Windows 版ダッシュボードの主要機能をブラウザ UI に実装する（`doc/obsoleted/design-v3-todo.md` 8）。
 
 ## やること
 
@@ -23,7 +23,7 @@ Windows 版ダッシュボードの主要機能をブラウザ UI に実装す�
 
 ## 参照
 
-- `doc/design-v3-todo.md` 8
+- `doc/obsoleted/design-v3-todo.md` 8
 - 親カード `ww-data/tasks/061-linux-gui.md`
 
 ## Authorised edits
@@ -34,8 +34,8 @@ Windows 版ダッシュボードの主要機能をブラウザ UI に実装す�
 
 ## Read-only
 
-- `doc/design-v3.md`
-- `doc/design-v3-en.md`
+- `doc/obsoleted/design-v3.md`
+- `doc/obsoleted/design-v3-en.md`
 - `src/gui_dashboard.cpp`
 
 ## 検証

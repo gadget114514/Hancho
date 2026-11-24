@@ -518,7 +518,7 @@ int main() {
     Check(qNovMonth.totalRuns == 4, "e2e smoke: Nov 2026 total runs is 4");
     Check(qNovMonth.totalCostUsd > 0.069 && qNovMonth.totalCostUsd < 0.071, "e2e smoke: Nov 2026 total cost is 0.07");
 
-    // 3. Verify JSON serialization matches U1 specification (doc/design-v3.md 3.6.1)
+    // 3. Verify JSON serialization matches U1 specification (doc/obsoleted/design-v3.md 3.6.1)
     nlohmann::json jNov10 = UsageStatsResultToJson(qNov10);
     Check(jNov10.value("ok", false), "e2e smoke: JSON ok is true");
     Check(jNov10.contains("records") && jNov10["records"].size() == 2, "e2e smoke: JSON records array has 2 items");

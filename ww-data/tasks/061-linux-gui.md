@@ -5,7 +5,7 @@ Splittable: no
 
 ## 目的
 
-Linux / macOS 向けのダッシュボードを **ブラウザ UI** で作る（`doc/design-v3-todo.md` 8）。ネイティブ GUI（Qt、GTK、Tauri など）は **ペンディング**。設計文書 §2.6 の非目標は取り消し済み。
+Linux / macOS 向けのダッシュボードを **ブラウザ UI** で作る（`doc/obsoleted/design-v3-todo.md` 8）。ネイティブ GUI（Qt、GTK、Tauri など）は **ペンディング**。設計文書 §2.6 の非目標は取り消し済み。
 
 ## 前提
 
@@ -26,8 +26,8 @@ Linux / macOS 向けのダッシュボードを **ブラウザ UI** で作る（
 
 ## 参照
 
-- `doc/design-v3-todo.md` 8
-- `doc/design-v3.md` 2.4
+- `doc/obsoleted/design-v3-todo.md` 8
+- `doc/obsoleted/design-v3.md` 2.4
 
 ## Authorised edits
 
@@ -38,8 +38,8 @@ Linux / macOS 向けのダッシュボードを **ブラウザ UI** で作る（
 
 ## Read-only
 
-- `doc/design-v3.md`
-- `doc/design-v3-en.md`
+- `doc/obsoleted/design-v3.md`
+- `doc/obsoleted/design-v3-en.md`
 - `src/gui_dashboard.cpp`
 
 ## 検証

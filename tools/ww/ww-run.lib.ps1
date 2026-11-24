@@ -375,7 +375,7 @@ function Get-WorktreePlan {
     }
 }
 
-# ---------- declared paths (doc/resource-locks.md) ----------
+# ---------- declared paths (doc/obsoleted/resource-locks.md) ----------
 # A card path as a comparable pattern relative to the checkout: forward slashes, lower case,
 # no leading "./" or trailing "/". A bare file name (`Foo.cs`) can live anywhere: **/foo.cs.
 function ConvertTo-WwPattern([string]$Path) {
@@ -506,7 +506,7 @@ function Test-RunConflict {
     return [pscustomobject]@{ Blocked = $false; Reason = ""; Runs = @() }
 }
 
-# ---------- hancho-cli job definitions (doc/resource-locks.md 3.2) ----------
+# ---------- hancho-cli job definitions (doc/obsoleted/resource-locks.md 3.2) ----------
 # One Hancho task-queue job per card: the card's Authorised edits / Read-only paths
 # become resources.write / resources.read, so hancho-cli never starts two overlapping cards. A card
 # without Authorised edits writes "**" (the whole checkout), the same lock ww-run itself takes.

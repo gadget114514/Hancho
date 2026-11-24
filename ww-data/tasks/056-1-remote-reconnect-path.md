@@ -6,7 +6,7 @@ Parent: 056-remote-reconnect.md
 
 ## 目的
 
-ダッシュボード再起動後に、リモートの試行へ再接続する経路を作る（`doc/design-v3.md` 2.5）。
+ダッシュボード再起動後に、リモートの試行へ再接続する経路を作る（`doc/obsoleted/design-v3.md` 2.5）。
 
 ## やること
 
@@ -20,8 +20,8 @@ Parent: 056-remote-reconnect.md
 
 ## 参照
 
-- `doc/design-v3.md` 2.5
-- `doc/remote-hosts.md`
+- `doc/obsoleted/design-v3.md` 2.5
+- `doc/obsoleted/remote-hosts.md`
 - 親カード `ww-data/tasks/056-remote-reconnect.md`
 
 ## Authorised edits
@@ -34,8 +34,8 @@ Parent: 056-remote-reconnect.md
 
 ## Read-only
 
-- `doc/design-v3.md`
-- `doc/design-v3-en.md`
+- `doc/obsoleted/design-v3.md`
+- `doc/obsoleted/design-v3-en.md`
 
 ## 検証
 

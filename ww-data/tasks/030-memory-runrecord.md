@@ -5,7 +5,7 @@ Splittable: no
 
 ## 目的
 
-試行 1 回につき 1 件の実行記録を、イベントから決定的に作る（`doc/design-v3.md` 3.3）。
+試行 1 回につき 1 件の実行記録を、イベントから決定的に作る（`doc/obsoleted/design-v3.md` 3.3）。
 
 ## やること
 
@@ -21,8 +21,8 @@ Splittable: no
 
 ## 参照
 
-- `doc/design-v3.md` 3.3, 3.7
-- `doc/design-v3-en.md` Section 3
+- `doc/obsoleted/design-v3.md` 3.3, 3.7
+- `doc/obsoleted/design-v3-en.md` Section 3
 
 ## Authorised edits
 
@@ -32,8 +32,8 @@ Splittable: no
 
 ## Read-only
 
-- `doc/design-v3.md`
-- `doc/design-v3-en.md`
+- `doc/obsoleted/design-v3.md`
+- `doc/obsoleted/design-v3-en.md`
 - `doc/schema/hancho.event.v1.json`
 
 ## 検証

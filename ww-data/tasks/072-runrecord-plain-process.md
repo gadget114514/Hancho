@@ -5,7 +5,7 @@ Splittable: no
 
 ## 目的
 
-JSON ストリームの有無や起動経路に関係なく、終わったプロセスを L1 の RunRecord に残す（`doc/design-v3.md` §7 決定 2026-11-11、`doc/design-v3-todo.md` 7）。
+JSON ストリームの有無や起動経路に関係なく、終わったプロセスを L1 の RunRecord に残す（`doc/obsoleted/design-v3.md` §7 決定 2026-11-11、`doc/obsoleted/design-v3-todo.md` 7）。
 
 ## やること
 
@@ -22,8 +22,8 @@ JSON ストリームの有無や起動経路に関係なく、終わったプロ
 
 ## 参照
 
-- `doc/design-v3.md` 3.3, 3.7, §7
-- `doc/design-v3-todo.md` 7
+- `doc/obsoleted/design-v3.md` 3.3, 3.7, §7
+- `doc/obsoleted/design-v3-todo.md` 7
 - `src/memory_record.h`
 
 ## Authorised edits
@@ -38,8 +38,8 @@ JSON ストリームの有無や起動経路に関係なく、終わったプロ
 
 ## Read-only
 
-- `doc/design-v3.md`
-- `doc/design-v3-en.md`
+- `doc/obsoleted/design-v3.md`
+- `doc/obsoleted/design-v3-en.md`
 
 ## 検証
 

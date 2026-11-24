@@ -26,7 +26,7 @@ Parent: 080-integration-fix.md
   - `build\Release\bt_ipc_smoke.exe`（058 / 060 が更新）
   - `build\Release\webui_smoke.exe`（061-3 が新規追加。如果 CMake に登録されていなければ追加する）
   - `build\Release\posix_core_smoke.exe`（062 / 072-1 が更新）
-- [ ] 失敗が「実装が仕様を満たしていない」場合は実装側を直す。ただし仕様は `doc/design-v3.md` と該当カードに書くこと。
+- [ ] 失敗が「実装が仕様を満たしていない」場合は実装側を直す。ただし仕様は `doc/obsoleted/design-v3.md` と該当カードに書くこと。
 - [ ] テストが新機能（usage の日次集計、memory prune と容量上限、ランカープラグイン、自動ノート、リモート再接続と filesNewer、WS 購読、ブラウザ UI、TUI、スキーマの型、キューの外プロセスの RunRecord、L3 ワーカー昇格）を実際に検証していることを確認する。検証していない機能があればテストを追加する。
 - [ ] 失敗するテストを「進めるためだけの閾値を緩める」で通さない。仕様どおりの期待値に直す。
 
@@ -38,7 +38,7 @@ Parent: 080-integration-fix.md
 
 ## 参照
 
-- `doc/design-v3.md` 3, 4
+- `doc/obsoleted/design-v3.md` 3, 4
 - `ww-data/tasks/`（050〜073）
 - 親カード `ww-data/tasks/080-integration-fix.md`
 

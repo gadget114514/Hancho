@@ -5,7 +5,7 @@ Splittable: no
 
 ## 目的
 
-`doc/schema/hancho.event.v1.json` の `data` を種別ごとに型まで固定する（`doc/design-v3.md` §7 決定 2026-11-11、`doc/design-v3-todo.md` 7）。
+`doc/schema/hancho.event.v1.json` の `data` を種別ごとに型まで固定する（`doc/obsoleted/design-v3.md` §7 決定 2026-11-11、`doc/obsoleted/design-v3-todo.md` 7）。
 
 ## やること
 
@@ -13,7 +13,7 @@ Splittable: no
 - [ ] どうしても自由形式のままにする場所（`input` など）は、残す理由をスキーマの `description` に書く。緩めたくなったときのために、例外の一覧を 1 か所にまとめる。
 - [ ] 送信側（`src/event_schema.cpp` と各アダプタ）が生成しうる全部の種別で、締めたスキーマの検証を通すことを確認する。
 - [ ] `event_schema_smoke` に、未知のフィールドや型の誤りを含むイベントが落ちることのテストを足す。
-- [ ] `doc/schema/` と `doc/LLM-jsonstream-format.md` に、`data` を型まで縛った旨と例外の扱いを書く。
+- [ ] `doc/schema/` と `doc/obsoleted/LLM-jsonstream-format.md` に、`data` を型まで縛った旨と例外の扱いを書く。
 
 ## 完了条件
 
@@ -23,9 +23,9 @@ Splittable: no
 
 ## 参照
 
-- `doc/design-v3.md` 1.3, 1.8, §7
+- `doc/obsoleted/design-v3.md` 1.3, 1.8, §7
 - `doc/schema/hancho.event.v1.json`
-- `doc/LLM-jsonstream-format.md`
+- `doc/obsoleted/LLM-jsonstream-format.md`
 
 ## Authorised edits
 
@@ -38,8 +38,8 @@ Splittable: no
 
 ## Read-only
 
-- `doc/design-v3.md`
-- `doc/design-v3-en.md`
+- `doc/obsoleted/design-v3.md`
+- `doc/obsoleted/design-v3-en.md`
 
 ## 検証
 

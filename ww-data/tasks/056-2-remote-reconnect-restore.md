@@ -10,12 +10,12 @@ Parent: 056-remote-reconnect.md
 
 ## 目的
 
-再接続した試行の結果を手元に復元させ、制限の解消を文書に反映する（`doc/design-v3.md` 2.5）。
+再接続した試行の結果を手元に復元させ、制限の解消を文書に反映する（`doc/obsoleted/design-v3.md` 2.5）。
 
 ## やること
 
 - [ ] 再接続時にリモートの試行の状態・ログ・イベントを取り寄せ、手元の一覧に復元する。
-- [ ] `doc/remote-hosts.md` の「再接続しない」の制限を書き換える。
+- [ ] `doc/obsoleted/remote-hosts.md` の「再接続しない」の制限を書き換える。
 - [ ] スモークテストを追加する（再起動を模した手元コアの再起動でリモートの状態を復元する）。
 
 ## 完了条件
@@ -24,8 +24,8 @@ Parent: 056-remote-reconnect.md
 
 ## 参照
 
-- `doc/design-v3.md` 2.5
-- `doc/remote-hosts.md`
+- `doc/obsoleted/design-v3.md` 2.5
+- `doc/obsoleted/remote-hosts.md`
 - 親カード `ww-data/tasks/056-remote-reconnect.md`
 
 ## Authorised edits
@@ -37,8 +37,8 @@ Parent: 056-remote-reconnect.md
 
 ## Read-only
 
-- `doc/design-v3.md`
-- `doc/design-v3-en.md`
+- `doc/obsoleted/design-v3.md`
+- `doc/obsoleted/design-v3-en.md`
 
 ## 検証
 

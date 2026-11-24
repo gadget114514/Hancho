@@ -1,6 +1,6 @@
 #pragma once
 
-// Health probe (doc/HanchoExpectations.md 8.3). Uses the engine registry's launch
+// Health probe (doc/obsoleted/HanchoExpectations.md 8.3). Uses the engine registry's launch
 // command with a fixed minimal prompt, closes stdin, and waits for the first event
 // plus a clean exit. Results are cached per engine+model in <data-dir>/probes.json.
 

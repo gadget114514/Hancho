@@ -5,7 +5,7 @@ Splittable: no
 
 ## 目的
 
-Hancho をやめるときの片付けと、判断基準の見直し手順を用意する（`doc/design-v3.md` 5.3〜5.5）。
+Hancho をやめるときの片付けと、判断基準の見直し手順を用意する（`doc/obsoleted/design-v3.md` 5.3〜5.5）。
 
 ## やること
 
@@ -22,9 +22,9 @@ Hancho をやめるときの片付けと、判断基準の見直し手順を用�
 
 ## 参照
 
-- `doc/design-v3.md` 5.3〜5.5
-- `doc/design-v3-en.md` Section 5
-- `doc/critical-comparison.md`
+- `doc/obsoleted/design-v3.md` 5.3〜5.5
+- `doc/obsoleted/design-v3-en.md` Section 5
+- `doc/obsoleted/critical-comparison.md`
 
 ## Authorised edits
 
@@ -37,8 +37,8 @@ Hancho をやめるときの片付けと、判断基準の見直し手順を用�
 
 ## Read-only
 
-- `doc/design-v3.md`
-- `doc/design-v3-en.md`
+- `doc/obsoleted/design-v3.md`
+- `doc/obsoleted/design-v3-en.md`
 
 ## 検証
 

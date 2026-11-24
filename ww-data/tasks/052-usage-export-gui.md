@@ -5,7 +5,7 @@ Splittable: no
 
 ## 目的
 
-長期の使用量を CSV / JSON で出し、GUI の表示範囲を 12 か月まで広げる（`doc/design-v3.md` 3.6.1 U2/U3、`doc/design-v3-todo.md` 2）。
+長期の使用量を CSV / JSON で出し、GUI の表示範囲を 12 か月まで広げる（`doc/obsoleted/design-v3.md` 3.6.1 U2/U3、`doc/obsoleted/design-v3-todo.md` 2）。
 
 ## やること
 
@@ -22,8 +22,8 @@ Splittable: no
 
 ## 参照
 
-- `doc/design-v3.md` 3.6.1
-- `doc/design-v3-todo.md` 2
+- `doc/obsoleted/design-v3.md` 3.6.1
+- `doc/obsoleted/design-v3-todo.md` 2
 
 ## Authorised edits
 
@@ -37,8 +37,8 @@ Splittable: no
 
 ## Read-only
 
-- `doc/design-v3.md`
-- `doc/design-v3-en.md`
+- `doc/obsoleted/design-v3.md`
+- `doc/obsoleted/design-v3-en.md`
 
 ## 検証
 

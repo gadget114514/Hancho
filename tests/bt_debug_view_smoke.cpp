@@ -1,6 +1,6 @@
 // Headless test for the behavior tree debug model (src/bt_debug_view.cpp). The sample state file
 // tests/data/bt/feature-x.json is SYNTHETIC: written by hand in the format of
-// doc/behavior-tree-plan.md section 7, not produced by a real run.
+// doc/obsoleted/behavior-tree-plan.md section 7, not produced by a real run.
 
 #include "../src/bt_debug_view.h"
 #include "../src/common.h"

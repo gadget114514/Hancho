@@ -10,7 +10,7 @@ Parent: 051-usage-daily.md
 
 ## 目的
 
-日 × エンジン × モデルで合計した集計を `hancho.usage.day/1` 形式で返し、CLI と MCP から見られるようにする（`doc/design-v3.md` 3.6.1 U1）。
+日 × エンジン × モデルで合計した集計を `hancho.usage.day/1` 形式で返し、CLI と MCP から見られるようにする（`doc/obsoleted/design-v3.md` 3.6.1 U1）。
 
 ## やること
 
@@ -23,7 +23,7 @@ Parent: 051-usage-daily.md
 
 ## 参照
 
-- `doc/design-v3.md` 3.6.1
+- `doc/obsoleted/design-v3.md` 3.6.1
 - 親カード `ww-data/tasks/051-usage-daily.md`
 
 ## Authorised edits
@@ -37,8 +37,8 @@ Parent: 051-usage-daily.md
 
 ## Read-only
 
-- `doc/design-v3.md`
-- `doc/design-v3-en.md`
+- `doc/obsoleted/design-v3.md`
+- `doc/obsoleted/design-v3-en.md`
 
 ## 検証
 

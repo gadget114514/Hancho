@@ -22,6 +22,88 @@ void ReplaceAll(std::string& s, const std::string& from, const std::string& to) 
     }
 }
 
+std::string TruncateUtf8Bytes(const std::string& s, size_t maxBytes) {
+    if (s.size() <= maxBytes) return s;
+    size_t n = maxBytes;
+    while (n > 0 && (static_cast<unsigned char>(s[n]) & 0xC0) == 0x80) n--;
+    return s.substr(0, n);
+}
+
+// 101-4: Append prior-attempt handoff context to the worker prompt.
+// After a candidate switch (engineCandidateIndex > 0), summarize failed attempts by
+// previous candidates up to 6000 bytes (dropping oldest first). When re-running the
+// same candidate, attach its own `lastHandoff` if present.
+std::string BuildWorkerHandoffPromptSuffix(const BtNode& node) {
+    if (!node.engineCandidates.empty() && node.engineCandidateIndex > 0) {
+        std::vector<std::string> items;
+        for (const auto& a : node.engineAttempts) {
+            if (a.result != "failed") continue;
+            std::string item = "- " + a.engine;
+            if (!a.model.empty()) item += "/" + a.model;
+            if (!a.failureClass.empty()) item += " [" + a.failureClass + "]";
+            item += "\n";
+            if (!a.failSignature.empty()) {
+                item += "  failed tests:";
+                const size_t limit = std::min<size_t>(a.failSignature.size(), 10);
+                for (size_t i = 0; i < limit; ++i) {
+                    item += (i == 0 ? " " : ", ") + a.failSignature[i];
+                }
+                item += "\n";
+            }
+            if (a.handoff.is_object()) {
+                for (const char* key : {"suspected", "tried", "ruledOut"}) {
+                    if (a.handoff.contains(key) && a.handoff[key].is_string()) {
+                        std::string val = a.handoff[key].get<std::string>();
+                        if (!val.empty()) {
+                            item += std::string("  ") + key + ": " + val + "\n";
+                        }
+                    }
+                }
+            }
+            items.push_back(std::move(item));
+        }
+        if (items.empty()) return "";
+
+        const std::string header =
+            "Previous attempts by other models (do not repeat what did not work):\n";
+        constexpr size_t kMaxHandoffBytes = 6000;
+
+        size_t totalBytes = header.size();
+        for (const auto& it : items) totalBytes += it.size();
+
+        size_t startIdx = 0;
+        while (startIdx + 1 < items.size() && totalBytes > kMaxHandoffBytes) {
+            totalBytes -= items[startIdx].size();
+            startIdx++;
+        }
+
+        std::string out = header;
+        for (size_t i = startIdx; i < items.size(); ++i) {
+            out += items[i];
+        }
+        if (out.size() > kMaxHandoffBytes) {
+            out = TruncateUtf8Bytes(out, kMaxHandoffBytes);
+        }
+        return out;
+    }
+
+    if (node.lastHandoff.is_object() && !node.lastHandoff.empty()) {
+        std::string body;
+        for (const char* key : {"suspected", "tried", "ruledOut"}) {
+            if (node.lastHandoff.contains(key) && node.lastHandoff[key].is_string()) {
+                std::string val = node.lastHandoff[key].get<std::string>();
+                if (!val.empty()) {
+                    body += std::string("- ") + key + ": " + val + "\n";
+                }
+            }
+        }
+        if (!body.empty()) {
+            return "Your previous attempt noted:\n" + body;
+        }
+    }
+    return "";
+}
+
 
 uint64_t CaptureStartFiletimeWithGuard() {
     SleepMs(2);
@@ -255,15 +337,68 @@ bool BehaviorTree::Impl::HoldForEngine(BehaviorTree& bt, BtNode& node,
 bool BehaviorTree::Impl::ShouldSwitchEngine(const BtNode& node, const std::string& failureClass) const {
     if (node.engineCandidates.empty()) return false;
     if (node.engineCandidateIndex + 1 >= static_cast<int>(node.engineCandidates.size())) return false;
-    return std::find(node.switchEngineOn.begin(), node.switchEngineOn.end(), failureClass) !=
-           node.switchEngineOn.end();
+    auto it = node.switchFailCounts.find(failureClass);
+    const int count = (it != node.switchFailCounts.end()) ? it->second : 0;
+    for (const auto& rule : node.switchEngineOn) {
+        if (rule.failureClass == failureClass && count >= rule.after) return true;
+    }
+    return false;
 }
 
-bool BehaviorTree::Impl::TrySwitchEngine(BehaviorTree& bt, BtNode& node,
-                                         const std::string& failureClass,
-                                         const std::string& detail, int64_t nowMs) {
+bool BehaviorTree::Impl::AdvanceEngineCandidate(BehaviorTree& bt, BtNode& node,
+                                                const std::string& failureClass,
+                                                const std::string& detail, int64_t nowMs,
+                                                const json& handoff,
+                                                const std::vector<std::string>& failSignature,
+                                                bool relaunch) {
     if (!ShouldSwitchEngine(node, failureClass)) return false;
     const BtEngineChoice& from = node.engineCandidates[node.engineCandidateIndex];
+
+    // 101-5: check switchLimits before advancing to the next candidate.
+    std::string stopReason;
+    if (node.switchLimits.maxCandidates > 0) {
+        std::vector<std::pair<std::string, std::string>> tried;
+        auto addTried = [&](const std::string& eng, const std::string& mod) {
+            for (const auto& p : tried) {
+                if (p.first == eng && p.second == mod) return;
+            }
+            tried.emplace_back(eng, mod);
+        };
+        for (const auto& att : node.engineAttempts) {
+            if (att.result != "skipped") addTried(att.engine, att.model);
+        }
+        addTried(from.engine, from.model);
+        if (static_cast<int>(tried.size()) >= node.switchLimits.maxCandidates) {
+            stopReason = "max_candidates";
+        }
+    }
+    if (stopReason.empty() && node.switchLimits.maxSec > 0 && node.firstStartMs > 0) {
+        const int64_t elapsedMs = nowMs - node.firstStartMs;
+        if (elapsedMs >= static_cast<int64_t>(node.switchLimits.maxSec) * 1000) {
+            stopReason = "max_sec";
+        }
+    }
+    if (stopReason.empty() && node.switchLimits.stopOnSameSymptom && !failSignature.empty()) {
+        for (auto it = node.engineAttempts.rbegin(); it != node.engineAttempts.rend(); ++it) {
+            if (it->result == "skipped") continue;
+            if (it->engine == from.engine && it->model == from.model) continue;
+            if (it->failSignature == failSignature) {
+                stopReason = "same_symptom";
+            }
+            break;
+        }
+    }
+    if (!stopReason.empty()) {
+        node.switchStoppedReason = stopReason;
+        if (node.detail.empty()) {
+            node.detail = "engineSwitchStopped: " + stopReason;
+        } else if (node.detail.find(stopReason) == std::string::npos) {
+            node.detail += " (engineSwitchStopped: " + stopReason + ")";
+        }
+        bt.EmitEvent(nowMs, "engineSwitchStopped", node.nodeKey, "failed", stopReason, node.runs);
+        return false;
+    }
+
     BtEngineAttempt attempt;
     attempt.engine = from.engine;
     attempt.model = from.model;
@@ -272,15 +407,26 @@ bool BehaviorTree::Impl::TrySwitchEngine(BehaviorTree& bt, BtNode& node,
     attempt.detail = detail;
     attempt.list = from.list;
     attempt.entry = from.entry;
+    if (handoff.is_object() && !handoff.empty()) {
+        attempt.handoff = handoff;
+    }
+    if (!failSignature.empty()) {
+        attempt.failSignature = failSignature;
+    }
     node.engineAttempts.push_back(std::move(attempt));
 
     node.engineCandidateIndex++;
+    node.switchFailCounts.clear();
+    node.recentFailSignatures.clear();
+    node.lastHandoff = json();
     const BtEngineChoice& to = node.engineCandidates[node.engineCandidateIndex];
     node.lastEngine = to.engine;
     node.lastModel = to.model;
-    node.state = "idle";
-    node.activeJobId.clear();
-    node.detail.clear();
+    if (relaunch) {
+        node.state = "idle";
+        node.activeJobId.clear();
+        node.detail.clear();
+    }
 
     std::string reason = from.engine + "/" + from.model + " -> " + to.engine + "/" + to.model;
     if (!failureClass.empty()) reason += " (" + failureClass + ")";
@@ -297,6 +443,14 @@ bool BehaviorTree::Impl::TrySwitchEngine(BehaviorTree& bt, BtNode& node,
     bt.EmitEvent(nowMs, "varSet", node.nodeKey, "running", "", node.runs,
                  "model", to.model);
     return true;
+}
+
+bool BehaviorTree::Impl::TrySwitchEngine(BehaviorTree& bt, BtNode& node,
+                                         const std::string& failureClass,
+                                         const std::string& detail, int64_t nowMs,
+                                         const json& handoff) {
+    if (!failureClass.empty()) node.switchFailCounts[failureClass]++;
+    return AdvanceEngineCandidate(bt, node, failureClass, detail, nowMs, handoff, {}, true);
 }
 
 void BehaviorTree::Impl::RunProbeLeaf(BehaviorTree& bt, BtNode& node, int64_t nowMs) {
@@ -573,6 +727,8 @@ void BehaviorTree::Impl::TickNode(BehaviorTree& bt, BtNode& node, int64_t nowMs)
                         node.engineAttempts.push_back({choice.engine, choice.model, "skipped",
                                                        "notApproved", "candidate is not approved and enabled"});
                         node.engineCandidateIndex++;
+                        node.switchFailCounts.clear();
+                        node.recentFailSignatures.clear();
                         continue;
                     }
                     // 091-6: skip a down engine and start from the next approved candidate.
@@ -580,6 +736,8 @@ void BehaviorTree::Impl::TickNode(BehaviorTree& bt, BtNode& node, int64_t nowMs)
                         node.engineAttempts.push_back({choice.engine, choice.model, "skipped",
                                                        "engineDown", "engine is down; waiting for recovery"});
                         node.engineCandidateIndex++;
+                        node.switchFailCounts.clear();
+                        node.recentFailSignatures.clear();
                         continue;
                     }
                     if (node.probe && bt.prober_) {
@@ -593,6 +751,9 @@ void BehaviorTree::Impl::TickNode(BehaviorTree& bt, BtNode& node, int64_t nowMs)
                             node.lastModel = choice.model;
                             node.detail = "probe_failed: " + inner +
                                           (pr.detail.empty() ? "" : (": " + pr.detail));
+                            if (!node.switchStoppedReason.empty()) {
+                                node.detail += " (engineSwitchStopped: " + node.switchStoppedReason + ")";
+                            }
                             json diag = json{{"class", "probe_failed"},
                                              {"summary", "preflight probe failed"},
                                              {"detail", inner}};
@@ -624,6 +785,12 @@ void BehaviorTree::Impl::TickNode(BehaviorTree& bt, BtNode& node, int64_t nowMs)
 
             if (HoldForEngine(bt, node, effEng, effMod, nowMs)) return;
 
+            std::string handoffSuffix = BuildWorkerHandoffPromptSuffix(node);
+            if (!handoffSuffix.empty()) {
+                if (!expPrompt.empty() && expPrompt.back() != '\n') expPrompt += "\n";
+                expPrompt += "\n" + handoffSuffix;
+            }
+
             BtWorkerSpec wspec{bt.id_, node.id, node.nodeKey, node.runs, proposedId, node.queueName,
                                effEng, effMod,
                                 expPrompt, expSummary, expCwd, node.timeoutSec, node.estimateSec, std::move(expEnv),
@@ -632,6 +799,7 @@ void BehaviorTree::Impl::TickNode(BehaviorTree& bt, BtNode& node, int64_t nowMs)
             node.isWorkerJob = true;
             node.lastEngine = effEng;
             node.lastModel = effMod;
+            if (node.firstStartMs == 0) node.firstStartMs = nowMs;
             if (bt.runner_) jobId = bt.runner_->StartWorker(wspec);
         }
 
@@ -644,7 +812,8 @@ void BehaviorTree::Impl::TickNode(BehaviorTree& bt, BtNode& node, int64_t nowMs)
         node.state = "running";
         node.activeJobId = jobId;
         node.jobs.push_back(jobId);
-        runningJobs[jobId] = RunningJobInfo{&node, false, node.isWorkerJob};
+        runningJobs[jobId] = RunningJobInfo{&node, false, node.isWorkerJob, expCwd,
+                                            expSuccess.testReport, expSuccess.contentFile};
         bt.EmitEvent(nowMs, "nodeStarted", node.nodeKey, node.state, jobId, node.runs);
         return;
     }

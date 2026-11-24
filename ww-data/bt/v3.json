@@ -35,8 +35,8 @@
                 "tests"
               ],
               "read": [
-                "doc/design-v3.md",
-                "doc/design-v3-en.md",
+                "doc/obsoleted/design-v3.md",
+                "doc/obsoleted/design-v3-en.md",
                 "src/event_schema.h"
               ]
             }
@@ -59,8 +59,8 @@
                 "tests"
               ],
               "read": [
-                "doc/design-v3.md",
-                "doc/design-v3-en.md",
+                "doc/obsoleted/design-v3.md",
+                "doc/obsoleted/design-v3-en.md",
                 "doc/schema/hancho.event.v1.json"
               ]
             }
@@ -85,8 +85,8 @@
                 "**/cmakelists.txt"
               ],
               "read": [
-                "doc/design-v3.md",
-                "doc/design-v3-en.md"
+                "doc/obsoleted/design-v3.md",
+                "doc/obsoleted/design-v3-en.md"
               ]
             }
           },
@@ -106,8 +106,8 @@
                 "tests"
               ],
               "read": [
-                "doc/design-v3.md",
-                "doc/design-v3-en.md"
+                "doc/obsoleted/design-v3.md",
+                "doc/obsoleted/design-v3-en.md"
               ]
             }
           },
@@ -127,8 +127,8 @@
                 "tests"
               ],
               "read": [
-                "doc/design-v3.md",
-                "doc/design-v3-en.md"
+                "doc/obsoleted/design-v3.md",
+                "doc/obsoleted/design-v3-en.md"
               ]
             }
           },
@@ -149,8 +149,8 @@
                 "doc"
               ],
               "read": [
-                "doc/design-v3.md",
-                "doc/design-v3-en.md"
+                "doc/obsoleted/design-v3.md",
+                "doc/obsoleted/design-v3-en.md"
               ]
             }
           },
@@ -171,8 +171,8 @@
                 "doc"
               ],
               "read": [
-                "doc/design-v3.md",
-                "doc/design-v3-en.md"
+                "doc/obsoleted/design-v3.md",
+                "doc/obsoleted/design-v3-en.md"
               ]
             }
           },
@@ -191,8 +191,8 @@
                 "**/cmakelists.txt"
               ],
               "read": [
-                "doc/design-v3.md",
-                "doc/design-v3-en.md",
+                "doc/obsoleted/design-v3.md",
+                "doc/obsoleted/design-v3-en.md",
                 "doc/schema/hancho.event.v1.json"
               ]
             }
@@ -212,8 +212,8 @@
                 "**/cmakelists.txt"
               ],
               "read": [
-                "doc/design-v3.md",
-                "doc/design-v3-en.md"
+                "doc/obsoleted/design-v3.md",
+                "doc/obsoleted/design-v3-en.md"
               ]
             }
           },
@@ -233,8 +233,8 @@
                 "doc"
               ],
               "read": [
-                "doc/design-v3.md",
-                "doc/design-v3-en.md"
+                "doc/obsoleted/design-v3.md",
+                "doc/obsoleted/design-v3-en.md"
               ]
             }
           },
@@ -253,8 +253,8 @@
                 "**/cmakelists.txt"
               ],
               "read": [
-                "doc/design-v3.md",
-                "doc/design-v3-en.md"
+                "doc/obsoleted/design-v3.md",
+                "doc/obsoleted/design-v3-en.md"
               ]
             }
           },
@@ -274,8 +274,8 @@
                 "doc"
               ],
               "read": [
-                "doc/design-v3.md",
-                "doc/design-v3-en.md"
+                "doc/obsoleted/design-v3.md",
+                "doc/obsoleted/design-v3-en.md"
               ]
             }
           },
@@ -296,8 +296,8 @@
                 "tests"
               ],
               "read": [
-                "doc/design-v3.md",
-                "doc/design-v3-en.md"
+                "doc/obsoleted/design-v3.md",
+                "doc/obsoleted/design-v3-en.md"
               ]
             }
           },
@@ -319,8 +319,8 @@
                 "**/cmakelists.txt"
               ],
               "read": [
-                "doc/design-v3.md",
-                "doc/design-v3-en.md",
+                "doc/obsoleted/design-v3.md",
+                "doc/obsoleted/design-v3-en.md",
                 "doc/schema/hancho.event.v1.json"
               ]
             }
@@ -340,8 +340,8 @@
                 "tests"
               ],
               "read": [
-                "doc/design-v3.md",
-                "doc/design-v3-en.md"
+                "doc/obsoleted/design-v3.md",
+                "doc/obsoleted/design-v3-en.md"
               ]
             }
           },
@@ -362,8 +362,8 @@
                 "tests"
               ],
               "read": [
-                "doc/design-v3.md",
-                "doc/design-v3-en.md"
+                "doc/obsoleted/design-v3.md",
+                "doc/obsoleted/design-v3-en.md"
               ]
             }
           },
@@ -382,8 +382,8 @@
                 "doc"
               ],
               "read": [
-                "doc/design-v3.md",
-                "doc/design-v3-en.md"
+                "doc/obsoleted/design-v3.md",
+                "doc/obsoleted/design-v3-en.md"
               ]
             }
           },
@@ -406,8 +406,8 @@
                 "doc"
               ],
               "read": [
-                "doc/design-v3.md",
-                "doc/design-v3-en.md"
+                "doc/obsoleted/design-v3.md",
+                "doc/obsoleted/design-v3-en.md"
               ]
             }
           },
@@ -429,8 +429,8 @@
                 "tests"
               ],
               "read": [
-                "doc/design-v3.md",
-                "doc/design-v3-en.md"
+                "doc/obsoleted/design-v3.md",
+                "doc/obsoleted/design-v3-en.md"
               ]
             }
           }

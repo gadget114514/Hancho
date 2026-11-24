@@ -5,7 +5,7 @@ Splittable: no
 
 ## 目的
 
-設定で列挙した特定のワーカーにも L3 への昇格を許す（`doc/design-v3.md` §7 決定 2026-11-11、3.5、`doc/design-v3-todo.md` 7）。
+設定で列挙した特定のワーカーにも L3 への昇格を許す（`doc/obsoleted/design-v3.md` §7 決定 2026-11-11、3.5、`doc/obsoleted/design-v3-todo.md` 7）。
 
 ## やること
 
@@ -24,8 +24,8 @@ Splittable: no
 
 ## 参照
 
-- `doc/design-v3.md` 3.5, 3.10, §7
-- `doc/design-v3-todo.md` 7
+- `doc/obsoleted/design-v3.md` 3.5, 3.10, §7
+- `doc/obsoleted/design-v3-todo.md` 7
 
 ## Authorised edits
 
@@ -38,8 +38,8 @@ Splittable: no
 
 ## Read-only
 
-- `doc/design-v3.md`
-- `doc/design-v3-en.md`
+- `doc/obsoleted/design-v3.md`
+- `doc/obsoleted/design-v3-en.md`
 
 ## 検証
 

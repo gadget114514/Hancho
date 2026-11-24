@@ -5,7 +5,7 @@ Splittable: no
 
 ## 目的
 
-L1 / L2 / L3 を検索し、根拠付きで取り出せるようにする（`doc/design-v3.md` 3.6, 3.8）。
+L1 / L2 / L3 を検索し、根拠付きで取り出せるようにする（`doc/obsoleted/design-v3.md` 3.6, 3.8）。
 
 ## やること
 
@@ -22,8 +22,8 @@ L1 / L2 / L3 を検索し、根拠付きで取り出せるようにする（`doc
 
 ## 参照
 
-- `doc/design-v3.md` 3.6, 3.8
-- `doc/design-v3-en.md` Section 3
+- `doc/obsoleted/design-v3.md` 3.6, 3.8
+- `doc/obsoleted/design-v3-en.md` Section 3
 
 ## Authorised edits
 
@@ -33,8 +33,8 @@ L1 / L2 / L3 を検索し、根拠付きで取り出せるようにする（`doc
 
 ## Read-only
 
-- `doc/design-v3.md`
-- `doc/design-v3-en.md`
+- `doc/obsoleted/design-v3.md`
+- `doc/obsoleted/design-v3-en.md`
 
 ## 検証
 

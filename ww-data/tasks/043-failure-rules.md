@@ -5,7 +5,7 @@ Splittable: no
 
 ## 目的
 
-分類規則をデータディレクトリで拡張し、決まらないときだけ LLM の見立てを参考にする（`doc/design-v3.md` 4.4）。
+分類規則をデータディレクトリで拡張し、決まらないときだけ LLM の見立てを参考にする（`doc/obsoleted/design-v3.md` 4.4）。
 
 ## やること
 
@@ -22,8 +22,8 @@ Splittable: no
 
 ## 参照
 
-- `doc/design-v3.md` 4.4
-- `doc/design-v3-en.md` Section 4
+- `doc/obsoleted/design-v3.md` 4.4
+- `doc/obsoleted/design-v3-en.md` Section 4
 
 ## Authorised edits
 
@@ -33,8 +33,8 @@ Splittable: no
 
 ## Read-only
 
-- `doc/design-v3.md`
-- `doc/design-v3-en.md`
+- `doc/obsoleted/design-v3.md`
+- `doc/obsoleted/design-v3-en.md`
 
 ## 検証
 

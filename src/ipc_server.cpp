@@ -88,10 +88,18 @@ std::string SnapshotToJson(const ProcessSnapshot& s) {
 }
 
 
-// Task-group rows in the task list have ids "group:<treeId>"; the behavior tree manager keys trees by
-// the bare id, so strip the row prefix before handing the id to it.
+// Task-group / direction rows in the task list have ids "direction:<dirId>" or legacy "group:<treeId>";
+// the behavior tree manager keys trees by the bare btId, so strip prefixes or resolve direction->btId.
 static std::string StripGroupRowPrefix(const std::string& id) {
     return id.rfind("group:", 0) == 0 ? id.substr(6) : id;
+}
+
+static std::string StripDirectionRowPrefix(const std::string& id) {
+    return id.rfind("direction:", 0) == 0 ? id.substr(10) : id;
+}
+
+static bool IsDirectionOrDirId(const std::string& id) {
+    return id.rfind("direction:", 0) == 0 || id.rfind("dir_", 0) == 0;
 }
 
 static std::string AsciiLower(std::string s) {
@@ -2019,6 +2027,88 @@ std::string IpcServer::HandleRequestJson(const std::string& reqJson) {
         }
         return out.dump();
     }
+    else if (action.rfind("task_", 0) == 0) {
+        nlohmann::json req = nlohmann::json::parse(reqJson, nullptr, false);
+        if (!req.is_object()) req = nlohmann::json::object();
+        std::string err;
+        std::string resp;
+        if (action == "task_create") {
+            resp = tqm_.TaskCreate(JsonGetString(reqJson, "title", ""),
+                                   JsonGetString(reqJson, "intent", ""),
+                                   JsonGetString(reqJson, "id", ""),
+                                   ExtractRawJsonValue(reqJson, "origin"), err);
+        } else if (action == "task_show") {
+            const int64_t logLimit = req.contains("logLimit") ? req.value("logLimit", int64_t(200))
+                                                              : req.value("log_limit", int64_t(200));
+            resp = tqm_.TaskShow(JsonGetString(reqJson, "id", ""), logLimit, err);
+        } else if (action == "task_list") {
+            const int64_t sinceVer = req.contains("since_version") ? req.value("since_version", int64_t(-1))
+                                                                 : req.value("sinceVersion", int64_t(-1));
+            resp = tqm_.TaskList(JsonGetString(reqJson, "state", ""),
+                                 req.value("limit", int64_t(0)), err, sinceVer);
+        } else if (action == "task_note") {
+            std::string session = JsonGetString(reqJson, "session", "");
+            if (session.empty() && req.contains("origin") && req["origin"].is_object()) {
+                session = req["origin"].value("session", std::string());
+            }
+            resp = tqm_.TaskNote(JsonGetString(reqJson, "id", ""),
+                                 JsonGetString(reqJson, "text", ""),
+                                 session, err);
+        } else if (action == "task_close") {
+            resp = tqm_.TaskClose(JsonGetString(reqJson, "id", ""),
+                                  JsonGetString(reqJson, "result", ""),
+                                  JsonGetString(reqJson, "reason", ""), err);
+        } else if (action == "task_reopen") {
+            resp = tqm_.TaskReopen(JsonGetString(reqJson, "id", ""),
+                                   JsonGetString(reqJson, "reason", ""), err);
+        } else if (action == "task_purge") {
+            const int64_t olderThanSec = req.contains("older_than_sec")
+                ? req.value("older_than_sec", int64_t(-1))
+                : req.value("olderThanSec", int64_t(-1));
+            resp = tqm_.TaskPurgeOlderThan(olderThanSec, err);
+        } else if (action == "task_wait") {
+            const int timeoutMs = req.contains("timeout_ms") ? req.value("timeout_ms", 30000)
+                                                             : req.value("timeoutMs", 30000);
+            const int64_t logLimit = req.contains("logLimit") ? req.value("logLimit", int64_t(200))
+                                                              : req.value("log_limit", int64_t(200));
+            resp = tqm_.TaskWait(JsonGetString(reqJson, "id", ""), timeoutMs, logLimit, err);
+        } else {
+            return "{\"ok\":false,\"error\":\"unknown task action: " + JsonEscape(action) + "\"}";
+        }
+        return resp;
+    }
+    else if (action.rfind("direction_", 0) == 0) {
+        nlohmann::json req = nlohmann::json::parse(reqJson, nullptr, false);
+        if (!req.is_object()) req = nlohmann::json::object();
+        std::string err;
+        std::string resp;
+        if (action == "direction_show") {
+            resp = tqm_.DirectionShow(JsonGetString(reqJson, "id", ""), err);
+        } else if (action == "direction_list") {
+            const int64_t sinceVer = req.contains("since_version") ? req.value("since_version", int64_t(-1))
+                                                                 : req.value("sinceVersion", int64_t(-1));
+            std::string taskId = JsonGetString(reqJson, "taskId", "");
+            if (taskId.empty()) taskId = JsonGetString(reqJson, "task_id", "");
+            if (taskId.empty()) taskId = JsonGetString(reqJson, "task", "");
+            resp = tqm_.DirectionList(taskId, JsonGetString(reqJson, "state", ""),
+                                      req.value("limit", int64_t(0)), err, sinceVer);
+        } else if (action == "direction_close") {
+            resp = tqm_.DirectionClose(JsonGetString(reqJson, "id", ""),
+                                       JsonGetString(reqJson, "result", ""),
+                                       JsonGetString(reqJson, "reason", ""), err);
+        } else if (action == "direction_reopen") {
+            resp = tqm_.DirectionReopen(JsonGetString(reqJson, "id", ""),
+                                        JsonGetString(reqJson, "reason", ""), err);
+        } else if (action == "direction_purge") {
+            const int64_t olderThanSec = req.contains("older_than_sec")
+                ? req.value("older_than_sec", int64_t(-1))
+                : req.value("olderThanSec", int64_t(-1));
+            resp = tqm_.DirectionPurgeOlderThan(olderThanSec, err);
+        } else {
+            return "{\"ok\":false,\"error\":\"unknown direction action: " + JsonEscape(action) + "\"}";
+        }
+        return resp;
+    }
     else if (action == "failure_diagnose" || action.rfind("taskqueue_", 0) == 0) {
         std::string err;
         std::string resp;
@@ -2059,7 +2149,8 @@ std::string IpcServer::HandleRequestJson(const std::string& reqJson) {
                                      jobsRaw,
                                      JsonGetInt(reqJson, "concurrency", 0),
                                      JsonGetString(reqJson, "notify_file", ""), err,
-                                     ExtractRawJsonValue(reqJson, "origin"));
+                                     ExtractRawJsonValue(reqJson, "origin"),
+                                     JsonGetString(reqJson, "task", ""));
         } else if (action == "taskqueue_list") {
             int64_t sinceSec = 0;
             const std::string sinceStr = JsonGetString(reqJson, "since", "");
@@ -2069,27 +2160,35 @@ std::string IpcServer::HandleRequestJson(const std::string& reqJson) {
                 const std::string tqFilter = JsonGetString(reqJson, "taskqueue", "");
                 const std::string stateFilter = JsonGetString(reqJson, "state", "");
                 const std::string btFilter = JsonGetString(reqJson, "bt", "");
+                const std::string taskFilter = JsonGetString(reqJson, "task", "");
                 resp = tqm_.TaskQueueList(tqFilter, stateFilter, sinceSec, err,
                                           JsonGetString(reqJson, "origin", ""), btFilter,
-                                          JsonGetBool(reqJson, "include_hidden", false));
+                                          JsonGetBool(reqJson, "include_hidden", false), taskFilter);
                 // Virtual task-group rows and their provisional leaves, derived from the live
                 // state on every query. Nothing is stored, so a finished group drops both rows.
-                if (err.empty() && btm_ && JsonGetBool(reqJson, "include_planned", false)) {
+                if (err.empty() && btm_ && taskFilter.empty() && JsonGetBool(reqJson, "include_planned", false)) {
                     nlohmann::json doc = nlohmann::json::parse(resp, nullptr, false);
                     if (doc.is_object() && doc.contains("jobs") && doc["jobs"].is_array()) {
                         BtRemainingInfo info = btm_->GetRemainingInfo();
+                        std::unordered_map<std::string, const TaskGroupInfo*> groupByBt;
                         for (const auto& g : info.groups) {
+                            groupByBt[g.id] = &g;
                             if (!tqFilter.empty() && g.taskqueue != tqFilter) continue;
                             if (!btFilter.empty() && g.id != btFilter) continue;
                             if (!TaskGroupStateMatches(stateFilter, g.state)) continue;
                             nlohmann::json job;
-                            job["id"] = "group:" + g.id;
+                            job["id"] = g.directionId.empty() ? ("group:" + g.id) : ("direction:" + g.directionId);
                             job["summary"] = g.summary.empty() ? g.id : g.summary;
                             job["state"] = g.state;
                             job["virtual"] = true;
                             job["taskqueue"] = g.taskqueue;
                             job["created_at"] = "";
                             job["start_time"] = g.startTime;
+                            if (!g.directionId.empty()) {
+                                job["direction_id"] = g.directionId;
+                                job["direction"] = {{"id", g.directionId}, {"kind", "bt"}, {"bt_id", g.id}, {"detail", g.detail}};
+                            }
+                            if (!g.taskId.empty()) job["task_id"] = g.taskId;
                             job["group"] = {{"id", g.id}, {"detail", g.detail}};
                             // Group rows show the origin of the tree, like the jobs it adds.
                             const std::string groupOrigin = tqm_.BtOriginJson(g.id);
@@ -2113,6 +2212,11 @@ std::string IpcServer::HandleRequestJson(const std::string& reqJson) {
                                 job["estimate_sec"] = t.estimateSec;
                                 job["created_at"] = "";
                                 job["bt"] = {{"id", t.btId}, {"node", t.nodeKey}, {"planned", true}};
+                                auto git = groupByBt.find(t.btId);
+                                if (git != groupByBt.end() && git->second) {
+                                    if (!git->second->directionId.empty()) job["direction_id"] = git->second->directionId;
+                                    if (!git->second->taskId.empty()) job["task_id"] = git->second->taskId;
+                                }
                                 doc["jobs"].push_back(std::move(job));
                             }
                         }
@@ -2125,14 +2229,39 @@ std::string IpcServer::HandleRequestJson(const std::string& reqJson) {
             resp = tqm_.TaskQueueGet(id,
                                      JsonGetBool(reqJson, "include_instructions", true),
                                      static_cast<int>(JsonGetInt(reqJson, "rev", 0)), err);
-            // The id may be a task group rather than a job; return the tree instead.
-            if (!err.empty() && btm_ && err.find("job not found") != std::string::npos) {
-                // Task-group rows carry a "group:" prefix that the behavior tree manager does not know.
-                nlohmann::json btDoc = nlohmann::json::parse(btm_->Get(StripGroupRowPrefix(id), false), nullptr, false);
-                if (btDoc.is_object() && btDoc.value("ok", false)) {
-                    btDoc["kind"] = "taskGroup";
-                    resp = btDoc.dump();
-                    err.clear();
+            // The id may be a direction or task group rather than a job; return the direction/tree instead.
+            if (!err.empty() && err.find("job not found") != std::string::npos) {
+                if (IsDirectionOrDirId(id)) {
+                    const std::string dirId = StripDirectionRowPrefix(id);
+                    nlohmann::json dirRec;
+                    if (tqm_.DirectionGet(dirId, dirRec)) {
+                        const std::string kind = dirRec.value("kind", "");
+                        const std::string btId = dirRec.value("btId", "");
+                        if (kind == "bt" && btm_ && !btId.empty()) {
+                            nlohmann::json btDoc = nlohmann::json::parse(btm_->Get(btId, false), nullptr, false);
+                            if (btDoc.is_object() && btDoc.value("ok", false)) {
+                                btDoc["kind"] = "taskGroup";
+                                btDoc["direction_id"] = dirId;
+                                resp = btDoc.dump();
+                                err.clear();
+                            }
+                        } else {
+                            std::string dirErr;
+                            std::string dirResp = tqm_.DirectionShow(dirId, dirErr);
+                            if (dirErr.empty()) {
+                                resp = dirResp;
+                                err.clear();
+                            }
+                        }
+                    }
+                } else if (btm_) {
+                    // Task-group rows carry a "group:" prefix that the behavior tree manager does not know.
+                    nlohmann::json btDoc = nlohmann::json::parse(btm_->Get(StripGroupRowPrefix(id), false), nullptr, false);
+                    if (btDoc.is_object() && btDoc.value("ok", false)) {
+                        btDoc["kind"] = "taskGroup";
+                        resp = btDoc.dump();
+                        err.clear();
+                    }
                 }
             }
         } else if (action == "taskqueue_retry") {
@@ -2145,8 +2274,8 @@ std::string IpcServer::HandleRequestJson(const std::string& reqJson) {
                 err = "invalid since '" + sinceStr + "' (use a number followed by m, h or d, e.g. 6h)";
             } else if (!retryId.empty()) {
                 resp = tqm_.TaskQueueRetry(retryId, resetAttempts, refreshInstr, TaskQueueCaller::External, err);
-                if (!err.empty() && btm_) {
-                    if (err.find("managed by a behavior tree") != std::string::npos) {
+                if (!err.empty()) {
+                    if (err.find("managed by a behavior tree") != std::string::npos && btm_) {
                         // A tree-owned job: retry the tree's branch instead.
                         TaskQueueJob job;
                         if (tqm_.GetJobSnapshot(retryId, job) && !job.bt.id.empty()) {
@@ -2154,9 +2283,26 @@ std::string IpcServer::HandleRequestJson(const std::string& reqJson) {
                             err.clear();
                         }
                     } else if (err.find("job not found") != std::string::npos) {
-                        // The id may be a task group rather than a job.
-                        resp = btm_->Retry(retryId, "", resetAttempts);
-                        err.clear();
+                        if (IsDirectionOrDirId(retryId)) {
+                            const std::string dirId = StripDirectionRowPrefix(retryId);
+                            nlohmann::json dirRec;
+                            if (tqm_.DirectionGet(dirId, dirRec)) {
+                                if (dirRec.value("kind", "") == "bt" && btm_ && !dirRec.value("btId", "").empty()) {
+                                    resp = btm_->Retry(dirRec.value("btId", ""), "", resetAttempts);
+                                    err.clear();
+                                } else {
+                                    std::string dirErr;
+                                    resp = tqm_.DirectionRetryJobs(dirId, resetAttempts, refreshInstr,
+                                                                   TaskQueueCaller::External, dirErr);
+                                    if (dirErr.empty()) err.clear();
+                                    else err = dirErr;
+                                }
+                            }
+                        } else if (btm_) {
+                            // The id may be a task group rather than a job.
+                            resp = btm_->Retry(StripGroupRowPrefix(retryId), "", resetAttempts);
+                            err.clear();
+                        }
                     }
                 }
             } else if (JsonGetBool(reqJson, "failed", false)) {
@@ -2166,24 +2312,64 @@ std::string IpcServer::HandleRequestJson(const std::string& reqJson) {
             } else {
                 err = "taskqueue_retry requires an id, or failed=true for bulk retry";
             }
+        } else if (action == "taskqueue_supersede") {
+            const std::string id = JsonGetString(reqJson, "id", "");
+            const std::string reason = JsonGetString(reqJson, "reason", "");
+            std::string newId = JsonGetString(reqJson, "new_id", "");
+            if (newId.empty()) newId = JsonGetString(reqJson, "newId", "");
+            const std::string patch = ExtractRawJsonValue(reqJson, "patch");
+            const std::string origin = ExtractRawJsonValue(reqJson, "origin");
+            resp = tqm_.TaskQueueSupersede(id, reason, newId, patch, origin, err);
         } else if (action == "taskqueue_update") {
             resp = tqm_.TaskQueueUpdate(JsonGetString(reqJson, "id", ""),
                                         ExtractRawJsonValue(reqJson, "patch"), TaskQueueCaller::External, err);
         } else if (action == "taskqueue_cancel") {
             const std::string id = JsonGetString(reqJson, "id", "");
             resp = tqm_.TaskQueueCancel(id, err);
-            // The id may be a task group rather than a job; cancel the tree instead.
-            if (!err.empty() && btm_ && err.find("job not found") != std::string::npos) {
-                resp = btm_->Cancel(StripGroupRowPrefix(id));
-                err.clear();
+            // The id may be a direction or task group rather than a job; cancel it instead.
+            if (!err.empty() && err.find("job not found") != std::string::npos) {
+                if (IsDirectionOrDirId(id)) {
+                    const std::string dirId = StripDirectionRowPrefix(id);
+                    nlohmann::json dirRec;
+                    if (tqm_.DirectionGet(dirId, dirRec)) {
+                        if (dirRec.value("kind", "") == "bt" && btm_ && !dirRec.value("btId", "").empty()) {
+                            resp = btm_->Cancel(dirRec.value("btId", ""));
+                            err.clear();
+                        } else {
+                            std::string dirErr;
+                            resp = tqm_.DirectionCancelJobs(dirId, dirErr);
+                            if (dirErr.empty()) err.clear();
+                            else err = dirErr;
+                        }
+                    }
+                } else if (btm_) {
+                    resp = btm_->Cancel(StripGroupRowPrefix(id));
+                    err.clear();
+                }
             }
         } else if (action == "taskqueue_close") {
             const std::string id = JsonGetString(reqJson, "id", "");
             resp = tqm_.TaskQueueClose(id, err);
-            // A task group has no job to close; stop the tree but keep it (use remove to delete).
-            if (!err.empty() && btm_ && err.find("job not found") != std::string::npos) {
-                resp = btm_->Cancel(StripGroupRowPrefix(id));
-                err.clear();
+            // A direction/task group has no job to close; stop the tree or jobs.
+            if (!err.empty() && err.find("job not found") != std::string::npos) {
+                if (IsDirectionOrDirId(id)) {
+                    const std::string dirId = StripDirectionRowPrefix(id);
+                    nlohmann::json dirRec;
+                    if (tqm_.DirectionGet(dirId, dirRec)) {
+                        if (dirRec.value("kind", "") == "bt" && btm_ && !dirRec.value("btId", "").empty()) {
+                            resp = btm_->Cancel(dirRec.value("btId", ""));
+                            err.clear();
+                        } else {
+                            std::string dirErr;
+                            resp = tqm_.DirectionCancelJobs(dirId, dirErr);
+                            if (dirErr.empty()) err.clear();
+                            else err = dirErr;
+                        }
+                    }
+                } else if (btm_) {
+                    resp = btm_->Cancel(StripGroupRowPrefix(id));
+                    err.clear();
+                }
             }
         } else if (action == "taskqueue_takeover") {
             resp = tqm_.TaskQueueTakeover(JsonGetString(reqJson, "id", ""),
@@ -2198,18 +2384,79 @@ std::string IpcServer::HandleRequestJson(const std::string& reqJson) {
             const bool paused = (action == "taskqueue_pause");
             const std::string name = JsonGetString(reqJson, "taskqueue", "");
             resp = tqm_.TaskQueuePause(name, paused, err);
-            // The name may be a task group rather than a queue.
-            if (!err.empty() && btm_ && err.find("task queue not found") != std::string::npos) {
-                std::string btResp = btm_->Pause(name, paused);
-                if (btResp.find("\"ok\":true") != std::string::npos) {
-                    resp = btResp;
-                    err.clear();
+            // The name may be a direction or task group rather than a queue.
+            if (!err.empty() && err.find("task queue not found") != std::string::npos) {
+                if (IsDirectionOrDirId(name)) {
+                    const std::string dirId = StripDirectionRowPrefix(name);
+                    nlohmann::json dirRec;
+                    if (tqm_.DirectionGet(dirId, dirRec)) {
+                        if (dirRec.value("kind", "") == "bt" && btm_ && !dirRec.value("btId", "").empty()) {
+                            std::string btResp = btm_->Pause(dirRec.value("btId", ""), paused);
+                            if (btResp.find("\"ok\":true") != std::string::npos) {
+                                resp = btResp;
+                                err.clear();
+                            }
+                        } else {
+                            std::string dirErr;
+                            resp = tqm_.DirectionPauseJobs(dirId, paused, dirErr);
+                            if (dirErr.empty()) err.clear();
+                            else err = dirErr;
+                        }
+                    }
+                } else if (btm_) {
+                    std::string btResp = btm_->Pause(StripGroupRowPrefix(name), paused);
+                    if (btResp.find("\"ok\":true") != std::string::npos) {
+                        resp = btResp;
+                        err.clear();
+                    }
                 }
             }
         } else if (action == "taskqueue_pause_job") {
-            resp = tqm_.TaskQueuePauseJob(JsonGetString(reqJson, "id", ""), true, err);
+            const std::string id = JsonGetString(reqJson, "id", "");
+            resp = tqm_.TaskQueuePauseJob(id, true, err);
+            if (!err.empty() && err.find("job not found") != std::string::npos) {
+                if (IsDirectionOrDirId(id)) {
+                    const std::string dirId = StripDirectionRowPrefix(id);
+                    nlohmann::json dirRec;
+                    if (tqm_.DirectionGet(dirId, dirRec)) {
+                        if (dirRec.value("kind", "") == "bt" && btm_ && !dirRec.value("btId", "").empty()) {
+                            resp = btm_->Pause(dirRec.value("btId", ""), true);
+                            err.clear();
+                        } else {
+                            std::string dirErr;
+                            resp = tqm_.DirectionPauseJobs(dirId, true, dirErr);
+                            if (dirErr.empty()) err.clear();
+                            else err = dirErr;
+                        }
+                    }
+                } else if (id.rfind("group:", 0) == 0 && btm_) {
+                    resp = btm_->Pause(StripGroupRowPrefix(id), true);
+                    err.clear();
+                }
+            }
         } else if (action == "taskqueue_resume_job") {
-            resp = tqm_.TaskQueuePauseJob(JsonGetString(reqJson, "id", ""), false, err);
+            const std::string id = JsonGetString(reqJson, "id", "");
+            resp = tqm_.TaskQueuePauseJob(id, false, err);
+            if (!err.empty() && err.find("job not found") != std::string::npos) {
+                if (IsDirectionOrDirId(id)) {
+                    const std::string dirId = StripDirectionRowPrefix(id);
+                    nlohmann::json dirRec;
+                    if (tqm_.DirectionGet(dirId, dirRec)) {
+                        if (dirRec.value("kind", "") == "bt" && btm_ && !dirRec.value("btId", "").empty()) {
+                            resp = btm_->Pause(dirRec.value("btId", ""), false);
+                            err.clear();
+                        } else {
+                            std::string dirErr;
+                            resp = tqm_.DirectionPauseJobs(dirId, false, dirErr);
+                            if (dirErr.empty()) err.clear();
+                            else err = dirErr;
+                        }
+                    }
+                } else if (id.rfind("group:", 0) == 0 && btm_) {
+                    resp = btm_->Pause(StripGroupRowPrefix(id), false);
+                    err.clear();
+                }
+            }
         } else if (action == "taskqueue_wait") {
             resp = tqm_.TaskQueueWait(JsonGetString(reqJson, "taskqueue", ""),
                                       static_cast<int>(JsonGetInt(reqJson, "since_version", 0)),
@@ -2224,11 +2471,29 @@ std::string IpcServer::HandleRequestJson(const std::string& reqJson) {
             }
         } else if (action == "taskqueue_remove") {
             const std::string id = JsonGetString(reqJson, "id", "");
-            resp = tqm_.TaskQueueRemove(id, JsonGetBool(reqJson, "force", false), err);
-            // The id may be a task group rather than a job; remove the tree instead.
-            if (!err.empty() && btm_ && err.find("job not found") != std::string::npos) {
-                resp = btm_->Remove(StripGroupRowPrefix(id));
-                err.clear();
+            const bool force = JsonGetBool(reqJson, "force", false);
+            resp = tqm_.TaskQueueRemove(id, force, err);
+            // The id may be a direction or task group rather than a job; remove the tree/jobs instead.
+            if (!err.empty() &&
+                (err.find("job not found") != std::string::npos || err.find("virtual") != std::string::npos)) {
+                if (IsDirectionOrDirId(id)) {
+                    const std::string dirId = StripDirectionRowPrefix(id);
+                    nlohmann::json dirRec;
+                    if (tqm_.DirectionGet(dirId, dirRec)) {
+                        if (dirRec.value("kind", "") == "bt" && btm_ && !dirRec.value("btId", "").empty()) {
+                            resp = btm_->Remove(dirRec.value("btId", ""));
+                            err.clear();
+                        } else {
+                            std::string dirErr;
+                            resp = tqm_.DirectionRemoveJobs(dirId, force, dirErr);
+                            if (dirErr.empty()) err.clear();
+                            else err = dirErr;
+                        }
+                    }
+                } else if (btm_) {
+                    resp = btm_->Remove(StripGroupRowPrefix(id));
+                    err.clear();
+                }
             }
         } else if (action == "taskqueue_link") {
             resp = tqm_.TaskQueueLink(JsonGetString(reqJson, "job", ""),
@@ -2488,6 +2753,17 @@ std::string IpcServer::HandleRequestJson(const std::string& reqJson) {
             std::string btJson, err;
             if (!extractBtPayload(btJson, err)) {
                 return "{\"ok\":false,\"error\":\"" + JsonEscape(err) + "\"}";
+            }
+            const std::string taskId = JsonGetString(reqJson, "task", "");
+            if (!taskId.empty()) {
+                if (!tqm_.ValidateTaskActive(taskId, err)) {
+                    return "{\"ok\":false,\"error\":\"" + JsonEscape(err) + "\"}";
+                }
+                auto btDef = json::parse(btJson, nullptr, false);
+                if (btDef.is_object()) {
+                    btDef["taskId"] = taskId;
+                    btJson = btDef.dump();
+                }
             }
             // Jobs the tree adds carry the origin of whoever started it; set it before
             // Start, which may already add the first jobs.
@@ -2932,12 +3208,23 @@ std::string IpcServer::HandleRequestJson(const std::string& reqJson) {
                 return resp.is_discarded() ? "{\"ok\":false,\"error\":\"invalid routine response\"}" : resp.dump();
             }
             const std::string runId = resp["runId"].get<std::string>();
-            const std::string btText = resp["bt"].get<std::string>();
+            std::string btText = resp["bt"].get<std::string>();
             const std::string taskqueue = resp["taskqueue"].get<std::string>();
             const bool wasStale = resp.value("state", std::string()) == "stale";
             json inputDiff = json::object();
             for (const char* key : {"state", "added", "removed", "changed", "absorbed"}) {
                 if (resp.contains(key)) inputDiff[key] = resp[key];
+            }
+            const std::string taskId = JsonGetString(reqJson, "task", "");
+            if (!taskId.empty()) {
+                if (!tqm_.ValidateTaskActive(taskId, err)) {
+                    return "{\"ok\":false,\"error\":\"" + JsonEscape(err) + "\"}";
+                }
+                auto btDef = json::parse(btText, nullptr, false);
+                if (btDef.is_object()) {
+                    btDef["taskId"] = taskId;
+                    btText = btDef.dump();
+                }
             }
             if (req.contains("origin") && req["origin"].is_object()) {
                 tqm_.SetBtOrigin(runId, req["origin"].dump());

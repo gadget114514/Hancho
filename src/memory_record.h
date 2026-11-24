@@ -1,6 +1,6 @@
 #pragma once
 
-// L1 run records (doc/design-v3.md 3.3, 3.7).
+// L1 run records (doc/obsoleted/design-v3.md 3.3, 3.7).
 //
 // One record is made for each finished TaskQueueAttempt, without an LLM, from the
 // attempt stored in logs/taskqueues/*.json and the normalized logs/proc_*.events.jsonl.
@@ -55,18 +55,18 @@ struct RunRecordInput {
     std::string logText;         // full log text when the caller already has it
 };
 
-// rr_<jobId>_<attempt>, matching the id in doc/design-v3.md 3.3.
+// rr_<jobId>_<attempt>, matching the id in doc/obsoleted/design-v3.md 3.3.
 std::string RunRecordId(const std::string& jobId, int attempt);
 
 // Evaluates deterministic failure classification rules for unclassified failures
-// (doc/design-v3.md §7, card 072-2). Matches queue attempts' determination:
+// (doc/obsoleted/design-v3.md §7, card 072-2). Matches queue attempts' determination:
 // launch_error, killed, timeout, idle_stall, crash (NTSTATUS), exit_nonzero, success_check_failed.
 // Returns pair of {failureClass, failureSummary}. If no deterministic rule matched, returns {"", ""}.
 std::pair<std::string, std::string> ClassifyDeterministicFailure(
     const std::string& reason, int exitCode, const std::string& outcome,
     const std::string& checkDetail = "", int timeoutSec = 0, int64_t durationSec = 0);
 
-// Input for creating a RunRecord from an execution outside a task queue (doc/design-v3.md §7, card 072-2).
+// Input for creating a RunRecord from an execution outside a task queue (doc/obsoleted/design-v3.md §7, card 072-2).
 struct PlainRunRecordInput {
     std::string jobId;
     int attempt = 1;
@@ -107,7 +107,7 @@ std::string RebuildRunRecordsJson();
 
 std::string RunRecordsDirectoryUtf8();
 
-// Memory storage statistics across L1, L2, L3 and index (doc/design-v3.md 3.7).
+// Memory storage statistics across L1, L2, L3 and index (doc/obsoleted/design-v3.md 3.7).
 struct MemoryStorageStats {
     int64_t totalBytes = 0;
     int64_t limitBytes = 0; // 0 = no limit configured
@@ -123,7 +123,7 @@ struct MemoryStorageStats {
 
 using StorageStats = MemoryStorageStats;
 
-// Options for memory prune (doc/design-v3.md 3.7).
+// Options for memory prune (doc/obsoleted/design-v3.md 3.7).
 struct PruneOptions {
     bool dryRun = false;
     int retentionDays = 90;   // default 90 days; <= 0 disables age-based pruning

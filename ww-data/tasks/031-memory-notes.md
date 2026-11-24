@@ -5,7 +5,7 @@ Splittable: no
 
 ## 目的
 
-人・エージェント・Hancho が明示的に書く短い事実を扱う（`doc/design-v3.md` 3.4, 3.10）。
+人・エージェント・Hancho が明示的に書く短い事実を扱う（`doc/obsoleted/design-v3.md` 3.4, 3.10）。
 
 ## やること
 
@@ -22,8 +22,8 @@ Splittable: no
 
 ## 参照
 
-- `doc/design-v3.md` 3.4, 3.10
-- `doc/design-v3-en.md` Section 3
+- `doc/obsoleted/design-v3.md` 3.4, 3.10
+- `doc/obsoleted/design-v3-en.md` Section 3
 
 ## Authorised edits
 
@@ -33,8 +33,8 @@ Splittable: no
 
 ## Read-only
 
-- `doc/design-v3.md`
-- `doc/design-v3-en.md`
+- `doc/obsoleted/design-v3.md`
+- `doc/obsoleted/design-v3-en.md`
 
 ## 検証
 

@@ -150,6 +150,7 @@ std::string TranslateToken(Lang lang, const std::string& type, const std::string
         if (value == "process_failure") return Pick(lang, "プロセス失敗", "Process failure", "Fallo de proceso");
         if (value == "timing_divergence") return Pick(lang, "見積もり乖離", "Timing divergence", "Desviación de tiempo");
         if (value == "resource_wait") return Pick(lang, "リソース待ち", "Resource wait", "Espera de recurso");
+        if (value == "lineage_repeated_failure") return Pick(lang, "系譜の繰り返し失敗", "Repeated lineage failure", "Fallo repetido de linaje");
     } else if (type == "section") {
         if (value == "summary") return Pick(lang, "要約", "Summary", "Resumen");
         if (value == "intent") return Pick(lang, "目的", "Intent", "Propósito");
@@ -241,6 +242,10 @@ std::string InfoPrefix(Lang lang, const std::string& key) {
     if (key == "timingAdvice") return "";
     if (key == "resourceWait") return Pick(lang, "待機中のリソース: ", "Waiting for resource: ", "Esperando el recurso: ");
     if (key == "resourceConflict") return Pick(lang, "ロック競合: ", "Lock conflict: ", "Conflicto de bloqueo: ");
+    if (key == "lineageRoot") return Pick(lang, "系譜の先頭: ", "Lineage root: ", "Raíz del linaje: ");
+    if (key == "lineageJobs") return Pick(lang, "系譜のジョブ: ", "Lineage jobs: ", "Tareas del linaje: ");
+    if (key == "failedCount") return Pick(lang, "失敗回数: ", "Failed jobs: ", "Tareas fallidas: ");
+    if (key == "lineageThreshold") return Pick(lang, "しきい値: ", "Threshold: ", "Umbral: ");
     return "";
 }
 
@@ -298,6 +303,7 @@ std::string TriageFormatRationale(const std::string& language, const std::string
     else if (key == "processFailure") text = Pick(lang, "通常のプロセスを再起動すべきか Hancho は判断できません。", "Hancho cannot determine whether a plain process should be restarted.", "Hancho no puede determinar si debe reiniciarse un proceso normal.");
     else if (key == "timingDivergence") text = Pick(lang, "実績時間を使って、同種・同キューの未完了ジョブの見積もりを調整してください。", "Use the measured duration to recalibrate unfinished jobs of the same kind and queue.", "Use la duración medida para reajustar tareas sin terminar del mismo tipo y cola.");
     else if (key == "resourceWait") text = Pick(lang, "待機を記録しながら、リソーススケジューラに処理を続けさせてください。", "Let the resource scheduler continue while recording the wait.", "Deje que el planificador de recursos continúe mientras registra la espera.");
+    else if (key == "lineageRepeatedFailure") text = Pick(lang, "同じ系譜で失敗が繰り返されています。人が経緯を確認して判断してください。", "The same lineage has failed repeatedly; a human should inspect the pattern and decide.", "El mismo linaje ha fallado repetidamente; una persona debe revisar el patrón y decidir.");
     else return fallback;
     if (key == "transientRetry" || key == "retryCheckCause")
         text = Replace(std::move(text), "class", TriageLabel(language, "class", Get(params, "class")));

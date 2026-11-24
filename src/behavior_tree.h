@@ -1,6 +1,6 @@
 #pragma once
 
-// Core Behavior Tree (BT) engine for Hancho (doc/behavior-tree-plan.md).
+// Core Behavior Tree (BT) engine for Hancho (doc/obsoleted/behavior-tree-plan.md).
 // Pure logic only: no GUI, no IPC, no process launching, no dependency on TaskQueueManager.
 
 #include "worker_engines.h"
@@ -160,12 +160,24 @@ struct BtLimits {
     int maxWallSec = 86400;
 };
 
+struct BtSwitchRule {
+    std::string failureClass;
+    int after = 1;
+};
+
+struct BtSwitchLimits {
+    int maxCandidates = 3;
+    int maxSec = 0;
+    bool stopOnSameSymptom = true;
+    bool configured = false;
+};
+
 struct BtWorkerDefaults {
     std::string engine;
     std::string model;
 };
 
-// Tree-level defaults (doc/HanchoExpectations.md 8.2). A node's explicit values always win,
+// Tree-level defaults (doc/obsoleted/HanchoExpectations.md 8.2). A node's explicit values always win,
 // including an explicit 0. `configured` on the idle fields means the default block was present.
 struct BtDefaults {
     BtWorkerDefaults worker;       // engine/model from the top-level "worker" block
@@ -173,13 +185,15 @@ struct BtDefaults {
     int workerMaxAttempts = 0;     // 0 = not specified
     bool workerProbe = false;
     bool hasWorkerProbe = false;
+    std::vector<BtSwitchRule> workerSwitchEngineOn;
+    BtSwitchLimits workerSwitchLimits;
     BtJobIdle jobIdle;
 
     bool hasWorkerIdle() const { return workerIdle.configured; }
     bool hasJobIdle() const { return jobIdle.configured; }
 };
 
-// A non-fatal lint finding from `bt validate` (doc/HanchoExpectations.md 8.4). Warnings never
+// A non-fatal lint finding from `bt validate` (doc/obsoleted/HanchoExpectations.md 8.4). Warnings never
 // fail validation; --strict turns them into errors.
 struct BtWarning {
     std::string path;
@@ -293,7 +307,7 @@ public:
                        const std::string& failDetail = "");
 
     // As above, with the taskqueue failure diagnostic JSON for the finished attempt. The
-    // diagnostic fields become ${<node>.failureClass} etc. (doc/HanchoExpectations.md 8.1).
+    // diagnostic fields become ${<node>.failureClass} etc. (doc/obsoleted/HanchoExpectations.md 8.1).
     void OnJobFinished(const std::string& jobId,
                        bool succeeded,
                        int exitCode,
@@ -345,6 +359,10 @@ public:
     const std::string& Id() const { return id_; }
     const std::string& Summary() const { return summary_; }
     const std::string& Intent() const { return intent_; }
+    // Task (lineage) this BT belongs to. Empty when the BT was started without --task.
+    const std::string& TaskId() const { return taskId_; }
+    const std::string& DirectionId() const { return directionId_; }
+    void SetDirectionId(const std::string& id) { directionId_ = id; }
     const std::string& TaskQueueName() const { return taskqueue_; }
     const std::string& Cwd() const { return cwd_; }
     const std::string& NotifyFile() const { return notifyFile_; }
@@ -398,6 +416,8 @@ private:
     std::string id_;
     std::string summary_;
     std::string intent_;
+    std::string taskId_;
+    std::string directionId_;
     std::string taskqueue_;
     std::string cwd_;
     std::string notifyFile_;

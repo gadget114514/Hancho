@@ -5,7 +5,7 @@ Splittable: no
 
 ## 目的
 
-人が承認した事実だけを、チームで共有できる知識として残す（`doc/design-v3.md` 3.5）。
+人が承認した事実だけを、チームで共有できる知識として残す（`doc/obsoleted/design-v3.md` 3.5）。
 
 ## やること
 
@@ -21,8 +21,8 @@ Splittable: no
 
 ## 参照
 
-- `doc/design-v3.md` 3.5
-- `doc/design-v3-en.md` Section 3
+- `doc/obsoleted/design-v3.md` 3.5
+- `doc/obsoleted/design-v3-en.md` Section 3
 
 ## Authorised edits
 
@@ -33,8 +33,8 @@ Splittable: no
 
 ## Read-only
 
-- `doc/design-v3.md`
-- `doc/design-v3-en.md`
+- `doc/obsoleted/design-v3.md`
+- `doc/obsoleted/design-v3-en.md`
 
 ## 検証
 

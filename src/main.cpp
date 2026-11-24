@@ -242,7 +242,7 @@ MCP SERVER SETUP:
             "timeoutSec": 3600, "prompt": "Fix the build errors in ${build.logFile}."},
            {"type": "fail"}]}]}}}
     Full format, every node type and three complete examples:
-      doc\behavior-tree.md (English), doc\behavior-tree-ja.md (Japanese), in the
+      doc\obsoleted\behavior-tree.md (English), doc\obsoleted\behavior-tree-ja.md (Japanese), in the
       Hancho installation folder. `hancho-cli.exe bt --help` lists the CLI.
 
   For the full machine-readable guide (agent.quick_start, decision, states):
@@ -970,7 +970,7 @@ int main() {
             return RunCoreHost(instanceLock.get(), false);
         }
 
-        // GUI standalone client launch (doc/design-v3.md §2.3 段階 A, Card 060c):
+        // GUI standalone client launch (doc/obsoleted/design-v3.md §2.3 段階 A, Card 060c):
         // 1. If a dashboard window is already open, bring it to front and exit.
         HWND existingDash = FindDashboardForDataDir();
         if (existingDash) {

@@ -5,7 +5,7 @@ Splittable: no
 
 ## 目的
 
-24 時間で捨てられる生ポイントに代えて、日 × エンジン × モデルの集計を永続させる（`doc/design-v3.md` 3.6.1 U1、`doc/design-v3-todo.md` 2）。
+24 時間で捨てられる生ポイントに代えて、日 × エンジン × モデルの集計を永続させる（`doc/obsoleted/design-v3.md` 3.6.1 U1、`doc/obsoleted/design-v3-todo.md` 2）。
 
 ## やること
 
@@ -22,8 +22,8 @@ Splittable: no
 
 ## 参照
 
-- `doc/design-v3.md` 3.6.1
-- `doc/design-v3-todo.md` 2
+- `doc/obsoleted/design-v3.md` 3.6.1
+- `doc/obsoleted/design-v3-todo.md` 2
 
 ## Authorised edits
 
@@ -38,8 +38,8 @@ Splittable: no
 
 ## Read-only
 
-- `doc/design-v3.md`
-- `doc/design-v3-en.md`
+- `doc/obsoleted/design-v3.md`
+- `doc/obsoleted/design-v3-en.md`
 
 ## 検証
 

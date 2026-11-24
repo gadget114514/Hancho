@@ -103,6 +103,21 @@ struct IpcTestHarness {
     }
 };
 
+bool WaitForJobState(IpcTestHarness& h, const std::string& jobId, const std::string& targetState, int timeoutMs) {
+    auto deadline = std::chrono::steady_clock::now() + std::chrono::milliseconds(timeoutMs);
+    while (std::chrono::steady_clock::now() < deadline) {
+        json rGet = h.Call({{"action", "taskqueue_get"}, {"id", jobId}});
+        if (rGet.value("ok", false)) {
+            json job = rGet.contains("job") ? rGet["job"] : rGet;
+            if (job.value("state", "") == targetState) {
+                return true;
+            }
+        }
+        Sleep(25);
+    }
+    return false;
+}
+
 } // namespace
 
 int main() {
@@ -328,29 +343,33 @@ int main() {
                 json resp = h.Call(req);
                 if (!resp.value("ok", false) || !resp.contains("jobs") || !resp["jobs"].is_array()) return false;
                 for (const auto& job : resp["jobs"]) {
-                    if (job.value("id", "") == "group:ipc-escalate" &&
+                    if (job.value("id", "").rfind("direction:", 0) == 0 &&
+                        job.contains("group") && job["group"].is_object() &&
+                        job["group"].value("id", "") == "ipc-escalate" &&
                         job.value("state", "") == "waitingForLlm" && job.value("virtual", false)) return true;
                 }
                 return false;
             };
             Check(hasWaitingGroup(nullptr),
-                  "taskqueue_list shows the waitingForLlm task group without a state filter");
+                  "taskqueue_list shows the waitingForLlm direction row without a state filter");
             Check(hasWaitingGroup("waitingForLlm"),
-                  "taskqueue_list shows the waitingForLlm task group with state=waitingForLlm");
+                  "taskqueue_list shows the waitingForLlm direction row with state=waitingForLlm");
             Check(hasWaitingGroup("waiting"),
-                  "taskqueue_list shows the waitingForLlm task group with the state=waiting alias");
+                  "taskqueue_list shows the waitingForLlm direction row with the state=waiting alias");
 
             {
                 json resp = h.Call({{"action", "taskqueue_list"}, {"include_planned", true}});
                 bool foundStart = false;
                 if (resp.value("ok", false) && resp.contains("jobs") && resp["jobs"].is_array()) {
                     for (const auto& job : resp["jobs"]) {
-                        if (job.value("id", "") != "group:ipc-escalate") continue;
+                        if (job.value("id", "").rfind("direction:", 0) != 0) continue;
+                        if (!job.contains("group") || !job["group"].is_object() ||
+                            job["group"].value("id", "") != "ipc-escalate") continue;
                         const std::string start = job.value("start_time", "");
                         foundStart = !start.empty() && start != "1970-01-01 00:00:00";
                     }
                 }
-                Check(foundStart, "taskqueue_list group row carries the BT start time");
+                Check(foundStart, "taskqueue_list direction row carries the BT start time");
             }
 
             // Missing rationale must be rejected
@@ -1349,6 +1368,299 @@ int main() {
             Check(!rBtGone.value("ok", true), "taskqueue_remove removed the tree");
             json rJobGone = h.Call({{"action", "taskqueue_get"}, {"id", "ipc-tg-fallback-only-1"}});
             Check(!rJobGone.value("ok", true), "taskqueue_remove removed the tree's jobs");
+
+            // 18b. 103-3: direction:<id> and group:<btId> alias both work on BT and jobs directions.
+            json dirBt = {
+                {"id", "ipc-dir-bt"},
+                {"cwd", tempDirUtf8},
+                {"root", {{"type", "job"}, {"id", "step1"}, {"summary", "DirBT"},
+                          {"command", "cmd /c exit 0"}, {"timeoutSec", 30}}}
+            };
+            json rDirStart = h.Call({{"action", "bt_start"}, {"bt", dirBt}});
+            for (int i = 0; i < 100; ++i) {
+                json g = h.Call({{"action", "bt_get"}, {"id", "ipc-dir-bt"}, {"compact", true}});
+                std::string s = g.value("state", "");
+                if (s == "succeeded" || s == "failed" || s == "cancelled") break;
+                Sleep(50);
+            }
+            const std::string btDirId = rDirStart.value("directionId", "");
+            Check(!btDirId.empty(), "103-3: bt_start returns directionId");
+            if (!btDirId.empty()) {
+                json rGetDir = h.Call({{"action", "taskqueue_get"}, {"id", "direction:" + btDirId}});
+                Check(rGetDir.value("ok", false) && rGetDir.value("direction_id", "") == btDirId,
+                      "103-3: taskqueue_get accepts direction:<id> for BT");
+                json rGetAlias = h.Call({{"action", "taskqueue_get"}, {"id", "group:ipc-dir-bt"}});
+                Check(rGetAlias.value("ok", false) && rGetAlias.value("kind", "") == "taskGroup",
+                      "103-3: taskqueue_get still accepts group:<btId> alias");
+                json rCloseDir = h.Call({{"action", "taskqueue_close"}, {"id", "direction:" + btDirId}});
+                Check(rCloseDir.value("ok", false), "103-3: taskqueue_close accepts direction:<id>");
+                json rRemDir = h.Call({{"action", "taskqueue_remove"}, {"id", "direction:" + btDirId}, {"force", true}});
+                Check(rRemDir.value("ok", false), "103-3: taskqueue_remove accepts direction:<id>");
+            }
+
+            // 18c. 103-3: kind="jobs" direction bulk cancel / retry / remove via direction:<id>.
+            json addJobs = {
+                {"action", "taskqueue_add"},
+                {"taskqueue", "default"},
+                {"jobs", json::array({
+                    {{"id", "ipc-jdir-1"}, {"command", "cmd /c exit 1"}, {"summary", "JDir 1"}, {"timeoutSec", 30}},
+                    {{"id", "ipc-jdir-2"}, {"command", "cmd /c exit 1"}, {"summary", "JDir 2"}, {"timeoutSec", 30}, {"dependsOn", json::array({"ipc-jdir-1"})}}
+                })}
+            };
+            json rAddJ = h.Call(addJobs);
+            const std::string jDirId = rAddJ.value("direction_id", "");
+            Check(!jDirId.empty(), "103-3: taskqueue_add returns direction_id");
+            if (!jDirId.empty()) {
+                json rCancelJ = h.Call({{"action", "taskqueue_cancel"}, {"id", "direction:" + jDirId}});
+                Check(rCancelJ.value("ok", false) && rCancelJ.value("cancelled", 0) >= 1,
+                      "103-3: taskqueue_cancel on direction:<id> cancels jobs in direction");
+                json rRetryJ = h.Call({{"action", "taskqueue_retry"}, {"id", "direction:" + jDirId}});
+                Check(rRetryJ.value("ok", false) && rRetryJ.value("retried", 0) >= 1,
+                      "103-3: taskqueue_retry on direction:<id> retries jobs in direction");
+                json rRemJ = h.Call({{"action", "taskqueue_remove"}, {"id", "direction:" + jDirId}, {"force", true}});
+                Check(rRemJ.value("ok", false) && rRemJ.value("removed", 0) == 2,
+                      "103-3: taskqueue_remove on direction:<id> removes jobs in direction");
+            }
+        }
+
+        // 19. 100-2c: task_* IPC actions, taskqueue_add --task, bt_start --task, and task_wait.
+        {
+            json rCreate = h.Call({{"action", "task_create"},
+                                   {"title", "IPC Task"},
+                                   {"intent", "Verify 100-2c IPC endpoints"},
+                                   {"origin", {{"session", "sess-ipc-1"}, {"client", "test"}}}});
+            Check(rCreate.value("ok", false), "task_create ok: " + rCreate.dump());
+            const std::string taskId = rCreate.value("id", "");
+            Check(taskId.rfind("task_", 0) == 0, "task_create returns task_ id");
+
+            json rList = h.Call({{"action", "task_list"}, {"state", "open"}});
+            Check(rList.value("ok", false), "task_list ok");
+            bool listed = false;
+            for (const auto& t : rList.value("tasks", json::array())) {
+                if (t.value("id", "") == taskId) listed = true;
+            }
+            Check(listed, "task_list includes newly created task");
+
+            json rNote = h.Call({{"action", "task_note"},
+                                 {"id", taskId},
+                                 {"text", "ipc note"},
+                                 {"origin", {{"session", "sess-ipc-2"}}}});
+            Check(rNote.value("ok", false), "task_note ok");
+
+            json rAdd = h.Call({{"action", "taskqueue_add"},
+                                {"taskqueue", "ipc-task-q"},
+                                {"task", taskId},
+                                {"jobs", json::array({{{"id", "ipc-tq-job-1"},
+                                                       {"command", "cmd /c exit 0"},
+                                                       {"summary", "Task job"},
+                                                       {"timeoutSec", 30}}})}});
+            Check(rAdd.value("ok", false), "taskqueue_add with task ok: " + rAdd.dump());
+
+            json rBtBad = h.Call({{"action", "bt_start"},
+                                  {"task", "task_does_not_exist"},
+                                  {"bt", {{"id", "ipc-task-bt-bad"},
+                                          {"cwd", tempDirUtf8},
+                                          {"root", {{"type", "job"}, {"id", "x"}, {"summary", "x"},
+                                                    {"command", "cmd /c exit 0"}, {"timeoutSec", 30}}}}}});
+            Check(!rBtBad.value("ok", true), "bt_start rejects unknown task");
+
+            json rBt = h.Call({{"action", "bt_start"},
+                               {"task", taskId},
+                               {"bt", {{"id", "ipc-task-bt"},
+                                       {"cwd", tempDirUtf8},
+                                       {"root", {{"type", "job"}, {"id", "leaf"}, {"summary", "BT task job"},
+                                                 {"command", "cmd /c exit 0"}, {"timeoutSec", 30}}}}}});
+            Check(rBt.value("ok", false), "bt_start with task ok: " + rBt.dump());
+
+            json rWait = h.Call({{"action", "task_wait"}, {"id", taskId}, {"timeout_ms", 10000}});
+            Check(rWait.value("ok", false) && !rWait.value("timedOut", true),
+                  "task_wait finishes and returns task_show shape: " + rWait.dump());
+            Check(rWait.contains("task") && rWait.contains("status") &&
+                      rWait.contains("jobs") && rWait.contains("log"),
+                  "task_wait returns task/status/jobs/log");
+            Check(rWait["jobs"].size() >= 2, "task_wait sees both taskqueue_add and bt_start jobs");
+
+            json rShow = h.Call({{"action", "task_show"}, {"id", taskId}, {"logLimit", 50}});
+            Check(rShow.value("ok", false), "task_show ok");
+            bool hasNote = false;
+            for (const auto& entry : rShow.value("log", json::array())) {
+                if (entry.value("kind", "") == "note" && entry.value("text", "") == "ipc note" &&
+                    entry.value("session", "") == "sess-ipc-2") {
+                    hasNote = true;
+                }
+            }
+            Check(hasNote, "task_show log includes note with session from origin");
+
+            json rTqListByTask = h.Call({{"action", "taskqueue_list"}, {"task", taskId}});
+            Check(rTqListByTask.value("ok", false) && rTqListByTask.contains("jobs") &&
+                      rTqListByTask["jobs"].size() >= 2,
+                  "100-4: taskqueue_list --task returns jobs for task");
+            bool taskFieldOk = true;
+            for (const auto& j : rTqListByTask.value("jobs", json::array())) {
+                if (!j.contains("task") || j["task"].value("id", "") != taskId ||
+                    j["task"].value("title", "") != "IPC Task" ||
+                    j["task"].value("state", "").empty()) {
+                    taskFieldOk = false;
+                }
+            }
+            Check(taskFieldOk, "100-4: IPC taskqueue_list jobs carry task{id,title,state}");
+
+            // 100-7: taskqueue_supersede over IPC (before task_close).
+            json rAddFail = h.Call({{"action", "taskqueue_add"},
+                                    {"taskqueue", "ipc-task-q"},
+                                    {"task", taskId},
+                                    {"jobs", json::array({{{"id", "ipc-sup-orig"},
+                                                           {"command", "cmd /c exit 1"},
+                                                           {"summary", "Failing job for supersede"},
+                                                           {"timeoutSec", 30},
+                                                           {"maxAttempts", 1}}})}});
+            Check(rAddFail.value("ok", false), "100-7: taskqueue_add failing job ok");
+            Check(WaitForJobState(h, "ipc-sup-orig", "failed", 10000), "100-7: ipc-sup-orig reaches failed");
+
+            json rSup = h.Call({{"action", "taskqueue_supersede"},
+                                {"id", "ipc-sup-orig"},
+                                {"reason", "fix exit code"},
+                                {"patch", {{"command", "cmd /c exit 0"}}}});
+            Check(rSup.value("ok", false) && rSup.value("id", "") == "ipc-sup-orig-s1" &&
+                      rSup.value("task_id", "") == taskId &&
+                      rSup.value("supersedes", "") == "ipc-sup-orig",
+                  "100-7: IPC taskqueue_supersede clones and links job on same task: " + rSup.dump());
+            Check(WaitForJobState(h, "ipc-sup-orig-s1", "succeeded", 10000),
+                  "100-7: ipc-sup-orig-s1 succeeds");
+
+            json rClose = h.Call({{"action", "task_close"},
+                                  {"id", taskId},
+                                  {"result", "succeeded"},
+                                  {"reason", "done"}});
+            Check(rClose.value("ok", false) && rClose.value("state", "") == "closed",
+                  "task_close ok");
+
+            json rBtClosed = h.Call({{"action", "bt_start"},
+                                     {"task", taskId},
+                                     {"bt", {{"id", "ipc-task-bt-closed"},
+                                             {"cwd", tempDirUtf8},
+                                             {"root", {{"type", "job"}, {"id", "y"}, {"summary", "y"},
+                                                       {"command", "cmd /c exit 0"}, {"timeoutSec", 30}}}}}});
+            Check(!rBtClosed.value("ok", true), "bt_start rejects closed task");
+
+            json rReopen = h.Call({{"action", "task_reopen"}, {"id", taskId}, {"reason", "more work"}});
+            Check(rReopen.value("ok", false), "task_reopen ok");
+
+            json rPurgeBad = h.Call({{"action", "task_purge"}, {"older_than_sec", -1}});
+            Check(!rPurgeBad.value("ok", true), "task_purge rejects negative older_than_sec");
+
+            json rPurge = h.Call({{"action", "task_purge"}, {"older_than_sec", 0}});
+            Check(rPurge.value("ok", false) && rPurge.contains("purged"), "task_purge ok");
+        }
+
+        // 17. 100-3: automatic task log entries for bt_resume (escalate_answered) and triage_decide (triage_decided).
+        {
+            auto countKind = [](const json& shown, const std::string& kind) {
+                int n = 0;
+                for (const auto& entry : shown.value("log", json::array())) {
+                    if (entry.value("kind", "") == kind) ++n;
+                }
+                return n;
+            };
+
+            json rTask = h.Call({{"action", "task_create"}, {"title", "100-3 auto log"}});
+            Check(rTask.value("ok", false), "100-3: task_create ok");
+            const std::string taskId = rTask.value("id", "");
+
+            json rBtEsc = h.Call({
+                {"action", "bt_start"},
+                {"task", taskId},
+                {"bt", {
+                    {"id", "ipc-task-esc-1003"},
+                    {"cwd", tempDirUtf8},
+                    {"root", {
+                        {"type", "escalate"},
+                        {"id", "gate"},
+                        {"summary", "Need decision"},
+                        {"question", "Ship it?"},
+                        {"options", {"ship", "abort"}},
+                        {"onAnswer", {{"ship", {{"type", "succeed"}, {"id", "ok"}}},
+                                      {"abort", {{"type", "fail"}, {"id", "no"}}}}}
+                    }}
+                }}
+            });
+            Check(rBtEsc.value("ok", false), "100-3: bt_start escalate with task ok");
+
+            json rWaitEsc = h.Call({{"action", "bt_wait"}, {"id", "ipc-task-esc-1003"}, {"timeout_ms", 5000}});
+            Check(rWaitEsc.value("state", "") == "waitingForLlm", "100-3: BT reached waitingForLlm");
+
+            json rBeforeRes = h.Call({{"action", "task_show"}, {"id", taskId}, {"logLimit", 50}});
+            Check(countKind(rBeforeRes, "escalate_answered") == 0, "100-3: no escalate_answered before bt_resume");
+
+            json rRes = h.Call({
+                {"action", "bt_resume"},
+                {"id", "ipc-task-esc-1003"},
+                {"node", "gate"},
+                {"answer", "ship"},
+                {"rationale", "tests green"}
+            });
+            Check(rRes.value("ok", false), "100-3: bt_resume ok");
+
+            json rAfterRes = h.Call({{"action", "task_show"}, {"id", taskId}, {"logLimit", 50}});
+            bool hasEscLog = false;
+            for (const auto& entry : rAfterRes.value("log", json::array())) {
+                if (entry.value("kind", "") == "escalate_answered" &&
+                    entry.value("bt", "") == "ipc-task-esc-1003" &&
+                    entry.value("text", "").find("ship") != std::string::npos &&
+                    entry.value("text", "").find("tests green") != std::string::npos) {
+                    hasEscLog = true;
+                }
+            }
+            Check(countKind(rAfterRes, "escalate_answered") == 1 && hasEscLog,
+                  "100-3: bt_resume logs 1 escalate_answered entry with answer and rationale");
+
+            // Failing job -> triage_list -> triage_decide -> triage_decided in task log.
+            json rFailJob = h.Call({
+                {"action", "taskqueue_add"},
+                {"taskqueue", "ipc-triage-1003"},
+                {"task", taskId},
+                {"jobs", json::array({{{"id", "ipc-fail-1003"},
+                                       {"command", "cmd /c exit 1"},
+                                       {"summary", "Fail for triage"},
+                                       {"timeoutSec", 30},
+                                       {"maxAttempts", 1}}})}
+            });
+            Check(rFailJob.value("ok", false), "100-3: failing job added to task");
+
+            json rWaitTask = h.Call({{"action", "task_wait"}, {"id", taskId}, {"timeout_ms", 10000}});
+            Check(rWaitTask.value("ok", false) && !rWaitTask.value("timedOut", true), "100-3: failing job finished");
+
+            json rTriageList = h.Call({{"action", "triage_list"}, {"state", "pending"}});
+            std::string cardId;
+            for (const auto& card : rTriageList.value("cards", json::array())) {
+                if (card.value("target", json::object()).value("jobId", "") == "ipc-fail-1003") {
+                    cardId = card.value("id", "");
+                    break;
+                }
+            }
+            Check(!cardId.empty(), "100-3: triage_list found card for failing job");
+            if (!cardId.empty()) {
+                json rDecide = h.Call({
+                    {"action", "triage_decide"},
+                    {"id", cardId},
+                    {"candidateId", "ignore"},
+                    {"reason", "expected failure"},
+                    {"by", "human"}
+                });
+                Check(rDecide.value("ok", false), "100-3: triage_decide ok: " + rDecide.dump());
+                json rAfterDecide = h.Call({{"action", "task_show"}, {"id", taskId}, {"logLimit", 50}});
+                bool hasTriageLog = false;
+                for (const auto& entry : rAfterDecide.value("log", json::array())) {
+                    if (entry.value("kind", "") == "triage_decided" &&
+                        entry.value("job", "") == "ipc-fail-1003" &&
+                        entry.value("text", "").find("ignore") != std::string::npos &&
+                        entry.value("text", "").find("expected failure") != std::string::npos) {
+                        hasTriageLog = true;
+                    }
+                }
+                Check(countKind(rAfterDecide, "triage_decided") == 1 && hasTriageLog,
+                      "100-3: triage_decide logs 1 triage_decided entry with candidate and reason");
+            }
         }
     }
 

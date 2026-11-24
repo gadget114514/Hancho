@@ -2,7 +2,7 @@
 
 #ifdef _WIN32
 
-// Windows implementations of the platform boundary (doc/design-v3.md 2.4).
+// Windows implementations of the platform boundary (doc/obsoleted/design-v3.md 2.4).
 // Everything that touches Win32 for the headless core lives here: shell
 // quoting, the per-data-directory instance lock, Job Object process trees,
 // Named Pipe IPC and ConPTY.

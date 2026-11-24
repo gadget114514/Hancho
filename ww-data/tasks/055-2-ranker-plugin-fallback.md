@@ -10,7 +10,7 @@ Parent: 055-ranker-plugin.md
 
 ## 目的
 
-プラグインが壊れても検索が止まらないようにし、差し替え動作を検証できる形にする（`doc/design-v3.md` 3.8）。
+プラグインが壊れても検索が止まらないようにし、差し替え動作を検証できる形にする（`doc/obsoleted/design-v3.md` 3.8）。
 
 ## やること
 
@@ -24,7 +24,7 @@ Parent: 055-ranker-plugin.md
 
 ## 参照
 
-- `doc/design-v3.md` 3.8
+- `doc/obsoleted/design-v3.md` 3.8
 - 親カード `ww-data/tasks/055-ranker-plugin.md`
 
 ## Authorised edits
@@ -37,8 +37,8 @@ Parent: 055-ranker-plugin.md
 
 ## Read-only
 
-- `doc/design-v3.md`
-- `doc/design-v3-en.md`
+- `doc/obsoleted/design-v3.md`
+- `doc/obsoleted/design-v3-en.md`
 
 ## 検証
 

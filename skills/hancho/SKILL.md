@@ -151,6 +151,7 @@ hancho-cli.exe power status
 - **supervisor の文脈を小さく保つ。** 詳細な指示は worker に渡し、成果物とログの末尾だけ読む。
 - **1文字修正にコーディングエージェントを起動しない。** `quickfix --file <path> --find <text> --replace <text>` を使う。決定的で数秒〜数十秒で終わる。
 - **supervisor 自身にコードを書かせない。** 監督はパッチ/置換/ジョブを出す。適用は `quickfix` か worker ジョブにやらせる。
+- **作業はタスクでまとめる。** 作業を始める前に `task create` でタスクを作り、ジョブや BT は `--task <id>` で付ける。判断と理由は `task note <id> --text "..."` に書き、内容を変えたやり直しは `taskqueue supersede <jobId> --reason "..."`、終わったら `task close <id> --result succeeded|failed --reason "..."` で閉じる。
 - **モデル / provider を勝手に変えない。** `taskqueue update` で `--model` を変えるには `--approve-model-change --reason "..."` が必要。監督は変更せず、カードを判断待ちに残す。
 - **data-dir を1つに固定する。** 例: `<project>/.hancho`。毎回 `--data-dir` を付けるか、`hancho-cli.exe mcp install --data-dir .hancho` で埋め込む。
 
@@ -215,10 +216,27 @@ hancho-cli.exe quickfix --file src/Foo.cs --find "old" --replace "new" --all --c
 
 `--find` が見つからない、または `--check`（正規表現）に一致しないとジョブは失敗します。`--check-literal` でリテラル一致。ローカル PowerShell で実行し、LLM は使いません。大きな変更だけ worker ジョブにしてください。
 
+### タスク（作業単位・経過ログ）
+
+```powershell
+hancho-cli.exe task create --title "Fix auth bug" --intent "..." --json
+hancho-cli.exe taskqueue add --file jobs.json --taskqueue main --task <taskId>
+hancho-cli.exe bt start --file plan.json --task <taskId>
+hancho-cli.exe task note <taskId> --text "判断と理由をここに残す"
+hancho-cli.exe task show <taskId> --json
+hancho-cli.exe task wait <taskId> --timeout-ms 300000
+hancho-cli.exe task close <taskId> --result succeeded --reason "..."
+```
+
+- 作業を始める前に `task create` でタスクを作り、以降の `taskqueue add` / `bt start` には `--task <taskId>` を付ける（MCP は `task_create` / `task_note` / `task_close`、`taskqueue_add` / `bt_start` の `task`）。
+- 方針の切り替えや調査結果など、判断と理由は `task note` に書く（セッションが消えてもタスクの経過ログに残る）。
+- 失敗ジョブを**同じ内容**で再実行するときは `taskqueue retry <id>`、**内容を変えて**やり直すときは `taskqueue supersede <id> --reason "..."`（MCP `taskqueue_supersede`）を使う。
+- 作業が終わったら `task close` で結果（`succeeded` / `failed`）と理由を記録する。
+
 ### タスクキュー（順番・依存）
 
 ```powershell
-hancho-cli.exe taskqueue add --file jobs.json --taskqueue main
+hancho-cli.exe taskqueue add --file jobs.json --taskqueue main --task <taskId>
 hancho-cli.exe taskqueue list main --json
 hancho-cli.exe taskqueue graph main
 hancho-cli.exe taskqueue wait main --since 0 --timeout-ms 300000
@@ -226,6 +244,7 @@ hancho-cli.exe taskqueue get build --json
 hancho-cli.exe taskqueue why build
 hancho-cli.exe taskqueue retry build
 hancho-cli.exe taskqueue retry --failed --since 6h
+hancho-cli.exe taskqueue supersede build --reason "timeout was too short" --timeout-sec 3600
 
 # 実行を止める: pause は再開できる。停止（取り消し）は cancel。
 hancho-cli.exe taskqueue pause-job build
@@ -286,19 +305,21 @@ test → 失敗なら修正 → 再ビルド → 再テスト、の例:
 }
 ```
 
-ノード: `job` / `worker` / `probe` / `wait` / `set` / `escalate` / `fail` / `succeed`。複合: `sequence` / `fallback` / `parallel` / `if` / **`catch`** / **`foreach`**（glob のファイルごとに `do` を展開、`exclude` 対応）。装飾: `retry` / `repeat` / `invert` / `forceSuccess` / `forceFailure` / `timeout`。条件: `fileExists` / `fileNewer` / `outputMatches` / `exitCode` / **`failure`** / `jsonValue` / `var` / `nodeState`。変数: `${name}`、`${<node>.state|exitCode|logFile|jobId|runs}`、`${<worker>.result}`、`${<escalate>.answer}`、失敗診断の `${<node>.failureClass|failureSummary|likelyCauses|suggestedAction|retryAt|engine|model}`。詳細は `doc/behavior-tree.md` / `doc/behavior-tree-ja.md`。
+ノード: `job` / `worker` / `probe` / `wait` / `set` / `escalate` / `fail` / `succeed`。複合: `sequence` / `fallback` / `parallel` / `if` / **`catch`** / **`foreach`**（glob のファイルごとに `do` を展開、`exclude` 対応）。装飾: `retry` / `repeat` / `invert` / `forceSuccess` / `forceFailure` / `timeout`。条件: `fileExists` / `fileNewer` / `outputMatches` / `exitCode` / **`failure`** / `jsonValue` / `var` / `nodeState`。変数: `${name}`、`${<node>.state|exitCode|logFile|jobId|runs}`、`${<worker>.result}`、`${<escalate>.answer}`、失敗診断の `${<node>.failureClass|failureSummary|likelyCauses|suggestedAction|retryAt|engine|model}`。詳細は `doc/obsoleted/behavior-tree.md` / `doc/obsoleted/behavior-tree-ja.md`。
 
 #### BT を書くときはハング対策を最初から入れる
 
 ハングしてから気付くのではなく、BT を書く時点で監視・退避・エスカレーションを組み込む。手順:
 
 1. **`bt template resilient-worker` から始める**（ww カード列なら `card-sequence`）。 `<...>` プレースホルダを実値に置き換える。テンプレートには `defaults.worker.idle` / `probe: true` / `engines` + `switchEngineOn` / `catch` / `escalate` が最初から入っている。`hancho-cli.exe bt template resilient-worker --json` で実物を取得できる。
-2. **`bt validate --strict` で警告ゼロにする。** `bt validate` の `warnings[]` はそのままでは検証成功なので、`--strict`（MCP `bt_validate` の `strict: true`）でエラーに昇格させてから直す。`no_hang_watch` / `opencode_without_model` / `unguarded_worker` / `engines_without_switch` / `switch_without_engines` / `engine_not_permitted` / `unswitchable_command` / `escalate_without_takeover` / `permit_not_approved` が主な警告。
+2. **`bt validate --strict` で警告ゼロにする。** `bt validate` の `warnings[]` はそのままでは検証成功なので、`--strict`（MCP `bt_validate` の `strict: true`）でエラーに昇格させてから直す。`no_hang_watch` / `opencode_without_model` / `unguarded_worker` / `engines_without_switch` / `switch_without_engines` / `engine_not_permitted` / `unswitchable_command` / `escalate_without_takeover` / `permit_not_approved` / `fix_class_without_blame` / `blame_before_worker` が主な警告。
+   - **修正失敗の切り替えも最初から組む**: `switchEngineOn` に `{"class":"fix_no_progress","after":1}`・`{"class":"fix_failed","after":2}`・`{"class":"root_cause_not_found","after":1}` を入れ、テスト `job` に `"blame": "<worker id>"` を付ける（`fix_*` があるのに `blame` がないと `fix_class_without_blame` 警告になる）。
+   - worker には `switchLimits`（既定 `maxCandidates: 3`, `stopOnSameSymptom: true`）で切り替え上限を設け、プロンプトには原因不明時の `HANCHO-RESULT: root_cause_not_found` と `PC_BT_RESULT_FILE` への `handoff` 出力を指示しておく。
 3. **候補は承認済みのリストから選ぶ。** worker の候補は `llm list --list worker`、escalate の代理回答 (`fallback`) は `llm list --list consult` にあるものだけを使う。足りなければ `llm add --list <l> --engine <e> --model <m> --reason "..."` で提案し、ユーザーに承認をもらってから使う（ダッシュボードの LLM ページで承認してもらうか、チャットで確認して `llm approve --list <l> --engine <e> --model <m> --user-said "<ユーザーの言葉>"` で記録する）。MCP は `llm_list` / `llm_add` / `llm_remove` / `llm_set_enabled` / `llm_approve`。
 4. **必要なら事前確認する。** `worker probe`（1 行、`hancho-cli.exe worker probe --engine <e> --model <m> --json`。MCP `worker_probe`）で「1 行返すだけ」の最小プロンプトを走らせ、共有の故障状態は `worker health`（MCP `worker_health`）で見る。本番起動前に壊れたエンジンを除外できる。
 5. そのうえで `bt start` → `bt wait --id <btid> --timeout-ms 600000` → `bt get --id <btid> --compact` で監視する。
 
-worker ノードの `engines` / `switchEngineOn`、`probe` 葉、`{engine}` / `{model}` プレースホルダ、`needs` による権限宣言の詳細は `doc/behavior-tree.md` の 5.3 / 5.4 と 11 章を参照。
+worker ノードの `engines` / `switchEngineOn`、`probe` 葉、`{engine}` / `{model}` プレースホルダ、`needs` による権限宣言の詳細は `doc/obsoleted/behavior-tree.md` の 5.3 / 5.4 と 11 章を参照。
 
 ### ルーチン（名前付き BT）
 
@@ -320,7 +341,7 @@ hancho-cli.exe routine save --name from-past --from-bt <btId>
 
 定義は `<cwd>/.hancho/routines/<name>.json`（project）または `<data-dir>/routines/<name>.json`（data）。実行ごとに `<name>-<yyyymmdd-hhmmss>` の ID が付き、ジョブ ID は衝突しない。MCP は `routine_list` / `routine_show` / `routine_run` / `routine_save` / `routine_check` / `routine_ask` / `routine_approve` / `routine_reject`。入力ファイルの変更で `stale` になっても実行は止まらないが、失敗した場合は triage の `routine_stale_failure` カード（`update_routine` 推奨）が出る。`update_routine` を選ぶと `routine ask`（直す）が起動し、結果は承認待ちの提案になる。
 
-`routine ask` の依頼は `routine-ask` キューの worker ジョブとして登録され、`worker` LLM リスト（rank 順、故障中はスキップ、空なら既定エンジン＋警告）で実行される。 worker の出力は厳格 BT 検証・`foreach` ドライラン・ChainGuard で検査され、不合格なら 1 回だけ直させる。合格した定義は `<dir>/.proposals/<name>.json` に `status: proposed` で保存され、更新提案の間も承認済みの旧版で `run` できる。人手の `routine save`（CLI／ダッシュボード）は承認済み、MCP の `routine_save` は提案になる。詳細は `doc/routines.md` / `doc/routines-ja.md`。
+`routine ask` の依頼は `routine-ask` キューの worker ジョブとして登録され、`worker` LLM リスト（rank 順、故障中はスキップ、空なら既定エンジン＋警告）で実行される。 worker の出力は厳格 BT 検証・`foreach` ドライラン・ChainGuard で検査され、不合格なら 1 回だけ直させる。合格した定義は `<dir>/.proposals/<name>.json` に `status: proposed` で保存され、更新提案の間も承認済みの旧版で `run` できる。人手の `routine save`（CLI／ダッシュボード）は承認済み、MCP の `routine_save` は提案になる。詳細は `doc/obsoleted/routines.md` / `doc/obsoleted/routines-ja.md`。
 
 ### `escalate`（supervisor が呼ばれる唯一の場所）
 
@@ -409,6 +430,14 @@ hancho-cli.exe export knowledge --format markdown
 hancho-cli.exe mcp install --client opencode   # claude なら --client claude
 hancho-cli.exe mcp install --data-dir .hancho --dry-run --json
 ```
+
+data-dir は `--data-dir` → 環境変数 `HANCHO_LOG_DIR` → `<exe のフォルダ>\logs` の順に決まる。カレントの `.hancho` は自動では使わない。MCP を全プロジェクト向け（Claude Code の user スコープ）に `--data-dir` なしで登録すると、全プロジェクトが `<インストール先>\logs` を共有する。
+
+- プロジェクトごとに分けるには、同じ名前 `hancho` をそのプロジェクトに登録する。Claude Code は local > project > user の順で狭いスコープを優先する。
+  - project スコープ: `hancho-cli.exe mcp install --client claude --data-dir .hancho`（カレントの `.mcp.json` に書く）
+  - local スコープ: `claude mcp add hancho --scope local -- <Hancho.exe> mcp --data-dir <絶対パス>`
+- git に入る `.mcp.json` では相対パスの `.hancho` のままにする（どこに clone しても使える）。相対パスはサーバーの起動フォルダ（ふつうはプロジェクトのルート）から解決されるので、エージェントはルートで起動する。絶対パスは git に入らない local スコープでだけ使う。`.hancho/` は git に入れない（`routines/` だけ残すなら `.hancho/*` と `!.hancho/routines/`）。登録を変えたらセッションを開き直す。
+- data-dir が違えば別の Hancho（キュー、BT、履歴、ダッシュボードが別）。実行中の BT やジョブがある間は切り替えない。今どこを使っているかはダッシュボードのタイトル（`Hancho - <data-dir>`）でわかる。
 
 主なツール: `start_process`、`list_processes`、`get_process_output`、`wait_process`、`send_process_input`、`kill_process`、`taskqueue_*`、`bt_*`、`run_worker` / `wait_worker`、`triage_list/get/decide`、`power_suspend/shutdown/cancel/status`、`memory_*`、`usage_*`、`chat_*`。
 

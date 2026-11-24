@@ -5,7 +5,7 @@ Splittable: no
 
 ## 目的
 
-失敗の理由に応じて再試行の仕方を変える（`doc/design-v3.md` 4.5）。
+失敗の理由に応じて再試行の仕方を変える（`doc/obsoleted/design-v3.md` 4.5）。
 
 ## やること
 
@@ -20,8 +20,8 @@ Splittable: no
 
 ## 参照
 
-- `doc/design-v3.md` 4.5
-- `doc/design-v3-en.md` Section 4
+- `doc/obsoleted/design-v3.md` 4.5
+- `doc/obsoleted/design-v3-en.md` Section 4
 
 ## Authorised edits
 
@@ -31,8 +31,8 @@ Splittable: no
 
 ## Read-only
 
-- `doc/design-v3.md`
-- `doc/design-v3-en.md`
+- `doc/obsoleted/design-v3.md`
+- `doc/obsoleted/design-v3-en.md`
 
 ## 検証
 

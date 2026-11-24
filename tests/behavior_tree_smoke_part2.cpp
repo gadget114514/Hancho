@@ -266,6 +266,31 @@ void RunPart2Tests(const std::string& tempDirUtf8, const std::wstring& tempDirW)
               "validation catches depth > 32: " + err);
     }
 
+    // 100-2b: the BT's taskId is read from its definition, saved, and still there after a reload.
+    {
+        std::string taskBt = R"({
+            "id": "feature-task",
+            "taskId": "task_bt1",
+            "root": { "type": "job", "id": "only", "summary": "Only job", "command": "cmd /c exit 0", "timeoutSec": 60 }
+        })";
+        BehaviorTree bt;
+        std::string err;
+        Check(bt.LoadDefinition(taskBt, &catalog, err), "100-2b: load BT with taskId: " + err);
+        Check(bt.TaskId() == "task_bt1", "100-2b: taskId is read from the definition");
+        std::string saved = bt.ToStateJson();
+        // ToStateJson pretty-prints (dump(2)), so accept either "key":"v" or "key": "v".
+        Check(saved.find("\"taskId\":\"task_bt1\"") != std::string::npos ||
+              saved.find("\"taskId\": \"task_bt1\"") != std::string::npos,
+              "100-2b: taskId is saved in the state JSON");
+        BehaviorTree restored;
+        Check(restored.LoadFromStateJson(saved, &catalog, err) && restored.TaskId() == "task_bt1",
+              "100-2b: taskId survives a reload from the state JSON: " + err);
+        BehaviorTree plain;
+        Check(plain.LoadDefinition(R"({"id":"feature-plain","root":{"type":"job","id":"p","summary":"p","command":"true","timeoutSec":60}})",
+                                   &catalog, err) && plain.TaskId().empty(),
+              "100-2b: a BT without taskId has an empty TaskId");
+    }
+
     // 9. Retry from failed node + Save (ToStateJson) -> Load (LoadFromStateJson) -> Continue + ParseBtDebugTree
     {
         std::string persistBt = R"({

@@ -5,7 +5,7 @@ Splittable: no
 
 ## 目的
 
-手元のダッシュボードを再起動しても、リモート実行中のジョブを追い続ける（`doc/design-v3.md` 2.5、`doc/design-v3-todo.md` 6）。
+手元のダッシュボードを再起動しても、リモート実行中のジョブを追い続ける（`doc/obsoleted/design-v3.md` 2.5、`doc/obsoleted/design-v3-todo.md` 6）。
 
 ## やること
 
@@ -20,9 +20,9 @@ Splittable: no
 
 ## 参照
 
-- `doc/design-v3.md` 2.5
-- `doc/design-v3-todo.md` 6
-- `doc/remote-hosts.md`
+- `doc/obsoleted/design-v3.md` 2.5
+- `doc/obsoleted/design-v3-todo.md` 6
+- `doc/obsoleted/remote-hosts.md`
 
 ## Authorised edits
 
@@ -36,8 +36,8 @@ Splittable: no
 
 ## Read-only
 
-- `doc/design-v3.md`
-- `doc/design-v3-en.md`
+- `doc/obsoleted/design-v3.md`
+- `doc/obsoleted/design-v3-en.md`
 
 ## 検証
 

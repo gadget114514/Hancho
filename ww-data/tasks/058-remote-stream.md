@@ -5,7 +5,7 @@ Splittable: no
 
 ## 目的
 
-リモートのログとイベントを、要求ごとに取り寄せるのではなく常時流し続ける（`doc/design-v3.md` 2.5、`doc/design-v3-todo.md` 6）。
+リモートのログとイベントを、要求ごとに取り寄せるのではなく常時流し続ける（`doc/obsoleted/design-v3.md` 2.5、`doc/obsoleted/design-v3-todo.md` 6）。
 
 ## やること
 
@@ -21,9 +21,9 @@ Splittable: no
 
 ## 参照
 
-- `doc/design-v3.md` 2.5
-- `doc/design-v3-todo.md` 6
-- `doc/remote-hosts.md`
+- `doc/obsoleted/design-v3.md` 2.5
+- `doc/obsoleted/design-v3-todo.md` 6
+- `doc/obsoleted/remote-hosts.md`
 
 ## Authorised edits
 
@@ -35,8 +35,8 @@ Splittable: no
 
 ## Read-only
 
-- `doc/design-v3.md`
-- `doc/design-v3-en.md`
+- `doc/obsoleted/design-v3.md`
+- `doc/obsoleted/design-v3-en.md`
 
 ## 検証
 

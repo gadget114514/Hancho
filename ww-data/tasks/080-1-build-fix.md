@@ -33,7 +33,7 @@ Parent: 080-integration-fix.md
 
 ## 参照
 
-- `doc/design-v3.md` 2.3, 3.7, 4.2
+- `doc/obsoleted/design-v3.md` 2.3, 3.7, 4.2
 - `ww-data/tasks/054-memory-prune.md`
 - `ww-data/tasks/060-gui-ipc-client.md`
 - `ww-data/tasks/061-linux-gui.md`

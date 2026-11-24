@@ -1,6 +1,6 @@
 #pragma once
 
-// Platform boundary for the headless core (doc/design-v3.md 2.4).
+// Platform boundary for the headless core (doc/obsoleted/design-v3.md 2.4).
 //
 // The core (task queue, behaviour tree, stream parsing) calls only this header.
 // Windows implementations live next to the existing Win32 code; POSIX

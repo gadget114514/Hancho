@@ -1,6 +1,6 @@
 #pragma once
 
-// Remote host registry (doc/design-v3.md 2.5, step C).
+// Remote host registry (doc/obsoleted/design-v3.md 2.5, step C).
 //
 // Hosts live in <data-dir>/hosts.json:
 //

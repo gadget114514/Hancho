@@ -286,6 +286,22 @@ std::string BtManager::LookupQueueNameForBtLocked(const std::string& btId) const
     return "bt-" + btId;
 }
 
+std::string BtManager::LookupTaskIdForBtLocked(const std::string& btId) const {
+    auto it = trees_.find(btId);
+    if (it != trees_.end() && it->second && it->second->tree) {
+        return it->second->tree->TaskId();
+    }
+    return "";
+}
+
+std::string BtManager::LookupDirectionIdForBtLocked(const std::string& btId) const {
+    auto it = trees_.find(btId);
+    if (it != trees_.end() && it->second && it->second->tree) {
+        return it->second->tree->DirectionId();
+    }
+    return "";
+}
+
 std::string BtManager::UniqueJobId(const std::string& proposedId) const {
     TaskQueueJob existing;
     if (!tqm_.GetJobSnapshot(proposedId, existing)) return proposedId;
@@ -314,6 +330,10 @@ std::string BtManager::StartJob(const BtJobSpec& spec) {
         spec.resources,
         spec.success,
         spec.idle);
+    const std::string taskId = LookupTaskIdForBtLocked(spec.btId);
+    if (!taskId.empty()) jobJson["task_id"] = taskId;
+    const std::string directionId = LookupDirectionIdForBtLocked(spec.btId);
+    if (!directionId.empty()) jobJson["direction_id"] = directionId;
 
     TaskQueueBtRef ref;
     ref.id = spec.btId;
@@ -384,6 +404,10 @@ std::string BtManager::StartWorker(const BtWorkerSpec& spec) {
         spec.resources,
         spec.success,
         spec.idle);
+    const std::string taskId = LookupTaskIdForBtLocked(spec.btId);
+    if (!taskId.empty()) jobJson["task_id"] = taskId;
+    const std::string directionId = LookupDirectionIdForBtLocked(spec.btId);
+    if (!directionId.empty()) jobJson["direction_id"] = directionId;
 
     TaskQueueBtRef ref;
     ref.id = spec.btId;
@@ -412,6 +436,8 @@ BtRemainingInfo BtManager::GetRemainingInfo() const {
         if (!active && state != "failed") continue;
         TaskGroupInfo group;
         group.id = entry->tree->Id();
+        group.directionId = entry->tree->DirectionId();
+        group.taskId = entry->tree->TaskId();
         group.state = state;
         group.summary = entry->tree->Summary();
         group.detail = entry->tree->Detail();
@@ -458,6 +484,35 @@ void BtManager::PersistEntryLocked(TreeEntry& entry) {
                 ej["value"] = ev.varValue;
             }
             ej["timestamp"] = FormatEpochMsIso(ev.timestampMs);
+
+            // Task log (100-2b): a BT that belongs to a task records its start and end there.
+            // TaskLog does nothing when the task has no record.
+            if (!entry.tree->TaskId().empty() &&
+                (ev.type == "btStarted" || ev.type == "btSucceeded" ||
+                 ev.type == "btFailed" || ev.type == "btCancelled")) {
+                tqm_.TaskLog(entry.tree->TaskId(), ev.type == "btStarted" ? "bt_started" : "bt_finished",
+                             "", entry.tree->Id(), ev.state, "");
+            }
+            if (!entry.tree->TaskId().empty() && ev.type == "engineSwitched") {
+                tqm_.TaskLog(entry.tree->TaskId(), "engine_switched", "", entry.tree->Id(),
+                             ev.detail, "");
+            }
+            // Task history: a failed exec / agent node (one that ran jobs) is recorded with its run
+            // number, so retries and fix loops inside the BT show up even though they are not a
+            // lineage. Failures of composite and condition nodes are left out (they only repeat it).
+            if (!entry.tree->TaskId().empty() && ev.type == "nodeFinished" && ev.state == "failed" &&
+                !ev.nodeKey.empty()) {
+                const std::vector<std::string> nodeJobs = entry.tree->NodeJobs(ev.nodeKey);
+                if (!nodeJobs.empty()) {
+                    nlohmann::json extra = nlohmann::json::object();
+                    extra["node"] = ev.nodeKey;
+                    if (ev.run > 0) extra["run"] = ev.run;
+                    std::string text = ev.nodeKey + (ev.run > 0 ? " run " + std::to_string(ev.run) : "");
+                    if (!ev.detail.empty()) text += ": " + ev.detail;
+                    tqm_.TaskLog(entry.tree->TaskId(), "bt_node_failed", nodeJobs.back(), entry.tree->Id(),
+                                 text, "", &extra);
+                }
+            }
 
             std::string line = ej.dump();
             AppendToLogFileWide(evFileW, line + "\r\n");
@@ -655,6 +710,17 @@ void BtManager::LoadPersistedTrees() {
         trees_[btId] = std::move(entry);
 
         const std::string st = entryPtr->tree->State();
+        if (entryPtr->tree->DirectionId().empty() &&
+            (st == "running" || st == "waitingForLlm" || st == "paused")) {
+            std::string dirId;
+            std::string dirErr;
+            const std::string btTitle =
+                entryPtr->tree->Summary().empty() ? btId : entryPtr->tree->Summary();
+            if (tqm_.EnsureBtDirection(btId, "", entryPtr->tree->TaskId(), btTitle,
+                                       tqm_.BtOriginJson(btId), dirId, dirErr)) {
+                entryPtr->tree->SetDirectionId(dirId);
+            }
+        }
         if (st == "running" || st == "waitingForLlm") {
             auto runningIds = entryPtr->tree->RunningJobIds();
             for (const auto& jobId : runningIds) {

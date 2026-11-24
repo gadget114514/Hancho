@@ -1,4 +1,4 @@
-// Smoke test for hancho-cli top TUI components (cards 062-1, 062-2, doc/tui-design-ja.md).
+// Smoke test for hancho-cli top TUI components (cards 062-1, 062-2, doc/obsoleted/tui-design-ja.md).
 // Verifies key sequence parsing, tab navigation, 5 dashboard-equivalent views, and format helpers.
 
 #include "cli_top.h"
@@ -693,6 +693,89 @@ void TestNarrowTerminalHandling() {
     Check(rendered.find("Hancho Top") != std::string::npos, "Narrow render contains title");
 }
 
+void TestQueueTaskColumnAndGrouping() {
+    Check(ParseKeySequence("t") == TopKey::ToggleTaskGroup, "Parse 't' as ToggleTaskGroup");
+    Check(ParseKeySequence("T") == TopKey::ToggleTaskGroup, "Parse 'T' as ToggleTaskGroup");
+
+    TopState state;
+    state.coreConnected = true;
+    state.activeTab = TopTab::Queue;
+    state.selectedRow = 0;
+
+    nlohmann::json counts;
+    counts["ok"] = true;
+    counts["running"] = 1;
+    counts["waiting"] = 0;
+    counts["pending"] = 0;
+    counts["succeeded"] = 1;
+    counts["failed"] = 1;
+    counts["total"] = 2;
+    state.countsData = counts;
+
+    nlohmann::json tasks;
+    tasks["ok"] = true;
+    tasks["tasks"] = nlohmann::json::array({
+        {{"id", "task_1"}, {"title", "Fix Build"}, {"state", "running"}}
+    });
+    state.tasksData = tasks;
+
+    nlohmann::json qData;
+    qData["ok"] = true;
+    qData["jobs"] = nlohmann::json::array({
+        {{"id", "job-1"}, {"taskqueue", "main"}, {"state", "failed"}, {"task_id", "task_1"}, {"superseded_by", "job-2"}, {"summary", "First attempt"}},
+        {{"id", "job-2"}, {"taskqueue", "main"}, {"state", "running"}, {"task_id", "task_1"}, {"supersedes", "job-1"}, {"summary", "Retry attempt"}}
+    });
+    state.queueData = qData;
+
+    // 1. Flat jobs view: Task column + footer shortcut
+    state.queueGroupByTask = false;
+    std::string flat = RenderScreen(state, 100, 26, false);
+    Check(flat.find("TASK") != std::string::npos, "Queue flat view has TASK column");
+    Check(flat.find("Fix Build") != std::string::npos, "Queue flat view displays task title");
+    Check(flat.find("[t] Task View") != std::string::npos, "Queue footer advertises [t] Task View");
+
+    // 2. Grouped tasks view: Task heading row + indented child job rows
+    state.queueGroupByTask = true;
+    std::string grouped = RenderScreen(state, 100, 26, false);
+    Check(grouped.find("[View: Tasks") != std::string::npos, "Queue grouped view shows Tasks mode");
+    Check(grouped.find("Fix Build") != std::string::npos, "Queue grouped view shows task heading");
+    Check(grouped.find("job-1") != std::string::npos && grouped.find("job-2") != std::string::npos,
+          "Queue grouped view shows child jobs");
+
+    // Selecting row 0 (task heading) has no job request; child rows are newest-first (row 1 = job-2, row 2 = job-1)
+    std::string req, desc;
+    state.selectedRow = 0;
+    Check(!BuildJobRetryRequest(state, req, desc), "Task heading row does not build job retry request");
+    state.selectedRow = 1;
+    Check(BuildJobRetryRequest(state, req, desc) && req.find("job-2") != std::string::npos,
+          "First child job row in grouped view builds retry request for job-2");
+    state.selectedRow = 2;
+    Check(BuildJobRetryRequest(state, req, desc) && req.find("job-1") != std::string::npos,
+          "Second child job row in grouped view builds retry request for job-1");
+
+    // 3. Help overlay documents t / T
+    state.showHelp = true;
+    std::string withHelp = RenderScreen(state, 100, 30, false);
+    Check(withHelp.find("t / T") != std::string::npos, "Help overlay documents t / T toggle");
+
+    // 4. 103-3: DirectionHeading row renders in Tasks view with direction:<id>
+    state.showHelp = false;
+    state.queueGroupByTask = true;
+    state.queueData["jobs"] = nlohmann::json::array({
+        {{"id", "job-d1"}, {"task_id", "task_1"}, {"direction_id", "dir_10"}, {"taskqueue", "default"},
+         {"state", "running"}, {"summary", "Step 1"}, {"created_at", "2026-11-24T10:00:00Z"}},
+        {{"id", "job-d2"}, {"task_id", "task_1"}, {"direction_id", "dir_10"}, {"taskqueue", "default"},
+         {"state", "pending"}, {"summary", "Step 2"}, {"created_at", "2026-11-24T10:01:00Z"}}
+    });
+    std::string withDir = RenderScreen(state, 100, 26, false);
+    Check(withDir.find("direction:dir_10") != std::string::npos,
+          "103-3: Queue grouped view renders DirectionHeading with direction:<id>");
+    state.selectedRow = 1; // DirectionHeading
+    std::string dirDetail = RenderScreen(state, 100, 26, false);
+    Check(dirDetail.find("[Direction Detail: direction:dir_10]") != std::string::npos,
+          "103-3: Selecting DirectionHeading renders Direction Detail subpane");
+}
+
 } // namespace
 
 int main() {
@@ -716,6 +799,7 @@ int main() {
     TestRenderingEmptyLists();
     TestColorAndNoColorRendering();
     TestNarrowTerminalHandling();
+    TestQueueTaskColumnAndGrouping();
     std::printf("=== Results: %d passed, %d failed ===\n", g_passes, g_failures);
     return g_failures == 0 ? 0 : 1;
 }

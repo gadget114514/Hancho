@@ -377,6 +377,11 @@ void BehaviorTree::Impl::ResetSubtreeForRun(BehaviorTree& bt, BtNode& node, bool
     if (resetHistory) {
         node.runs = 0;
         node.engineCandidateIndex = 0;
+        node.switchFailCounts.clear();
+        node.recentFailSignatures.clear();
+        node.lastHandoff = json();
+        node.firstStartMs = 0;
+        node.switchStoppedReason.clear();
     } else if (node.type == "retry" || node.type == "repeat" ||
                node.type == "sequence" || node.type == "fallback" ||
                node.type == "parallel" || node.type == "foreach" ||

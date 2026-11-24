@@ -195,10 +195,17 @@ int main() {
     Check(GetWebUiAsset("/index.html", "", indexHtml, assetMime) &&
               indexHtml.find("data-tab=\"routines\"") != std::string::npos,
           "embedded Web UI serves the Routines tab");
+    Check(indexHtml.find("tq-view-mode-pills") != std::string::npos &&
+              indexHtml.find("modal-task-details") != std::string::npos,
+          "embedded Web UI index.html has task view toggle and task details modal");
     Check(GetWebUiAsset("/app.js", "", appJs, assetMime) &&
               appJs.find("renderRoutinesTable") != std::string::npos &&
               appJs.find("routine_run") != std::string::npos,
           "embedded Web UI app.js handles routine_list / routine_run");
+    Check(appJs.find("openTaskDetails") != std::string::npos &&
+              appJs.find("task_list") != std::string::npos &&
+              appJs.find("task_show") != std::string::npos,
+          "embedded Web UI app.js handles task_list / task_show and task details");
 
     // Mock IPC handler simulating core
     auto mockIpcHandler = [](const std::string& reqJson) -> std::string {
@@ -277,6 +284,24 @@ int main() {
             resp["status"] = "running";
             resp["supervisor_goal"] = "complete task";
             return resp.dump();
+        }
+        if (action == "task_list") {
+            return nlohmann::json{
+                {"ok", true},
+                {"version", 1},
+                {"tasks", nlohmann::json::array({
+                    {{"id", "task_1"}, {"title", "Build & Test"}, {"state", "running"}}
+                })}
+            }.dump();
+        }
+        if (action == "task_show") {
+            return nlohmann::json{
+                {"ok", true},
+                {"task", {{"id", req.value("id", "task_1")}, {"title", "Build & Test"}, {"intent", "Verify build"}}},
+                {"status", {{"state", "running"}}},
+                {"jobs", nlohmann::json::array({{{"id", "job_001"}, {"state", "completed"}}})},
+                {"log", nlohmann::json::array({{{"at", "2026-11-11 12:00:00"}, {"kind", "created"}, {"text", "task created"}}})}
+            }.dump();
         }
         if (action == "get_usage_history") {
             nlohmann::json resp;
@@ -496,6 +521,26 @@ int main() {
             std::string routineRunResp = SendWsFrame(wsSock2, "{\"action\":\"routine_run\",\"name\":\"demo\"}");
             Check(routineRunResp.find("\"runId\":\"demo-1\"") != std::string::npos,
                   "Pane 6: routine_run is callable over the Web UI IPC");
+
+            // Task lineage: task_list and task_show over WebSocket + HTTP /api/tasks
+            std::string taskListWs = SendWsFrame(wsSock2, "{\"action\":\"task_list\"}");
+            Check(taskListWs.find("\"tasks\"") != std::string::npos &&
+                      taskListWs.find("\"task_1\"") != std::string::npos,
+                  "Task lineage: task_list over WebSocket returns tasks");
+            std::string taskShowWs = SendWsFrame(wsSock2, "{\"action\":\"task_show\",\"id\":\"task_1\"}");
+            Check(taskShowWs.find("\"intent\":\"Verify build\"") != std::string::npos &&
+                      taskShowWs.find("\"log\"") != std::string::npos,
+                  "Task lineage: task_show over WebSocket returns intent, jobs, and log");
+
+            std::string tasksHttp = HttpExchange(testPort,
+                "GET /api/tasks?token=" + testToken + " HTTP/1.1\r\nHost: 127.0.0.1:" + std::to_string(testPort) + "\r\n\r\n");
+            Check(tasksHttp.find("200 OK") != std::string::npos && tasksHttp.find("\"task_1\"") != std::string::npos,
+                  "HTTP /api/tasks returns task list");
+
+            std::string taskShowHttp = HttpExchange(testPort,
+                "GET /api/tasks/task_1?token=" + testToken + " HTTP/1.1\r\nHost: 127.0.0.1:" + std::to_string(testPort) + "\r\n\r\n");
+            Check(taskShowHttp.find("200 OK") != std::string::npos && taskShowHttp.find("\"Verify build\"") != std::string::npos,
+                  "HTTP /api/tasks/task_1 returns task details");
 
             closesocket(wsSock2);
         }

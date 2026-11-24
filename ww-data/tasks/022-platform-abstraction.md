@@ -5,7 +5,7 @@ Splittable: no
 
 ## 目的
 
-OS 依存を境界の後ろへ移す（`doc/design-v3.md` 2.4）。このカードでは Windows の挙動を変えない。
+OS 依存を境界の後ろへ移す（`doc/obsoleted/design-v3.md` 2.4）。このカードでは Windows の挙動を変えない。
 
 ## やること
 
@@ -21,8 +21,8 @@ OS 依存を境界の後ろへ移す（`doc/design-v3.md` 2.4）。このカー�
 
 ## 参照
 
-- `doc/design-v3.md` 2.4
-- `doc/design-v3-en.md` Section 2.4
+- `doc/obsoleted/design-v3.md` 2.4
+- `doc/obsoleted/design-v3-en.md` Section 2.4
 
 ## Authorised edits
 
@@ -33,8 +33,8 @@ OS 依存を境界の後ろへ移す（`doc/design-v3.md` 2.4）。このカー�
 
 ## Read-only
 
-- `doc/design-v3.md`
-- `doc/design-v3-en.md`
+- `doc/obsoleted/design-v3.md`
+- `doc/obsoleted/design-v3-en.md`
 
 ## 検証
 

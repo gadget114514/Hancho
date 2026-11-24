@@ -5,7 +5,7 @@ Splittable: no
 
 ## 目的
 
-診断を利用者が見て次の手を選べる形で出す（`doc/design-v3.md` 4.6）。
+診断を利用者が見て次の手を選べる形で出す（`doc/obsoleted/design-v3.md` 4.6）。
 
 ## やること
 
@@ -22,8 +22,8 @@ Splittable: no
 
 ## 参照
 
-- `doc/design-v3.md` 4.6
-- `doc/design-v3-en.md` Section 4
+- `doc/obsoleted/design-v3.md` 4.6
+- `doc/obsoleted/design-v3-en.md` Section 4
 
 ## Authorised edits
 
@@ -35,8 +35,8 @@ Splittable: no
 
 ## Read-only
 
-- `doc/design-v3.md`
-- `doc/design-v3-en.md`
+- `doc/obsoleted/design-v3.md`
+- `doc/obsoleted/design-v3-en.md`
 
 ## 検証
 

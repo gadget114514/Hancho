@@ -10,7 +10,7 @@ Parent: 060-gui-ipc-client.md
 
 ## 目的
 
-GUI が直接読んでいるコアの状態を、IPC（Named Pipe 越し）に置き換える（`doc/design-v3.md` 2.3 段階 A）。
+GUI が直接読んでいるコアの状態を、IPC（Named Pipe 越し）に置き換える（`doc/obsoleted/design-v3.md` 2.3 段階 A）。
 
 ## やること
 
@@ -22,7 +22,7 @@ GUI が直接読んでいるコアの状態を、IPC（Named Pipe 越し）に�
 
 ## 参照
 
-- `doc/design-v3.md` 2.3, 2.4
+- `doc/obsoleted/design-v3.md` 2.3, 2.4
 - 親カード `ww-data/tasks/060-gui-ipc-client.md`
 
 ## Authorised edits
@@ -33,8 +33,8 @@ GUI が直接読んでいるコアの状態を、IPC（Named Pipe 越し）に�
 
 ## Read-only
 
-- `doc/design-v3.md`
-- `doc/design-v3-en.md`
+- `doc/obsoleted/design-v3.md`
+- `doc/obsoleted/design-v3-en.md`
 
 ## 検証
 

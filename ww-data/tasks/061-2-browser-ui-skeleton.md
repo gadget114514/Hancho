@@ -11,7 +11,7 @@ Parent: 061-linux-gui.md
 
 ## 目的
 
-コアが localhost の HTTP + WebSocket サーバーとして動き、ブラウザが接続して状態を表示できる骨格を作る（`doc/design-v3-todo.md` 8）。
+コアが localhost の HTTP + WebSocket サーバーとして動き、ブラウザが接続して状態を表示できる骨格を作る（`doc/obsoleted/design-v3-todo.md` 8）。
 
 ## やること
 
@@ -25,8 +25,8 @@ Parent: 061-linux-gui.md
 
 ## 参照
 
-- `doc/design-v3-todo.md` 8
-- `doc/design-v3.md` 2.4
+- `doc/obsoleted/design-v3-todo.md` 8
+- `doc/obsoleted/design-v3.md` 2.4
 - 親カード `ww-data/tasks/061-linux-gui.md`
 
 ## Authorised edits
@@ -38,8 +38,8 @@ Parent: 061-linux-gui.md
 
 ## Read-only
 
-- `doc/design-v3.md`
-- `doc/design-v3-en.md`
+- `doc/obsoleted/design-v3.md`
+- `doc/obsoleted/design-v3-en.md`
 - `src/gui_dashboard.cpp`
 
 ## 検証

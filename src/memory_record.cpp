@@ -111,7 +111,7 @@ std::string NormalizeSlashes(const std::string& s) {
     return out;
 }
 
-// Turns an absolute target into a path relative to the job cwd (doc/design-v3.md 3.3).
+// Turns an absolute target into a path relative to the job cwd (doc/obsoleted/design-v3.md 3.3).
 // Paths outside the cwd are kept, with forward slashes, so they stay traceable.
 std::string RelativeToCwd(const std::string& target, const std::string& cwd) {
     std::string t = NormalizeSlashes(Trim(target));
@@ -279,7 +279,7 @@ std::string ResolveLogText(const RunRecordInput& input, const std::string& logPa
 }
 
 // Replaces numbers and path-shaped tokens so similar errors group together
-// (doc/design-v3.md 3.3: "数字やパスを伏せた形で重複を数え").
+// (doc/obsoleted/design-v3.md 3.3: "数字やパスを伏せた形で重複を数え").
 std::string NormalizeErrorTerm(const std::string& token) {
     if (HasPathSeparator(token) && token.size() > 1) return "<path>";
     std::string out;

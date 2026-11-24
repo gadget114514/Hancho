@@ -247,6 +247,7 @@ json BuildTreeResponseJson(const BehaviorTree& tree, TreeView view) {
     json out;
     out["ok"] = true;
     out["id"] = tree.Id();
+    if (!tree.DirectionId().empty()) out["directionId"] = tree.DirectionId();
     out["state"] = tree.State();
     if (!tree.Detail().empty()) out["detail"] = tree.Detail();
     out["version"] = tree.Version();
@@ -336,6 +337,15 @@ std::string BtManager::Start(const std::string& jsonText, bool paused) {
         }
     }
 
+    std::string dirId;
+    std::string dirErr;
+    const std::string btTitle = tree->Summary().empty() ? btId : tree->Summary();
+    if (!tqm_.EnsureBtDirection(btId, tree->DirectionId(), tree->TaskId(), btTitle,
+                                tqm_.BtOriginJson(btId), dirId, dirErr)) {
+        return MakeErrorJson(dirErr);
+    }
+    tree->SetDirectionId(dirId);
+
     tree->SetJobRunner(this);
     tree->SetProber(this);
     tree->SetEngineHealth(this);
@@ -383,6 +393,7 @@ std::string BtManager::List() {
         const BehaviorTree& t = *entry->tree;
         json item;
         item["id"] = t.Id();
+        if (!t.DirectionId().empty()) item["directionId"] = t.DirectionId();
         item["summary"] = t.Summary();
         item["intent"] = t.Intent();
         item["state"] = t.State();
@@ -485,6 +496,14 @@ std::string BtManager::Resume(const std::string& id,
     }
 
     PersistEntryLocked(entry);
+    // Task log (100-3): record escalation answer on the BT's task if it has a record.
+    if (!entry.tree->TaskId().empty()) {
+        std::string text = answer;
+        if (!rationale.empty()) {
+            text += (text.empty() ? "" : ": ") + rationale;
+        }
+        tqm_.TaskLog(entry.tree->TaskId(), "escalate_answered", "", entry.tree->Id(), text, "");
+    }
     return BuildTreeResponseJson(*entry.tree, TreeView::Summary).dump();
 }
 

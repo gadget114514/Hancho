@@ -5,7 +5,7 @@ Splittable: no
 
 ## 目的
 
-`hancho-cli top` を簡易表示のままにせず、ダッシュボードと同等の端末向け画面に育てる（`doc/design-v3-todo.md` 8）。
+`hancho-cli top` を簡易表示のままにせず、ダッシュボードと同等の端末向け画面に育てる（`doc/obsoleted/design-v3-todo.md` 8）。
 
 ## やること
 
@@ -22,8 +22,8 @@ Splittable: no
 
 ## 参照
 
-- `doc/design-v3-todo.md` 8
-- `doc/design-v3.md` 2.4
+- `doc/obsoleted/design-v3-todo.md` 8
+- `doc/obsoleted/design-v3.md` 2.4
 
 ## Authorised edits
 
@@ -35,8 +35,8 @@ Splittable: no
 
 ## Read-only
 
-- `doc/design-v3.md`
-- `doc/design-v3-en.md`
+- `doc/obsoleted/design-v3.md`
+- `doc/obsoleted/design-v3-en.md`
 - `src/gui_dashboard.cpp`
 
 ## 検証

@@ -5,7 +5,7 @@ Splittable: no
 
 ## 目的
 
-Hancho をやめるときに、データを Hancho なしで読める形へ書き出す（`doc/design-v3.md` 5.4）。
+Hancho をやめるときに、データを Hancho なしで読める形へ書き出す（`doc/obsoleted/design-v3.md` 5.4）。
 
 ## やること
 
@@ -21,8 +21,8 @@ Hancho をやめるときに、データを Hancho なしで読める形へ書�
 
 ## 参照
 
-- `doc/design-v3.md` 5.4
-- `doc/design-v3-en.md` Section 5
+- `doc/obsoleted/design-v3.md` 5.4
+- `doc/obsoleted/design-v3-en.md` Section 5
 
 ## Authorised edits
 
@@ -36,8 +36,8 @@ Hancho をやめるときに、データを Hancho なしで読める形へ書�
 
 ## Read-only
 
-- `doc/design-v3.md`
-- `doc/design-v3-en.md`
+- `doc/obsoleted/design-v3.md`
+- `doc/obsoleted/design-v3-en.md`
 
 ## 検証
 

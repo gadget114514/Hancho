@@ -1,6 +1,6 @@
 #pragma once
 
-// Worker engine abstraction for Behavior Trees (doc/behavior-tree-plan.md section 4.3).
+// Worker engine abstraction for Behavior Trees (doc/obsoleted/behavior-tree-plan.md section 4.3).
 // Pure logic only: no GUI, no IPC, no process launching.
 
 #include "nlohmann/json.hpp"
@@ -52,7 +52,7 @@ struct WorkerEngineDef {
     // no bypass flags at all. Never use the worker permissionArgs here.
     std::string advicePermissionArgs;
     std::vector<std::string> models; // optional allowlist; empty accepts any valid model name
-    std::string adapter;             // Tier 1/3 adapter name (doc/design-v3.md 1.5)
+    std::string adapter;             // Tier 1/3 adapter name (doc/obsoleted/design-v3.md 1.5)
     WorkerEngineCapabilities capabilities;
 };
 
