@@ -50,6 +50,16 @@ task                 依頼 1 件。意図・経過ログを持つ
 - **系譜**は、やり直し（`supersedes`）でつながった job の列。task の中にあり、direction をまたいでよい（失敗した direction の job を、新しい direction の job でやり直す）。
 - **BT の中のやり直し**（`retry` ノード、fix ループ、`bt retry`）は同じ direction の中で起きる。系譜にはならない。
 - **単発プロセス:** `start` で起動したプロセスは task にも direction にも job にも入らない。成功判定、リトライ、使用量の集計はない。
+- **タスクカードは direction。** 大きな task（機能 1 件）は複数のカードを持ち、1 枚を 1 本の direction として実行する（たとえば BT 1 本: agent → build → test → 失敗なら fix）。カードは task を分けたものではない（task は 1 つのまま）。
+  - task が終わるのは、中のカードがすべて成功したか閉じられたとき。
+  - カードが失敗するとトリアージになる。トリアージの判断（やり直す、閉じるなど）はそのカードに対して行い、task 全体には行わない。
+- **トリアージのカードも direction。** トリアージのカードは、失敗して判断を待っている direction そのもので、別の単位ではない（direction 1 本につきトリアージのカードは多くても 1 枚）。
+  - 原因・候補・推奨・判断は、その direction に付く情報として持つ。カードの id は direction の id。
+  - direction の中で job が何本落ちても、カードは 1 枚。証拠として失敗した job を全部載せる。
+  - 判断で「閉じる」と、その direction が閉じる。「やり直す」と、同じ direction の中でもう一度試すか、`supersedes` で引き継ぐ新しい direction（救済）を作る。救済の direction が失敗すれば、それがまた 1 枚のカードになる。
+  - つまり、タスクカード（まだ実行していない、または実行中の direction）とトリアージのカード（失敗した direction）は、同じ direction を状態で呼び分けたもの。
+  - タスクカードと direction は 1 対多になりうる。実行が失敗し、直して流し直すと、同じタスクカードに direction が 2 本できる。保存した BT（ルーチン）とその実行の関係と同じ。
+  - これまでは `doc/` の Markdown（例: `doc/task-lineage-cards.md` のカード 100-x）にしかなく、Hancho は知らなかった。task の中に保存し、まだ実行していない direction（`planned`）として扱う案がある（下の「direction のレコード」）。
 
 ## 用語
 
@@ -71,6 +81,7 @@ task                 依頼 1 件。意図・経過ログを持つ
 | キュー（taskqueue） | task を実行する順番。実際に並ぶのは task の job で、順番・依存つきで並べる。名前は変えない |
 | BT（behavior tree） | ノードの木。結果によって次を変える流れを 1 つの JSON で書いた定義。実行すると direction になる |
 | ルーチン（routine） | 名前を付けて保存した BT |
+| タスクカード（task card） | 大きな task の中に入っている作業の 1 単位（= direction）。task は複数のカードを持つ。1 枚を 1 本の direction として実行する。中身は作業の説明（触るファイル、やること、テスト）と、ほかのタスクカードへの依存。番号は `102-3` のように「計画の番号-連番」で付ける。単に「カード」と言えばタスクカードのこと（`doc/` の「カード 100-x」「カード 102-x」）。失敗した direction を指すときは「トリアージのカード」と書いて区別する（どちらも同じ direction） |
 
 ### BT のノード
 
@@ -110,7 +121,8 @@ task                 依頼 1 件。意図・経過ログを持つ
 |---|---|
 | 失敗クラス（failure class） | 失敗の種類（`exit_nonzero`、`startup_hang`、`fix_no_progress` など） |
 | escalate | BT の途中で supervisor に判断を求めるノード。回答は `bt resume` |
-| トリアージ（triage） | 失敗を 1 枚のカードにまとめ、原因・候補・推奨を出す仕組み |
+| トリアージ（triage） | task の中でトリアージになった（失敗した）カード（direction）を、どう処理するかを決める仕組み。原因・候補（やり直す、内容を変えてやり直す、閉じる、引き取る）・推奨を出す。判断の対象はカードで、task 全体ではない |
+| トリアージのカード | 失敗して判断を待っている direction そのもの（トリアージのカード = direction）。id は direction の id で、direction 1 本につき多くても 1 枚。原因・候補・推奨・判断は direction に付く。単発プロセス（`start`）は direction を持たないので、カードではなくお知らせにする |
 | 引き取り（takeover） | supervisor が job や escalate を自分で片付けると記録すること |
 
 ## direction のレコード
@@ -118,8 +130,14 @@ task                 依頼 1 件。意図・経過ログを持つ
 - `bt start`、`routine run`、`taskqueue add`（job 1 つでも）のたびに 1 件作る。
 - 項目: `id`、種類（`bt` / `jobs`）、`taskId`、作成時刻、作成したセッション（`origin`）。
 - job は `directionId` で direction に属する。BT が出す job は、その BT の direction に属する。
-- id の決め方（BT の id をそのまま使うか、`dir_` のようなプレフィックスで採番するか）は実装のカードで決める。
+- id の決め方（BT の id をそのまま使うか、`dir_` のようなプレフィックスで採番するか）は実装のカードで決める（仮の答え: `dir_` + 連番。`doc/direction-cards.md`）。
 - 一覧の仮想行は `group:<id>` から `direction:<id>` に変える。
+- 案（未決定）: タスクカードを、まだ実行していない direction（状態 `planned`）として先に作れるようにする。
+  - 中身: タスクカードの本文（または BT の定義そのもの）、使う雛形の名前、ほかの direction への依存（`after`）。
+  - 実行すると BT を作り、同じレコードが `running` になる。
+  - やり直しは、元の direction を引き継ぐ（`supersedes`）新しい direction にする。job の系譜と同じ形を 1 段上で使う。
+  - task を開けば、タスクカードごとの進み具合（済み・実行中・依存待ち）が見える。依存のないものは並行して流せる。
+  - 保存場所（task のレコードの中か、`taskId` を持つ direction のレコードか）と、本文から BT を作る雛形の形は、実装のタスクカードで決める（仮の答え: direction のレコードに持ち、雛形 `card` で BT を作る。`doc/task-card-store-cards.md`）。
 
 ## 0.10.0 での名前の変更
 
@@ -151,5 +169,6 @@ task                 依頼 1 件。意図・経過ログを持つ
 
 ## 残っている作業
 
-- 0.10.0 の名前の変更と direction のレコードを、実装のカードにする。
-- `skills/hancho/SKILL.md`、help、`doc/behavior-tree*.md`、`doc/task-lineage-plan.md` などをこの用語集に合わせて書き換える。task-lineage の未決定 4「タスクの呼び名」は task に決まる。
+- 0.10.0 の名前の変更と direction のレコード → タスクカード 103-1〜103-8（`doc/direction-cards.md`）。
+- タスクカードを Hancho に保存する仕組み（上の「direction のレコード」の案）→ タスクカード 104-1〜104-6（`doc/task-card-store-cards.md`）。
+- `skills/hancho/SKILL.md`、help、`doc/behavior-tree*.md` などをこの用語集に合わせて書き換える → タスクカード 103-8（名前の変更と同時に行う。名前を変える前に文書だけ新しい名前にすると、まだ受け付けない名前を案内してしまうため）。`doc/task-lineage-plan.md` は書き換え済み。

@@ -1,0 +1,12 @@
+{
+  "now": "2026-11-21 15:00:00",
+  "days": 30,
+  "points_per_hour": 4,
+  "tokens_per_day": 180000,
+  "cost_per_day": 5.0,
+  "queue": "demo",
+  "models": [
+    { "engine": "claude", "model": "claude-sonnet-4", "weight": 3 },
+    { "engine": "opencode", "model": "grok-code-fast-1", "weight": 2 }
+  ]
+}

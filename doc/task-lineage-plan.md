@@ -1,6 +1,7 @@
 # タスクと系譜（task / lineage）計画
 
-状態: 方針決定済み・実装中（2026-11-23 相談。同日、タスクを Hancho のレコードにする方針に改訂）
+状態: 実装済み（カード 100-1〜100-10、コミット `7531229`。2026-11-24 に経過ログへの attempt・BT ノードの失敗の記録を追加、コミット `304082b`）。ブランチ `feature/fix-engine-switch` にあり、`main` にはまだマージしていない。ダッシュボード・Web UI・TUI は画面でまだ確かめていない。
+（2026-11-23 相談。同日、タスクを Hancho のレコードにする方針に改訂）
 
 ## 問題
 
@@ -116,20 +117,27 @@ Hancho 経由で worker に実装させる。agent は claude / haiku。haiku �
 
 | カード | 内容 | 状態 |
 |---|---|---|
-| 100-1 | 系譜のデータ層: `supersedes` / `taskId` / `supersededBy` / `supersedeReason`、保存・読み込み、`taskqueue_add` での検証と結び付け、テスト。詳細は `doc/task-lineage-100-1.md` | 実装済み・テスト修正中（2026-11-23。`lineage-100-1` はテストの誤判定で止まったため取り消し、`lineage-all2` の最初の段で続ける） |
-| 100-2 | タスクのレコード: 保存、`task create/show/list/note/close`（CLI・MCP）、`taskqueue add --task`、`bt start --task`、状態の計算、経過ログ（作成・ジョブ追加・やり直しの自動記録） | 未着手 |
-| 100-3 | 経過ログへの自動記録: escalate への回答、引き取り、トリアージの判断、キャンセル | 未着手 |
-| 100-4 | `taskqueue list` / `get` / MCP の出力にタスク（title・状態）を足す | 未着手 |
-| 100-5 | ダッシュボード: リストビューで 2 段表示、詳細ペインに意図と経過ログ、タスク表示 / ジョブ表示の切り替え、集計 | 未着手 |
-| 100-6 | `run --exit-on-drain` の終了コードと JUnit をタスク・系譜基準にする | 未決定 3 待ち |
-| 100-7 | やり直しジョブを追加する経路で `supersedes` を自動で付ける（`taskqueue retry` 系・トリアージ）。skill に「先にタスクを作る・判断は `task note`」を書く | 未決定 1 待ち |
-| 100-8 | 繰り返し失敗の警告とトリアージカード | 未着手 |
-| 100-9 | Web UI の一覧 | 未決定 2 待ち |
-| 100-10 | ドキュメント・ヘルプ・スキル更新（`doc/cli*.md`、`doc/mcp*.md`、`doc/taskqueue*.md`、`doc/obsoleted/hancho-taskqueue-spec.md`、`cli.cpp` のヘルプ出力、skill） | 未着手 |
+| 100-1 | 系譜のデータ層: `supersedes` / `taskId` / `supersededBy` / `supersedeReason`、保存・読み込み、`taskqueue_add` での検証と結び付け、テスト。詳細は `doc/task-lineage-100-1.md` | 実装済み |
+| 100-2 | タスクのレコード: 保存、`task create/show/list/note/close/reopen/purge`（CLI・MCP・IPC）、`taskqueue add --task`、`bt start --task`、状態の計算、経過ログ（作成・ジョブ追加・やり直しの自動記録） | 実装済み |
+| 100-3 | 経過ログへの自動記録: escalate への回答、引き取り、トリアージの判断、キャンセル | 実装済み |
+| 100-4 | `taskqueue list` / `get` / MCP の出力にタスク（title・状態）を足す。`dependsOn` を系譜の最新ジョブで解決 | 実装済み |
+| 100-5 | ダッシュボード: リストビューで 2 段表示、詳細ペインに意図と経過ログ、タスク表示 / ジョブ表示の切り替え、集計 | 実装済み（画面は未確認） |
+| 100-6 | `run --exit-on-drain` の終了コードと JUnit をタスク・系譜基準にする（既定。旧挙動は `--count-superseded`） | 実装済み |
+| 100-7 | `taskqueue supersede` を新設。skill に「先にタスクを作る・判断は `task note`」を書く | 実装済み |
+| 100-8 | 繰り返し失敗の警告とトリアージカード | 実装済み |
+| 100-9 | Web UI と TUI の一覧 | 実装済み（画面は未確認） |
+| 100-10 | ドキュメント・ヘルプ・スキル更新 | 実装済み |
+
+仮の決定は `doc/task-lineage-cards.md` の表のとおりに実装した。下の「懸念」「未決定」は、その表で答えを決めた。
+
+このあとの 0.10 の作業:
+- direction のレコードと 0.10.0 の名前の変更: `doc/direction-cards.md`（タスクカード 103-x）。
+- タスクカードを Hancho に保存する: `doc/task-card-store-cards.md`（タスクカード 104-x）。
+- タスク一覧の作り直し: `doc/task-list-redesign-cards.md`（タスクカード 102-x）。
 
 ## 懸念
 
-重要な順。対策が決まったら「決定事項」に移す。
+重要な順。すべて `doc/task-lineage-cards.md` の「仮の決定」で答えを決め、実装した（懸念 1 はさらに用語集で direction に決まった）。以下は経緯として残す。
 
 1. **BT の「タスクグループ」と名前・見出し行がぶつかる**: 今のタスク一覧には、実行中の BT が `group:<id>` の仮想行（タスクグループ）として出る。新しいタスクとの関係を決めないと、一覧に 2 種類の見出し行が並ぶ。案: BT の実行をタスクの一部にする／タスクなしで起動した BT を暗黙のタスクとして扱う。→ 用語集（`doc/terminology.md`）で、BT の実行は task の下の direction とし、仮想行は 0.10.0 で `direction:<id>` に変えることにした。
 2. **stable（0.9.x）に戻すと系譜が消える**: 0.9.x と 0.10 は同じデータディレクトリを使う。0.9.x に戻すと、キューを保存したときに知らないフィールド（`supersedes` / `task_id` など）が落ち、系譜とタスクとのつながりが消える。
@@ -151,8 +159,11 @@ Hancho 経由で worker に実装させる。agent は claude / haiku。haiku �
 - **失敗分類の誤判定で、普通のジョブが許可待ちのまま止まる（0.9.43 にもある）**: `src/taskqueue.cpp` の失敗分類は、ログの行を `kPermissionPattern`（`permission_denied` などの正規表現）で探して `permission_denied` に分類する。LLM ではない普通のジョブでも、ログに JSON のキー `on_permission_denied` が出るだけで一致し、ジョブが `waitingForPermit` で止まる。BT では失敗として扱われないので、修正ループに進まない。`taskqueue_smoke` が失敗したときに実際に起きた（2026-11-23、`lineage-100-1-test-1`）。
   - 今の回避策: BT のテストは出力をファイルに書き出し（`> build\test-logs\<id>.txt`）、成功判定は `contentFile` / `contentRegex` で行う。
   - 直し方の案: ログ行による判定を agent のジョブ（LLM を動かすジョブ）だけに限る、または単語の境界で一致させる。`stable` にも直す必要がある。
+  - 直した: `stable` は `14eceb1`（v0.9.44）、`main` は `88a178b`。単語の境界で一致させ、LLM の worker ジョブだけに当てる。`feature/fix-engine-switch` にはまだ入っていない（`main` にマージするときに入る）。
 
 ## 未決定
+
+すべて `doc/task-lineage-cards.md` の「仮の決定」で答えを決め、実装した。以下は経緯として残す。
 
 1. やり直しジョブは主にどの経路で追加されるか（supervisor が手で `taskqueue_add` / BT のフォールバック / トリアージからの再投入）。これで `supersedes` を自動で付ける場所が決まる。
 2. Web UI（`src/webui/app.js`）の一覧も同じ表示に合わせるか。
