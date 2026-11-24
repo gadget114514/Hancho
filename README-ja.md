@@ -120,6 +120,9 @@ New-Item -ItemType Junction -Path .claude\skills\hancho -Target (Resolve-Path sk
 
 
 
+### v0.9.47
+- **BT のエンジン切り替え**: worker の試行が失敗し、そのエンジンが停止（down）と判定されたとき（`idle_stall` の後など）、`switchEngineOn` にその失敗クラスがなくても、`engines` の次の承認済みで動いている候補に切り替えるようにしました。`engineSwitched` イベントには「engine down」と出ます。使える候補が残っていないときだけ復旧を待ちます（これまでは、ほかの候補が正常でも、止まったエンジンの復旧を待ち続けていました）。
+
 ### v0.9.46
 - **設定ダイアログ（表示タブ / 表示スケール）**: 「表示スケール (DPI)」のコントロールがすべてのタブ（「版」タブなど）に表示されてしまう不具合を修正し、使用量グラフの単位コントロールと重ならないよう Y 座標を再配置しました。
 - **IPC クライアントの非同期 I/O 化**: `timeoutMs > 0` の `SendIpcRequest` で `FILE_FLAG_OVERLAPPED` とイベント待機（タイムアウト時は `CancelIoEx`）を使うようにし、`Sleep(10)` によるポーリングを廃止しました。

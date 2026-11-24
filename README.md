@@ -124,6 +124,9 @@ The application icons are modeled on the character "Telephone Cat" (電話猫, D
 
 
 
+### v0.9.47
+- **Behavior tree engine fallback**: when a worker's attempt fails and its engine is then marked down (for example after `idle_stall`), the node now switches to the next approved candidate in `engines` that is up, even if the failure class is not listed in `switchEngineOn`. The `engineSwitched` event says "engine down". The node waits for recovery only when no later candidate can be used (before, it waited for the down engine while other candidates were healthy).
+
 ### v0.9.46
 - **Settings dialog (Appearance tab / Display scale)**: fixed a bug where the "Display scale (DPI)" controls appeared on every settings tab (including About), and repositioned them and the font dropdowns below the usage graph bar-size rows so they do not overlap.
 - **IPC client overlapped I/O**: `SendIpcRequest` with `timeoutMs > 0` now uses `FILE_FLAG_OVERLAPPED` with event waiting and `CancelIoEx` on timeout instead of `Sleep(10)` polling.
