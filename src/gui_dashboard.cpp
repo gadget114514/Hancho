@@ -590,12 +590,12 @@ static UiLanguage ParseLanguage(const std::string& code) {
 
 // Compact dashboard header / splitter layout constants
 constexpr int kHeaderKpiTop        = 6;
-constexpr int kHeaderKpiRow1Bottom = 26;
-constexpr int kHeaderKpiRow2Top    = 30;
-constexpr int kHeaderKpiBottom     = 50;
-constexpr int kToolbarTop          = 56;
+constexpr int kHeaderKpiRow1Bottom = 30;
+constexpr int kHeaderKpiRow2Top    = 34;
+constexpr int kHeaderKpiBottom     = 58;
+constexpr int kToolbarTop          = 64;
 constexpr int kToolbarH            = 24;
-constexpr int kListTop             = 98;
+constexpr int kListTop             = 106;
 constexpr int kSplitterH           = 6;
 constexpr int kRowSplitterH        = 6;
 constexpr int kMinRowListH         = 64;
@@ -626,7 +626,7 @@ static void UpdateDisplayScale(HWND hwnd, int dpi) {
         }
         if (dpi <= 0) dpi = 96;
     }
-    g_displayScale = 96.0f / static_cast<float>(dpi);
+    g_displayScale = static_cast<float>(dpi) / 96.0f;
 }
 
 static int ClampListFontPx(int px) {
@@ -2524,7 +2524,7 @@ static void DrawKpiCard(HDC hdc, const RECT& rc, const wchar_t* title, const std
     SelectObject(hdc, oldBrush);
     SelectObject(hdc, oldPen);
 
-    RECT rcStripe = {rc.left + 3, rc.top + 1, rc.right - 3, rc.top + 5};
+    RECT rcStripe = {rc.left + S(3), rc.top + S(1), rc.right - S(3), rc.top + S(5)};
     HBRUSH stripeBrush = CachedSolidBrush(accentColor);
     FillRect(hdc, &rcStripe, stripeBrush);
 
@@ -2532,7 +2532,7 @@ static void DrawKpiCard(HDC hdc, const RECT& rc, const wchar_t* title, const std
         int stripeLeft = static_cast<int>(rcStripe.left);
         int stripeRight = static_cast<int>(rcStripe.right);
         int stripeW = stripeRight - stripeLeft;
-        int bandW = (std::max)(14, stripeW / 3);
+        int bandW = (std::max)(S(14), stripeW / 3);
         int travel = stripeW + bandW;
         int bandLeft = stripeLeft - bandW + static_cast<int>(marqueePhase * travel);
         RECT rcBand = {(std::max)(stripeLeft, bandLeft), rcStripe.top,
@@ -2557,33 +2557,33 @@ static void DrawKpiCard(HDC hdc, const RECT& rc, const wchar_t* title, const std
         SelectObject(hdc, hFontUi);
         GetTextExtentPoint32W(hdc, subText.c_str(), static_cast<int>(subText.size()), &szSub);
         int cardW = rc.right - rc.left;
-        if (cardW - 16 - szVal.cx - szSub.cx >= 45) {
+        if (cardW - S(16) - szVal.cx - szSub.cx >= S(45)) {
             showSub = true;
         }
     }
 
-    int padX = 7;
+    int padX = S(7);
     int rightEdge = rc.right - padX;
 
     // Draw Value on the right (bold, g_theme.text)
-    RECT rcVal = {rightEdge - szVal.cx, rc.top + 2, rightEdge, rc.bottom - 1};
+    RECT rcVal = {rightEdge - szVal.cx, rc.top + S(3), rightEdge, rc.bottom - S(1)};
     SetTextColor(hdc, g_theme.text);
     SelectObject(hdc, hFontKpiVal);
     DrawTextW(hdc, value.c_str(), -1, &rcVal, DT_RIGHT | DT_VCENTER | DT_SINGLELINE);
 
-    int titleRight = rcVal.left - 4;
+    int titleRight = rcVal.left - S(4);
 
     // Draw subText to the left of value if space permits
     if (showSub) {
-        RECT rcSub = {rcVal.left - szSub.cx - 4, rc.top + 2, rcVal.left - 4, rc.bottom - 1};
+        RECT rcSub = {rcVal.left - szSub.cx - S(4), rc.top + S(3), rcVal.left - S(4), rc.bottom - S(1)};
         SetTextColor(hdc, g_theme.muted);
         SelectObject(hdc, hFontUi);
         DrawTextW(hdc, subText.c_str(), -1, &rcSub, DT_RIGHT | DT_VCENTER | DT_SINGLELINE);
-        titleRight = rcSub.left - 4;
+        titleRight = rcSub.left - S(4);
     }
 
     // Draw Title on the left (g_theme.muted, hFontUi, single line with ellipsis)
-    RECT rcTitle = {rc.left + padX, rc.top + 2, (std::max)(rc.left + padX + 10, static_cast<LONG>(titleRight)), rc.bottom - 1};
+    RECT rcTitle = {rc.left + padX, rc.top + S(3), (std::max)(rc.left + padX + S(10), static_cast<LONG>(titleRight)), rc.bottom - S(1)};
     SetTextColor(hdc, g_theme.muted);
     SelectObject(hdc, hFontUi);
     DrawTextW(hdc, title, -1, &rcTitle, DT_LEFT | DT_VCENTER | DT_SINGLELINE | DT_END_ELLIPSIS);
@@ -2981,11 +2981,11 @@ static void DrawDashboardCanvas(DashboardState* st, HDC hdcWindow, const RECT* u
     }
 
     // 1. Top KPI Cards (2 rows: Row 0 = Processes, Row 1 = Tasks)
-    int kpiMargin = 10;
-    int kpiGap = 7;
+    int kpiMargin = S(10);
+    int kpiGap = S(7);
     int numCols = 8;
     int availW = width - kpiMargin * 2 - kpiGap * (numCols - 1);
-    int cardW = (std::max)(90, availW / numCols);
+    int cardW = (std::max)(S(90), availW / numCols);
 
     // Partial repaints (the 60ms KPI bar animation) only touch the KPI strip; skip
     // the card drawing and tooltip refresh when it is outside the dirty region.
@@ -2993,8 +2993,8 @@ static void DrawDashboardCanvas(DashboardState* st, HDC hdcWindow, const RECT* u
                             RectsOverlap(rcBlit, st->rcKpiArea);
 
     for (int row = 0; kpiVisible && row < 2; ++row) {
-        int cardTop = (row == 0) ? kHeaderKpiTop : kHeaderKpiRow2Top;
-        int cardBottom = (row == 0) ? kHeaderKpiRow1Bottom : kHeaderKpiBottom;
+        int cardTop = S((row == 0) ? kHeaderKpiTop : kHeaderKpiRow2Top);
+        int cardBottom = S((row == 0) ? kHeaderKpiRow1Bottom : kHeaderKpiBottom);
 
         for (int col = 0; col < numCols; ++col) {
             int i = row * numCols + col;
@@ -9638,7 +9638,7 @@ static void ApplySplitterDragLayout(HWND hwnd, DashboardState* st, POINT pt) {
     }
 
     if (st->usageSplitterDragging) {
-        int usageTop = kHeaderKpiBottom + 2;
+        int usageTop = S(kHeaderKpiBottom + 2);
         int newH = pt.y - usageTop;
         if (newH < 60) newH = 60;
         if (newH > 400) newH = 400;
@@ -9655,7 +9655,7 @@ static void ApplySplitterDragLayout(HWND hwnd, DashboardState* st, POINT pt) {
         rcDirty.top -= 2; rcDirty.bottom += 2;
         InvalidateRect(hwnd, &rcDirty, FALSE);
 
-        RECT rcToolbar = {0, kToolbarTop, rcClient.right, st->processListTop};
+        RECT rcToolbar = {0, S(kToolbarTop), rcClient.right, st->processListTop};
         InvalidateRect(hwnd, &rcToolbar, FALSE);
         return;
     }
@@ -13524,6 +13524,29 @@ static void ApplyDashboardRefreshTimer(DashboardState* st) {
     WakeDashboardDataFetch(st);  // 102-4: worker picks up the new period on its next wait
 }
 
+// Recreates the header / KPI / toolbar UI fonts at the active display scale.
+static void ApplyUiFonts(DashboardState* st) {
+    if (!st) return;
+    auto makeFont = [](int px, int weight) {
+        return CreateFontW(-px, 0, 0, 0, weight, FALSE, FALSE, FALSE, DEFAULT_CHARSET,
+                           OUT_DEFAULT_PRECIS, CLIP_DEFAULT_PRECIS, CLEARTYPE_QUALITY, DEFAULT_PITCH, L"Segoe UI");
+    };
+    HFONT oldUi = st->hFontUi;
+    HFONT oldUiBold = st->hFontUiBold;
+    HFONT oldKpiVal = st->hFontKpiVal;
+    st->hFontUi = makeFont((std::max)(9, S(13)), FW_NORMAL);
+    st->hFontUiBold = makeFont((std::max)(9, S(13)), FW_BOLD);
+    st->hFontKpiVal = makeFont((std::max)(10, S(14)), FW_BOLD);
+    for (HWND ctrl : {st->hwndSearchProcEdit, st->hwndSearchTaskEdit, st->hwndTaskOriginCombo}) {
+        if (ctrl && st->hFontUi) {
+            SendMessageW(ctrl, WM_SETFONT, reinterpret_cast<WPARAM>(st->hFontUi), TRUE);
+        }
+    }
+    if (oldUi) DeleteObject(oldUi);
+    if (oldUiBold) DeleteObject(oldUiBold);
+    if (oldKpiVal) DeleteObject(oldKpiVal);
+}
+
 // Recreates the process / task list fonts at the configured sizes and applies them to the lists.
 static void ApplyListFonts(DashboardState* st) {
     if (!st) return;
@@ -13533,8 +13556,8 @@ static void ApplyListFonts(DashboardState* st) {
     };
     HFONT oldProc = st->hFontProcList;
     HFONT oldTask = st->hFontTaskList;
-    st->hFontProcList = makeFont(ClampListFontPx(S(st->processListFontPx)));
-    st->hFontTaskList = makeFont(ClampListFontPx(S(st->taskListFontPx)));
+    st->hFontProcList = makeFont((std::max)(9, S(ClampListFontPx(st->processListFontPx))));
+    st->hFontTaskList = makeFont((std::max)(9, S(ClampListFontPx(st->taskListFontPx))));
     if (st->hwndList) {
         SendMessageW(st->hwndList, WM_SETFONT, reinterpret_cast<WPARAM>(st->hFontProcList), TRUE);
         InvalidateRect(st->hwndList, nullptr, TRUE);
@@ -13689,6 +13712,7 @@ static void LoadShellConfig(DashboardState* st) {
     }
     st->displayScaleDpi = static_cast<int>(JsonGetInt(content, "display_scale_dpi", 0));
     UpdateDisplayScale(st->hwndMain, st->displayScaleDpi);
+    ApplyUiFonts(st);
     st->refreshIntervalMs = ClampRefreshIntervalMs(
         static_cast<int>(JsonGetInt(content, "refresh_interval_ms", kDefaultRefreshIntervalMs)));
     SettingsManager::Instance().SetTabGridRefreshIntervalMs(st->refreshIntervalMs);
@@ -16300,9 +16324,9 @@ static void UpdateSettingsDialogTexts(HWND hwnd) {
         SetWindowTextW(ds->lblDisplayMode, Tr(L"表示スケール (DPI):", L"Display scale (DPI):", L"Escala de visualización (DPI):"));
     }
     if (ds->cmbDisplayMode) {
-        static const int kDpiChoices[] = {0, 96, 120, 144};
+        static const int kDpiChoices[] = {0, 96, 120, 144, 192};
         int sel = 0;
-        for (int i = 0; i < 4; ++i) {
+        for (int i = 0; i < 5; ++i) {
             if (kDpiChoices[i] == ds->dash->displayScaleDpi) { sel = i; break; }
         }
         SendMessageW(ds->cmbDisplayMode, CB_SETCURSEL, sel, 0);
@@ -16748,6 +16772,7 @@ static LRESULT CALLBACK SettingsWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPAR
             SendMessageW(ds->cmbDisplayMode, CB_ADDSTRING, 0, (LPARAM)L"100% (96 DPI)");
             SendMessageW(ds->cmbDisplayMode, CB_ADDSTRING, 0, (LPARAM)L"125% (120 DPI)");
             SendMessageW(ds->cmbDisplayMode, CB_ADDSTRING, 0, (LPARAM)L"150% (144 DPI)");
+            SendMessageW(ds->cmbDisplayMode, CB_ADDSTRING, 0, (LPARAM)L"200% (192 DPI)");
 
             ds->lblProcFont = CreateWindowExW(0, L"STATIC", L"", WS_CHILD | WS_VISIBLE,
                 18, 546, 530, 20, hwnd, nullptr, hInst, nullptr);
@@ -17679,16 +17704,19 @@ static LRESULT CALLBACK SettingsWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPAR
                 return 0;
             }
             if (id == IDC_SET_DISPLAY_MODE && HIWORD(wParam) == CBN_SELCHANGE) {
-                static const int kDpiChoices[] = {0, 96, 120, 144};
+                static const int kDpiChoices[] = {0, 96, 120, 144, 192};
                 const int sel = static_cast<int>(SendMessageW(ds->cmbDisplayMode, CB_GETCURSEL, 0, 0));
-                if (sel >= 0 && sel < 4) {
+                if (sel >= 0 && sel < 5) {
                     ds->dash->displayScaleDpi = kDpiChoices[sel];
                     UpdateDisplayScale(ds->dash->hwndMain, ds->dash->displayScaleDpi);
+                    ApplyUiFonts(ds->dash);
                     ApplyListFonts(ds->dash);
+                    ds->dash->lastToolbarWidth = -1;
                     RECT rc = {};
                     if (GetClientRect(ds->dash->hwndMain, &rc)) {
                         LayoutControls(ds->dash, rc.right, rc.bottom);
                     }
+                    InvalidateRect(ds->dash->hwndMain, nullptr, TRUE);
                     RefreshDashboardData(ds->dash);
                     SaveShellConfig(ds->dash);
                 }
