@@ -138,6 +138,9 @@ New-Item -ItemType Junction -Path .claude\skills\hancho -Target (Resolve-Path sk
 
 
 
+### v0.9.47
+- **BT のエンジン切り替え**: worker の試行が失敗し、そのエンジンが停止（down）と判定されたとき（`idle_stall` の後など）、`switchEngineOn` にその失敗クラスがなくても、`engines` の次の承認済みで動いている候補に切り替えるようにしました。`engineSwitched` イベントには「engine down」と出ます。使える候補が残っていないときだけ復旧を待ちます（これまでは、ほかの候補が正常でも、止まったエンジンの復旧を待ち続けていました）。
+
 ### v0.9.44
 - **失敗分類の修正**: 普通の（LLM でない）ジョブの出力に、ジョブ JSON のキー `"on_permission_denied"` のような権限らしい識別子が含まれているだけで、`permission_denied` と判定されて `waitingForPermit` で止まる不具合を直しました。今は通常の失敗として扱われ、behavior tree のフォールバックの枝に進みます。ログ行による権限拒否の判定は単語単位で照合し、LLM ワーカーのジョブだけに適用します。
 

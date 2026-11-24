@@ -142,6 +142,9 @@ The application icons are modeled on the character "Telephone Cat" (電話猫, D
 
 
 
+### v0.9.47
+- **Behavior tree engine fallback**: when a worker's attempt fails and its engine is then marked down (for example after `idle_stall`), the node now switches to the next approved candidate in `engines` that is up, even if the failure class is not listed in `switchEngineOn`. The `engineSwitched` event says "engine down". The node waits for recovery only when no later candidate can be used (before, it waited for the down engine while other candidates were healthy).
+
 ### v0.9.44
 - **Failure classifier fix**: a plain (non-LLM) job whose output merely contains a permission-like identifier, such as the job JSON key `"on_permission_denied"`, is no longer classified as `permission_denied` and parked in `waitingForPermit`; it now fails normally so behavior trees take their fallback branch. The log-line permission rule matches whole words only and applies only to LLM worker jobs.
 
