@@ -697,7 +697,9 @@ void BehaviorTree::OnJobFinished(const std::string& jobId,
     // the same node with the next candidate.
     bool switched = false;
     if (!succeeded && !node.engineCandidates.empty()) {
-        switched = impl_->TrySwitchEngine(*this, node, failureClass, node.detail, nowMs, workerHandoff);
+        switched = impl_->TrySwitchEngine(*this, node, failureClass, node.detail, nowMs, workerHandoff) ||
+                   impl_->TrySwitchFromDownEngine(*this, node, failureClass, node.detail, nowMs,
+                                                  workerHandoff);
     }
     if (!switched && info.isWorker) {
         RecordWorkerAttempt(node, succeeded ? "succeeded" : "failed",
@@ -710,7 +712,7 @@ void BehaviorTree::OnJobFinished(const std::string& jobId,
         return;
     }
 
-    // No switchable candidate: keep the node waiting while the engine is down. The task
+    // No usable candidate left: keep the node waiting while the engine is down. The task
     // queue retries within maxAttempts; after that this node resumes once recovery probes OK.
     if (!succeeded && impl_->HoldForEngine(*this, node, node.lastEngine, node.lastModel, nowMs)) {
         return;

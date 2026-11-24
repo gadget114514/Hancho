@@ -350,8 +350,14 @@ bool BehaviorTree::Impl::AdvanceEngineCandidate(BehaviorTree& bt, BtNode& node,
                                                 const std::string& detail, int64_t nowMs,
                                                 const json& handoff,
                                                 const std::vector<std::string>& failSignature,
-                                                bool relaunch) {
-    if (!ShouldSwitchEngine(node, failureClass)) return false;
+                                                bool relaunch, const std::string& why,
+                                                bool ignoreSwitchEngineOn) {
+    if (ignoreSwitchEngineOn) {
+        if (node.engineCandidates.empty() ||
+            node.engineCandidateIndex + 1 >= static_cast<int>(node.engineCandidates.size())) return false;
+    } else if (!ShouldSwitchEngine(node, failureClass)) {
+        return false;
+    }
     const BtEngineChoice& from = node.engineCandidates[node.engineCandidateIndex];
 
     // 101-5: check switchLimits before advancing to the next candidate.
@@ -430,6 +436,7 @@ bool BehaviorTree::Impl::AdvanceEngineCandidate(BehaviorTree& bt, BtNode& node,
 
     std::string reason = from.engine + "/" + from.model + " -> " + to.engine + "/" + to.model;
     if (!failureClass.empty()) reason += " (" + failureClass + ")";
+    if (!why.empty()) reason += " " + why;
     if (!to.list.empty()) reason += " [" + to.list + "]";
     if (!to.entry.empty()) reason += " " + to.entry;
     if (!detail.empty()) reason += " " + BtVarPreview(detail, 120);
@@ -451,6 +458,30 @@ bool BehaviorTree::Impl::TrySwitchEngine(BehaviorTree& bt, BtNode& node,
                                          const json& handoff) {
     if (!failureClass.empty()) node.switchFailCounts[failureClass]++;
     return AdvanceEngineCandidate(bt, node, failureClass, detail, nowMs, handoff, {}, true);
+}
+
+// A failed attempt left its engine marked down. Waiting for that engine to recover while
+// another approved candidate is up only stalls the tree, so move on regardless of
+// switchEngineOn. The relaunch skips any further candidate that is down or not approved.
+bool BehaviorTree::Impl::TrySwitchFromDownEngine(BehaviorTree& bt, BtNode& node,
+                                                 const std::string& failureClass,
+                                                 const std::string& detail, int64_t nowMs,
+                                                 const json& handoff) {
+    if (!bt.health_ || node.engineCandidates.empty()) return false;
+    const int cur = node.engineCandidateIndex;
+    if (cur < 0 || cur >= static_cast<int>(node.engineCandidates.size())) return false;
+    const BtEngineChoice& from = node.engineCandidates[cur];
+    if (!bt.health_->IsDown(from.engine, from.model)) return false;
+    bool usable = false;
+    for (size_t i = static_cast<size_t>(cur) + 1; i < node.engineCandidates.size() && !usable; ++i) {
+        const BtEngineChoice& c = node.engineCandidates[i];
+        if (bt.catalog_ && !bt.catalog_->IsApprovedForList("worker", c.engine, c.model)) continue;
+        if (bt.health_->IsDown(c.engine, c.model)) continue;
+        usable = true;
+    }
+    if (!usable) return false;
+    return AdvanceEngineCandidate(bt, node, failureClass, detail, nowMs, handoff, {}, true,
+                                  "engine down", true);
 }
 
 void BehaviorTree::Impl::RunProbeLeaf(BehaviorTree& bt, BtNode& node, int64_t nowMs) {
