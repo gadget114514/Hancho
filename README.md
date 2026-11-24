@@ -124,6 +124,16 @@ The application icons are modeled on the character "Telephone Cat" (電話猫, D
 
 
 
+### v0.9.46
+- **Settings dialog (Appearance tab / Display scale)**: fixed a bug where the "Display scale (DPI)" controls appeared on every settings tab (including About), and repositioned them and the font dropdowns below the usage graph bar-size rows so they do not overlap.
+- **IPC client overlapped I/O**: `SendIpcRequest` with `timeoutMs > 0` now uses `FILE_FLAG_OVERLAPPED` with event waiting and `CancelIoEx` on timeout instead of `Sleep(10)` polling.
+- **Dashboard task list & triage performance**:
+  - Finished job rows are cached and reused when the job JSON, UI language, and triage state have not changed.
+  - Missing usage/stream file lookups are suppressed for 10 seconds, and located stream file paths are cached.
+  - Running job activity is read from the process snapshots fetched in the same refresh tick instead of calling IPC per row.
+  - Triage cards are referenced without per-row copying, triage polling is throttled to 10 seconds (or immediately when the task list changes or a triage action is taken), and unchanged responses skip UI updates.
+  - The task ListView updates incrementally (adding/removing trailing rows, updating only changed cells, and restoring selection on reorder) without `ListView_DeleteAllItems`, and column text widths are cached per font.
+
 ### v0.9.45
 - **Dashboard task list performance**: the list now updates only the cells that changed when the job order is unchanged, instead of rebuilding all rows on every tick. Column widths grow only when a changed cell needs it. Finished-job token / cost usage is computed once and cached (keyed by job ID and attempt count, recalculated on retry), and sort keys are computed once before sorting. The default dashboard refresh interval is now 5 seconds (user-configurable).
 - **OpenCode usage attribution**: when an opencode run has no `--model`, Hancho now reads the provider and model from opencode's own log for that session, so its tokens are no longer recorded under `(unknown)`. Session-title calls (`small=true`) are ignored.
