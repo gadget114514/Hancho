@@ -1,4 +1,5 @@
 #include "bt_manager.h"
+#include "bt_templates.h"
 #include "common.h"
 #include "nlohmann/json.hpp"
 
@@ -67,8 +68,8 @@ std::string FormatCompactNodeLine(const json& n, const std::string& role) {
     int runs = status.is_object() ? status.value("runs", 0) : 0;
     if (type == "retry" || type == "repeat") {
         ss << " (" << runs << '/' << n.value("max", 0) << ')';
-    } else if (type == "job" || type == "worker") {
-        if (type == "worker") {
+    } else if (type == "job" || type == "worker" || type == "exec" || type == "agent") {
+        if (type == "worker" || type == "agent") {
             std::string engine = StrField(n, "engine");
             std::string model = StrField(n, "model");
             if (!engine.empty() || !model.empty()) {
@@ -368,8 +369,10 @@ std::string BtManager::Start(const std::string& jsonText, bool paused) {
     json resp = BuildTreeResponseJson(*entryPtr->tree, TreeView::Summary);
     json warningArray = json::array();
     for (const auto& w : warnings) {
-        warningArray.push_back(json{{"path", w.path}, {"code", w.code},
-                                    {"message", w.message}, {"suggestion", w.suggestion}});
+        json wj{{"path", w.path}, {"code", w.code},
+                {"message", w.message}, {"suggestion", w.suggestion}};
+        if (!w.alias.empty()) wj["alias"] = w.alias;
+        warningArray.push_back(std::move(wj));
     }
     resp["warnings"] = std::move(warningArray);
     return resp.dump();
@@ -613,6 +616,270 @@ std::string BtManager::Pause(const std::string& id, bool paused) {
 
     PersistEntryLocked(entry);
     return BuildTreeResponseJson(*entry.tree, TreeView::Summary).dump();
+}
+
+namespace {
+
+void ReplaceAllInString(std::string& s, const std::string& from, const std::string& to) {
+    if (from.empty()) return;
+    size_t pos = 0;
+    while ((pos = s.find(from, pos)) != std::string::npos) {
+        s.replace(pos, from.size(), to);
+        pos += to.size();
+    }
+}
+
+void ApplyCardParamsToNode(nlohmann::json& node,
+                           const std::string& cardNumber,
+                           const std::string& cardTitle,
+                           const std::string& cardBody,
+                           const nlohmann::json& effectiveParams) {
+    if (!node.is_object()) return;
+    const std::string type = node.value("type", std::string());
+    const std::string id = node.value("id", std::string());
+
+    if (node.contains("summary") && node["summary"].is_string()) {
+        std::string s = node["summary"].get<std::string>();
+        ReplaceAllInString(s, "<card summary>", cardTitle);
+        ReplaceAllInString(s, "<task summary>", cardTitle);
+        node["summary"] = s;
+    }
+
+    if ((type == "agent" || type == "worker") && id == "impl") {
+        std::string prompt = node.value("prompt", std::string());
+        if (prompt.find("<card body>") != std::string::npos) {
+            ReplaceAllInString(prompt, "<card body>", cardBody);
+        } else if (prompt.find("<agent prompt>") != std::string::npos) {
+            ReplaceAllInString(prompt, "<agent prompt>", cardBody);
+        } else if (prompt.find("<worker prompt>") != std::string::npos) {
+            ReplaceAllInString(prompt, "<worker prompt>", cardBody);
+        } else {
+            prompt = cardBody;
+        }
+        node["prompt"] = prompt;
+
+        if (effectiveParams.contains("engines") && effectiveParams["engines"].is_array() &&
+            !effectiveParams["engines"].empty()) {
+            node["engines"] = effectiveParams["engines"];
+        } else {
+            node.erase("engines");
+        }
+        if (!node.contains("engines") || !node["engines"].is_array() || node["engines"].size() < 2) {
+            node.erase("switchEngineOn");
+        }
+    }
+
+    if (type == "escalate") {
+        node["question"] = "Card " + cardNumber + " (" + cardTitle + ") failed. What should the supervisor decide?";
+    }
+
+    if (node.contains("child") && node["child"].is_object()) {
+        ApplyCardParamsToNode(node["child"], cardNumber, cardTitle, cardBody, effectiveParams);
+    }
+
+    if (node.contains("children") && node["children"].is_array()) {
+        nlohmann::json filtered = nlohmann::json::array();
+        for (auto& ch : node["children"]) {
+            if (!ch.is_object()) continue;
+            const std::string chType = ch.value("type", std::string());
+            const std::string chId = ch.value("id", std::string());
+            if ((chType == "exec" || chType == "job") && chId == "build") {
+                const std::string buildCmd = effectiveParams.value("build", std::string());
+                if (buildCmd.empty()) continue;
+                ch["command"] = buildCmd;
+            } else if ((chType == "exec" || chType == "job") && chId == "test") {
+                const std::string testCmd = effectiveParams.value("test", std::string());
+                if (testCmd.empty()) continue;
+                ch["command"] = testCmd;
+            } else {
+                ApplyCardParamsToNode(ch, cardNumber, cardTitle, cardBody, effectiveParams);
+            }
+            filtered.push_back(std::move(ch));
+        }
+        node["children"] = std::move(filtered);
+    }
+}
+
+bool BuildCardBtDefinition(const std::string& taskId,
+                           const nlohmann::json& taskCardDefaults,
+                           const nlohmann::json& showDoc,
+                           nlohmann::json& outBtDef,
+                           std::string& outBtId,
+                           std::string& outDirId,
+                           std::string& outError) {
+    outError.clear();
+    const nlohmann::json dir = showDoc.value("direction", nlohmann::json::object());
+    const nlohmann::json card = showDoc.value("card", nlohmann::json::object());
+    outDirId = dir.value("id", std::string());
+    const std::string number = card.value("number", std::string());
+    const std::string title = card.value("title", dir.value("title", std::string()));
+    const std::string body = card.value("body", std::string());
+    std::string tmplName = card.value("template", std::string("card"));
+    if (tmplName.empty()) tmplName = "card";
+
+    nlohmann::json btDef = BtTemplateDefinition(tmplName);
+    if (btDef.is_null() || !btDef.is_object()) {
+        outError = "unknown bt template: " + tmplName;
+        return false;
+    }
+
+    nlohmann::json effectiveParams = nlohmann::json::object();
+    if (taskCardDefaults.is_object()) {
+        for (auto it = taskCardDefaults.begin(); it != taskCardDefaults.end(); ++it) {
+            effectiveParams[it.key()] = it.value();
+        }
+    }
+    if (card.contains("params") && card["params"].is_object()) {
+        const auto& cp = card["params"];
+        for (auto it = cp.begin(); it != cp.end(); ++it) {
+            effectiveParams[it.key()] = it.value();
+        }
+    }
+
+    outBtId = "card-" + taskId + "-" + number;
+    btDef["id"] = outBtId;
+    btDef["taskId"] = taskId;
+    btDef["directionId"] = outDirId;
+    btDef["summary"] = number + ": " + title;
+    btDef["intent"] = title;
+    if (effectiveParams.contains("cwd") && effectiveParams["cwd"].is_string() &&
+        !effectiveParams["cwd"].get<std::string>().empty()) {
+        btDef["cwd"] = effectiveParams["cwd"];
+    }
+    if (btDef.contains("root") && btDef["root"].is_object()) {
+        ApplyCardParamsToNode(btDef["root"], number, title, body, effectiveParams);
+    }
+    outBtDef = std::move(btDef);
+    return true;
+}
+
+} // namespace
+
+std::string BtManager::CardRun(const std::string& taskId,
+                               const std::string& number,
+                               bool ready,
+                               int maxConcurrent,
+                               bool force,
+                               const std::string& originJson) {
+    std::string err;
+    if (!tqm_.ValidateTaskActive(taskId, err)) {
+        return MakeErrorJson(err);
+    }
+    nlohmann::json taskRec;
+    if (!tqm_.TaskGet(taskId, taskRec)) {
+        return MakeErrorJson("task not found: " + taskId);
+    }
+    const nlohmann::json cardDefaults =
+        (taskRec.contains("cardDefaults") && taskRec["cardDefaults"].is_object())
+            ? taskRec["cardDefaults"]
+            : nlohmann::json::object();
+
+    auto startOneCard = [&](const nlohmann::json& showDoc, nlohmann::json& outStarted,
+                            std::string& outErr) -> bool {
+        nlohmann::json btDef;
+        std::string btId;
+        std::string dirId;
+        if (!BuildCardBtDefinition(taskId, cardDefaults, showDoc, btDef, btId, dirId, outErr)) {
+            return false;
+        }
+        if (!originJson.empty()) {
+            tqm_.SetBtOrigin(btId, originJson);
+        }
+        const json startResp = json::parse(Start(btDef.dump(), false), nullptr, false);
+        if (!startResp.is_object() || !startResp.value("ok", false)) {
+            outErr = startResp.is_object() ? startResp.value("error", std::string("failed to start card BT"))
+                                           : std::string("failed to start card BT");
+            return false;
+        }
+        const std::string num = showDoc["card"].value("number", std::string());
+        outStarted = {
+            {"number", num},
+            {"directionId", dirId},
+            {"btId", btId},
+            {"state", startResp.value("state", std::string("running"))}
+        };
+        return true;
+    };
+
+    if (!ready) {
+        if (number.empty()) {
+            return MakeErrorJson("card number or --ready is required");
+        }
+        const std::string showRaw = tqm_.CardShow(number, taskId, err);
+        const json showDoc = json::parse(showRaw, nullptr, false);
+        if (!showDoc.is_object() || !showDoc.value("ok", false)) {
+            return showRaw.empty() ? MakeErrorJson(err) : showRaw;
+        }
+        const json dir = showDoc.value("direction", json::object());
+        const json status = showDoc.value("status", json::object());
+        const std::string state = status.value("state", std::string());
+        if (dir.value("kind", std::string()) != "card" || state != "planned") {
+            return MakeErrorJson("card '" + number + "' can only be run while planned (current state: " + state + ")");
+        }
+        const json waiting = showDoc.value("waitingFor", json::array());
+        if (!force && waiting.is_array() && !waiting.empty()) {
+            std::string deps;
+            for (size_t i = 0; i < waiting.size(); ++i) {
+                if (i > 0) deps += ", ";
+                deps += waiting[i].get<std::string>();
+            }
+            return MakeErrorJson("card '" + number + "' is waiting on dependencies: " + deps);
+        }
+        json startedItem;
+        if (!startOneCard(showDoc, startedItem, err)) {
+            return MakeErrorJson(err);
+        }
+        startedItem["ok"] = true;
+        startedItem["taskId"] = taskId;
+        return startedItem.dump();
+    }
+
+    if (!number.empty()) {
+        return MakeErrorJson("cannot specify both card number and --ready");
+    }
+    if (maxConcurrent < 1) {
+        return MakeErrorJson("max must be >= 1");
+    }
+    const std::string listRaw = tqm_.CardList(taskId, err);
+    const json listDoc = json::parse(listRaw, nullptr, false);
+    if (!listDoc.is_object() || !listDoc.value("ok", false)) {
+        return listRaw.empty() ? MakeErrorJson(err) : listRaw;
+    }
+    const json cards = listDoc.value("cards", json::array());
+    int activeCount = 0;
+    for (const auto& c : cards) {
+        const std::string st = c.value("state", std::string());
+        if (st == "running" || st == "waitingForLlm" || st == "paused") {
+            ++activeCount;
+        }
+    }
+
+    json started = json::array();
+    for (const auto& c : cards) {
+        if (activeCount + static_cast<int>(started.size()) >= maxConcurrent) break;
+        if (c.value("state", std::string()) != "planned") continue;
+        const json waiting = c.value("waitingFor", json::array());
+        if (!force && waiting.is_array() && !waiting.empty()) continue;
+
+        const std::string num = c.value("number", std::string());
+        const json showDoc = json::parse(tqm_.CardShow(num, taskId, err), nullptr, false);
+        if (!showDoc.is_object() || !showDoc.value("ok", false)) {
+            return MakeErrorJson(err.empty() ? ("failed to load card " + num) : err);
+        }
+        json startedItem;
+        if (!startOneCard(showDoc, startedItem, err)) {
+            return MakeErrorJson(err);
+        }
+        started.push_back(std::move(startedItem));
+    }
+
+    return json{
+        {"ok", true},
+        {"taskId", taskId},
+        {"started", started},
+        {"activeCount", activeCount + static_cast<int>(started.size())},
+        {"max", maxConcurrent}
+    }.dump();
 }
 
 } // namespace pc

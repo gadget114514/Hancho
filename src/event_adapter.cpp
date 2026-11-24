@@ -402,6 +402,9 @@ LlmStreamEvent LlmStreamEventFromHanchoV1(const nlohmann::json& event) {
     } else if (kind == "error") {
         ev.type = "error";
         ev.content = StringField(data, "message");
+        ev.errorClass = StringField(data, "class");
+        ev.errorCode = StringField(data, "code");
+        ev.httpStatus = static_cast<int>(I64Field(data, "httpStatus"));
     }
     return ev;
 }

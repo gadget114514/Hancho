@@ -636,7 +636,7 @@ void BehaviorTree::OnJobFinished(const std::string& jobId,
     // worker's engine candidate for its next run when `switchEngineOn` threshold is met.
     if (!succeeded && !info.isWorker && !node.blame.empty() && !IsEnvFailureClass(failureClass)) {
         BtNode* blamed = impl_->FindNode(node.blame, id_);
-        if (blamed && blamed->type == "worker") {
+        if (blamed && blamed->type == "agent") {
             std::vector<std::string> sig = BuildJobFailSignature(node, info, cwd_, logFile, logTail);
             std::string fixClass = "fix_failed";
             if (!sig.empty() && !blamed->recentFailSignatures.empty()) {

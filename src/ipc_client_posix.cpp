@@ -5,6 +5,8 @@
 #include "common.h"
 #include "platform/platform.h"
 
+#include <atomic>
+#include <cctype>
 #include <cerrno>
 #include <cstdlib>
 #include <cstring>
@@ -78,6 +80,37 @@ void SpawnCore() {
 
 } // namespace
 
+static std::atomic<bool> g_noAutoStart{false};
+
+void SetNoAutoStart(bool noAutoStart) {
+    g_noAutoStart.store(noAutoStart);
+}
+
+bool GetNoAutoStart() {
+    return g_noAutoStart.load();
+}
+
+bool HasAutoStartEnvVar() {
+    const char* v = std::getenv("HANCHO_AUTOSTART");
+    return v != nullptr && !Trim(v).empty();
+}
+
+bool ShouldSuppressDialogs() {
+    if (HasAutoStartEnvVar()) return true;
+    const char* v = std::getenv("HANCHO_NO_DIALOGS");
+    return v != nullptr && Trim(v) == "1";
+}
+
+AutoStartMode ResolveAutoStartMode(bool noAutoStartFlag, const char* envValue) {
+    if (noAutoStartFlag) return AutoStartMode::Off;
+    const char* raw = envValue ? envValue : std::getenv("HANCHO_AUTOSTART");
+    std::string val = raw ? Trim(raw) : "";
+    for (char& ch : val) ch = static_cast<char>(std::tolower(static_cast<unsigned char>(ch)));
+    if (val == "headless") return AutoStartMode::Headless;
+    if (val == "off") return AutoStartMode::Off;
+    return AutoStartMode::Gui;
+}
+
 bool SendIpcRequest(const std::string& reqJson, std::string& outRespJson, std::string& outError,
                      bool autoStartGui, int timeoutMs, bool* outTimedOut) {
     if (outTimedOut) *outTimedOut = false;
@@ -85,6 +118,10 @@ bool SendIpcRequest(const std::string& reqJson, std::string& outRespJson, std::s
     std::string err;
     auto conn = platform::ConnectIpc(endpoint, 0, err);
     if (!conn && autoStartGui) {
+        if (ResolveAutoStartMode() == AutoStartMode::Off) {
+            outError = "Hancho core is not running (auto-start disabled). Start it with: Hancho --headless";
+            return false;
+        }
         // A core holding the instance lock is still starting: wait, don't spawn another.
         if (!IsHanchoRunningForDataDirWide()) SpawnCore();
         for (int attempt = 0; attempt < 300 && !conn; ++attempt) {

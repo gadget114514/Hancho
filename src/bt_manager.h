@@ -104,6 +104,12 @@ public:
     // its virtual rows (task group and planned leaves) disappear for good.
     std::string Remove(const std::string& id);
     std::string Pause(const std::string& id, bool paused);
+    std::string CardRun(const std::string& taskId,
+                        const std::string& number,
+                        bool ready,
+                        int maxConcurrent,
+                        bool force,
+                        const std::string& originJson = "");
 
     static int64_t NowEpochMs();
     static std::wstring GetBtDirectoryWide();

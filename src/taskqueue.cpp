@@ -25,6 +25,19 @@
 #include <unordered_set>
 #include <stdexcept>
 #include <iomanip>
+#ifdef _WIN32
+#ifndef WIN32_LEAN_AND_MEAN
+#define WIN32_LEAN_AND_MEAN
+#endif
+#include <windows.h>
+#else
+#include <signal.h>
+#include <poll.h>
+#include <unistd.h>
+#ifdef __linux__
+#include <sys/syscall.h>
+#endif
+#endif
 
 namespace pc {
 
@@ -1462,6 +1475,42 @@ TaskQueueFailureDiagnostic ClassifyTaskQueueFailure(const TaskQueueFailureInput&
         }
     }
 
+    // 4.7 (102-2): a structured class from the error object (HTTP status or error code, set by
+    // llm_stream). It outranks the log-wording rules below, so a token expiry is not misread as
+    // a quota line elsewhere in the log. doc/llm-error-class-cards.md has the mapping.
+    {
+        const nlohmann::json* structured = FindLastEvent(in.events, [&](const nlohmann::json& ev) {
+            if (ev.value("kind", std::string()) != "error") return false;
+            const std::string c = EventDataString(ev, "class");
+            return c == "auth_error" || c == "rate_limited" || c == "provider_down";
+        });
+        if (structured) {
+            const std::string cls = EventDataString(*structured, "class");
+            const std::string message = EventDataString(*structured, "message");
+            const std::string code = EventDataString(*structured, "code");
+            const int64_t httpStatus = EventDataInt(*structured, "httpStatus", 0);
+            d.failureClass = cls;
+            d.confidence = "high";
+            d.detail["rule"] = "structured." + cls;
+            if (!message.empty()) d.detail["message"] = message;
+            if (!code.empty()) d.detail["code"] = code;
+            if (httpStatus > 0) d.detail["httpStatus"] = httpStatus;
+            if (cls == "auth_error") {
+                d.summary = message.empty() ? "Authentication failed." : "Authentication failed: " + message;
+                d.suggestedAction = "human";
+            } else if (cls == "rate_limited") {
+                d.summary = "The provider rejected the request for rate or quota; wait before retrying.";
+                d.suggestedAction = "retry_after";
+            } else {
+                d.summary = "The provider is overloaded or unavailable; retry later.";
+                d.suggestedAction = "retry";
+            }
+            AddEventEvidence(d, in.eventsFile, EventSeqOf(*structured));
+            EnsureEvidence(d, in);
+            return d;
+        }
+    }
+
     // 5. rate_limited: a rejected rate_limit event, or an equivalent error/log line.
     if (rateEvent || rateError) {
         const nlohmann::json& ev = rateEvent ? *rateEvent : *rateError;
@@ -2451,6 +2500,8 @@ static TaskQueueJob ParseJob(const std::string& j) {
     if (HasJsonKey(j, "origin")) {
         job.origin = TaskQueueManager::ParseOriginJson(JsonFieldObj(j, "origin", ""));
     }
+    const int64_t parsedRev = JsonFieldInt(j, "rev", 0);
+    job.rev = parsedRev > 0 ? static_cast<uint64_t>(parsedRev) : 0;
     return job;
 }
 
@@ -2518,6 +2569,7 @@ TaskQueueManager::TaskQueueManager() {
     LoadQueues();
     {
         std::lock_guard<std::mutex> lock(mutex_);
+        InitRevLocked();
         for (auto& [name, tq] : queues_) {
             bool changed = false;
             for (auto& job : tq.jobs) {
@@ -2549,6 +2601,7 @@ TaskQueueManager::TaskQueueManager() {
                 } else {
                     job.state = "pending";
                     job.updatedAt = GetCurrentTimestampStr();
+                    MarkJobChangedLocked(job);
                     tq.version++;
                 }
                 changed = true;
@@ -2573,6 +2626,30 @@ void TaskQueueManager::ShutdownTaskQueueManager() {
     if (schedulerThread_.joinable()) {
         schedulerThread_.join();
     }
+    if (clientWatchRunning_.exchange(false)) {
+        {
+            std::lock_guard<std::mutex> lock(mutex_);
+            WakeClientWatchLocked();
+        }
+        if (clientWatchThread_.joinable()) {
+            clientWatchThread_.join();
+        }
+    }
+    std::lock_guard<std::mutex> lock(mutex_);
+    for (auto& w : clientWatches_) {
+#ifdef _WIN32
+        if (w.handle) { CloseHandle(static_cast<HANDLE>(w.handle)); w.handle = nullptr; }
+#else
+        if (w.pidfd >= 0) { close(w.pidfd); w.pidfd = -1; }
+#endif
+    }
+    clientWatches_.clear();
+#ifdef _WIN32
+    if (clientWatchWakeEvent_) {
+        CloseHandle(static_cast<HANDLE>(clientWatchWakeEvent_));
+        clientWatchWakeEvent_ = nullptr;
+    }
+#endif
 }
 
 void TaskQueueManager::SetProcessManager(ProcessManager* pm) {
@@ -2600,6 +2677,11 @@ void TaskQueueManager::SetJobFinishedCallback(JobFinishedCallback cb) {
 void TaskQueueManager::SetBtRetryCallback(BtRetryCallback cb) {
     std::lock_guard<std::mutex> lock(mutex_);
     btRetryCb_ = std::move(cb);
+}
+
+void TaskQueueManager::SetBtCancelCallback(BtCancelCallback cb) {
+    std::lock_guard<std::mutex> lock(mutex_);
+    btCancelCb_ = std::move(cb);
 }
 
 void TaskQueueManager::SetSuspendCallback(SuspendCallback cb) {
@@ -2955,6 +3037,7 @@ void TaskQueueManager::CheckSuspendWhenDone() {
                 job.shutdownWhenDone = false;
                 job.shutdownDelaySec = 0;
                 job.updatedAt = GetCurrentTimestampStr();
+                MarkJobChangedLocked(job);
                 if (fireJob.empty()) {
                     fireJob = job.id;
                     fireState = job.state;
@@ -3002,6 +3085,7 @@ std::string TaskQueueManager::SetJobPowerWhenDone(const std::string& id, const s
     job->shutdownWhenDone = normalized == "shutdown";
     job->shutdownDelaySec = normalized == "shutdown" ? delaySec : 0;
     job->updatedAt = GetCurrentTimestampStr();
+    MarkJobChangedLocked(*job);
     SaveQueue(*tq);
     powerPhase_.clear();
     powerDueMs_ = 0;
@@ -3037,6 +3121,7 @@ std::string TaskQueueManager::ClearPowerWhenDone(std::string& outError) {
                 job.shutdownWhenDone = false;
                 job.shutdownDelaySec = 0;
                 job.updatedAt = GetCurrentTimestampStr();
+                MarkJobChangedLocked(job);
                 ++cleared;
                 changed = true;
             }
@@ -3219,7 +3304,7 @@ void TaskQueueManager::LogAttemptToTaskLocked(const TaskQueueJob& job, const std
         }
     }
     TaskLog(job.taskId, gaveUp ? "job_failed" : "attempt_finished", job.id, "", text.str(), "", &extra);
-    if ((eventType == "jobSucceeded" || gaveUp) && !job.directionId.empty() && !job.taskId.empty()) {
+    if ((eventType == "jobSucceeded" || gaveUp) && !job.directionId.empty()) {
         MaybeLogDirectionFinishedLocked(job.directionId, job.taskId);
     }
 }
@@ -3241,6 +3326,71 @@ void TaskQueueManager::LoadQueues() {
         queues_[tq.name] = tq;
     }
     jobIndexDirty_ = true;
+}
+
+void TaskQueueManager::InitRevLocked() {
+    uint64_t lastRev = 0;
+    const std::wstring revPath = PathJoinWide(GetEffectiveDataDirectoryWide(), L"taskqueue_rev.json");
+    const std::string revText = ReadFileUtf8Wide(revPath);
+    if (!revText.empty()) {
+        nlohmann::json doc = nlohmann::json::parse(revText, nullptr, false);
+        if (doc.is_object() && doc.contains("last_rev") && doc["last_rev"].is_number_unsigned()) {
+            lastRev = doc["last_rev"].get<uint64_t>();
+        }
+    }
+    uint64_t maxJobRev = 0;
+    for (const auto& [name, tq] : queues_) {
+        (void)name;
+        for (const auto& job : tq.jobs) {
+            if (job.rev > maxJobRev) maxJobRev = job.rev;
+        }
+    }
+    const uint64_t maxTaskRev = taskStore_.MaxRev();
+    const uint64_t maxDirRev = directionStore_.MaxRev();
+    currentRev_ = std::max({lastRev, maxJobRev, maxTaskRev, maxDirRev});
+}
+
+void TaskQueueManager::PersistLastRevLocked() {
+    const std::wstring revPath = PathJoinWide(GetEffectiveDataDirectoryWide(), L"taskqueue_rev.json");
+    WriteFileAtomicWide(revPath, "{\"last_rev\":" + std::to_string(currentRev_) + "}\n");
+}
+
+uint64_t TaskQueueManager::BumpRevLocked() {
+    ++currentRev_;
+    PersistLastRevLocked();
+    return currentRev_;
+}
+
+void TaskQueueManager::MarkJobChangedLocked(TaskQueueJob& job) {
+    job.rev = BumpRevLocked();
+    job.cachedJsonFull_.clear();
+    job.cachedJsonNoInstr_.clear();
+}
+
+void TaskQueueManager::RecordJobTombstoneLocked(const std::string& jobId) {
+    if (jobId.empty()) return;
+    const uint64_t delRev = BumpRevLocked();
+    if (maxTombstones_ == 0) {
+        if (delRev > evictedBeforeRev_) evictedBeforeRev_ = delRev;
+        return;
+    }
+    while (tombstones_.size() >= maxTombstones_) {
+        if (tombstones_.front().rev > evictedBeforeRev_) {
+            evictedBeforeRev_ = tombstones_.front().rev;
+        }
+        tombstones_.pop_front();
+    }
+    tombstones_.push_back({jobId, delRev});
+}
+
+uint64_t TaskQueueManager::GetCurrentRev() const {
+    std::lock_guard<std::mutex> lock(mutex_);
+    return currentRev_;
+}
+
+void TaskQueueManager::SetMaxTombstonesForTest(size_t maxTombstones) {
+    std::lock_guard<std::mutex> lock(mutex_);
+    maxTombstones_ = maxTombstones;
 }
 
 void TaskQueueManager::SaveQueue(const TaskQueue& tq) {
@@ -3366,6 +3516,10 @@ static std::string TimingFeedbackToJson(const TaskQueueJob& job) {
 }
 
 std::string TaskQueueManager::JobToJson(const TaskQueueJob& job, bool includeInstructions) const {
+    if (job.state != "pending" || (job.holdReason.empty() && job.retryAtMs == 0)) {
+        const std::string& cached = includeInstructions ? job.cachedJsonFull_ : job.cachedJsonNoInstr_;
+        if (!cached.empty()) return cached;
+    }
     std::ostringstream oss;
     oss << "{\"id\":\"" << JsonEscape(job.id) << "\""
         << ",\"taskqueue\":\"" << JsonEscape(job.taskqueue) << "\""
@@ -3456,8 +3610,13 @@ std::string TaskQueueManager::JobToJson(const TaskQueueJob& job, bool includeIns
     if (!job.origin.empty()) oss << ",\"origin\":" << OriginToJson(job.origin);
     std::string tf = TimingFeedbackToJson(job);
     if (!tf.empty()) oss << ",\"timing_feedback\":" << tf;
-    oss << "}";
-    return oss.str();
+    oss << ",\"rev\":" << job.rev << "}";
+    std::string result = oss.str();
+    if (hold.empty()) {
+        if (includeInstructions) job.cachedJsonFull_ = result;
+        else job.cachedJsonNoInstr_ = result;
+    }
+    return result;
 }
 
 TaskQueueOrigin TaskQueueManager::ParseOriginJson(const std::string& json) {
@@ -3663,6 +3822,19 @@ std::string TaskQueueManager::TaskSummaryJsonLocked(const TaskQueueJob& job) con
     const nlohmann::json status = TaskStateLocked(effectiveTaskId);
     taskObj["state"] = status.value("state", std::string());
     return taskObj.dump();
+}
+
+std::string TaskQueueManager::TaskSummaryJsonCachedLocked(const TaskQueueJob& job) const {
+    if (taskSummaryCacheRev_ != currentRev_) {
+        taskSummaryCache_.clear();
+        taskSummaryCacheRev_ = currentRev_;
+    }
+    const std::string effectiveTaskId = job.taskId.empty() ? job.id : job.taskId;
+    auto it = taskSummaryCache_.find(effectiveTaskId);
+    if (it != taskSummaryCache_.end()) return it->second;
+    std::string json = TaskSummaryJsonLocked(job);
+    taskSummaryCache_.emplace(effectiveTaskId, json);
+    return json;
 }
 
 bool TaskQueueManager::IsDepSatisfied(const TaskQueueJob& dep, const std::string& on) {
@@ -4758,7 +4930,8 @@ std::string TaskQueueManager::TaskQueueAdd(const std::string& taskqueue, const s
             {"origin", originRecord},
             {"title", dirTitle},
             {"closed", nullptr},
-            {"removedJobs", nlohmann::json::array()}
+            {"removedJobs", nlohmann::json::array()},
+            {"rev", BumpRevLocked()}
         };
         std::string dirErr;
         if (directionStore_.Create(dirRecord, dirErr)) {
@@ -4770,7 +4943,10 @@ std::string TaskQueueManager::TaskQueueAdd(const std::string& taskqueue, const s
         }
     }
 
-    for (auto& j : newJobs) tq.jobs.push_back(j);
+    for (auto& j : newJobs) {
+        MarkJobChangedLocked(j);
+        tq.jobs.push_back(j);
+    }
     for (auto& j : tq.jobs) {
         if (j.num <= 0) j.num = nextJobNum_++;
     }
@@ -4784,6 +4960,7 @@ std::string TaskQueueManager::TaskQueueAdd(const std::string& taskqueue, const s
         if (!head || !headQueue) continue;
         head->supersededBy = link.newId;
         head->updatedAt = GetCurrentTimestampStr();
+        MarkJobChangedLocked(*head);
         if (headQueue != &queues_[taskqueue]) SaveQueue(*headQueue);
     }
     ReevaluateAll();
@@ -4912,6 +5089,7 @@ std::string TaskQueueManager::AddBtJob(const std::string& taskqueue, const std::
         return BuildError(outError);
     }
     job.num = nextJobNum_++;
+    MarkJobChangedLocked(job);
     tq.jobs.push_back(job);
     queues_[taskqueue] = tq;
     jobIndexDirty_ = true;
@@ -4924,13 +5102,90 @@ std::string TaskQueueManager::AddBtJob(const std::string& taskqueue, const std::
            "\",\"added\":[\"" + JsonEscape(job.id) + "\"]}";
 }
 
+namespace {
+
+bool IsFinishedJobState(const std::string& state) {
+    return state == "succeeded" || state == "cancelled" || state == "closed" || state == "takenOver";
+}
+
+bool IsFinishedTaskState(const std::string& state) {
+    return state == "succeeded" || state == "cancelled" || state == "closed";
+}
+
+char AsciiLowerChar(unsigned char c) {
+    return (c >= 'A' && c <= 'Z') ? static_cast<char>(c + ('a' - 'A')) : static_cast<char>(c);
+}
+
+bool ContainsCaseInsensitive(const std::string& haystack, const std::string& needle) {
+    if (needle.empty()) return true;
+    if (haystack.size() < needle.size()) return false;
+    auto it = std::search(
+        haystack.begin(), haystack.end(),
+        needle.begin(), needle.end(),
+        [](char a, char b) {
+            return AsciiLowerChar(static_cast<unsigned char>(a)) ==
+                   AsciiLowerChar(static_cast<unsigned char>(b));
+        });
+    return it != haystack.end();
+}
+
+void ParseBeforeCursor(const std::string& before, std::string& outTs, std::string& outId) {
+    const size_t pos = before.rfind('|');
+    if (pos == std::string::npos) {
+        outTs = before;
+        outId.clear();
+    } else {
+        outTs = before.substr(0, pos);
+        outId = before.substr(pos + 1);
+    }
+}
+
+std::string MakeBeforeCursor(const std::string& ts, const std::string& id) {
+    return ts + "|" + id;
+}
+
+bool IsOlderThanCursor(const std::string& ts, const std::string& id,
+                       const std::string& cursorTs, const std::string& cursorId) {
+    if (ts != cursorTs) return ts < cursorTs;
+    return id < cursorId;
+}
+
+} // namespace
+
 std::string TaskQueueManager::TaskQueueList(const std::string& taskqueue, const std::string& state, int64_t sinceSec, std::string& outError,
                                             const std::string& origin, const std::string& btId, bool includeHidden,
-                                            const std::string& taskId) {
+                                            const std::string& taskId, int64_t finishedLimit,
+                                            const std::string& before, const std::string& query) {
     outError.clear();
+    const int64_t effectiveLimit = (finishedLimit < 0) ? GetTaskListRecentCount() : finishedLimit;
     std::lock_guard<std::mutex> lock(mutex_);
-    struct ListedJob { std::string queue; TaskQueueJob job; };
-    std::vector<ListedJob> listed;
+
+    struct TaskSearchInfo { std::string title; std::string intent; };
+    struct DirSearchInfo { std::string title; std::string cardTitle; };
+    std::unordered_map<std::string, TaskSearchInfo> taskSearch;
+    std::unordered_map<std::string, DirSearchInfo> dirSearch;
+    if (!query.empty()) {
+        for (const auto& rec : taskStore_.All()) {
+            const std::string tid = rec.value("id", std::string());
+            if (!tid.empty()) {
+                taskSearch[tid] = {rec.value("title", std::string()), rec.value("intent", std::string())};
+            }
+        }
+        for (const auto& rec : directionStore_.All()) {
+            const std::string did = rec.value("id", std::string());
+            if (!did.empty()) {
+                std::string cardTitle;
+                if (rec.contains("card") && rec["card"].is_object()) {
+                    cardTitle = rec["card"].value("title", std::string());
+                }
+                dirSearch[did] = {rec.value("title", std::string()), std::move(cardTitle)};
+            }
+        }
+    }
+
+    struct ListedJob { std::string queue; TaskQueueJob job; std::string finishedAt; };
+    std::vector<ListedJob> unfinished;
+    std::vector<ListedJob> finished;
     const int64_t cutoff = GetNowEpochSec() - sinceSec;
     for (const auto& [name, tq] : queues_) {
         if (!taskqueue.empty() && name != taskqueue) continue;
@@ -4939,21 +5194,74 @@ std::string TaskQueueManager::TaskQueueList(const std::string& taskqueue, const 
             if (!state.empty() && job.state != state) continue;
             if (!origin.empty() && !OriginMatches(job.origin, origin)) continue;
             if (!btId.empty() && job.bt.id != btId) continue;
-            if (!taskId.empty()) {
-                const std::string effectiveTask = job.taskId.empty() ? job.id : job.taskId;
-                if (effectiveTask != taskId) continue;
-            }
+            const std::string effectiveTask = job.taskId.empty() ? job.id : job.taskId;
+            if (!taskId.empty() && effectiveTask != taskId) continue;
             if (sinceSec > 0) {
                 const int64_t ts = ParseTimestampStrToEpoch(job.updatedAt);
                 if (ts <= 0 || ts < cutoff) continue;
             }
-            listed.push_back({name, job});
+            if (!query.empty()) {
+                bool matched = ContainsCaseInsensitive(job.id, query) ||
+                               ContainsCaseInsensitive(job.summary, query);
+                if (!matched) {
+                    auto tit = taskSearch.find(effectiveTask);
+                    if (tit != taskSearch.end()) {
+                        matched = ContainsCaseInsensitive(tit->second.title, query) ||
+                                  ContainsCaseInsensitive(tit->second.intent, query);
+                    }
+                }
+                if (!matched && !job.directionId.empty()) {
+                    auto dit = dirSearch.find(job.directionId);
+                    if (dit != dirSearch.end()) {
+                        matched = ContainsCaseInsensitive(dit->second.title, query) ||
+                                  ContainsCaseInsensitive(dit->second.cardTitle, query);
+                    }
+                }
+                if (!matched) continue;
+            }
+            if (IsFinishedJobState(job.state)) {
+                const std::string finAt = !job.updatedAt.empty() ? job.updatedAt : job.createdAt;
+                finished.push_back({name, job, finAt});
+            } else {
+                unfinished.push_back({name, job, ""});
+            }
         }
     }
-    std::stable_sort(listed.begin(), listed.end(), [](const ListedJob& a, const ListedJob& b) {
+    std::stable_sort(unfinished.begin(), unfinished.end(), [](const ListedJob& a, const ListedJob& b) {
         if (a.job.createdAt != b.job.createdAt) return a.job.createdAt > b.job.createdAt;
         return false;
     });
+    std::stable_sort(finished.begin(), finished.end(), [](const ListedJob& a, const ListedJob& b) {
+        if (a.finishedAt != b.finishedAt) return a.finishedAt > b.finishedAt;
+        return a.job.id > b.job.id;
+    });
+    if (!before.empty()) {
+        // Cursor pagination steps through older finished items without repeating unfinished ones.
+        unfinished.clear();
+        std::string cursorTs, cursorId;
+        ParseBeforeCursor(before, cursorTs, cursorId);
+        std::vector<ListedJob> older;
+        older.reserve(finished.size());
+        for (auto& item : finished) {
+            if (IsOlderThanCursor(item.finishedAt, item.job.id, cursorTs, cursorId)) {
+                older.push_back(std::move(item));
+            }
+        }
+        finished = std::move(older);
+    }
+    bool more = false;
+    int64_t remaining = 0;
+    std::string nextBefore;
+    if (effectiveLimit > 0 && static_cast<int64_t>(finished.size()) > effectiveLimit) {
+        more = true;
+        remaining = static_cast<int64_t>(finished.size()) - effectiveLimit;
+        finished.resize(static_cast<size_t>(effectiveLimit));
+        nextBefore = MakeBeforeCursor(finished.back().finishedAt, finished.back().job.id);
+    }
+    std::vector<ListedJob> listed;
+    listed.reserve(unfinished.size() + finished.size());
+    for (auto& item : unfinished) listed.push_back(std::move(item));
+    for (auto& item : finished) listed.push_back(std::move(item));
     std::ostringstream oss;
     oss << "{\"ok\":true,\"jobs\":[";
     bool first = true;
@@ -4974,9 +5282,135 @@ std::string TaskQueueManager::TaskQueueList(const std::string& taskqueue, const 
         oss << jj << ",\"resource_wait\":";
         if (resourceWait.empty()) oss << "null";
         else oss << "\"" << JsonEscape(resourceWait) << "\"";
-        oss << ",\"task\":" << TaskSummaryJsonLocked(item.job) << "}";
+        oss << ",\"task\":" << TaskSummaryJsonCachedLocked(item.job) << "}";
     }
-    oss << "]}";
+    oss << "],\"more\":" << (more ? "true" : "false")
+        << ",\"next_before\":\"" << JsonEscape(nextBefore) << "\""
+        << ",\"remaining\":" << remaining << "}";
+    return oss.str();
+}
+
+std::string TaskQueueManager::TaskQueueChanges(uint64_t since, bool includeHidden, std::string& outError) {
+    outError.clear();
+    std::lock_guard<std::mutex> lock(mutex_);
+    const bool isReset = (evictedBeforeRev_ > 0 && since < evictedBeforeRev_);
+    const bool includeAll = isReset || (since == 0);
+
+    if (!includeAll && since >= currentRev_) {
+        return "{\"ok\":true,\"rev\":" + std::to_string(currentRev_) +
+               ",\"jobs\":[],\"removed\":[],\"tasks\":[],\"directions\":[]}";
+    }
+
+    std::vector<const TaskQueueJob*> changedJobs;
+    std::unordered_set<std::string> changedTaskIds;
+    std::unordered_set<std::string> changedDirIds;
+    for (const auto& [name, tq] : queues_) {
+        (void)name;
+        for (const auto& job : tq.jobs) {
+            if (job.hidden && !includeHidden) continue;
+            if (includeAll || job.rev > since) {
+                changedJobs.push_back(&job);
+                const std::string effTask = job.taskId.empty() ? job.id : job.taskId;
+                changedTaskIds.insert(effTask);
+                if (!job.directionId.empty()) changedDirIds.insert(job.directionId);
+            }
+        }
+    }
+
+    std::ostringstream oss;
+    oss << "{\"ok\":true,\"rev\":" << currentRev_;
+    if (isReset) oss << ",\"reset\":true";
+
+    oss << ",\"jobs\":[";
+    const int64_t nowMs = static_cast<int64_t>(GetNowTickMs());
+    for (size_t i = 0; i < changedJobs.size(); ++i) {
+        if (i > 0) oss << ",";
+        const TaskQueueJob& job = *changedJobs[i];
+        bool allSat = true;
+        for (const auto& d : job.dependsOn) {
+            const TaskQueueJob* dep = ResolveDepJobLocked(d.id);
+            if (!dep || !IsDepSatisfied(*dep, d.on)) { allSat = false; break; }
+        }
+        std::string resourceWait = ResourceWaitLocked(job, allSat, nowMs);
+        std::string jj = JobToJson(job, false);
+        if (!jj.empty() && jj.back() == '}') jj.pop_back();
+        oss << jj << ",\"resource_wait\":";
+        if (resourceWait.empty()) oss << "null";
+        else oss << "\"" << JsonEscape(resourceWait) << "\"";
+        oss << ",\"task\":" << TaskSummaryJsonCachedLocked(job) << "}";
+    }
+    oss << "]";
+
+    oss << ",\"removed\":[";
+    if (!isReset) {
+        bool firstRem = true;
+        for (const auto& t : tombstones_) {
+            if (t.rev > since) {
+                if (!firstRem) oss << ",";
+                firstRem = false;
+                oss << "\"" << JsonEscape(t.id) << "\"";
+            }
+        }
+    }
+    oss << "]";
+
+    nlohmann::json tasksArr = nlohmann::json::array();
+    for (const auto& record : taskStore_.All()) {
+        const uint64_t r = (record.is_object() && record.contains("rev") && record["rev"].is_number_unsigned())
+            ? record["rev"].get<uint64_t>() : 0;
+        const std::string id = record.value("id", std::string());
+        if (includeAll || r > since || changedTaskIds.count(id) > 0) {
+            const nlohmann::json status = TaskStateLocked(id);
+            tasksArr.push_back({
+                {"id", id},
+                {"title", record.value("title", std::string())},
+                {"state", status.value("state", std::string())},
+                {"createdAt", record.value("createdAt", std::string())},
+                {"updatedAt", record.value("updatedAt", std::string())},
+                {"rev", r}
+            });
+        }
+    }
+    oss << ",\"tasks\":" << tasksArr.dump();
+
+    nlohmann::json dirsArr = nlohmann::json::array();
+    for (const auto& record : directionStore_.All()) {
+        const uint64_t r = (record.is_object() && record.contains("rev") && record["rev"].is_number_unsigned())
+            ? record["rev"].get<uint64_t>() : 0;
+        const std::string id = record.value("id", std::string());
+        if (includeAll || r > since || changedDirIds.count(id) > 0) {
+            const nlohmann::json status = DirectionStateLocked(id);
+            nlohmann::json item = {
+                {"id", id},
+                {"kind", record.value("kind", std::string())},
+                {"taskId", record.value("taskId", std::string())},
+                {"btId", record.value("btId", std::string())},
+                {"title", record.value("title", std::string())},
+                {"state", status.value("state", std::string())},
+                {"createdAt", record.value("createdAt", std::string())},
+                {"updatedAt", record.value("updatedAt", std::string())},
+                {"rev", r}
+            };
+            if (status.contains("result")) item["result"] = status["result"];
+            if (record.contains("card") && record["card"].is_object()) {
+                const auto& card = record["card"];
+                item["card"] = {
+                    {"number", card.value("number", std::string())},
+                    {"title", card.value("title", std::string())},
+                    {"template", card.value("template", std::string())}
+                };
+            }
+            if (record.contains("after") && record["after"].is_array()) {
+                item["after"] = record["after"];
+            }
+            const std::string supersedes = record.value("supersedes", std::string());
+            if (!supersedes.empty()) item["supersedes"] = supersedes;
+            const std::string supersededBy = record.value("supersededBy", std::string());
+            if (!supersededBy.empty()) item["supersededBy"] = supersededBy;
+            dirsArr.push_back(std::move(item));
+        }
+    }
+    oss << ",\"directions\":" << dirsArr.dump() << "}";
     return oss.str();
 }
 
@@ -5007,6 +5441,8 @@ std::string TaskQueueManager::TaskQueueGet(const std::string& id, bool includeIn
         if (!text.empty()) {
             job.instructions.text = text;
             job.instructions.rev = rev;
+            job.cachedJsonFull_.clear();
+            job.cachedJsonNoInstr_.clear();
         }
     }
 
@@ -5060,6 +5496,7 @@ void TaskQueueManager::RequeueJobLocked(TaskQueue& tq, TaskQueueJob& job, bool r
     job.blockedBy.clear();
     job.retryAtMs = 0;
     job.updatedAt = GetCurrentTimestampStr();
+    MarkJobChangedLocked(job);
 }
 
 std::string TaskQueueManager::TaskQueueRetry(const std::string& id, bool resetAttempts, bool refreshInstructions, std::string& outError) {
@@ -5433,6 +5870,7 @@ std::string TaskQueueManager::TaskQueueUpdate(const std::string& id, const std::
     }
 
     job->updatedAt = GetCurrentTimestampStr();
+    MarkJobChangedLocked(*job);
     ReevaluateAll();
     SaveQueue(*tq);
     cv_.notify_all();
@@ -5743,8 +6181,10 @@ std::string TaskQueueManager::TaskQueueSupersede(const std::string& id, const st
 
     head->supersededBy = newJob.id;
     head->updatedAt = newJob.createdAt;
+    MarkJobChangedLocked(*head);
     if (headQueue != srcQueue) SaveQueue(*headQueue);
 
+    MarkJobChangedLocked(newJob);
     srcQueue->jobs.push_back(newJob);
     jobIndexDirty_ = true;
     ReevaluateAll();
@@ -5814,6 +6254,7 @@ std::string TaskQueueManager::TaskQueuePauseJob(const std::string& id, bool paus
 
     job->paused = paused;
     job->updatedAt = GetCurrentTimestampStr();
+    MarkJobChangedLocked(*job);
     EmitEventLocked(*tq, paused ? "jobPaused" : "jobResumed", id, attemptN);
     if (!paused) ReevaluateAll();
     SaveQueue(*tq);
@@ -5821,7 +6262,8 @@ std::string TaskQueueManager::TaskQueuePauseJob(const std::string& id, bool paus
     return "{\"ok\":true,\"job\":" + JobToJson(*job, true) + "}";
 }
 
-std::string TaskQueueManager::TaskQueueCancel(const std::string& id, std::string& outError) {
+std::string TaskQueueManager::TaskQueueCancel(const std::string& id, std::string& outError,
+                                            const std::string& reason) {
     outError.clear();
     std::string resp;
     ProcessManager* pm = nullptr;
@@ -5848,20 +6290,22 @@ std::string TaskQueueManager::TaskQueueCancel(const std::string& id, std::string
             pid = job->attempts.back().processId;
             remoteHost = job->attempts.back().remoteHost;
             remotePid = job->attempts.back().remoteProcessId;
+            if (!reason.empty()) job->attempts.back().reason = reason;
         }
         job->state = "cancelled";
         job->paused = false;
         job->blockedBy.clear();
         job->retryAtMs = 0;
         job->updatedAt = GetCurrentTimestampStr();
+        MarkJobChangedLocked(*job);
         EmitEventLocked(*tq, "jobCancelled", id, job->attempts.empty() ? 0 : job->attempts.back().n);
         ReevaluateAll();
         SaveQueue(*tq);
         if (!job->taskId.empty()) {
-            TaskLog(job->taskId, "job_cancelled", id, "", "cancelled", "");
-            if (!job->directionId.empty()) {
-                MaybeLogDirectionFinishedLocked(job->directionId, job->taskId);
-            }
+            TaskLog(job->taskId, "job_cancelled", id, "", reason.empty() ? "cancelled" : reason, "");
+        }
+        if (!job->directionId.empty()) {
+            MaybeLogDirectionFinishedLocked(job->directionId, job->taskId);
         }
         if (schedulerRunning_.load()) {
             pendingFinished_.push_back({*job, "cancelled"});
@@ -5881,6 +6325,30 @@ std::string TaskQueueManager::TaskQueueCancel(const std::string& id, std::string
     }
     FlushFinishedCallbacks();
     return resp;
+}
+
+int TaskQueueManager::CancelAllActiveJobs(const std::string& reason) {
+    (void)reason;
+    std::vector<std::string> ids;
+    {
+        std::lock_guard<std::mutex> lock(mutex_);
+        for (const auto& kv : queues_) {
+            for (const auto& job : kv.second.jobs) {
+                if (job.state != "succeeded" && job.state != "failed" &&
+                    job.state != "cancelled" && job.state != "closed" &&
+                    job.state != "takenOver") {
+                    ids.push_back(job.id);
+                }
+            }
+        }
+    }
+    int cancelled = 0;
+    for (const auto& id : ids) {
+        std::string err;
+        TaskQueueCancel(id, err);
+        ++cancelled;
+    }
+    return cancelled;
 }
 
 std::string TaskQueueManager::TaskQueueClose(const std::string& id, std::string& outError) {
@@ -5912,6 +6380,7 @@ std::string TaskQueueManager::TaskQueueClose(const std::string& id, std::string&
         job->blockedBy.clear();
         job->retryAtMs = 0;
         job->updatedAt = GetCurrentTimestampStr();
+        MarkJobChangedLocked(*job);
         EmitEventLocked(*tq, "jobClosed", id, job->attempts.empty() ? 0 : job->attempts.back().n);
         ReevaluateAll();
         SaveQueue(*tq);
@@ -5989,6 +6458,7 @@ std::string TaskQueueManager::TaskQueueTakeover(const std::string& id, const std
         job->blockedBy.clear();
         job->retryAtMs = 0;
         job->updatedAt = job->takeover.at;
+        MarkJobChangedLocked(*job);
         EmitEventLocked(*tq, "jobTakenOver", id, job->attempts.empty() ? 0 : job->attempts.back().n);
         ReevaluateAll();
         SaveQueue(*tq);
@@ -6054,6 +6524,7 @@ std::string TaskQueueManager::TaskQueueComplete(const std::string& id, const std
         job->takeover.result = finalResult;
         job->takeover.completionReason = reason;
         job->updatedAt = job->takeover.completedAt;
+        MarkJobChangedLocked(*job);
         EmitEventLocked(*tq, "jobTakeoverCompleted", id, job->attempts.empty() ? 0 : job->attempts.back().n);
         ReevaluateAll();
         SaveAllLocked();
@@ -6337,6 +6808,7 @@ std::string TaskQueueManager::TaskQueueLink(const std::string& jobId, const std:
     }
     job->dependsOn = newDeps;
     job->updatedAt = GetCurrentTimestampStr();
+    MarkJobChangedLocked(*job);
     EmitEventLocked(*tq, "dependencyLinked", jobId, 0);
     ReevaluateAll();
     SaveQueue(*tq);
@@ -6365,6 +6837,7 @@ std::string TaskQueueManager::TaskQueueUnlink(const std::string& jobId, const st
     }
     deps.erase(it, deps.end());
     job->updatedAt = GetCurrentTimestampStr();
+    MarkJobChangedLocked(*job);
     EmitEventLocked(*tq, "dependencyUnlinked", jobId, 0);
     ReevaluateAll();
     SaveQueue(*tq);
@@ -6404,6 +6877,7 @@ bool TaskQueueManager::ReevaluateJob(TaskQueue& tq, TaskQueueJob& job) {
             job.state = "blocked";
             job.blockedBy = blocker;
             job.updatedAt = GetCurrentTimestampStr();
+            MarkJobChangedLocked(job);
             EmitEventLocked(tq, "jobBlocked", job.id, 0);
             return true;
         }
@@ -6414,6 +6888,7 @@ bool TaskQueueManager::ReevaluateJob(TaskQueue& tq, TaskQueueJob& job) {
         job.state = "pending";
         job.blockedBy.clear();
         job.updatedAt = GetCurrentTimestampStr();
+        MarkJobChangedLocked(job);
         return true;
     }
     return false;
@@ -6938,6 +7413,7 @@ void TaskQueueManager::ApplyAttemptOutcome(TaskQueue& tq, TaskQueueJob& job, boo
     a.exitCode = exitCode;
     a.checkDetail = checkDetail;
     job.updatedAt = a.end;
+    MarkJobChangedLocked(job);
 
     if (job.state == "cancelled") {
         SaveQueue(tq);
@@ -7467,6 +7943,7 @@ void TaskQueueManager::ProcessSchedulerTick() {
                                         j.attempts.empty() ? 1 : j.attempts.back().n, diag);
                         if (diag) diag->nextSteps.push_back({"retry", nullptr, false,
                             "A permit was approved; the job is being re-run."});
+                        MarkJobChangedLocked(j);
                         healthChanged = true;
                         SaveAllLocked();
                     } else if (rejectedAll) {
@@ -7480,6 +7957,7 @@ void TaskQueueManager::ProcessSchedulerTick() {
                             diag->nextSteps.push_back({"fix_spec", nullptr, true,
                                 "The permit was rejected; change the instructions to stay inside the project."});
                         }
+                        MarkJobChangedLocked(j);
                         EmitEventLocked(tq, "jobFailed", j.id,
                                         j.attempts.empty() ? 1 : j.attempts.back().n, diag);
                         healthChanged = true;
@@ -7555,6 +8033,7 @@ void TaskQueueManager::ProcessSchedulerTick() {
             job.attempts.push_back(a);
             job.state = "running";
             job.updatedAt = a.start;
+            MarkJobChangedLocked(job);
             EmitEventLocked(tq, "jobStarted", job.id, n);
             job.attempts.back().startEventSeq = static_cast<uint64_t>(tq.version);
 
@@ -8000,11 +8479,10 @@ int CheckAndRecordAutoNotes(const TaskQueueJob& job, const TaskQueueAttempt& att
                 if (condition.empty()) condition = r2.condition;
                 if (condition.empty()) condition = r1.condition;
 
-                std::string text = job.name + " は直近 3 回 " + r3.failureClass;
+                std::string text = job.name + " failed 3 times in a row: " + r3.failureClass;
                 if (!condition.empty()) {
-                    text += "（" + condition + "）";
+                    text += " (" + condition + ")";
                 }
-                text += "で失敗";
 
                 memory::NoteInput note;
                 note.text = text;
@@ -8012,6 +8490,8 @@ int CheckAndRecordAutoNotes(const TaskQueueJob& job, const TaskQueueAttempt& att
                 note.authorType = "hancho";
                 note.sources = {r1.id, r2.id, r3.id};
                 note.tags = {"auto", "failure_streak", r3.failureClass};
+                note.data = {{"kind", "failure_streak"}, {"job", job.name},
+                             {"failureClass", r3.failureClass}, {"condition", condition}};
                 std::string res = memory::NoteJson(note);
                 nlohmann::json r = nlohmann::json::parse(res, nullptr, false);
                 if (r.value("ok", false) && !r.value("duplicate", false)) {
@@ -8051,9 +8531,9 @@ int CheckAndRecordAutoNotes(const TaskQueueJob& job, const TaskQueueAttempt& att
                 double p90 = AutoNotePercentile(durations, 0.9);
                 int64_t p90Sec = static_cast<int64_t>(p90 + 0.5);
 
-                std::string text = job.name + " は所要時間がタイムアウトに近い（p90 " +
-                                   std::to_string(p90Sec) + " 秒 / 上限 " +
-                                   std::to_string(effTimeout) + " 秒）";
+                std::string text = job.name + " is close to its timeout (p90 " +
+                                   std::to_string(p90Sec) + " s / limit " +
+                                   std::to_string(effTimeout) + " s)";
 
                 memory::NoteInput note;
                 note.text = text;
@@ -8061,6 +8541,8 @@ int CheckAndRecordAutoNotes(const TaskQueueJob& job, const TaskQueueAttempt& att
                 note.authorType = "hancho";
                 note.sources = {prev.id, curr.id};
                 note.tags = {"auto", "timeout_warning"};
+                note.data = {{"kind", "timeout_warning"}, {"job", job.name},
+                             {"p90", std::to_string(p90Sec)}, {"timeoutSec", std::to_string(effTimeout)}};
                 std::string res = memory::NoteJson(note);
                 nlohmann::json r = nlohmann::json::parse(res, nullptr, false);
                 if (r.value("ok", false) && !r.value("duplicate", false)) {
@@ -8097,7 +8579,7 @@ int CheckAndRecordAutoNotes(const TaskQueueJob& job, const TaskQueueAttempt& att
                     fileList += diff[i];
                 }
 
-                std::string text = job.name + " は失敗の後に成功。直した可能性のあるファイル: " + fileList;
+                std::string text = job.name + " succeeded after a failure. Files possibly fixed: " + fileList;
 
                 memory::NoteInput note;
                 note.text = text;
@@ -8105,6 +8587,7 @@ int CheckAndRecordAutoNotes(const TaskQueueJob& job, const TaskQueueAttempt& att
                 note.authorType = "hancho";
                 note.sources = {prev.id, curr.id};
                 note.tags = {"auto", "fix_diff"};
+                note.data = {{"kind", "fix_diff"}, {"job", job.name}, {"files", fileList}};
                 std::string res = memory::NoteJson(note);
                 nlohmann::json r = nlohmann::json::parse(res, nullptr, false);
                 if (r.value("ok", false) && !r.value("duplicate", false)) {
@@ -8163,6 +8646,7 @@ bool TaskQueueManager::RecordPlainRunLocked(const PlainRunState& state, std::str
         if (!state.cwd.empty()) it->cwd = state.cwd;
         if (!state.summary.empty()) it->summary = state.summary;
         it->attempts.push_back(a);
+        MarkJobChangedLocked(*it);
     } else {
         TaskQueueJob job;
         job.id = jobId;
@@ -8177,6 +8661,7 @@ bool TaskQueueManager::RecordPlainRunLocked(const PlainRunState& state, std::str
         job.createdAt = startTs;
         job.updatedAt = endTs;
         job.attempts.push_back(a);
+        MarkJobChangedLocked(job);
         tq.jobs.push_back(std::move(job));
         jobIndexDirty_ = true;
     }
@@ -8293,6 +8778,7 @@ void TaskQueueManager::OnProcessFinished(int processId, int exitCode, const std:
                     a.exitCode = exitCode;
                     a.checkDetail = "cancelled";
                     job.updatedAt = a.end;
+                    MarkJobChangedLocked(job);
                     fin.checkDetail = "cancelled";
                     a.failure = ClassifyTaskQueueFailure(fin);
                     tq.version++;
@@ -8597,6 +9083,7 @@ nlohmann::json MakeTaskLogEntry(const std::string& kind, const std::string& jobI
 void TaskQueueManager::RecordRemovedJobsLocked(const std::vector<TaskQueueJob>& gone) {
     const std::string now = GetCurrentTimestampStr();
     for (const auto& job : gone) {
+        RecordJobTombstoneLocked(job.id);
         const nlohmann::json entry = {{"id", job.id}, {"state", job.state},
                                       {"supersedes", job.supersedes},
                                       {"supersededBy", job.supersededBy}};
@@ -8608,6 +9095,7 @@ void TaskQueueManager::RecordRemovedJobsLocked(const std::vector<TaskQueueJob>& 
                 removed.push_back(entry);
                 record["removedJobs"] = removed;
                 record["updatedAt"] = now;
+                record["rev"] = BumpRevLocked();
                 std::string err;
                 // The removal goes ahead even if the record cannot be saved; only the history is lost then.
                 taskStore_.Save(record, err);
@@ -8621,6 +9109,7 @@ void TaskQueueManager::RecordRemovedJobsLocked(const std::vector<TaskQueueJob>& 
                 removed.push_back(entry);
                 dirRecord["removedJobs"] = removed;
                 dirRecord["updatedAt"] = now;
+                dirRecord["rev"] = BumpRevLocked();
                 std::string err;
                 directionStore_.Save(dirRecord, err);
             }
@@ -8650,6 +9139,34 @@ bool TaskQueueManager::EnsureBtDirection(const std::string& btId,
     if (!existingDirectionId.empty()) {
         nlohmann::json existing;
         if (directionStore_.Get(existingDirectionId, existing)) {
+            const bool needsPromote =
+                existing.value("kind", std::string()) == "card" ||
+                existing.value("btId", std::string()).empty();
+            if (needsPromote) {
+                existing["kind"] = "bt";
+                existing["btId"] = btId;
+                existing["updatedAt"] = GetCurrentTimestampStr();
+                if (!taskId.empty() && existing.value("taskId", std::string()).empty()) {
+                    existing["taskId"] = taskId;
+                }
+                existing["rev"] = BumpRevLocked();
+                if (!directionStore_.Save(existing, outError)) return false;
+                const std::string effTaskId =
+                    taskId.empty() ? existing.value("taskId", std::string()) : taskId;
+                if (!effTaskId.empty()) {
+                    nlohmann::json extra = {
+                        {"directionId", existingDirectionId},
+                        {"directionKind", "bt"},
+                        {"title", existing.value("title", dirTitle)}
+                    };
+                    if (existing.contains("card") && existing["card"].is_object()) {
+                        const std::string cardNum = existing["card"].value("number", std::string());
+                        if (!cardNum.empty()) extra["cardNumber"] = cardNum;
+                    }
+                    TaskLog(effTaskId, "direction_started", "", btId,
+                            existing.value("title", dirTitle), origin.session, &extra);
+                }
+            }
             outDirectionId = existingDirectionId;
             return true;
         }
@@ -8667,7 +9184,8 @@ bool TaskQueueManager::EnsureBtDirection(const std::string& btId,
             {"origin", originRecord},
             {"title", dirTitle},
             {"closed", nullptr},
-            {"removedJobs", nlohmann::json::array()}
+            {"removedJobs", nlohmann::json::array()},
+            {"rev", BumpRevLocked()}
         };
         if (!directionStore_.Create(record, outError)) return false;
         outDirectionId = existingDirectionId;
@@ -8684,7 +9202,8 @@ bool TaskQueueManager::EnsureBtDirection(const std::string& btId,
             {"origin", originRecord},
             {"title", dirTitle},
             {"closed", nullptr},
-            {"removedJobs", nlohmann::json::array()}
+            {"removedJobs", nlohmann::json::array()},
+            {"rev", BumpRevLocked()}
         };
         if (!directionStore_.Create(record, outError)) return false;
         outDirectionId = newId;
@@ -8769,13 +9288,18 @@ nlohmann::json TaskQueueManager::DirectionState(const std::string& id) const {
 }
 
 void TaskQueueManager::MaybeLogDirectionFinishedLocked(const std::string& directionId, const std::string& taskId) {
-    if (directionId.empty() || taskId.empty()) return;
+    if (directionId.empty()) return;
     nlohmann::json dirRecord;
     if (!directionStore_.Get(directionId, dirRecord)) return;
-    if (dirRecord.contains("closed") && dirRecord["closed"].is_object()) return;
+    if (dirRecord.contains("closed") && dirRecord["closed"].is_object()) {
+        UnwatchDirectionClientLocked(directionId);
+        return;
+    }
     const nlohmann::json st = DirectionStateLocked(directionId);
     const std::string s = st.value("state", std::string());
     if (s != "succeeded" && s != "failed" && s != "cancelled") return;
+    UnwatchDirectionClientLocked(directionId);
+    if (taskId.empty()) return;
     const std::string btId = dirRecord.value("btId", std::string());
     nlohmann::json extra = {{"directionId", directionId}, {"state", s}};
     TaskLog(taskId, "direction_finished", "", btId, s, "", &extra);
@@ -8833,6 +9357,66 @@ std::string TaskQueueManager::DirectionShow(const std::string& id, std::string& 
                           {"status", DirectionStateLocked(id)}, {"jobs", jobs}}.dump();
 }
 
+namespace {
+
+bool CompareCardNumberNatural(const std::string& a, const std::string& b) {
+    size_t ia = 0;
+    size_t ib = 0;
+    while (ia < a.size() && ib < b.size()) {
+        const bool da = std::isdigit(static_cast<unsigned char>(a[ia])) != 0;
+        const bool db = std::isdigit(static_cast<unsigned char>(b[ib])) != 0;
+        if (da && db) {
+            size_t za = ia;
+            while (za < a.size() && a[za] == '0') ++za;
+            size_t ea = za;
+            while (ea < a.size() && std::isdigit(static_cast<unsigned char>(a[ea]))) ++ea;
+
+            size_t zb = ib;
+            while (zb < b.size() && b[zb] == '0') ++zb;
+            size_t eb = zb;
+            while (eb < b.size() && std::isdigit(static_cast<unsigned char>(b[eb]))) ++eb;
+
+            const size_t la = ea - za;
+            const size_t lb = eb - zb;
+            if (la != lb) return la < lb;
+            const int cmp = a.compare(za, la, b, zb, lb);
+            if (cmp != 0) return cmp < 0;
+            // Tie-break on leading zero count so ordering is strict.
+            if ((ea - ia) != (eb - ib)) return (ea - ia) < (eb - ib);
+            ia = ea;
+            ib = eb;
+        } else {
+            if (a[ia] != b[ib]) return static_cast<unsigned char>(a[ia]) < static_cast<unsigned char>(b[ib]);
+            ++ia;
+            ++ib;
+        }
+    }
+    return a.size() < b.size();
+}
+
+bool IsDirectionSatisfiedForCardDep(const nlohmann::json& status) {
+    const std::string state = status.value("state", std::string());
+    if (state == "succeeded") return true;
+    if (state == "closed" && status.value("result", std::string()) == "succeeded") return true;
+    return false;
+}
+
+nlohmann::json FollowCardHeadLocked(const DirectionStore& store, const nlohmann::json& start) {
+    nlohmann::json cur = start;
+    std::unordered_set<std::string> seen;
+    seen.insert(cur.value("id", std::string()));
+    for (int step = 0; step < 1000; ++step) {
+        const std::string nextId = cur.value("supersededBy", std::string());
+        if (nextId.empty() || !seen.insert(nextId).second) break;
+        nlohmann::json nextRec;
+        if (!store.Get(nextId, nextRec) || !nextRec.is_object()) break;
+        cur = std::move(nextRec);
+    }
+    return cur;
+}
+
+} // namespace
+
 std::string TaskQueueManager::DirectionList(const std::string& taskIdFilter, const std::string& stateFilter,
                                             int64_t limit, std::string& outError, int64_t sinceVersion) {
     outError.clear();
@@ -8849,6 +9433,16 @@ std::string TaskQueueManager::DirectionList(const std::string& taskIdFilter, con
         return nlohmann::json{{"ok", true}, {"version", version}, {"unchanged", true}}.dump();
     }
     std::lock_guard<std::mutex> lock(mutex_);
+    std::unordered_map<std::string, std::unordered_map<std::string, std::string>> numberToDirIdByTask;
+    for (const auto& rec : directionStore_.All()) {
+        if (!rec.contains("card") || !rec["card"].is_object()) continue;
+        const std::string tId = rec.value("taskId", std::string());
+        const std::string num = rec["card"].value("number", std::string());
+        if (tId.empty() || num.empty()) continue;
+        const nlohmann::json head = FollowCardHeadLocked(directionStore_, rec);
+        const std::string headId = head.value("id", std::string());
+        if (!headId.empty()) numberToDirIdByTask[tId][num] = headId;
+    }
     nlohmann::json directions = nlohmann::json::array();
     for (const auto& record : directionStore_.All()) {
         const std::string id = record.value("id", std::string());
@@ -8881,6 +9475,43 @@ std::string TaskQueueManager::DirectionList(const std::string& taskIdFilter, con
             {"updatedAt", record.value("updatedAt", std::string())}
         };
         if (status.contains("result")) item["result"] = status["result"];
+        if (record.contains("card") && record["card"].is_object()) {
+            const auto& card = record["card"];
+            item["card"] = {
+                {"number", card.value("number", std::string())},
+                {"title", card.value("title", std::string())},
+                {"template", card.value("template", std::string())}
+            };
+        }
+        if (record.contains("after") && record["after"].is_array()) {
+            item["after"] = record["after"];
+            if (record.contains("card") && record["card"].is_object()) {
+                nlohmann::json waitingFor = nlohmann::json::array();
+                const auto taskIt = numberToDirIdByTask.find(recTaskId);
+                for (const auto& dep : record["after"]) {
+                    if (!dep.is_string()) continue;
+                    const std::string depNum = dep.get<std::string>();
+                    if (taskIt == numberToDirIdByTask.end()) {
+                        waitingFor.push_back(depNum);
+                        continue;
+                    }
+                    auto depIt = taskIt->second.find(depNum);
+                    if (depIt == taskIt->second.end()) {
+                        waitingFor.push_back(depNum);
+                        continue;
+                    }
+                    const nlohmann::json depStatus = DirectionStateLocked(depIt->second);
+                    if (!IsDirectionSatisfiedForCardDep(depStatus)) {
+                        waitingFor.push_back(depNum);
+                    }
+                }
+                item["waitingFor"] = std::move(waitingFor);
+            }
+        }
+        const std::string supersedes = record.value("supersedes", std::string());
+        if (!supersedes.empty()) item["supersedes"] = supersedes;
+        const std::string supersededBy = record.value("supersededBy", std::string());
+        if (!supersededBy.empty()) item["supersededBy"] = supersededBy;
         directions.push_back(std::move(item));
         if (limit > 0 && static_cast<int64_t>(directions.size()) >= limit) break;
     }
@@ -8958,6 +9589,7 @@ std::string TaskQueueManager::DirectionClose(const std::string& id, const std::s
     const std::string now = GetCurrentTimestampStr();
     record["closed"] = nlohmann::json{{"result", result}, {"reason", reason}, {"at", now}};
     record["updatedAt"] = now;
+    record["rev"] = BumpRevLocked();
     if (!directionStore_.Save(record, outError)) return BuildError(outError);
     const std::string taskId = record.value("taskId", std::string());
     if (!taskId.empty()) {
@@ -8990,6 +9622,7 @@ std::string TaskQueueManager::DirectionReopen(const std::string& id, const std::
     }
     record["closed"] = nullptr;
     record["updatedAt"] = GetCurrentTimestampStr();
+    record["rev"] = BumpRevLocked();
     if (!directionStore_.Save(record, outError)) return BuildError(outError);
     const std::string taskId = record.value("taskId", std::string());
     if (!taskId.empty()) {
@@ -9026,7 +9659,10 @@ std::string TaskQueueManager::DirectionPurgeOlderThan(int64_t olderThanSec, std:
         }
         if (!shouldPurge) continue;
         std::string err;
-        if (directionStore_.Remove(id, err)) ++purged;
+        if (directionStore_.Remove(id, err)) {
+            ++purged;
+            BumpRevLocked();
+        }
     }
     return nlohmann::json{{"ok", true}, {"purged", purged}}.dump();
 }
@@ -9113,7 +9749,7 @@ void TaskQueueManager::TaskLog(const std::string& taskId, const std::string& kin
 
 std::string TaskQueueManager::TaskCreate(const std::string& title, const std::string& intent,
                                          const std::string& id, const std::string& originJson,
-                                         std::string& outError) {
+                                         std::string& outError, const std::string& cardDefaultsJson) {
     outError.clear();
     if (title.empty()) {
         outError = "title is required";
@@ -9124,6 +9760,14 @@ std::string TaskQueueManager::TaskCreate(const std::string& title, const std::st
         return BuildError(outError);
     }
     if (!id.empty() && !TaskStore::ValidateId(id, outError)) return BuildError(outError);
+    nlohmann::json cardDefaultsObj;
+    if (!cardDefaultsJson.empty()) {
+        cardDefaultsObj = nlohmann::json::parse(cardDefaultsJson, nullptr, false);
+        if (cardDefaultsObj.is_discarded() || !cardDefaultsObj.is_object()) {
+            outError = "cardDefaults must be a JSON object";
+            return BuildError(outError);
+        }
+    }
     const TaskQueueOrigin origin = ParseOriginJson(originJson);
     nlohmann::json originRecord = nlohmann::json::parse(OriginToJson(origin), nullptr, false);
     if (!originRecord.is_object()) originRecord = nlohmann::json::object();
@@ -9134,9 +9778,73 @@ std::string TaskQueueManager::TaskCreate(const std::string& title, const std::st
     nlohmann::json record = {{"id", newId}, {"title", title}, {"intent", intent},
                              {"createdAt", now}, {"updatedAt", now}, {"origin", originRecord},
                              {"closed", nullptr}, {"removedJobs", nlohmann::json::array()}};
+    if (cardDefaultsObj.is_object()) {
+        record["cardDefaults"] = cardDefaultsObj;
+    }
+    record["rev"] = BumpRevLocked();
     if (!taskStore_.Create(record, outError)) return BuildError(outError);
     TaskLog(newId, "created", "", "", title, origin.session);
     return nlohmann::json{{"ok", true}, {"id", newId}, {"title", title}, {"state", "open"}}.dump();
+}
+
+std::string TaskQueueManager::TaskUpdate(const std::string& id,
+                                         bool hasTitle, const std::string& title,
+                                         bool hasIntent, const std::string& intent,
+                                         bool hasCardDefaults, const std::string& cardDefaultsJson,
+                                         const std::string& session, std::string& outError) {
+    outError.clear();
+    if (id.empty()) {
+        outError = "task id is required";
+        return BuildError(outError);
+    }
+    if (hasTitle) {
+        if (title.empty()) {
+            outError = "title cannot be empty";
+            return BuildError(outError);
+        }
+        if (!TaskStore::ValidateSize("title", title, TaskStore::kTitleMaxBytes, outError)) {
+            return BuildError(outError);
+        }
+    }
+    if (hasIntent && !TaskStore::ValidateSize("intent", intent, TaskStore::kIntentMaxBytes, outError)) {
+        return BuildError(outError);
+    }
+    nlohmann::json cardDefaultsObj;
+    if (hasCardDefaults) {
+        cardDefaultsObj = cardDefaultsJson.empty()
+            ? nlohmann::json::object()
+            : nlohmann::json::parse(cardDefaultsJson, nullptr, false);
+        if (cardDefaultsObj.is_discarded() || !cardDefaultsObj.is_object()) {
+            outError = "cardDefaults must be a JSON object";
+            return BuildError(outError);
+        }
+    }
+
+    std::lock_guard<std::mutex> lock(mutex_);
+    nlohmann::json record;
+    if (!taskStore_.Get(id, record)) {
+        outError = "task not found: " + id;
+        return BuildError(outError);
+    }
+    if (hasTitle) record["title"] = title;
+    if (hasIntent) record["intent"] = intent;
+    if (hasCardDefaults) record["cardDefaults"] = cardDefaultsObj;
+    record["updatedAt"] = GetCurrentTimestampStr();
+    record["rev"] = BumpRevLocked();
+    if (!taskStore_.Save(record, outError)) return BuildError(outError);
+
+    TaskLog(id, "task_updated", "", "", record.value("title", std::string()), session);
+    nlohmann::json out = {
+        {"ok", true},
+        {"id", id},
+        {"title", record.value("title", std::string())},
+        {"task", record}
+    };
+    return out.dump();
+}
+
+bool TaskQueueManager::TaskGet(const std::string& id, nlohmann::json& outRecord) const {
+    return taskStore_.Get(id, outRecord);
 }
 
 std::string TaskQueueManager::TaskShow(const std::string& id, int64_t logLimit, std::string& outError) {
@@ -9170,11 +9878,27 @@ std::string TaskQueueManager::TaskShow(const std::string& id, int64_t logLimit, 
     const auto entries = taskStore_.ReadLog(id, limit);
     nlohmann::json log = nlohmann::json::array();
     for (const auto& entry : entries) log.push_back(entry);
+    std::unordered_map<std::string, std::string> numberToDirId;
+    for (const auto& rec : directionStore_.All()) {
+        if (rec.value("taskId", std::string()) != id) continue;
+        if (!rec.contains("card") || !rec["card"].is_object()) continue;
+        const std::string num = rec["card"].value("number", std::string());
+        const nlohmann::json head = FollowCardHeadLocked(directionStore_, rec);
+        const std::string headId = head.value("id", std::string());
+        if (!num.empty() && !headId.empty()) numberToDirId[num] = headId;
+    }
     nlohmann::json directions = nlohmann::json::array();
+    std::vector<nlohmann::json> cardItems;
     for (const std::string& dirId : CollectTaskDirectionIds(queues_, directionStore_, id)) {
         const nlohmann::json ds = DirectionStateLocked(dirId);
         std::string kind;
         std::string title;
+        std::string cardNumber;
+        std::string supersedes;
+        std::string supersededBy;
+        nlohmann::json afterArr = nlohmann::json::array();
+        nlohmann::json waitingFor = nlohmann::json::array();
+        bool isCard = false;
         if (dirId.rfind("job:", 0) == 0) {
             kind = "job";
             const TaskQueueJob* job = FindJobConst(dirId.substr(4));
@@ -9184,24 +9908,72 @@ std::string TaskQueueManager::TaskShow(const std::string& id, int64_t logLimit, 
             if (directionStore_.Get(dirId, dirRec) && dirRec.is_object()) {
                 kind = dirRec.value("kind", std::string());
                 title = dirRec.value("title", std::string());
+                supersedes = dirRec.value("supersedes", std::string());
+                supersededBy = dirRec.value("supersededBy", std::string());
+                if (dirRec.contains("card") && dirRec["card"].is_object()) {
+                    isCard = true;
+                    cardNumber = dirRec["card"].value("number", std::string());
+                    if (title.empty()) title = dirRec["card"].value("title", std::string());
+                    if (dirRec.contains("after") && dirRec["after"].is_array()) {
+                        afterArr = dirRec["after"];
+                        for (const auto& dep : afterArr) {
+                            if (!dep.is_string()) continue;
+                            const std::string depNum = dep.get<std::string>();
+                            auto it = numberToDirId.find(depNum);
+                            if (it == numberToDirId.end()) {
+                                waitingFor.push_back(depNum);
+                                continue;
+                            }
+                            const nlohmann::json depStatus = DirectionStateLocked(it->second);
+                            if (!IsDirectionSatisfiedForCardDep(depStatus)) {
+                                waitingFor.push_back(depNum);
+                            }
+                        }
+                    }
+                }
             }
         }
+        const std::string dState = ds.value("state", std::string());
         nlohmann::json d = {
             {"id", dirId},
             {"kind", kind},
             {"title", title},
-            {"state", ds.value("state", std::string())}
+            {"state", dState}
         };
+        if (!cardNumber.empty()) d["cardNumber"] = cardNumber;
+        if (!afterArr.empty()) d["after"] = afterArr;
+        if (!waitingFor.empty()) d["waitingFor"] = waitingFor;
+        if (!supersedes.empty()) d["supersedes"] = supersedes;
+        if (!supersededBy.empty()) d["supersededBy"] = supersededBy;
         if (ds.contains("result")) d["result"] = ds["result"];
+        if (isCard && supersededBy.empty()) {
+            nlohmann::json cItem = {
+                {"directionId", dirId},
+                {"number", cardNumber},
+                {"title", title},
+                {"state", dState},
+                {"after", afterArr},
+                {"waitingFor", waitingFor}
+            };
+            if (!supersedes.empty()) cItem["supersedes"] = supersedes;
+            if (ds.contains("result")) cItem["result"] = ds["result"];
+            cardItems.push_back(std::move(cItem));
+        }
         directions.push_back(std::move(d));
     }
+    std::sort(cardItems.begin(), cardItems.end(), [](const nlohmann::json& a, const nlohmann::json& b) {
+        return CompareCardNumberNatural(a.value("number", std::string()), b.value("number", std::string()));
+    });
+    nlohmann::json cards = nlohmann::json::array();
+    for (auto& c : cardItems) cards.push_back(std::move(c));
     return nlohmann::json{{"ok", true}, {"task", record}, {"status", TaskStateLocked(id)},
-                          {"directions", directions}, {"jobs", jobs}, {"log", log},
+                          {"directions", directions}, {"cards", cards}, {"jobs", jobs}, {"log", log},
                           {"repeatedFailures", repeatedFailures}}.dump();
 }
 
 std::string TaskQueueManager::TaskList(const std::string& stateFilter, int64_t limit, std::string& outError,
-                                       int64_t sinceVersion) {
+                                       int64_t sinceVersion, int64_t finishedLimit,
+                                       const std::string& before, const std::string& query) {
     outError.clear();
     static const std::vector<std::string> kStates = {"open", "running", "failed", "cancelled", "succeeded", "closed"};
     if (!stateFilter.empty() && std::find(kStates.begin(), kStates.end(), stateFilter) == kStates.end()) {
@@ -9209,22 +9981,124 @@ std::string TaskQueueManager::TaskList(const std::string& stateFilter, int64_t l
         return BuildError(outError);
     }
     const int64_t version = taskStore_.Version();
-    if (sinceVersion >= 0 && sinceVersion == version && stateFilter.empty() && limit <= 0) {
+    if (sinceVersion >= 0 && sinceVersion == version && stateFilter.empty() && limit <= 0 &&
+        finishedLimit == 0 && before.empty() && query.empty()) {
         return nlohmann::json{{"ok", true}, {"version", version}, {"unchanged", true}}.dump();
     }
+    const int64_t effectiveLimit = (finishedLimit < 0) ? GetTaskListRecentCount() : finishedLimit;
     std::lock_guard<std::mutex> lock(mutex_);
-    nlohmann::json tasks = nlohmann::json::array();
+
+    std::unordered_map<std::string, std::vector<std::string>> taskDirTitles;
+    std::unordered_map<std::string, std::vector<std::pair<std::string, std::string>>> taskJobs;
+    if (!query.empty()) {
+        for (const auto& rec : directionStore_.All()) {
+            const std::string tid = rec.value("taskId", std::string());
+            if (tid.empty()) continue;
+            const std::string dtitle = rec.value("title", std::string());
+            if (!dtitle.empty()) taskDirTitles[tid].push_back(dtitle);
+            if (rec.contains("card") && rec["card"].is_object()) {
+                const std::string ctitle = rec["card"].value("title", std::string());
+                if (!ctitle.empty()) taskDirTitles[tid].push_back(ctitle);
+            }
+        }
+        for (const auto& [qname, tq] : queues_) {
+            (void)qname;
+            for (const auto& job : tq.jobs) {
+                const std::string effTask = job.taskId.empty() ? job.id : job.taskId;
+                taskJobs[effTask].emplace_back(job.id, job.summary);
+            }
+        }
+    }
+
+    struct ListedTask {
+        std::string id;
+        std::string finishedAt;
+        nlohmann::json item;
+    };
+    std::vector<ListedTask> unfinished;
+    std::vector<ListedTask> finished;
     for (const auto& record : taskStore_.All()) {
         const std::string id = record.value("id", std::string());
         const nlohmann::json status = TaskStateLocked(id);
         const std::string state = status.value("state", std::string());
         if (!stateFilter.empty() && state != stateFilter) continue;
-        tasks.push_back({{"id", id}, {"title", record.value("title", std::string())}, {"state", state},
-                         {"createdAt", record.value("createdAt", std::string())},
-                         {"updatedAt", record.value("updatedAt", std::string())}});
-        if (limit > 0 && static_cast<int64_t>(tasks.size()) >= limit) break;
+        const std::string title = record.value("title", std::string());
+        const std::string intent = record.value("intent", std::string());
+        if (!query.empty()) {
+            bool matched = ContainsCaseInsensitive(id, query) ||
+                           ContainsCaseInsensitive(title, query) ||
+                           ContainsCaseInsensitive(intent, query);
+            if (!matched) {
+                auto dit = taskDirTitles.find(id);
+                if (dit != taskDirTitles.end()) {
+                    for (const auto& dt : dit->second) {
+                        if (ContainsCaseInsensitive(dt, query)) { matched = true; break; }
+                    }
+                }
+            }
+            if (!matched) {
+                auto jit = taskJobs.find(id);
+                if (jit != taskJobs.end()) {
+                    for (const auto& [jid, jsum] : jit->second) {
+                        if (ContainsCaseInsensitive(jid, query) || ContainsCaseInsensitive(jsum, query)) {
+                            matched = true;
+                            break;
+                        }
+                    }
+                }
+            }
+            if (!matched) continue;
+        }
+        const std::string createdAt = record.value("createdAt", std::string());
+        const std::string updatedAt = record.value("updatedAt", std::string());
+        const std::string sortTs = !updatedAt.empty() ? updatedAt : createdAt;
+        nlohmann::json item = {{"id", id}, {"title", title}, {"state", state},
+                               {"createdAt", createdAt}, {"updatedAt", updatedAt}};
+        if (IsFinishedTaskState(state)) {
+            finished.push_back({id, sortTs, std::move(item)});
+        } else {
+            unfinished.push_back({id, sortTs, std::move(item)});
+        }
     }
-    return nlohmann::json{{"ok", true}, {"version", version}, {"tasks", tasks}}.dump();
+    auto byNewest = [](const ListedTask& a, const ListedTask& b) {
+        if (a.finishedAt != b.finishedAt) return a.finishedAt > b.finishedAt;
+        return a.id > b.id;
+    };
+    std::stable_sort(unfinished.begin(), unfinished.end(), byNewest);
+    std::stable_sort(finished.begin(), finished.end(), byNewest);
+    if (!before.empty()) {
+        unfinished.clear();
+        std::string cursorTs, cursorId;
+        ParseBeforeCursor(before, cursorTs, cursorId);
+        std::vector<ListedTask> older;
+        older.reserve(finished.size());
+        for (auto& t : finished) {
+            if (IsOlderThanCursor(t.finishedAt, t.id, cursorTs, cursorId)) {
+                older.push_back(std::move(t));
+            }
+        }
+        finished = std::move(older);
+    }
+    bool more = false;
+    int64_t remaining = 0;
+    std::string nextBefore;
+    if (effectiveLimit > 0 && static_cast<int64_t>(finished.size()) > effectiveLimit) {
+        more = true;
+        remaining = static_cast<int64_t>(finished.size()) - effectiveLimit;
+        finished.resize(static_cast<size_t>(effectiveLimit));
+        nextBefore = MakeBeforeCursor(finished.back().finishedAt, finished.back().id);
+    }
+    nlohmann::json tasks = nlohmann::json::array();
+    for (auto& t : unfinished) {
+        if (limit > 0 && static_cast<int64_t>(tasks.size()) >= limit) break;
+        tasks.push_back(std::move(t.item));
+    }
+    for (auto& t : finished) {
+        if (limit > 0 && static_cast<int64_t>(tasks.size()) >= limit) break;
+        tasks.push_back(std::move(t.item));
+    }
+    return nlohmann::json{{"ok", true}, {"version", version}, {"tasks", tasks},
+                          {"more", more}, {"next_before", nextBefore}, {"remaining", remaining}}.dump();
 }
 
 std::string TaskQueueManager::TaskNote(const std::string& id, const std::string& text, const std::string& session,
@@ -9266,6 +10140,7 @@ std::string TaskQueueManager::TaskClose(const std::string& id, const std::string
     const std::string now = GetCurrentTimestampStr();
     record["closed"] = nlohmann::json{{"result", result}, {"reason", reason}, {"at", now}};
     record["updatedAt"] = now;
+    record["rev"] = BumpRevLocked();
     if (!taskStore_.Save(record, outError)) return BuildError(outError);
     TaskLog(id, "closed", "", "", result + ": " + reason, "");
     return nlohmann::json{{"ok", true}, {"id", id}, {"state", "closed"}, {"result", result}}.dump();
@@ -9290,6 +10165,7 @@ std::string TaskQueueManager::TaskReopen(const std::string& id, const std::strin
     }
     record["closed"] = nullptr;
     record["updatedAt"] = GetCurrentTimestampStr();
+    record["rev"] = BumpRevLocked();
     if (!taskStore_.Save(record, outError)) return BuildError(outError);
     TaskLog(id, "reopened", "", "", reason, "");
     const nlohmann::json status = TaskStateLocked(id);
@@ -9303,6 +10179,7 @@ std::string TaskQueueManager::TaskPurgeOlderThan(int64_t olderThanSec, std::stri
         return BuildError(outError);
     }
     // Only closed tasks are removed. Their closing time decides the age.
+    std::lock_guard<std::mutex> lock(mutex_);
     const int64_t cutoff = GetNowEpochSec() - olderThanSec;
     int64_t purged = 0;
     for (const auto& record : taskStore_.All()) {
@@ -9310,7 +10187,10 @@ std::string TaskQueueManager::TaskPurgeOlderThan(int64_t olderThanSec, std::stri
         const int64_t closedAt = ParseTimestampStrToEpoch(record["closed"].value("at", std::string()));
         if (closedAt <= 0 || closedAt >= cutoff) continue;
         std::string err;
-        if (taskStore_.Remove(record.value("id", std::string()), err)) ++purged;
+        if (taskStore_.Remove(record.value("id", std::string()), err)) {
+            ++purged;
+            BumpRevLocked();
+        }
     }
     return nlohmann::json{{"ok", true}, {"purged", purged}}.dump();
 }
@@ -9374,7 +10254,8 @@ std::string TaskQueueManager::TaskWait(const std::string& id, int timeoutMs, int
     return shown;
 }
 
-std::string TaskQueueManager::DirectionCancelJobs(const std::string& id, std::string& outError) {
+std::string TaskQueueManager::DirectionCancelJobs(const std::string& id, std::string& outError,
+                                                  const std::string& reason) {
     outError.clear();
     nlohmann::json record;
     if (!directionStore_.Get(id, record)) {
@@ -9399,7 +10280,7 @@ std::string TaskQueueManager::DirectionCancelJobs(const std::string& id, std::st
     int cancelled = 0;
     for (const auto& jid : jobIds) {
         std::string err;
-        TaskQueueCancel(jid, err);
+        TaskQueueCancel(jid, err, reason);
         if (err.empty()) ++cancelled;
     }
     return nlohmann::json{{"ok", true}, {"id", id}, {"cancelled", cancelled}}.dump();
@@ -9499,6 +10380,1050 @@ std::string TaskQueueManager::DirectionRemoveJobs(const std::string& id, bool fo
     }
     outError.clear();
     return nlohmann::json{{"ok", true}, {"id", id}, {"removed", removed}}.dump();
+}
+
+namespace {
+
+std::vector<std::string> DedupeAfterList(const std::vector<std::string>& raw) {
+    std::vector<std::string> out;
+    std::unordered_set<std::string> seen;
+    for (const auto& s : raw) {
+        if (s.empty()) continue;
+        if (seen.insert(s).second) out.push_back(s);
+    }
+    return out;
+}
+
+constexpr int kDefaultMaxCardRescueDepth = 2;
+
+bool FindExactCardInTask(const DirectionStore& store, const std::string& taskId,
+                         const std::string& number, nlohmann::json& outRecord) {
+    bool foundSuperseded = false;
+    nlohmann::json supersededRec;
+    for (const auto& rec : store.All()) {
+        if (rec.value("taskId", std::string()) != taskId) continue;
+        if (!rec.contains("card") || !rec["card"].is_object()) continue;
+        if (rec["card"].value("number", std::string()) != number) continue;
+        if (rec.value("supersededBy", std::string()).empty()) {
+            outRecord = rec;
+            return true;
+        }
+        if (!foundSuperseded) {
+            supersededRec = rec;
+            foundSuperseded = true;
+        }
+    }
+    if (foundSuperseded) {
+        outRecord = std::move(supersededRec);
+        return true;
+    }
+    return false;
+}
+
+bool ResolveCardLatestInTask(const DirectionStore& store, const std::string& taskId,
+                             const std::string& number, nlohmann::json& outRecord) {
+    nlohmann::json rec;
+    if (!FindExactCardInTask(store, taskId, number, rec)) return false;
+    outRecord = FollowCardHeadLocked(store, rec);
+    return true;
+}
+
+bool HasCardDepCycle(const DirectionStore& store, const std::string& taskId,
+                     const std::string& targetNumber, const std::vector<std::string>& initialAfter) {
+    std::unordered_map<std::string, std::string> numberToLatestNumber;
+    const auto allRecs = store.All();
+    for (const auto& rec : allRecs) {
+        if (rec.value("taskId", std::string()) != taskId) continue;
+        if (!rec.contains("card") || !rec["card"].is_object()) continue;
+        const std::string num = rec["card"].value("number", std::string());
+        if (num.empty()) continue;
+        const nlohmann::json head = FollowCardHeadLocked(store, rec);
+        const std::string headNum =
+            (head.contains("card") && head["card"].is_object())
+                ? head["card"].value("number", num)
+                : num;
+        numberToLatestNumber[num] = headNum;
+    }
+    auto resolveNum = [&](const std::string& n) -> std::string {
+        auto it = numberToLatestNumber.find(n);
+        return it != numberToLatestNumber.end() ? it->second : n;
+    };
+
+    std::unordered_map<std::string, std::vector<std::string>> adj;
+    for (const auto& rec : allRecs) {
+        if (rec.value("taskId", std::string()) != taskId) continue;
+        if (!rec.contains("card") || !rec["card"].is_object()) continue;
+        if (!rec.value("supersededBy", std::string()).empty()) continue;
+        const std::string num = rec["card"].value("number", std::string());
+        std::vector<std::string> deps;
+        if (rec.contains("after") && rec["after"].is_array()) {
+            for (const auto& d : rec["after"]) {
+                if (d.is_string()) deps.push_back(resolveNum(d.get<std::string>()));
+            }
+        }
+        adj[num] = std::move(deps);
+    }
+    const std::string resolvedTarget = resolveNum(targetNumber);
+    std::vector<std::string> resolvedInitial;
+    resolvedInitial.reserve(initialAfter.size());
+    for (const auto& d : initialAfter) resolvedInitial.push_back(resolveNum(d));
+    adj[resolvedTarget] = resolvedInitial;
+
+    std::unordered_set<std::string> visited;
+    std::vector<std::string> stack = resolvedInitial;
+    while (!stack.empty()) {
+        const std::string cur = stack.back();
+        stack.pop_back();
+        if (cur == resolvedTarget) return true;
+        if (!visited.insert(cur).second) continue;
+        auto it = adj.find(cur);
+        if (it == adj.end()) continue;
+        for (const auto& nxt : it->second) {
+            if (nxt == resolvedTarget) return true;
+            if (visited.count(nxt) == 0) stack.push_back(nxt);
+        }
+    }
+    return false;
+}
+
+} // namespace
+
+std::string TaskQueueManager::CardAdd(const std::string& taskId, const std::string& number,
+                                      const std::string& title, const std::string& body,
+                                      const std::vector<std::string>& after, const std::string& tmpl,
+                                      const std::string& paramsJson, const std::string& originJson,
+                                      std::string& outError) {
+    outError.clear();
+    if (!ValidateTaskActive(taskId, outError)) return BuildError(outError);
+    if (!DirectionStore::ValidateCardNumber(number, outError)) return BuildError(outError);
+    if (title.empty()) {
+        outError = "title is required";
+        return BuildError(outError);
+    }
+    if (!DirectionStore::ValidateSize("title", title, DirectionStore::kTitleMaxBytes, outError)) {
+        return BuildError(outError);
+    }
+    if (!DirectionStore::ValidateSize("body", body, DirectionStore::kCardBodyMaxBytes, outError)) {
+        return BuildError(outError);
+    }
+    const std::string effTmpl = tmpl.empty() ? std::string("card") : tmpl;
+    if (!DirectionStore::ValidateSize("template", effTmpl, DirectionStore::kCardTemplateMaxBytes, outError)) {
+        return BuildError(outError);
+    }
+    nlohmann::json paramsObj = nlohmann::json::object();
+    if (!paramsJson.empty()) {
+        paramsObj = nlohmann::json::parse(paramsJson, nullptr, false);
+        if (paramsObj.is_discarded() || !paramsObj.is_object()) {
+            outError = "params must be a JSON object";
+            return BuildError(outError);
+        }
+    }
+    const std::vector<std::string> dedupAfter = DedupeAfterList(after);
+    const TaskQueueOrigin origin = ParseOriginJson(originJson);
+    nlohmann::json originRecord = nlohmann::json::parse(OriginToJson(origin), nullptr, false);
+    if (!originRecord.is_object()) originRecord = nlohmann::json::object();
+
+    std::lock_guard<std::mutex> lock(mutex_);
+    nlohmann::json existing;
+    if (FindExactCardInTask(directionStore_, taskId, number, existing)) {
+        outError = "card '" + number + "' already exists in task '" + taskId + "'";
+        return BuildError(outError);
+    }
+    for (const auto& dep : dedupAfter) {
+        if (dep == number) {
+            outError = "card '" + number + "' cannot depend on itself";
+            return BuildError(outError);
+        }
+        nlohmann::json depRec;
+        if (!ResolveCardLatestInTask(directionStore_, taskId, dep, depRec)) {
+            outError = "unknown dependency card '" + dep + "' in task '" + taskId + "'";
+            return BuildError(outError);
+        }
+    }
+    if (HasCardDepCycle(directionStore_, taskId, number, dedupAfter)) {
+        outError = "dependency cycle detected involving card '" + number + "'";
+        return BuildError(outError);
+    }
+
+    const std::string newId = directionStore_.NextId();
+    const std::string now = GetCurrentTimestampStr();
+    nlohmann::json afterArr = nlohmann::json::array();
+    for (const auto& dep : dedupAfter) afterArr.push_back(dep);
+
+    nlohmann::json record = {
+        {"id", newId},
+        {"kind", "card"},
+        {"taskId", taskId},
+        {"title", title},
+        {"createdAt", now},
+        {"updatedAt", now},
+        {"origin", originRecord},
+        {"closed", nullptr},
+        {"removedJobs", nlohmann::json::array()},
+        {"after", afterArr},
+        {"card", {
+            {"number", number},
+            {"title", title},
+            {"body", body},
+            {"template", effTmpl},
+            {"params", paramsObj}
+        }},
+        {"rev", BumpRevLocked()}
+    };
+    if (!directionStore_.Create(record, outError)) return BuildError(outError);
+    nlohmann::json extra = {{"directionId", newId}, {"cardNumber", number}, {"title", title}};
+    TaskLog(taskId, "card_added", "", "", number + ": " + title, origin.session, &extra);
+    return nlohmann::json{
+        {"ok", true},
+        {"id", newId},
+        {"directionId", newId},
+        {"taskId", taskId},
+        {"number", number},
+        {"title", title},
+        {"state", "planned"}
+    }.dump();
+}
+
+std::string TaskQueueManager::CardList(const std::string& taskId, std::string& outError) {
+    outError.clear();
+    nlohmann::json taskRec;
+    if (taskId.empty() || !taskStore_.Get(taskId, taskRec)) {
+        outError = "task not found: " + taskId;
+        return BuildError(outError);
+    }
+    std::lock_guard<std::mutex> lock(mutex_);
+    std::vector<nlohmann::json> cardRecs;
+    std::unordered_map<std::string, std::string> numberToDirId;
+    for (const auto& rec : directionStore_.All()) {
+        if (rec.value("taskId", std::string()) != taskId) continue;
+        if (!rec.contains("card") || !rec["card"].is_object()) continue;
+        const std::string num = rec["card"].value("number", std::string());
+        const nlohmann::json head = FollowCardHeadLocked(directionStore_, rec);
+        const std::string headId = head.value("id", std::string());
+        if (!num.empty() && !headId.empty()) numberToDirId[num] = headId;
+        if (!rec.value("supersededBy", std::string()).empty()) continue;
+        cardRecs.push_back(rec);
+    }
+    std::sort(cardRecs.begin(), cardRecs.end(), [](const nlohmann::json& a, const nlohmann::json& b) {
+        return CompareCardNumberNatural(
+            a["card"].value("number", std::string()),
+            b["card"].value("number", std::string()));
+    });
+
+    nlohmann::json cards = nlohmann::json::array();
+    for (const auto& rec : cardRecs) {
+        const std::string dirId = rec.value("id", std::string());
+        const auto& card = rec["card"];
+        const std::string num = card.value("number", std::string());
+        const nlohmann::json status = DirectionStateLocked(dirId);
+        const std::string state = status.value("state", std::string("planned"));
+
+        nlohmann::json afterArr = nlohmann::json::array();
+        nlohmann::json waitingFor = nlohmann::json::array();
+        if (rec.contains("after") && rec["after"].is_array()) {
+            afterArr = rec["after"];
+            for (const auto& dep : afterArr) {
+                if (!dep.is_string()) continue;
+                const std::string depNum = dep.get<std::string>();
+                auto it = numberToDirId.find(depNum);
+                if (it == numberToDirId.end()) {
+                    waitingFor.push_back(depNum);
+                    continue;
+                }
+                const nlohmann::json depStatus = DirectionStateLocked(it->second);
+                if (!IsDirectionSatisfiedForCardDep(depStatus)) {
+                    waitingFor.push_back(depNum);
+                }
+            }
+        }
+
+        // Omit card.body from list payloads to keep responses small.
+        nlohmann::json item = {
+            {"id", dirId},
+            {"directionId", dirId},
+            {"kind", rec.value("kind", std::string("card"))},
+            {"taskId", taskId},
+            {"number", num},
+            {"title", card.value("title", std::string())},
+            {"template", card.value("template", std::string("card"))},
+            {"after", afterArr},
+            {"state", state},
+            {"waitingFor", waitingFor},
+            {"ready", state == "planned" && waitingFor.empty()},
+            {"createdAt", rec.value("createdAt", std::string())},
+            {"updatedAt", rec.value("updatedAt", std::string())}
+        };
+        if (status.contains("result")) item["result"] = status["result"];
+        const std::string btId = rec.value("btId", std::string());
+        if (!btId.empty()) item["btId"] = btId;
+        const std::string supersedes = rec.value("supersedes", std::string());
+        if (!supersedes.empty()) item["supersedes"] = supersedes;
+        const std::string supersedeReason = rec.value("supersedeReason", std::string());
+        if (!supersedeReason.empty()) item["supersedeReason"] = supersedeReason;
+        cards.push_back(std::move(item));
+    }
+    return nlohmann::json{{"ok", true}, {"taskId", taskId}, {"cards", cards}}.dump();
+}
+
+std::string TaskQueueManager::CardShow(const std::string& idOrNumber, const std::string& taskId,
+                                       std::string& outError) {
+    outError.clear();
+    if (idOrNumber.empty()) {
+        outError = "card number or direction id is required";
+        return BuildError(outError);
+    }
+    std::lock_guard<std::mutex> lock(mutex_);
+    nlohmann::json record;
+    nlohmann::json directRec;
+    if (directionStore_.Get(idOrNumber, directRec)) {
+        if (!taskId.empty() && directRec.value("taskId", std::string()) != taskId) {
+            outError = "card not found: " + idOrNumber;
+            return BuildError(outError);
+        }
+        record = std::move(directRec);
+    } else {
+        std::vector<nlohmann::json> matches;
+        std::vector<nlohmann::json> supersededMatches;
+        for (const auto& rec : directionStore_.All()) {
+            if (!taskId.empty() && rec.value("taskId", std::string()) != taskId) continue;
+            if (!rec.contains("card") || !rec["card"].is_object()) continue;
+            if (rec["card"].value("number", std::string()) != idOrNumber) continue;
+            if (!rec.value("supersededBy", std::string()).empty()) {
+                supersededMatches.push_back(rec);
+                continue;
+            }
+            matches.push_back(rec);
+        }
+        if (matches.empty()) matches = std::move(supersededMatches);
+        if (matches.empty()) {
+            outError = "card not found: " + idOrNumber;
+            return BuildError(outError);
+        }
+        if (matches.size() > 1) {
+            outError = "multiple tasks have card '" + idOrNumber + "'; specify --task <id>";
+            return BuildError(outError);
+        }
+        record = std::move(matches[0]);
+    }
+
+    const std::string dirId = record.value("id", std::string());
+    const std::string recTaskId = record.value("taskId", std::string());
+    const nlohmann::json status = DirectionStateLocked(dirId);
+
+    nlohmann::json waitingFor = nlohmann::json::array();
+    if (record.contains("after") && record["after"].is_array() && !recTaskId.empty()) {
+        for (const auto& dep : record["after"]) {
+            if (!dep.is_string()) continue;
+            const std::string depNum = dep.get<std::string>();
+            nlohmann::json depRec;
+            if (!ResolveCardLatestInTask(directionStore_, recTaskId, depNum, depRec)) {
+                waitingFor.push_back(depNum);
+                continue;
+            }
+            const nlohmann::json depStatus = DirectionStateLocked(depRec.value("id", std::string()));
+            if (!IsDirectionSatisfiedForCardDep(depStatus)) {
+                waitingFor.push_back(depNum);
+            }
+        }
+    }
+
+    nlohmann::json jobs = nlohmann::json::array();
+    for (const auto& [name, tq] : queues_) {
+        (void)name;
+        for (const auto& job : tq.jobs) {
+            if (job.directionId != dirId) continue;
+            jobs.push_back({{"id", job.id}, {"taskqueue", job.taskqueue}, {"name", job.name},
+                            {"summary", job.summary}, {"state", job.state},
+                            {"supersedes", job.supersedes}, {"supersededBy", job.supersededBy}});
+        }
+    }
+
+    nlohmann::json out = {
+        {"ok", true},
+        {"direction", record},
+        {"after", record.value("after", nlohmann::json::array())},
+        {"status", status},
+        {"waitingFor", waitingFor},
+        {"jobs", jobs}
+    };
+    if (record.contains("card") && record["card"].is_object()) {
+        out["card"] = record["card"];
+    }
+    return out.dump();
+}
+
+std::string TaskQueueManager::CardEdit(const std::string& taskId, const std::string& number,
+                                       bool hasTitle, const std::string& title,
+                                       bool hasBody, const std::string& body,
+                                       bool hasAfter, const std::vector<std::string>& after,
+                                       bool hasTemplate, const std::string& tmpl,
+                                       bool hasParams, const std::string& paramsJson,
+                                       const std::string& session, std::string& outError) {
+    outError.clear();
+    if (!ValidateTaskActive(taskId, outError)) return BuildError(outError);
+    if (number.empty()) {
+        outError = "card number is required";
+        return BuildError(outError);
+    }
+    if (hasTitle) {
+        if (title.empty()) {
+            outError = "title cannot be empty";
+            return BuildError(outError);
+        }
+        if (!DirectionStore::ValidateSize("title", title, DirectionStore::kTitleMaxBytes, outError)) {
+            return BuildError(outError);
+        }
+    }
+    if (hasBody && !DirectionStore::ValidateSize("body", body, DirectionStore::kCardBodyMaxBytes, outError)) {
+        return BuildError(outError);
+    }
+    if (hasTemplate) {
+        if (tmpl.empty()) {
+            outError = "template cannot be empty";
+            return BuildError(outError);
+        }
+        if (!DirectionStore::ValidateSize("template", tmpl, DirectionStore::kCardTemplateMaxBytes, outError)) {
+            return BuildError(outError);
+        }
+    }
+    nlohmann::json paramsObj;
+    if (hasParams) {
+        paramsObj = paramsJson.empty() ? nlohmann::json::object() : nlohmann::json::parse(paramsJson, nullptr, false);
+        if (paramsObj.is_discarded() || !paramsObj.is_object()) {
+            outError = "params must be a JSON object";
+            return BuildError(outError);
+        }
+    }
+
+    std::lock_guard<std::mutex> lock(mutex_);
+    nlohmann::json record;
+    if (!FindExactCardInTask(directionStore_, taskId, number, record)) {
+        outError = "card '" + number + "' not found in task '" + taskId + "'";
+        return BuildError(outError);
+    }
+    const std::string dirId = record.value("id", std::string());
+    const std::string state = DirectionStateLocked(dirId).value("state", std::string());
+    if (record.value("kind", std::string()) != "card" || state != "planned") {
+        outError = "card '" + number + "' can only be edited while planned (current state: " + state + ")";
+        return BuildError(outError);
+    }
+
+    if (hasAfter) {
+        const std::vector<std::string> dedupAfter = DedupeAfterList(after);
+        for (const auto& dep : dedupAfter) {
+            if (dep == number) {
+                outError = "card '" + number + "' cannot depend on itself";
+                return BuildError(outError);
+            }
+            nlohmann::json depRec;
+            if (!ResolveCardLatestInTask(directionStore_, taskId, dep, depRec)) {
+                outError = "unknown dependency card '" + dep + "' in task '" + taskId + "'";
+                return BuildError(outError);
+            }
+        }
+        if (HasCardDepCycle(directionStore_, taskId, number, dedupAfter)) {
+            outError = "dependency cycle detected involving card '" + number + "'";
+            return BuildError(outError);
+        }
+        nlohmann::json afterArr = nlohmann::json::array();
+        for (const auto& dep : dedupAfter) afterArr.push_back(dep);
+        record["after"] = afterArr;
+    }
+
+    nlohmann::json card = record["card"];
+    if (hasTitle) {
+        card["title"] = title;
+        record["title"] = title;
+    }
+    if (hasBody) card["body"] = body;
+    if (hasTemplate) card["template"] = tmpl;
+    if (hasParams) card["params"] = paramsObj;
+    record["card"] = card;
+    record["updatedAt"] = GetCurrentTimestampStr();
+    record["rev"] = BumpRevLocked();
+
+    if (!directionStore_.Save(record, outError)) return BuildError(outError);
+    const std::string newTitle = record.value("title", std::string());
+    nlohmann::json extra = {{"directionId", dirId}, {"cardNumber", number}, {"title", newTitle}};
+    TaskLog(taskId, "card_edited", "", "", number + ": " + newTitle, session, &extra);
+    return nlohmann::json{
+        {"ok", true},
+        {"id", dirId},
+        {"directionId", dirId},
+        {"taskId", taskId},
+        {"number", number},
+        {"title", newTitle},
+        {"state", "planned"}
+    }.dump();
+}
+
+std::string TaskQueueManager::CardRemove(const std::string& taskId, const std::string& number,
+                                         const std::string& session, std::string& outError) {
+    outError.clear();
+    if (!ValidateTaskActive(taskId, outError)) return BuildError(outError);
+    if (number.empty()) {
+        outError = "card number is required";
+        return BuildError(outError);
+    }
+    std::lock_guard<std::mutex> lock(mutex_);
+    nlohmann::json record;
+    if (!FindExactCardInTask(directionStore_, taskId, number, record)) {
+        outError = "card '" + number + "' not found in task '" + taskId + "'";
+        return BuildError(outError);
+    }
+    const std::string dirId = record.value("id", std::string());
+    const std::string state = DirectionStateLocked(dirId).value("state", std::string());
+    if (record.value("kind", std::string()) != "card" || state != "planned") {
+        outError = "card '" + number + "' can only be removed while planned (current state: " + state + ")";
+        return BuildError(outError);
+    }
+    const std::string title = record.value("title", std::string());
+    if (!directionStore_.Remove(dirId, outError)) return BuildError(outError);
+    BumpRevLocked();
+    nlohmann::json extra = {{"directionId", dirId}, {"cardNumber", number}, {"title", title}};
+    TaskLog(taskId, "card_removed", "", "", number + ": " + title, session, &extra);
+    return nlohmann::json{
+        {"ok", true},
+        {"id", dirId},
+        {"directionId", dirId},
+        {"taskId", taskId},
+        {"number", number}
+    }.dump();
+}
+
+std::string TaskQueueManager::CardRedo(const std::string& taskId, const std::string& idOrNumber,
+                                       bool hasBody, const std::string& body,
+                                       bool hasParams, const std::string& paramsJson,
+                                       const std::string& reason, bool force,
+                                       const std::string& originJson, std::string& outError) {
+    outError.clear();
+    if (!ValidateTaskActive(taskId, outError)) return BuildError(outError);
+    if (idOrNumber.empty()) {
+        outError = "card number or direction id is required";
+        return BuildError(outError);
+    }
+    if (!DirectionStore::ValidateSize("reason", reason, DirectionStore::kReasonMaxBytes, outError)) {
+        return BuildError(outError);
+    }
+    if (hasBody && !DirectionStore::ValidateSize("body", body, DirectionStore::kCardBodyMaxBytes, outError)) {
+        return BuildError(outError);
+    }
+    nlohmann::json paramsObj;
+    if (hasParams) {
+        paramsObj = paramsJson.empty() ? nlohmann::json::object() : nlohmann::json::parse(paramsJson, nullptr, false);
+        if (paramsObj.is_discarded() || !paramsObj.is_object()) {
+            outError = "params must be a JSON object";
+            return BuildError(outError);
+        }
+    }
+
+    const TaskQueueOrigin origin = ParseOriginJson(originJson);
+    nlohmann::json originRecord = nlohmann::json::parse(OriginToJson(origin), nullptr, false);
+    if (!originRecord.is_object()) originRecord = nlohmann::json::object();
+
+    std::lock_guard<std::mutex> lock(mutex_);
+    nlohmann::json record;
+    nlohmann::json directRec;
+    if (directionStore_.Get(idOrNumber, directRec)) {
+        if (directRec.value("taskId", std::string()) != taskId ||
+            !directRec.contains("card") || !directRec["card"].is_object()) {
+            outError = "card '" + idOrNumber + "' not found in task '" + taskId + "'";
+            return BuildError(outError);
+        }
+        record = std::move(directRec);
+    } else if (!FindExactCardInTask(directionStore_, taskId, idOrNumber, record)) {
+        outError = "card '" + idOrNumber + "' not found in task '" + taskId + "'";
+        return BuildError(outError);
+    }
+
+    nlohmann::json head = FollowCardHeadLocked(directionStore_, record);
+    const std::string headId = head.value("id", std::string());
+    const nlohmann::json headCard = head.value("card", nlohmann::json::object());
+    const std::string headNumber = headCard.value("number", std::string());
+    const std::string headState = DirectionStateLocked(headId).value("state", std::string());
+    if (headState != "failed" && headState != "closed" && headState != "cancelled") {
+        outError = "card '" + headNumber + "' can only be redone when failed, cancelled, or closed (current state: " +
+                   headState + ")";
+        return BuildError(outError);
+    }
+
+    int depth = 0;
+    nlohmann::json root = head;
+    std::unordered_set<std::string> seenBack;
+    seenBack.insert(headId);
+    for (int step = 0; step < 1000; ++step) {
+        const std::string prevId = root.value("supersedes", std::string());
+        if (prevId.empty() || !seenBack.insert(prevId).second) break;
+        nlohmann::json prevRec;
+        if (!directionStore_.Get(prevId, prevRec) || !prevRec.is_object()) break;
+        root = std::move(prevRec);
+        ++depth;
+    }
+
+    if (!force && depth >= kDefaultMaxCardRescueDepth) {
+        outError = "rescue chain limit (" + std::to_string(kDefaultMaxCardRescueDepth) +
+                   ") exceeded for card '" + headNumber + "'; pass --force to override";
+        return BuildError(outError);
+    }
+
+    std::unordered_set<std::string> usedNumbers;
+    for (const auto& rec : directionStore_.All()) {
+        if (rec.value("taskId", std::string()) != taskId) continue;
+        if (!rec.contains("card") || !rec["card"].is_object()) continue;
+        const std::string num = rec["card"].value("number", std::string());
+        if (!num.empty()) usedNumbers.insert(num);
+    }
+
+    const std::string baseNumber =
+        (root.contains("card") && root["card"].is_object())
+            ? root["card"].value("number", headNumber)
+            : headNumber;
+    int suffix = depth + 1;
+    if (suffix < 1) suffix = 1;
+    std::string newNumber = baseNumber + "-r" + std::to_string(suffix);
+    while (usedNumbers.count(newNumber) > 0) {
+        ++suffix;
+        newNumber = baseNumber + "-r" + std::to_string(suffix);
+    }
+    if (!DirectionStore::ValidateCardNumber(newNumber, outError)) {
+        return BuildError(outError);
+    }
+
+    const std::string newId = directionStore_.NextId();
+    const std::string now = GetCurrentTimestampStr();
+    const std::string title = headCard.value("title", head.value("title", std::string()));
+    const std::string effBody = hasBody ? body : headCard.value("body", std::string());
+    const std::string effTmpl = headCard.value("template", std::string("card"));
+    const nlohmann::json effParams =
+        hasParams ? paramsObj : headCard.value("params", nlohmann::json::object());
+
+    nlohmann::json newRecord = {
+        {"id", newId},
+        {"kind", "card"},
+        {"taskId", taskId},
+        {"title", title},
+        {"createdAt", now},
+        {"updatedAt", now},
+        {"origin", originRecord},
+        {"closed", nullptr},
+        {"removedJobs", nlohmann::json::array()},
+        {"after", head.value("after", nlohmann::json::array())},
+        {"supersedes", headId},
+        {"card", {
+            {"number", newNumber},
+            {"title", title},
+            {"body", effBody},
+            {"template", effTmpl},
+            {"params", effParams}
+        }}
+    };
+    if (!reason.empty()) newRecord["supersedeReason"] = reason;
+    newRecord["rev"] = BumpRevLocked();
+
+    if (!directionStore_.Create(newRecord, outError)) return BuildError(outError);
+    head["supersededBy"] = newId;
+    head["updatedAt"] = now;
+    head["rev"] = BumpRevLocked();
+    std::string saveErr;
+    if (!directionStore_.Save(head, saveErr)) {
+        std::string ignoreErr;
+        directionStore_.Remove(newId, ignoreErr);
+        outError = saveErr;
+        return BuildError(outError);
+    }
+
+    nlohmann::json extra = {
+        {"directionId", newId},
+        {"cardNumber", newNumber},
+        {"supersedes", headId},
+        {"supersedesNumber", headNumber},
+        {"title", title}
+    };
+    if (!reason.empty()) extra["reason"] = reason;
+    const std::string logText = newNumber + " supersedes " + headNumber +
+                                (reason.empty() ? std::string() : (": " + reason));
+    TaskLog(taskId, "card_redone", "", "", logText, origin.session, &extra);
+
+    nlohmann::json out = {
+        {"ok", true},
+        {"id", newId},
+        {"directionId", newId},
+        {"taskId", taskId},
+        {"number", newNumber},
+        {"title", title},
+        {"state", "planned"},
+        {"supersedes", headId},
+        {"supersedesNumber", headNumber},
+        {"rescueDepth", depth + 1}
+    };
+    if (!reason.empty()) out["reason"] = reason;
+    return out.dump();
+}
+
+// ---------------------------------------------------------------------------
+// Client-exit watch for --cancel-on-exit (card 105-4)
+// ---------------------------------------------------------------------------
+
+bool TaskQueueManager::QueryProcessStartTimePortable(uint32_t pid, uint64_t& outStartTime) {
+    outStartTime = 0;
+    if (pid == 0) return false;
+#ifdef _WIN32
+    HANDLE h = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, FALSE, static_cast<DWORD>(pid));
+    if (!h) return false;
+    FILETIME ct{}, et{}, kt{}, ut{};
+    bool ok = GetProcessTimes(h, &ct, &et, &kt, &ut) != FALSE;
+    CloseHandle(h);
+    if (ok) {
+        outStartTime = (static_cast<uint64_t>(ct.dwHighDateTime) << 32) | ct.dwLowDateTime;
+    }
+    return true;
+#else
+    if (kill(static_cast<pid_t>(pid), 0) != 0 && errno == ESRCH) return false;
+#ifdef __linux__
+    std::ifstream in("/proc/" + std::to_string(pid) + "/stat");
+    std::string line;
+    if (std::getline(in, line)) {
+        size_t rparen = line.rfind(')');
+        if (rparen != std::string::npos && rparen + 2 < line.size()) {
+            std::istringstream iss(line.substr(rparen + 2));
+            std::string tok;
+            // Field 3 is state; field 22 is starttime (index 19 after ')').
+            for (int idx = 3; idx <= 22 && (iss >> tok); ++idx) {
+                if (idx == 22) {
+                    try { outStartTime = std::stoull(tok); } catch (...) { outStartTime = 0; }
+                }
+            }
+        }
+    }
+#endif
+    return true;
+#endif
+}
+
+bool TaskQueueManager::IsWatchedProcessAlive(uint32_t pid, uint64_t expectedStartTime) {
+    if (pid == 0) return false;
+#ifdef _WIN32
+    HANDLE h = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION | SYNCHRONIZE, FALSE, static_cast<DWORD>(pid));
+    if (!h) return false;
+    if (WaitForSingleObject(h, 0) == WAIT_OBJECT_0) {
+        CloseHandle(h);
+        return false;
+    }
+    if (expectedStartTime != 0) {
+        FILETIME ct{}, et{}, kt{}, ut{};
+        if (GetProcessTimes(h, &ct, &et, &kt, &ut)) {
+            uint64_t actual = (static_cast<uint64_t>(ct.dwHighDateTime) << 32) | ct.dwLowDateTime;
+            if (actual != expectedStartTime) {
+                CloseHandle(h);
+                return false;
+            }
+        }
+    }
+    CloseHandle(h);
+    return true;
+#else
+    if (kill(static_cast<pid_t>(pid), 0) != 0 && errno == ESRCH) return false;
+    if (expectedStartTime != 0) {
+        uint64_t actual = 0;
+        if (!QueryProcessStartTimePortable(pid, actual)) return false;
+        if (actual != 0 && actual != expectedStartTime) return false;
+    }
+    return true;
+#endif
+}
+
+void TaskQueueManager::WakeClientWatchLocked() {
+#ifdef _WIN32
+    if (clientWatchWakeEvent_) {
+        SetEvent(static_cast<HANDLE>(clientWatchWakeEvent_));
+    }
+#endif
+}
+
+void TaskQueueManager::UnwatchDirectionClientLocked(const std::string& directionId) {
+    if (directionId.empty()) return;
+    bool removed = false;
+    for (auto it = clientWatches_.begin(); it != clientWatches_.end(); ) {
+        if (it->directionId == directionId) {
+#ifdef _WIN32
+            if (it->handle) { CloseHandle(static_cast<HANDLE>(it->handle)); it->handle = nullptr; }
+#else
+            if (it->pidfd >= 0) { close(it->pidfd); it->pidfd = -1; }
+#endif
+            it = clientWatches_.erase(it);
+            removed = true;
+        } else {
+            ++it;
+        }
+    }
+    if (removed) WakeClientWatchLocked();
+
+    nlohmann::json dirRec;
+    if (directionStore_.Get(directionId, dirRec) && dirRec.contains("clientWatch")) {
+        dirRec.erase("clientWatch");
+        dirRec["updatedAt"] = GetCurrentTimestampStr();
+        dirRec["rev"] = BumpRevLocked();
+        std::string err;
+        directionStore_.Save(dirRec, err);
+    }
+}
+
+void TaskQueueManager::UnwatchDirectionClient(const std::string& directionId) {
+    if (directionId.empty()) return;
+    std::lock_guard<std::mutex> lock(mutex_);
+    UnwatchDirectionClientLocked(directionId);
+}
+
+bool TaskQueueManager::WatchDirectionClient(const std::string& directionId, uint32_t clientPid,
+                                            std::string& outError) {
+    outError.clear();
+    if (directionId.empty() || clientPid == 0) return true;
+
+    uint64_t startTime = 0;
+#ifdef _WIN32
+    HANDLE h = OpenProcess(SYNCHRONIZE | PROCESS_QUERY_LIMITED_INFORMATION, FALSE,
+                           static_cast<DWORD>(clientPid));
+    if (!h) {
+        CancelDirectionOnClientExit(directionId);
+        return true;
+    }
+    if (WaitForSingleObject(h, 0) == WAIT_OBJECT_0) {
+        CloseHandle(h);
+        CancelDirectionOnClientExit(directionId);
+        return true;
+    }
+    FILETIME ct{}, et{}, kt{}, ut{};
+    if (GetProcessTimes(h, &ct, &et, &kt, &ut)) {
+        startTime = (static_cast<uint64_t>(ct.dwHighDateTime) << 32) | ct.dwLowDateTime;
+    }
+#else
+    if (!QueryProcessStartTimePortable(clientPid, startTime)) {
+        CancelDirectionOnClientExit(directionId);
+        return true;
+    }
+    int pidfd = -1;
+#ifdef __linux__
+#ifdef SYS_pidfd_open
+    pidfd = static_cast<int>(syscall(SYS_pidfd_open, static_cast<pid_t>(clientPid), 0));
+#endif
+#endif
+#endif
+
+    {
+        std::lock_guard<std::mutex> lock(mutex_);
+        nlohmann::json dirRec;
+        if (!directionStore_.Get(directionId, dirRec)) {
+#ifdef _WIN32
+            CloseHandle(h);
+#else
+            if (pidfd >= 0) close(pidfd);
+#endif
+            outError = "direction not found: " + directionId;
+            return false;
+        }
+        dirRec["clientWatch"] = {{"pid", clientPid}, {"startTime", startTime}};
+        dirRec["updatedAt"] = GetCurrentTimestampStr();
+        dirRec["rev"] = BumpRevLocked();
+        if (!directionStore_.Save(dirRec, outError)) {
+#ifdef _WIN32
+            CloseHandle(h);
+#else
+            if (pidfd >= 0) close(pidfd);
+#endif
+            return false;
+        }
+
+        for (auto it = clientWatches_.begin(); it != clientWatches_.end(); ) {
+            if (it->directionId == directionId) {
+#ifdef _WIN32
+                if (it->handle) CloseHandle(static_cast<HANDLE>(it->handle));
+#else
+                if (it->pidfd >= 0) close(it->pidfd);
+#endif
+                it = clientWatches_.erase(it);
+            } else {
+                ++it;
+            }
+        }
+        ClientWatchEntry entry;
+        entry.directionId = directionId;
+        entry.pid = clientPid;
+        entry.startTime = startTime;
+#ifdef _WIN32
+        entry.handle = h;
+        if (!clientWatchWakeEvent_) {
+            clientWatchWakeEvent_ = CreateEventW(nullptr, FALSE, FALSE, nullptr);
+        }
+#else
+        entry.pidfd = pidfd;
+#endif
+        clientWatches_.push_back(entry);
+        if (!clientWatchRunning_.exchange(true)) {
+            if (clientWatchThread_.joinable()) clientWatchThread_.join();
+            clientWatchThread_ = std::thread(&TaskQueueManager::ClientWatchLoop, this);
+        }
+        WakeClientWatchLocked();
+    }
+    return true;
+}
+
+void TaskQueueManager::CancelDirectionOnClientExit(const std::string& directionId) {
+    if (directionId.empty()) return;
+    std::string kind;
+    std::string btId;
+    std::string taskId;
+    BtCancelCallback btCancel;
+    {
+        std::lock_guard<std::mutex> lock(mutex_);
+        nlohmann::json dirRec;
+        if (!directionStore_.Get(directionId, dirRec)) {
+            UnwatchDirectionClientLocked(directionId);
+            return;
+        }
+        const nlohmann::json st = DirectionStateLocked(directionId);
+        const std::string s = st.value("state", std::string());
+        if (s == "succeeded" || s == "failed" || s == "cancelled" || s == "closed") {
+            UnwatchDirectionClientLocked(directionId);
+            return;
+        }
+        kind = dirRec.value("kind", std::string());
+        btId = dirRec.value("btId", std::string());
+        taskId = dirRec.value("taskId", std::string());
+        btCancel = btCancelCb_;
+        UnwatchDirectionClientLocked(directionId);
+    }
+
+    if (kind == "bt" && !btId.empty() && btCancel) {
+        btCancel(btId);
+    }
+    std::string err;
+    DirectionCancelJobs(directionId, err, "client exited");
+    if (!taskId.empty()) {
+        nlohmann::json extra = {{"directionId", directionId}, {"reason", "client exited"}};
+        TaskLog(taskId, "direction_cancelled", "", btId, "client exited", "", &extra);
+    }
+    WriteAuditLog("CLIENT_EXIT_CANCEL", "Cancelled direction " + directionId + " (client exited)");
+}
+
+void TaskQueueManager::ReconcileDirectionClientWatches() {
+    std::vector<nlohmann::json> all = directionStore_.All();
+    std::vector<std::string> toCancel;
+    std::vector<std::pair<std::string, uint32_t>> toWatch;
+    {
+        std::lock_guard<std::mutex> lock(mutex_);
+        for (const auto& rec : all) {
+            if (!rec.contains("clientWatch") || !rec["clientWatch"].is_object()) continue;
+            const std::string dirId = rec.value("id", std::string());
+            if (dirId.empty()) continue;
+            const nlohmann::json st = DirectionStateLocked(dirId);
+            const std::string s = st.value("state", std::string());
+            if (s == "succeeded" || s == "failed" || s == "cancelled" || s == "closed") {
+                UnwatchDirectionClientLocked(dirId);
+                continue;
+            }
+            const uint32_t pid = rec["clientWatch"].value("pid", static_cast<uint32_t>(0));
+            const uint64_t expectedStart = rec["clientWatch"].value("startTime", static_cast<uint64_t>(0));
+            if (pid == 0 || !IsWatchedProcessAlive(pid, expectedStart)) {
+                toCancel.push_back(dirId);
+            } else {
+                toWatch.push_back({dirId, pid});
+            }
+        }
+    }
+    for (const auto& dirId : toCancel) {
+        CancelDirectionOnClientExit(dirId);
+    }
+    for (const auto& item : toWatch) {
+        std::string err;
+        WatchDirectionClient(item.first, item.second, err);
+    }
+}
+
+void TaskQueueManager::ClientWatchLoop() {
+    while (clientWatchRunning_.load()) {
+#ifdef _WIN32
+        HANDLE wakeEv = nullptr;
+        std::vector<std::pair<std::string, HANDLE>> items;
+        {
+            std::lock_guard<std::mutex> lock(mutex_);
+            wakeEv = static_cast<HANDLE>(clientWatchWakeEvent_);
+            for (const auto& w : clientWatches_) {
+                if (w.handle) items.push_back({w.directionId, static_cast<HANDLE>(w.handle)});
+            }
+        }
+        if (items.empty()) {
+            if (wakeEv) WaitForSingleObject(wakeEv, INFINITE);
+            else std::this_thread::sleep_for(std::chrono::milliseconds(100));
+            continue;
+        }
+        const size_t maxBatch = MAXIMUM_WAIT_OBJECTS - 1;
+        const DWORD timeoutMs = (items.size() <= maxBatch) ? INFINITE : 200;
+        for (size_t offset = 0; offset < items.size() && clientWatchRunning_.load(); offset += maxBatch) {
+            size_t count = std::min(maxBatch, items.size() - offset);
+            std::vector<HANDLE> handles;
+            handles.reserve(count + 1);
+            if (wakeEv) handles.push_back(wakeEv);
+            for (size_t i = 0; i < count; ++i) handles.push_back(items[offset + i].second);
+            DWORD res = WaitForMultipleObjects(static_cast<DWORD>(handles.size()),
+                                               handles.data(), FALSE, timeoutMs);
+            if (!clientWatchRunning_.load()) break;
+            const size_t base = wakeEv ? 1 : 0;
+            if (wakeEv && res == WAIT_OBJECT_0) {
+                break; // Watch list changed; re-snapshot.
+            }
+            if (res >= WAIT_OBJECT_0 + base && res < WAIT_OBJECT_0 + handles.size()) {
+                size_t idx = offset + static_cast<size_t>(res - WAIT_OBJECT_0 - base);
+                CancelDirectionOnClientExit(items[idx].first);
+                break;
+            }
+        }
+#else
+        std::vector<ClientWatchEntry> items;
+        {
+            std::lock_guard<std::mutex> lock(mutex_);
+            items = clientWatches_;
+        }
+        if (items.empty()) {
+            std::this_thread::sleep_for(std::chrono::milliseconds(200));
+            continue;
+        }
+        std::vector<struct pollfd> pfds;
+        std::vector<size_t> pfdToItem;
+        bool hasPollFallback = false;
+        for (size_t i = 0; i < items.size(); ++i) {
+            if (items[i].pidfd >= 0) {
+                struct pollfd p{};
+                p.fd = items[i].pidfd;
+                p.events = POLLIN;
+                pfds.push_back(p);
+                pfdToItem.push_back(i);
+            } else {
+                hasPollFallback = true;
+            }
+        }
+        if (!pfds.empty()) {
+            int timeoutMs = hasPollFallback ? 1000 : 500;
+            int r = poll(pfds.data(), static_cast<nfds_t>(pfds.size()), timeoutMs);
+            if (r > 0) {
+                for (size_t j = 0; j < pfds.size(); ++j) {
+                    if (pfds[j].revents & (POLLIN | POLLHUP | POLLERR)) {
+                        CancelDirectionOnClientExit(items[pfdToItem[j]].directionId);
+                    }
+                }
+            }
+        } else {
+            std::this_thread::sleep_for(std::chrono::milliseconds(1000));
+        }
+        if (hasPollFallback && clientWatchRunning_.load()) {
+            for (const auto& item : items) {
+                if (item.pidfd >= 0) continue;
+                if (!IsWatchedProcessAlive(item.pid, item.startTime)) {
+                    CancelDirectionOnClientExit(item.directionId);
+                }
+            }
+        }
+#endif
+    }
 }
 
 } // namespace pc

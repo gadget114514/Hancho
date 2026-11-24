@@ -1,8 +1,46 @@
 #include "ipc_client.h"
 #include "common.h"
 #include <wincrypt.h>
+#include <atomic>
+#include <cctype>
 
 namespace pc {
+
+static std::atomic<bool> g_noAutoStart{false};
+
+void SetNoAutoStart(bool noAutoStart) {
+    g_noAutoStart.store(noAutoStart);
+}
+
+bool GetNoAutoStart() {
+    return g_noAutoStart.load();
+}
+
+static std::string ReadEnvUtf8(const wchar_t* name) {
+    wchar_t buf[512] = {};
+    DWORD len = GetEnvironmentVariableW(name, buf, 512);
+    if (len == 0 || len >= 512) return "";
+    return WideToUtf8(std::wstring(buf, len));
+}
+
+bool HasAutoStartEnvVar() {
+    return !Trim(ReadEnvUtf8(L"HANCHO_AUTOSTART")).empty();
+}
+
+bool ShouldSuppressDialogs() {
+    if (HasAutoStartEnvVar()) return true;
+    return Trim(ReadEnvUtf8(L"HANCHO_NO_DIALOGS")) == "1";
+}
+
+AutoStartMode ResolveAutoStartMode(bool noAutoStartFlag, const char* envValue) {
+    if (noAutoStartFlag) return AutoStartMode::Off;
+    std::string val = envValue ? std::string(envValue) : ReadEnvUtf8(L"HANCHO_AUTOSTART");
+    val = Trim(val);
+    for (char& ch : val) ch = static_cast<char>(std::tolower(static_cast<unsigned char>(ch)));
+    if (val == "headless") return AutoStartMode::Headless;
+    if (val == "off") return AutoStartMode::Off;
+    return AutoStartMode::Gui;
+}
 
 // How long a client waits for a starting core's pipe. A core restoring many jobs can
 // take well over the old 4 seconds, and giving up early made every caller spawn yet
@@ -90,7 +128,9 @@ static void ClearAutoStartFailure() {
     DeleteFileW(AutoStartFailureMarkerPath().c_str());
 }
 
+static void LaunchOutsideCallerTree(const std::wstring& targetCmdLine);
 static void LaunchGuiOutsideCallerTree();
+static void LaunchHeadlessOutsideCallerTree();
 
 // Resolve the GUI daemon executable. hancho-cli.exe (console edition) lives next to
 // Hancho.exe, so prefer the sibling GUI binary when present.
@@ -113,22 +153,39 @@ static std::wstring ResolveGuiExePath() {
     return current;
 }
 
-// Starts `Hancho.exe gui` via WMI Win32_Process.Create so that it is created by
+static std::wstring ResolveCoreExePath() {
+    const std::wstring hanchoExe = ResolveGuiExePath();
+    auto slash = hanchoExe.find_last_of(L"\\/");
+    if (slash == std::wstring::npos) return hanchoExe;
+    const std::wstring coreExe = hanchoExe.substr(0, slash + 1) + L"HanchoCore.exe";
+    WIN32_FILE_ATTRIBUTE_DATA a = {}, b = {};
+    const bool haveCore = GetFileAttributesExW(coreExe.c_str(), GetFileExInfoStandard, &a) != FALSE;
+    const bool haveHancho = GetFileAttributesExW(hanchoExe.c_str(), GetFileExInfoStandard, &b) != FALSE;
+    if (haveCore && haveHancho &&
+        a.nFileSizeHigh == b.nFileSizeHigh && a.nFileSizeLow == b.nFileSizeLow &&
+        a.ftLastWriteTime.dwHighDateTime == b.ftLastWriteTime.dwHighDateTime &&
+        a.ftLastWriteTime.dwLowDateTime == b.ftLastWriteTime.dwLowDateTime) {
+        return coreExe;
+    }
+    if (haveHancho) {
+        DeleteFileW(coreExe.c_str());
+        if (CopyFileW(hanchoExe.c_str(), coreExe.c_str(), FALSE)) {
+            return coreExe;
+        }
+    }
+    if (haveCore) return coreExe;
+    return hanchoExe;
+}
+
+// Starts a command via WMI Win32_Process.Create so that it is created by
 // WmiPrvSE.exe completely outside the CLI caller's process tree, Job Object, and
 // stdout/stderr pipes (preventing Claude's Bash tool from blocking).
-static void LaunchGuiOutsideCallerTree() {
-    std::wstring guiExePath = ResolveGuiExePath();
-
+static void LaunchOutsideCallerTree(const std::wstring& targetCmdLine) {
     STARTUPINFOW si = {};
     si.cb = sizeof(si);
     si.dwFlags = STARTF_USESHOWWINDOW;
     si.wShowWindow = SW_HIDE;
     PROCESS_INFORMATION pi = {};
-
-    std::wstring guiCmdLine = L"\"" + guiExePath + L"\" gui";
-    if (HasCustomDataDirectory()) {
-        guiCmdLine += L" --data-dir \"" + GetEffectiveDataDirectoryWide() + L"\"";
-    }
 
     auto Base64Encode = [](const std::wstring& in) -> std::wstring {
         DWORD base64Len = 0;
@@ -158,7 +215,7 @@ static void LaunchGuiOutsideCallerTree() {
         return out;
     };
 
-    std::wstring b64CmdLine = Base64Encode(guiCmdLine);
+    std::wstring b64CmdLine = Base64Encode(targetCmdLine);
 
     // Win32_Process.Create gives a console-subsystem GUI a new console window when no
     // startup information is supplied, so a grandchild `Hancho.exe gui` flashes a
@@ -199,6 +256,24 @@ static void LaunchGuiOutsideCallerTree() {
     }
 }
 
+static void LaunchGuiOutsideCallerTree() {
+    std::wstring guiExePath = ResolveGuiExePath();
+    std::wstring guiCmdLine = L"\"" + guiExePath + L"\" gui";
+    if (HasCustomDataDirectory()) {
+        guiCmdLine += L" --data-dir \"" + GetEffectiveDataDirectoryWide() + L"\"";
+    }
+    LaunchOutsideCallerTree(guiCmdLine);
+}
+
+static void LaunchHeadlessOutsideCallerTree() {
+    std::wstring coreExePath = ResolveCoreExePath();
+    std::wstring coreCmdLine = L"\"" + coreExePath + L"\" --headless";
+    if (HasCustomDataDirectory()) {
+        coreCmdLine += L" --data-dir \"" + GetEffectiveDataDirectoryWide() + L"\"";
+    }
+    LaunchOutsideCallerTree(coreCmdLine);
+}
+
 // Connects to the core, starting it at most once across all concurrent callers.
 static bool ConnectOrAutoStart(HANDLE& hPipe, std::string& outError) {
     // A core that already holds the instance mutex is still starting: wait for its
@@ -210,12 +285,23 @@ static bool ConnectOrAutoStart(HANDLE& hPipe, std::string& outError) {
         return false;
     }
 
-    ULONGLONG remainingMs = 0;
-    if (RecentAutoStartFailure(remainingMs)) {
-        outError = "Hancho core failed to start recently; not starting it again for " +
-                   std::to_string((remainingMs + 999) / 1000) +
-                   " seconds. Start it manually with: Hancho.exe --headless";
+    const AutoStartMode mode = ResolveAutoStartMode();
+    if (mode == AutoStartMode::Off) {
+        outError = "Hancho core is not running (auto-start disabled). Start it with: Hancho.exe --headless";
+        if (HasCustomDataDirectory()) {
+            outError += " --data-dir \"" + WideToUtf8(GetEffectiveDataDirectoryWide()) + "\"";
+        }
         return false;
+    }
+
+    if (!HasAutoStartEnvVar()) {
+        ULONGLONG remainingMs = 0;
+        if (RecentAutoStartFailure(remainingMs)) {
+            outError = "Hancho core failed to start recently; not starting it again for " +
+                       std::to_string((remainingMs + 999) / 1000) +
+                       " seconds. Start it manually with: Hancho.exe --headless";
+            return false;
+        }
     }
 
     // Only one client launches the core; the others wait for the pipe it opens.
@@ -234,7 +320,11 @@ static bool ConnectOrAutoStart(HANDLE& hPipe, std::string& outError) {
         } else if (IsHanchoRunningForDataDirWide()) {
             connected = WaitForPipe(hPipe, kCoreStartWaitMs);
         } else {
-            LaunchGuiOutsideCallerTree();
+            if (mode == AutoStartMode::Headless) {
+                LaunchHeadlessOutsideCallerTree();
+            } else {
+                LaunchGuiOutsideCallerTree();
+            }
             connected = WaitForPipe(hPipe, kCoreStartWaitMs + 5000);
             if (connected) ClearAutoStartFailure();
             else MarkAutoStartFailed();
@@ -244,7 +334,9 @@ static bool ConnectOrAutoStart(HANDLE& hPipe, std::string& outError) {
     if (startMutex) CloseHandle(startMutex);
 
     if (!connected) {
-        outError = "Failed to connect to Hancho Named Pipe server after auto-starting GUI.";
+        outError = (mode == AutoStartMode::Headless)
+            ? "Failed to connect to Hancho Named Pipe server after auto-starting headless core."
+            : "Failed to connect to Hancho Named Pipe server after auto-starting GUI.";
     }
     return connected;
 }

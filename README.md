@@ -33,6 +33,10 @@ See [Overview](doc/obsoleted/overview.md) for the working model in detail: `run_
 
 A behavior tree can also be saved as a named **routine** and re-run with `routine run <name>` — ideal for fixed chores like "build all targets and run every smoke test"; stale inputs and run results are tracked automatically. See [Routines](doc/obsoleted/routines.md).
 
+For CI pipelines (Jenkins, GitHub Actions self-hosted runners), see [CI Guide](doc/ci.md): opt-in `run --ephemeral`, `run --bt`, `--wait-scope direction`, `--cancel-on-exit`, `--follow`, `--logs-dir`, `--report-output`, `--timeout`, `HANCHO_AUTOSTART`, and `HANCHO_NO_DIALOGS`. Without those flags, interactive defaults remain unchanged.
+
+In v0.10.0, terminology was aligned around `task` → `direction` → `job` → `attempt`, `exec` / `agent` BT nodes, `agent` lists, `peer` / `host` in Chat, and `run_agent` / `agent stream|probe|health` (with all 0.9.x names kept as aliases; see [doc/terminology.md](doc/terminology.md)). Note: rolling back to 0.9.x drops lineage/task/direction links and 0.9.x cannot run BTs written with `exec`/`agent`.
+
 ### Executables
 
 | File | Description |
@@ -109,6 +113,7 @@ The skill starts with `hancho-cli.exe help --json`, so the commands it shows alw
 
 | Document | Contents |
 | :--- | :--- |
+| [Docs index](doc/README.md) | Index of the documents under `doc/`, and which ones are in English |
 | [Overview](doc/obsoleted/overview.md) | Working model, `run_worker`, suspend, behavior trees, stable events, graduation |
 | [Start](doc/obsoleted/start.md) | Quick start for LLM agents, build instructions, `Hancho.exe` vs. `hancho-cli.exe` |
 | [Key Features](doc/obsoleted/features.md) | Dashboard GUI, shell launcher, history, tray, logs, Job Objects, settings, task queue overview |
@@ -128,7 +133,7 @@ The skill starts with `hancho-cli.exe help --json`, so the commands it shows alw
 | [Hancho v3 Design](doc/obsoleted/design-v3-en.md) | Event schema and adapters, headless/remote, semantic memory, failure analysis, graduation guide |
 | [Release Checklist](doc/obsoleted/release-checklist.md) | Per-release review of the graduation feature map and cleanup commands |
 | [CLI help output](doc/obsoleted/cli-help.md) | Full `Hancho.exe --help` and `hancho-cli.exe help` text |
-| [Hancho skill](skills/hancho/SKILL.md) | Agent skill for using Hancho well |
+| [Hancho skill](skills/hancho/SKILL.md) | Agent skill for using Hancho well (Japanese: [SKILL-ja.md](skills/hancho/SKILL-ja.md)) |
 | [CLAUDE.md example](doc/obsoleted/example-claude.md) | Example of CLAUDE.md |
 | [tools/ww](tools/ww/README-ww.md) | Optional, independent task-card runner template (not part of Hancho) |
 

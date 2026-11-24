@@ -15,11 +15,14 @@ namespace llm {
 
 using nlohmann::json;
 
+constexpr const char* kAgent = "agent";
 constexpr const char* kWorker = "worker";
 constexpr const char* kConsult = "consult";
 constexpr const char* kSupervisor = "supervisor";
 
 bool IsValidList(const std::string& list);
+// Maps "worker" (legacy alias) and "agent" to "agent"; leaves other names unchanged.
+std::string CanonicalListName(const std::string& list);
 
 struct Entry {
     std::string engine;

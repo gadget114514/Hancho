@@ -77,7 +77,7 @@ public:
         guiShowCb_ = std::move(cb);
     }
     // Called when a client asks the core host to stop. Must return immediately.
-    void SetShutdownCallback(std::function<void()> cb) {
+    void SetShutdownCallback(std::function<void(bool cancelJobs)> cb) {
         std::lock_guard<std::mutex> lock(cbMutex_);
         shutdownCb_ = std::move(cb);
     }
@@ -152,7 +152,7 @@ private:
     std::unique_ptr<PermitDraftManager> permitDraft_;
     std::atomic<HWND> notifyHwnd_{nullptr};
     std::function<void()> guiShowCb_;
-    std::function<void()> shutdownCb_;
+    std::function<void(bool)> shutdownCb_;
     PowerCallback powerCb_;
     std::mutex cbMutex_;
     bool headless_ = false;

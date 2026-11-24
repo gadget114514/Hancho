@@ -65,8 +65,8 @@ std::string BuildNodeLabel(const json& n, const std::string& type, const std::st
     int runs = status.is_object() ? status.value("runs", 0) : 0;
     if (type == "retry" || type == "repeat") {
         ss << " (" << runs << '/' << n.value("max", 0) << ')';
-    } else if (type == "job" || type == "worker") {
-        if (type == "worker") {
+    } else if (type == "job" || type == "worker" || type == "exec" || type == "agent") {
+        if (type == "worker" || type == "agent") {
             // Engine and model as written in the node; empty means the tree/PC default.
             std::string engine = Str(n, "engine");
             std::string model = Str(n, "model");

@@ -211,7 +211,7 @@ bool LooksLikeLlmJobCommand(const std::string& command) {
 }
 
 bool IsLlmLikeNode(const json& j, const BtNode& node) {
-    return node.type == "worker" || j.contains("engine") || j.contains("agentType") ||
+    return node.type == "agent" || j.contains("engine") || j.contains("agentType") ||
            LooksLikeLlmJobCommand(node.command);
 }
 
@@ -382,9 +382,12 @@ std::unique_ptr<BtNode> ParseNode(const json& j, const std::string& path, const 
         return node;
     }
     std::string rawType = j["type"].get<std::string>();
-    node->type = (rawType == "selector") ? "fallback" : rawType;
+    if (rawType == "selector") node->type = "fallback";
+    else if (rawType == "job") node->type = "exec";
+    else if (rawType == "worker") node->type = "agent";
+    else node->type = rawType;
     const std::string& t = node->type;
-    if (t == "worker" && !node->id.empty()) ctx.workerIds.insert(node->id);
+    if (t == "agent" && !node->id.empty()) ctx.workerIds.insert(node->id);
 
     auto requireChildObj = [&](const char* key, const std::string& childRole, std::unique_ptr<BtNode>& outSlot) {
         if (!j.contains(key) || !j[key].is_object()) {
@@ -580,7 +583,7 @@ std::unique_ptr<BtNode> ParseNode(const json& j, const std::string& path, const 
     } else if (t == "timeout") {
         ReqPosInt(j, "sec", path, t, node->sec, ctx);
         requireChildObj("child", "child", node->singleChild);
-    } else if (t == "job") {
+    } else if (t == "exec") {
         ReqStr(j, "command", path, t, node->command, ctx);
         ReqStr(j, "summary", path, t, node->summary, ctx);
         ReqPosInt(j, "timeoutSec", path, t, node->timeoutSec, ctx);
@@ -643,10 +646,10 @@ std::unique_ptr<BtNode> ParseNode(const json& j, const std::string& path, const 
             }
         }
         ParseJobCommonFields(j, path, *node, ctx);
-    } else if (t == "worker") {
+    } else if (t == "agent") {
         if (j.contains("prompt") && j["prompt"].is_string()) node->prompt = j["prompt"].get<std::string>();
         if (j.contains("promptFile") && j["promptFile"].is_string()) node->promptFile = j["promptFile"].get<std::string>();
-        if (node->prompt.empty() && node->promptFile.empty()) ctx.AddError(path, "'worker' requires non-empty 'prompt' or 'promptFile'");
+        if (node->prompt.empty() && node->promptFile.empty()) ctx.AddError(path, "'" + rawType + "' requires non-empty 'prompt' or 'promptFile'");
         ReqStr(j, "summary", path, t, node->summary, ctx);
         ReqPosInt(j, "timeoutSec", path, t, node->timeoutSec, ctx);
         if (j.contains("estimateSec")) ReqPosInt(j, "estimateSec", path, t, node->estimateSec, ctx);
@@ -892,10 +895,11 @@ std::unique_ptr<BtNode> ParseNode(const json& j, const std::string& path, const 
 
 void AddWarning(std::vector<BtWarning>& warnings, const std::string& path,
                 const std::string& code, const std::string& message,
-                const std::string& suggestion) {
+                const std::string& suggestion, const std::string& alias = "") {
     BtWarning w;
     w.path = path;
     w.code = code;
+    w.alias = alias;
     w.message = message;
     w.suggestion = suggestion;
     warnings.push_back(std::move(w));
@@ -929,7 +933,7 @@ bool CommandHasModelFlag(const std::string& command) {
 bool IsOpencodeLauncher(const BtNode& n, const ParseContext& ctx) {
     if (n.engine == "opencode") return true;
     const std::string defaultEngine = ctx.defaults.worker.engine;
-    if (n.type == "worker" && n.engine.empty() && defaultEngine == "opencode") return true;
+    if (n.type == "agent" && n.engine.empty() && defaultEngine == "opencode") return true;
     for (const auto& c : n.engineCandidates) if (c.engine == "opencode") return true;
     if (n.fallback.enabled && n.fallback.engine == "opencode") return true;
     return HasWholeWord(LowerCopy(n.command), "opencode");
@@ -941,15 +945,15 @@ bool LaunchHasModel(const BtNode& n, const ParseContext& ctx) {
         for (const auto& c : n.engineCandidates) if (c.model.empty()) return false;
         return true;
     }
-    if (n.type == "worker" && ctx.defaults.worker.engine == "opencode" &&
+    if (n.type == "agent" && ctx.defaults.worker.engine == "opencode" &&
         !ctx.defaults.worker.model.empty()) return true;
     if (n.fallback.enabled && !n.fallback.model.empty()) return true;
     return CommandHasModelFlag(n.command);
 }
 
 bool IsLlmLaunchNode(const BtNode& n, const ParseContext& ctx) {
-    if (n.type == "worker") return true;
-    if (n.type != "job") return false;
+    if (n.type == "agent") return true;
+    if (n.type != "exec") return false;
     return !n.engine.empty() || !n.model.empty() || !n.engineCandidates.empty() ||
            n.rawDef.contains("agentType") || LooksLikeLlmJobCommand(n.command) ||
            IsOpencodeLauncher(n, ctx);
@@ -963,16 +967,17 @@ void CheckNodeWarnings(const BtNode& n, ParseContext& ctx, bool guarded,
 
     if (llmLauncher && !hasWatch) {
         AddWarning(warnings, n.pathKey, "no_hang_watch",
-                   "An LLM worker/job has neither idle.firstEventSec nor idle.outputSec, and no defaults.",
-                   "Add \"idle\": {\"firstEventSec\": 180} or a \"defaults.worker.idle\" entry.");
+                   "An LLM agent/exec has neither idle.firstEventSec nor idle.outputSec, and no defaults.",
+                   "Add \"idle\": {\"firstEventSec\": 180} or a \"defaults.agent.idle\" entry.");
     }
     if (llmLauncher && !guarded) {
-        AddWarning(warnings, n.pathKey, "unguarded_worker",
-                   "An LLM worker/job failure reaches the root without a catch, fallback or retry ancestor.",
-                   "Wrap the node in a \"catch\" with handlers, or place it under \"fallback\" / \"retry\".");
+        AddWarning(warnings, n.pathKey, "unguarded_agent",
+                   "An LLM agent/exec failure reaches the root without a catch, fallback or retry ancestor.",
+                   "Wrap the node in a \"catch\" with handlers, or place it under \"fallback\" / \"retry\".",
+                   "unguarded_worker");
     }
 
-    if ((n.type == "worker" || n.type == "job" || n.type == "probe") &&
+    if ((n.type == "agent" || n.type == "exec" || n.type == "probe") &&
         IsOpencodeLauncher(n, ctx) && !LaunchHasModel(n, ctx)) {
         AddWarning(warnings, n.pathKey, "opencode_without_model",
                    "opencode is launched without a model (neither \"model\" nor --model/-Model).",
@@ -1016,27 +1021,28 @@ void CheckNodeWarnings(const BtNode& n, ParseContext& ctx, bool guarded,
                    "Add at least two approved entries to \"engines\", or remove \"switchEngineOn\".");
     }
 
-    if (llmLauncher && n.type == "job" && !n.command.empty() &&
+    if (llmLauncher && n.type == "exec" && !n.command.empty() &&
         n.command.find("{engine}") == std::string::npos &&
         n.command.find("{model}") == std::string::npos) {
         AddWarning(warnings, n.pathKey, "unswitchable_command",
-                   "This LLM job command has no {engine}/{model} placeholder, so it cannot be switched on failure.",
+                   "This LLM exec command has no {engine}/{model} placeholder, so it cannot be switched on failure.",
                    "Use {engine} and {model} in the command (for example -Engine {engine} -Model {model}).");
     }
 
-    if (n.type == "worker" && n.onSwitch == "revert") {
+    if (n.type == "agent" && n.onSwitch == "revert") {
         AddWarning(warnings, n.pathKey, "on_switch_revert_unsupported",
                    "onSwitch='revert' is not supported yet; keeping previous candidate changes ('keep').",
                    "Remove \"onSwitch\": \"revert\" or set \"onSwitch\": \"keep\".");
     }
 
-    if (n.type == "job" && !n.blame.empty() && seenWorkers.find(n.blame) == seenWorkers.end()) {
-        AddWarning(warnings, n.pathKey, "blame_before_worker",
-                   "job with blame='" + n.blame + "' appears before worker '" + n.blame + "' in execution order.",
-                   "Place worker '" + n.blame + "' before this job node so it runs before being blamed.");
+    if (n.type == "exec" && !n.blame.empty() && seenWorkers.find(n.blame) == seenWorkers.end()) {
+        AddWarning(warnings, n.pathKey, "blame_before_agent",
+                   "exec with blame='" + n.blame + "' appears before agent '" + n.blame + "' in execution order.",
+                   "Place agent '" + n.blame + "' before this exec node so it runs before being blamed.",
+                   "blame_before_worker");
     }
 
-    if (n.type == "worker") {
+    if (n.type == "agent") {
         bool hasFixRule = false;
         for (const auto& rule : n.switchEngineOn) {
             if (rule.failureClass.rfind("fix_", 0) == 0) {
@@ -1046,9 +1052,9 @@ void CheckNodeWarnings(const BtNode& n, ParseContext& ctx, bool guarded,
         }
         if (hasFixRule && (n.id.empty() || ctx.blamedWorkers.find(n.id) == ctx.blamedWorkers.end())) {
             AddWarning(warnings, n.pathKey, "fix_class_without_blame",
-                       "Worker has a fix_* rule in switchEngineOn, but no job node blames this worker.",
-                       "Add \"blame\": \"" + (n.id.empty() ? std::string("<worker-id>") : n.id) +
-                       "\" to the test job that validates this worker's changes.");
+                       "Agent has a fix_* rule in switchEngineOn, but no exec node blames this agent.",
+                       "Add \"blame\": \"" + (n.id.empty() ? std::string("<agent-id>") : n.id) +
+                       "\" to the test exec node that validates this agent's changes.");
         }
     }
 
@@ -1060,6 +1066,14 @@ void CheckNodeWarnings(const BtNode& n, ParseContext& ctx, bool guarded,
                        "escalate has \"expect\" but does not offer \"takeover\".",
                        "Add \"takeover\" to \"expect\" so the supervisor can be handed control.");
         }
+    }
+
+    const std::string rawType = n.rawDef.is_object() ? n.rawDef.value("type", std::string()) : std::string();
+    if (rawType == "job" || rawType == "worker") {
+        const std::string newType = (rawType == "job") ? "exec" : "agent";
+        AddWarning(warnings, n.pathKey, "deprecated_node_type",
+                   "Node type '" + rawType + "' is deprecated; use '" + newType + "' instead.",
+                   "Replace \"type\": \"" + rawType + "\" with \"type\": \"" + newType + "\".");
     }
 
     if (!ctx.catalog) return;
@@ -1106,7 +1120,7 @@ void CollectNodeWarnings(const BtNode& n, ParseContext& ctx, bool guarded,
                          std::set<std::string>& seenWorkers,
                          std::vector<BtWarning>& warnings) {
     CheckNodeWarnings(n, ctx, guarded, seenWorkers, warnings);
-    if (n.type == "worker" && !n.id.empty()) seenWorkers.insert(n.id);
+    if (n.type == "agent" && !n.id.empty()) seenWorkers.insert(n.id);
     const bool childGuarded = guarded || n.type == "catch" || n.type == "fallback" || n.type == "retry";
     for (const auto& c : n.children) CollectNodeWarnings(*c, ctx, childGuarded, seenWorkers, warnings);
     if (n.condChild) CollectNodeWarnings(*n.condChild, ctx, childGuarded, seenWorkers, warnings);
@@ -1126,10 +1140,10 @@ void ValidateFailureNodeReferences(const BtNode& node, ParseContext& ctx) {
         ctx.seenKeys.find(node.condNode) == ctx.seenKeys.end()) {
         ctx.AddError(node.pathKey + ".node", "unknown node id '" + node.condNode + "'");
     }
-    if (node.type == "job" && !node.blame.empty() &&
+    if (node.type == "exec" && !node.blame.empty() &&
         ctx.workerIds.find(node.blame) == ctx.workerIds.end()) {
         ctx.AddError(node.pathKey + ".blame",
-                     "unknown or non-worker node id '" + node.blame + "'");
+                     "unknown or non-agent node id '" + node.blame + "'");
     }
     for (const auto& c : node.children) ValidateFailureNodeReferences(*c, ctx);
     if (node.condChild) ValidateFailureNodeReferences(*node.condChild, ctx);
@@ -1144,45 +1158,87 @@ void ValidateFailureNodeReferences(const BtNode& node, ParseContext& ctx) {
     if (node.otherwiseChild) ValidateFailureNodeReferences(*node.otherwiseChild, ctx);
 }
 
-void ParseDefaultsBlock(const json& doc, ParseContext& ctx) {
+void ParseDefaultsBlock(const json& doc, ParseContext& ctx, std::vector<BtWarning>* warnings = nullptr) {
     if (!doc.contains("defaults")) return;
     if (!doc["defaults"].is_object()) {
         ctx.AddError("defaults", "must be an object");
         return;
     }
     const json& d = doc["defaults"];
-    if (d.contains("worker")) {
-        if (!d["worker"].is_object()) {
-            ctx.AddError("defaults.worker", "must be an object");
-        } else {
-            const json& w = d["worker"];
-            ParseIdleObject(w, "idle", "defaults.worker.idle", ctx.defaults.workerIdle, ctx);
-            if (w.contains("maxAttempts")) {
-                if (!w["maxAttempts"].is_number_integer() || w["maxAttempts"].get<int>() < 1)
-                    ctx.AddError("defaults.worker.maxAttempts", "must be a positive integer");
-                else
-                    ctx.defaults.workerMaxAttempts = w["maxAttempts"].get<int>();
-            }
-            if (w.contains("probe")) {
-                if (!w["probe"].is_boolean()) ctx.AddError("defaults.worker.probe", "must be a boolean");
-                else {
-                    ctx.defaults.workerProbe = w["probe"].get<bool>();
-                    ctx.defaults.hasWorkerProbe = true;
-                }
-            }
-            if (w.contains("switchEngineOn")) {
-                ParseSwitchEngineOn(w["switchEngineOn"], "defaults.worker.switchEngineOn",
-                                    ctx.defaults.workerSwitchEngineOn, ctx);
-            }
-            if (w.contains("switchLimits")) {
-                ParseSwitchLimits(w["switchLimits"], "defaults.worker.switchLimits",
-                                  ctx.defaults.workerSwitchLimits, ctx);
+    auto parseAgentDefaults = [&](const json& w, const std::string& basePath, BtDefaults& dst) {
+        ParseIdleObject(w, "idle", basePath + ".idle", dst.workerIdle, ctx);
+        if (w.contains("maxAttempts")) {
+            if (!w["maxAttempts"].is_number_integer() || w["maxAttempts"].get<int>() < 1)
+                ctx.AddError(basePath + ".maxAttempts", "must be a positive integer");
+            else
+                dst.workerMaxAttempts = w["maxAttempts"].get<int>();
+        }
+        if (w.contains("probe")) {
+            if (!w["probe"].is_boolean()) ctx.AddError(basePath + ".probe", "must be a boolean");
+            else {
+                dst.workerProbe = w["probe"].get<bool>();
+                dst.hasWorkerProbe = true;
             }
         }
+        if (w.contains("switchEngineOn")) {
+            ParseSwitchEngineOn(w["switchEngineOn"], basePath + ".switchEngineOn",
+                                dst.workerSwitchEngineOn, ctx);
+        }
+        if (w.contains("switchLimits")) {
+            ParseSwitchLimits(w["switchLimits"], basePath + ".switchLimits",
+                              dst.workerSwitchLimits, ctx);
+        }
+    };
+
+    const bool hasAgent = d.contains("agent");
+    const bool hasWorker = d.contains("worker");
+    if (hasWorker) {
+        if (!d["worker"].is_object()) {
+            ctx.AddError("defaults.worker", "must be an object");
+        } else if (hasAgent) {
+            BtDefaults ignored;
+            parseAgentDefaults(d["worker"], "defaults.worker", ignored);
+        } else {
+            parseAgentDefaults(d["worker"], "defaults.worker", ctx.defaults);
+        }
+        if (warnings) {
+            AddWarning(*warnings, "defaults.worker", "deprecated_defaults_key",
+                       hasAgent ? "Both 'defaults.agent' and 'defaults.worker' are present; using 'defaults.agent' ('defaults.worker' is deprecated)."
+                                : "'defaults.worker' is deprecated; use 'defaults.agent' instead.",
+                       hasAgent ? "Remove 'defaults.worker' and keep 'defaults.agent'."
+                                : "Rename 'defaults.worker' to 'defaults.agent'.");
+        }
     }
-    if (d.contains("job")) {
-        if (!d["job"].is_object()) ctx.AddError("defaults.job", "must be an object");
-        else ParseIdleObject(d["job"], "idle", "defaults.job.idle", ctx.defaults.jobIdle, ctx);
+    if (hasAgent) {
+        if (!d["agent"].is_object()) {
+            ctx.AddError("defaults.agent", "must be an object");
+        } else {
+            parseAgentDefaults(d["agent"], "defaults.agent", ctx.defaults);
+        }
+    }
+
+    const bool hasExec = d.contains("exec");
+    const bool hasJob = d.contains("job");
+    if (hasJob) {
+        if (!d["job"].is_object()) {
+            ctx.AddError("defaults.job", "must be an object");
+        } else if (hasExec) {
+            BtJobIdle ignored;
+            ParseIdleObject(d["job"], "idle", "defaults.job.idle", ignored, ctx);
+        } else {
+            ParseIdleObject(d["job"], "idle", "defaults.job.idle", ctx.defaults.jobIdle, ctx);
+        }
+        if (warnings) {
+            AddWarning(*warnings, "defaults.job", "deprecated_defaults_key",
+                       hasExec ? "Both 'defaults.exec' and 'defaults.job' are present; using 'defaults.exec' ('defaults.job' is deprecated)."
+                               : "'defaults.job' is deprecated; use 'defaults.exec' instead.",
+                       hasExec ? "Remove 'defaults.job' and keep 'defaults.exec'."
+                               : "Rename 'defaults.job' to 'defaults.exec'.");
+        }
+    }
+    if (hasExec) {
+        if (!d["exec"].is_object()) ctx.AddError("defaults.exec", "must be an object");
+        else ParseIdleObject(d["exec"], "idle", "defaults.exec.idle", ctx.defaults.jobIdle, ctx);
     }
 }
 
@@ -1221,7 +1277,7 @@ bool ParseTreeDocument(const std::string& jsonText, const IBtEngineCatalog* cata
             }
         }
     }
-    ParseDefaultsBlock(doc, ctx);
+    ParseDefaultsBlock(doc, ctx, outWarnings);
     if (doc.contains("vars") && !doc["vars"].is_object()) ctx.AddError("vars", "must be an object");
     std::unique_ptr<BtNode> parsedRoot;
     if (!doc.contains("root") || !doc["root"].is_object()) ctx.AddError("root", "missing required object 'root'");
@@ -1268,8 +1324,10 @@ std::string BehaviorTree::ValidateResponse(const std::string& jsonText,
 
     json warningArray = json::array();
     for (const auto& w : warnings) {
-        warningArray.push_back(json{{"path", w.path}, {"code", w.code},
-                                    {"message", w.message}, {"suggestion", w.suggestion}});
+        json wj{{"path", w.path}, {"code", w.code},
+                {"message", w.message}, {"suggestion", w.suggestion}};
+        if (!w.alias.empty()) wj["alias"] = w.alias;
+        warningArray.push_back(std::move(wj));
     }
     json out;
     out["warnings"] = std::move(warningArray);

@@ -143,6 +143,13 @@ std::string JsonGetString(const std::string& json, const std::string& key, const
 int64_t JsonGetInt(const std::string& json, const std::string& key, int64_t defaultVal = 0);
 bool JsonGetBool(const std::string& json, const std::string& key, bool defaultVal = false);
 
+// True when text has kana, kanji or hangul (the summary and title are stored in English).
+bool IsNonEnglishText(const std::string& text);
+// Adds "warnings" to a JSON object response for each summary/title in argsJson (top level, or in
+// the "jobs" array) that is not English. Nothing is rejected. Returns responseJson unchanged when
+// there is nothing to warn about or it is not a JSON object.
+std::string AppendNonEnglishWarnings(const std::string& responseJson, const std::string& argsJson);
+
 uint64_t GetNowTickMs();
 
 #ifdef HANCHO_DEMO_BUILD
@@ -201,6 +208,14 @@ void AppendToLogFileWide(const std::wstring& filePath, const std::string& data);
 void WriteFileAtomicWide(const std::wstring& filePath, const std::string& data);
 std::string ReadFileUtf8Wide(const std::wstring& filePath);
 void WriteAuditLog(const std::string& category, const std::string& message);
+
+// App configuration loaded from <data-dir>/config.json.
+constexpr int64_t kDefaultTaskListRecentCount = 30;
+struct AppConfig {
+    int64_t taskListRecentCount = kDefaultTaskListRecentCount;
+};
+AppConfig LoadAppConfig();
+int64_t GetTaskListRecentCount();
 
 // Project data reset (hancho-cli reset). The targets are every entry directly under the
 // effective data directory (taskqueues/, logs, proc_* files, config.json, ...).

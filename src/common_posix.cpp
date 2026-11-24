@@ -495,15 +495,46 @@ std::string JsonEscape(const std::string& s) {
     return out;
 }
 
+// Same rule as common.cpp: prefer the shallowest occurrence of the key, so a job's own "id"
+// wins over the "id" inside its "bt" object that sorted key order puts first.
 static size_t FindJsonValueStart(const std::string& json, const std::string& key) {
-    std::string pattern = "\"" + key + "\"";
-    size_t keyPos = json.find(pattern);
-    if (keyPos == std::string::npos) return std::string::npos;
-    size_t colon = json.find(':', keyPos + pattern.size());
-    if (colon == std::string::npos) return std::string::npos;
-    size_t p = colon + 1;
-    while (p < json.size() && std::isspace(static_cast<unsigned char>(json[p]))) p++;
-    return p;
+    auto isWs = [](char c) { return std::isspace(static_cast<unsigned char>(c)) != 0; };
+    const size_t n = json.size();
+    size_t best = std::string::npos;
+    int bestDepth = 0;
+    int depth = 0;
+    size_t i = 0;
+    while (i < n) {
+        const char c = json[i];
+        if (c == '{' || c == '[') {
+            ++depth;
+            ++i;
+        } else if (c == '}' || c == ']') {
+            --depth;
+            ++i;
+        } else if (c == '"') {
+            const size_t start = ++i;
+            while (i < n && json[i] != '"') {
+                i += (json[i] == '\\') ? 2 : 1;
+            }
+            if (i >= n) break;
+            const size_t end = i++;
+            if (end - start != key.size() || json.compare(start, key.size(), key) != 0) continue;
+            size_t p = i;
+            while (p < n && isWs(json[p])) ++p;
+            if (p >= n || json[p] != ':') continue;
+            if (best == std::string::npos || depth < bestDepth) {
+                ++p;
+                while (p < n && isWs(json[p])) ++p;
+                best = p;
+                bestDepth = depth;
+                if (depth <= 1) break;
+            }
+        } else {
+            ++i;
+        }
+    }
+    return best;
 }
 
 std::string JsonGetString(const std::string& json, const std::string& key,

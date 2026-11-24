@@ -444,7 +444,8 @@ TASK QUEUE:
   reset [--yes]                                    (delete ALL project data in the data directory; lists targets without --yes; refused while running)
 
 TASKS (group jobs and behavior trees under a shared intent and progress log):
-  task create --title "..." [--intent "..." | --intent-file <path>] [--id <id>] [--json]
+  task create --title "..." [--intent "..." | --intent-file <path>] [--id <id>] [--card-defaults <json>] [--json]
+  task update <id> [--title "..."] [--intent "..." | --intent-file <path>] [--card-defaults <json>]
   task show <id> [--log-limit N] [--json]
   task list [--state open|running|failed|cancelled|succeeded|closed] [--limit N] [--json]
   task note <id> --text "..."
@@ -452,6 +453,15 @@ TASKS (group jobs and behavior trees under a shared intent and progress log):
   task reopen <id> --reason "..."
   task purge --older-than <sec>
   task wait <id> [--timeout-ms N]
+
+CARDS (task cards stored as planned directions inside a task):
+  card add --task <id> --number <num> --title "..." [--body "..." | --body-file <md>] [--after <n1,n2>] [--template <name>] [--params <json>]
+  card list --task <id> [--json]
+  card show <number|directionId> [--task <id>] [--json]
+  card edit <number> --task <id> [--title "..."] [--body "..." | --body-file <md>] [--after <n1,n2>] [--template <name>] [--params <json>]
+  card remove <number> --task <id>
+  card run (<number> | --ready [--max <n>]) --task <id> [--force]
+  card redo <number> --task <id> [--body "..." | --body-file <md>] [--params <json>] [--reason "..."] [--run] [--force]
 
 BEHAVIOR TREES (for LLM agents; next step depends on results):
   bt validate|start --file <bt.json> [--task <id>]    Check / register and run a behavior tree

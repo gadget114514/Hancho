@@ -165,9 +165,17 @@ std::wstring PeerText(const nlohmann::json& msgOrPeer) {
     return out;
 }
 
+std::string MsgFlow(const nlohmann::json& m) {
+    std::string f = m.value("flow", std::string());
+    if (f.empty()) f = m.value("direction", std::string());
+    return f;
+}
+
 std::wstring AgentsText(const nlohmann::json& m) {
-    std::string from = m.value("from_agent", std::string());
-    std::string to = m.value("to_agent", std::string());
+    std::string from = m.value("from_peer", std::string());
+    if (from.empty()) from = m.value("from_agent", std::string());
+    std::string to = m.value("to_peer", std::string());
+    if (to.empty()) to = m.value("to_agent", std::string());
     std::wstring out;
     if (!from.empty()) out += Utf8ToWide(from);
     if (!to.empty()) {
@@ -1162,7 +1170,7 @@ int SelectedMessageIndex(DialogState* st) {
 void UpdateDetailLabels(DialogState* st) {
     if (!st) return;
     const bool outgoing = st->selectedMessage.is_object() &&
-                          st->selectedMessage.value("direction", std::string()) == "out";
+                          MsgFlow(st->selectedMessage) == "out";
     if (st->detailLabel) {
         SetWindowTextW(st->detailLabel,
                        outgoing ? T(L"送信本文", L"SENT MESSAGE", L"MENSAJE ENVIADO")
@@ -1214,7 +1222,7 @@ void PopulateFiles(DialogState* st, const nlohmann::json& message) {
 void SetMessageTimeCell(DialogState* st, int row, const nlohmann::json& msg) {
     if (!st || !st->messages || row < 0) return;
     std::wstring time = TimeText(msg);
-    if (!msg.value("read", false) && msg.value("direction", std::string()) != "out") {
+    if (!msg.value("read", false) && MsgFlow(msg) != "out") {
         time = L"● " + time;
     }
     ListView_SetItemText(st->messages, row, 0, const_cast<wchar_t*>(time.c_str()));
@@ -1230,7 +1238,7 @@ void SelectMessage(DialogState* st, int idx) {
     SetWindowTextW(st->msgText,
                    NormalizeCrLfWide(msg.value("text", std::string())).c_str());
     PopulateFiles(st, msg);
-    if (msg.value("direction", std::string()) != "out" && !msg.value("read", false)) {
+    if (MsgFlow(msg) != "out" && !msg.value("read", false)) {
         uint64_t id = msg.value("id", 0ULL);
         nlohmann::json resp;
         IpcCall({{"action", "chat_read"}, {"ids", nlohmann::json::array({id})}}, resp);
@@ -1269,12 +1277,13 @@ void LoadMessages(DialogState* st) {
     for (size_t i = 0; i < st->messagesJson.size(); ++i) {
         const auto& m = st->messagesJson[i];
         std::wstring time = TimeText(m);
-        if (!m.value("read", false) && m.value("direction", std::string()) != "out") {
+        const std::string flow = MsgFlow(m);
+        if (!m.value("read", false) && flow != "out") {
             time = L"● " + time;
         }
         std::vector<std::wstring> cells = {
             time,
-            Utf8ToWide(m.value("direction", std::string())),
+            Utf8ToWide(flow),
             PeerText(m),
             AgentsText(m),
             PreviewOf(m.value("text", std::string())),
@@ -1438,6 +1447,7 @@ void DoSend(DialogState* st) {
             {"action", "chat_send"},
             {"to", to},
             {"text", text},
+            {"from_peer", fromAgent},
             {"from_agent", fromAgent}
         };
         if (!st->attachFiles.empty()) req["files"] = st->attachFiles;
@@ -1466,7 +1476,7 @@ void DoSend(DialogState* st) {
 void EnterReplyMode(DialogState* st, int idx) {
     if (!st || idx < 0 || static_cast<size_t>(idx) >= st->messagesJson.size()) return;
     const nlohmann::json& m = st->messagesJson[static_cast<size_t>(idx)];
-    if (m.value("direction", std::string()) == "out") return;
+    if (MsgFlow(m) == "out") return;
     std::string peerKey;
     if (m.contains("peer") && m["peer"].is_object()) {
         peerKey = m["peer"].value("key", std::string());
@@ -1613,8 +1623,12 @@ void LoadLog(DialogState* st) {
             std::string error = e.value("error", std::string());
             detail = Utf8ToWide(!status.empty() ? status : (!path.empty() ? path : error));
         }
-        std::wstring from = Utf8ToWide(e.value("from_agent", std::string()));
-        std::wstring to = Utf8ToWide(e.value("to_agent", std::string()));
+        std::string fromStr = e.value("from_peer", std::string());
+        if (fromStr.empty()) fromStr = e.value("from_agent", std::string());
+        std::string toStr = e.value("to_peer", std::string());
+        if (toStr.empty()) toStr = e.value("to_agent", std::string());
+        std::wstring from = Utf8ToWide(fromStr);
+        std::wstring to = Utf8ToWide(toStr);
         std::vector<std::wstring> cells = {
             Utf8ToWide(e.value("logged_at", e.value("time", std::string()))),
             Utf8ToWide(e.value("event", std::string())),
@@ -2381,8 +2395,7 @@ LRESULT CALLBACK IpmsgWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam)
                         if (idx < 0) {
                             // Nothing selected: reply to the newest received message.
                             for (int i = static_cast<int>(st->messagesJson.size()) - 1; i >= 0; --i) {
-                                if (st->messagesJson[static_cast<size_t>(i)].value(
-                                        "direction", std::string()) != "out") {
+                                if (MsgFlow(st->messagesJson[static_cast<size_t>(i)]) != "out") {
                                     idx = i;
                                     break;
                                 }
@@ -2578,8 +2591,7 @@ LRESULT CALLBACK IpmsgWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam)
                         int idx = static_cast<int>(info.lParam);
                         if (idx >= 0 && static_cast<size_t>(idx) < st->messagesJson.size()) {
                             const auto& m = st->messagesJson[static_cast<size_t>(idx)];
-                            if (!m.value("read", false) &&
-                                m.value("direction", std::string()) != "out") {
+                            if (!m.value("read", false) && MsgFlow(m) != "out") {
                                 cd->clrText = RGB(0xB0, 0x30, 0x30);
                             }
                         }

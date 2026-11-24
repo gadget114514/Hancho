@@ -113,7 +113,7 @@ struct AgentExtractedResult {
 };
 
 // Shared helper to extract a worker's final response from its LLM stream (or fallback output),
-// used by IPC run_worker/wait_worker and by Behavior Tree worker nodes (${<id>.result}).
+// used by IPC run_agent/wait_agent (aliases run_worker/wait_worker) and by Behavior Tree agent nodes (${<id>.result}).
 AgentExtractedResult ExtractAgentResult(ProcessManager& pm, int id, bool finished, int settleWaitMs = 100);
 
 class ProcessManager {

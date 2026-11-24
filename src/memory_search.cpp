@@ -71,6 +71,7 @@ struct Doc {
     std::string noteHash;
     std::string sourceFile;
     std::string sourcesJson = "null";
+    std::string dataJson = "null";
     int sourceLine = 0;
     int64_t createdEpoch = 0;
     int64_t durationSec = 0;
@@ -762,6 +763,8 @@ Doc MakeNoteDoc(const json& body, const std::string& rel, int line) {
     }
     auto sourcesIt = body.find("sources");
     if (sourcesIt != body.end()) d.sourcesJson = sourcesIt->dump();
+    auto dataIt = body.find("data");
+    if (dataIt != body.end() && dataIt->is_object()) d.dataJson = dataIt->dump();
 
     std::string text = FirstNonEmpty({JStr(body, "text"), JStr(body, "summary")});
     d.noteHash = NoteTextHash(text);
@@ -1319,6 +1322,8 @@ json HitJson(const Doc& d, double score) {
     h["source"] = {{"file", d.sourceFile}, {"line", d.sourceLine}};
     json sources = json::parse(d.sourcesJson, nullptr, false);
     if (!sources.is_discarded()) h["sources"] = sources;
+    json data = json::parse(d.dataJson, nullptr, false);
+    if (data.is_object()) h["data"] = data;
     if (!d.files.empty()) h["files"] = d.files;
     return h;
 }
@@ -2475,6 +2480,11 @@ std::string NoteJson(const NoteInput& input) {
         note["scope"] = in.scope;
         note["author"] = authorObj;
         if (!in.sources.empty()) note["sources"] = in.sources;
+        if (!in.data.empty()) {
+            json data = json::object();
+            for (const auto& kv : in.data) data[kv.first] = kv.second;
+            note["data"] = data;
+        }
         note["status"] = "active";
         note["supersedes"] = in.supersedes.empty() ? json(nullptr) : json(in.supersedes);
         note["expiresAt"] = expiresAt.empty() ? json(nullptr) : json(expiresAt);

@@ -4,6 +4,7 @@
 #include <algorithm>
 #include <cctype>
 #include <cstddef>
+#include <cstdint>
 #include <map>
 #include <string>
 #include <unordered_map>
@@ -16,7 +17,8 @@ enum class TaskDisplayRowKind {
     TaskHeading,
     DirectionHeading,
     Job,
-    MoreJobs
+    MoreJobs,
+    LoadMoreFinished
 };
 
 struct TaskDisplayRow {
@@ -36,8 +38,12 @@ struct TaskDisplayRow {
     std::string resultsCompact;
     int jobCount = 0;
     int hiddenJobCount = 0;
+    int hiddenFinishedCount = 0;
     std::string supersedes;
     std::string supersededBy;
+    bool isCard = false;
+    std::string cardNumber;
+    std::vector<std::string> waitingFor;
     nlohmann::json jobJson;
 };
 
@@ -164,6 +170,40 @@ inline int TaskStateSortRank(const std::string& state) {
     return 6;
 }
 
+inline bool CompareCardNumberNatural(const std::string& a, const std::string& b) {
+    size_t ia = 0;
+    size_t ib = 0;
+    while (ia < a.size() && ib < b.size()) {
+        const bool da = std::isdigit(static_cast<unsigned char>(a[ia])) != 0;
+        const bool db = std::isdigit(static_cast<unsigned char>(b[ib])) != 0;
+        if (da && db) {
+            size_t za = ia;
+            while (za < a.size() && a[za] == '0') ++za;
+            size_t ea = za;
+            while (ea < a.size() && std::isdigit(static_cast<unsigned char>(a[ea]))) ++ea;
+
+            size_t zb = ib;
+            while (zb < b.size() && b[zb] == '0') ++zb;
+            size_t eb = zb;
+            while (eb < b.size() && std::isdigit(static_cast<unsigned char>(b[eb]))) ++eb;
+
+            const size_t la = ea - za;
+            const size_t lb = eb - zb;
+            if (la != lb) return la < lb;
+            const int cmp = a.compare(za, la, b, zb, lb);
+            if (cmp != 0) return cmp < 0;
+            if ((ea - ia) != (eb - ib)) return (ea - ia) < (eb - ib);
+            ia = ea;
+            ib = eb;
+        } else {
+            if (a[ia] != b[ib]) return static_cast<unsigned char>(a[ia]) < static_cast<unsigned char>(b[ib]);
+            ++ia;
+            ++ib;
+        }
+    }
+    return a.size() < b.size();
+}
+
 inline std::vector<TaskDisplayRow> BuildTaskDisplayRows(
     const std::vector<nlohmann::json>& jobs,
     const std::vector<nlohmann::json>& tasks,
@@ -171,7 +211,8 @@ inline std::vector<TaskDisplayRow> BuildTaskDisplayRows(
     const std::unordered_map<std::string, bool>& expandedOverrides,
     const std::unordered_set<std::string>& showAllJobsTasks,
     TaskViewCounts& outCounts,
-    size_t maxVisibleJobsPerTask = 8) {
+    size_t maxVisibleJobsPerTask = 8,
+    const std::vector<nlohmann::json>& directions = {}) {
     outCounts = TaskViewCounts{};
 
     // Index explicit task records from task_list.
@@ -182,6 +223,7 @@ inline std::vector<TaskDisplayRow> BuildTaskDisplayRows(
         std::string sortTs;
         bool hasRecord = false;
         std::vector<nlohmann::json> jobs;
+        std::vector<nlohmann::json> directions;
     };
     std::unordered_map<std::string, TaskMeta> taskMap;
     std::vector<std::string> taskOrder;
@@ -271,6 +313,19 @@ inline std::vector<TaskDisplayRow> BuildTaskDisplayRows(
         m.jobs.push_back(j);
     }
 
+    // Attach explicit direction/card records to their tasks.
+    for (const auto& d : directions) {
+        if (!d.is_object()) continue;
+        if (d.value("implicit", false)) continue;
+        const std::string did = d.value("id", std::string());
+        const std::string tid = d.value("taskId", std::string());
+        if (did.empty() || tid.empty()) continue;
+        TaskMeta& m = ensureTask(tid);
+        const std::string dTs = d.value("updatedAt", d.value("createdAt", std::string()));
+        if (dTs > m.sortTs) m.sortTs = dTs;
+        m.directions.push_back(d);
+    }
+
     // Compute task-level states & counts.
     for (const auto& id : taskOrder) {
         TaskMeta& m = taskMap[id];
@@ -347,6 +402,11 @@ inline std::vector<TaskDisplayRow> BuildTaskDisplayRows(
             bool isVirtualBt = false;
             bool isLegacyGroup = false;
             bool hasHeading = false;
+            bool isCard = false;
+            std::string cardNumber;
+            std::string supersedes;
+            std::string supersededBy;
+            std::vector<std::string> waitingFor;
             nlohmann::json virtualJob;
             std::vector<nlohmann::json> realJobs;
             std::vector<std::string> realStates;
@@ -364,6 +424,32 @@ inline std::vector<TaskDisplayRow> BuildTaskDisplayRows(
             }
             return it->second;
         };
+
+        for (const auto& dirRec : m.directions) {
+            const std::string did = dirRec.value("id", std::string());
+            if (did.empty()) continue;
+            DirMeta& d = ensureDir(did);
+            const std::string k = dirRec.value("kind", std::string());
+            if (!k.empty()) d.kind = k;
+            const std::string t = dirRec.value("title", std::string());
+            if (!t.empty()) d.title = t;
+            const std::string st = dirRec.value("state", std::string());
+            if (!st.empty()) d.state = st;
+            d.supersedes = dirRec.value("supersedes", std::string());
+            d.supersededBy = dirRec.value("supersededBy", std::string());
+            if (dirRec.contains("card") && dirRec["card"].is_object()) {
+                d.isCard = true;
+                d.cardNumber = dirRec["card"].value("number", std::string());
+                if (d.title.empty()) d.title = dirRec["card"].value("title", std::string());
+            }
+            if (dirRec.contains("waitingFor") && dirRec["waitingFor"].is_array()) {
+                for (const auto& w : dirRec["waitingFor"]) {
+                    if (w.is_string()) d.waitingFor.push_back(w.get<std::string>());
+                }
+            }
+            const std::string dTs = dirRec.value("updatedAt", dirRec.value("createdAt", std::string()));
+            if (dTs > d.sortTs) d.sortTs = dTs;
+        }
 
         for (const auto& j : m.jobs) {
             const std::string jid = j.value("id", std::string());
@@ -410,16 +496,23 @@ inline std::vector<TaskDisplayRow> BuildTaskDisplayRows(
                 d.state = ComputeImplicitTaskState(d.realJobs);
             }
             if (d.kind.empty()) d.kind = "jobs";
-            d.hasHeading = (d.isVirtualBt && (!d.isLegacyGroup || !d.realJobs.empty())) ||
+            d.hasHeading = d.isCard || (d.state == "planned") ||
+                           (d.isVirtualBt && (!d.isLegacyGroup || !d.realJobs.empty())) ||
                            (d.kind == "jobs" && d.realJobs.size() >= 2) ||
                            (d.kind == "bt" && d.realJobs.size() >= 2);
             dirStatesChrono.push_back(d.state);
         }
 
-        // Sort directions chronologically by earliest real job or sortTs for compact task results.
+        // Sort non-card directions chronologically by earliest real job or sortTs,
+        // and card directions in natural card number order.
         std::sort(dirOrder.begin(), dirOrder.end(), [&](const std::string& a, const std::string& b) {
             const DirMeta& da = dirMap[a];
             const DirMeta& db = dirMap[b];
+            if (da.isCard != db.isCard) return !da.isCard;
+            if (da.isCard && db.isCard) {
+                if (da.cardNumber != db.cardNumber) return CompareCardNumberNatural(da.cardNumber, db.cardNumber);
+                return a < b;
+            }
             const std::string ta = !da.realJobs.empty() ? da.realJobs.front().value("created_at", std::string()) : da.sortTs;
             const std::string tb = !db.realJobs.empty() ? db.realJobs.front().value("created_at", std::string()) : db.sortTs;
             if (ta != tb) return ta < tb;
@@ -471,15 +564,22 @@ inline std::vector<TaskDisplayRow> BuildTaskDisplayRows(
             hdr.jobCount = totalRealJobs;
             out.push_back(std::move(hdr));
 
-            if (!taskExpanded || m.jobs.empty()) continue;
+            if (!taskExpanded || (m.jobs.empty() && dirOrder.empty())) continue;
         }
 
         const int baseIndent = emitTaskHeading ? 1 : 0;
         const bool showAllTask = (maxVisibleJobsPerTask == 0) || (showAllJobsTasks.count(id) > 0);
         size_t emittedSingleDirJobs = 0;
         int hiddenSingleDirJobs = 0;
-        // Display directions newest-first when under a TaskHeading.
-        std::vector<std::string> dispDirOrder(dirOrder.rbegin(), dirOrder.rend());
+        // Display non-card directions newest-first and card directions in natural card number order.
+        std::vector<std::string> dispDirOrder;
+        dispDirOrder.reserve(dirOrder.size());
+        for (auto it = dirOrder.rbegin(); it != dirOrder.rend(); ++it) {
+            if (!dirMap[*it].isCard) dispDirOrder.push_back(*it);
+        }
+        for (const auto& did : dirOrder) {
+            if (dirMap[did].isCard) dispDirOrder.push_back(did);
+        }
         for (const auto& did : dispDirOrder) {
             const DirMeta& d = dirMap[did];
             if (!d.hasHeading) {
@@ -513,6 +613,19 @@ inline std::vector<TaskDisplayRow> BuildTaskDisplayRows(
             if (dirOvIt == expandedOverrides.end()) dirOvIt = expandedOverrides.find(did);
             if (dirOvIt != expandedOverrides.end()) dirExpanded = dirOvIt->second;
 
+            int redoDepth = 0;
+            {
+                std::string curSup = d.supersedes;
+                std::unordered_set<std::string> seenSup;
+                while (!curSup.empty() && seenSup.insert(curSup).second && redoDepth < 16) {
+                    auto sit = dirMap.find(curSup);
+                    if (sit == dirMap.end()) break;
+                    ++redoDepth;
+                    curSup = sit->second.supersedes;
+                }
+            }
+            const int dirIndent = baseIndent + redoDepth;
+
             TaskDisplayRow dhdr;
             dhdr.kind = TaskDisplayRowKind::DirectionHeading;
             dhdr.taskId = id;
@@ -520,13 +633,19 @@ inline std::vector<TaskDisplayRow> BuildTaskDisplayRows(
             dhdr.directionKind = d.kind;
             dhdr.directionTitle = d.title;
             dhdr.directionState = d.state;
-            dhdr.indent = baseIndent;
+            dhdr.indent = dirIndent;
             dhdr.expanded = dirExpanded;
+            dhdr.isSuperseded = !d.supersededBy.empty();
             dhdr.hasTaskRecord = m.hasRecord;
             dhdr.taskTitle = m.title;
             dhdr.taskState = m.state;
             dhdr.resultsCompact = FormatTaskResultsCompact(d.realStates);
             dhdr.jobCount = static_cast<int>(d.realStates.size());
+            dhdr.supersedes = d.supersedes;
+            dhdr.supersededBy = d.supersededBy;
+            dhdr.isCard = d.isCard;
+            dhdr.cardNumber = d.cardNumber;
+            dhdr.waitingFor = d.waitingFor;
             dhdr.jobJson = d.virtualJob;
             out.push_back(std::move(dhdr));
 
@@ -545,7 +664,7 @@ inline std::vector<TaskDisplayRow> BuildTaskDisplayRows(
                 child.taskId = id;
                 child.directionId = did;
                 child.jobId = j.value("id", std::string());
-                child.indent = baseIndent + 1;
+                child.indent = dirIndent + 1;
                 child.hasTaskRecord = m.hasRecord;
                 child.taskTitle = m.title;
                 child.taskState = m.state;
@@ -560,7 +679,7 @@ inline std::vector<TaskDisplayRow> BuildTaskDisplayRows(
                 more.kind = TaskDisplayRowKind::MoreJobs;
                 more.taskId = id;
                 more.directionId = did;
-                more.indent = baseIndent + 1;
+                more.indent = dirIndent + 1;
                 more.hasTaskRecord = m.hasRecord;
                 more.taskTitle = m.title;
                 more.taskState = m.state;
@@ -582,5 +701,226 @@ inline std::vector<TaskDisplayRow> BuildTaskDisplayRows(
     }
     return out;
 }
+
+// 102-6: finished-row limiting and query filtering, independent of Win32 / the GUI.
+inline bool IsFinishedTaskState(const std::string& state) {
+    return state == "succeeded" || state == "failed" || state == "cancelled" ||
+           state == "closed" || state == "takenOver";
+}
+
+inline std::string TaskDisplayRowState(const TaskDisplayRow& row) {
+    if (row.kind == TaskDisplayRowKind::TaskHeading) return row.taskState;
+    if (row.kind == TaskDisplayRowKind::DirectionHeading) return row.directionState;
+    if (row.kind == TaskDisplayRowKind::Job) {
+        if (row.jobJson.is_object()) return row.jobJson.value("state", row.taskState);
+        return row.taskState;
+    }
+    return std::string();
+}
+
+inline std::string TaskDisplayRowQueryText(const TaskDisplayRow& row) {
+    std::string out;
+    auto add = [&](const std::string& value) {
+        if (value.empty()) return;
+        if (!out.empty()) out += ' ';
+        out += value;
+    };
+    add(row.taskId);
+    add(row.taskTitle);
+    add(row.taskState);
+    add(row.directionId);
+    add(row.directionTitle);
+    add(row.directionKind);
+    add(row.cardNumber);
+    add(row.jobId);
+    add(row.resultsCompact);
+    if (row.jobJson.is_object()) {
+        add(row.jobJson.value("summary", std::string()));
+        add(row.jobJson.value("state", std::string()));
+        add(row.jobJson.value("taskqueue", std::string()));
+    }
+    return out;
+}
+
+inline bool TaskDisplayRowMatchesQuery(const TaskDisplayRow& row, const std::string& query) {
+    if (query.empty()) return true;
+    std::string hay = TaskDisplayRowQueryText(row);
+    std::string needle = query;
+    for (char& c : hay) c = static_cast<char>(std::tolower(static_cast<unsigned char>(c)));
+    for (char& c : needle) c = static_cast<char>(std::tolower(static_cast<unsigned char>(c)));
+    return hay.find(needle) != std::string::npos;
+}
+
+struct TaskDisplayFilterOptions {
+    size_t visibleFinishedCount = 30;
+    std::string query;
+};
+
+struct TaskDisplayFilterResult {
+    std::vector<TaskDisplayRow> rows;
+    size_t totalFinished = 0;
+    size_t shownFinished = 0;
+    bool queryActive = false;
+    bool hasMore = false;
+};
+
+inline TaskDisplayFilterResult FilterTaskDisplayRows(
+    const std::vector<TaskDisplayRow>& input,
+    const TaskDisplayFilterOptions& options) {
+    TaskDisplayFilterResult result;
+    result.queryActive = !options.query.empty();
+    const size_t limit = options.visibleFinishedCount;
+
+    std::vector<TaskDisplayRow> matched;
+    matched.reserve(input.size());
+    if (!result.queryActive) {
+        for (const auto& row : input) matched.push_back(row);
+    } else {
+        std::unordered_set<std::string> keepTasks;
+        for (const auto& row : input) {
+            if (!TaskDisplayRowMatchesQuery(row, options.query)) continue;
+            if (!row.taskId.empty()) keepTasks.insert(row.taskId);
+            if (!row.directionId.empty()) keepTasks.insert("direction:" + row.directionId);
+        }
+        for (const auto& row : input) {
+            const bool direct = TaskDisplayRowMatchesQuery(row, options.query);
+            const bool sameTask = !row.taskId.empty() && keepTasks.count(row.taskId) > 0;
+            const bool sameDir = !row.directionId.empty() && keepTasks.count("direction:" + row.directionId) > 0;
+            if (direct || sameTask || sameDir) matched.push_back(row);
+        }
+    }
+
+    for (const auto& row : matched) {
+        const bool finished = IsFinishedTaskState(TaskDisplayRowState(row));
+        if (finished) ++result.totalFinished;
+        if (finished && result.shownFinished >= limit) {
+            result.hasMore = true;
+            continue;
+        }
+        if (finished) ++result.shownFinished;
+        result.rows.push_back(row);
+    }
+    if (result.hasMore) {
+        TaskDisplayRow more;
+        more.kind = TaskDisplayRowKind::LoadMoreFinished;
+        more.hiddenFinishedCount = static_cast<int>(result.totalFinished - result.shownFinished);
+        result.rows.push_back(std::move(more));
+    }
+    return result;
+}
+
+inline TaskDisplayFilterResult FilterTaskDisplayRows(
+    const std::vector<TaskDisplayRow>& input,
+    size_t visibleFinishedCount,
+    const std::string& query) {
+    TaskDisplayFilterOptions options;
+    options.visibleFinishedCount = visibleFinishedCount;
+    options.query = query;
+    return FilterTaskDisplayRows(input, options);
+}
+
+
+// Translated display text for the dashboard (card 106-3). The dashboard is a separate process, so
+// translations come from the core (translate_get) and are kept here as (lang, field, original) ->
+// translation. Drawing never asks for a translation: a text missing from the table is recorded as a
+// miss, the caller fetches all misses once per list build, and a change of the core's revision
+// drops the table so the next build asks again.
+class DisplayTextCache {
+public:
+    struct Miss {
+        std::string lang;
+        std::string field;
+        std::string text;
+    };
+
+    // The text to show. English, an empty text, or a text the config does not translate
+    // (translatable false) gives the original. A cached translation gives the translation.
+    // Otherwise the original is shown and the text is queued as a miss.
+    std::string Display(const std::string& text, const std::string& lang, const std::string& field,
+                        bool translatable) {
+        if (!translatable || text.empty() || lang.empty() || lang == "en") return text;
+        const std::string key = Key(lang, field, text);
+        auto it = table_.find(key);
+        if (it == table_.end()) {
+            misses_.emplace(key, Miss{lang, field, text});
+            return text;
+        }
+        return it->second.state == State::Translated ? it->second.translated : text;
+    }
+
+    // The cached translation of text, or "" when there is none. The search box matches these.
+    std::string CachedTranslation(const std::string& text, const std::string& lang,
+                                  const std::string& field) const {
+        auto it = table_.find(Key(lang, field, text));
+        if (it == table_.end() || it->second.state != State::Translated) return std::string();
+        return it->second.translated;
+    }
+
+    // Records the core's answer for one text. waiting: the core has it queued or it failed, so it is
+    // not asked again until the revision changes. An empty translation, or one equal to the text,
+    // means that no translation applies.
+    void Store(const std::string& text, const std::string& lang, const std::string& field,
+               const std::string& translated, bool waiting) {
+        const std::string key = Key(lang, field, text);
+        Entry entry;
+        if (waiting) {
+            entry.state = State::Waiting;
+        } else if (!translated.empty() && translated != text) {
+            entry.state = State::Translated;
+            entry.translated = translated;
+        } else {
+            entry.state = State::Original;
+        }
+        table_[key] = std::move(entry);
+        misses_.erase(key);
+    }
+
+    // The misses queued since the last call. The caller fetches them.
+    std::vector<Miss> TakeMisses() {
+        std::vector<Miss> out;
+        out.reserve(misses_.size());
+        for (auto& item : misses_) out.push_back(std::move(item.second));
+        misses_.clear();
+        return out;
+    }
+
+    // True while some text waits for the core, so the revision is worth checking.
+    bool HasWaiting() const {
+        for (const auto& item : table_) {
+            if (item.second.state == State::Waiting) return true;
+        }
+        return false;
+    }
+
+    // Sets the core's revision. Returns true when it changed from a known revision. The table is
+    // dropped then, so every text is asked again.
+    bool SetRevision(uint64_t revision) {
+        if (known_ && revision == revision_) return false;
+        const bool changed = known_;
+        known_ = true;
+        revision_ = revision;
+        table_.clear();
+        return changed;
+    }
+
+    void Clear() {
+        table_.clear();
+        misses_.clear();
+    }
+
+private:
+    enum class State { Waiting, Original, Translated };
+    struct Entry {
+        State state = State::Original;
+        std::string translated;
+    };
+    static std::string Key(const std::string& lang, const std::string& field, const std::string& text) {
+        return lang + '\x1f' + field + '\x1f' + text;
+    }
+    std::map<std::string, Entry> table_;
+    std::map<std::string, Miss> misses_;
+    uint64_t revision_ = 0;
+    bool known_ = false;
+};
 
 } // namespace pc

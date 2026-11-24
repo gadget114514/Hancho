@@ -641,6 +641,7 @@ struct IpmsgNode::Impl {
         j["id"] = m.id;
         j["time"] = FormatLocalTime(m.timeMs);
         j["time_ms"] = m.timeMs;
+        j["flow"] = m.direction;
         j["direction"] = m.direction;
         nlohmann::json p;
         p["key"] = m.peerKey;
@@ -651,8 +652,14 @@ struct IpmsgNode::Impl {
         p["nickname"] = m.peerNick;
         j["peer"] = p;
         j["text"] = m.text;
-        if (!m.fromAgent.empty()) j["from_agent"] = m.fromAgent;
-        if (!m.toAgent.empty()) j["to_agent"] = m.toAgent;
+        if (!m.fromAgent.empty()) {
+            j["from_peer"] = m.fromAgent;
+            j["from_agent"] = m.fromAgent;
+        }
+        if (!m.toAgent.empty()) {
+            j["to_peer"] = m.toAgent;
+            j["to_agent"] = m.toAgent;
+        }
         if (m.replyTo) j["reply_to"] = m.replyTo;
         j["status"] = m.status;
         j["read"] = m.read;
@@ -681,7 +688,8 @@ struct IpmsgNode::Impl {
             m.id = j.value("id", uint64_t(0));
             if (!m.id) continue;
             m.timeMs = j.value("time_ms", int64_t(0));
-            m.direction = j.value("direction", std::string("in"));
+            m.direction = j.value("flow", std::string());
+            if (m.direction.empty()) m.direction = j.value("direction", std::string("in"));
             if (j.contains("peer") && j["peer"].is_object()) {
                 const auto& p = j["peer"];
                 m.peerKey = p.value("key", std::string());
@@ -692,8 +700,10 @@ struct IpmsgNode::Impl {
                 m.peerNick = p.value("nickname", std::string());
             }
             m.text = j.value("text", std::string());
-            m.fromAgent = j.value("from_agent", std::string());
-            m.toAgent = j.value("to_agent", std::string());
+            m.fromAgent = j.value("from_peer", std::string());
+            if (m.fromAgent.empty()) m.fromAgent = j.value("from_agent", std::string());
+            m.toAgent = j.value("to_peer", std::string());
+            if (m.toAgent.empty()) m.toAgent = j.value("to_agent", std::string());
             m.replyTo = j.value("reply_to", uint64_t(0));
             m.status = j.value("status", std::string());
             if (m.status == "sending") m.status = "failed";
@@ -887,10 +897,13 @@ struct IpmsgNode::Impl {
                 if (ext.rfind(kHanchoExtTag, 0) == 0) {
                     nlohmann::json ej = nlohmann::json::parse(ext.substr(std::strlen(kHanchoExtTag)), nullptr, false);
                     if (ej.is_object()) {
-                        m.fromAgent = ej.value("from_agent", std::string());
-                        m.toAgent = ej.value("to_agent", std::string());
+                        m.fromAgent = ej.value("from_peer", std::string());
+                        if (m.fromAgent.empty()) m.fromAgent = ej.value("from_agent", std::string());
+                        m.toAgent = ej.value("to_peer", std::string());
+                        if (m.toAgent.empty()) m.toAgent = ej.value("to_agent", std::string());
                         m.replyTo = ej.value("reply_to", uint64_t(0));
                         m.audience = ej.value("audience", std::string());
+                        if (m.audience == "peer") m.audience = "agent";
                         if (m.audience != "human" && m.audience != "agent") m.audience.clear();
                         m.hops = ej.value("hops", 0);
                     }
@@ -1509,6 +1522,7 @@ nlohmann::json IpmsgNode::Peers() const {
     nlohmann::json out;
     out["ok"] = true;
     out["running"] = running_.load();
+    out["hosts"] = arr;
     out["peers"] = arr;
     return out;
 }
@@ -1534,9 +1548,9 @@ nlohmann::json IpmsgNode::Send(const std::string& toIn, const std::string& text,
     if (text.empty() && files.empty()) return {{"ok", false}, {"error", "text or files required"}};
     const std::string to = Trim(toIn);
     std::string audience = audienceIn;
-    if (audience == "llm" || audience == "hancho" || audience == "internal") audience = "agent";
+    if (audience == "peer" || audience == "llm" || audience == "hancho" || audience == "internal") audience = "agent";
     if (!audience.empty() && audience != "human" && audience != "agent")
-        return {{"ok", false}, {"error", "audience must be human, agent or empty"}};
+        return {{"ok", false}, {"error", "audience must be human, peer, agent or empty"}};
     if (hops < 0) hops = 0;
 
     // Local delivery between agents on this node.
@@ -1676,8 +1690,14 @@ nlohmann::json IpmsgNode::Send(const std::string& toIn, const std::string& text,
             }
             packet.push_back('\0');
             nlohmann::json ext = nlohmann::json::object();
-            if (!fromAgent.empty()) ext["from_agent"] = fromAgent;
-            if (!toAgent.empty()) ext["to_agent"] = toAgent;
+            if (!fromAgent.empty()) {
+                ext["from_peer"] = fromAgent;
+                ext["from_agent"] = fromAgent;
+            }
+            if (!toAgent.empty()) {
+                ext["to_peer"] = toAgent;
+                ext["to_agent"] = toAgent;
+            }
             if (replyTo) ext["reply_to"] = replyTo;
             if (!audience.empty()) ext["audience"] = audience;
             if (hops) ext["hops"] = hops;
@@ -1947,8 +1967,12 @@ nlohmann::json IpmsgNode::Log(const std::string& since, const std::string& until
                 }
                 if (lower(pk).find(lpeer) == std::string::npos) continue;
             }
-            if (!agent.empty() && j.value("from_agent", std::string()) != agent &&
-                j.value("to_agent", std::string()) != agent && j.value("agent", std::string()) != agent)
+            if (!agent.empty() &&
+                j.value("from_peer", std::string()) != agent &&
+                j.value("from_agent", std::string()) != agent &&
+                j.value("to_peer", std::string()) != agent &&
+                j.value("to_agent", std::string()) != agent &&
+                j.value("agent", std::string()) != agent)
                 continue;
             ++total;
             hits.push_back(std::move(j));

@@ -206,6 +206,14 @@ int main() {
               appJs.find("task_list") != std::string::npos &&
               appJs.find("task_show") != std::string::npos,
           "embedded Web UI app.js handles task_list / task_show and task details");
+    Check(appJs.find("select-ui-lang") != std::string::npos &&
+              appJs.find("navigator.languages") != std::string::npos &&
+              appJs.find("'Refresh': '更新'") != std::string::npos &&
+              appJs.find("'Refresh': 'Actualizar'") != std::string::npos,
+          "embedded Web UI app.js has the language selector with ja and es strings");
+    Check(appJs.find("translate_get") != std::string::npos &&
+              appJs.find("handleTranslateResponse") != std::string::npos,
+          "embedded Web UI app.js requests and applies translate_get answers");
 
     // Mock IPC handler simulating core
     auto mockIpcHandler = [](const std::string& reqJson) -> std::string {
@@ -280,6 +288,7 @@ int main() {
             nlohmann::json resp;
             resp["ok"] = true;
             resp["id"] = 1;
+            resp["engine"] = "worker";
             resp["agent_type"] = "worker";
             resp["status"] = "running";
             resp["supervisor_goal"] = "complete task";
@@ -495,7 +504,9 @@ int main() {
 
             // Pane 3: Monitor pane (Agent state, stream, and usage history)
             std::string stateResp = SendWsFrame(wsSock2, "{\"action\":\"get_agent_state\",\"id\":1}");
-            Check(stateResp.find("\"agent_type\":\"worker\"") != std::string::npos, "Pane 3: get_agent_state ok");
+            Check(stateResp.find("\"engine\":\"worker\"") != std::string::npos &&
+                      stateResp.find("\"agent_type\":\"worker\"") != std::string::npos,
+                  "Pane 3: get_agent_state ok");
             std::string streamResp = SendWsFrame(wsSock2, "{\"action\":\"get_agent_stream\",\"id\":1,\"schema\":\"v1\"}");
             Check(streamResp.find("\"events\"") != std::string::npos, "Pane 3: get_agent_stream ok");
             std::string usageResp = SendWsFrame(wsSock2, "{\"action\":\"get_usage_history\",\"since_sec\":86400}");

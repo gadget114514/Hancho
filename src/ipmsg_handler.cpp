@@ -141,7 +141,8 @@ ParsedAnswer ParseAnswer(const std::string& raw) {
             audience = ToLowerText(TrimText(obj["audience"].get<std::string>()));
         }
         const bool hasText = obj.contains("text") && obj["text"].is_string();
-        if (audience == "none" || audience == "human" || audience == "agent" || hasText) {
+        if (audience == "none" || audience == "human" || audience == "agent" || audience == "peer" || hasText) {
+            if (audience == "peer") audience = "agent";
             if (audience != "none" && audience != "human" && audience != "agent") {
                 audience = "human";
             }
@@ -149,7 +150,9 @@ ParsedAnswer ParseAnswer(const std::string& raw) {
             if (hasText) {
                 answer.text = obj["text"].get<std::string>();
             }
-            if (obj.contains("to_agent") && obj["to_agent"].is_string()) {
+            if (obj.contains("to_peer") && obj["to_peer"].is_string()) {
+                answer.toAgent = obj["to_peer"].get<std::string>();
+            } else if (obj.contains("to_agent") && obj["to_agent"].is_string()) {
                 answer.toAgent = obj["to_agent"].get<std::string>();
             }
             return answer;
@@ -331,7 +334,8 @@ void IpmsgHandler::LogEvent(const std::string& event, const nlohmann::json& body
 
 bool IpmsgHandler::ShouldProcess(const IpmsgHandlerConfig& cfg, const nlohmann::json& message,
                                  std::string& reason) const {
-    const std::string direction = message.value("direction", std::string());
+    std::string direction = message.value("flow", std::string());
+    if (direction.empty()) direction = message.value("direction", std::string());
     if (direction != "in" && direction != "local") {
         reason = "direction-" + (direction.empty() ? std::string("unknown") : direction);
         return false;
@@ -346,13 +350,15 @@ bool IpmsgHandler::ShouldProcess(const IpmsgHandlerConfig& cfg, const nlohmann::
         reason = "max-hops";
         return false;
     }
-    const std::string fromAgent = message.value("from_agent", std::string());
+    std::string fromAgent = message.value("from_peer", std::string());
+    if (fromAgent.empty()) fromAgent = message.value("from_agent", std::string());
     const std::string ownAgent = cfg.agent.empty() ? std::string("hancho-llm") : cfg.agent;
     if (direction == "local" && !ownAgent.empty() && fromAgent == ownAgent) {
         reason = "self";
         return false;
     }
-    const std::string toAgent = message.value("to_agent", std::string());
+    std::string toAgent = message.value("to_peer", std::string());
+    if (toAgent.empty()) toAgent = message.value("to_agent", std::string());
     if (cfg.agent.empty()) {
         if (!toAgent.empty()) {
             reason = "agent-filter";
@@ -380,10 +386,16 @@ std::string IpmsgHandler::MakeJobId(uint64_t messageId) const {
 std::string IpmsgHandler::BuildPrompt(const IpmsgHandlerConfig& cfg,
                                       const nlohmann::json& message) const {
     nlohmann::json data;
+    std::string fromPeer = message.value("from_peer", std::string());
+    if (fromPeer.empty()) fromPeer = message.value("from_agent", std::string());
+    std::string toPeer = message.value("to_peer", std::string());
+    if (toPeer.empty()) toPeer = message.value("to_agent", std::string());
     data["id"] = message.value("id", uint64_t(0));
     data["peer"] = message.contains("peer") ? message["peer"] : nlohmann::json::object();
-    data["from_agent"] = message.value("from_agent", std::string());
-    data["to_agent"] = message.value("to_agent", std::string());
+    data["from_peer"] = fromPeer;
+    data["from_agent"] = fromPeer;
+    data["to_peer"] = toPeer;
+    data["to_agent"] = toPeer;
     data["text"] = message.value("text", std::string());
     data["files"] = message.contains("files") ? message["files"] : nlohmann::json::array();
     data["audience"] = message.value("audience", std::string());
@@ -440,7 +452,8 @@ void IpmsgHandler::ProcessMessage(const nlohmann::json& message) {
     const std::string peer = message.contains("peer") && message["peer"].is_object()
                                  ? message["peer"].value("key", std::string())
                                  : std::string();
-    const std::string fromAgent = message.value("from_agent", std::string());
+    std::string fromAgent = message.value("from_peer", std::string());
+    if (fromAgent.empty()) fromAgent = message.value("from_agent", std::string());
     const int hops = message.value("hops", 0);
 
     std::string skipReason;
@@ -579,7 +592,7 @@ void IpmsgHandler::HandleJobResult(const TrackedJob& entry, const IpmsgHandlerCo
     }
     nlohmann::json body = {{"id", entry.messageId}, {"job_id", entry.jobId},
                            {"peer", entry.peer}, {"audience", answer.audience},
-                           {"to_agent", toAgent}, {"hops", entry.hops + 1}};
+                           {"to_peer", toAgent}, {"to_agent", toAgent}, {"hops", entry.hops + 1}};
     if (send.contains("ids")) body["reply_ids"] = send["ids"];
     LogEvent("handler_reply", body);
 }

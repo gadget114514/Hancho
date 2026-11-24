@@ -219,6 +219,10 @@ nlohmann::json BuildHanchoEventV1(const LlmStreamEvent& ev, const HanchoEventSou
         if (ev.permissionDenials > 0) data["permissionDenials"] = ev.permissionDenials;
     } else if (kind == "error") {
         data["message"] = ev.content;
+        // 102-1: structured fields for the failure classifier (doc/llm-error-class-cards.md).
+        if (!ev.errorClass.empty()) data["class"] = ev.errorClass;
+        if (!ev.errorCode.empty()) data["code"] = ev.errorCode;
+        if (ev.httpStatus > 0) data["httpStatus"] = ev.httpStatus;
     } else {
         std::string text = ev.content;
         if (text.empty()) text = ev.toolAction;

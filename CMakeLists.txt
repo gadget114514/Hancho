@@ -45,6 +45,7 @@ set(HANCHO_SOURCES
     src/routine.cpp
     src/triage.cpp
     src/triage_manager.cpp
+    src/translation_store.cpp
     src/triage_text.cpp
     src/chain_guard.cpp
     src/ipc_server.cpp
@@ -55,6 +56,7 @@ set(HANCHO_SOURCES
     src/ipmsg_handler.cpp
     src/webui_assets.cpp
     src/ipc_client.cpp
+    src/ephemeral_core.cpp
     src/remote_client.cpp
     src/remote_hosts.cpp
     src/cli.cpp
@@ -193,12 +195,21 @@ add_custom_command(TARGET Hancho POST_BUILD
     COMMENT "Copying lib/conpty.dll and lib/OpenConsole.exe to output directory"
 )
 
+add_custom_target(HanchoCore
+    DEPENDS Hancho
+    COMMAND ${CMAKE_COMMAND} -E copy_if_different
+        "$<TARGET_FILE:Hancho>"
+        "$<TARGET_FILE_DIR:Hancho>/HanchoCore.exe"
+    COMMENT "Copying Hancho.exe to HanchoCore.exe"
+)
+
 # Console client (human-friendly by default, --json for machine-readable output)
 add_executable(hancho-cli
     src/cli_main.cpp
     src/cli.cpp
     src/triage_text.cpp
     src/ipc_client.cpp
+    src/ephemeral_core.cpp
     src/remote_client.cpp
     src/remote_hosts.cpp
     src/event_adapter.cpp
@@ -314,6 +325,7 @@ add_executable(wct
     src/wct_client.cpp
     src/common.cpp
     src/ipc_client.cpp
+    src/ephemeral_core.cpp
     src/remote_client.cpp
     src/remote_hosts.cpp
     ${WCSP_SOURCES}
@@ -350,6 +362,7 @@ add_executable(HanchoTerm
     src/gui_theme.cpp
     src/common.cpp
     src/ipc_client.cpp
+    src/ephemeral_core.cpp
     src/Terminal/src/ConPtySession.cpp
     src/Terminal/src/ImageManager.cpp
     src/Terminal/src/TerminalBuffer.cpp
@@ -793,6 +806,80 @@ target_link_libraries(triage_smoke PRIVATE
     crypt32
 )
 
+# Headless smoke test for the translation cache and the translate-llm batch worker (src/translation_store.cpp).
+add_executable(translation_smoke
+    tests/translation_smoke.cpp
+    src/translation_store.cpp
+    src/taskqueue.cpp
+    src/task_store.cpp
+    src/direction_store.cpp
+    src/worker_engines.cpp
+    src/worker_probe.cpp
+    src/engine_health.cpp
+    src/llm_config.cpp
+    src/permit_config.cpp
+    src/chain_guard.cpp
+    src/process_manager.cpp
+    src/platform/platform_windows.cpp
+    src/llm_stream.cpp
+    src/llm_stream_claude.cpp
+    src/llm_stream_opencode.cpp
+    src/llm_stream_agy.cpp
+    src/llm_stream_codex.cpp
+    src/event_schema.cpp
+    src/event_adapter.cpp
+    src/common.cpp
+    src/memory_search.cpp
+    src/memory_record.cpp
+    src/Terminal/src/ConPtySession.cpp
+    src/Terminal/src/ImageManager.cpp
+    src/Terminal/src/TerminalBuffer.cpp
+    src/Terminal/src/TerminalEmulator.cpp
+    src/Terminal/src/TerminalView.cpp
+    ${WCSP_SOURCES}
+)
+
+target_include_directories(translation_smoke PRIVATE
+    src
+    include
+    src/Terminal/include
+    src/Terminal/src
+    src/wcsp
+)
+
+if(MSVC)
+    target_compile_options(translation_smoke PRIVATE /W4 /utf-8 /EHsc)
+endif()
+
+target_link_libraries(translation_smoke PRIVATE
+    user32
+    gdi32
+    comctl32
+    shell32
+    advapi32
+    psapi
+    ole32
+    shlwapi
+    imm32
+    winmm
+    d2d1
+    dwrite
+    dwmapi
+    windowscodecs
+    ws2_32
+    "${CMAKE_CURRENT_SOURCE_DIR}/lib/libsixel.lib"
+)
+
+add_custom_command(TARGET translation_smoke POST_BUILD
+    COMMAND ${CMAKE_COMMAND} -E copy_if_different
+        "${CMAKE_CURRENT_SOURCE_DIR}/lib/conpty.dll"
+        "$<TARGET_FILE_DIR:translation_smoke>/conpty.dll"
+    COMMAND ${CMAKE_COMMAND} -E copy_if_different
+        "${CMAKE_CURRENT_SOURCE_DIR}/lib/OpenConsole.exe"
+        "$<TARGET_FILE_DIR:translation_smoke>/OpenConsole.exe"
+    COMMENT "Copying lib/conpty.dll and lib/OpenConsole.exe for translation_smoke"
+)
+
 # Headless test for the behavior tree core engine (src/behavior_tree*.cpp).
 add_executable(behavior_tree_smoke
     tests/behavior_tree_smoke.cpp
@@ -977,6 +1064,7 @@ add_executable(bt_ipc_smoke
     src/routine.cpp
     src/triage.cpp
     src/triage_manager.cpp
+    src/translation_store.cpp
     src/memory_record.cpp
     src/memory_search.cpp
     src/chain_guard.cpp
@@ -1066,6 +1154,7 @@ add_executable(routine_smoke
     src/direction_store.cpp
     src/triage.cpp
     src/triage_manager.cpp
+    src/translation_store.cpp
     src/memory_record.cpp
     src/memory_search.cpp
     src/chain_guard.cpp
@@ -1183,6 +1272,7 @@ target_link_libraries(memory_record_smoke PRIVATE
 add_executable(headless_smoke
     tests/headless_smoke.cpp
     src/ipc_client.cpp
+    src/ephemeral_core.cpp
     src/common.cpp
 )
 
@@ -1198,6 +1288,32 @@ if(MSVC)
 endif()
 
 target_link_libraries(headless_smoke PRIVATE
+    user32
+    shell32
+    advapi32
+    crypt32
+)
+
+# Smoke test for the disposable CI core (`run --ephemeral`, Card 105-2).
+add_executable(ephemeral_smoke
+    tests/ephemeral_smoke.cpp
+    src/ephemeral_core.cpp
+    src/ipc_client.cpp
+    src/common.cpp
+)
+
+add_dependencies(ephemeral_smoke Hancho hancho-cli)
+
+target_include_directories(ephemeral_smoke PRIVATE
+    src
+    include
+)
+
+if(MSVC)
+    target_compile_options(ephemeral_smoke PRIVATE /W4 /utf-8 /EHsc)
+endif()
+
+target_link_libraries(ephemeral_smoke PRIVATE
     user32
     shell32
     advapi32
@@ -1254,6 +1370,7 @@ add_executable(cli_top_smoke
     tests/cli_top_smoke.cpp
     src/common.cpp
     src/ipc_client.cpp
+    src/ephemeral_core.cpp
 )
 
 target_include_directories(cli_top_smoke PRIVATE
@@ -1339,6 +1456,7 @@ add_executable(webui_config_smoke
     src/routine.cpp
     src/triage.cpp
     src/triage_manager.cpp
+    src/translation_store.cpp
     src/triage_text.cpp
     src/memory_record.cpp
     src/memory_search.cpp
@@ -1401,6 +1519,7 @@ add_executable(term_server_smoke
     tests/term_server_smoke.cpp
     src/common.cpp
     src/ipc_client.cpp
+    src/ephemeral_core.cpp
     ${WCSP_SOURCES}
 )
 
@@ -1483,6 +1602,7 @@ else()
         src/permit_config.cpp
         src/triage.cpp
         src/triage_manager.cpp
+        src/translation_store.cpp
         src/chain_guard_posix.cpp
         src/ipc_server.cpp
     src/permit_draft.cpp
@@ -1534,6 +1654,7 @@ else()
     add_executable(hancho-cli
         src/cli_main_posix.cpp
         src/cli.cpp
+        src/ephemeral_core.cpp
         src/ipc_client_posix.cpp
         src/remote_client.cpp
         src/remote_hosts.cpp

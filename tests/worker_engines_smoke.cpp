@@ -232,10 +232,37 @@ int main() {
 
         auto r = llm::Add(cfgPath, "worker", "opencode", "opencode-go/deepseek-v4.1-flash",
                           "", 0, false, "primary", "cli", "seed worker");
-        Check(r.ok, "llm add worker succeeds");
+        Check(r.ok && r.data.value("list", "") == "agent", "llm add worker succeeds and returns list=agent");
         r = llm::Add(cfgPath, "consult", "opencode", "opencode-go/deepseek-v4.1-flash",
                      "", 0, false, "same model, different role", "cli", "seed consult");
         Check(r.ok, "llm add consult succeeds");
+
+        // 103-5: "agent" and "worker" read/write the same list, JSON output uses "agent",
+        // and llms.json on disk keeps the "worker" key for 0.9.x compatibility.
+        r = llm::Add(cfgPath, "agent", "claude", "claude-opus-5-5",
+                     "", 0, false, "via agent alias", "cli", "seed agent");
+        Check(r.ok && r.data.value("list", "") == "agent", "llm add agent succeeds and returns list=agent");
+        {
+            const json disk = json::parse(ReadFileUtf8Wide(cfgPath), nullptr, false);
+            Check(disk.is_object() && disk.contains("worker") && !disk.contains("agent") &&
+                  disk["worker"].size() == 2,
+                  "llms.json on disk keeps the 'worker' key and stores both entries");
+        }
+        {
+            auto lrAgent = llm::List(cfgPath, "agent");
+            auto lrWorker = llm::List(cfgPath, "worker");
+            Check(lrAgent.ok && lrAgent.data.contains("agent") && !lrAgent.data.contains("worker") &&
+                  lrAgent.data["agent"].size() == 2,
+                  "llm list agent returns 'agent' key with both entries");
+            Check(lrWorker.ok && lrWorker.data.contains("agent") && !lrWorker.data.contains("worker") &&
+                  lrWorker.data["agent"].size() == 2,
+                  "llm list worker alias returns 'agent' key with both entries");
+            const auto& proposed = lrWorker.data.value("proposed", json::array());
+            Check(!proposed.empty() && proposed[0].value("list", "") == "agent",
+                  "llm list proposed entries report list=agent");
+        }
+        Check(llm::Remove(cfgPath, "agent", "claude", "claude-opus-5-5", "cli", "cleanup").ok,
+              "llm remove via agent removes entry added via agent/worker");
 
         llm::Config cfg;
         std::string err;
@@ -253,6 +280,8 @@ int main() {
         Check(cfg.consult[0].status == "proposed", "approving worker did not approve consult");
         Check(llm::HasUsable(cfg, "worker", "opencode", "opencode-go/deepseek-v4.1-flash"),
               "approved worker candidate is usable");
+        Check(llm::HasUsable(cfg, "agent", "opencode", "opencode-go/deepseek-v4.1-flash"),
+              "approved candidate is usable via agent alias");
         Check(!llm::HasUsable(cfg, "consult", "opencode", "opencode-go/deepseek-v4.1-flash"),
               "proposed consult candidate is not usable");
         Check(!llm::Approve(cfgPath, "worker", "opencode", "opencode-go/deepseek-v4.1-flash", "", "chat").ok,

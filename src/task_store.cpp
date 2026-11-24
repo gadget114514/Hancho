@@ -240,4 +240,33 @@ int64_t TaskStore::Version() const {
     return version_;
 }
 
+uint64_t TaskStore::MaxRev() const {
+    std::lock_guard<std::mutex> lock(mutex_);
+    uint64_t maxRev = 0;
+    for (const auto& [id, record] : records_) {
+        (void)id;
+        if (record.is_object() && record.contains("rev") && record["rev"].is_number_unsigned()) {
+            const uint64_t r = record["rev"].get<uint64_t>();
+            if (r > maxRev) maxRev = r;
+        }
+    }
+    return maxRev;
+}
+
+std::vector<nlohmann::json> TaskStore::SinceRev(uint64_t sinceRev, bool includeZero) const {
+    std::lock_guard<std::mutex> lock(mutex_);
+    std::vector<nlohmann::json> out;
+    for (const auto& [id, record] : records_) {
+        (void)id;
+        uint64_t r = 0;
+        if (record.is_object() && record.contains("rev") && record["rev"].is_number_unsigned()) {
+            r = record["rev"].get<uint64_t>();
+        }
+        if ((includeZero && r == 0) || r > sinceRev) {
+            out.push_back(record);
+        }
+    }
+    return out;
+}
+
 } // namespace pc

@@ -8,6 +8,7 @@
 #include "nlohmann/json.hpp"
 #include <string>
 #include <vector>
+#include <deque>
 #include <map>
 #include <unordered_map>
 #include <mutex>
@@ -680,6 +681,11 @@ struct TaskQueueJob {
     // Why this job redoes `supersedes` (JSON `supersede_reason`, at most 2000 bytes). Kept on the
     // job that took over, so the reason stays readable after the session that wrote it is gone.
     std::string supersedeReason;
+    // Monotonic revision number assigned on creation and on every change (card 102-2).
+    uint64_t rev = 0;
+    // Transient serialized JSON cache (not persisted), invalidated when the job changes.
+    mutable std::string cachedJsonFull_;
+    mutable std::string cachedJsonNoInstr_;
 };
 
 // ---------------------------------------------------------------------------
@@ -702,6 +708,12 @@ struct TaskQueueRunJob {
     std::string blockedBy;
     bool interrupted = false;
     std::string supersededBy;
+    std::string directionId;
+    std::string logFile;
+    std::string lastLinesFile;
+    std::string startTime;
+    std::string endTime;
+    std::string outputTail;
 
     bool Unfinished() const {
         return state.empty() || state == "pending" || state == "running" ||
@@ -763,6 +775,17 @@ inline std::string TaskQueueRunXmlEscape(const std::string& text) {
     return out;
 }
 
+inline std::string TaskQueueRunXmlSanitize(const std::string& text) {
+    std::string filtered;
+    filtered.reserve(text.size());
+    for (unsigned char c : text) {
+        if (c >= 0x20 || c == '\t' || c == '\n' || c == '\r') {
+            filtered += static_cast<char>(c);
+        }
+    }
+    return TaskQueueRunXmlEscape(filtered);
+}
+
 inline std::string TaskQueueRunFailureMessage(const TaskQueueRunJob& job) {
     std::ostringstream oss;
     if (job.state == "blocked") {
@@ -780,11 +803,15 @@ inline std::string TaskQueueRunFailureMessage(const TaskQueueRunJob& job) {
 
 // Minimal JUnit XML: one testcase per job (excluding superseded jobs unless countSuperseded).
 // Failed/blocked jobs get <failure message>, cancelled or unfinished jobs get <skipped message>.
-// Everything is escaped.
+// Everything is escaped. When includeOutput is true, non-empty outputTail is written to <system-out>.
+// When btOutcome is non-null, one additional testcase is appended for the behavior tree result.
 inline std::string TaskQueueRunJUnitXml(const std::string& suiteName,
                                         const std::vector<TaskQueueRunJob>& jobs,
-                                        bool countSuperseded = false) {
-    const std::vector<TaskQueueRunJob> counted = TaskQueueRunCountedJobs(jobs, countSuperseded);
+                                        bool countSuperseded = false,
+                                        bool includeOutput = false,
+                                        const TaskQueueRunJob* btOutcome = nullptr) {
+    std::vector<TaskQueueRunJob> counted = TaskQueueRunCountedJobs(jobs, countSuperseded);
+    if (btOutcome) counted.push_back(*btOutcome);
     size_t failures = 0;
     size_t skipped = 0;
     for (const auto& job : counted) {
@@ -803,17 +830,28 @@ inline std::string TaskQueueRunJUnitXml(const std::string& suiteName,
         const std::string name = job.id.empty() ? job.name : job.id;
         oss << "    <testcase classname=\"" << TaskQueueRunXmlEscape(suiteName) << "\""
             << " name=\"" << TaskQueueRunXmlEscape(name) << "\" time=\"0.000\"";
+        const bool hasSysOut = includeOutput && !job.outputTail.empty();
         if (job.state == "succeeded") {
-            oss << "/>\n";
+            if (!hasSysOut) {
+                oss << "/>\n";
+            } else {
+                oss << ">\n      <system-out>" << TaskQueueRunXmlSanitize(job.outputTail)
+                    << "</system-out>\n    </testcase>\n";
+            }
             continue;
         }
         const std::string message = TaskQueueRunXmlEscape(TaskQueueRunFailureMessage(job));
+        oss << ">\n";
         if (job.Cancelled() || job.Unfinished()) {
-            oss << ">\n      <skipped message=\"" << message << "\"/>\n    </testcase>\n";
+            oss << "      <skipped message=\"" << message << "\"/>\n";
         } else {
-            oss << ">\n      <failure message=\"" << message << "\">" << message
-                << "</failure>\n    </testcase>\n";
+            oss << "      <failure message=\"" << message << "\">" << message << "</failure>\n";
         }
+        if (hasSysOut) {
+            oss << "      <system-out>" << TaskQueueRunXmlSanitize(job.outputTail)
+                << "</system-out>\n";
+        }
+        oss << "    </testcase>\n";
     }
     oss << "  </testsuite>\n</testsuites>\n";
     return oss.str();
@@ -826,6 +864,9 @@ inline TaskQueueRunJob TaskQueueRunJobFromJson(const nlohmann::json& job) {
     out.name = job.value("name", out.id);
     out.summary = job.value("summary", std::string());
     out.state = job.value("state", std::string());
+    if (job.contains("direction_id") && job["direction_id"].is_string()) {
+        out.directionId = job["direction_id"].get<std::string>();
+    }
     if (job.contains("blocked_by") && job["blocked_by"].is_string()) {
         out.blockedBy = job["blocked_by"].get<std::string>();
     }
@@ -839,6 +880,10 @@ inline TaskQueueRunJob TaskQueueRunJobFromJson(const nlohmann::json& job) {
             if (attempt.contains("exit_code") && attempt["exit_code"].is_number()) {
                 out.exitCode = attempt["exit_code"].get<int>();
             }
+            out.logFile = attempt.value("log_file", std::string());
+            out.lastLinesFile = attempt.value("last_lines_file", std::string());
+            out.startTime = attempt.value("start", std::string());
+            out.endTime = attempt.value("end", std::string());
             const auto failure = attempt.find("failure");
             if (failure != attempt.end() && failure->is_object()) {
                 out.failureClass = failure->value("class", std::string());
@@ -905,6 +950,7 @@ public:
     using ProcessFinishedCallback = std::function<void(int processId, int exitCode, const std::string& endKind)>;
     using JobFinishedCallback = std::function<void(const TaskQueueJob& snapshot, const std::string& finalState)>;
     using BtRetryCallback = std::function<bool(const TaskQueueBtRef& ref, bool resetCounters, std::string& outError)>;
+    using BtCancelCallback = std::function<void(const std::string& btId)>;
     // Invoked on the scheduler thread when a flagged job and all other work are idle.
     // action is "sleep", "hibernate" or "shutdown".
     using SuspendCallback = std::function<void(const std::string& jobId, const std::string& state,
@@ -913,6 +959,7 @@ public:
     void SetProcessFinishedCallback(ProcessFinishedCallback cb);
     void SetJobFinishedCallback(JobFinishedCallback cb);
     void SetBtRetryCallback(BtRetryCallback cb);
+    void SetBtCancelCallback(BtCancelCallback cb);
     void SetSuspendCallback(SuspendCallback cb);
     void SetProcessManager(ProcessManager* pm);
     // Installed by IpcServer. Passing empty callbacks makes remote jobs fail to launch.
@@ -938,7 +985,12 @@ public:
     // (session ids also match by prefix); "pid:<n>" matches the origin process id.
     std::string TaskQueueList(const std::string& taskqueue, const std::string& state, int64_t sinceSec, std::string& outError,
                               const std::string& origin = "", const std::string& btId = "",
-                              bool includeHidden = false, const std::string& taskId = "");
+                              bool includeHidden = false, const std::string& taskId = "",
+                              int64_t finishedLimit = 0, const std::string& before = "",
+                              const std::string& query = "");
+    std::string TaskQueueChanges(uint64_t since, bool includeHidden, std::string& outError);
+    uint64_t GetCurrentRev() const;
+    void SetMaxTombstonesForTest(size_t maxTombstones);
     static TaskQueueOrigin ParseOriginJson(const std::string& json);
     static std::string OriginToJson(const TaskQueueOrigin& origin);
     static bool OriginMatches(const TaskQueueOrigin& origin, const std::string& filter);
@@ -957,7 +1009,11 @@ public:
                                    const std::string& originJson, std::string& outError);
     std::string TaskQueueUpdate(const std::string& id, const std::string& patchJson, std::string& outError);
     std::string TaskQueueUpdate(const std::string& id, const std::string& patchJson, TaskQueueCaller caller, std::string& outError);
-    std::string TaskQueueCancel(const std::string& id, std::string& outError);
+    std::string TaskQueueCancel(const std::string& id, std::string& outError,
+                                const std::string& reason = "");
+    // Cancels all unfinished jobs (queued, pending, running, waiting_retry, paused).
+    // Returns the number of jobs cancelled.
+    int CancelAllActiveJobs(const std::string& reason);
     // Force-closes a job: stops any running process and sets the state to "closed", a terminal
     // state (like succeeded/failed/cancelled) that the scheduler never picks up again.
     std::string TaskQueueClose(const std::string& id, std::string& outError);
@@ -993,10 +1049,18 @@ public:
     // {"ok":...} shape as the job calls. A task's state is computed from its jobs (TaskState).
     // An empty result or a non-positive limit means the default.
     std::string TaskCreate(const std::string& title, const std::string& intent, const std::string& id,
-                           const std::string& originJson, std::string& outError);
+                           const std::string& originJson, std::string& outError,
+                           const std::string& cardDefaultsJson = "");
+    std::string TaskUpdate(const std::string& id,
+                           bool hasTitle, const std::string& title,
+                           bool hasIntent, const std::string& intent,
+                           bool hasCardDefaults, const std::string& cardDefaultsJson,
+                           const std::string& session, std::string& outError);
+    bool TaskGet(const std::string& id, nlohmann::json& outRecord) const;
     std::string TaskShow(const std::string& id, int64_t logLimit, std::string& outError);
     std::string TaskList(const std::string& stateFilter, int64_t limit, std::string& outError,
-                         int64_t sinceVersion = -1);
+                         int64_t sinceVersion = -1, int64_t finishedLimit = 0,
+                         const std::string& before = "", const std::string& query = "");
     std::string TaskNote(const std::string& id, const std::string& text, const std::string& session,
                          std::string& outError);
     std::string TaskClose(const std::string& id, const std::string& result, const std::string& reason,
@@ -1036,11 +1100,41 @@ public:
                                 std::string& outError);
     std::string DirectionPurgeOlderThan(int64_t olderThanSec, std::string& outError);
     // Bulk operations on all jobs belonging to a kind="jobs" direction (card 103-3).
-    std::string DirectionCancelJobs(const std::string& id, std::string& outError);
+    std::string DirectionCancelJobs(const std::string& id, std::string& outError,
+                                      const std::string& reason = "");
     std::string DirectionRetryJobs(const std::string& id, bool resetAttempts, bool refreshInstructions,
                                    TaskQueueCaller caller, std::string& outError);
     std::string DirectionPauseJobs(const std::string& id, bool paused, std::string& outError);
     std::string DirectionRemoveJobs(const std::string& id, bool force, std::string& outError);
+
+    // Client-exit watch for --cancel-on-exit (card 105-4).
+    bool WatchDirectionClient(const std::string& directionId, uint32_t clientPid, std::string& outError);
+    void UnwatchDirectionClient(const std::string& directionId);
+    void ReconcileDirectionClientWatches();
+
+    // Task card operations (doc/task-card-store-cards.md, cards 104-1, 104-3).
+    std::string CardAdd(const std::string& taskId, const std::string& number,
+                        const std::string& title, const std::string& body,
+                        const std::vector<std::string>& after, const std::string& tmpl,
+                        const std::string& paramsJson, const std::string& originJson,
+                        std::string& outError);
+    std::string CardList(const std::string& taskId, std::string& outError);
+    std::string CardShow(const std::string& idOrNumber, const std::string& taskId,
+                         std::string& outError);
+    std::string CardEdit(const std::string& taskId, const std::string& number,
+                         bool hasTitle, const std::string& title,
+                         bool hasBody, const std::string& body,
+                         bool hasAfter, const std::vector<std::string>& after,
+                         bool hasTemplate, const std::string& tmpl,
+                         bool hasParams, const std::string& paramsJson,
+                         const std::string& session, std::string& outError);
+    std::string CardRemove(const std::string& taskId, const std::string& number,
+                           const std::string& session, std::string& outError);
+    std::string CardRedo(const std::string& taskId, const std::string& idOrNumber,
+                         bool hasBody, const std::string& body,
+                         bool hasParams, const std::string& paramsJson,
+                         const std::string& reason, bool force,
+                         const std::string& originJson, std::string& outError);
 
     // Scheduler hooks
     void OnProcessFinished(int processId, int exitCode, const std::string& endKind);
@@ -1122,6 +1216,13 @@ private:
     const TaskQueueJob* ResolveDepJobLocked(const std::string& depId, const TaskQueue* extraQueue = nullptr) const;
     // Compact {"id","title","state"} summary for TaskQueueList / TaskQueueGet (no "title" for implicit tasks).
     std::string TaskSummaryJsonLocked(const TaskQueueJob& job) const;
+    std::string TaskSummaryJsonCachedLocked(const TaskQueueJob& job) const;
+    // Monotonic revision and tombstones (card 102-2).
+    void InitRevLocked();
+    uint64_t BumpRevLocked();
+    void PersistLastRevLocked();
+    void MarkJobChangedLocked(TaskQueueJob& job);
+    void RecordJobTombstoneLocked(const std::string& jobId);
     // Requeues one job (caller holds mutex_, has validated the state, and saves the queue).
     void RequeueJobLocked(TaskQueue& tq, TaskQueueJob& job, bool resetAttempts, bool refreshInstructions);
 
@@ -1173,6 +1274,23 @@ private:
     nlohmann::json DirectionStateLocked(const std::string& id) const;
     void MaybeLogDirectionFinishedLocked(const std::string& directionId, const std::string& taskId);
 
+    struct ClientWatchEntry {
+        std::string directionId;
+        uint32_t pid = 0;
+        uint64_t startTime = 0;
+#ifdef _WIN32
+        void* handle = nullptr;
+#else
+        int pidfd = -1;
+#endif
+    };
+    void ClientWatchLoop();
+    void WakeClientWatchLocked();
+    void UnwatchDirectionClientLocked(const std::string& directionId);
+    void CancelDirectionOnClientExit(const std::string& directionId);
+    static bool QueryProcessStartTimePortable(uint32_t pid, uint64_t& outStartTime);
+    static bool IsWatchedProcessAlive(uint32_t pid, uint64_t expectedStartTime);
+
     TaskStore taskStore_;
     DirectionStore directionStore_;
     ProcessManager* pm_ = nullptr;
@@ -1186,7 +1304,14 @@ private:
     int jobFinishedCbInFlight_ = 0;
     std::condition_variable jobFinishedCbIdleCv_;
     BtRetryCallback btRetryCb_;
+    BtCancelCallback btCancelCb_;
     SuspendCallback suspendCb_;
+    std::vector<ClientWatchEntry> clientWatches_;
+    std::atomic<bool> clientWatchRunning_{false};
+    std::thread clientWatchThread_;
+#ifdef _WIN32
+    void* clientWatchWakeEvent_ = nullptr;
+#endif
     // Power monitor state, guarded by mutex_.
     std::string powerPhase_; // empty/idle, waiting_target, waiting_others, countdown
     int64_t powerDueMs_ = 0;
@@ -1201,6 +1326,16 @@ private:
     std::map<std::string, TaskQueueOrigin> btOrigins_; // behavior tree id -> who started it
     std::map<std::string, std::string> lastNotice_; // taskqueue -> last emitted notice type
     int nextJobNum_ = 1;
+    uint64_t currentRev_ = 0;
+    struct JobTombstone {
+        std::string id;
+        uint64_t rev = 0;
+    };
+    std::deque<JobTombstone> tombstones_;
+    uint64_t evictedBeforeRev_ = 0;
+    size_t maxTombstones_ = 10000;
+    mutable uint64_t taskSummaryCacheRev_ = 0;
+    mutable std::unordered_map<std::string, std::string> taskSummaryCache_;
     int64_t lastHealthCheckTickMs_ = 0;  // auto-probe at most once per second
     std::atomic<bool> schedulerRunning_{false};
     std::atomic<bool> resourceLocksEnabled_{true};
