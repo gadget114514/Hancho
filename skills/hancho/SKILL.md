@@ -255,7 +255,24 @@ hancho-cli.exe card remove 102-3 --task <taskId>                      # only whi
 ```
 
 - A card is expanded into a BT (agent → build → test → fix loop on failure) by the `card` template (`hancho-cli.exe bt template card --json`). `build` / `test` / `engines` are filled in from `--params` or the task's `--card-defaults`.
-- MCP: `card_add` / `card_list` / `card_show` / `card_edit` / `card_remove` / `card_run` / `card_redo`. Where batch import from Markdown (`card import`) is available, `card import --task <taskId> --file doc/xxx-cards.md` can also be used.
+- MCP: `card_add` / `card_list` / `card_show` / `card_edit` / `card_remove` / `card_run` / `card_redo`.
+- Batch import / export of Markdown card files: `card import --task <taskId> --file doc/xxx-cards.md [--dry-run]`, `card export --task <taskId> [--file <md>] [--lang <en|ja|es>]`. `--dry-run` checks the file without writing.
+- `card translate --task <taskId> [--translate-cards <all|title|off>]` translates the non-English titles and bodies of the task's cards to English. `card import` takes the same `--translate-cards` option.
+
+### Translation (stored in English, shown in your language)
+
+Stored data (summaries, auto-notes, card text) is kept in English, and the original text is kept too. Translation happens only for display or export.
+
+```powershell
+hancho-cli.exe translate get --lang ja --field card.title "Add card list"   # cached translation; queues a miss in the background
+hancho-cli.exe translate status                                             # progress of the translation worker
+hancho-cli.exe translate clear --lang ja                                    # drop the cached translations for one language
+```
+
+- Languages are `en`, `ja`, `es`. The dashboard and Web UI show translated titles and job summaries.
+- The CLI `--lang` option only reads the cache (no new translation runs in the CLI).
+- MCP: `translate_get` / `translate_status` / `translate_clear`.
+- Write summaries and titles in English when you create them. The core warns when a non-English summary or title is stored.
 
 ### Task queue (order and dependencies)
 
