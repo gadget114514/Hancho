@@ -130,6 +130,16 @@ CardMarkdownSend MakeFakeCardSend(FakeCardTask& t) {
             resp = {{"ok", true}, {"number", num}};
             return true;
         }
+        if (action == "translate_get") {
+            nlohmann::json items = nlohmann::json::array();
+            if (req.contains("texts") && req["texts"].is_array()) {
+                for (const auto& text : req["texts"]) {
+                    items.push_back({{"text", text}, {"translated", nullptr}, {"state", "pending"}});
+                }
+            }
+            resp = {{"ok", true}, {"lang", req.value("lang", std::string())}, {"items", items}};
+            return true;
+        }
         return fail("unknown action " + action);
     };
 }
@@ -313,7 +323,7 @@ void TestCardMarkdown() {
         FakeCardTask first;
         first.cards["103-2"] = {{"title", "external"}, {"body", ""}, {"state", "planned"},
                                 {"after", nlohmann::json::array()}, {"directionId", "dir_9"}};
-        ImportCardMarkdown(first.taskId, kCardDocChain, false, "en", MakeFakeCardSend(first));
+        ImportCardMarkdown(first.taskId, kCardDocChain, false, "en", MakeFakeCardSend(first), "off");
         std::string md;
         std::string err;
         Check(ExportCardMarkdown(first.taskId, "en", MakeFakeCardSend(first), md, err) &&
@@ -322,7 +332,7 @@ void TestCardMarkdown() {
 
         FakeCardTask second;
         second.cards["103-2"] = first.cards["103-2"];
-        const CardMarkdownImportResult r = ImportCardMarkdown(second.taskId, md, false, "en", MakeFakeCardSend(second));
+        const CardMarkdownImportResult r = ImportCardMarkdown(second.taskId, md, false, "en", MakeFakeCardSend(second), "off");
         Check(r.ok && r.warnings.empty(), "104-4: re-import of the export is clean");
         Check(SnapshotTask(first) == SnapshotTask(second),
               "104-4: import -> export -> import gives the same cards");
@@ -2846,7 +2856,7 @@ int main() {
         if (sj.contains("results") && !sj["results"].empty()) {
             noteId = sj["results"][0].value("id", "");
             std::string text = sj["results"][0].value("summary", sj["results"][0].value("text", ""));
-            Check(text.find("build は直近 3 回 success_check_failed（filesNewer）で失敗") != std::string::npos,
+            Check(text.find("build failed 3 times in a row: success_check_failed (filesNewer)") != std::string::npos,
                   "Rule 1 text matches expected wording");
         }
         if (!noteId.empty()) {
@@ -2895,8 +2905,8 @@ int main() {
         sj = nlohmann::json::parse(sres, nullptr, false);
         if (sj.contains("results") && !sj["results"].empty()) {
             std::string text = sj["results"][0].value("summary", sj["results"][0].value("text", ""));
-            Check(text.find("test は所要時間がタイムアウトに近い") != std::string::npos &&
-                  text.find("上限 1800 秒") != std::string::npos,
+            Check(text.find("test is close to its timeout") != std::string::npos &&
+                  text.find("/ limit 1800 s)") != std::string::npos,
                   "Rule 2 text matches p90 and timeout limit wording");
         }
 
@@ -2929,7 +2939,7 @@ int main() {
         sj = nlohmann::json::parse(sres, nullptr, false);
         if (sj.contains("results") && !sj["results"].empty()) {
             std::string text = sj["results"][0].value("summary", sj["results"][0].value("text", ""));
-            Check(text.find("lint は失敗の後に成功。直した可能性のあるファイル: src/bar.cpp") != std::string::npos,
+            Check(text.find("lint succeeded after a failure. Files possibly fixed: src/bar.cpp") != std::string::npos,
                   "Rule 3 text lists filesEdited diff");
         }
 
@@ -2939,7 +2949,7 @@ int main() {
         memory::BriefResult brief = memory::BuildBrief(bo);
         Check(brief.ok, "memory brief succeeds with auto-notes");
         Check(brief.text.find("Related notes") != std::string::npos &&
-              brief.text.find("build は直近 3 回") != std::string::npos,
+              brief.text.find("build failed 3 times in a row") != std::string::npos,
               "memory brief includes auto-notes in Related notes");
     }
 
@@ -5530,12 +5540,23 @@ int main() {
 
     // --- 106-1: Hancho-written notes are English and carry data; non-English summary warns ---
     {
+        const std::wstring streakDir = dir + L"\\streak1061";
+        CreateDirectoryW(streakDir.c_str(), nullptr);
+        SetDataDirectoryOverride(streakDir);
+
+        ProcessManager streakPm;
+        TaskQueueManager streakTqm;
+        streakTqm.SetProcessManager(&streakPm);
+        streakPm.SetProcessFinishedCallback([&streakTqm](int pid, int ec, const std::string& kind) {
+            streakTqm.OnProcessFinished(pid, ec, kind);
+        });
+
         // Three failed attempts in a row write the failure_streak note.
         std::string streakJobs = R"([{"id":"STREAK","command":"cmd /c exit 1","summary":"streak job",
             "timeoutSec":30,"maxAttempts":3}])";
-        Check(JsonGetBool(tqm.TaskQueueAdd("streakq", streakJobs, 0, "", err), "ok", false),
+        Check(JsonGetBool(streakTqm.TaskQueueAdd("streakq", streakJobs, 0, "", err), "ok", false),
               "106-1: streak job added: " + err);
-        Check(WaitForState(tqm, "STREAK", "failed", 60000), "106-1: streak job failed");
+        Check(WaitForState(streakTqm, "STREAK", "failed", 60000), "106-1: streak job failed");
 
         const std::wstring notesPath = Utf8ToWide(memory::MemoryDirectoryUtf8()) + L"\\notes.jsonl";
         nlohmann::json streakNote;
@@ -5562,6 +5583,10 @@ int main() {
             Check(streakNote["data"].value("job", std::string()) != "",
                   "106-1: auto-note data carries the job name");
         }
+
+        streakPm.SetProcessFinishedCallback(nullptr);
+        streakTqm.ShutdownTaskQueueManager();
+        SetDataDirectoryOverride(dir);
 
         // The warning helper: a Japanese summary/title is reported, an English one is not.
         Check(IsNonEnglishText("ひらがな") && IsNonEnglishText("カタカナ") && IsNonEnglishText("漢字") &&
