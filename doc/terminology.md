@@ -38,6 +38,12 @@ task                 依頼 1 件。意図・経過ログを持つ
   - BT は 1 本で 1 つの direction になる。ノードを実行するたびに、その direction の job を出す。
   - `taskqueue add --file jobs.json` は 1 回で 1 つの direction になる。ファイルの中の job がその direction に属する。job を 1 つだけ登録したときも 1 つの direction になる。
   - `routine run` も 1 つの direction（中身は BT）。
+- **direction を実行する仕組みとして BT を採用している。** direction は「何をするか」（指示の 1 単位）、BT は「それをどう実行するか」（実行の仕組み）。
+  - direction の中身は BT で書く。何を順に・並行に動かし、失敗したら何をするか（`retry`、fix ループ、エンジンの切り替え、escalate）を BT のノードで表す。Hancho は BT を進め、ノードごとに job を出し、結果を見て次のノードを決める。
+  - 成否・回復・判断待ちは BT の状態で決まる。BT の中で直せた失敗は direction の失敗にならず（トリアージのカードにもならない）、BT が `failed` で終わったときだけ direction が失敗する。
+  - タスクカードを流すときも、本文と雛形から BT を作って実行する（`doc/task-card-store-cards.md` の雛形 `card`: agent → build → test → 失敗なら fix）。ルーチンは、名前を付けて保存した direction の仕組み（BT）。
+  - `taskqueue add` 1 回分の direction は BT を使わない。job を `dependsOn` で並べただけの、分岐も回復もない direction（BT で書けば exec ノードを並べただけのものに当たる）。結果によって次を変えたいときは BT にする。
+  - BT 以外の仕組みで direction を実行する予定はない。direction のレコード（下）は BT とは別に持ち、BT の id は `btId` として direction から指す。
 - **BT のノードは exec と agent の 2 種類が job を出す。**
   - exec: 実行するコマンドを自分で書く。中身は何でもよい（ビルド、テスト、LLM を起動するスクリプト）。
   - agent: エンジン・モデル・指示文を書き、Hancho が `engines.json` からコマンドを作って LLM を起動する。
@@ -79,7 +85,7 @@ task                 依頼 1 件。意図・経過ログを持つ
 | 用語 | 意味 |
 |---|---|
 | キュー（taskqueue） | task を実行する順番。実際に並ぶのは task の job で、順番・依存つきで並べる。名前は変えない |
-| BT（behavior tree） | ノードの木。結果によって次を変える流れを 1 つの JSON で書いた定義。実行すると direction になる |
+| BT（behavior tree） | ノードの木。結果によって次を変える流れを 1 つの JSON で書いた定義。direction を実行する仕組みとして採用している（direction = 何をするか、BT = どう実行するか）。実行すると direction になる |
 | ルーチン（routine） | 名前を付けて保存した BT |
 | タスクカード（task card） | 大きな task の中に入っている作業の 1 単位（= direction）。task は複数のカードを持つ。1 枚を 1 本の direction として実行する。中身は作業の説明（触るファイル、やること、テスト）と、ほかのタスクカードへの依存。番号は `102-3` のように「計画の番号-連番」で付ける。単に「カード」と言えばタスクカードのこと（`doc/` の「カード 100-x」「カード 102-x」）。失敗した direction を指すときは「トリアージのカード」と書いて区別する（どちらも同じ direction） |
 
