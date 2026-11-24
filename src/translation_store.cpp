@@ -61,8 +61,8 @@ std::string DumpUtf8(const json& value) {
 } // namespace
 
 bool ShouldTranslate(const std::string& field, const json& config) {
-    if (CfgString(config, "translate_mode", "auto") == "off") return false;
-    const std::string cards = CfgString(config, "translate_cards", "all");
+    if (CfgString(config, "translate_mode", "off") == "off") return false;
+    const std::string cards = CfgString(config, "translate_cards", "off");
     if (field == "card.title") return cards != "off";
     if (field == "card.body") return cards == "all";
     return true;
@@ -407,14 +407,14 @@ void TranslationStore::ReloadConfig() {
 }
 
 void TranslationStore::ApplyConfig(const json& config) {
-    std::string mode = CfgString(config, "translate_mode", "auto");
-    if (mode != "auto" && mode != "off") mode = "auto";
+    std::string mode = CfgString(config, "translate_mode", "off");
+    if (mode != "auto" && mode != "off") mode = "off";
     std::string engine = CfgString(config, "translate_engine");
     if (engine.empty()) engine = CfgString(config, "triage_llm_engine");
     std::string model = CfgString(config, "translate_model");
     if (model.empty()) model = CfgString(config, "triage_llm_model");
-    std::string cards = CfgString(config, "translate_cards", "all");
-    if (cards != "all" && cards != "title" && cards != "off") cards = "all";
+    std::string cards = CfgString(config, "translate_cards", "off");
+    if (cards != "all" && cards != "title" && cards != "off") cards = "off";
 
     std::lock_guard<std::mutex> lock(mutex_);
     const bool changed = mode != mode_ || engine != engine_ || model != model_ || cards != cards_;

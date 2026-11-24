@@ -736,6 +736,7 @@ enum ControlId {
     IDC_SET_PROC_FONT = 6054,
     IDC_SET_TASK_FONT = 6055,
     IDC_SET_TRANSLATE_CARDS = 6150,  // 106-3: translate task cards (all / title / off)
+    IDC_SET_TRANSLATE_MODE = 6151,   // on-demand translation (auto / off)
     IDC_SET_DISPLAY_MODE = 6091,
     IDC_SET_SHOW_SUPERVISOR_HINTS = 6056,
     IDC_SET_HINT_AUTO_DISMISS_SEC = 6057,
@@ -1083,7 +1084,8 @@ struct DashboardState {
     std::wstring taskSearchText;
     // 106-3: translated display text (see DisplayText). translateCards is "all", "title" or "off".
     pc::DisplayTextCache translations;
-    std::string translateCards = "all";
+    std::string translateMode = "off";
+    std::string translateCards = "off";
     bool showOriginalCardText = false;  // the card detail shows the original body and title
     bool translationsChanged = false;   // a translation landed: rebuild the lists on the next tick
     std::vector<std::wstring> taskTitleTips;  // per task row: the translated title with its original
@@ -1233,8 +1235,8 @@ static void WakeDashboardDataFetch(DashboardState* st);
 static const size_t kTranslateBatchMax = 200;
 
 static nlohmann::json DashTranslateConfig(const DashboardState* st) {
-    return nlohmann::json{{"translate_mode", "auto"},
-                          {"translate_cards", st ? st->translateCards : std::string("all")}};
+    return nlohmann::json{{"translate_mode", st ? st->translateMode : std::string("off")},
+                          {"translate_cards", st ? st->translateCards : std::string("off")}};
 }
 
 // The text to show for a free-text field: "" for task and job titles, "card.title", "card.body".
@@ -13706,9 +13708,13 @@ static void LoadShellConfig(DashboardState* st) {
         JsonGetInt(content, "process_list_font_px", kDefaultListFontPx)));
     st->taskListFontPx = ClampListFontPx(static_cast<int>(
         JsonGetInt(content, "task_list_font_px", kDefaultListFontPx)));
-    st->translateCards = JsonGetString(content, "translate_cards", "all");
+    st->translateMode = JsonGetString(content, "translate_mode", "off");
+    if (st->translateMode != "auto" && st->translateMode != "off") {
+        st->translateMode = "off";
+    }
+    st->translateCards = JsonGetString(content, "translate_cards", "off");
     if (st->translateCards != "all" && st->translateCards != "title" && st->translateCards != "off") {
-        st->translateCards = "all";
+        st->translateCards = "off";
     }
     st->displayScaleDpi = static_cast<int>(JsonGetInt(content, "display_scale_dpi", 0));
     UpdateDisplayScale(st->hwndMain, st->displayScaleDpi);
@@ -13842,6 +13848,7 @@ static void SaveShellConfig(const DashboardState* st) {
         << "  \"memory_max_bytes\": " << st->memoryMaxBytes << ",\n"
         << "  \"process_list_font_px\": " << st->processListFontPx << ",\n"
         << "  \"task_list_font_px\": " << st->taskListFontPx << ",\n"
+        << "  \"translate_mode\": \"" << JsonEscape(st->translateMode) << "\",\n"
         << "  \"translate_cards\": \"" << JsonEscape(st->translateCards) << "\",\n"
         << "  \"task_view_mode\": " << (st->taskViewMode ? "true" : "false") << ",\n"
         << "  \"display_scale_dpi\": " << st->displayScaleDpi << ",\n"
@@ -14779,6 +14786,7 @@ struct SettingsDlgState {
         HWND cmbTaskFont = nullptr;
     HWND lblTranslateCards = nullptr;
     HWND cmbTranslateCards = nullptr;
+    HWND chkTranslateMode = nullptr;
         HWND lblDisplayMode = nullptr;
         HWND cmbDisplayMode = nullptr;
        HWND hwndAboutTitle = nullptr;
@@ -16347,6 +16355,14 @@ static void UpdateSettingsDialogTexts(HWND hwnd) {
         SetWindowTextW(ds->lblTranslateCards, Tr(L"タスクカードを訳す", L"Translate task cards", L"Traducir tarjetas de tareas"));
     }
     if (ds->cmbTranslateCards) FillTranslateCardsCombo(ds->cmbTranslateCards, ds->dash->translateCards);
+    if (ds->chkTranslateMode) {
+        SetWindowTextW(ds->chkTranslateMode, Tr(
+            L"オンデマンド翻訳を有効にする (LLM)",
+            L"Enable on-demand translation (LLM)",
+            L"Activar traducción bajo demanda (LLM)"));
+        SendMessageW(ds->chkTranslateMode, BM_SETCHECK,
+                     ds->dash->translateMode == "auto" ? BST_CHECKED : BST_UNCHECKED, 0);
+    }
     CheckRadioButton(hwnd, IDC_SET_LANG_JA, IDC_SET_LANG_ES,
         g_uiLanguage == UiLanguage::Japanese ? IDC_SET_LANG_JA :
         g_uiLanguage == UiLanguage::Spanish ? IDC_SET_LANG_ES : IDC_SET_LANG_EN);
@@ -16789,7 +16805,10 @@ static LRESULT CALLBACK SettingsWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPAR
             ds->cmbTranslateCards = CreateWindowExW(WS_EX_CLIENTEDGE, L"COMBOBOX", L"",
                 WS_CHILD | WS_VISIBLE | WS_TABSTOP | CBS_DROPDOWNLIST | WS_VSCROLL,
                 18, 678, 300, 200, hwnd, (HMENU)IDC_SET_TRANSLATE_CARDS, hInst, nullptr);
-            FillTranslateCardsCombo(ds->cmbTranslateCards, "all");
+            FillTranslateCardsCombo(ds->cmbTranslateCards, "off");
+            ds->chkTranslateMode = CreateWindowExW(0, L"BUTTON", L"",
+                WS_CHILD | WS_VISIBLE | WS_TABSTOP | BS_AUTOCHECKBOX,
+                334, 678, 340, 24, hwnd, (HMENU)IDC_SET_TRANSLATE_MODE, hInst, nullptr);
             for (int i = 0; i < kListFontSizeCount; ++i) {
                 std::wstring item = std::to_wstring(kListFontSizes[i]) + L" px";
                 SendMessageW(ds->cmbProcFont, CB_ADDSTRING, 0, reinterpret_cast<LPARAM>(item.c_str()));
@@ -17072,7 +17091,7 @@ static LRESULT CALLBACK SettingsWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPAR
                              ds->lblWebUiAllowedHosts, ds->editWebUiAllowedHosts,
                              ds->lblWebUiPort, ds->editWebUiPort, ds->lblWebUiUrl, ds->editWebUiUrl,
                              ds->lblWebUiToken, ds->editWebUiToken, ds->btnWebUiTokenRoll,
-                             ds->lblDisplayMode, ds->cmbDisplayMode, ds->lblProcFont, ds->cmbProcFont, ds->lblTaskFont, ds->cmbTaskFont, ds->lblTranslateCards, ds->cmbTranslateCards };
+                             ds->lblDisplayMode, ds->cmbDisplayMode, ds->lblProcFont, ds->cmbProcFont, ds->lblTaskFont, ds->cmbTaskFont, ds->lblTranslateCards, ds->cmbTranslateCards, ds->chkTranslateMode };
              for (HWND h : ctrls) SendMessageW(h, WM_SETFONT, (WPARAM)ds->dash->hFontUi, TRUE);
              for (HWND h : ds->chkTriageKinds) if (h) SendMessageW(h, WM_SETFONT, (WPARAM)ds->dash->hFontUi, TRUE);
              for (HWND h : ds->chkTriageLlmPermissions) if (h) SendMessageW(h, WM_SETFONT, (WPARAM)ds->dash->hFontUi, TRUE);
@@ -17228,7 +17247,7 @@ static LRESULT CALLBACK SettingsWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPAR
                     ds->lblUsageBucket[1], ds->cmbUsageBucket[1], ds->lblUsageBucket[2], ds->cmbUsageBucket[2],
                     ds->lblUsageBucket[3], ds->cmbUsageBucket[3],
                     ds->lblDisplayMode, ds->cmbDisplayMode,
-                    ds->lblProcFont, ds->cmbProcFont, ds->lblTaskFont, ds->cmbTaskFont, ds->lblTranslateCards, ds->cmbTranslateCards });
+                    ds->lblProcFont, ds->cmbProcFont, ds->lblTaskFont, ds->cmbTaskFont, ds->lblTranslateCards, ds->cmbTranslateCards, ds->chkTranslateMode });
                 auto& colors = ds->tabPages[7];
                 colors.insert(colors.end(), { ds->lblListBg, ds->btnListBgReset });
                 colors.insert(colors.end(), ds->btnListBg, ds->btnListBg + kListRowKeyCount);
@@ -17730,6 +17749,13 @@ static LRESULT CALLBACK SettingsWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPAR
                     SaveShellConfig(ds->dash);
                     RefreshTaskQueueData(ds->dash, true);
                 }
+                return 0;
+            }
+            if (id == IDC_SET_TRANSLATE_MODE) {
+                ds->dash->translateMode =
+                    (SendMessageW(ds->chkTranslateMode, BM_GETCHECK, 0, 0) == BST_CHECKED) ? "auto" : "off";
+                SaveShellConfig(ds->dash);
+                RefreshTaskQueueData(ds->dash, true);
                 return 0;
             }
             if ((id == IDC_SET_PROC_FONT || id == IDC_SET_TASK_FONT) && HIWORD(wParam) == CBN_SELCHANGE) {
