@@ -3565,14 +3565,14 @@ void PrintCliUsageJson() {
         "On failure read bt_get {id, compact: true}; fix the cause (bt_update changes a non-running node's definition) and call bt_retry {id, from}."
       ],
       "nodes": {
-        "leaves": "job {command, summary, timeoutSec, success, capture}, worker {prompt, summary, timeoutSec, engine, model, outputSchema}, wait {sec}, set {var, value}, escalate {question, guidance, expect, include, timeoutSec, fallback {afterSec, engine, model}}, fail, succeed",
+        "leaves": "job {command, summary, timeoutSec, success, capture, blame}, worker {prompt, summary, timeoutSec, engine, model, engines, switchEngineOn, switchLimits, onSwitch, outputSchema}, wait {sec}, set {var, value}, escalate {question, guidance, expect, include, timeoutSec, fallback {afterSec, engine, model}}, fail, succeed",
         "composites": "sequence, fallback (selector), parallel {success: all|any|n}, if {cond, then, else}",
         "decorators": "retry {max}, repeat {max, until}, invert, forceSuccess, forceFailure, timeout {sec}",
         "conditions": "fileExists, fileNewer, outputMatches, exitCode, jsonValue, var, nodeState"
       },
       "variables": "${name} expands BT vars; in command it is quoted as one argument. Node variables: ${<id>.state|exitCode|logFile|jobId|runs}, ${<worker>.result} (final response), ${<worker>.output.<path>} (JSON the worker wrote to PC_BT_RESULT_FILE), ${<escalate>.answer}.",
       "remaining": "bt_get/bt_list return pendingEstimateSec (estimated work in job/worker leaves that have not started on the current branch) and plannedTasks (node, type, summary, taskqueue, estimateSec). The desktop dashboard, CLI, Web UI and MCP list them as provisional planned rows and add their estimates to the task remaining time, under a virtual task-group row (id 'group:<id>') for the BT root. They are re-derived on every query, so retry/fallback/if branch changes and completion drop stale rows.",
-      "engines": "Workers name an engine (claude, agy, opencode, codex, or ones in <data dir>/engines.json) and optionally a model; permission flags live only in the engine definition. An engine may also set adapter (a Tier 1/3 file in <data dir>/adapters/) and capabilities (jsonStream, resume, reportsUsage, reportsSubagents, permissionModes).",
+      "engines": "Workers name an engine (claude, agy, opencode, codex, or ones in <data dir>/engines.json) and optionally a model; permission flags live only in the engine definition. An engine may also set adapter (a Tier 1/3 file in <data dir>/adapters/) and capabilities (jsonStream, resume, reportsUsage, reportsSubagents, permissionModes). Use engines + switchEngineOn ([{class, after}]) with job.blame to switch models on repeated fix failures, bounded by switchLimits ({maxCandidates, maxSec, stopOnSameSymptom}).",
       "limits": "retry/repeat max <= 100 (required); limits.maxNodeRuns default 200; limits.maxWallSec default 86400; depth 32; 1000 nodes.",
       "rules": [
         "Write intent (the goal) and, on escalate, question + guidance for your future self.",

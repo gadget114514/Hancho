@@ -479,6 +479,10 @@ void BtManager::PersistEntryLocked(TreeEntry& entry) {
                 tqm_.TaskLog(entry.tree->TaskId(), ev.type == "btStarted" ? "bt_started" : "bt_finished",
                              "", entry.tree->Id(), ev.state, "");
             }
+            if (!entry.tree->TaskId().empty() && ev.type == "engineSwitched") {
+                tqm_.TaskLog(entry.tree->TaskId(), "engine_switched", "", entry.tree->Id(),
+                             ev.detail, "");
+            }
 
             std::string line = ej.dump();
             AppendToLogFileWide(evFileW, line + "\r\n");

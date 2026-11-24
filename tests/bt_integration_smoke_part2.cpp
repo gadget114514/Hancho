@@ -417,6 +417,124 @@ void RunPart2IntegrationTests(const std::wstring& tempDirW, const std::string& t
               rootNode["handlers"][0]["do"].value("id", "") == "fix",
               "091-2: bt_get tree keeps catch handlers with their do nodes");
     }
+
+    // 101-3: End-to-end blame attribution through BtManager + TaskQueueManager.
+    {
+        TestHarness h;
+        std::wstring countBatW = tempDirW + L"\\blame_test_cmd.bat";
+        std::wstring flag1W = tempDirW + L"\\blame_run1.flag";
+        std::wstring flag2W = tempDirW + L"\\blame_run2.flag";
+        DeleteFileW(flag1W.c_str());
+        DeleteFileW(flag2W.c_str());
+        std::string countBat =
+            "@echo off\r\n"
+            "if not exist blame_run1.flag (\r\n"
+            "    echo ok > blame_run1.flag\r\n"
+            "    echo [FAIL] integration_case_1\r\n"
+            "    exit /b 1\r\n"
+            ")\r\n"
+            "if not exist blame_run2.flag (\r\n"
+            "    echo ok > blame_run2.flag\r\n"
+            "    echo [FAIL] integration_case_1\r\n"
+            "    exit /b 1\r\n"
+            ")\r\n"
+            "echo [PASS] integration_case_1\r\n"
+            "exit /b 0\r\n";
+        WriteFileAtomicWide(countBatW, countBat);
+
+        json btDef = {
+            {"id", "bt-blame-int"},
+            {"cwd", tempDirUtf8},
+            {"root", {
+                {"type", "retry"},
+                {"max", 4},
+                {"child", {
+                    {"type", "sequence"},
+                    {"children", json::array({
+                        {{"type", "worker"}, {"id", "impl"}, {"engine", "test-worker"},
+                         {"summary", "Mock worker"}, {"prompt", "Fix it"}, {"timeoutSec", 30}},
+                        {{"type", "job"}, {"id", "check"}, {"summary", "Run check"},
+                         {"command", QuoteCommandArg(WideToUtf8(countBatW))},
+                         {"timeoutSec", 30}, {"blame", "impl"}}
+                    })}
+                }}
+            }}
+        };
+        h.btm->Start(btDef.dump());
+        json waitResp = json::parse(h.btm->Wait("bt-blame-int", 0, 20000), nullptr, false);
+        Check(waitResp.value("state", "") == "succeeded",
+              "101-3: blame integration tree succeeded after retries (got " + waitResp.value("state", "") + ")");
+        json getResp = json::parse(h.btm->Get("bt-blame-int", false), nullptr, false);
+        const auto& implSt = getResp["tree"]["root"]["child"]["children"][0]["status"];
+        Check(implSt.contains("switchFailCounts") &&
+              implSt["switchFailCounts"].value("fix_failed", 0) == 1 &&
+              implSt["switchFailCounts"].value("fix_no_progress", 0) == 1 &&
+              implSt.contains("recentFailSignatures") &&
+              implSt["recentFailSignatures"].size() == 2,
+              "101-3: BtManager + TaskQueueManager recorded fix_failed, fix_no_progress, and recentFailSignatures on blamed worker");
+    }
+
+    // 101-4: Task-attached BT logs engine_switched to TaskLog on switch.
+    {
+        std::wstring workerBatW = tempDirW + L"\\mock_worker.bat";
+        std::string workerCmd = QuoteCommandArg(WideToUtf8(workerBatW)) + " --model {model} --prompt {prompt}";
+        json enginesJson = {
+            {"default", "test-worker"},
+            {"engines", {
+                {"test-worker", {
+                    {"command", workerCmd},
+                    {"models", json::array({"test-m1", "test-m2"})},
+                    {"defaultModel", "test-m1"}
+                }}
+            }}
+        };
+        WriteFileAtomicWide(tempDirW + L"\\engines.json", enginesJson.dump(2));
+
+        TestHarness h;
+        std::string taskErr;
+        json taskCreateResp = json::parse(
+            h.tqm.TaskCreate("Switch log task", "Verify engine_switched task log", "", "", taskErr),
+            nullptr, false);
+        std::string taskId = taskCreateResp.is_object() ? taskCreateResp.value("id", "") : "";
+        Check(taskCreateResp.is_object() && taskCreateResp.value("ok", false) && !taskId.empty(),
+              "101-4: TaskCreate succeeded: " + taskErr);
+
+        json btDef = {
+            {"id", "bt-switch-tasklog"},
+            {"taskId", taskId},
+            {"cwd", tempDirUtf8},
+            {"root", {
+                {"type", "job"},
+                {"id", "switch_job"},
+                {"summary", "Switch job"},
+                {"command", "cmd.exe /c if \"{model}\"==\"test-m1\" (exit 1) else (exit 0)"},
+                {"timeoutSec", 30},
+                {"engines", json::array({
+                    {{"engine", "test-worker"}, {"model", "test-m1"}},
+                    {{"engine", "test-worker"}, {"model", "test-m2"}}
+                })},
+                {"switchEngineOn", json::array({"exit_nonzero"})}
+            }}
+        };
+        h.btm->Start(btDef.dump());
+        json waitResp = json::parse(h.btm->Wait("bt-switch-tasklog", 0, 15000), nullptr, false);
+        Check(waitResp.value("state", "") == "succeeded",
+              "101-4: bt-switch-tasklog succeeded after switch (got " + waitResp.value("state", "") + ")");
+
+        std::string showErr;
+        json taskShown = json::parse(h.tqm.TaskShow(taskId, 50, showErr), nullptr, false);
+        bool hasSwitchedLog = false;
+        if (taskShown.contains("log") && taskShown["log"].is_array()) {
+            for (const auto& entry : taskShown["log"]) {
+                if (entry.value("kind", "") == "engine_switched" &&
+                    entry.value("bt", "") == "bt-switch-tasklog" &&
+                    entry.value("text", "").find("test-worker/test-m1 -> test-worker/test-m2") != std::string::npos) {
+                    hasSwitchedLog = true;
+                }
+            }
+        }
+        Check(hasSwitchedLog, "101-4: TaskLog recorded engine_switched entry on task");
+    }
 }
 
 } // namespace bt_int_test

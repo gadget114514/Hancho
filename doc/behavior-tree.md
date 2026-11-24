@@ -293,6 +293,21 @@ hancho-cli permit revoke <id> --reason "no longer needed"
 
 MCP tools: `permit_list` (`scope`), `permit_request` (`kind`, `target`, `reason`, optional `engine`/`engines`/`scope`), `permit_approve` (`id`, `userSaid`), `permit_revoke` (`id`, `reason`). The dashboard also has an LLM page and a Permits page for approval.
 
+### 5.5 Switching on fix failure
+
+Beyond startup/environment errors, a `worker` can switch to the next engine candidate when repeated fix attempts stall:
+
+- **Thresholded rules (`after`)**: `switchEngineOn` accepts `{"class": "<class>", "after": <n>}` (`after` in `1..10`, default `1`; plain strings mean `after: 1`). Counts are tracked per candidate per failure class and reset to `0` on switch. Failures below `after` fail the node normally so an outer `retry` / `catch` re-runs the same candidate. Environmental classes (`resource_conflict`, `permission_denied`, `rate_limited`, `provider_down`, `auth_error`) are not counted as fix failures.
+- **Attributing test failures (`blame`)**: A `job` node can set `"blame": "<worker id>"` (referencing a `worker` node in the same tree). When that job fails (excluding environmental classes), Hancho builds a sorted failure signature from `success.testReport` or `failLineRegex` (default `^\[FAIL\].*`) in `success.contentFile`/log, compares it with the worker's `recentFailSignatures` (up to 3), and classifies it as:
+  - `fix_no_progress`: same signature as the previous attempt,
+  - `fix_oscillating`: matches any of the last 3 signatures,
+  - `fix_failed`: a different, non-matching signature (or empty).
+  If the blamed worker's `switchEngineOn` threshold is met, its candidate advances for the next run.
+- **Self-reporting (`root_cause_not_found`)**: Printing `HANCHO-RESULT: root_cause_not_found` at the start of a line classifies the attempt as `root_cause_not_found`.
+- **Handoff (`handoff`)**: If `PC_BT_RESULT_FILE` contains `"handoff": {"suspected": "...", "tried": "...", "ruledOut": "..."}` (each value capped at 2000 bytes), Hancho records it on the attempt. On a same-candidate retry, it is appended to the prompt as `Your previous attempt noted:`. After a switch, prior failed attempts (engine/model, class, top 10 failed tests, and handoff, capped at 6000 bytes) are appended as `Previous attempts by other models (do not repeat what did not work):`. If the tree has a `taskId`, switches also append an `engine_switched` entry to the task log.
+- **Stop limits (`switchLimits`)**: On `worker` or `defaults.worker`, `{"maxCandidates": 3, "maxSec": 0, "stopOnSameSymptom": true}` stops further switching when the candidate count reaches `maxCandidates`, elapsed node time exceeds `maxSec` (`> 0`), or the current candidate's last `failSignature` matches the previous candidate's (`stopOnSameSymptom`). Stopping emits `engineSwitchStopped` (`max_candidates` / `max_sec` / `same_symptom`) and falls through to `catch` / `escalate`, whose packet includes `engineAttempts` (shared failing tests, per-candidate handoffs, and `"likelyNotModel": true` on `same_symptom`).
+- **Previous changes (`onSwitch`)**: `"onSwitch": "keep"` (default) keeps the previous candidate's edits; `"revert"` emits warning `on_switch_revert_unsupported` and behaves as `"keep"`.
+
 ---
 
 ## 6. Limits
@@ -550,6 +565,9 @@ An LLM worker can silently stall for an hour (no events, no output) before a pla
 | `escalate_without_takeover` | `expect` has no `takeover` |
 | `permit_not_approved` | a declared `needs` entry is not approved |
 | `permit_invalid` | a `needs` entry is malformed |
+| `blame_before_worker` | a `job` with `blame` appears before the blamed `worker` in execution order |
+| `fix_class_without_blame` | a `worker` has `fix_*` in `switchEngineOn` but no `job` blames it |
+| `on_switch_revert_unsupported` | `onSwitch` is set to `"revert"` (not yet supported; treated as `"keep"`) |
 
 ```powershell
 hancho-cli bt validate --file plan.json --json          # {"ok":true,"valid":true,"warnings":[...]}

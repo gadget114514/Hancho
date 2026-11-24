@@ -160,6 +160,18 @@ struct BtLimits {
     int maxWallSec = 86400;
 };
 
+struct BtSwitchRule {
+    std::string failureClass;
+    int after = 1;
+};
+
+struct BtSwitchLimits {
+    int maxCandidates = 3;
+    int maxSec = 0;
+    bool stopOnSameSymptom = true;
+    bool configured = false;
+};
+
 struct BtWorkerDefaults {
     std::string engine;
     std::string model;
@@ -173,6 +185,8 @@ struct BtDefaults {
     int workerMaxAttempts = 0;     // 0 = not specified
     bool workerProbe = false;
     bool hasWorkerProbe = false;
+    std::vector<BtSwitchRule> workerSwitchEngineOn;
+    BtSwitchLimits workerSwitchLimits;
     BtJobIdle jobIdle;
 
     bool hasWorkerIdle() const { return workerIdle.configured; }

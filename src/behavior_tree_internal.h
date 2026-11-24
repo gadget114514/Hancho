@@ -67,6 +67,8 @@ struct BtEngineAttempt {
     std::string detail;
     std::string list;          // "worker" — the LLM list the choice came from
     std::string entry;         // compact description of the approving list row
+    json handoff;              // optional {"suspected","tried","ruledOut"} from PC_BT_RESULT_FILE
+    std::vector<std::string> failSignature; // populated in 101-3
 };
 
 struct BtNode {
@@ -117,9 +119,18 @@ struct BtNode {
     // non-empty the node runs the first usable candidate and advances on a failure class
     // listed in `switchEngineOn`. `engine` / `model` may not be combined with `engines`.
     std::vector<BtEngineChoice> engineCandidates;
-    std::vector<std::string> switchEngineOn;
+    std::vector<BtSwitchRule> switchEngineOn;
+    BtSwitchLimits switchLimits;
+    std::map<std::string, int> switchFailCounts;
     int engineCandidateIndex = 0;
     std::vector<BtEngineAttempt> engineAttempts;
+    json lastHandoff;          // handoff from the most recent worker attempt (101-2, used in 101-4)
+    std::string onSwitch = "keep"; // "keep" (default) or "revert" (warned as unsupported, 101-4)
+    std::string blame;         // job node: worker id to blame on failure (101-3)
+    std::string failLineRegex; // job node: regex for fail signature lines (101-3)
+    std::vector<std::vector<std::string>> recentFailSignatures; // worker: last 3 signatures for current candidate (101-3)
+    int64_t firstStartMs = 0;  // epoch ms of first worker launch on this node (101-5, for switchLimits.maxSec)
+    std::string switchStoppedReason; // "max_candidates", "max_sec", or "same_symptom" (101-5)
     int probeTimeoutSec = 60;
     // 091-6: a worker whose engine is down waits for recovery instead of failing.
     bool waitingForEngine = false;
@@ -243,6 +254,9 @@ struct RunningJobInfo {
     BtNode* node = nullptr;
     bool isFallback = false;
     bool isWorker = false;
+    std::string effectiveCwd;
+    std::string expandedTestReport;
+    std::string expandedContentFile;
 };
 
 struct BehaviorTree::Impl {
@@ -296,7 +310,12 @@ struct BehaviorTree::Impl {
     // Advances a worker node to its next engine candidate when `failureClass` is switchable.
     // Records the attempt, emits `engineSwitched` and resets the node to idle for relaunch.
     bool TrySwitchEngine(BehaviorTree& bt, BtNode& node, const std::string& failureClass,
-                         const std::string& detail, int64_t nowMs);
+                         const std::string& detail, int64_t nowMs,
+                         const json& handoff = json());
+    bool AdvanceEngineCandidate(BehaviorTree& bt, BtNode& node, const std::string& failureClass,
+                                const std::string& detail, int64_t nowMs,
+                                const json& handoff, const std::vector<std::string>& failSignature,
+                                bool relaunch);
     bool ShouldSwitchEngine(const BtNode& node, const std::string& failureClass) const;
     // 091-6: hold a leaf while its engine is down instead of failing it.
     bool HoldForEngine(BehaviorTree& bt, BtNode& node, const std::string& engine,

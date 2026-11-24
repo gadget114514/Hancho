@@ -35,16 +35,37 @@ inline const char* const kResilientWorkerTemplate = R"JSON({
     "type": "catch",
     "id": "impl_guard",
     "child": {
-      "type": "worker",
-      "id": "impl",
-      "summary": "<task summary>",
-       "prompt": "Stay inside the project (cwd): do not read or write files outside it. If the task requires one, add it to needs and request a permit instead. <worker prompt>",
-      "timeoutSec": 5400,
-      "engines": [
-        { "engine": "opencode", "model": "<primary-model>" },
-        { "engine": "agy", "model": "<backup-model>" }
-      ],
-      "switchEngineOn": ["startup_hang", "auth_error", "probe_failed"]
+      "type": "sequence",
+      "id": "impl_and_test",
+      "children": [
+        {
+          "type": "worker",
+          "id": "impl",
+          "summary": "<task summary>",
+          "prompt": "Stay inside the project (cwd): do not read or write files outside it. If the task requires one, add it to needs and request a permit instead. If you cannot find the root cause, print 'HANCHO-RESULT: root_cause_not_found' on its own line, write a 'handoff' object ({suspected, tried, ruledOut}) to PC_BT_RESULT_FILE, and exit non-zero. <worker prompt>",
+          "timeoutSec": 5400,
+          "engines": [
+            { "engine": "opencode", "model": "<primary-model>" },
+            { "engine": "agy", "model": "<backup-model>" }
+          ],
+          "switchEngineOn": [
+            "startup_hang",
+            "auth_error",
+            "probe_failed",
+            { "class": "fix_no_progress", "after": 1 },
+            { "class": "fix_failed", "after": 2 },
+            { "class": "root_cause_not_found", "after": 1 }
+          ]
+        },
+        {
+          "type": "job",
+          "id": "test",
+          "summary": "Run tests",
+          "command": "<test command>",
+          "timeoutSec": 900,
+          "blame": "impl"
+        }
+      ]
     },
     "handlers": [
       {
@@ -103,7 +124,14 @@ inline const char* const kCardSequenceTemplate = R"JSON({
             { "engine": "opencode", "model": "<primary-model>" },
             { "engine": "agy", "model": "<backup-model>" }
           ],
-          "switchEngineOn": ["startup_hang", "auth_error", "probe_failed"]
+          "switchEngineOn": [
+            "startup_hang",
+            "auth_error",
+            "probe_failed",
+            { "class": "fix_no_progress", "after": 1 },
+            { "class": "fix_failed", "after": 2 },
+            { "class": "root_cause_not_found", "after": 1 }
+          ]
         },
         "handlers": [
           {
@@ -149,7 +177,14 @@ inline const char* const kCardSequenceTemplate = R"JSON({
             { "engine": "opencode", "model": "<primary-model>" },
             { "engine": "agy", "model": "<backup-model>" }
           ],
-          "switchEngineOn": ["startup_hang", "auth_error", "probe_failed"]
+          "switchEngineOn": [
+            "startup_hang",
+            "auth_error",
+            "probe_failed",
+            { "class": "fix_no_progress", "after": 1 },
+            { "class": "fix_failed", "after": 2 },
+            { "class": "root_cause_not_found", "after": 1 }
+          ]
         },
         "handlers": [
           {

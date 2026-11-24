@@ -574,6 +574,24 @@ int main() {
         Check(ClassifyTaskQueueFailure(other).failureClass == "permission_denied",
               "design's rejection wording is recognized");
 
+        // 101-2: HANCHO-RESULT: root_cause_not_found at line start only.
+        TaskQueueFailureInput rcnf = base();
+        rcnf.endKind = "failed";
+        rcnf.exitCode = 1;
+        rcnf.logText = "investigating...\nHANCHO-RESULT: root_cause_not_found\n";
+        auto rcnfDiag = ClassifyTaskQueueFailure(rcnf);
+        Check(rcnfDiag.failureClass == "root_cause_not_found",
+              "101-2: marker line classifies as root_cause_not_found");
+        Check(rcnfDiag.confidence == "high" && rcnfDiag.suggestedAction == "retry",
+              "101-2: root_cause_not_found has high confidence and retry action");
+
+        TaskQueueFailureInput rcnfJson = base();
+        rcnfJson.endKind = "failed";
+        rcnfJson.exitCode = 1;
+        rcnfJson.logText = R"({"type":"assistant","text":"HANCHO-RESULT: root_cause_not_found"})" "\n";
+        Check(ClassifyTaskQueueFailure(rcnfJson).failureClass == "exit_nonzero",
+              "101-2: marker inside JSON string does not trigger root_cause_not_found");
+
         // 091-7 (5)/(6): the pure hold/resume decision.
         Check(PlanPermissionHandling(d, "sess-1", 0, 2, "q", "").resume,
               "first denial resumes the same session");

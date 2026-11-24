@@ -2,6 +2,7 @@
 #include "common.h"
 
 #include <algorithm>
+#include <iterator>
 #include <sstream>
 
 namespace pc {
@@ -27,6 +28,10 @@ bool FindPathToNode(const BtNode* cur, const BtNode* target, std::vector<const B
     if (FindPathToNode(cur->elseChild.get(), target, path)) return true;
     if (FindPathToNode(cur->singleChild.get(), target, path)) return true;
     if (FindPathToNode(cur->untilChild.get(), target, path)) return true;
+    if (FindPathToNode(cur->otherwiseChild.get(), target, path)) return true;
+    for (const auto& h : cur->catchHandlers) {
+        if (FindPathToNode(h.doNode.get(), target, path)) return true;
+    }
     path.pop_back();
     return false;
 }
@@ -40,6 +45,10 @@ void CollectVisitedNodes(const BtNode* cur, std::vector<const BtNode*>& out) {
     CollectVisitedNodes(cur->elseChild.get(), out);
     CollectVisitedNodes(cur->singleChild.get(), out);
     CollectVisitedNodes(cur->untilChild.get(), out);
+    CollectVisitedNodes(cur->otherwiseChild.get(), out);
+    for (const auto& h : cur->catchHandlers) {
+        CollectVisitedNodes(h.doNode.get(), out);
+    }
 }
 
 const BtNode* FindActiveEscalation(const BtNode* cur, const std::string& nodeKey, const std::string& btId) {
@@ -60,6 +69,10 @@ const BtNode* FindActiveEscalation(const BtNode* cur, const std::string& nodeKey
     if (const BtNode* f = FindActiveEscalation(cur->elseChild.get(), nodeKey, btId)) return f;
     if (const BtNode* f = FindActiveEscalation(cur->singleChild.get(), nodeKey, btId)) return f;
     if (const BtNode* f = FindActiveEscalation(cur->untilChild.get(), nodeKey, btId)) return f;
+    if (const BtNode* f = FindActiveEscalation(cur->otherwiseChild.get(), nodeKey, btId)) return f;
+    for (const auto& h : cur->catchHandlers) {
+        if (const BtNode* f = FindActiveEscalation(h.doNode.get(), nodeKey, btId)) return f;
+    }
     return nullptr;
 }
 
@@ -166,6 +179,83 @@ void BehaviorTree::Impl::StartEscalateNode(BehaviorTree& bt, BtNode& node, int64
     json allVarsObj = json::object();
     for (const auto& [k, v] : bt.vars_) allVarsObj[k] = BtVarPreview(v);
 
+    // 101-5: attach the immediately preceding failed worker's engineAttempts, common failed
+    // tests (intersection of non-empty failSignatures across candidates), and likelyNotModel.
+    const BtNode* failedWorker = nullptr;
+    for (auto it = visitedNodes.rbegin(); it != visitedNodes.rend(); ++it) {
+        const BtNode* pn = *it;
+        if (pn->type == "worker" && pn->state == "failed" &&
+            (!pn->engineAttempts.empty() || !pn->switchStoppedReason.empty())) {
+            failedWorker = pn;
+            break;
+        }
+        if (pn->type == "job" && pn->state == "failed" && !pn->blame.empty()) {
+            const BtNode* blamed = FindNodeConst(pn->blame, bt.id_);
+            if (blamed && blamed->type == "worker" &&
+                (!blamed->engineAttempts.empty() || !blamed->switchStoppedReason.empty())) {
+                failedWorker = blamed;
+                break;
+            }
+        }
+    }
+    if (!failedWorker) {
+        for (auto it = visitedNodes.rbegin(); it != visitedNodes.rend(); ++it) {
+            const BtNode* pn = *it;
+            if (pn->type == "worker" &&
+                (!pn->engineAttempts.empty() || !pn->switchStoppedReason.empty())) {
+                failedWorker = pn;
+                break;
+            }
+        }
+    }
+
+    json engineAttemptsObj;
+    if (failedWorker) {
+        json attArr = json::array();
+        std::map<std::string, std::vector<std::string>> candSigs;
+        for (const auto& a : failedWorker->engineAttempts) {
+            json aj{{"engine", a.engine}, {"model", a.model}, {"result", a.result}};
+            if (!a.failureClass.empty()) aj["failureClass"] = a.failureClass;
+            if (!a.detail.empty()) aj["detail"] = a.detail;
+            if (a.handoff.is_object() && !a.handoff.empty()) aj["handoff"] = a.handoff;
+            if (!a.failSignature.empty()) {
+                aj["failSignature"] = a.failSignature;
+                if (a.result != "skipped") {
+                    candSigs[a.engine + "/" + a.model] = a.failSignature;
+                }
+            }
+            attArr.push_back(std::move(aj));
+        }
+        std::vector<std::string> commonTests;
+        if (!candSigs.empty()) {
+            auto cit = candSigs.begin();
+            commonTests = cit->second;
+            std::sort(commonTests.begin(), commonTests.end());
+            commonTests.erase(std::unique(commonTests.begin(), commonTests.end()), commonTests.end());
+            for (++cit; cit != candSigs.end() && !commonTests.empty(); ++cit) {
+                std::vector<std::string> rhs = cit->second;
+                std::sort(rhs.begin(), rhs.end());
+                rhs.erase(std::unique(rhs.begin(), rhs.end()), rhs.end());
+                std::vector<std::string> inter;
+                std::set_intersection(commonTests.begin(), commonTests.end(),
+                                      rhs.begin(), rhs.end(),
+                                      std::back_inserter(inter));
+                commonTests = std::move(inter);
+            }
+        }
+        engineAttemptsObj = json{
+            {"node", failedWorker->nodeKey},
+            {"attempts", std::move(attArr)},
+            {"commonFailedTests", commonTests}
+        };
+        if (!failedWorker->switchStoppedReason.empty()) {
+            engineAttemptsObj["stoppedReason"] = failedWorker->switchStoppedReason;
+        }
+        if (failedWorker->switchStoppedReason == "same_symptom") {
+            engineAttemptsObj["likelyNotModel"] = true;
+        }
+    }
+
     json pktJson;
     pktJson["btId"] = pkt.btId;
     pktJson["node"] = pkt.nodeKey;
@@ -182,6 +272,9 @@ void BehaviorTree::Impl::StartEscalateNode(BehaviorTree& bt, BtNode& node, int64
         {"files", filesObj}
     };
     pktJson["vars"] = allVarsObj;
+    if (engineAttemptsObj.is_object()) {
+        pktJson["engineAttempts"] = engineAttemptsObj;
+    }
     pktJson["howToAnswer"] = {
         {"tool", "bt_resume"},
         {"bt", pkt.btId},
@@ -232,6 +325,30 @@ void BehaviorTree::Impl::StartEscalateNode(BehaviorTree& bt, BtNode& node, int64
         md << "## Variables\n";
         for (auto it = allVarsObj.begin(); it != allVarsObj.end(); ++it) {
             md << "- `" << it.key() << "` = `" << it.value().get<std::string>() << "`\n";
+        }
+        md << "\n";
+    }
+    if (engineAttemptsObj.is_object()) {
+        md << "## Engine Attempts (`" << failedWorker->nodeKey << "`)\n";
+        if (engineAttemptsObj.contains("stoppedReason")) {
+            md << "- Stopped reason: `" << engineAttemptsObj["stoppedReason"].get<std::string>() << "`\n";
+        }
+        if (engineAttemptsObj.value("likelyNotModel", false)) {
+            md << "- `likelyNotModel`: `true`\n";
+        }
+        if (engineAttemptsObj.contains("commonFailedTests") && !engineAttemptsObj["commonFailedTests"].empty()) {
+            md << "- Common failed tests:";
+            for (const auto& t : engineAttemptsObj["commonFailedTests"]) {
+                md << " `" << t.get<std::string>() << "`";
+            }
+            md << "\n";
+        }
+        for (const auto& aj : engineAttemptsObj["attempts"]) {
+            md << "- `" << aj.value("engine", "") << "/" << aj.value("model", "") << "` ("
+               << aj.value("result", "") << ")";
+            if (aj.contains("failureClass")) md << " [" << aj["failureClass"].get<std::string>() << "]";
+            if (aj.contains("handoff")) md << " handoff=" << aj["handoff"].dump();
+            md << "\n";
         }
         md << "\n";
     }

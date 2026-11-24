@@ -1242,6 +1242,8 @@ TaskQueueFailureDiagnostic ClassifyTaskQueueFailure(const TaskQueueFailureInput&
     static const char* kTurnPattern =
         "(max_turns|maximum number of turns|turn limit|context length|context window|maximum context|"
         "prompt is too long|too many tokens|token limit)";
+    static const char* kRootCauseNotFoundPattern =
+        "^HANCHO-RESULT:[ \\t]*root_cause_not_found([ \\t]|$)";
 
     TaskQueueFailureDiagnostic d;
     d.detail = nlohmann::json::object();
@@ -1630,6 +1632,22 @@ TaskQueueFailureDiagnostic ClassifyTaskQueueFailure(const TaskQueueFailureInput&
         d.suggestedAction = "human";
         EnsureEvidence(d, in);
         return d;
+    }
+
+    // 12.5 root_cause_not_found: worker self-reported it could not find the root cause (line start only).
+    {
+        int line = FindLogLineRegex(in, kRootCauseNotFoundPattern);
+        if (line > 0) {
+            d.failureClass = "root_cause_not_found";
+            d.confidence = "high";
+            d.summary = "The worker reported that the root cause was not found.";
+            d.detail["rule"] = "builtin.root_cause_not_found";
+            d.detail["source"] = "log";
+            d.suggestedAction = "retry";
+            AddLogEvidence(d, in.logFile, line);
+            EnsureEvidence(d, in);
+            return d;
+        }
     }
 
     // 13. incomplete: the agent ended normally but left TODOs and did not satisfy the checks.

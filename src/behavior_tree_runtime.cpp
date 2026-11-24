@@ -2,10 +2,200 @@
 #include "common.h"
 
 #include <algorithm>
+#include <cctype>
+#include <regex>
+#include <sstream>
 
 namespace pc {
 
 namespace {
+
+std::string TruncateUtf8Bytes(std::string s, size_t maxBytes) {
+    if (s.size() <= maxBytes) return s;
+    size_t n = maxBytes;
+    while (n > 0 && (static_cast<unsigned char>(s[n]) & 0xC0) == 0x80) n--;
+    s.resize(n);
+    return s;
+}
+
+std::string XmlAttrValue(const std::string& tag, const std::string& name) {
+    size_t pos = 0;
+    while ((pos = tag.find(name, pos)) != std::string::npos) {
+        const bool startOk = pos > 0 && std::isspace(static_cast<unsigned char>(tag[pos - 1]));
+        size_t eq = pos + name.size();
+        while (eq < tag.size() && std::isspace(static_cast<unsigned char>(tag[eq]))) ++eq;
+        if (!startOk || eq >= tag.size() || tag[eq] != '=') { pos += name.size(); continue; }
+        size_t q = eq + 1;
+        while (q < tag.size() && std::isspace(static_cast<unsigned char>(tag[q]))) ++q;
+        if (q >= tag.size() || (tag[q] != '"' && tag[q] != '\'')) return "";
+        size_t end = tag.find(tag[q], q + 1);
+        if (end == std::string::npos) return "";
+        std::string v = tag.substr(q + 1, end - q - 1);
+        auto replaceAll = [&](const std::string& from, const std::string& to) {
+            size_t p = 0;
+            while ((p = v.find(from, p)) != std::string::npos) {
+                v.replace(p, from.size(), to);
+                p += to.size();
+            }
+        };
+        replaceAll("&lt;", "<");
+        replaceAll("&gt;", ">");
+        replaceAll("&quot;", "\"");
+        replaceAll("&apos;", "'");
+        replaceAll("&amp;", "&");
+        return v;
+    }
+    return "";
+}
+
+std::vector<std::string> ExtractFailedTestNamesFromXml(const std::string& xml) {
+    std::vector<std::string> out;
+    size_t pos = 0;
+    bool inCase = false;
+    bool caseFailed = false;
+    std::string caseName;
+    auto closeCase = [&]() {
+        if (!inCase) return;
+        if (caseFailed) out.push_back(caseName.empty() ? "(unnamed)" : caseName);
+        inCase = false;
+    };
+    while ((pos = xml.find('<', pos)) != std::string::npos) {
+        size_t end = xml.find('>', pos);
+        if (end == std::string::npos) break;
+        std::string tag = xml.substr(pos + 1, end - pos - 1);
+        pos = end + 1;
+        if (tag.empty() || tag[0] == '?' || tag[0] == '!') continue;
+        size_t n = 0;
+        while (n < tag.size() && !std::isspace(static_cast<unsigned char>(tag[n])) && tag[n] != '/') ++n;
+        std::string name = tag.substr(0, n);
+        const bool selfClosing = !tag.empty() && tag.back() == '/';
+        if (name == "testcase") {
+            closeCase();
+            std::string cls = XmlAttrValue(tag, "classname");
+            std::string nm = XmlAttrValue(tag, "name");
+            caseName = cls.empty() ? nm : (cls + "." + nm);
+            inCase = true;
+            caseFailed = false;
+            if (selfClosing) closeCase();
+        } else if (name == "/testcase") {
+            closeCase();
+        } else if (inCase && (name == "failure" || name == "error")) {
+            caseFailed = true;
+        } else if (name == "test-case") {
+            std::string full = XmlAttrValue(tag, "fullname");
+            if (full.empty()) full = XmlAttrValue(tag, "name");
+            std::string res = XmlAttrValue(tag, "result");
+            for (char& c : res) c = static_cast<char>(std::tolower(static_cast<unsigned char>(c)));
+            if (res == "failed" || res == "failure" || res == "error") {
+                out.push_back(full.empty() ? "(unnamed)" : full);
+            }
+        }
+    }
+    closeCase();
+    return out;
+}
+
+std::vector<std::string> BuildJobFailSignature(const BtNode& node,
+                                               const RunningJobInfo& info,
+                                               const std::string& btCwd,
+                                               const std::string& logFile,
+                                               const std::string& logTail) {
+    const std::string effCwd = !info.effectiveCwd.empty()
+        ? info.effectiveCwd
+        : (!node.cwd.empty() ? node.cwd : btCwd);
+    const std::string testReport = !info.expandedTestReport.empty()
+        ? info.expandedTestReport
+        : node.success.testReport;
+    const std::string contentFile = !info.expandedContentFile.empty()
+        ? info.expandedContentFile
+        : node.success.contentFile;
+
+    std::vector<std::string> sig;
+    if (!testReport.empty()) {
+        std::string xml = ReadFileUtf8Wide(ResolveBtPathWide(effCwd, testReport));
+        if (!xml.empty()) sig = ExtractFailedTestNamesFromXml(xml);
+    } else {
+        std::string text;
+        if (!contentFile.empty()) {
+            text = ReadFileUtf8Wide(ResolveBtPathWide(effCwd, contentFile));
+        } else {
+            if (!logFile.empty()) text = ReadFileUtf8Wide(Utf8ToWide(logFile));
+            if (text.empty()) text = logTail;
+        }
+        if (!text.empty()) {
+            const std::string pattern = node.failLineRegex.empty()
+                ? std::string("^\\[FAIL\\].*")
+                : node.failLineRegex;
+            try {
+                std::regex re(pattern);
+                std::istringstream iss(text);
+                std::string line;
+                while (std::getline(iss, line)) {
+                    if (!line.empty() && line.back() == '\r') line.pop_back();
+                    if (std::regex_search(line, re)) {
+                        sig.push_back(TruncateUtf8Bytes(std::move(line), 300));
+                        if (sig.size() >= 200) break;
+                    }
+                }
+            } catch (const std::regex_error&) {
+            }
+        }
+    }
+    std::sort(sig.begin(), sig.end());
+    sig.erase(std::unique(sig.begin(), sig.end()), sig.end());
+    return sig;
+}
+
+bool IsEnvFailureClass(const std::string& cls) {
+    return cls == "resource_conflict" || cls == "permission_denied" ||
+           cls == "rate_limited" || cls == "provider_down" || cls == "auth_error";
+}
+
+json ExtractWorkerHandoff(const std::string& resultJson) {
+    if (resultJson.empty()) return json();
+    json resParsed = json::parse(resultJson, nullptr, false);
+    if (!resParsed.is_object() || !resParsed.contains("handoff") || !resParsed["handoff"].is_object()) {
+        return json();
+    }
+    json out = json::object();
+    for (auto hit = resParsed["handoff"].begin(); hit != resParsed["handoff"].end(); ++hit) {
+        std::string val;
+        if (hit.value().is_string()) {
+            val = hit.value().get<std::string>();
+        } else if (!hit.value().is_null()) {
+            val = hit.value().dump();
+        } else {
+            continue;
+        }
+        if (val.size() > 2000) {
+            size_t n = 2000;
+            while (n > 0 && (static_cast<unsigned char>(val[n]) & 0xC0) == 0x80) n--;
+            val.resize(n);
+        }
+        out[hit.key()] = std::move(val);
+    }
+    return out.empty() ? json() : out;
+}
+
+void RecordWorkerAttempt(BtNode& node, const std::string& result,
+                         const std::string& failureClass, const std::string& detail,
+                         const json& handoff) {
+    if (node.engineCandidates.empty() && (!handoff.is_object() || handoff.empty())) return;
+    BtEngineAttempt attempt;
+    attempt.engine = node.lastEngine;
+    attempt.model = node.lastModel;
+    attempt.result = result;
+    attempt.failureClass = failureClass;
+    attempt.detail = detail;
+    if (!node.engineCandidates.empty() &&
+        node.engineCandidateIndex < static_cast<int>(node.engineCandidates.size())) {
+        const auto& c = node.engineCandidates[node.engineCandidateIndex];
+        attempt.list = c.list;
+        attempt.entry = c.entry;
+    }
+    if (handoff.is_object() && !handoff.empty()) attempt.handoff = handoff;
+    node.engineAttempts.push_back(std::move(attempt));
+}
 
 BtNode* FindDeepestFailedNode(BtNode* cur) {
     if (!cur || cur->state != "failed") return nullptr;
@@ -169,7 +359,11 @@ void BehaviorTree::Impl::CheckTimers(BehaviorTree& bt, BtNode& node, int64_t now
                 node.engineWaitUntilMs = 0;
                 node.state = "idle";
                 node.detail.clear();
-                if (!node.engineCandidates.empty()) node.engineCandidateIndex = 0;
+                if (!node.engineCandidates.empty()) {
+                    node.engineCandidateIndex = 0;
+                    node.switchFailCounts.clear();
+                    node.recentFailSignatures.clear();
+                }
                 bt.EmitEvent(nowMs, "engineRecovered", node.nodeKey, node.state,
                              "engine recovered: " + node.lastEngine + "/" + node.lastModel, node.runs);
             }
@@ -397,7 +591,14 @@ void BehaviorTree::OnJobFinished(const std::string& jobId,
 
     // Only worker nodes have a final response and a result file. For a plain job the runner's
     // fallback text is the process log, which must not become ${<id>.result}.
+    json workerHandoff;
     if (info.isWorker) {
+        workerHandoff = ExtractWorkerHandoff(resolvedResultJson);
+        if (workerHandoff.is_object() && !workerHandoff.empty()) {
+            node.lastHandoff = workerHandoff;
+        } else if (succeeded) {
+            node.lastHandoff = json();
+        }
         impl_->StoreWorkerOutputs(*this, node, finalResponse, resolvedResultJson, nowMs);
         if (info.isWorker && succeeded && !node.outputSchema.empty()) {
             std::string schemaErr;
@@ -407,6 +608,7 @@ void BehaviorTree::OnJobFinished(const std::string& jobId,
                 node.detail = schemaErr.empty() ? "outputInvalid"
                                                 : "outputInvalid: " + BtVarPreview(schemaErr);
                 impl_->ApplyFailureDiagnostic(*this, node, "", false, nowMs);
+                RecordWorkerAttempt(node, "failed", "outputInvalid", node.detail, workerHandoff);
                 EmitEvent(nowMs, "nodeFinished", node.nodeKey, node.state, node.detail, node.runs);
                 Tick(nowMs);
                 return;
@@ -429,6 +631,60 @@ void BehaviorTree::OnJobFinished(const std::string& jobId,
         failureClass = node.failureDiagnostic.value("class", std::string());
     }
 
+    // 101-3: a job node with `blame: "<worker id>"` attributes its non-environmental failure
+    // to the blamed worker node, classifies progress vs stall/oscillation, and advances the
+    // worker's engine candidate for its next run when `switchEngineOn` threshold is met.
+    if (!succeeded && !info.isWorker && !node.blame.empty() && !IsEnvFailureClass(failureClass)) {
+        BtNode* blamed = impl_->FindNode(node.blame, id_);
+        if (blamed && blamed->type == "worker") {
+            std::vector<std::string> sig = BuildJobFailSignature(node, info, cwd_, logFile, logTail);
+            std::string fixClass = "fix_failed";
+            if (!sig.empty() && !blamed->recentFailSignatures.empty()) {
+                if (blamed->recentFailSignatures.back() == sig) {
+                    fixClass = "fix_no_progress";
+                } else {
+                    for (const auto& prev : blamed->recentFailSignatures) {
+                        if (prev == sig) {
+                            fixClass = "fix_oscillating";
+                            break;
+                        }
+                    }
+                }
+            }
+            blamed->switchFailCounts[fixClass]++;
+            if (!sig.empty()) {
+                blamed->recentFailSignatures.push_back(sig);
+                if (blamed->recentFailSignatures.size() > 3) {
+                    blamed->recentFailSignatures.erase(blamed->recentFailSignatures.begin());
+                }
+            }
+            if (!blamed->engineAttempts.empty()) {
+                std::string curEng = blamed->lastEngine;
+                std::string curMod = blamed->lastModel;
+                if (!blamed->engineCandidates.empty() &&
+                    blamed->engineCandidateIndex < static_cast<int>(blamed->engineCandidates.size())) {
+                    curEng = blamed->engineCandidates[blamed->engineCandidateIndex].engine;
+                    curMod = blamed->engineCandidates[blamed->engineCandidateIndex].model;
+                }
+                auto& lastAtt = blamed->engineAttempts.back();
+                if (lastAtt.engine == curEng && lastAtt.model == curMod) {
+                    lastAtt.failSignature = sig;
+                }
+            }
+            if (!impl_->AdvanceEngineCandidate(*this, *blamed, fixClass, node.detail, nowMs,
+                                               json(), sig, false)) {
+                if (!blamed->switchStoppedReason.empty() &&
+                    node.detail.find(blamed->switchStoppedReason) == std::string::npos) {
+                    if (node.detail.empty()) {
+                        node.detail = "engineSwitchStopped: " + blamed->switchStoppedReason;
+                    } else {
+                        node.detail += " (engineSwitchStopped: " + blamed->switchStoppedReason + ")";
+                    }
+                }
+            }
+        }
+    }
+
     // 091-6: share the failure with the rest of Hancho so other jobs on this engine wait
     // instead of failing too, and the core can probe for recovery.
     if (!succeeded && !node.lastEngine.empty() && health_ && health_->IsDownWorthy(failureClass)) {
@@ -439,11 +695,19 @@ void BehaviorTree::OnJobFinished(const std::string& jobId,
     // Engine switching (091-3): a switchable failure on a worker with more approved
     // candidates is not terminal. Record the attempt, emit `engineSwitched`, and relaunch
     // the same node with the next candidate.
+    bool switched = false;
     if (!succeeded && !node.engineCandidates.empty()) {
-        if (impl_->TrySwitchEngine(*this, node, failureClass, node.detail, nowMs)) {
-            Tick(nowMs);
-            return;
-        }
+        switched = impl_->TrySwitchEngine(*this, node, failureClass, node.detail, nowMs, workerHandoff);
+    }
+    if (!switched && info.isWorker) {
+        RecordWorkerAttempt(node, succeeded ? "succeeded" : "failed",
+                            succeeded ? "" : failureClass,
+                            succeeded ? "" : node.detail,
+                            workerHandoff);
+    }
+    if (switched) {
+        Tick(nowMs);
+        return;
     }
 
     // No switchable candidate: keep the node waiting while the engine is down. The task

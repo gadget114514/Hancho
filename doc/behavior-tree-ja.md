@@ -290,6 +290,21 @@ hancho-cli permit revoke <id> --reason "no longer needed"
 
 MCP ツール: `permit_list` (`scope`)、`permit_request` (`kind`, `target`, `reason`、任意で `engine`/`engines`/`scope`)、`permit_approve` (`id`, `userSaid`)、`permit_revoke` (`id`, `reason`)。ダッシュボードにも LLM ページと権限 (Permits) ページがあり、そこで承認できます。
 
+### 5.5 修正失敗で切り替える
+
+起動失敗や環境エラーだけでなく、修正の行き詰まりを検知して次のモデル候補へ切り替えられます。
+
+- **回数付きの条件 (`after`)**: `switchEngineOn` の要素に `{"class": "<class>", "after": <n>}` (`after` は `1..10`、既定 `1`。文字列のみは `after: 1` と同じ) を書けます。失敗数は候補ごと・クラスごとに数え、切り替えると `0` に戻ります。`after` 未満の失敗は通常のノード失敗となり、外側の `retry` / `catch` が同じ候補で再実行します。環境系のクラス (`resource_conflict` / `permission_denied` / `rate_limited` / `provider_down` / `auth_error`) は修正失敗として数えません。
+- **テスト失敗の帰属 (`blame`)**: `job` ノードに `"blame": "<worker id>"` を書くと、そのジョブの失敗 (環境系クラスを除く) を指定した `worker` ノードの失敗として数えます。`success.testReport` または `success.contentFile`/ログの `failLineRegex` (既定 `^\[FAIL\].*`) から失敗署名を組み立て、worker の直近 3 件の署名 (`recentFailSignatures`) と比較して次のように分類します:
+  - `fix_no_progress`: 直前と同じ失敗署名
+  - `fix_oscillating`: 直近 3 回のいずれかと同じ署名に戻った
+  - `fix_failed`: それ以外の変化している失敗 (または空)
+  worker の `switchEngineOn` 条件を満たせば、次の実行で使う候補を先に進めます。
+- **自己申告 (`root_cause_not_found`)**: ワーカーが行頭に `HANCHO-RESULT: root_cause_not_found` を出力すると、失敗クラス `root_cause_not_found` が付きます。
+- **引き継ぎメモ (`handoff`)**: `PC_BT_RESULT_FILE` に `"handoff": {"suspected": "...", "tried": "...", "ruledOut": "..."}` (各値 2000 バイト上限) を書くと試行記録に残ります。同じ候補での再実行時は `Your previous attempt noted:` としてプロンプト末尾に添えられ、別候補への切り替え後は過去の失敗試行 (エンジン/モデル・失敗クラス・失敗テスト先頭 10 件・handoff、合計 6000 バイト上限) が `Previous attempts by other models (do not repeat what did not work):` として渡されます。BT に `taskId` があればタスクの経過ログに `engine_switched` も残ります。
+- **停止上限 (`switchLimits`)**: `worker` または `defaults.worker` に `{"maxCandidates": 3, "maxSec": 0, "stopOnSameSymptom": true}` を設定できます。試した候補数が `maxCandidates` に達した・ノード初回起動からの経過秒が `maxSec` (`> 0`) を超えた・直前の候補と今の候補の最後の `failSignature` が同じ (`stopOnSameSymptom`) 場合、切り替えを止めて `engineSwitchStopped` イベント (`max_candidates` / `max_sec` / `same_symptom`) を出し、外側の `catch` / `escalate` へ落とします。escalate のパケットには `engineAttempts` (共通の失敗テスト・各候補の handoff・`same_symptom` 停止時の `"likelyNotModel": true`) が含まれます。
+- **前の候補の変更 (`onSwitch`)**: `"onSwitch": "keep"` (既定) は変更を残します。`"revert"` を指定すると警告 `on_switch_revert_unsupported` を出し、`keep` と同じ扱いになります。
+
 ---
 
 ## 6. 上限 (Limits)
@@ -540,6 +555,9 @@ LLM ワーカーは何もイベントを出さないまま 1 時間止まり、�
 | `escalate_without_takeover` | `expect` に `takeover` が無い |
 | `permit_not_approved` | 宣言した `needs` が未承認 |
 | `permit_invalid` | `needs` の形式が不正 |
+| `blame_before_worker` | `blame` 付き `job` が対象の `worker` より前の実行順に置かれている |
+| `fix_class_without_blame` | `worker` の `switchEngineOn` に `fix_*` があるのに `blame` する `job` が無い |
+| `on_switch_revert_unsupported` | `onSwitch: "revert"` が指定された (未対応のため `keep` 扱い) |
 
 ```powershell
 hancho-cli bt validate --file plan.json --json          # {"ok":true,"valid":true,"warnings":[...]}
