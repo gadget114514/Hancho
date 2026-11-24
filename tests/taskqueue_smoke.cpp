@@ -3251,6 +3251,26 @@ int main() {
                   hasKind("closed") && hasKind("reopened"),
               "100-2a: log holds created, job_added, superseded, note, closed and reopened");
 
+        // Task history: each attempt's end is logged with its result, and a job that gives up
+        // is logged as job_failed (j1 failed with exit 1, then j2 succeeded).
+        bool j1Failed = false, j1GaveUp = false, j2Ok = false;
+        for (const auto& entry : logA["log"]) {
+            const std::string kind = entry.value("kind", std::string());
+            const std::string job = entry.value("job", std::string());
+            if (kind == "attempt_finished" && job == j1 && entry.value("attempt", 0) == 1 &&
+                entry.value("result", std::string()) == "failed" && entry.value("exitCode", -1) == 1 &&
+                entry.value("text", std::string()).find("exit 1") != std::string::npos) {
+                j1Failed = true;
+            }
+            if (kind == "job_failed" && job == j1) j1GaveUp = true;
+            if (kind == "attempt_finished" && job == j2 && entry.value("result", std::string()) == "succeeded") {
+                j2Ok = true;
+            }
+        }
+        Check(j1Failed, "history: attempt_finished records the failed attempt with its exit code");
+        Check(j1GaveUp, "history: job_failed records the job that gave up");
+        Check(j2Ok, "history: attempt_finished records the succeeded attempt");
+
         // Save and reload: the state and the log come back.
         tPm.SetProcessFinishedCallback(nullptr);
         tm.ShutdownTaskQueueManager();

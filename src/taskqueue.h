@@ -1008,9 +1008,11 @@ public:
     // Works for a task without a record too (the implicit task of a lineage's first job).
     nlohmann::json TaskState(const std::string& taskId) const;
     // Appends one entry to a task's log. Does nothing when taskId has no record. Takes only the
-    // task store's lock, so it is safe to call with or without mutex_ held.
+    // task store's lock, so it is safe to call with or without mutex_ held. The fields of `extra`
+    // (an object) are added to the entry as they are.
     void TaskLog(const std::string& taskId, const std::string& kind, const std::string& jobId,
-                 const std::string& btId, const std::string& text, const std::string& session);
+                 const std::string& btId, const std::string& text, const std::string& session,
+                 const nlohmann::json* extra = nullptr);
 
     // Scheduler hooks
     void OnProcessFinished(int processId, int exitCode, const std::string& endKind);
@@ -1132,6 +1134,9 @@ private:
 
     void EmitEventLocked(TaskQueue& tq, const std::string& type, const std::string& jobId, int64_t attempt,
                          const TaskQueueFailureDiagnostic* failure = nullptr);
+    // Task history: records how an attempt of a task's job ended (attempt_finished) and when the
+    // job gives up (job_failed), so retries that do not start a new lineage entry stay visible.
+    void LogAttemptToTaskLocked(const TaskQueueJob& job, const std::string& eventType, int64_t attempt);
     static std::string BuildError(const std::string& msg);
     // Task records. Callers hold mutex_ (lock order: mutex_ -> the store's own lock).
     // Before jobs leave a queue, their ids, states and lineage are kept on the task record.

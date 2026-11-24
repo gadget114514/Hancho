@@ -51,6 +51,12 @@
   - Hancho が自動で書く: タスク作成、ジョブ追加、やり直し（`supersede_reason` 付き）、BT の開始・完了・失敗・キャンセル、escalate への回答と rationale、引き取り（takeover / complete）、トリアージの判断と理由、キャンセル、タスクを閉じたとき。
   - supervisor が書く: `task note <id> --text "..."`。判断と理由を残す。
   - セッション id だけでなく文章そのものを残すので、セッションが消えても読める。
+- 経過ログは task の履歴を兼ねる。系譜に入らないやり直しもここで追えるようにする（2026-11-24 決定）。
+  - `attempt_finished`: job の attempt が 1 回終わるたびに書く。項目 `attempt`、`result`（`succeeded`、`failed`、`checkFailed`、`deferred`、`permissionResume`、`waitingForPermit` など。attempt の `reason` と同じ）、失敗なら `exitCode`、`failureClass`。同じ内容のリトライ（attempt が増えるだけ）もこれで残る。
+  - `job_failed`: job があきらめて `failed` になったとき。
+  - `bt_node_failed`: BT の中で job を出したノード（exec / agent）が失敗したとき。項目 `node`、`run`（何回目か）、`job`（最後の job）。`retry` ノードや fix ループのやり直しはこれで残る。失敗が上に伝わるだけの複合ノード・条件ノードは書かない。
+  - job を purge しても経過ログは消えない（タスクのレコードと経過ログは別のファイル）。
+  - 経過ログはレコードのあるタスク（`task create` で作ったもの）にだけ書く。暗黙のタスクと単発プロセス（`start`）には履歴がない。
 
 ### 系譜（タスクの中のやり直し）
 - `TaskQueueJob` に `supersedes`（やり直し元のジョブ id）を追加し、`taskqueue_add` で受け取る。

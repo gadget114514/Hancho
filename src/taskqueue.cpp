@@ -3156,7 +3156,10 @@ void TaskQueueManager::EmitEventLocked(TaskQueue& tq, const std::string& type, c
     // Events of a job that belongs to a task carry the task id (100-2b). Empty taskId: left out.
     for (const auto& j : tq.jobs) {
         if (j.id != jobId) continue;
-        if (!j.taskId.empty()) oss << ",\"task_id\":\"" << JsonEscape(j.taskId) << "\"";
+        if (!j.taskId.empty()) {
+            oss << ",\"task_id\":\"" << JsonEscape(j.taskId) << "\"";
+            LogAttemptToTaskLocked(j, type, attempt);
+        }
         break;
     }
     if (failure && !failure->Empty()) {
@@ -3169,6 +3172,50 @@ void TaskQueueManager::EmitEventLocked(TaskQueue& tq, const std::string& type, c
         (type == "taskqueueDrained" || type == "taskqueueStalled" || type == "jobFailed")) {
         WriteFileAtomicWide(Utf8ToWide(tq.notifyFile), oss.str());
     }
+}
+
+void TaskQueueManager::LogAttemptToTaskLocked(const TaskQueueJob& job, const std::string& eventType,
+                                              int64_t attempt) {
+    const bool attemptEnd = eventType == "jobSucceeded" || eventType == "jobAttemptFailed" ||
+                            eventType == "jobDeferred" || eventType == "jobWaitingForPermit";
+    const bool gaveUp = eventType == "jobFailed";
+    if (!attemptEnd && !gaveUp) return;
+
+    const TaskQueueAttempt* a = nullptr;
+    for (const auto& att : job.attempts) {
+        if (att.n == attempt) a = &att;
+    }
+    // Waiting for a dead engine follows jobAttemptFailed for the same attempt: already logged.
+    if (eventType == "jobDeferred" && a && a->reason == "engineWaiting") return;
+    std::string result = eventType == "jobSucceeded" ? "succeeded"
+                       : eventType == "jobWaitingForPermit" ? "waitingForPermit"
+                       : (a && !a->reason.empty()) ? a->reason : "failed";
+    nlohmann::json extra = nlohmann::json::object();
+    extra["attempt"] = attempt;
+    extra["result"] = result;
+    std::ostringstream text;
+    if (gaveUp) {
+        text << "gave up after attempt " << attempt;
+    } else {
+        text << "attempt " << attempt << ": " << result;
+    }
+    if (a && eventType != "jobSucceeded") {
+        std::vector<std::string> parts;
+        if (a->exitCode >= 0 && !a->end.empty()) {
+            extra["exitCode"] = a->exitCode;
+            parts.push_back("exit " + std::to_string(a->exitCode));
+        }
+        if (!a->failure.failureClass.empty()) {
+            extra["failureClass"] = a->failure.failureClass;
+            parts.push_back(a->failure.failureClass);
+        }
+        if (!parts.empty()) {
+            text << " (";
+            for (size_t i = 0; i < parts.size(); ++i) text << (i ? ", " : "") << parts[i];
+            text << ")";
+        }
+    }
+    TaskLog(job.taskId, gaveUp ? "job_failed" : "attempt_finished", job.id, "", text.str(), "", &extra);
 }
 
 void TaskQueueManager::LoadQueues() {
@@ -8400,10 +8447,15 @@ nlohmann::json TaskQueueManager::TaskState(const std::string& taskId) const {
 }
 
 void TaskQueueManager::TaskLog(const std::string& taskId, const std::string& kind, const std::string& jobId,
-                               const std::string& btId, const std::string& text, const std::string& session) {
+                               const std::string& btId, const std::string& text, const std::string& session,
+                               const nlohmann::json* extra) {
     if (taskId.empty()) return;
+    nlohmann::json entry = MakeTaskLogEntry(kind, jobId, btId, text, session);
+    if (extra && extra->is_object()) {
+        for (auto it = extra->begin(); it != extra->end(); ++it) entry[it.key()] = it.value();
+    }
     std::string err;
-    taskStore_.AppendLog(taskId, MakeTaskLogEntry(kind, jobId, btId, text, session), err);
+    taskStore_.AppendLog(taskId, entry, err);
 }
 
 std::string TaskQueueManager::TaskCreate(const std::string& title, const std::string& intent,

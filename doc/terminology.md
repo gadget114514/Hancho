@@ -87,7 +87,7 @@ task                 依頼 1 件。意図・経過ログを持つ
 |---|---|
 | supervisor | ユーザーと話している LLM。task を作り、direction を出し、結果を見て次を決める |
 | Hancho | プロセスを所有し、監視・成功判定・リトライ・記録をする |
-| worker | job を実行しているプロセスという役割（LLM、ビルド、テスト、スクリプト） |
+| worker | job を実行しているプロセスという役割（LLM、ビルド、テスト、スクリプト）。supervisor と対になる言葉で、supervisor が決めて任せた仕事を worker が実行する |
 | agent | engine + model の組（定義は下の「LLM まわり」）。job として動かしているあいだは worker になる |
 | peer | Chat でメッセージをやり取りする相手（LLM や Hancho）。今の Chat の `--from-agent` / `--to-agent` の agent。agent（job として動く LLM）とは別 |
 | host | Chat の LAN 上の相手の Hancho（`192.168.1.20:2426` のようなアドレス）。今の `chat peers` の peer |

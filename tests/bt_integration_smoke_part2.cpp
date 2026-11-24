@@ -535,6 +535,68 @@ void RunPart2IntegrationTests(const std::wstring& tempDirW, const std::string& t
         }
         Check(hasSwitchedLog, "101-4: TaskLog recorded engine_switched entry on task");
     }
+
+    // Task history: a retry inside a task's BT is logged as bt_node_failed (node, run, job), and
+    // each job attempt as attempt_finished, even though the retry is not a lineage.
+    {
+        TestHarness h;
+        std::string taskErr;
+        json created = json::parse(h.tqm.TaskCreate("Retry history", "", "", "", taskErr), nullptr, false);
+        const std::string taskId = created.is_object() ? created.value("id", "") : "";
+        Check(!taskId.empty(), "history: TaskCreate succeeded: " + taskErr);
+
+        // Fails on the first run (creates the flag), succeeds on the next.
+        const std::string flag = tempDirUtf8 + "\\retry_history.flag";
+        DeleteFileW(Utf8ToWide(flag).c_str());
+        const std::wstring flakyBatW = tempDirW + L"\\flaky_once.bat";
+        WriteFileAtomicWide(flakyBatW,
+                            "@echo off\r\n"
+                            "if exist \"%~dp0retry_history.flag\" exit /b 0\r\n"
+                            "type nul > \"%~dp0retry_history.flag\"\r\n"
+                            "exit /b 1\r\n");
+        json btDef = {
+            {"id", "bt-retry-history"},
+            {"taskId", taskId},
+            {"cwd", tempDirUtf8},
+            {"root", {
+                {"type", "retry"},
+                {"max", 3},
+                {"child", {
+                    {"type", "job"},
+                    {"id", "flaky"},
+                    {"summary", "Fails once"},
+                    {"command", QuoteCommandArg(WideToUtf8(flakyBatW))},
+                    {"timeoutSec", 30}
+                }}
+            }}
+        };
+        h.btm->Start(btDef.dump());
+        json waitResp = json::parse(h.btm->Wait("bt-retry-history", 0, 15000), nullptr, false);
+        Check(waitResp.value("state", "") == "succeeded",
+              "history: retry BT succeeded on the second run (got " + waitResp.dump() + ")");
+
+        std::string showErr;
+        json shown = json::parse(h.tqm.TaskShow(taskId, 0, showErr), nullptr, false);
+        int nodeFailed = 0, attemptsOk = 0, attemptsFailed = 0;
+        for (const auto& entry : shown.value("log", json::array())) {
+            const std::string kind = entry.value("kind", "");
+            if (kind == "bt_node_failed" && entry.value("bt", "") == "bt-retry-history" &&
+                entry.value("node", "").find("flaky") != std::string::npos && entry.value("run", 0) == 1 &&
+                !entry.value("job", "").empty()) {
+                ++nodeFailed;
+            }
+            if (kind == "attempt_finished") {
+                if (entry.value("result", "") == "succeeded") ++attemptsOk;
+                else ++attemptsFailed;
+            }
+        }
+        Check(nodeFailed == 1, "history: bt_node_failed recorded once for the failed run (got " +
+                                   std::to_string(nodeFailed) + ")");
+        Check(attemptsFailed == 1 && attemptsOk == 1,
+              "history: attempt_finished recorded the failed and the succeeded job");
+        DeleteFileW(Utf8ToWide(flag).c_str());
+        DeleteFileW(flakyBatW.c_str());
+    }
 }
 
 } // namespace bt_int_test

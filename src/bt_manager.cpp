@@ -483,6 +483,22 @@ void BtManager::PersistEntryLocked(TreeEntry& entry) {
                 tqm_.TaskLog(entry.tree->TaskId(), "engine_switched", "", entry.tree->Id(),
                              ev.detail, "");
             }
+            // Task history: a failed exec / agent node (one that ran jobs) is recorded with its run
+            // number, so retries and fix loops inside the BT show up even though they are not a
+            // lineage. Failures of composite and condition nodes are left out (they only repeat it).
+            if (!entry.tree->TaskId().empty() && ev.type == "nodeFinished" && ev.state == "failed" &&
+                !ev.nodeKey.empty()) {
+                const std::vector<std::string> nodeJobs = entry.tree->NodeJobs(ev.nodeKey);
+                if (!nodeJobs.empty()) {
+                    nlohmann::json extra = nlohmann::json::object();
+                    extra["node"] = ev.nodeKey;
+                    if (ev.run > 0) extra["run"] = ev.run;
+                    std::string text = ev.nodeKey + (ev.run > 0 ? " run " + std::to_string(ev.run) : "");
+                    if (!ev.detail.empty()) text += ": " + ev.detail;
+                    tqm_.TaskLog(entry.tree->TaskId(), "bt_node_failed", nodeJobs.back(), entry.tree->Id(),
+                                 text, "", &extra);
+                }
+            }
 
             std::string line = ej.dump();
             AppendToLogFileWide(evFileW, line + "\r\n");
