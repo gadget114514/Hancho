@@ -440,13 +440,14 @@ void BehaviorTree::OnJobFinished(const std::string& jobId,
     // candidates is not terminal. Record the attempt, emit `engineSwitched`, and relaunch
     // the same node with the next candidate.
     if (!succeeded && !node.engineCandidates.empty()) {
-        if (impl_->TrySwitchEngine(*this, node, failureClass, node.detail, nowMs)) {
+        if (impl_->TrySwitchEngine(*this, node, failureClass, node.detail, nowMs) ||
+            impl_->TrySwitchFromDownEngine(*this, node, failureClass, node.detail, nowMs)) {
             Tick(nowMs);
             return;
         }
     }
 
-    // No switchable candidate: keep the node waiting while the engine is down. The task
+    // No usable candidate left: keep the node waiting while the engine is down. The task
     // queue retries within maxAttempts; after that this node resumes once recovery probes OK.
     if (!succeeded && impl_->HoldForEngine(*this, node, node.lastEngine, node.lastModel, nowMs)) {
         return;

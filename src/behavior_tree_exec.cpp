@@ -263,6 +263,35 @@ bool BehaviorTree::Impl::TrySwitchEngine(BehaviorTree& bt, BtNode& node,
                                          const std::string& failureClass,
                                          const std::string& detail, int64_t nowMs) {
     if (!ShouldSwitchEngine(node, failureClass)) return false;
+    return SwitchToNextEngine(bt, node, failureClass, detail, "", nowMs);
+}
+
+// A failed attempt left its engine marked down. Waiting for that engine to recover while
+// another approved candidate is up only stalls the tree, so move on regardless of
+// switchEngineOn. The relaunch skips any further candidate that is down or not approved.
+bool BehaviorTree::Impl::TrySwitchFromDownEngine(BehaviorTree& bt, BtNode& node,
+                                                 const std::string& failureClass,
+                                                 const std::string& detail, int64_t nowMs) {
+    if (!bt.health_ || node.engineCandidates.empty()) return false;
+    const int cur = node.engineCandidateIndex;
+    if (cur < 0 || cur >= static_cast<int>(node.engineCandidates.size())) return false;
+    const BtEngineChoice& from = node.engineCandidates[cur];
+    if (!bt.health_->IsDown(from.engine, from.model)) return false;
+    bool usable = false;
+    for (size_t i = static_cast<size_t>(cur) + 1; i < node.engineCandidates.size() && !usable; ++i) {
+        const BtEngineChoice& c = node.engineCandidates[i];
+        if (bt.catalog_ && !bt.catalog_->IsApprovedForList("worker", c.engine, c.model)) continue;
+        if (bt.health_->IsDown(c.engine, c.model)) continue;
+        usable = true;
+    }
+    if (!usable) return false;
+    return SwitchToNextEngine(bt, node, failureClass, detail, "engine down", nowMs);
+}
+
+bool BehaviorTree::Impl::SwitchToNextEngine(BehaviorTree& bt, BtNode& node,
+                                            const std::string& failureClass,
+                                            const std::string& detail,
+                                            const std::string& why, int64_t nowMs) {
     const BtEngineChoice& from = node.engineCandidates[node.engineCandidateIndex];
     BtEngineAttempt attempt;
     attempt.engine = from.engine;
@@ -284,6 +313,7 @@ bool BehaviorTree::Impl::TrySwitchEngine(BehaviorTree& bt, BtNode& node,
 
     std::string reason = from.engine + "/" + from.model + " -> " + to.engine + "/" + to.model;
     if (!failureClass.empty()) reason += " (" + failureClass + ")";
+    if (!why.empty()) reason += " " + why;
     if (!to.list.empty()) reason += " [" + to.list + "]";
     if (!to.entry.empty()) reason += " " + to.entry;
     if (!detail.empty()) reason += " " + BtVarPreview(detail, 120);

@@ -1194,6 +1194,63 @@ int main() {
                                "timedOut", R"({"class":"startup_hang","summary":"no events"})");
         Check(markHealth.IsDown("opencode", "m1"),
               "0916: a startup_hang failure marks the engine down for other jobs");
+
+        // A failure that leaves the engine down moves on to the next candidate even when
+        // its class is not in switchEngineOn (before: the node waited for the down engine).
+        {
+            FakeHealth h;
+            FakeJobRunner r;
+            BehaviorTree t;
+            Check(t.LoadDefinition(twoCandidates, &catalogAll, err), "down-switch: load BT: " + err);
+            t.SetJobRunner(&r);
+            t.SetEngineHealth(&h);
+            t.Start(1000);
+            Check(r.startedWorkers.size() == 1 && r.startedWorkers[0].engine == "opencode",
+                  "down-switch: first candidate starts");
+            h.down.insert("opencode/m1");  // e.g. the core marked it down for idle_stall
+            t.OnJobFinished("eh-two-impl-1", false, 1, "", "", 1100, "", "",
+                            "idle_timed_out", R"({"class":"idle_stall","summary":"no output"})");
+            Check(r.startedWorkers.size() == 2 && r.startedWorkers[1].engine == "agy" &&
+                  r.startedWorkers[1].model == "m2",
+                  "down-switch: down engine switches to the next candidate without switchEngineOn");
+            Check(t.State() == "running" && t.ToStateJson().find("\"waitingForEngine\":true") == std::string::npos,
+                  "down-switch: node is not held for the down engine");
+            bool sawSwitch = false;
+            for (const auto& ev : t.Events()) {
+                if (ev.type == "engineSwitched" && ev.detail.find("engine down") != std::string::npos) sawSwitch = true;
+            }
+            Check(sawSwitch, "down-switch: engineSwitched event says engine down");
+        }
+        {
+            FakeHealth h;
+            h.nextProbeAt = 5000;
+            FakeJobRunner r;
+            BehaviorTree t;
+            Check(t.LoadDefinition(twoCandidates, &catalogAll, err), "down-hold: load BT: " + err);
+            t.SetJobRunner(&r);
+            t.SetEngineHealth(&h);
+            t.Start(1000);
+            h.down.insert("opencode/m1");
+            h.down.insert("agy/m2");
+            t.OnJobFinished("eh-two-impl-1", false, 1, "", "", 1100, "", "",
+                            "idle_timed_out", R"({"class":"idle_stall","summary":"no output"})");
+            Check(r.startedWorkers.size() == 1 && t.State() == "running" &&
+                  t.ToStateJson().find("waitingForEngine") != std::string::npos,
+                  "down-hold: with every later candidate down the node still waits");
+        }
+        {
+            FakeHealth h;
+            FakeJobRunner r;
+            BehaviorTree t;
+            Check(t.LoadDefinition(twoCandidates, &catalogAll, err), "up-fail: load BT: " + err);
+            t.SetJobRunner(&r);
+            t.SetEngineHealth(&h);
+            t.Start(1000);
+            t.OnJobFinished("eh-two-impl-1", false, 1, "", "", 1100, "", "",
+                            "exit", R"({"class":"exit_nonzero","summary":"exit 1"})");
+            Check(r.startedWorkers.size() == 1 && t.State() == "failed",
+                  "up-fail: a non-switchable failure on a healthy engine still fails the node");
+        }
     }
 
     RunPart2Tests(tempDirUtf8, tempDirW);
