@@ -244,9 +244,41 @@ $script:WwLimitPatterns = @(
     '"(code|status)"\s*:\s*429'
 )
 
+# Failure classes written by Hancho's event stream (doc/llm-error-class-cards.md, 102-1/102-2).
+$script:WwStructuredClasses = @('auth_error', 'rate_limited', 'provider_down')
+
+# Token-expiry and auth wording, the text fallback when no structured class is present (102-4).
+$script:WwAuthPatterns = @(
+    'token (has )?expired',
+    'invalid_grant',
+    'authentication_error',
+    '401 unauthorized'
+)
+
+# 102-4: reads the event lines (JSON, kind "error", data.class) from the end, so the newest error wins.
+function Get-StructuredErrorHint([string]$text) {
+    if ([string]::IsNullOrEmpty($text)) { return $null }
+    $lines = $text -split "`n"
+    for ($i = $lines.Count - 1; $i -ge 0; $i--) {
+        $line = $lines[$i].Trim()
+        if ($line -notlike '*"class"*') { continue }
+        try { $ev = $line | ConvertFrom-Json -ErrorAction Stop } catch { continue }
+        if ($null -eq $ev -or $ev.kind -ne 'error' -or $null -eq $ev.data) { continue }
+        $cls = [string]$ev.data.class
+        if ($script:WwStructuredClasses -contains $cls) { return "structured:$cls" }
+    }
+    return $null
+}
+
 function Get-LimitHint([string]$text) {
     if ([string]::IsNullOrEmpty($text)) { return $null }
+    $structured = Get-StructuredErrorHint $text
+    if ($structured) { return $structured }
     foreach ($p in $script:WwLimitPatterns) {
+        $m = [regex]::Match($text, $p, [System.Text.RegularExpressions.RegexOptions]::IgnoreCase)
+        if ($m.Success) { return $m.Value }
+    }
+    foreach ($p in $script:WwAuthPatterns) {
         $m = [regex]::Match($text, $p, [System.Text.RegularExpressions.RegexOptions]::IgnoreCase)
         if ($m.Success) { return $m.Value }
     }

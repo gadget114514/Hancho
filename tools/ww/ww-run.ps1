@@ -555,7 +555,7 @@ try {
                 $next = Get-NextWorkerCandidate -DataDir $data -Root $root `
                     -CurrentEngine $Engine -CurrentProvider $Provider -CurrentModel $Model
                 if ($next) {
-                    $swMsg = "[ww-run] engine switch: $Engine hit limit ('$hint'); switching to $($next.Engine) ($($next.EffectiveModel))"
+                    $swMsg = "[ww-run] engine switch: $Engine hit error ('$hint'); switching to $($next.Engine) ($($next.EffectiveModel))"
                     Write-Host $swMsg -ForegroundColor Yellow
                     "[$(Get-Date -Format 's')] $swMsg" | Add-Content -Encoding UTF8 $log
                     $Engine = $next.Engine

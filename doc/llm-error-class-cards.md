@@ -58,6 +58,17 @@
 - `doc/terminology.md` に `auth_error` の説明が既にあれば合わせる（無ければ足さない）。
 - ビルドと既存のスモークテスト（`taskqueue_smoke` / `behavior_tree_smoke`）が通ること。
 
+## 102-4 ww-run の切り替えを構造化クラスで判定する
+
+背景: `tools/ww/ww-run.ps1` は失敗後、Hancho のイベントファイル（末尾 60 行）を `Get-LimitHint` で文字列判定し、一致したら次の候補へ切り替える（`ww-run.ps1` の 544〜571 行付近）。トークン切れは `WwLimitPatterns` に無いので切り替わらない。
+
+- `tools/ww/ww-run.lib.ps1`:
+  - `Get-StructuredErrorHint`（新規）: 末尾の各行を JSON として読み、`kind == "error"` かつ `data.class` が `auth_error` / `rate_limited` / `provider_down` のものを返す（末尾から最初に見つかったもの）。`"class"` を含まない行は読まない。
+  - `Get-LimitHint`: まず構造化クラスを見る（`structured:<class>` を返す）。無ければ従来の `WwLimitPatterns`。さらに認証切れの文字列（`WwAuthPatterns`: `token has expired` / `token expired` / `invalid_grant` / `authentication_error` / `401 unauthorized`）を最後の保険として見る。
+- `tools/ww/ww-run.ps1` と `ww-run-fallback.ps1`: 変えない（同じ `Get-LimitHint` を使うので自動で効く）。ただし切り替えの表示文 `hit limit` は `hit error` に寄せる。
+- テスト: `tools/ww/ww-run.selftest.ps1` に、構造化 auth_error 行 → `structured:auth_error` / 構造化 rate_limited → `structured:rate_limited` / 認証切れの文字列 → 非 null / 通常の失敗 → null。
+- 範囲外: 切り替え先の候補選び（`Get-NextWorkerCandidate`）と、BT 側の `switchEngineOn`。
+
 ## 共通の約束
 
 - 変えるのは上に書いたファイルとそのテストだけ。C++ のソースは LF。コミットはしない。
