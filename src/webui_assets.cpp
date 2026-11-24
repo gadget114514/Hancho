@@ -1849,6 +1849,7 @@ const char kAppJs_0[] = R"JS_0(/**
     // Task Queue
     jobs: [],
     tasks: [],
+    directions: [],
     tqViewMode: 'jobs',
     expandedTasks: {},
     tqFilter: 'all',
@@ -2006,7 +2007,8 @@ const char kAppJs_0[] = R"JS_0(/**
   const elModalMemPrune = document.getElementById('modal-mem-prune');
   const elInputPruneDays = document.getElementById('input-prune-days');
   const elChkPruneDryRun = document.getElementById('chk-prune-dry-run');
-  const elBtnSubmitPrune = document.getElementById('btn-submit-prune');
+)JS_0";
+const char kAppJs_1[] = R"JS_1(  const elBtnSubmitPrune = document.getElementById('btn-submit-prune');
   const elPruneResultBox = document.getElementById('prune-result-box');
 
   // --- WebSocket Connection ---
@@ -2024,6 +2026,7 @@ const char kAppJs_0[] = R"JS_0(/**
       elStatusDot.className = 'status-dot connected';
       elStatusText.textContent = 'Connected';
       elReconnectBanner.classList.add('hidden');
+      scheduleTranslateFlush(0);
     } else if (status === 'connecting') {
       state.connected = false;
       elStatusDot.className = 'status-dot connecting';
@@ -2108,9 +2111,14 @@ const char kAppJs_0[] = R"JS_0(/**
   function handleWsMessage(data) {
     if (!data) return;
 
+    // translate_get answer (card 106-4)
+    if (data.ok === true && Array.isArray(data.items) && typeof data.lang === 'string' && 'revision' in data) {
+      handleTranslateResponse(data);
+      return;
+    }
+
     // Process list response
-)JS_0";
-const char kAppJs_1[] = R"JS_1(    if (data.processes && Array.isArray(data.processes)) {
+    if (data.processes && Array.isArray(data.processes)) {
       state.processes = data.processes;
       elBadgeProcCount.textContent = state.processes.length;
       renderProcessesTable();
@@ -2133,6 +2141,21 @@ const char kAppJs_1[] = R"JS_1(    if (data.processes && Array.isArray(data.proc
       if (state.activeTab === 'taskqueue') {
         renderTaskQueueTable();
       }
+      return;
+    }
+
+    // Direction list response
+    if (data.directions && Array.isArray(data.directions) && !data.task) {
+      state.directions = data.directions;
+      if (state.activeTab === 'taskqueue') {
+        renderTaskQueueTable();
+      }
+      return;
+    }
+
+    // Card show response
+    if (data.ok && data.card && data.direction && !data.task) {
+      renderCardDetailsModal(data);
       return;
     }
 
@@ -2173,7 +2196,7 @@ const char kAppJs_1[] = R"JS_1(    if (data.processes && Array.isArray(data.proc
     }
 
     // Agent State
-    if (data.agent_type !== undefined && data.status !== undefined && data.id !== undefined) {
+    if ((data.engine !== undefined || data.agent_type !== undefined) && data.status !== undefined && data.id !== undefined) {
       updateAgentOverview(data);
       return;
     }
@@ -2272,7 +2295,8 @@ const char kAppJs_1[] = R"JS_1(    if (data.processes && Array.isArray(data.proc
       if (tab.getAttribute('data-tab') === tabName) {
         tab.classList.add('active');
       } else {
-        tab.classList.remove('active');
+)JS_1";
+const char kAppJs_2[] = R"JS_2(        tab.classList.remove('active');
       }
     });
 
@@ -2298,6 +2322,7 @@ const char kAppJs_1[] = R"JS_1(    if (data.processes && Array.isArray(data.proc
     } else if (state.activeTab === 'taskqueue') {
       sendWsRequest({ action: 'taskqueue_list', include_planned: true });
       sendWsRequest({ action: 'task_list' });
+      sendWsRequest({ action: 'direction_list' });
       sendWsRequest({ action: 'taskqueue_resource_locks' });
     } else if (state.activeTab === 'monitor') {
       sendWsRequest({ action: 'list' });
@@ -2426,8 +2451,7 @@ const char kAppJs_1[] = R"JS_1(    if (data.processes && Array.isArray(data.proc
           html += `<tr><td>${escapeHtml(j.node || '')}</td><td>${escapeHtml(j.command || '')}</td></tr>`;
         });
         html += '</tbody></table>';
-)JS_1";
-const char kAppJs_2[] = R"JS_2(      }
+      }
       html += `<div>承認: <button id="routine-detail-approve" class="btn btn-xs">Approve</button> ` +
         `<button id="routine-detail-reject" class="btn btn-xs">Reject</button></div>`;
     }
@@ -2482,7 +2506,8 @@ const char kAppJs_2[] = R"JS_2(      }
     if (sec === undefined || sec === null || isNaN(sec) || sec < 0) return '-';
     if (sec < 60) return sec.toFixed(1) + 's';
     const m = Math.floor(sec / 60);
-    const s = Math.floor(sec % 60);
+)JS_2";
+const char kAppJs_3[] = R"JS_3(    const s = Math.floor(sec % 60);
     return `${m}m ${s}s`;
   }
 
@@ -2709,7 +2734,8 @@ const char kAppJs_2[] = R"JS_2(      }
         id: id,
         title: job.task.title || (rec ? rec.title : '') || '',
         state: job.task.state || (rec ? rec.state : '') || '',
-        hasRecord: !!(job.task.title || rec)
+)JS_3";
+const char kAppJs_4[] = R"JS_4(        hasRecord: !!(job.task.title || rec)
       };
     }
     const id = job.task_id || job.taskId || '';
@@ -2732,8 +2758,7 @@ const char kAppJs_2[] = R"JS_2(      }
   }
 
   function formatTaskResultsCompact(jobs) {
-)JS_2";
-const char kAppJs_3[] = R"JS_3(    const syms = jobs.map(j => jobStateSymbol(j.state));
+    const syms = jobs.map(j => jobStateSymbol(j.state));
     if (syms.length <= 8) return syms.join('');
     let out = '';
     let i = 0;
@@ -2751,7 +2776,7 @@ const char kAppJs_3[] = R"JS_3(    const syms = jobs.map(j => jobStateSymbol(j.s
 
   function buildJobRowHtml(job, indent) {
     const key = escapeHtml(job.key || job.id || '-');
-    const name = escapeHtml(job.name || job.summary || '(unnamed)');
+    const name = escapeHtml(job.name || D(job.summary || '') || '(unnamed)');
     const queue = escapeHtml(job.taskqueue || job.queue || 'default');
     const cmd = escapeHtml(job.command || job.commandLine || job.cmd || '-');
     const stateBadge = `<span class="${getBadgeClass(job.state)}">${escapeHtml(job.state || 'unknown')}</span>`;
@@ -2789,7 +2814,7 @@ const char kAppJs_3[] = R"JS_3(    const syms = jobs.map(j => jobStateSymbol(j.s
     if (taskInfo.id) {
       const taskLabel = taskInfo.title ? `${taskInfo.title} (${taskInfo.id})` : taskInfo.id;
       if (taskInfo.hasRecord) {
-        taskCell = `<a class="task-link" data-task-id="${escapeHtml(taskInfo.id)}" title="${escapeHtml(taskLabel)}">${escapeHtml(taskInfo.title || taskInfo.id)}</a>`;
+        taskCell = `<a class="task-link" data-task-id="${escapeHtml(taskInfo.id)}" title="${escapeHtml(taskLabel)}">${escapeHtml(D(taskInfo.title || '') || taskInfo.id)}</a>`;
       } else {
         taskCell = `<span class="text-muted" title="${escapeHtml(taskLabel)}">${escapeHtml(taskInfo.id)}</span>`;
       }
@@ -2906,14 +2931,46 @@ const char kAppJs_3[] = R"JS_3(    const syms = jobs.map(j => jobStateSymbol(j.s
         ensureGroup(t.id);
       }
 
+      const dirsByTask = {};
+      for (const dir of state.directions) {
+        if (!dir || dir.implicit || !dir.taskId) continue;
+        if (!dirsByTask[dir.taskId]) dirsByTask[dir.taskId] = [];
+        dirsByTask[dir.taskId].push(dir);
+      }
+
       for (const job of filtered) {
         const tid = resolveTaskId(job);
         const g = ensureGroup(tid);
         const info = getJobTaskInfo(job);
         if (!g.title && info.title) g.title = info.title;
-        if (!g.state && info.state) g.state = info.state;
+)JS_4";
+const char kAppJs_5[] = R"JS_5(        if (!g.state && info.state) g.state = info.state;
         if (info.hasRecord) g.hasRecord = true;
         g.jobs.push(job);
+      }
+
+      function compareCardNumberNatural(a, b) {
+        let ia = 0, ib = 0;
+        while (ia < a.length && ib < b.length) {
+          const da = a[ia] >= '0' && a[ia] <= '9';
+          const db = b[ib] >= '0' && b[ib] <= '9';
+          if (da && db) {
+            let za = ia; while (za < a.length && a[za] === '0') za++;
+            let ea = za; while (ea < a.length && a[ea] >= '0' && a[ea] <= '9') ea++;
+            let zb = ib; while (zb < b.length && b[zb] === '0') zb++;
+            let eb = zb; while (eb < b.length && b[eb] >= '0' && b[eb] <= '9') eb++;
+            const la = ea - za, lb = eb - zb;
+            if (la !== lb) return la - lb;
+            const sa = a.slice(za, ea), sb = b.slice(zb, eb);
+            if (sa !== sb) return sa < sb ? -1 : 1;
+            if ((ea - ia) !== (eb - ib)) return (ea - ia) - (eb - ib);
+            ia = ea; ib = eb;
+          } else {
+            if (a[ia] !== b[ib]) return a[ia] < b[ib] ? -1 : 1;
+            ia++; ib++;
+          }
+        }
+        return a.length - b.length;
       }
 
       if (groupOrder.length === 0) {
@@ -2922,11 +2979,33 @@ const char kAppJs_3[] = R"JS_3(    const syms = jobs.map(j => jobStateSymbol(j.s
         return;
       }
 
-)JS_3";
-const char kAppJs_3b[] = R"JS_3b(      for (const gid of groupOrder) {
+      for (const gid of groupOrder) {
         const g = groupMap[gid];
         const dirMap = {};
         const dirOrder = [];
+        const taskDirs = dirsByTask[gid] || [];
+        for (const dir of taskDirs) {
+          const did = dir.id;
+          if (!did) continue;
+          if (!dirMap[did]) {
+            dirMap[did] = {
+              id: did,
+              kind: dir.kind || 'jobs',
+              title: (dir.card && dir.card.title) || dir.title || '',
+              state: dir.state || '',
+              isVirtualBt: false,
+              isLegacyGroup: false,
+              isCard: !!dir.card,
+              cardNumber: dir.card ? (dir.card.number || '') : '',
+              waitingFor: Array.isArray(dir.waitingFor) ? dir.waitingFor : [],
+              supersedes: dir.supersedes || '',
+              supersededBy: dir.supersededBy || '',
+              realJobs: [],
+              virtualJob: null
+            };
+            dirOrder.push(did);
+          }
+        }
         for (const job of g.jobs) {
           const jid = job.id || job.key || '';
           let did = job.direction_id || job.directionId || '';
@@ -2936,7 +3015,7 @@ const char kAppJs_3b[] = R"JS_3b(      for (const gid of groupOrder) {
             else did = 'job:' + jid;
           }
           if (!dirMap[did]) {
-            dirMap[did] = { id: did, kind: 'jobs', title: '', state: '', isVirtualBt: false, isLegacyGroup: false, realJobs: [], virtualJob: null };
+            dirMap[did] = { id: did, kind: 'jobs', title: '', state: '', isVirtualBt: false, isLegacyGroup: false, isCard: false, cardNumber: '', waitingFor: [], supersedes: '', supersededBy: '', realJobs: [], virtualJob: null };
             dirOrder.push(did);
           }
           const d = dirMap[did];
@@ -2944,14 +3023,24 @@ const char kAppJs_3b[] = R"JS_3b(      for (const gid of groupOrder) {
             d.isVirtualBt = true;
             d.isLegacyGroup = jid.startsWith('group:');
             d.kind = 'bt';
-            d.title = job.summary || d.title;
-            d.state = job.state || d.state;
+            if (!d.title) d.title = job.summary || '';
+            if (!d.state) d.state = job.state || '';
             d.virtualJob = job;
           } else {
             d.realJobs.push(job);
             if (job.bt && typeof job.bt === 'object') d.kind = 'bt';
           }
         }
+        dirOrder.sort((a, b) => {
+          const da = dirMap[a], db = dirMap[b];
+          if (da.isCard !== db.isCard) return da.isCard ? 1 : -1;
+          if (da.isCard && db.isCard) {
+            const cmp = compareCardNumberNatural(da.cardNumber, db.cardNumber);
+            if (cmp !== 0) return cmp;
+            return a < b ? -1 : (a > b ? 1 : 0);
+          }
+          return 0;
+        });
         let totalRealJobs = 0;
         const dirStateObjs = [];
         for (const did of dirOrder) {
@@ -2962,7 +3051,7 @@ const char kAppJs_3b[] = R"JS_3b(      for (const gid of groupOrder) {
             const lastJ = d.realJobs.length ? d.realJobs[d.realJobs.length - 1] : null;
             d.state = lastJ ? (lastJ.state || 'open') : 'open';
           }
-          d.hasHeading = (d.isVirtualBt && (!d.isLegacyGroup || d.realJobs.length > 0)) || d.realJobs.length >= 2;
+          d.hasHeading = d.isCard || (d.state === 'planned') || (d.isVirtualBt && (!d.isLegacyGroup || d.realJobs.length > 0)) || d.realJobs.length >= 2;
           dirStateObjs.push({ state: d.state });
         }
 
@@ -2979,7 +3068,7 @@ const char kAppJs_3b[] = R"JS_3b(      for (const gid of groupOrder) {
           taskExpanded = state.expandedTasks[gid] !== undefined ? state.expandedTasks[gid] : defaultExp;
           const arrow = taskExpanded ? '▾' : '▸';
           const compact = formatTaskResultsCompact(dirStateObjs);
-          const titleText = g.title ? `${g.title} (${gid})` : gid;
+          const titleText = g.title ? `${D(g.title)} (${gid})` : gid;
           const stateBadge = `<span class="${getBadgeClass(taskState)}">${escapeHtml(taskState)}</span>`;
           const detailsBtn = g.hasRecord
             ? `<button class="btn btn-sm btn-task-details" data-task-id="${escapeHtml(gid)}">Task Details</button>`
@@ -3010,26 +3099,54 @@ const char kAppJs_3b[] = R"JS_3b(      for (const gid of groupOrder) {
             const dExpanded = state.expandedTasks[dirKey] !== undefined ? state.expandedTasks[dirKey] : dExpDef;
             const dArrow = dExpanded ? '▾' : '▸';
             const dCompact = formatTaskResultsCompact(d.realJobs);
-            const dTitle = d.title ? `${d.title} (${dirKey})` : dirKey;
+            const dTitle = d.title ? `${D(d.title)} (${dirKey})` : dirKey;
             const dBadge = `<span class="${getBadgeClass(d.state)}">${escapeHtml(d.state)}</span>`;
-            const dPad = baseIndent > 0 ? ` style="padding-left: ${baseIndent * 24}px;"` : '';
+            let redoDepth = 0;
+            let curSup = d.supersedes;
+            const seenSup = new Set();
+            while (curSup && !seenSup.has(curSup) && redoDepth < 16) {
+              seenSup.add(curSup);
+              if (!dirMap[curSup]) break;
+              redoDepth++;
+              curSup = dirMap[curSup].supersedes;
+            }
+            const effIndent = baseIndent + redoDepth;
+            const dPad = effIndent > 0 ? ` style="padding-left: ${effIndent * 24}px;"` : '';
             const dStLower = (d.state || '').toLowerCase();
-            const dRetryBtn = dStLower === 'failed'
-              ? `<button class="btn btn-sm btn-primary btn-job-retry" data-key="${escapeHtml(dirKey)}">Retry</button>` : '';
-            const dCancelBtn = (dStLower === 'running' || dStLower === 'waitingforllm' || dStLower === 'paused')
-              ? `<button class="btn btn-sm btn-danger btn-job-cancel" data-key="${escapeHtml(dirKey)}">Cancel</button>` : '';
+            if (d.isCard) {
+              const dispState = (dStLower === 'planned' && d.waitingFor.length > 0) ? 'waiting' : d.state;
+              const cBadge = `<span class="${getBadgeClass(dispState)}">${escapeHtml(dispState)}</span>`;
+              const cArrow = d.realJobs.length > 0 ? dArrow : '·';
+              const cTitle = d.title ? `${d.cardNumber} ${D(d.title)}` : d.cardNumber;
+              const waitTxt = d.waitingFor.length > 0 ? `<span class="text-muted">(waiting: ${escapeHtml(d.waitingFor.join(', '))})</span> ` : '';
+              const dimStyle = (dStLower === 'planned' || d.supersededBy) ? ' style="opacity: 0.65;"' : '';
+              const cBtn = `<button class="btn btn-sm btn-card-details" data-dir-id="${escapeHtml(d.id)}" data-task-id="${escapeHtml(gid)}">Card</button>`;
+              html += `<tr class="direction-heading-row card-direction-row" data-direction-id="${escapeHtml(dirKey)}" data-card-id="${escapeHtml(d.id)}" data-task-id="${escapeHtml(gid)}" data-card-number="${escapeHtml(d.cardNumber)}" data-card-state="${escapeHtml(dStLower)}"${dimStyle}>
+                <td>${cBadge}</td>
+)JS_5";
+const char kAppJs_6[] = R"JS_6(                <td class="font-mono" colspan="2"${dPad}><strong>${cArrow} ${escapeHtml(cTitle)}</strong></td>
+                <td colspan="3">${waitTxt}<span class="font-mono">${escapeHtml(dCompact)}</span> <span class="text-muted">(${d.realJobs.length} job${d.realJobs.length === 1 ? '' : 's'})</span></td>
+                <td colspan="5"></td>
+                <td style="text-align: center;">${cBtn}</td>
+              </tr>`;
+            } else {
+              const dRetryBtn = dStLower === 'failed'
+                ? `<button class="btn btn-sm btn-primary btn-job-retry" data-key="${escapeHtml(dirKey)}">Retry</button>` : '';
+              const dCancelBtn = (dStLower === 'running' || dStLower === 'waitingforllm' || dStLower === 'paused')
+                ? `<button class="btn btn-sm btn-danger btn-job-cancel" data-key="${escapeHtml(dirKey)}">Cancel</button>` : '';
 
-            html += `<tr class="direction-heading-row" data-direction-id="${escapeHtml(dirKey)}">
-              <td>${dBadge}</td>
-              <td class="font-mono" colspan="2"${dPad}><strong>${dArrow} ${escapeHtml(dTitle)}</strong></td>
-              <td colspan="3"><span class="text-muted">direction (${escapeHtml(d.kind)})</span> <span class="font-mono">${escapeHtml(dCompact)}</span> <span class="text-muted">(${d.realJobs.length} job${d.realJobs.length === 1 ? '' : 's'})</span></td>
-              <td colspan="5"></td>
-              <td style="text-align: center;">${dRetryBtn} ${dCancelBtn}</td>
-            </tr>`;
+              html += `<tr class="direction-heading-row" data-direction-id="${escapeHtml(dirKey)}">
+                <td>${dBadge}</td>
+                <td class="font-mono" colspan="2"${dPad}><strong>${dArrow} ${escapeHtml(dTitle)}</strong></td>
+                <td colspan="3"><span class="text-muted">direction (${escapeHtml(d.kind)})</span> <span class="font-mono">${escapeHtml(dCompact)}</span> <span class="text-muted">(${d.realJobs.length} job${d.realJobs.length === 1 ? '' : 's'})</span></td>
+                <td colspan="5"></td>
+                <td style="text-align: center;">${dRetryBtn} ${dCancelBtn}</td>
+              </tr>`;
+            }
 
             if (dExpanded) {
               for (const job of d.realJobs) {
-                html += buildJobRowHtml(job, baseIndent + 1);
+                html += buildJobRowHtml(job, effIndent + 1);
               }
             }
           }
@@ -3082,6 +3199,28 @@ const char kAppJs_3b[] = R"JS_3b(      for (const gid of groupOrder) {
       });
     });
 
+    elTqTbody.querySelectorAll('.btn-card-details').forEach(el => {
+      el.addEventListener('click', function(e) {
+        e.stopPropagation();
+        const did = this.getAttribute('data-dir-id');
+        const tid = this.getAttribute('data-task-id');
+        if (did) openCardDetails(did, tid);
+      });
+    });
+
+    elTqTbody.querySelectorAll('.card-direction-row').forEach(row => {
+      row.addEventListener('contextmenu', function(e) {
+        e.preventDefault();
+        e.stopPropagation();
+        showCardContextMenu(e.clientX, e.clientY, {
+          id: this.getAttribute('data-card-id') || '',
+          taskId: this.getAttribute('data-task-id') || '',
+          number: this.getAttribute('data-card-number') || '',
+          state: this.getAttribute('data-card-state') || ''
+        });
+      });
+    });
+
     elTqTbody.querySelectorAll('.btn-job-details').forEach(btn => {
       btn.addEventListener('click', function(e) {
         e.stopPropagation();
@@ -3108,8 +3247,7 @@ const char kAppJs_3b[] = R"JS_3b(      for (const gid of groupOrder) {
         sendWsRequest({ action: 'taskqueue_cancel', id: key });
         setTimeout(() => {
           sendWsRequest({ action: 'taskqueue_list', include_planned: true });
-)JS_3b";
-const char kAppJs_4[] = R"JS_4(          sendWsRequest({ action: 'task_list' });
+          sendWsRequest({ action: 'task_list' });
         }, 200);
       });
     });
@@ -3123,6 +3261,81 @@ const char kAppJs_4[] = R"JS_4(          sendWsRequest({ action: 'task_list' });
     sendWsRequest({ action: 'task_show', id: taskId, log_limit: 200 });
   }
 
+  function openCardDetails(dirId, taskId) {
+    if (!dirId) return;
+    elTaskModalTitle.textContent = `Card: ${dirId}`;
+    elTaskModalBody.innerHTML = '<div class="empty-message">Loading card details...</div>';
+    elModalTaskDetails.classList.remove('hidden');
+    sendWsRequest({ action: 'card_show', id: dirId, taskId: taskId || '' });
+  }
+
+  function renderCardDetailsModal(data) {
+    const dir = data.direction || {};
+    const card = data.card || {};
+    const status = data.status || {};
+    const waiting = Array.isArray(data.waitingFor) ? data.waitingFor : [];
+    const st = status.state || 'planned';
+    const dispState = (st === 'planned' && waiting.length > 0) ? 'waiting' : st;
+    elTaskModalTitle.textContent = `Card ${card.number || dir.id || '-'}: ${D(card.title || '', 'card.title')}`;
+    let html = '';
+    const fields = [
+      ['Card Number', card.number || '-'],
+      ['Direction ID', dir.id || '-'],
+      ['Task ID', dir.taskId || '-'],
+      ['State', dispState],
+      ['Template', card.template || 'card'],
+      ['Waiting For', waiting.length ? waiting.join(', ') : '-']
+    ];
+    for (const [k, v] of fields) {
+      html += `<div class="detail-row">
+        <div class="detail-label">${escapeHtml(k)}:</div>
+        <div class="detail-value">${escapeHtml(String(v))}</div>
+      </div>`;
+    }
+    html += `<div class="mt-3"><strong>Body</strong></div>
+      <pre class="task-intent-box">${escapeHtml(card.body ? D(card.body, 'card.body') : '(no body)')}</pre>`;
+    elTaskModalBody.innerHTML = html;
+    elModalTaskDetails.classList.remove('hidden');
+  }
+
+  function showCardContextMenu(x, y, card) {
+    const existing = document.getElementById('card-context-menu');
+    if (existing) existing.remove();
+    const menu = document.createElement('div');
+    menu.id = 'card-context-menu';
+    menu.style.cssText = `position:fixed;left:${x}px;top:${y}px;z-index:9999;background:var(--bg-card,#1e2430);border:1px solid var(--border,#334155);border-radius:6px;padding:4px 0;min-width:160px;box-shadow:0 4px 16px rgba(0,0,0,0.4);`;
+    const addItem = (label, fn) => {
+      const btn = document.createElement('button');
+      btn.textContent = label;
+      btn.style.cssText = 'display:block;width:100%;text-align:left;padding:6px 14px;background:none;border:none;color:inherit;cursor:pointer;font-size:13px;';
+      btn.addEventListener('click', () => { menu.remove(); fn(); });
+      menu.appendChild(btn);
+    };
+    if (card.state === 'planned') {
+      addItem('Run card', () => {
+        sendWsRequest({ action: 'card_run', taskId: card.taskId, number: card.number });
+        setTimeout(() => { sendWsRequest({ action: 'direction_list' }); sendWsRequest({ action: 'taskqueue_list', include_planned: true }); }, 250);
+      });
+    }
+    if (card.state === 'failed' || card.state === 'closed' || card.state === 'cancelled' || card.state === 'succeeded') {
+      addItem('Redo card (rescue)', () => {
+)JS_6";
+const char kAppJs_7[] = R"JS_7(        sendWsRequest({ action: 'card_redo', taskId: card.taskId, number: card.number, run: true });
+        setTimeout(() => { sendWsRequest({ action: 'direction_list' }); sendWsRequest({ action: 'taskqueue_list', include_planned: true }); }, 250);
+      });
+    }
+    if (card.state !== 'closed') {
+      addItem('Close direction', () => {
+        sendWsRequest({ action: 'direction_close', id: card.id, result: 'ignored', reason: 'closed from webui' });
+        setTimeout(() => { sendWsRequest({ action: 'direction_list' }); sendWsRequest({ action: 'taskqueue_list', include_planned: true }); }, 250);
+      });
+    }
+    addItem('Show card body', () => openCardDetails(card.id, card.taskId));
+    document.body.appendChild(menu);
+    const closeMenu = () => { menu.remove(); document.removeEventListener('click', closeMenu); };
+    setTimeout(() => document.addEventListener('click', closeMenu), 0);
+  }
+
   function renderTaskDetailsModal(data) {
     const t = data.task || {};
     const status = data.status || {};
@@ -3130,12 +3343,12 @@ const char kAppJs_4[] = R"JS_4(          sendWsRequest({ action: 'task_list' });
     const log = Array.isArray(data.log) ? data.log : [];
     const st = status.state || t.state || 'open';
 
-    elTaskModalTitle.textContent = `Task: ${t.title || t.id || '-'}`;
+    elTaskModalTitle.textContent = `Task: ${D(t.title || '') || t.id || '-'}`;
 
     let html = '';
     const fields = [
       ['Task ID', t.id || '-'],
-      ['Title', t.title || '-'],
+      ['Title', D(t.title || '') || '-'],
       ['State', st + (status.paused ? ' (paused)' : '')],
       ['Created At', t.createdAt || '-'],
       ['Updated At', t.updatedAt || '-']
@@ -3155,7 +3368,7 @@ const char kAppJs_4[] = R"JS_4(          sendWsRequest({ action: 'task_list' });
     }
 
     html += `<div class="mt-3"><strong>Intent</strong></div>
-      <pre class="task-intent-box">${escapeHtml(t.intent || '(none)')}</pre>`;
+      <pre class="task-intent-box">${escapeHtml(t.intent ? D(t.intent) : '(none)')}</pre>`;
 
     html += `<div class="mt-3"><strong>Jobs (${jobs.length})</strong></div>`;
     if (jobs.length === 0) {
@@ -3278,7 +3491,7 @@ const char kAppJs_4[] = R"JS_4(          sendWsRequest({ action: 'task_list' });
   }
 
   function updateAgentOverview(agentData) {
-    elMonitorAgentStatus.textContent = agentData.status || agentData.agent_type || 'Active';
+    elMonitorAgentStatus.textContent = agentData.status || agentData.engine || agentData.agent_type || 'Active';
     elMonitorAgentStatus.className = 'badge ' + getBadgeClass(agentData.status);
     elInputAgentGoal.value = agentData.supervisor_goal || agentData.goal || '';
     elInputAgentNotes.value = agentData.supervisor_notes || agentData.notes || '';
@@ -3313,7 +3526,8 @@ const char kAppJs_4[] = R"JS_4(          sendWsRequest({ action: 'task_list' });
           <span class="text-muted font-mono" style="font-size:0.75rem;">${timeStr}</span>
         </div>
         <div class="event-card-body">${escapeHtml(payloadStr)}</div>
-      </div>`;
+)JS_7";
+const char kAppJs_8[] = R"JS_8(      </div>`;
     }
 
     elMonitorEventsList.innerHTML = html;
@@ -3424,8 +3638,7 @@ const char kAppJs_4[] = R"JS_4(          sendWsRequest({ action: 'task_list' });
     const keys = Object.keys(classes);
 
     if (keys.length === 0) {
-)JS_4";
-const char kAppJs_5[] = R"JS_5(      elDiagClassesContainer.innerHTML = '<div class="empty-message">No failure categories currently reported.</div>';
+      elDiagClassesContainer.innerHTML = '<div class="empty-message">No failure categories currently reported.</div>';
       return;
     }
 
@@ -3554,7 +3767,7 @@ const char kAppJs_5[] = R"JS_5(      elDiagClassesContainer.innerHTML = '<div cl
       const id = escapeHtml(rec.id || '-');
       const job = escapeHtml(rec.jobName || rec.taskqueue || '-');
       const outcome = escapeHtml(rec.outcome || rec.status || '-');
-      const summary = escapeHtml(rec.summary || rec.title || rec.text || '-');
+      const summary = escapeHtml(D(rec.summary || rec.title || rec.text || '-'));
       const created = formatTime(rec.createdAt || rec.created);
 
       const isL2 = kind === 'l2';
@@ -3565,7 +3778,8 @@ const char kAppJs_5[] = R"JS_5(      elDiagClassesContainer.innerHTML = '<div cl
         <td>${job}</td>
         <td>${outcome}</td>
         <td class="job-cmd" title="${summary}">${summary}</td>
-        <td>${created}</td>
+)JS_8";
+const char kAppJs_9[] = R"JS_9(        <td>${created}</td>
         <td style="text-align: center;">
           <button class="btn btn-sm btn-mem-view" data-id="${id}">View</button>
           ${isL2 ? `
@@ -3745,8 +3959,7 @@ const char kAppJs_5[] = R"JS_5(      elDiagClassesContainer.innerHTML = '<div cl
   });
 
   elBtnProcResetIds.addEventListener('click', () => {
-)JS_5";
-const char kAppJs_6[] = R"JS_6(    if (confirm('Reset process IDs? (Only applies when no processes are active)')) {
+    if (confirm('Reset process IDs? (Only applies when no processes are active)')) {
       sendWsRequest({ action: 'reset_ids' });
       setTimeout(() => sendWsRequest({ action: 'list' }), 200);
     }
@@ -3817,7 +4030,8 @@ const char kAppJs_6[] = R"JS_6(    if (confirm('Reset process IDs? (Only applies
   });
 
   elBtnTqPurge.addEventListener('click', () => {
-    if (confirm('Purge completed, failed, and cancelled jobs from queue?')) {
+)JS_9";
+const char kAppJs_10[] = R"JS_10(    if (confirm('Purge completed, failed, and cancelled jobs from queue?')) {
       sendWsRequest({ action: 'taskqueue_purge', taskqueue: '', states: ['completed', 'failed', 'cancelled'] });
       setTimeout(() => sendWsRequest({ action: 'taskqueue_list', include_planned: true }), 300);
     }
@@ -3935,17 +4149,538 @@ const char kAppJs_6[] = R"JS_6(    if (confirm('Reset process IDs? (Only applies
     }
   });
 
+  // --- Display language (card 106-4) ---
+  // Fixed strings are translated by key (the English text). Free text (job summaries, task and
+  // card titles, bodies, memory summaries) goes through D(), which shows the cached translation
+  // from the core (translate_get) or the original while it is pending.
+  const UI_LANGS = ['en', 'ja', 'es'];
+  const UI_LANG_KEY = 'hancho_ui_lang';
+  const uiState = { lang: 'en' };
+  let uiLangSelect = null;
+
+  const I18N = {
+    ja: {
+      'Active Agent / Process': '対象のエージェント / プロセス',
+      'Actions': '操作',
+      'Agent Event Stream (hancho.event/1)': 'エージェントのイベント (hancho.event/1)',
+      'All': 'すべて',
+      'All Layers': 'すべての層',
+      'Approve': '承認',
+      'Auto-refresh': '自動更新',
+      'Blocked': 'ブロック',
+      'Cancel': 'キャンセル',
+      'Cancelled': 'キャンセル済み',
+      'Card Number': 'カード番号',
+      'Clear Finished': '終了分を消去',
+      'Close': '閉じる',
+      'Command': 'コマンド',
+      'Command Line: *': 'コマンドライン: *',
+      'Connected': '接続済み',
+      'Connecting...': '接続中...',
+      'Core': 'コア',
+      'Cost': 'コスト',
+      'Created': '作成',
+      'Created At': '作成日時',
+      'Date / Time': '日時',
+      'Direction ID': 'Direction ID',
+      'Disconnected': '切断中',
+      'Display language': '表示言語',
+      'Dry run only (calculate space without deleting)': '試し実行のみ（削除せず容量だけ計算）',
+      'Duration': '所要時間',
+      'End time': '終了時刻',
+      'Ended': '終了',
+      'Errors': 'エラー',
+      'Estimated Cost': '推定コスト',
+      'Execute Prune': '整理を実行',
+      'Execution Mode': '実行モード',
+      'Exit': '終了コード',
+      'Failed': '失敗',
+      'Failed Jobs & Process Diagnoses': '失敗したジョブとプロセスの診断',
+      'Failure Diagnosis': '失敗の診断',
+      'Finished': '完了',
+      'Goal': '目標',
+      'Hancho Dashboard': 'Hancho ダッシュボード',
+      'Hierarchical Memory Storage (L1 Runs / L2 Notes / L3 Knowledge)': '階層メモリ（L1 実行記録 / L2 ノート / L3 知識）',
+      'ID': 'ID',
+      'Inputs': '入力',
+      'Intent': '意図',
+      'Job / Queue': 'ジョブ / キュー',
+      'Job Details': 'ジョブの詳細',
+      'Job Key / ID': 'ジョブのキー / ID',
+      'Jobs': 'ジョブ',
+      'Kill All': 'すべて停止',
+      'L1 Runs': 'L1 実行記録',
+      'L2 Notes': 'L2 ノート',
+      'L3 Knowledge': 'L3 知識',
+      'Last 24 Hours': '直近 24 時間',
+      'Last run': '最終実行',
+      'Last run details': '最終実行の詳細',
+      'Layer': '層',
+      'Loading memory records...': 'メモリの記録を読み込み中...',
+      'Loading output...': '出力を読み込み中...',
+      'Loading processes...': 'プロセスを読み込み中...',
+      'Loading routines...': 'ルーチンを読み込み中...',
+      'Loading task queue...': 'タスクキューを読み込み中...',
+      'Memory': 'メモリ',
+      'Memory Record': 'メモリの記録',
+      'Model': 'モデル',
+      'Monitor': 'モニター',
+      'Name': '名前',
+      'Name / Command': '名前 / コマンド',
+      'No failure statistics available.': '失敗の統計はありません。',
+      'No failures currently detected. Everything is running smoothly!': '現在、失敗は検出されていません。',
+      'No usage data recorded.': '使用量の記録がありません。',
+      'Normal': '通常',
+      'Outcome': '結果',
+      'Output Tokens': '出力トークン',
+      'PID': 'PID',
+      'PTY (pseudo-terminal)': 'PTY（擬似端末）',
+      'Pause Queue': 'キューを一時停止',
+      'Pending': '保留',
+      'Pipe (standard I/O)': 'パイプ（標準入出力）',
+      'Process / Job Name': 'プロセス / ジョブ名',
+      'Process Terminal & Logs': 'プロセスの端末とログ',
+      'Processes': 'プロセス',
+      'Progress': '進捗',
+      'Prompt Tokens': '入力トークン',
+      'Prune L1 Records': 'L1 記録を整理',
+      'Prune L1 Run Records': 'L1 実行記録を整理',
+      'Purge Finished': '終了分を削除',
+      'Queue': 'キュー',
+      'Queue Failure Classification (Why Did It Fail?)': 'キューの失敗分類（なぜ失敗したか）',
+      'Quota Status': '割り当ての状態',
+      'Reconnect Now': '今すぐ再接続',
+      'Record ID': '記録 ID',
+      'Refresh': '更新',
+      'Refresh Diagnosis': '診断を更新',
+      'Refresh state': '状態を更新',
+      'Reject': '却下',
+      'Repeated Failures': '繰り返した失敗',
+      'Reset IDs': 'ID を振り直す',
+      'Resource Locks': 'リソースロック',
+      'Resume Queue': 'キューを再開',
+)JS_10";
+const char kAppJs_11[] = R"JS_11(      'Retention (days)': '保持期間（日）',
+      'Retry': '再試行',
+      'Routines': 'ルーチン',
+      'Running': '実行中',
+      'Save Info': '情報を保存',
+      'Select a routine to see its node results.': 'ルーチンを選ぶと、ノードの結果を表示します。',
+      'Select a running agent to view events.': 'イベントを見るには実行中のエージェントを選んでください。',
+      'Send': '送信',
+      'Start New Process': '新しいプロセスを開始',
+      'Start Process': 'プロセスを開始',
+      'Started': '開始',
+      'State': '状態',
+      'Succeeded': '成功',
+      'Summary': '概要',
+      'Summary / Key Insights': '概要 / 要点',
+      'Supervisor Notes': 'supervisor のメモ',
+      'Task': 'タスク',
+      'Task Details': 'タスクの詳細',
+      'Task ID': 'タスク ID',
+      'Task Queue': 'タスクキュー',
+      'Tasks': 'タスク',
+      'Template': 'テンプレート',
+      'Thinking': '思考',
+      'Timeout (seconds)': 'タイムアウト（秒）',
+      'Tokens': 'トークン',
+      'Tools': 'ツール',
+      'Total Jobs': 'ジョブ総数',
+      'Total Storage': '総使用量',
+      'Total Tokens': 'トークン総数',
+      'Updated': '更新',
+      'Updated At': '更新日時',
+      'Usage & Cost Analytics': '使用量とコストの分析',
+      'Waiting': '待機中',
+      'Waiting For': '待ち対象',
+      'Working Directory': '作業ディレクトリ',
+      'Body': '本文',
+      'Title': 'タイトル'
+    },
+    es: {
+      'Active Agent / Process': 'Agente / proceso activo',
+      'Actions': 'Acciones',
+      'Agent Event Stream (hancho.event/1)': 'Flujo de eventos del agente (hancho.event/1)',
+      'All': 'Todos',
+      'All Layers': 'Todas las capas',
+      'Approve': 'Aprobar',
+      'Auto-refresh': 'Actualización automática',
+      'Blocked': 'Bloqueado',
+      'Body': 'Cuerpo',
+      'Cancel': 'Cancelar',
+      'Cancelled': 'Cancelado',
+      'Card Number': 'Número de tarjeta',
+      'Clear Finished': 'Limpiar terminados',
+      'Close': 'Cerrar',
+      'Command': 'Comando',
+      'Command Line: *': 'Línea de comandos: *',
+      'Connected': 'Conectado',
+      'Connecting...': 'Conectando...',
+      'Core': 'Núcleo',
+      'Cost': 'Coste',
+      'Created': 'Creado',
+      'Created At': 'Creado el',
+      'Date / Time': 'Fecha / hora',
+      'Direction ID': 'ID de dirección',
+      'Disconnected': 'Desconectado',
+      'Display language': 'Idioma de la interfaz',
+      'Dry run only (calculate space without deleting)': 'Solo simulación (calcular el espacio sin borrar)',
+      'Duration': 'Duración',
+      'End time': 'Hora de fin',
+      'Ended': 'Terminado',
+      'Errors': 'Errores',
+      'Estimated Cost': 'Coste estimado',
+      'Execute Prune': 'Ejecutar limpieza',
+      'Execution Mode': 'Modo de ejecución',
+      'Exit': 'Salida',
+      'Failed': 'Fallido',
+      'Failed Jobs & Process Diagnoses': 'Trabajos fallidos y diagnósticos de procesos',
+      'Failure Diagnosis': 'Diagnóstico de fallos',
+      'Finished': 'Finalizado',
+      'Goal': 'Objetivo',
+      'Hancho Dashboard': 'Panel de Hancho',
+      'Hierarchical Memory Storage (L1 Runs / L2 Notes / L3 Knowledge)': 'Memoria jerárquica (ejecuciones L1 / notas L2 / conocimiento L3)',
+      'ID': 'ID',
+      'Inputs': 'Entradas',
+      'Intent': 'Intención',
+      'Job / Queue': 'Trabajo / cola',
+      'Job Details': 'Detalles del trabajo',
+      'Job Key / ID': 'Clave / ID del trabajo',
+      'Jobs': 'Trabajos',
+      'Kill All': 'Detener todos',
+      'L1 Runs': 'Ejecuciones L1',
+      'L2 Notes': 'Notas L2',
+      'L3 Knowledge': 'Conocimiento L3',
+      'Last 24 Hours': 'Últimas 24 horas',
+      'Last run': 'Última ejecución',
+      'Last run details': 'Detalles de la última ejecución',
+      'Layer': 'Capa',
+      'Loading memory records...': 'Cargando registros de memoria...',
+      'Loading output...': 'Cargando salida...',
+      'Loading processes...': 'Cargando procesos...',
+      'Loading routines...': 'Cargando rutinas...',
+      'Loading task queue...': 'Cargando cola de tareas...',
+      'Memory': 'Memoria',
+      'Memory Record': 'Registro de memoria',
+      'Model': 'Modelo',
+      'Monitor': 'Monitor',
+      'Name': 'Nombre',
+      'Name / Command': 'Nombre / comando',
+      'No failure statistics available.': 'No hay estadísticas de fallos.',
+      'No failures currently detected. Everything is running smoothly!': 'No se detectan fallos. ¡Todo funciona bien!',
+      'No usage data recorded.': 'No hay datos de uso registrados.',
+      'Normal': 'Normal',
+      'Outcome': 'Resultado',
+      'Output Tokens': 'Tokens de salida',
+      'PID': 'PID',
+      'PTY (pseudo-terminal)': 'PTY (pseudoterminal)',
+      'Pause Queue': 'Pausar cola',
+      'Pending': 'Pendiente',
+      'Pipe (standard I/O)': 'Tubería (E/S estándar)',
+      'Process / Job Name': 'Proceso / nombre del trabajo',
+      'Process Terminal & Logs': 'Terminal y registros del proceso',
+      'Processes': 'Procesos',
+      'Progress': 'Progreso',
+      'Prompt Tokens': 'Tokens de entrada',
+      'Prune L1 Records': 'Limpiar registros L1',
+      'Prune L1 Run Records': 'Limpiar registros de ejecución L1',
+      'Purge Finished': 'Purgar terminados',
+      'Queue': 'Cola',
+      'Queue Failure Classification (Why Did It Fail?)': 'Clasificación de fallos de la cola (¿por qué falló?)',
+      'Quota Status': 'Estado de la cuota',
+      'Reconnect Now': 'Reconectar ahora',
+      'Record ID': 'ID del registro',
+      'Refresh': 'Actualizar',
+      'Refresh Diagnosis': 'Actualizar diagnóstico',
+      'Refresh state': 'Actualizar estado',
+      'Reject': 'Rechazar',
+      'Repeated Failures': 'Fallos repetidos',
+      'Reset IDs': 'Reiniciar IDs',
+      'Resource Locks': 'Bloqueos de recursos',
+      'Resume Queue': 'Reanudar cola',
+      'Retention (days)': 'Retención (días)',
+      'Retry': 'Reintentar',
+      'Routines': 'Rutinas',
+      'Running': 'En ejecución',
+      'Save Info': 'Guardar información',
+      'Select a routine to see its node results.': 'Selecciona una rutina para ver los resultados de sus nodos.',
+      'Select a running agent to view events.': 'Selecciona un agente en ejecución para ver sus eventos.',
+      'Send': 'Enviar',
+      'Start New Process': 'Iniciar nuevo proceso',
+      'Start Process': 'Iniciar proceso',
+      'Started': 'Iniciado',
+      'State': 'Estado',
+      'Succeeded': 'Correcto',
+      'Summary': 'Resumen',
+      'Summary / Key Insights': 'Resumen / puntos clave',
+      'Supervisor Notes': 'Notas del supervisor',
+      'Task': 'Tarea',
+      'Task Details': 'Detalles de la tarea',
+      'Task ID': 'ID de tarea',
+      'Task Queue': 'Cola de tareas',
+      'Tasks': 'Tareas',
+      'Template': 'Plantilla',
+      'Thinking': 'Razonamiento',
+      'Timeout (seconds)': 'Tiempo límite (segundos)',
+      'Title': 'Título',
+      'Tokens': 'Tokens',
+      'Tools': 'Herramientas',
+      'Total Jobs': 'Trabajos totales',
+      'Total Storage': 'Almacenamiento total',
+      'Total Tokens': 'Tokens totales',
+      'Updated': 'Actualizado',
+      'Updated At': 'Actualizado el',
+      'Usage & Cost Analytics': 'Análisis de uso y coste',
+      'Waiting': 'En espera',
+      'Waiting For': 'Esperando',
+      'Working Directory': 'Directorio de trabajo',
+      'Intent': 'Intención'
+    }
+  };
+
+  function browserUiLang() {
+    const langs = (navigator.languages && navigator.languages.length) ? navigator.languages : [navigator.language || 'en'];
+    for (const l of langs) {
+      const code = String(l || '').slice(0, 2).toLowerCase();
+      if (UI_LANGS.includes(code)) return code;
+    }
+    return 'en';
+  }
+
+  function loadUiLang() {
+    let saved = '';
+    try { saved = localStorage.getItem(UI_LANG_KEY) || ''; } catch (e) {}
+    return UI_LANGS.includes(saved) ? saved : browserUiLang();
+  }
+
+  function T(text) {
+    const dict = uiState.lang === 'en' ? null : I18N[uiState.lang];
+    return (dict && dict[text]) || text;
+  }
+
+  // The fixed string for orig (untrimmed). A trailing colon is kept, so "Task ID:" uses "Task ID".
+  function translateFixed(orig) {
+    const en = orig.trim();
+    if (!en || uiState.lang === 'en') return orig;
+    let base = en;
+    let colon = '';
+    if (base.endsWith(':')) {
+      base = base.slice(0, -1).trim();
+      colon = ':';
+    }
+    const out = T(base);
+    if (out === base) return orig;
+    return orig.replace(en, () => out + colon);
+  }
+
+  const I18N_ATTRS = ['placeholder', 'title', 'aria-label'];
+  const i18nTextRecs = new WeakMap();
+  const i18nAttrRecs = new WeakMap();
+  let fixedI18nActive = false;
+  let fixedI18nFrame = 0;
+
+  // Walks the page and sets each text node and label attribute to the current language.
+  // Each node keeps its English original, so switching back to English restores it.
+  function applyFixedI18n() {
+    const root = document.body;
+)JS_11";
+const char kAppJs_12[] = R"JS_12(    if (!root) return;
+    const walker = document.createTreeWalker(root, NodeFilter.SHOW_TEXT, {
+      acceptNode(node) {
+        const p = node.parentNode;
+        return (p && /^(SCRIPT|STYLE|PRE|TEXTAREA|CODE)$/.test(p.nodeName)) ? NodeFilter.FILTER_REJECT : NodeFilter.FILTER_ACCEPT;
+      }
+    });
+    const nodes = [];
+    while (walker.nextNode()) nodes.push(walker.currentNode);
+    for (const node of nodes) {
+      const current = node.nodeValue;
+      const rec = i18nTextRecs.get(node);
+      const orig = (rec && rec.set === current) ? rec.orig : current;
+      const next = translateFixed(orig);
+      if (next !== current) node.nodeValue = next;
+      i18nTextRecs.set(node, { orig: orig, set: next });
+    }
+    for (const el of root.querySelectorAll('[placeholder],[title],[aria-label]')) {
+      let recs = i18nAttrRecs.get(el);
+      if (!recs) {
+        recs = {};
+        i18nAttrRecs.set(el, recs);
+      }
+      for (const attr of I18N_ATTRS) {
+        if (!el.hasAttribute(attr)) continue;
+        const cur = el.getAttribute(attr);
+        const r = recs[attr];
+        const orig = (r && r.set === cur) ? r.orig : cur;
+        const next = translateFixed(orig);
+        if (next !== cur) el.setAttribute(attr, next);
+        recs[attr] = { orig: orig, set: next };
+      }
+    }
+    fixedI18nActive = uiState.lang !== 'en';
+  }
+
+  // Re-applies the fixed strings after the page re-renders (throttled to one pass per frame).
+  function scheduleFixedI18n() {
+    if (!fixedI18nActive) return;
+    if (fixedI18nFrame) return;
+    fixedI18nFrame = requestAnimationFrame(function() {
+      fixedI18nFrame = 0;
+      applyFixedI18n();
+    });
+  }
+
+  function startFixedI18nObserver() {
+    if (!window.MutationObserver) return;
+    const observer = new MutationObserver(scheduleFixedI18n);
+    observer.observe(document.body, {
+      childList: true,
+      subtree: true,
+      characterData: true,
+      attributes: true,
+      attributeFilter: I18N_ATTRS
+    });
+  }
+
+  function buildUiLangSelect() {
+    const sel = document.createElement('select');
+    sel.id = 'select-ui-lang';
+    sel.className = 'ui-lang-select';
+    sel.title = 'Display language';
+    sel.setAttribute('aria-label', 'Display language');
+    for (const [code, label] of [['en', 'English'], ['ja', '日本語'], ['es', 'Español']]) {
+      const opt = document.createElement('option');
+      opt.value = code;
+      opt.textContent = label;
+      sel.appendChild(opt);
+    }
+    sel.value = uiState.lang;
+    sel.addEventListener('change', function() { setUiLang(this.value); });
+    if (elStatusDot && elStatusDot.parentElement) {
+      elStatusDot.parentElement.insertBefore(sel, elStatusDot);
+    }
+    uiLangSelect = sel;
+  }
+
+  function setUiLang(lang) {
+    if (!UI_LANGS.includes(lang) || lang === uiState.lang) return;
+    uiState.lang = lang;
+    try { localStorage.setItem(UI_LANG_KEY, lang); } catch (e) {}
+    document.documentElement.lang = lang;
+    if (uiLangSelect) uiLangSelect.value = lang;
+    applyFixedI18n();
+    refreshTranslatedViews();
+  }
+
+  // Free text: translate_get through the core, one batch per language and field.
+  const TR_BATCH = 50;
+  const TR_RETRY_MS = 3000;
+  const TR_MAX_ATTEMPTS = 20;
+  const trCache = new Map();    // lang + text -> the text to show (a translation, or the original)
+  const trPending = new Map();  // key -> entry waiting to be sent
+  const trWaiting = new Map();  // key -> entry sent and not answered yet
+  let trFlushTimer = null;
+
+  function trKey(lang, text) {
+    return lang + '\u001f' + text;
+  }
+
+  // The text to show for a free-text value. English shows the original. Otherwise a cached
+  // translation is shown; a missing one is queued and the original is shown until it arrives.
+  function D(text, field) {
+    if (typeof text !== 'string' || text === '') return text || '';
+    const lang = uiState.lang;
+    if (lang === 'en' || !/\p{L}/u.test(text)) return text;
+    const key = trKey(lang, text);
+    const cached = trCache.get(key);
+    if (cached !== undefined) return cached;
+    if (!trPending.has(key) && !trWaiting.has(key)) {
+      trPending.set(key, { key: key, lang: lang, text: text, field: field || '', attempts: 0 });
+      scheduleTranslateFlush(300);
+    }
+    return text;
+  }
+
+  function scheduleTranslateFlush(delay) {
+    if (trFlushTimer) return;
+    trFlushTimer = setTimeout(flushTranslate, delay);
+  }
+
+  function releaseWaiting(entry) {
+    if (trWaiting.get(entry.key) !== entry) return;
+    trWaiting.delete(entry.key);
+    trPending.set(entry.key, entry);
+    scheduleTranslateFlush(0);
+  }
+
+  function flushTranslate() {
+    trFlushTimer = null;
+    if (!state.connected || trPending.size === 0) return;
+    const groups = new Map();
+    let count = 0;
+    for (const [key, entry] of trPending) {
+      if (count >= TR_BATCH) break;
+      trPending.delete(key);
+      count++;
+      if (entry.attempts >= TR_MAX_ATTEMPTS) {
+        trCache.set(key, entry.text);
+        continue;
+      }
+      entry.attempts++;
+      trWaiting.set(key, entry);
+      setTimeout(function() { releaseWaiting(entry); }, TR_RETRY_MS);
+      const gk = entry.lang + '\u001f' + entry.field;
+      if (!groups.has(gk)) groups.set(gk, { lang: entry.lang, field: entry.field, texts: [] });
+      groups.get(gk).texts.push(entry.text);
+    }
+    for (const g of groups.values()) {
+      const req = { action: 'translate_get', lang: g.lang, texts: g.texts };
+      if (g.field) req.field = g.field;
+      sendWsRequest(req);
+    }
+    if (trPending.size > 0) scheduleTranslateFlush(50);
+  }
+
+  // The core's answer to translate_get: {ok, lang, revision, enabled, items: [{text, translated, state}]}.
+  function handleTranslateResponse(data) {
+    const lang = data.lang;
+    let changed = false;
+    for (const item of data.items) {
+      if (!item || typeof item.text !== 'string') continue;
+      const key = trKey(lang, item.text);
+      if (item.state === 'pending' || item.state === 'unavailable') continue;
+      trWaiting.delete(key);
+      const shown = (item.state === 'translated' && typeof item.translated === 'string' && item.translated)
+        ? item.translated : item.text;
+      trCache.set(key, shown);
+      if (shown !== item.text) changed = true;
+    }
+    if (changed) refreshTranslatedViews();
+  }
+
+  // Redraws the visible tab so that cached translations appear.
+  function refreshTranslatedViews() {
+    if (state.activeTab === 'taskqueue') renderTaskQueueTable();
+    else if (state.activeTab === 'memory') renderMemoryTable();
+    scheduleFixedI18n();
+  }
+
   // --- Initialize ---
+  uiState.lang = loadUiLang();
+  document.documentElement.lang = uiState.lang;
+  buildUiLangSelect();
+  applyFixedI18n();
+  startFixedI18nObserver();
   setupAutoRefresh();
   connectWs();
 })();
-)JS_6";
+)JS_12";
+
 static const std::string& GetAppJs() {
-    static const std::string s = std::string(kAppJs_0) + kAppJs_1 + kAppJs_2 + kAppJs_3 + kAppJs_3b + kAppJs_4 + kAppJs_5 + kAppJs_6;
+    static const std::string s = std::string(kAppJs_0) + kAppJs_1 + kAppJs_2 + kAppJs_3 + kAppJs_4 + kAppJs_5 + kAppJs_6 + kAppJs_7 + kAppJs_8 + kAppJs_9 + kAppJs_10 + kAppJs_11 + kAppJs_12;
     return s;
 }
-
-
 
 const char kIconSvg[] = R"SVG(<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 32 32" fill="none">
   <rect width="32" height="32" rx="6" fill="#1e1e28"/>

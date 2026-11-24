@@ -134,5 +134,5 @@ task  タスク一覧の作り直し
 
 - skill に supervisor の手順を書く: 大きな依頼は `task create` → カードを `card add`（または `card import`）→ `card run --ready` → 終わったら次の `--ready`。判断と理由は `task note`。カードを 1 本の BT に詰めない。
 - `doc/terminology.md` の「direction のレコード」の「案（未決定）」を決定に変える。
-- 0.10 の作業そのものを Hancho に入れる: task「0.10.0」を作り、`doc/task-list-redesign-cards.md`（102-x、102-1 は除く）、`doc/direction-cards.md`（103-x の残り）を `card import` で取り込む。取り込んだあとの進み具合は Hancho の `card list` で見て、`doc/` の文書の状態の表は更新しない（文書には「Hancho の task <id> を見る」と書く）。
+- 0.10 の作業そのものを Hancho に入れる: task「0.10.0」を作り、`doc/task-list-redesign-cards.md`（102-x、102-1 は除く）、`doc/direction-cards.md`（103-x の残り）、`doc/ci-cards.md`（105-x）、`doc/i18n-cards.md`（106-x）を `card import` で取り込む。取り込んだあとの進み具合は Hancho の `card list` で見て、`doc/` の文書の状態の表は更新しない（文書には「Hancho の task <id> を見る」と書く）。
 - テスト: help に `card` の操作が出る、skill の例が `bt validate` を通る。

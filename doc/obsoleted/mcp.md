@@ -46,7 +46,8 @@ You can also run the server directly with `Hancho.exe mcp`. It connects to the d
 
 | Tool | Description |
 | :--- | :--- |
-| `task_create` | Create a task record (`title` max 200 bytes, optional `intent` max 16 KB, optional `id` starting with `task_`, optional `originLabel`). Returns the task id. |
+| `task_create` | Create a task record (`title` max 200 bytes, optional `intent` max 16 KB, optional `id` starting with `task_`, optional `cardDefaults`, optional `originLabel`). Returns the task id. |
+| `task_update` | Update a task's `title`, `intent`, or `cardDefaults` (`id`). |
 | `task_show` | Show a task record, computed state, jobs/lineages, and recent progress log entries (`id`, optional `logLimit` default 200). |
 | `task_list` | List task records with computed state (`state?`: `open`\|`running`\|`failed`\|`cancelled`\|`succeeded`\|`closed`, `limit?`). |
 | `task_note` | Append a note to a task's progress log (`id`, `text` max 4 KB). |
@@ -54,6 +55,18 @@ You can also run the server directly with `Hancho.exe mcp`. It connects to the d
 | `task_reopen` | Reopen a closed task (`id`, `reason` max 2000 bytes). |
 | `task_purge` | Remove closed task records older than `olderThanSec` seconds. |
 | `task_wait` | Wait until all active jobs of a task finish or `timeoutMs` elapses, then return the `task_show` payload (`id`, `timeoutMs?`, `logLimit?`). |
+
+**Task card tools**
+
+| Tool | Description |
+| :--- | :--- |
+| `card_add` | Add a planned task card (direction) to an active task (`taskId`, `number`, `title`, `body?` max 64 KB, `after?`, `template?` default `card`, `params?`). |
+| `card_list` | List task cards in a task sorted by card number, with state and `waitingFor` dependencies (`taskId`; body omitted). |
+| `card_show` | Show a task card by card number or direction id, including its body, dependencies, and jobs (`id`, `taskId?`). |
+| `card_edit` | Edit a planned task card (`taskId`, `number`, `title?`, `body?`, `after?`, `template?`, `params?`). Fails once no longer `planned`. |
+| `card_remove` | Remove a planned task card from a task (`taskId`, `number`). Fails once no longer `planned`. |
+| `card_run` | Run a planned task card (`number`) or dependency-satisfied cards (`ready: true`, `max?` default 1) by instantiating its BT template and promoting its direction (`taskId`, `force?`, `originLabel?`). |
+| `card_redo` | Create a rescue card (`<number>-r<n>`) superseding a failed, cancelled, or closed card (`taskId`, `number`, `body?`, `params?`, `reason?`, `run?`, `force?`, `originLabel?`). |
 
 **Task queue tools**
 

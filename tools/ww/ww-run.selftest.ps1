@@ -377,6 +377,12 @@ Check ($jobWithProv.engine_switch -eq $true) "job carries engine_switch=true"
 Check ((Get-LimitHint "error: HTTP 429 Too Many Requests") -ne $null) "Get-LimitHint detects 429"
 Check ((Get-LimitHint "insufficient_quota: you exceeded your current quota") -ne $null) "Get-LimitHint detects quota"
 Check ($null -eq (Get-LimitHint "syntax error at line 42")) "Get-LimitHint returns null for normal failure"
+# 102-4: structured classes from the event stream, and the token-expiry text fallback.
+Check ((Get-LimitHint '{"kind":"error","data":{"message":"Your session has expired","class":"auth_error","httpStatus":401}}') -eq "structured:auth_error") "Get-LimitHint reads structured auth_error"
+$multiLine = "some log line`n" + '{"kind":"error","data":{"message":"429","class":"rate_limited","httpStatus":429}}'
+Check ((Get-LimitHint $multiLine) -eq "structured:rate_limited") "Get-LimitHint reads structured rate_limited from a multi-line tail"
+Check ((Get-LimitHint '{"kind":"error","data":{"message":"quota","class":"provider_down"}}') -eq "structured:provider_down") "structured class outranks quota wording"
+Check ((Get-LimitHint "Error: token has expired, please sign in again") -ne $null) "Get-LimitHint detects token expiry wording"
 
 $llmTestDir = Join-Path $base "llm-test"
 New-Item -ItemType Directory -Force $llmTestDir | Out-Null

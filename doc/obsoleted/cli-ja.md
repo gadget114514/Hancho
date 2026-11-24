@@ -128,7 +128,8 @@ hancho-cli.exe run --file jobs.json --exit-on-drain --count-superseded
 **タスク（意図と経過ログでジョブ・BT をまとめる）:**
 
 ```powershell
-hancho-cli.exe task create --title "認証バグ修正" --intent "トークン更新の不具合を修正する" --json
+hancho-cli.exe task create --title "認証バグ修正" --intent "トークン更新の不具合を修正する" --card-defaults '{"build":"cmake --build build","test":"ctest --test-dir build"}' --json
+hancho-cli.exe task update task_1 --card-defaults '{"build":"cmake --build build --config Release"}'
 hancho-cli.exe taskqueue add --file jobs.json --taskqueue main --task task_1
 hancho-cli.exe bt start --file plan.json --task task_1
 hancho-cli.exe task note task_1 --text "ログ確認後、リフレッシュ再試行方式に変更"
@@ -142,6 +143,21 @@ hancho-cli.exe task purge --older-than 604800
 ```
 
 タスクのレコードは `<data-dir>/tasks/`（`<id>.json` と `<id>.log.jsonl`）に保存されます。タスクの状態（`open`, `running`, `failed`, `cancelled`, `succeeded`, `closed`）は、明示的に閉じられていない限り、中の各系譜の最新ジョブから計算されます。`run --exit-on-drain` も既定では系譜基準（`superseded_by` を持つジョブを除外）で判定し、`--count-superseded` を付けると従来の全ジョブ基準になります。
+
+**タスクカード（task 内の `planned` な direction）:**
+
+```powershell
+hancho-cli.exe card add --task task_1 --number 102-3 --title "カード一覧を追加" --body-file card.md --after 102-2
+hancho-cli.exe card list --task task_1
+hancho-cli.exe card show 102-3 --task task_1
+hancho-cli.exe card edit 102-3 --task task_1 --body-file card_v2.md
+hancho-cli.exe card run --ready --task task_1 --max 1
+hancho-cli.exe card run 102-3 --task task_1
+hancho-cli.exe card redo 102-3 --task task_1 --reason "テスト期待値を修正" --run
+hancho-cli.exe card remove 102-3 --task task_1
+```
+
+カードは task 内の `planned` な direction として保存され、`card run` で雛形 `card` から BT を生成して実行します（未指定の `build` / `test` / `engines` / `cwd` はタスクの `cardDefaults` から補われます）。失敗したカードは `card redo`（`<number>-r<n>`）で救済できます。
 
 **クイック修正（小さな決定的編集）:**
 

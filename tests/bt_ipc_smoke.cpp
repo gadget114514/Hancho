@@ -6,6 +6,7 @@
 #include "common.h"
 #include "event_schema.h"
 #include "ipc_server.h"
+#include "ipmsg.h"
 #include "llm_stream.h"
 #include "nlohmann/json.hpp"
 #include "process_manager.h"
@@ -277,8 +278,8 @@ int main() {
             std::string compactStr = rGetCompact.value("compact", "");
             Check(rGetCompact.value("ok", false) && !rGetCompact.contains("tree") &&
                   compactStr.find("[succeeded] ipc-two-jobs") != std::string::npos &&
-                  compactStr.find("[succeeded] job job_a") != std::string::npos &&
-                  compactStr.find("[succeeded] job job_b") != std::string::npos,
+                  compactStr.find("[succeeded] exec job_a") != std::string::npos &&
+                  compactStr.find("[succeeded] exec job_b") != std::string::npos,
                   "bt_get compact includes one-line-per-node compact representation");
 
             json rList = h.Call({{"action", "bt_list"}});
@@ -590,13 +591,36 @@ int main() {
             if (id > 0) {
                 json v1 = h.Call({{"action", "get_agent_stream"}, {"id", id}, {"schema", "v1"}, {"tail", 0}});
                 Check(v1.value("ok", false) && v1.value("schema", "") == "hancho.event/1" &&
+                          v1.value("engine", "") == "claude" && v1.value("agent_type", "") == "claude" &&
                           v1.contains("events") && v1["events"].is_array() && !v1["events"].empty() &&
                           v1["events"][0].value("kind", "") == "message",
-                      "IPC get_agent_stream schema=v1 returns hancho.event/1 events");
+                      "IPC get_agent_stream schema=v1 returns hancho.event/1 events and engine/agent_type");
+
+                json st = h.Call({{"action", "get_agent_state"}, {"id", id}});
+                Check(st.value("ok", false) && st.value("engine", "") == "claude" &&
+                          st.value("agent_type", "") == "claude",
+                      "IPC get_agent_state returns both engine and agent_type");
 
                 json legacy = h.Call({{"action", "get_agent_stream"}, {"id", id}, {"schema", "legacy"}, {"tail", 0}});
                 Check(legacy.value("ok", false) && legacy.value("schema", "") != "hancho.event/1",
                       "IPC get_agent_stream schema=legacy still returns the old shape");
+            }
+
+            // 103-7: starting with "engine" parameter works identically to "agent_type".
+            json startEng = h.Call({{"action", "start"},
+                                    {"cmd", QuoteCommandArg(WideToUtf8(batW))},
+                                    {"name", "v1_stream_engine"},
+                                    {"engine", "claude"},
+                                    {"json_stream", true},
+                                    {"wait", true},
+                                    {"wait_ms", 15000}});
+            Check(startEng.value("ok", false), "start with engine parameter succeeds");
+            int engId = startEng.value("id", 0);
+            if (engId > 0) {
+                json stEng = h.Call({{"action", "get_agent_state"}, {"id", engId}});
+                Check(stEng.value("ok", false) && stEng.value("engine", "") == "claude" &&
+                          stEng.value("agent_type", "") == "claude",
+                      "103-7: get_agent_state returns engine=claude when started with engine param");
             }
         }
 
@@ -1661,6 +1685,41 @@ int main() {
                 Check(countKind(rAfterDecide, "triage_decided") == 1 && hasTriageLog,
                       "100-3: triage_decide logs 1 triage_decided entry with candidate and reason");
             }
+        }
+    }
+
+    // 14. 103-6: Chat peer / host / flow fields and aliases
+    {
+        IpmsgNode node;
+        IpmsgConfig cfg;
+        cfg.enabled = true;
+        cfg.bind = "127.0.0.1";
+        cfg.port = 24291;
+        cfg.nickname = "test-node";
+        std::string err;
+        if (node.Start(cfg, &err)) {
+            json peers = node.Peers();
+            Check(peers.value("ok", false) && peers.contains("hosts") && peers["hosts"].is_array() &&
+                      peers.contains("peers") && peers["peers"].is_array(),
+                  "103-6: Peers() returns both hosts and peers arrays");
+
+            json s1 = node.Send("local", "hello peer", "a1", "a2", 0, {}, "peer", 0);
+            json s2 = node.Send("local", "hello agent", "a1", "a2", 0, {}, "agent", 0);
+            Check(s1.value("ok", false) && s2.value("ok", false), "103-6: local sends with peer/agent audience ok");
+            if (s1.contains("ids") && !s1["ids"].empty() && s2.contains("ids") && !s2["ids"].empty()) {
+                json g1 = node.Get(s1["ids"][0].get<uint64_t>());
+                json g2 = node.Get(s2["ids"][0].get<uint64_t>());
+                const json m1 = g1.value("message", json::object());
+                const json m2 = g2.value("message", json::object());
+                Check(m1.value("flow", "") == "local" && m1.value("direction", "") == "local",
+                      "103-6: message writes both flow and direction");
+                Check(m1.value("from_peer", "") == "a1" && m1.value("from_agent", "") == "a1" &&
+                          m1.value("to_peer", "") == "a2" && m1.value("to_agent", "") == "a2",
+                      "103-6: message writes both from_peer/from_agent and to_peer/to_agent");
+                Check(m1.value("audience", "") == m2.value("audience", ""),
+                      "103-6: audience=peer and audience=agent produce the same message audience");
+            }
+            node.Stop();
         }
     }
 

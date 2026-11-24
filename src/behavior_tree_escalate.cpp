@@ -184,14 +184,14 @@ void BehaviorTree::Impl::StartEscalateNode(BehaviorTree& bt, BtNode& node, int64
     const BtNode* failedWorker = nullptr;
     for (auto it = visitedNodes.rbegin(); it != visitedNodes.rend(); ++it) {
         const BtNode* pn = *it;
-        if (pn->type == "worker" && pn->state == "failed" &&
+        if (pn->type == "agent" && pn->state == "failed" &&
             (!pn->engineAttempts.empty() || !pn->switchStoppedReason.empty())) {
             failedWorker = pn;
             break;
         }
-        if (pn->type == "job" && pn->state == "failed" && !pn->blame.empty()) {
+        if (pn->type == "exec" && pn->state == "failed" && !pn->blame.empty()) {
             const BtNode* blamed = FindNodeConst(pn->blame, bt.id_);
-            if (blamed && blamed->type == "worker" &&
+            if (blamed && blamed->type == "agent" &&
                 (!blamed->engineAttempts.empty() || !blamed->switchStoppedReason.empty())) {
                 failedWorker = blamed;
                 break;
@@ -201,7 +201,7 @@ void BehaviorTree::Impl::StartEscalateNode(BehaviorTree& bt, BtNode& node, int64
     if (!failedWorker) {
         for (auto it = visitedNodes.rbegin(); it != visitedNodes.rend(); ++it) {
             const BtNode* pn = *it;
-            if (pn->type == "worker" &&
+            if (pn->type == "agent" &&
                 (!pn->engineAttempts.empty() || !pn->switchStoppedReason.empty())) {
                 failedWorker = pn;
                 break;

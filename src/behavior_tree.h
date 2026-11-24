@@ -148,7 +148,7 @@ public:
 struct BtPlannedTask {
     std::string btId;
     std::string nodeKey;
-    std::string type;       // "job" or "worker"
+    std::string type;       // "exec" or "agent"
     std::string summary;
     std::string queueName;
     std::string proposedJobId;  // job id the leaf will get when it starts
@@ -198,6 +198,7 @@ struct BtDefaults {
 struct BtWarning {
     std::string path;
     std::string code;
+    std::string alias;
     std::string message;
     std::string suggestion;
 };

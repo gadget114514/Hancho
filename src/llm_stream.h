@@ -36,6 +36,9 @@ struct LlmStreamEvent {
     std::string rateLimitStatus; // "allowed", "rejected", ...
     double rateLimitUtilization = -1.0; // share of that window used, 0..1; -1 if unknown
     int64_t rateLimitResetsAtSec = 0;
+    std::string errorClass;    // 102-1: structured class from the error object ("auth_error", "rate_limited", "provider_down"); empty if unknown
+    std::string errorCode;     // error code or type from the error object (e.g. "authentication_error")
+    int httpStatus = 0;        // HTTP status from the error object; 0 if absent
     uint64_t apiDurationMs = 0;   // Claude result duration_api_ms
     uint64_t numTurns = 0;        // Claude result num_turns
     uint64_t permissionDenials = 0; // Claude result permission_denials count
@@ -125,6 +128,9 @@ std::string DetectAgentType(const std::string& commandLine, const std::string& n
 
 // Parse a single raw JSON line emitted by claude, agy, or opencode.
 // Returns true if successfully parsed as a JSON event.
+// 102-1: maps a structured HTTP status / error code to a failure class. Returns "" when unknown.
+std::string ClassifyLlmErrorStructured(int httpStatus, const std::string& errorCode);
+
 bool ParseLlmStreamLine(const std::string& line, const std::string& defaultAgentType, LlmStreamEvent& outEvent);
 
 // Parse a raw JSON line into events. Per agent, the line is split into events by its own format:

@@ -24,6 +24,9 @@ public:
     static constexpr size_t kReasonMaxBytes = 2000;
     static constexpr size_t kIdMaxLength = 64;
     static constexpr const char* kIdPrefix = "dir_";
+    static constexpr size_t kCardNumberMaxBytes = 64;
+    static constexpr size_t kCardBodyMaxBytes = 65536;
+    static constexpr size_t kCardTemplateMaxBytes = 64;
 
     // Creates dir when needed and loads every record found there.
     void Open(const std::wstring& dir);
@@ -31,6 +34,9 @@ public:
     // An explicit id must start with "dir_", be at most 64 characters and contain only ASCII
     // letters, digits, '_' and '-'.
     static bool ValidateId(const std::string& id, std::string& outError);
+    // A card number must be non-empty, at most 64 characters, contain only ASCII letters,
+    // digits, '-', '_' and '.', and must not start with "dir_".
+    static bool ValidateCardNumber(const std::string& number, std::string& outError);
     // Fails when value is longer than maxBytes.
     static bool ValidateSize(const char* field, const std::string& value, size_t maxBytes,
                              std::string& outError);
@@ -52,6 +58,10 @@ public:
 
     // Counter that changes on every write.
     int64_t Version() const;
+    // Maximum rev across all loaded records (0 when none).
+    uint64_t MaxRev() const;
+    // Snapshot of every record with rev > sinceRev (or all records when includeZero is true).
+    std::vector<nlohmann::json> SinceRev(uint64_t sinceRev, bool includeZero = false) const;
 
 private:
     bool WriteRecordLocked(const nlohmann::json& record, std::string& outError);

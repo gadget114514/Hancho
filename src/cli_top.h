@@ -7,6 +7,7 @@
 
 #include <algorithm>
 #include <cctype>
+#include <cstdlib>
 #include <chrono>
 #include <cmath>
 #include <iomanip>
@@ -27,6 +28,112 @@
 #include <sys/ioctl.h>
 #include <signal.h>
 #endif
+
+namespace pc {
+
+// Display language of the human-readable CLI and TUI (card 106-4): --lang <en|ja|es>, else the
+// HANCHO_LANG environment variable, else en. JSON output stays original unless --lang is given,
+// in which case the translatable fields get a <field>Display sibling (cached translations only).
+
+// "en", "ja" or "es" for a valid value (case-insensitive), "" otherwise.
+inline std::string NormalizeDisplayLang(const std::string& value) {
+    std::string lang = value;
+    std::transform(lang.begin(), lang.end(), lang.begin(),
+                   [](unsigned char c) { return static_cast<char>(std::tolower(c)); });
+    if (lang == "en" || lang == "ja" || lang == "es") return lang;
+    return std::string();
+}
+
+// The language for a value, or for HANCHO_LANG when value is empty. Invalid values give en.
+inline std::string ResolveDisplayLang(const std::string& value) {
+    if (!value.empty()) {
+        const std::string lang = NormalizeDisplayLang(value);
+        return lang.empty() ? std::string("en") : lang;
+    }
+    const char* env = std::getenv("HANCHO_LANG");
+    if (env && *env) {
+        const std::string lang = NormalizeDisplayLang(env);
+        if (!lang.empty()) return lang;
+    }
+    return std::string("en");
+}
+
+// The language and flag of this process, set by RunCli from --lang / HANCHO_LANG.
+inline std::string& DisplayLangSetting() {
+    static std::string lang = "en";
+    return lang;
+}
+
+inline bool& DisplayLangExplicit() {
+    static bool given = false;
+    return given;
+}
+
+// A human-readable string for the display language. Use: CliTr(lang, ja, en, es).
+inline const char* CliTr(const std::string& lang, const char* ja, const char* en, const char* es) {
+    if (lang == "ja") return ja;
+    if (lang == "es") return es;
+    return en;
+}
+
+// The cached translation of text for lang, read from <data-dir>/translations/<lang>.json. It never
+// asks the core to translate (the CLI is one-shot and must not wait). Returns text when no
+// translation is cached, for en, or when the cached source differs from text.
+inline std::string CachedDisplayText(const std::string& text, const std::string& lang) {
+    if (text.empty() || lang == "en" || lang.empty()) return text;
+    static std::map<std::string, nlohmann::json> docs;
+    auto found = docs.find(lang);
+    if (found == docs.end()) {
+        const std::wstring path = PathJoinWide(PathJoinWide(GetEffectiveDataDirectoryWide(), L"translations"),
+                                               Utf8ToWide(lang) + L".json");
+        nlohmann::json doc = nlohmann::json::parse(ReadFileUtf8Wide(path), nullptr, false);
+        if (!doc.is_object()) doc = nlohmann::json::object();
+        found = docs.emplace(lang, std::move(doc)).first;
+    }
+    const nlohmann::json& doc = found->second;
+    if (!doc.contains("entries") || !doc["entries"].is_object()) return text;
+    const nlohmann::json& entries = doc["entries"];
+    auto entry = entries.find(Sha256Hex(text));
+    if (entry == entries.end() || !entry->is_object()) return text;
+    auto source = entry->find("source");
+    auto translated = entry->find("translated");
+    if (source == entry->end() || !source->is_string() || source->get<std::string>() != text) return text;
+    if (translated == entry->end() || !translated->is_string() || translated->get<std::string>().empty()) return text;
+    return translated->get<std::string>();
+}
+
+// The JSON response with <field>Display added to the translatable fields (title, intent, summary)
+// of the jobs, tasks, directions and cards it carries. Only when --lang was given; otherwise the
+// response is returned unchanged.
+inline std::string JsonWithDisplayFields(const std::string& respJson) {
+    if (!DisplayLangExplicit()) return respJson;
+    const std::string lang = DisplayLangSetting();
+    if (lang == "en") return respJson;
+    nlohmann::json root = nlohmann::json::parse(respJson, nullptr, false);
+    if (!root.is_object()) return respJson;
+    auto addFields = [&lang](nlohmann::json& obj) {
+        if (!obj.is_object()) return;
+        for (const char* field : {"title", "intent", "summary"}) {
+            auto it = obj.find(field);
+            if (it != obj.end() && it->is_string()) {
+                obj[std::string(field) + "Display"] = CachedDisplayText(it->get<std::string>(), lang);
+            }
+        }
+    };
+    for (const char* key : {"jobs", "tasks", "directions", "cards"}) {
+        auto it = root.find(key);
+        if (it != root.end() && it->is_array()) {
+            for (auto& element : *it) addFields(element);
+        }
+    }
+    for (const char* key : {"task", "job", "direction", "card"}) {
+        auto it = root.find(key);
+        if (it != root.end()) addFields(*it);
+    }
+    return root.dump();
+}
+
+} // namespace pc
 
 namespace pc::top {
 
@@ -81,6 +188,30 @@ inline const char* TabName(TopTab tab) {
     }
 }
 
+inline const char* TabNameL(TopTab tab, const std::string& lang) {
+    if (lang == "ja") {
+        switch (tab) {
+            case TopTab::Processes:   return "1: プロセス";
+            case TopTab::Queue:       return "2: キュー";
+            case TopTab::Monitor:     return "3: モニター";
+            case TopTab::Diagnostics: return "4: 原因";
+            case TopTab::Memory:      return "5: メモリ";
+            default:                  return "Unknown";
+        }
+    }
+    if (lang == "es") {
+        switch (tab) {
+            case TopTab::Processes:   return "1: Procesos";
+            case TopTab::Queue:       return "2: Cola";
+            case TopTab::Monitor:     return "3: Monitor";
+            case TopTab::Diagnostics: return "4: Diagnóstico";
+            case TopTab::Memory:      return "5: Memoria";
+            default:                  return "Unknown";
+        }
+    }
+    return TabName(tab);
+}
+
 // Formatting helpers
 inline std::string FormatBytes(int64_t bytes) {
     if (bytes < 0) bytes = 0;
@@ -131,6 +262,7 @@ struct TopState {
     nlohmann::json countsData;
     nlohmann::json queueData;
     nlohmann::json tasksData;
+    nlohmann::json directionsData;
     nlohmann::json monitorStream;
     nlohmann::json monitorState;
     nlohmann::json diagBreakdown;
@@ -141,6 +273,15 @@ struct TopState {
 
     bool queueGroupByTask = false;
     std::unordered_map<std::string, bool> taskExpandedOverrides;
+
+    // Display language (card 106-4) and the translated free texts (card 106-3's cache). Drawing
+    // records the texts it showed untranslated; the fetch asks the core for them.
+    std::string lang = "en";
+    mutable pc::DisplayTextCache texts;
+
+    std::string Shown(const std::string& text, const char* field = "") const {
+        return texts.Display(text, lang, field, true);
+    }
 
     void NextTab() {
         int next = (static_cast<int>(activeTab) + 1) % static_cast<int>(TopTab::Count);
@@ -483,8 +624,14 @@ inline std::vector<pc::TaskDisplayRow> BuildQueueDisplayRows(const TopState& sta
             if (t.is_object()) tasks.push_back(t);
         }
     }
+    std::vector<nlohmann::json> directions;
+    if (state.directionsData.contains("directions") && state.directionsData["directions"].is_array()) {
+        for (const auto& d : state.directionsData["directions"]) {
+            if (d.is_object()) directions.push_back(d);
+        }
+    }
     pc::TaskViewCounts counts;
-    return pc::BuildTaskDisplayRows(jobs, tasks, state.queueGroupByTask, state.taskExpandedOverrides, {}, counts);
+    return pc::BuildTaskDisplayRows(jobs, tasks, state.queueGroupByTask, state.taskExpandedOverrides, {}, counts, 8, directions);
 }
 
 inline bool GetSelectedQueueJob(const TopState& state, nlohmann::json& outJob) {
@@ -722,7 +869,7 @@ inline std::string RenderScreen(const TopState& state, int width, int height, bo
     out << " ";
     for (int i = 0; i < static_cast<int>(TopTab::Count); ++i) {
         TopTab t = static_cast<TopTab>(i);
-        std::string label = std::string(" ") + TabName(t) + " ";
+        std::string label = std::string(" ") + TabNameL(t, state.lang) + " ";
         if (t == state.activeTab) {
             out << invert(label);
         } else {
@@ -893,7 +1040,7 @@ inline std::string RenderScreen(const TopState& state, int width, int height, bo
                 if (state.queueGroupByTask) {
                     if (r.kind == pc::TaskDisplayRowKind::TaskHeading) {
                         std::string label = std::string(r.expanded ? "v " : "> ") +
-                                            (!r.taskTitle.empty() ? r.taskTitle : r.taskId);
+                                            (!r.taskTitle.empty() ? state.Shown(r.taskTitle) : r.taskId);
                         std::string countStr = std::to_string(r.jobCount) + (r.jobCount == 1 ? " job" : " jobs");
                         row << PadOrTruncate(label, 24) << " "
                             << PadOrTruncate("-", 14) << " "
@@ -903,16 +1050,43 @@ inline std::string RenderScreen(const TopState& state, int width, int height, bo
                                              static_cast<size_t>(std::max(10, width - 66)));
                     } else if (r.kind == pc::TaskDisplayRowKind::DirectionHeading) {
                         std::string indentStr(static_cast<size_t>(r.indent) * 2, ' ');
-                        std::string dirLabel = indentStr + std::string(r.expanded ? "v " : "> ") +
-                                               (!r.directionTitle.empty() ? r.directionTitle : ("direction:" + r.directionId));
-                        std::string kindCol = "dir:" + (r.directionKind.empty() ? "jobs" : r.directionKind);
-                        std::string countStr = std::to_string(r.jobCount) + (r.jobCount == 1 ? " job" : " jobs");
-                        row << PadOrTruncate(dirLabel, 24) << " "
-                            << PadOrTruncate(kindCol, 14) << " "
-                            << PadOrTruncate(r.directionState, 11) << " "
-                            << PadOrTruncate(r.resultsCompact.empty() ? "-" : r.resultsCompact, 11) << " "
-                            << PadOrTruncate(countStr + " (direction:" + r.directionId + ")",
-                                             static_cast<size_t>(std::max(10, width - 66)));
+                        if (r.isCard) {
+                            std::string prefix = r.jobCount > 0 ? std::string(r.expanded ? "v " : "> ") : "  ";
+                            std::string cardLabel = indentStr + prefix + r.cardNumber +
+                                                    (!r.directionTitle.empty() ? (" " + r.directionTitle) : "");
+                            std::string stCol = (r.directionState == "planned" && !r.waitingFor.empty())
+                                                    ? "waiting"
+                                                    : r.directionState;
+                            std::string infoCol;
+                            if (!r.waitingFor.empty()) {
+                                infoCol = "waiting:";
+                                for (size_t wi = 0; wi < r.waitingFor.size(); ++wi) {
+                                    if (wi > 0) infoCol += ",";
+                                    infoCol += " " + r.waitingFor[wi];
+                                }
+                                infoCol += " ";
+                            }
+                            if (r.jobCount > 0) {
+                                infoCol += std::to_string(r.jobCount) + (r.jobCount == 1 ? " job " : " jobs ");
+                            }
+                            infoCol += "(direction:" + r.directionId + ")";
+                            row << PadOrTruncate(cardLabel, 24) << " "
+                                << PadOrTruncate("card", 14) << " "
+                                << PadOrTruncate(stCol, 11) << " "
+                                << PadOrTruncate(r.resultsCompact.empty() ? "-" : r.resultsCompact, 11) << " "
+                                << PadOrTruncate(infoCol, static_cast<size_t>(std::max(10, width - 66)));
+                        } else {
+                            std::string dirLabel = indentStr + std::string(r.expanded ? "v " : "> ") +
+                                                   (!r.directionTitle.empty() ? r.directionTitle : ("direction:" + r.directionId));
+                            std::string kindCol = "dir:" + (r.directionKind.empty() ? "jobs" : r.directionKind);
+                            std::string countStr = std::to_string(r.jobCount) + (r.jobCount == 1 ? " job" : " jobs");
+                            row << PadOrTruncate(dirLabel, 24) << " "
+                                << PadOrTruncate(kindCol, 14) << " "
+                                << PadOrTruncate(r.directionState, 11) << " "
+                                << PadOrTruncate(r.resultsCompact.empty() ? "-" : r.resultsCompact, 11) << " "
+                                << PadOrTruncate(countStr + " (direction:" + r.directionId + ")",
+                                                 static_cast<size_t>(std::max(10, width - 66)));
+                        }
                     } else if (r.kind == pc::TaskDisplayRowKind::MoreJobs) {
                         std::string indentStr(static_cast<size_t>(std::max(1, r.indent)) * 2, ' ');
                         row << PadOrTruncate(indentStr + "... (+" + std::to_string(r.hiddenJobCount) + " older)", 24);
@@ -927,7 +1101,8 @@ inline std::string RenderScreen(const TopState& state, int width, int height, bo
                         if (dur.empty() && j.contains("durationSec")) {
                             dur = std::to_string(j["durationSec"].get<int64_t>()) + "s";
                         }
-                        std::string summary = j.value("summary", j.value("commandLine", ""));
+                        std::string summary = j.contains("summary") ? state.Shown(j.value("summary", std::string()))
+                                                     : j.value("commandLine", std::string());
                         if (!r.supersedes.empty()) summary = "[<- " + pc::ShortJobRef(r.supersedes) + "] " + summary;
                         if (!r.supersededBy.empty()) summary = "[-> " + pc::ShortJobRef(r.supersededBy) + "] " + summary;
 
@@ -941,7 +1116,7 @@ inline std::string RenderScreen(const TopState& state, int width, int height, bo
                 } else {
                     const auto& j = r.jobJson;
                     std::string jid = j.value("id", j.value("key", "-"));
-                    std::string taskCol = !r.taskTitle.empty() ? r.taskTitle
+                    std::string taskCol = !r.taskTitle.empty() ? state.Shown(r.taskTitle)
                                         : ((r.hasTaskRecord || (!r.taskId.empty() && r.taskId != jid)) ? r.taskId : "-");
                     std::string rawQueue = j.value("taskqueue", j.value("queue", "default"));
                     std::string host = GetJobHost(j);
@@ -951,7 +1126,8 @@ inline std::string RenderScreen(const TopState& state, int width, int height, bo
                     if (dur.empty() && j.contains("durationSec")) {
                         dur = std::to_string(j["durationSec"].get<int64_t>()) + "s";
                     }
-                    std::string summary = j.value("summary", j.value("commandLine", ""));
+                    std::string summary = j.contains("summary") ? state.Shown(j.value("summary", std::string()))
+                                                     : j.value("commandLine", std::string());
 
                     row << PadOrTruncate(jid, 12) << " "
                         << PadOrTruncate(taskCol, 16) << " "
@@ -989,13 +1165,35 @@ inline std::string RenderScreen(const TopState& state, int width, int height, bo
                         linesRendered++;
                     }
                 } else if (selRow.kind == pc::TaskDisplayRowKind::DirectionHeading) {
-                    out << bold("[Direction Detail: direction:" + selRow.directionId + "]")
-                        << "  Kind: " << (selRow.directionKind.empty() ? "jobs" : selRow.directionKind)
-                        << "  State: " << colorState(selRow.directionState)
-                        << "  Jobs: " << selRow.jobCount;
-                    if (!selRow.resultsCompact.empty()) out << "  Results: " << selRow.resultsCompact;
-                    out << "\n";
-                    linesRendered++;
+                    if (selRow.isCard) {
+                        const std::string stDisp = (selRow.directionState == "planned" && !selRow.waitingFor.empty())
+                                                       ? "waiting"
+                                                       : selRow.directionState;
+                        out << bold("[Card Detail: " + selRow.cardNumber + "]")
+                            << "  State: " << colorState(stDisp)
+                            << "  Direction: " << selRow.directionId;
+                        if (selRow.jobCount > 0) out << "  Jobs: " << selRow.jobCount;
+                        if (!selRow.resultsCompact.empty()) out << "  Results: " << selRow.resultsCompact;
+                        out << "\n";
+                        linesRendered++;
+                        if (!selRow.waitingFor.empty()) {
+                            out << "   Waiting for:";
+                            for (size_t wi = 0; wi < selRow.waitingFor.size(); ++wi) {
+                                if (wi > 0) out << ",";
+                                out << " " << selRow.waitingFor[wi];
+                            }
+                            out << "\n";
+                            linesRendered++;
+                        }
+                    } else {
+                        out << bold("[Direction Detail: direction:" + selRow.directionId + "]")
+                            << "  Kind: " << (selRow.directionKind.empty() ? "jobs" : selRow.directionKind)
+                            << "  State: " << colorState(selRow.directionState)
+                            << "  Jobs: " << selRow.jobCount;
+                        if (!selRow.resultsCompact.empty()) out << "  Results: " << selRow.resultsCompact;
+                        out << "\n";
+                        linesRendered++;
+                    }
                     if (!selRow.directionTitle.empty()) {
                         out << "   Title: " << PadOrTruncate(selRow.directionTitle, static_cast<size_t>(std::max(10, width - 12))) << "\n";
                         linesRendered++;
@@ -1008,7 +1206,7 @@ inline std::string RenderScreen(const TopState& state, int width, int height, bo
                     std::string host = GetJobHost(sel);
                     std::string queueCol = FormatQueueColumn(rawQueue, host);
                     std::string st = sel.value("state", "pending");
-                    std::string summary = sel.value("summary", "");
+                    std::string summary = state.Shown(sel.value("summary", std::string()));
                     std::string cmd = sel.value("commandLine", sel.value("cmd", ""));
                     std::string blockedBy = sel.value("blockedBy", "");
                     int attempts = sel.value("attemptsCount", 0);
@@ -1031,7 +1229,7 @@ inline std::string RenderScreen(const TopState& state, int width, int height, bo
                     out << "\n";
                     linesRendered++;
                     if (selRow.hasTaskRecord || (!selRow.taskId.empty() && selRow.taskId != jid)) {
-                        out << "   Task: " << (selRow.taskTitle.empty() ? selRow.taskId : (selRow.taskTitle + " (" + selRow.taskId + ")"));
+                        out << "   Task: " << (selRow.taskTitle.empty() ? selRow.taskId : (state.Shown(selRow.taskTitle) + " (" + selRow.taskId + ")"));
                         if (!selRow.taskState.empty()) out << " [" << selRow.taskState << "]";
                         out << "\n";
                         linesRendered++;
@@ -1513,6 +1711,37 @@ inline std::string RenderScreen(const TopState& state, int width, int height, bo
 }
 
 // Controller function running the TUI loop
+// Asks the core for the texts the last draw showed untranslated (card 106-3's misses). A change of
+// the core's revision drops the table, so the next draw records the misses again. Only the TUI
+// requests translations; the one-shot CLI reads the cache.
+inline void FetchDisplayTranslations(TopState& state) {
+    std::map<std::string, std::vector<std::string>> byField;
+    for (const auto& miss : state.texts.TakeMisses()) {
+        byField[miss.field].push_back(miss.text);
+    }
+    for (const auto& group : byField) {
+        nlohmann::json req = {{"action", "translate_get"}, {"lang", state.lang}, {"texts", group.second}};
+        if (!group.first.empty()) req["field"] = group.first;
+        std::string resp, err;
+        if (!SendIpcRequest(req.dump(), resp, err, false)) continue;
+        nlohmann::json reply = nlohmann::json::parse(resp, nullptr, false);
+        if (!reply.is_object() || !reply.value("ok", false) || !reply.contains("items") || !reply["items"].is_array()) continue;
+        if (reply.contains("revision") && reply["revision"].is_number_unsigned()) {
+            state.texts.SetRevision(reply["revision"].get<uint64_t>());
+        }
+        for (const auto& item : reply["items"]) {
+            if (!item.is_object() || !item.contains("text") || !item["text"].is_string()) continue;
+            std::string translated;
+            if (item.contains("translated") && item["translated"].is_string()) {
+                translated = item["translated"].get<std::string>();
+            }
+            const std::string st = item.value("state", std::string());
+            const bool waiting = (st == "pending" || st == "unavailable");
+            state.texts.Store(item["text"].get<std::string>(), state.lang, group.first, translated, waiting);
+        }
+    }
+}
+
 inline int RunTopLoop(const std::vector<std::string>& args, bool jsonOutput) {
     int intervalMs = 1000;
     bool once = false;
@@ -1533,6 +1762,7 @@ inline int RunTopLoop(const std::vector<std::string>& args, bool jsonOutput) {
 
     TopState state;
     state.intervalMs = intervalMs;
+    state.lang = DisplayLangSetting();
 
     auto fetchState = [&]() {
         state.timestamp = GetCurrentTimestampStr();
@@ -1565,6 +1795,11 @@ inline int RunTopLoop(const std::vector<std::string>& args, bool jsonOutput) {
             state.countsData = nlohmann::json::parse(respCounts, nullptr, false);
         }
 
+        // Translated free texts (card 106-4): ask for the ones the last draw showed in the original.
+        if (state.coreConnected && state.lang != "en") {
+            FetchDisplayTranslations(state);
+        }
+
         // Tab-specific fetches:
         if (state.activeTab == TopTab::Queue) {
             std::string respQ, errQ;
@@ -1574,6 +1809,10 @@ inline int RunTopLoop(const std::vector<std::string>& args, bool jsonOutput) {
             std::string respT, errT;
             if (SendIpcRequest("{\"action\":\"task_list\"}", respT, errT, false)) {
                 state.tasksData = nlohmann::json::parse(respT, nullptr, false);
+            }
+            std::string respD, errD;
+            if (SendIpcRequest("{\"action\":\"direction_list\"}", respD, errD, false)) {
+                state.directionsData = nlohmann::json::parse(respD, nullptr, false);
             }
             std::string respRemQ, errRemQ;
             if (SendIpcRequest("{\"action\":\"remote_taskqueues\"}", respRemQ, errRemQ, false)) {

@@ -59,6 +59,10 @@ public:
 
     // Counter that changes on every write, so the GUI can fetch only what changed.
     int64_t Version() const;
+    // Maximum rev across all loaded records (0 when none).
+    uint64_t MaxRev() const;
+    // Snapshot of every record with rev > sinceRev (or all records when includeZero is true).
+    std::vector<nlohmann::json> SinceRev(uint64_t sinceRev, bool includeZero = false) const;
 
 private:
     bool WriteRecordLocked(const nlohmann::json& record, std::string& outError);

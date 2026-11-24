@@ -1699,6 +1699,27 @@ static bool ParseGenericEvent(const nlohmann::json& j, const std::string& trimme
             outEvent.content = getStr(j["error"], "message");
             if (outEvent.content.empty()) outEvent.content = j["error"].dump();
         }
+        // 102-1: keep the structured fields the message text drops. They may sit on the error
+        // object or on the line itself; a numeric or string "status" is read as the HTTP status.
+        const nlohmann::json* errObj = j["error"].is_object() ? &j["error"] : nullptr;
+        auto pickStatus = [&](const nlohmann::json& o) {
+            if (!o.is_object()) return;
+            if (outEvent.httpStatus == 0 && o.contains("status")) {
+                const auto& s = o["status"];
+                if (s.is_number_integer()) outEvent.httpStatus = s.get<int>();
+                else if (s.is_string()) {
+                    try { outEvent.httpStatus = std::stoi(s.get<std::string>()); } catch (...) {}
+                }
+            }
+            if (outEvent.errorCode.empty()) {
+                std::string c = getStr(o, "code");
+                if (c.empty()) c = getStr(o, "type");
+                if (!c.empty()) outEvent.errorCode = c;
+            }
+        };
+        if (errObj) pickStatus(*errObj);
+        pickStatus(j);
+        outEvent.errorClass = ClassifyLlmErrorStructured(outEvent.httpStatus, outEvent.errorCode);
         return finish();
     }
 
@@ -1711,6 +1732,31 @@ static bool ParseGenericEvent(const nlohmann::json& j, const std::string& trimme
     return finish();
 }
 
+
+std::string ClassifyLlmErrorStructured(int httpStatus, const std::string& errorCode) {
+    // 102-1: the table in doc/llm-error-class-cards.md. The HTTP status wins; the code is the fallback.
+    std::string code;
+    code.reserve(errorCode.size());
+    for (char c : errorCode) code.push_back(static_cast<char>(std::tolower(static_cast<unsigned char>(c))));
+
+    if (httpStatus == 401 || httpStatus == 403) return "auth_error";
+    if (httpStatus == 429) return "rate_limited";
+    if (httpStatus == 500 || httpStatus == 502 || httpStatus == 503 || httpStatus == 504 || httpStatus == 529) {
+        return "provider_down";
+    }
+    if (code == "authentication_error" || code == "invalid_grant" || code == "invalid_api_key" ||
+        code == "token_expired") {
+        return "auth_error";
+    }
+    if (code == "rate_limit_error" || code == "rate_limit_exceeded" || code == "insufficient_quota" ||
+        code == "quota_exceeded" || code == "billing_hard_limit_reached") {
+        return "rate_limited";
+    }
+    if (code == "overloaded_error" || code == "server_error" || code == "service_unavailable") {
+        return "provider_down";
+    }
+    return "";
+}
 
 bool ParseLlmStreamLine(const std::string& line, const std::string& defaultAgentType, LlmStreamEvent& outEvent) {
     std::string trimmed = TrimStr(line);
@@ -1893,6 +1939,7 @@ std::string LlmSubagentsToJson(const std::vector<LlmSubagentState>& subagents) {
 std::string LlmEventsToJson(const std::vector<LlmStreamEvent>& events, const LlmAgentState& state) {
     nlohmann::json root;
     root["ok"] = true;
+    root["engine"] = state.agentType;
     root["agent_type"] = state.agentType;
     root["model"] = state.model;
     root["status"] = state.status;

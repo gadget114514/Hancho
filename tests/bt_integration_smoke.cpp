@@ -1,6 +1,7 @@
 // Headless integration smoke test for BtManager + TaskQueueManager + ProcessManager (Part 1).
 
 #include "bt_integration_smoke_common.h"
+#include "bt_templates.h"
 
 using namespace bt_int_test;
 
@@ -449,7 +450,251 @@ int main() {
               "103-1: bt-dir-103-reuse succeeds");
     }
 
+    // 104-2: card run, --ready, --max, dependency check, and task cardDefaults
+    {
+        TestHarness h;
+        std::string tErr;
+        const json initDefaults = {
+            {"build", "cmd.exe /c echo BUILD_OLD"},
+            {"test", "cmd.exe /c echo TEST_OLD"},
+            {"cwd", tempDirUtf8},
+            {"engines", json::array({{{"engine", "test-worker"}, {"model", "test-m1"}}})}
+        };
+        const json tcResp = json::parse(
+            h.tqm.TaskCreate("Card run task", "Test 104-2", "", "", tErr, initDefaults.dump()),
+            nullptr, false);
+        Check(tcResp.value("ok", false), "104-2: TaskCreate with cardDefaults succeeds");
+        const std::string taskId = tcResp.value("id", std::string());
+
+        const json newDefaults = {
+            {"build", "cmd.exe /c echo BUILD_OK > card_build_ok.flag"},
+            {"test", "cmd.exe /c echo TEST_OK > card_test_ok.flag"},
+            {"cwd", tempDirUtf8},
+            {"engines", json::array({{{"engine", "test-worker"}, {"model", "test-m1"}}})}
+        };
+        const json tuResp = json::parse(
+            h.tqm.TaskUpdate(taskId, true, "Card run task updated", false, "",
+                             true, newDefaults.dump(), "", tErr),
+            nullptr, false);
+        Check(tuResp.value("ok", false) && tuResp["task"]["cardDefaults"]["build"].get<std::string>().find("BUILD_OK") != std::string::npos,
+              "104-2: TaskUpdate updates cardDefaults");
+
+        const json caResp = json::parse(
+            h.tqm.CardAdd(taskId, "104-a", "Card A", "Implement A", {}, "card", "", "", tErr),
+            nullptr, false);
+        const json cbResp = json::parse(
+            h.tqm.CardAdd(taskId, "104-b", "Card B", "Implement B", {"104-a"}, "card", "", "", tErr),
+            nullptr, false);
+        const json ccResp = json::parse(
+            h.tqm.CardAdd(taskId, "104-c", "Card C", "Implement C", {}, "card", "", "", tErr),
+            nullptr, false);
+        Check(caResp.value("ok", false) && cbResp.value("ok", false) && ccResp.value("ok", false),
+              "104-2: added 3 cards (104-b depends on 104-a)");
+        const std::string dirA = caResp.value("directionId", std::string());
+
+        // Waiting dependency must fail without --force
+        const json blockedRun = json::parse(
+            h.btm->CardRun(taskId, "104-b", false, 1, false), nullptr, false);
+        Check(!blockedRun.value("ok", true) &&
+                  blockedRun.value("error", std::string()).find("waiting") != std::string::npos,
+              "104-2: running card with unsatisfied dependency fails");
+
+        // --ready with default max=1 starts only 104-a
+        const json ready1 = json::parse(
+            h.btm->CardRun(taskId, "", true, 1, false), nullptr, false);
+        Check(ready1.value("ok", false) && ready1["started"].is_array() &&
+                  ready1["started"].size() == 1 &&
+                  ready1["started"][0].value("number", std::string()) == "104-a" &&
+                  ready1["started"][0].value("directionId", std::string()) == dirA,
+              "104-2: card run --ready --max 1 starts only 104-a");
+
+        const std::string btA = ready1["started"][0].value("btId", std::string());
+        nlohmann::json dirARec;
+        Check(h.tqm.DirectionGet(dirA, dirARec) &&
+                  dirARec.value("kind", std::string()) == "bt" &&
+                  dirARec.value("btId", std::string()) == btA,
+              "104-2: planned direction promoted to kind=bt with btId");
+
+        const json dirAState = h.tqm.DirectionState(dirA);
+        const std::string stA = dirAState.value("state", std::string());
+        Check(stA == "running" || stA == "succeeded",
+              "104-2: direction state after CardRun is running/succeeded (got " + stA + ")");
+
+        const json waitA = json::parse(h.btm->Wait(btA, 0, 15000), nullptr, false);
+        Check(waitA.value("ok", false) && waitA.value("state", std::string()) == "succeeded",
+              "104-2: 104-a BT succeeds");
+        Check(FileExistsW(tempDirW + L"\\card_build_ok.flag") &&
+                  FileExistsW(tempDirW + L"\\card_test_ok.flag"),
+              "104-2: task cardDefaults build & test commands executed");
+
+        std::string qErr;
+        const json qList = json::parse(
+            h.tqm.TaskQueueList("", "", 0, qErr, "", btA, true), nullptr, false);
+        Check(qList.value("ok", false) && qList["jobs"].is_array() && !qList["jobs"].empty(),
+              "104-2: 104-a BT spawned jobs");
+        bool allJobsHaveDirA = true;
+        for (const auto& j : qList["jobs"]) {
+            if (j.value("direction_id", std::string()) != dirA) allJobsHaveDirA = false;
+        }
+        Check(allJobsHaveDirA, "104-2: all jobs of 104-a BT belong to dirA");
+
+        // Now 104-b and 104-c are both ready; --ready --max 2 starts both
+        const json ready2 = json::parse(
+            h.btm->CardRun(taskId, "", true, 2, false), nullptr, false);
+        Check(ready2.value("ok", false) && ready2["started"].is_array() &&
+                  ready2["started"].size() == 2,
+              "104-2: card run --ready --max 2 starts remaining 2 ready cards");
+        for (const auto& s : ready2["started"]) {
+            const std::string btId = s.value("btId", std::string());
+            const json w = json::parse(h.btm->Wait(btId, 0, 15000), nullptr, false);
+            Check(w.value("ok", false) && w.value("state", std::string()) == "succeeded",
+                  "104-2: ready card " + s.value("number", std::string()) + " succeeds");
+        }
+    }
+
     RunPart2IntegrationTests(tempDirW, tempDirUtf8);
+
+    // Card 105-4: BT direction cancelled when watched client process exits.
+    {
+        TestHarness h;
+        const json btDef = {
+            {"id", "bt-watch-cancel"},
+            {"taskqueue", "main"},
+            {"root", {
+                {"type", "exec"},
+                {"id", "sleep_step"},
+                {"command", "cmd /c ping -n 30 127.0.0.1 >nul"},
+                {"summary", "long step"},
+                {"timeoutSec", 60}
+            }}
+        };
+        const json started = json::parse(h.btm->Start(btDef.dump(), false), nullptr, false);
+        Check(started.value("ok", false), "105-4 BT: started bt-watch-cancel");
+        const std::string dirId = started.value("directionId", std::string());
+        Check(!dirId.empty(), "105-4 BT: bt_start returned directionId");
+
+#ifdef _WIN32
+        STARTUPINFOW si{};
+        si.cb = sizeof(si);
+        PROCESS_INFORMATION pi{};
+        std::wstring cmd = L"cmd.exe /c ping -n 30 127.0.0.1 >nul";
+        BOOL spawned = CreateProcessW(nullptr, &cmd[0], nullptr, nullptr, FALSE,
+                                      CREATE_NO_WINDOW, nullptr, nullptr, &si, &pi);
+        Check(spawned != FALSE, "105-4 BT: spawned dummy client process");
+        if (spawned) {
+            CloseHandle(pi.hThread);
+            std::string wErr;
+            Check(h.tqm.WatchDirectionClient(dirId, static_cast<uint32_t>(pi.dwProcessId), wErr),
+                  "105-4 BT: WatchDirectionClient registered");
+            Sleep(150);
+            TerminateProcess(pi.hProcess, 1);
+            WaitForSingleObject(pi.hProcess, 3000);
+            CloseHandle(pi.hProcess);
+
+            const json waited = json::parse(h.btm->Wait("bt-watch-cancel", 0, 10000), nullptr, false);
+            Check(waited.value("ok", false) && waited.value("state", std::string()) == "cancelled",
+                  "105-4 BT: BT cancelled when watched client exited (got " +
+                  waited.value("state", std::string()) + ")");
+        }
+#endif
+
+        // Card 103-8: Verify exec/agent BT example validates cleanly with no deprecation warnings.
+        const json newNamesBt = {
+            {"id", "skill-example-bt"},
+            {"taskqueue", "main"},
+            {"root", {
+                {"type", "sequence"},
+                {"children", {
+                    {{"type", "exec"}, {"id", "build"}, {"command", "cmake --build build"},
+                     {"summary", "Build"}, {"timeoutSec", 1800}},
+                    {{"type", "agent"}, {"id", "fix"}, {"engine", "claude"}, {"model", "sonnet"},
+                     {"prompt", "Fix errors"}, {"summary", "Fix"}, {"timeoutSec", 900}}
+                }}
+            }}
+        };
+        const json val = json::parse(h.btm->Validate(newNamesBt.dump(), false), nullptr, false);
+        Check(val.value("ok", false) && val.value("valid", false),
+              "103-8: exec+agent BT example passes bt validate");
+
+        // Card 103-8: resilient-agent template validates cleanly under strict=true.
+        const json tplRes = BtTemplateResult("resilient-agent");
+        Check(tplRes.value("ok", false) && tplRes.contains("bt"),
+              "103-8: bt template resilient-agent returns template");
+        if (tplRes.contains("bt")) {
+            const json tplVal = json::parse(h.btm->Validate(tplRes["bt"].dump(), true), nullptr, false);
+            Check(tplVal.value("ok", false) && tplVal.value("valid", false) &&
+                      (!tplVal.contains("warnings") || tplVal["warnings"].empty()),
+                  "103-8: resilient-agent template passes bt validate --strict with zero warnings");
+        }
+    }
+
+    // Card 105-3: run --bt flow (start, wait, direction-filtered jobs, JUnit outcome for success & failure).
+    {
+        TestHarness h;
+        const json okBt = {
+            {"id", "bt-ci-ok"},
+            {"taskqueue", "main"},
+            {"root", {
+                {"type", "exec"},
+                {"id", "ok_step"},
+                {"command", "cmd /c echo CI_OK"},
+                {"summary", "ok step"},
+                {"timeoutSec", 30}
+            }}
+        };
+        const json okStart = json::parse(h.btm->Start(okBt.dump(), false), nullptr, false);
+        Check(okStart.value("ok", false) && !okStart.value("directionId", std::string()).empty(),
+              "105-3: bt-ci-ok started with directionId");
+        const json okWait = json::parse(h.btm->Wait("bt-ci-ok", 0, 10000), nullptr, false);
+        Check(okWait.value("ok", false) && okWait.value("state", std::string()) == "succeeded",
+              "105-3: bt-ci-ok succeeded");
+        std::string lErr;
+        const json okList = json::parse(h.tqm.TaskQueueList("main", "", 0, lErr, "", "bt-ci-ok", true),
+                                        nullptr, false);
+        std::vector<TaskQueueRunJob> okJobs;
+        if (okList.contains("jobs") && okList["jobs"].is_array()) {
+            for (const auto& j : okList["jobs"]) okJobs.push_back(TaskQueueRunJobFromJson(j));
+        }
+        TaskQueueRunJob okOutcome;
+        okOutcome.id = "bt-ci-ok";
+        okOutcome.name = "bt-ci-ok";
+        okOutcome.state = okWait.value("state", std::string());
+        const std::string okXml = TaskQueueRunJUnitXml("main", okJobs, false, false, &okOutcome);
+        Check(okXml.find("tests=\"2\"") != std::string::npos &&
+                  okXml.find("failures=\"0\"") != std::string::npos,
+              "105-3: succeeded --bt JUnit report has job testcase + BT outcome testcase");
+
+        const json failBt = {
+            {"id", "bt-ci-fail"},
+            {"taskqueue", "main"},
+            {"root", {
+                {"type", "exec"},
+                {"id", "fail_step"},
+                {"command", "cmd /c exit 3"},
+                {"summary", "fail step"},
+                {"timeoutSec", 30}
+            }}
+        };
+        const json failStart = json::parse(h.btm->Start(failBt.dump(), false), nullptr, false);
+        Check(failStart.value("ok", false), "105-3: bt-ci-fail started");
+        const json failWait = json::parse(h.btm->Wait("bt-ci-fail", 0, 10000), nullptr, false);
+        Check(failWait.value("ok", false) && failWait.value("state", std::string()) == "failed",
+              "105-3: bt-ci-fail failed");
+        const json failList = json::parse(h.tqm.TaskQueueList("main", "", 0, lErr, "", "bt-ci-fail", true),
+                                          nullptr, false);
+        std::vector<TaskQueueRunJob> failJobs;
+        if (failList.contains("jobs") && failList["jobs"].is_array()) {
+            for (const auto& j : failList["jobs"]) failJobs.push_back(TaskQueueRunJobFromJson(j));
+        }
+        TaskQueueRunJob failOutcome;
+        failOutcome.id = "bt-ci-fail";
+        failOutcome.name = "bt-ci-fail";
+        failOutcome.state = failWait.value("state", std::string());
+        const std::string failXml = TaskQueueRunJUnitXml("main", failJobs, false, false, &failOutcome);
+        Check(failXml.find("tests=\"2\"") != std::string::npos &&
+                  failXml.find("failures=\"2\"") != std::string::npos,
+              "105-3: failed --bt JUnit report records both failed job and failed BT outcome");
+    }
 
     RemoveDirRecursive(tempDirW);
     std::printf("%s (%d passed, %d failures)\n", g_failures ? "FAILED" : "ALL PASSED", g_passes, g_failures);

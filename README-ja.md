@@ -30,6 +30,10 @@ Hancho には、1 コマンドだけ、順番のあるジョブのキュー、�
 
 ビヘイビアツリーは名前付きの**ルーチン**として保存でき、`routine run <name>` で繰り返し実行できます（「全ターゲットをビルドして全スモークを走らせる」などの定型作業向け）。入力の変更や実行結果も自動で追跡します。詳しくは [ルーチン](doc/obsoleted/routines-ja.md)。
 
+CI（Jenkins や GitHub Actions のセルフホストランナー）での利用は [CI ガイド](doc/ci-ja.md)（[English](doc/ci.md)）を参照してください。`run --ephemeral`、`run --bt`、`--wait-scope direction`、`--cancel-on-exit`、`--follow`、`--logs-dir`、`--report-output`、`--timeout`、`HANCHO_AUTOSTART`、`HANCHO_NO_DIALOGS` はすべてオプトインで、付けなければ従来の既定動作のままです。
+
+0.10.0 では用語を `task` → `direction` → `job` → `attempt`、BT ノード `exec` / `agent`、`agent` リスト、Chat の `peer` / `host`、`run_agent` / `agent stream|probe|health` に揃えました（0.9.x の旧名も別名として引き続き利用できます。詳しくは [doc/terminology.md](doc/terminology.md)）。注意: 0.9.x に戻すと系譜・タスク・direction のつながりは消え、`exec`/`agent` で書いた BT は 0.9.x では動きません。
+
 ### 実行ファイル
 
 | ファイル | 説明 |
@@ -106,6 +110,7 @@ New-Item -ItemType Junction -Path .claude\skills\hancho -Target (Resolve-Path sk
 
 | ドキュメント | 内容 |
 | :--- | :--- |
+| [doc/ の文書一覧](doc/README.md) | `doc/` の文書の一覧と、どれが英語か |
 | [概要](doc/obsoleted/overview-ja.md) | 動作モデル、`run_worker`、サスペンド、ビヘイビアツリー、安定イベント、卒業 |
 | [スタート](doc/obsoleted/start-ja.md) | LLM エージェント向けクイックスタート、ビルド方法、`Hancho.exe` と `hancho-cli.exe` |
 | [主な特徴](doc/obsoleted/features-ja.md) | ダッシュボード GUI、シェル起動、履歴、トレイ、ログ、設定、タスクキュー概要 |
@@ -125,7 +130,7 @@ New-Item -ItemType Junction -Path .claude\skills\hancho -Target (Resolve-Path sk
 | [Hancho v3 設計](doc/obsoleted/design-v3.md) | イベントスキーマとアダプター、ヘッドレス/リモート、意味的メモリ、失敗分析、卒業指針 |
 | [リリースチェックリスト](doc/obsoleted/release-checklist-ja.md) | リリースごとの卒業用機能対応表の見直しと片付けコマンドの確認 |
 | [CLI help 出力](doc/obsoleted/cli-help-ja.md) | `Hancho.exe --help` と `hancho-cli.exe help` の全文 |
-| [Hancho スキル](skills/hancho/SKILL.md) | Hancho をうまく使うためのエージェントスキル |
+| [Hancho スキル](skills/hancho/SKILL-ja.md) | Hancho をうまく使うためのエージェントスキル（英語版: [SKILL.md](skills/hancho/SKILL.md)） |
 | [tools/ww](tools/ww/README-ww.md) | 任意・独立のタスクカード実行テンプレート（Hancho の一部ではない） |
 
 ---

@@ -9,6 +9,9 @@ namespace {
 
 json NodeToJson(const BtNode& node, bool forceQueue = false) {
     json j = node.rawDef;
+    if (node.type == "exec" || node.type == "agent") {
+        j["type"] = node.type;
+    }
 
     if (node.hasStatus || node.state != "idle" || node.runs > 0 || node.launchSeq > 0 || !node.jobs.empty()) {
         json st = json::object();
@@ -142,8 +145,8 @@ json DefaultsToJson(const BtDefaults& d) {
             {"stopOnSameSymptom", d.workerSwitchLimits.stopOnSameSymptom}
         };
     }
-    if (!worker.empty()) out["worker"] = std::move(worker);
-    if (d.hasJobIdle()) out["job"] = {{"idle", IdleToJson(d.jobIdle)}};
+    if (!worker.empty()) out["agent"] = std::move(worker);
+    if (d.hasJobIdle()) out["exec"] = {{"idle", IdleToJson(d.jobIdle)}};
     return out;
 }
 
@@ -308,9 +311,9 @@ void BehaviorTree::Impl::RestoreNodeStatus(BehaviorTree& bt,
     }
 
     if (node.state == "running") {
-        if ((node.type == "job" || node.type == "worker") && !node.jobs.empty()) {
+        if ((node.type == "exec" || node.type == "agent") && !node.jobs.empty()) {
             node.activeJobId = node.jobs.back();
-            node.isWorkerJob = (node.type == "worker");
+            node.isWorkerJob = (node.type == "agent");
             runningJobs[node.activeJobId] = RunningJobInfo{&node, false, node.isWorkerJob};
         } else if (node.type == "wait") {
             node.waitDeadlineMs = baseMs + static_cast<int64_t>(node.sec) * 1000;
@@ -502,7 +505,10 @@ bool CheckJsonShapeMatchesNode(const BtNode& oldNode,
         return false;
     }
     std::string rawType = jNew.value("type", "");
-    std::string normType = (rawType == "selector") ? "fallback" : rawType;
+    std::string normType = rawType;
+    if (rawType == "selector") normType = "fallback";
+    else if (rawType == "job") normType = "exec";
+    else if (rawType == "worker") normType = "agent";
     if (normType != oldNode.type) {
         err = oldNode.pathKey + ": cannot change node type from '" + oldNode.type + "' to '" + rawType + "'";
         return false;

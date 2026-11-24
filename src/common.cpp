@@ -1,5 +1,6 @@
 #include "common.h"
 #include "parse_util.h"
+#include "nlohmann/json.hpp"
 #include <tlhelp32.h>
 #include <iterator>
 #include <sstream>
@@ -252,6 +253,67 @@ std::string GetTailLines(const std::string& text, int maxLines) {
     return text;
 }
 
+bool IsNonEnglishText(const std::string& text) {
+    // Walk the UTF-8 code points; any kana, kanji, CJK punctuation or hangul counts.
+    for (size_t i = 0; i < text.size();) {
+        const unsigned char c = static_cast<unsigned char>(text[i]);
+        uint32_t cp = c;
+        size_t len = 1;
+        if (c >= 0xF0 && c < 0xF8) { cp = c & 0x07; len = 4; }
+        else if (c >= 0xE0) { cp = c & 0x0F; len = 3; }
+        else if (c >= 0xC0) { cp = c & 0x1F; len = 2; }
+        if (len > 1) {
+            if (i + len > text.size()) break;
+            for (size_t k = 1; k < len; ++k) {
+                cp = (cp << 6) | (static_cast<unsigned char>(text[i + k]) & 0x3F);
+            }
+        }
+        i += len;
+        if ((cp >= 0x3000 && cp <= 0x30FF) ||  // CJK punctuation, hiragana, katakana
+            (cp >= 0x31F0 && cp <= 0x31FF) ||  // katakana phonetic extensions
+            (cp >= 0x3130 && cp <= 0x318F) ||  // hangul compatibility jamo
+            (cp >= 0x3400 && cp <= 0x4DBF) ||  // CJK extension A
+            (cp >= 0x4E00 && cp <= 0x9FFF) ||  // CJK unified ideographs (kanji)
+            (cp >= 0xAC00 && cp <= 0xD7AF) ||  // hangul syllables
+            (cp >= 0xF900 && cp <= 0xFAFF) ||  // CJK compatibility ideographs
+            (cp >= 0xFF66 && cp <= 0xFF9D)) {  // halfwidth katakana
+            return true;
+        }
+    }
+    return false;
+}
+
+std::string AppendNonEnglishWarnings(const std::string& responseJson, const std::string& argsJson) {
+    const nlohmann::json args = nlohmann::json::parse(argsJson, nullptr, false);
+    if (!args.is_object()) return responseJson;
+
+    nlohmann::json warnings = nlohmann::json::array();
+    auto check = [&warnings](const nlohmann::json& obj) {
+        if (!obj.is_object()) return;
+        for (const char* field : {"summary", "title"}) {
+            auto it = obj.find(field);
+            if (it != obj.end() && it->is_string() && IsNonEnglishText(it->get<std::string>())) {
+                warnings.push_back(std::string(field) + " is not English: " + it->get<std::string>());
+            }
+        }
+    };
+    check(args);
+    auto jobs = args.find("jobs");
+    if (jobs != args.end() && jobs->is_array()) {
+        for (const auto& job : *jobs) check(job);
+    }
+    if (warnings.empty()) return responseJson;
+
+    nlohmann::json resp = nlohmann::json::parse(responseJson, nullptr, false);
+    if (!resp.is_object()) return responseJson;
+    if (resp.contains("warnings") && resp["warnings"].is_array()) {
+        for (const auto& w : warnings) resp["warnings"].push_back(w);
+    } else {
+        resp["warnings"] = warnings;
+    }
+    return resp.dump();
+}
+
 std::string JsonEscape(const std::string& s) {
     std::string out;
     out.reserve(s.size() + s.size() / 8); // Heuristic to reduce allocations
@@ -277,24 +339,49 @@ std::string JsonEscape(const std::string& s) {
     return out;
 }
 
+// Finds the value of `key`, preferring the shallowest occurrence. nlohmann writes keys in
+// sorted order, so a job's "bt":{"id":...} comes before the job's own "id"; taking the first
+// match anywhere made every job of a tree read as the tree's id. The first key at depth 1 (an
+// object's own keys) wins at once; otherwise the shallowest one does. So a key that exists only
+// in a nested object is still found, and a fragment cut at `"bt":{` still reads the bt's "id".
 static size_t FindJsonKeyValuePos(const std::string& json, const std::string& key) {
-    std::string pattern = "\"" + key + "\"";
-    size_t pos = 0;
-    while ((pos = json.find(pattern, pos)) != std::string::npos) {
-        size_t afterKey = pos + pattern.size();
-        while (afterKey < json.size() && (json[afterKey] == ' ' || json[afterKey] == '\t' || json[afterKey] == '\r' || json[afterKey] == '\n')) {
-            afterKey++;
-        }
-        if (afterKey < json.size() && json[afterKey] == ':') {
-            afterKey++;
-            while (afterKey < json.size() && (json[afterKey] == ' ' || json[afterKey] == '\t' || json[afterKey] == '\r' || json[afterKey] == '\n')) {
-                afterKey++;
+    auto isWs = [](char c) { return c == ' ' || c == '\t' || c == '\r' || c == '\n'; };
+    const size_t n = json.size();
+    size_t best = std::string::npos;
+    int bestDepth = 0;
+    int depth = 0;
+    size_t i = 0;
+    while (i < n) {
+        const char c = json[i];
+        if (c == '{' || c == '[') {
+            ++depth;
+            ++i;
+        } else if (c == '}' || c == ']') {
+            --depth;
+            ++i;
+        } else if (c == '"') {
+            const size_t start = ++i;
+            while (i < n && json[i] != '"') {
+                i += (json[i] == '\\') ? 2 : 1;
             }
-            return afterKey;
+            if (i >= n) break;
+            const size_t end = i++;  // closing quote
+            if (end - start != key.size() || json.compare(start, key.size(), key) != 0) continue;
+            size_t p = i;
+            while (p < n && isWs(json[p])) ++p;
+            if (p >= n || json[p] != ':') continue;  // a string value, not a key
+            if (best == std::string::npos || depth < bestDepth) {
+                ++p;
+                while (p < n && isWs(json[p])) ++p;
+                best = p;
+                bestDepth = depth;
+                if (depth <= 1) break;  // nothing can be shallower than the object's own keys
+            }
+        } else {
+            ++i;
         }
-        pos += pattern.size();
     }
-    return std::string::npos;
+    return best;
 }
 
 std::string JsonGetString(const std::string& json, const std::string& key, const std::string& defaultVal) {
@@ -1163,6 +1250,20 @@ std::string Sha256Hex(const std::string& input) {
     char out[65];
     for (int i = 0; i < 8; ++i) snprintf(out + i * 8, 9, "%08x", c.h[i]);
     return std::string(out, 64);
+}
+
+AppConfig LoadAppConfig() {
+    AppConfig cfg;
+    const std::string content = ReadFileUtf8Wide(PathJoinWide(GetEffectiveDataDirectoryWide(), L"config.json"));
+    if (!content.empty()) {
+        const int64_t v = JsonGetInt(content, "task_list_recent_count", kDefaultTaskListRecentCount);
+        if (v > 0) cfg.taskListRecentCount = v;
+    }
+    return cfg;
+}
+
+int64_t GetTaskListRecentCount() {
+    return LoadAppConfig().taskListRecentCount;
 }
 
 } // namespace pc

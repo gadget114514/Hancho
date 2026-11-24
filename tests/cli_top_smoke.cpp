@@ -5,6 +5,8 @@
 
 #include <cassert>
 #include <cstdio>
+#include <filesystem>
+#include <fstream>
 #include <string>
 #include <vector>
 
@@ -774,6 +776,108 @@ void TestQueueTaskColumnAndGrouping() {
     std::string dirDetail = RenderScreen(state, 100, 26, false);
     Check(dirDetail.find("[Direction Detail: direction:dir_10]") != std::string::npos,
           "103-3: Selecting DirectionHeading renders Direction Detail subpane");
+
+    // 5. 104-5: Card DirectionHeading renders in TUI Queue grouped view with waiting state
+    state.queueData["jobs"] = nlohmann::json::array();
+    state.tasksData["tasks"] = nlohmann::json::array({
+        {{"id", "task_cards"}, {"title", "Card Task"}, {"state", "open"}}
+    });
+    state.directionsData["directions"] = nlohmann::json::array({
+        {{"id", "dir_c1"}, {"taskId", "task_cards"}, {"kind", "card"}, {"state", "planned"},
+         {"card", {{"number", "104-1"}, {"title", "First Card"}}}},
+        {{"id", "dir_c2"}, {"taskId", "task_cards"}, {"kind", "card"}, {"state", "planned"},
+         {"card", {{"number", "104-2"}, {"title", "Waiting Card"}}},
+         {"waitingFor", nlohmann::json::array({"104-1"})}}
+    });
+    state.selectedRow = 1; // Card 104-1
+    std::string withCards = RenderScreen(state, 100, 26, false);
+    Check(withCards.find("104-1") != std::string::npos && withCards.find("104-2") != std::string::npos,
+          "104-5: TUI renders card numbers in order");
+    Check(withCards.find("waiting") != std::string::npos && withCards.find("waiting: 104-1") != std::string::npos,
+          "104-5: TUI renders waiting state and blocking card number");
+    Check(withCards.find("[Card Detail: 104-1]") != std::string::npos,
+          "104-5: Selecting card row renders Card Detail subpane");
+}
+
+void TestDisplayLanguage() {
+    Check(pc::NormalizeDisplayLang("JA") == "ja", "NormalizeDisplayLang accepts ja in any case");
+    Check(pc::NormalizeDisplayLang("fr").empty(), "NormalizeDisplayLang rejects fr");
+    Check(pc::ResolveDisplayLang("es") == "es", "ResolveDisplayLang uses the flag value");
+    Check(pc::ResolveDisplayLang("fr") == "en", "ResolveDisplayLang falls back to en for an invalid flag");
+    Check(std::string(pc::CliTr("ja", "日本語", "English", "Español")) == "日本語", "CliTr picks the Japanese string");
+    Check(std::string(pc::CliTr("en", "日本語", "English", "Español")) == "English", "CliTr picks the English string");
+    Check(std::string(pc::CliTr("es", "日本語", "English", "Español")) == "Español", "CliTr picks the Spanish string");
+}
+
+void TestCachedAndJsonDisplay() {
+    std::error_code ec;
+    const std::filesystem::path dir = std::filesystem::temp_directory_path() / "pc_cli_top_smoke_lang";
+    std::filesystem::remove_all(dir, ec);
+    std::filesystem::create_directories(dir / "translations", ec);
+    pc::SetDataDirectoryOverride(dir.wstring());
+    nlohmann::json cache = {{"version", 1}, {"lang", "ja"},
+        {"entries", {{pc::Sha256Hex("Fix the build"), {{"source", "Fix the build"}, {"translated", "ビルドを直す"}}}}}};
+    {
+        std::ofstream out(dir / "translations" / "ja.json", std::ios::binary);
+        out << cache.dump();
+    }
+
+    Check(pc::CachedDisplayText("Fix the build", "ja") == "ビルドを直す", "CachedDisplayText gives the cached translation");
+    Check(pc::CachedDisplayText("Not cached", "ja") == "Not cached", "CachedDisplayText gives the original when nothing is cached");
+    Check(pc::CachedDisplayText("Fix the build", "en") == "Fix the build", "CachedDisplayText gives the original for en");
+
+    const std::string src = R"({"ok":true,"tasks":[{"id":"t1","title":"Fix the build"}]})";
+    pc::DisplayLangExplicit() = false;
+    Check(pc::JsonWithDisplayFields(src) == src, "JSON without --lang stays original");
+    pc::DisplayLangSetting() = "ja";
+    pc::DisplayLangExplicit() = true;
+    nlohmann::json out = nlohmann::json::parse(pc::JsonWithDisplayFields(src), nullptr, false);
+    Check(out.is_object() && out["tasks"][0]["title"] == "Fix the build",
+          "JSON with --lang keeps the original title");
+    Check(out.is_object() && out["tasks"][0].value("titleDisplay", std::string()) == "ビルドを直す",
+          "JSON with --lang adds titleDisplay from the cache");
+    pc::DisplayLangExplicit() = false;
+    pc::DisplayLangSetting() = "en";
+    std::filesystem::remove_all(dir, ec);
+}
+
+void TestRenderingDisplayLanguage() {
+    TopState state;
+    state.coreConnected = true;
+    state.activeTab = TopTab::Queue;
+    nlohmann::json qData;
+    qData["ok"] = true;
+    qData["jobs"] = nlohmann::json::array();
+    nlohmann::json j1;
+    j1["id"] = "build-1";
+    j1["state"] = "running";
+    j1["taskqueue"] = "ci";
+    j1["summary"] = "Fix the build";
+    qData["jobs"].push_back(j1);
+    state.queueData = qData;
+
+    state.lang = "ja";
+    state.texts.SetRevision(1);
+    state.texts.Store("Fix the build", "ja", "", "ビルドを直す", false);
+    std::string ja = RenderScreen(state, 100, 24, false);
+    Check(ja.find("ビルドを直す") != std::string::npos, "TUI shows the cached translation of a job summary");
+    Check(ja.find("キュー") != std::string::npos, "TUI tab names follow the display language");
+
+    state.lang = "en";
+    std::string en = RenderScreen(state, 100, 24, false);
+    Check(en.find("Fix the build") != std::string::npos && en.find("ビルド") == std::string::npos,
+          "TUI in English shows the original summary");
+
+    state.lang = "ja";
+    state.queueData["jobs"][0]["summary"] = "Other job";
+    std::string other = RenderScreen(state, 100, 24, false);
+    Check(other.find("Other job") != std::string::npos, "TUI shows the original while a text is untranslated");
+    const auto misses = state.texts.TakeMisses();
+    bool recorded = false;
+    for (const auto& miss : misses) {
+        if (miss.text == "Other job") recorded = true;
+    }
+    Check(recorded, "TUI records the untranslated text so the fetch can ask the core for it");
 }
 
 } // namespace
@@ -800,6 +904,9 @@ int main() {
     TestColorAndNoColorRendering();
     TestNarrowTerminalHandling();
     TestQueueTaskColumnAndGrouping();
+    TestDisplayLanguage();
+    TestCachedAndJsonDisplay();
+    TestRenderingDisplayLanguage();
     std::printf("=== Results: %d passed, %d failed ===\n", g_passes, g_failures);
     return g_failures == 0 ? 0 : 1;
 }

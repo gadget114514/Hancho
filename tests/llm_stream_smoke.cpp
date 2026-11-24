@@ -648,6 +648,31 @@ int main() {
         std::filesystem::remove_all(fakeHome, ec);
     }
 
+    // 102-1: structured error classes (doc/llm-error-class-cards.md).
+    Check(ClassifyLlmErrorStructured(401, "") == "auth_error", "102-1: HTTP 401 -> auth_error");
+    Check(ClassifyLlmErrorStructured(403, "") == "auth_error", "102-1: HTTP 403 -> auth_error");
+    Check(ClassifyLlmErrorStructured(429, "") == "rate_limited", "102-1: HTTP 429 -> rate_limited");
+    Check(ClassifyLlmErrorStructured(503, "") == "provider_down", "102-1: HTTP 503 -> provider_down");
+    Check(ClassifyLlmErrorStructured(0, "authentication_error") == "auth_error", "102-1: code authentication_error -> auth_error");
+    Check(ClassifyLlmErrorStructured(0, "insufficient_quota") == "rate_limited", "102-1: code insufficient_quota -> rate_limited");
+    Check(ClassifyLlmErrorStructured(0, "overloaded_error") == "provider_down", "102-1: code overloaded_error -> provider_down");
+    Check(ClassifyLlmErrorStructured(400, "invalid_request_error") == "", "102-1: unknown error stays unclassified");
+    {
+        LlmStreamEvent ev;
+        bool ok = ParseLlmStreamLine(
+            R"({"type":"error","error":{"type":"authentication_error","status":401,"message":"token expired"}})",
+            "claude", ev);
+        Check(ok && ev.type == "error", "102-1: error line parsed as an error event");
+        Check(ev.errorClass == "auth_error" && ev.httpStatus == 401 && ev.errorCode == "authentication_error",
+              "102-1: error object keeps class, status and code");
+    }
+    {
+        LlmStreamEvent ev;
+        bool ok = ParseLlmStreamLine(R"({"type":"error","error":"plain text failure"})", "claude", ev);
+        Check(ok && ev.type == "error" && ev.errorClass.empty() && ev.httpStatus == 0,
+              "102-1: a bare string error has no structured class");
+    }
+
     if (g_failures == 0) std::printf("ALL PASS\n");
     else std::printf("%d check(s) failed\n", g_failures);
     return g_failures == 0 ? 0 : 1;

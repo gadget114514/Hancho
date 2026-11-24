@@ -53,10 +53,10 @@ void RemoveDirRecursive(const std::wstring& dir) {
     RemoveDirectoryW(dir.c_str());
 }
 
-bool IpcCall(const json& req, json& out, std::string* outError = nullptr) {
+bool IpcCall(const json& req, json& out, std::string* outError = nullptr, bool autoStart = false) {
     std::string resp;
     std::string err;
-    if (!SendIpcRequest(req.dump(), resp, err, false)) {
+    if (!SendIpcRequest(req.dump(), resp, err, autoStart)) {
         if (outError) *outError = err;
         return false;
     }
@@ -90,6 +90,16 @@ HWND FindProcessWindow(const wchar_t* className, DWORD pid) {
         DWORD owner = 0;
         GetWindowThreadProcessId(w, &owner);
         if (owner == pid) return w;
+    }
+    return nullptr;
+}
+
+HWND FindDashboardWindowForDir(const std::wstring& dataDir) {
+    HWND w = nullptr;
+    while ((w = FindWindowExW(nullptr, w, L"HanchoDashboardWnd", nullptr)) != nullptr) {
+        wchar_t title[1024] = {};
+        GetWindowTextW(w, title, 1024);
+        if (DashboardTitleMatches(title, dataDir)) return w;
     }
     return nullptr;
 }
@@ -201,7 +211,10 @@ int main() {
     // Verify that launching Hancho.exe gui starts an independent GUI process
     // connected to the running core, closing it leaves jobs running, and
     // reopening reconnects.
+    // Note: Hancho.exe relaunches as HanchoDashboard.exe and exits immediately,
+    // so we locate the dashboard window by data-dir title and wait on its PID.
     {
+        const DWORD corePid = static_cast<DWORD>(ping.value("pid", 0));
         std::wstring guiCmd = L"\"" + exe + L"\" gui --no-prompt --data-dir \"" + tempDirW + L"\"";
         std::vector<wchar_t> mutableGuiCmd(guiCmd.begin(), guiCmd.end());
         mutableGuiCmd.push_back(L'\0');
@@ -214,23 +227,27 @@ int main() {
         Check(guiStarted != FALSE, "Hancho.exe gui standalone client starts");
         if (guiStarted) {
             CloseHandle(guiPi.hThread);
-            Check(guiPi.dwProcessId != pi.dwProcessId, "GUI runs as a separate process from core");
 
             // Wait for GUI window to appear
             HWND dashHwnd = nullptr;
             for (int attempt = 0; attempt < 50; ++attempt) {
-                dashHwnd = FindProcessWindow(L"HanchoDashboardWnd", guiPi.dwProcessId);
+                dashHwnd = FindDashboardWindowForDir(tempDirW);
                 if (dashHwnd) break;
                 Sleep(100);
             }
+            DWORD dashPid = 0;
+            if (dashHwnd) GetWindowThreadProcessId(dashHwnd, &dashPid);
+            Check(dashPid != 0 && dashPid != corePid, "GUI runs as a separate process from core");
             Check(dashHwnd != nullptr, "standalone GUI creates dashboard window");
 
+            HANDLE hDashProc = dashPid ? OpenProcess(SYNCHRONIZE, FALSE, dashPid) : nullptr;
             // Close the GUI window using registered HanchoQuit message
             UINT quitMsg = RegisterWindowMessageW(L"HanchoQuit");
             if (dashHwnd) PostMessageW(dashHwnd, quitMsg, 0, 0);
 
-            DWORD guiExit = WaitForSingleObject(guiPi.hProcess, 10000);
+            DWORD guiExit = WaitForSingleObject(hDashProc ? hDashProc : guiPi.hProcess, 10000);
             Check(guiExit == WAIT_OBJECT_0, "standalone GUI process exits cleanly when closed");
+            if (hDashProc) CloseHandle(hDashProc);
             CloseHandle(guiPi.hProcess);
 
             // Verify core keeps running and answering ping after GUI exits
@@ -249,15 +266,19 @@ int main() {
                 CloseHandle(guiPi2.hThread);
                 HWND dashHwnd2 = nullptr;
                 for (int attempt = 0; attempt < 50; ++attempt) {
-                    dashHwnd2 = FindProcessWindow(L"HanchoDashboardWnd", guiPi2.dwProcessId);
+                    dashHwnd2 = FindDashboardWindowForDir(tempDirW);
                     if (dashHwnd2) break;
                     Sleep(100);
                 }
                 Check(dashHwnd2 != nullptr, "reconnected GUI creates dashboard window");
 
+                DWORD dashPid2 = 0;
+                if (dashHwnd2) GetWindowThreadProcessId(dashHwnd2, &dashPid2);
+                HANDLE hDashProc2 = dashPid2 ? OpenProcess(SYNCHRONIZE, FALSE, dashPid2) : nullptr;
                 if (dashHwnd2) PostMessageW(dashHwnd2, quitMsg, 0, 0);
-                DWORD guiExit2 = WaitForSingleObject(guiPi2.hProcess, 10000);
+                DWORD guiExit2 = WaitForSingleObject(hDashProc2 ? hDashProc2 : guiPi2.hProcess, 10000);
                 Check(guiExit2 == WAIT_OBJECT_0, "reconnected GUI process exits cleanly");
+                if (hDashProc2) CloseHandle(hDashProc2);
                 CloseHandle(guiPi2.hProcess);
             }
         }
@@ -324,7 +345,13 @@ int main() {
 
     // 6. Launching GUI standalone with --no-prompt when core is not running exits with error
     {
-        std::wstring guiCmd = L"\"" + exe + L"\" gui --no-prompt --data-dir \"" + tempDirW + L"\"";
+        // Launch HanchoDashboard.exe directly so RelaunchAsRole does not exit 0 early.
+        const size_t slash = exe.find_last_of(L"\\/");
+        const std::wstring dir = (slash == std::wstring::npos) ? L"" : exe.substr(0, slash + 1);
+        const std::wstring dashExe = dir + L"HanchoDashboard.exe";
+        const std::wstring guiTarget =
+            (GetFileAttributesW(dashExe.c_str()) != INVALID_FILE_ATTRIBUTES) ? dashExe : exe;
+        std::wstring guiCmd = L"\"" + guiTarget + L"\" gui --no-prompt --data-dir \"" + tempDirW + L"\"";
         std::vector<wchar_t> mutableGuiCmd(guiCmd.begin(), guiCmd.end());
         mutableGuiCmd.push_back(L'\0');
 
@@ -340,6 +367,107 @@ int main() {
             CloseHandle(guiPi.hProcess);
             Check(ec != 0, "GUI exits with error when core is not running and --no-prompt is set");
         }
+    }
+
+    // 7. Card 105-1: Auto-start mode resolution unit tests + --no-autostart + HANCHO_AUTOSTART=headless
+    {
+        // Save/clear HANCHO_AUTOSTART for deterministic default check
+        SetEnvironmentVariableW(L"HANCHO_AUTOSTART", nullptr);
+        Check(ResolveAutoStartMode(false, nullptr) == AutoStartMode::Gui,
+              "105-1: default ResolveAutoStartMode without flag or env is Gui");
+        Check(!HasAutoStartEnvVar(), "105-1: HasAutoStartEnvVar is false when unset");
+        Check(ResolveAutoStartMode(false, "") == AutoStartMode::Gui,
+              "105-1: empty HANCHO_AUTOSTART resolves to Gui");
+        Check(ResolveAutoStartMode(false, "gui") == AutoStartMode::Gui,
+              "105-1: HANCHO_AUTOSTART=gui resolves to Gui");
+        Check(ResolveAutoStartMode(false, "headless") == AutoStartMode::Headless,
+              "105-1: HANCHO_AUTOSTART=headless resolves to Headless");
+        Check(ResolveAutoStartMode(false, "HEADLESS") == AutoStartMode::Headless,
+              "105-1: HANCHO_AUTOSTART=HEADLESS resolves to Headless");
+        Check(ResolveAutoStartMode(false, "off") == AutoStartMode::Off,
+              "105-1: HANCHO_AUTOSTART=off resolves to Off");
+        Check(ResolveAutoStartMode(true, "headless") == AutoStartMode::Off,
+              "105-1: --no-autostart overrides HANCHO_AUTOSTART=headless to Off");
+        Check(ResolveAutoStartMode(true, nullptr) == AutoStartMode::Off,
+              "105-1: --no-autostart resolves to Off");
+
+        // Test --no-autostart with hancho-cli.exe when core is not running
+        const size_t slash = exe.find_last_of(L"\\/");
+        const std::wstring dir = (slash == std::wstring::npos) ? L"" : exe.substr(0, slash + 1);
+        const std::wstring cliExe = dir + L"hancho-cli.exe";
+        if (GetFileAttributesW(cliExe.c_str()) != INVALID_FILE_ATTRIBUTES) {
+            std::wstring noAutoDir = tempDirW + L"_noauto";
+            RemoveDirRecursive(noAutoDir);
+            CreateDirectoryW(noAutoDir.c_str(), nullptr);
+
+            SECURITY_ATTRIBUTES sa = {sizeof(sa), nullptr, TRUE};
+            HANDLE hRead = nullptr, hWrite = nullptr;
+            CreatePipe(&hRead, &hWrite, &sa, 0);
+            SetHandleInformation(hRead, HANDLE_FLAG_INHERIT, 0);
+
+            STARTUPINFOW csi = {};
+            csi.cb = sizeof(csi);
+            csi.dwFlags = STARTF_USESTDHANDLES;
+            csi.hStdOutput = hWrite;
+            csi.hStdError = hWrite;
+            PROCESS_INFORMATION cpi = {};
+            std::wstring cliCmd = L"\"" + cliExe + L"\" --no-autostart --data-dir \"" + noAutoDir + L"\" list";
+            std::vector<wchar_t> cliBuf(cliCmd.begin(), cliCmd.end());
+            cliBuf.push_back(L'\0');
+            BOOL ok = CreateProcessW(nullptr, cliBuf.data(), nullptr, nullptr, TRUE,
+                                     CREATE_NO_WINDOW, nullptr, nullptr, &csi, &cpi);
+            CloseHandle(hWrite);
+            std::string output;
+            if (ok) {
+                CloseHandle(cpi.hThread);
+                char buf[1024];
+                DWORD nr = 0;
+                while (ReadFile(hRead, buf, sizeof(buf), &nr, nullptr) && nr > 0) {
+                    output.append(buf, nr);
+                }
+                WaitForSingleObject(cpi.hProcess, 10000);
+                DWORD ec = 0;
+                GetExitCodeProcess(cpi.hProcess, &ec);
+                CloseHandle(cpi.hProcess);
+                Check(ec == 1, "105-1: --no-autostart exits with code 1 when core is not running");
+                Check(output.find("Hancho.exe --headless") != std::string::npos,
+                      "105-1: --no-autostart error mentions Hancho.exe --headless");
+            } else {
+                Check(false, "105-1: hancho-cli --no-autostart failed to launch");
+            }
+            CloseHandle(hRead);
+            RemoveDirRecursive(noAutoDir);
+        }
+
+        // Test HANCHO_AUTOSTART=headless auto-starts headless core without dashboard window
+        std::wstring headlessAutoDir = tempDirW + L"_auto_headless";
+        RemoveDirRecursive(headlessAutoDir);
+        CreateDirectoryW(headlessAutoDir.c_str(), nullptr);
+        SetDataDirectoryOverride(headlessAutoDir);
+        SetEnvironmentVariableW(L"HANCHO_AUTOSTART", L"headless");
+        SetEnvironmentVariableW(L"HANCHO_NO_DIALOGS", L"1");
+
+        json autoPing;
+        bool autoOk = IpcCall({{"action", "ping"}}, autoPing, nullptr, true);
+        Check(autoOk && autoPing.value("ok", false),
+              "105-1: HANCHO_AUTOSTART=headless auto-starts core via IPC");
+        Check(autoPing.value("headless", false),
+              "105-1: HANCHO_AUTOSTART=headless core reports headless=true");
+        DWORD autoPid = static_cast<DWORD>(autoPing.value("pid", 0));
+        if (autoPid > 0) {
+            Check(FindProcessWindow(L"HanchoDashboardWnd", autoPid) == nullptr,
+                  "105-1: HANCHO_AUTOSTART=headless creates no dashboard window");
+        }
+        json autoQuit;
+        IpcCall({{"action", "quit"}}, autoQuit);
+        for (int i = 0; i < 100; ++i) {
+            if (!IsHanchoRunningForDataDirWide()) break;
+            Sleep(100);
+        }
+        SetEnvironmentVariableW(L"HANCHO_AUTOSTART", nullptr);
+        SetEnvironmentVariableW(L"HANCHO_NO_DIALOGS", nullptr);
+        SetDataDirectoryOverride(tempDirW);
+        RemoveDirRecursive(headlessAutoDir);
     }
 
     RemoveDirRecursive(tempDirW);

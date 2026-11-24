@@ -75,6 +75,30 @@ bool DirectionStore::ValidateId(const std::string& id, std::string& outError) {
     return true;
 }
 
+bool DirectionStore::ValidateCardNumber(const std::string& number, std::string& outError) {
+    outError.clear();
+    if (number.empty()) {
+        outError = "card number is required";
+        return false;
+    }
+    if (number.size() > kCardNumberMaxBytes) {
+        outError = "card number must be at most 64 characters";
+        return false;
+    }
+    if (number.compare(0, std::char_traits<char>::length(kIdPrefix), kIdPrefix) == 0) {
+        outError = "card number must not start with 'dir_'";
+        return false;
+    }
+    for (char c : number) {
+        const unsigned char u = static_cast<unsigned char>(c);
+        if (!(std::isalnum(u) || c == '-' || c == '_' || c == '.')) {
+            outError = "card number may contain only letters, digits, '-', '_' and '.'";
+            return false;
+        }
+    }
+    return true;
+}
+
 bool DirectionStore::ValidateSize(const char* field, const std::string& value, size_t maxBytes,
                                   std::string& outError) {
     outError.clear();
@@ -183,6 +207,35 @@ std::vector<nlohmann::json> DirectionStore::All() const {
 int64_t DirectionStore::Version() const {
     std::lock_guard<std::mutex> lock(mutex_);
     return version_;
+}
+
+uint64_t DirectionStore::MaxRev() const {
+    std::lock_guard<std::mutex> lock(mutex_);
+    uint64_t maxRev = 0;
+    for (const auto& [id, record] : records_) {
+        (void)id;
+        if (record.is_object() && record.contains("rev") && record["rev"].is_number_unsigned()) {
+            const uint64_t r = record["rev"].get<uint64_t>();
+            if (r > maxRev) maxRev = r;
+        }
+    }
+    return maxRev;
+}
+
+std::vector<nlohmann::json> DirectionStore::SinceRev(uint64_t sinceRev, bool includeZero) const {
+    std::lock_guard<std::mutex> lock(mutex_);
+    std::vector<nlohmann::json> out;
+    for (const auto& [id, record] : records_) {
+        (void)id;
+        uint64_t r = 0;
+        if (record.is_object() && record.contains("rev") && record["rev"].is_number_unsigned()) {
+            r = record["rev"].get<uint64_t>();
+        }
+        if ((includeZero && r == 0) || r > sinceRev) {
+            out.push_back(record);
+        }
+    }
+    return out;
 }
 
 } // namespace pc

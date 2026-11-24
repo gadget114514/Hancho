@@ -492,7 +492,7 @@ bool IsFinalNodeState(const BtNode& node) {
 }
 
 int64_t LeafBudgetSec(const BtNode& node) {
-    if (node.type == "job" || node.type == "worker") {
+    if (node.type == "exec" || node.type == "agent") {
         return node.estimateSec > 0 ? node.estimateSec : node.timeoutSec;
     }
     if (node.type == "probe") return node.timeoutSec;
@@ -514,7 +514,7 @@ int64_t RepeatBudgetSec(const BtNode& node, int64_t childBudget) {
 // Best-case duration of one complete run of the node, used for future retry/repeat attempts.
 int64_t FullBudgetSec(const BtNode& node) {
     const std::string& t = node.type;
-    if (t == "job" || t == "worker" || t == "probe" || t == "wait") return ClampEstimateSec(LeafBudgetSec(node));
+    if (t == "exec" || t == "agent" || t == "probe" || t == "wait") return ClampEstimateSec(LeafBudgetSec(node));
     if (t == "sequence" || t == "foreach") {
         int64_t sum = 0;
         for (const auto& c : node.children) sum += FullBudgetSec(*c);
@@ -563,7 +563,7 @@ int64_t FullBudgetSec(const BtNode& node) {
 int64_t PendingNodeSec(const BtNode& node) {
     if (IsFinalNodeState(node)) return 0;
     const std::string& t = node.type;
-    if (t == "job" || t == "worker" || t == "probe" || t == "wait") {
+    if (t == "exec" || t == "agent" || t == "probe" || t == "wait") {
         // Running jobs are already part of the task queue's remaining time.
         return node.state == "idle" ? ClampEstimateSec(LeafBudgetSec(node)) : 0;
     }
@@ -639,7 +639,7 @@ void CollectPlannedTasks(const BtNode& node, const BehaviorTree& bt,
                          std::vector<BtPlannedTask>& out) {
     if (IsFinalNodeState(node)) return;
     const std::string& t = node.type;
-    if (t == "job" || t == "worker") {
+    if (t == "exec" || t == "agent") {
         if (node.state != "idle") return;
         BtPlannedTask task;
         task.btId = bt.Id();

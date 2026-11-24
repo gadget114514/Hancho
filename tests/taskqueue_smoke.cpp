@@ -9,6 +9,7 @@
 #include <ctime>
 #include <cstdio>
 #include <cwctype>
+#include <set>
 #include <string>
 
 namespace pc {
@@ -66,6 +67,22 @@ int main() {
     std::wstring env = L"HANCHO_LOG_DIR=" + dir;
     _wputenv(env.c_str());
     SetDataDirectoryOverride(dir);
+
+    // --- JSON getters prefer the object's own key over a nested one -------------------------
+    {
+        // nlohmann sorts keys, so "bt" (with its own "id") comes before the job's "id".
+        const std::string job =
+            R"({"attempts":[{"id":"a1"}],"bt":{"id":"tree","node":"build","run":1},)"
+            R"("id":"tree-build-1","note":"\"id\":\"fake\"","state":"running"})";
+        Check(JsonGetString(job, "id", "") == "tree-build-1", "JsonGetString takes the top-level id");
+        Check(JsonGetString(job, "node", "") == "build", "JsonGetString still finds a nested-only key");
+        Check(JsonGetInt(job, "run", 0) == 1, "JsonGetInt still finds a nested-only key");
+        // Callers cut the text at "bt":{ and read "id" from there; that must stay the tree's id.
+        const size_t btPos = job.find("\"bt\":{");
+        Check(JsonGetString(job.substr(btPos), "id", "") == "tree",
+              "JsonGetString on a fragment cut at a nested object reads that object's key");
+        Check(JsonGetString(job, "missing", "dflt") == "dflt", "JsonGetString default for a missing key");
+    }
 
     // --- Dashboard window title ----------------------------------------------------------
     {
@@ -315,6 +332,25 @@ int main() {
             in.events.push_back(event("error", 78, R"({"message":"Invalid API key provided"})"));
             auto d = classified(in, "auth_error", "human");
             Check(d.evidence[0].IsEvent() && d.evidence[0].seq == 78, "auth_error evidence is the event seq");
+        }
+        {
+            // 102-2: a structured class wins even when the wording matches no built-in pattern.
+            TaskQueueFailureInput in = makeBase();
+            in.endKind = "failed";
+            in.exitCode = 1;
+            in.events.push_back(event("error", 80,
+                R"({"message":"Your session has expired, sign in again","class":"auth_error","httpStatus":401})"));
+            auto d = classified(in, "auth_error", "human");
+            Check(d.detail.value("rule", std::string()) == "structured.auth_error", "structured auth_error names its rule");
+            Check(d.detail.value("httpStatus", 0) == 401, "structured auth_error carries httpStatus");
+        }
+        {
+            // 102-2: a structured provider_down outranks a quota line in the same events.
+            TaskQueueFailureInput in = makeBase();
+            in.endKind = "failed";
+            in.exitCode = 1;
+            in.events.push_back(event("error", 81, R"({"message":"quota exceeded","class":"provider_down","httpStatus":503})"));
+            classified(in, "provider_down", "retry");
         }
         {
             TaskQueueFailureInput in = makeBase();
@@ -1135,7 +1171,10 @@ int main() {
         std::string r = tqm.TaskQueueRetry("H", true, true, err);
         Check(JsonGetBool(r, "ok", false), "retry H with refresh: " + err);
         std::string g = tqm.TaskQueueGet("H", true, 0, err);
-        Check(JsonGetString(g, "rev", "0") == "2", "instructions revision bumped to 2");
+        auto gj = nlohmann::json::parse(g, nullptr, false);
+        Check(gj.is_object() && gj.contains("job") && gj["job"].contains("instructions") &&
+                  gj["job"]["instructions"].value("rev", 0) == 2,
+              "instructions revision bumped to 2");
     }
 
     Sleep(300);
@@ -1236,12 +1275,14 @@ int main() {
         // Under-estimate: estimate 100s, duration 20s -> 0.2x (diverged_under)
         testJob.estimateSec = 100;
         testJob.attempts[0].end = "2026-11-12 10:00:20";
+        testJob.cachedJsonNoInstr_.clear();
         tfJson = tqm.JobToJson(testJob, false);
         Check(tfJson.find("\"accuracy\":\"diverged_under\"") != std::string::npos, "diverged_under detected");
 
         // Accurate: estimate 30s, duration 30s -> 1.0x (accurate)
         testJob.estimateSec = 30;
         testJob.attempts[0].end = "2026-11-12 10:00:30";
+        testJob.cachedJsonNoInstr_.clear();
         tfJson = tqm.JobToJson(testJob, false);
         Check(tfJson.find("\"accuracy\":\"accurate\"") != std::string::npos, "accurate detected within tolerance");
 
@@ -3687,6 +3728,63 @@ int main() {
         Check(flatRows.size() == jobs.size() && flatRows[0].indent == 0 && flatRows[0].taskTitle == "Running task",
               "100-5: Job view is flat with taskTitle populated");
 
+        // 102-6: visibleFinishedCount slicing, "Load 20 more" row and query filtering.
+        {
+            std::vector<nlohmann::json> fTasks;
+            std::vector<nlohmann::json> fJobs;
+            for (int i = 0; i < 5; ++i) {
+                const std::string id = "f_task_" + std::to_string(i);
+                fTasks.push_back({{"id", id},
+                                  {"title", i == 2 ? "special build" : "ordinary build"},
+                                  {"state", "succeeded"},
+                                  {"updatedAt", "2026-11-24T10:0" + std::to_string(i) + ":00Z"}});
+                fJobs.push_back({{"id", "f_job_" + std::to_string(i)},
+                                 {"task_id", id},
+                                 {"state", "succeeded"},
+                                 {"summary", i == 2 ? "special summary" : "normal summary"},
+                                 {"created_at", "2026-11-24T10:0" + std::to_string(i) + ":00Z"}});
+            }
+            fJobs.push_back({{"id", "f_live"}, {"state", "running"}, {"summary", "live job"},
+                             {"created_at", "2026-11-24T10:10:00Z"}});
+            TaskViewCounts fCounts;
+            std::unordered_map<std::string, bool> fOv;
+            std::unordered_set<std::string> fAll;
+            auto fRows = BuildTaskDisplayRows(fJobs, fTasks, /*taskViewMode=*/false, fOv, fAll, fCounts, 8);
+
+            auto limited = FilterTaskDisplayRows(fRows, /*visibleFinishedCount=*/2, /*query=*/"");
+            Check(limited.totalFinished == 5 && limited.shownFinished == 2 && limited.hasMore,
+                  "102-6: finished rows counted in full, only visibleFinishedCount kept");
+            Check(limited.rows.size() == 4 &&
+                      limited.rows.back().kind == TaskDisplayRowKind::LoadMoreFinished &&
+                      limited.rows.back().hiddenFinishedCount == 3,
+                  "102-6: LoadMoreFinished row reports 3 hidden finished rows");
+            Check(!limited.rows.empty() && limited.rows.front().jobId == "f_job_0",
+                  "102-6: first visibleFinishedCount finished rows kept in display order");
+            Check(limited.rows.back().kind == TaskDisplayRowKind::LoadMoreFinished ||
+                      std::any_of(limited.rows.begin(), limited.rows.end(), [](const TaskDisplayRow& r) {
+                          return r.jobId == "f_live";
+                      }),
+                  "102-6: unfinished rows are never dropped by the limit");
+
+            auto more = FilterTaskDisplayRows(fRows, /*visibleFinishedCount=*/20, /*query=*/"");
+            Check(!more.hasMore && more.rows.size() == fRows.size() && more.shownFinished == 5,
+                  "102-6: no LoadMoreFinished row when everything fits");
+
+            auto searched = FilterTaskDisplayRows(fRows, /*visibleFinishedCount=*/30, /*query=*/"special");
+            Check(searched.queryActive && !searched.rows.empty(),
+                  "102-6: query keeps matching rows");
+            bool onlySpecial = true;
+            for (const auto& r : searched.rows) {
+                if (r.kind == TaskDisplayRowKind::LoadMoreFinished) continue;
+                if (TaskDisplayRowQueryText(r).find("special") == std::string::npos) onlySpecial = false;
+            }
+            Check(onlySpecial, "102-6: query filters out non-matching rows case-insensitively");
+
+            auto cleared = FilterTaskDisplayRows(fRows, /*visibleFinishedCount=*/2, /*query=*/"");
+            Check(cleared.rows.size() == limited.rows.size() && cleared.totalFinished == 5,
+                  "102-6: clearing the query restores the normal limited view");
+        }
+
         // 3. TaskList version & since_version
         auto parse = [](const std::string& raw) {
             nlohmann::json j = nlohmann::json::parse(raw, nullptr, false);
@@ -4145,6 +4243,920 @@ int main() {
             reloadTm.ShutdownTaskQueueManager();
         }
         SetDataDirectoryOverride(dir);
+    }
+
+    // 104-1: planned card directions, CRUD, validations, task state, and persistence.
+    {
+        auto parse = [](const std::string& s) {
+            return nlohmann::json::parse(s, nullptr, false);
+        };
+        const std::wstring cardDataDir = PathJoinWide(dir, L"dir_104_1");
+        std::filesystem::remove_all(cardDataDir);
+        std::filesystem::create_directories(cardDataDir);
+        SetDataDirectoryOverride(cardDataDir);
+
+        std::string taskA;
+        std::string taskB;
+        std::string dir102_2;
+        std::string dir102_10;
+        {
+            ProcessManager cPm;
+            TaskQueueManager cTm;
+            cTm.SetProcessManager(&cPm);
+            cPm.SetProcessFinishedCallback([&](int pid, int code, const std::string& endKind) {
+                cTm.OnProcessFinished(pid, code, endKind);
+            });
+            std::string err;
+
+            const nlohmann::json tA = parse(cTm.TaskCreate("104-1 task A", "card store", "", "{}", err));
+            const nlohmann::json tB = parse(cTm.TaskCreate("104-1 task B", "ambiguous num", "", "{}", err));
+            taskA = tA.value("id", std::string());
+            taskB = tB.value("id", std::string());
+            Check(!taskA.empty() && !taskB.empty(), "104-1: tasks created");
+
+            // 1) Add cards out of order: 102-10, 102-2, 102-3 (with after 102-2).
+            const nlohmann::json c10 = parse(cTm.CardAdd(
+                taskA, "102-10", "Tenth card", "## Body 10\n", {}, "", R"({"build":"cmake --build build"})", "{}", err));
+            Check(c10.value("ok", false) && c10.value("state", std::string()) == "planned",
+                  "104-1: CardAdd 102-10 succeeds as planned");
+            dir102_10 = c10.value("directionId", std::string());
+
+            const nlohmann::json c2 = parse(cTm.CardAdd(
+                taskA, "102-2", "Second card", "## Body 2\n", {}, "card", "{}", "{}", err));
+            Check(c2.value("ok", false), "104-1: CardAdd 102-2 succeeds");
+            dir102_2 = c2.value("directionId", std::string());
+
+            const nlohmann::json c3 = parse(cTm.CardAdd(
+                taskA, "102-3", "Third card", "## Body 3\n", {"102-2"}, "", "{}", "{}", err));
+            Check(c3.value("ok", false), "104-1: CardAdd 102-3 with after 102-2 succeeds");
+
+            // 2) CardList: sorted naturally (102-2, 102-3, 102-10), omits body, shows waitingFor.
+            const nlohmann::json list1 = parse(cTm.CardList(taskA, err));
+            Check(list1.value("ok", false) && list1["cards"].size() == 3,
+                  "104-1: CardList returns 3 cards");
+            Check(list1["cards"][0].value("number", std::string()) == "102-2" &&
+                      list1["cards"][1].value("number", std::string()) == "102-3" &&
+                      list1["cards"][2].value("number", std::string()) == "102-10",
+                  "104-1: CardList sorts naturally by card number");
+            Check(!list1["cards"][0].contains("body") && !list1["cards"][1].contains("body"),
+                  "104-1: CardList omits card body");
+            Check(list1["cards"][1]["waitingFor"].size() == 1 &&
+                      list1["cards"][1]["waitingFor"][0] == "102-2" &&
+                      !list1["cards"][1].value("ready", true),
+                  "104-1: 102-3 is waitingFor 102-2");
+            Check(list1["cards"][0]["waitingFor"].empty() && list1["cards"][0].value("ready", false),
+                  "104-1: 102-2 is ready");
+
+            // DirectionList also omits body.
+            const nlohmann::json dList = parse(cTm.DirectionList(taskA, "", 0, err));
+            Check(dList.value("ok", false) && dList["directions"].size() == 3,
+                  "104-1: DirectionList includes planned card directions");
+            for (const auto& d : dList["directions"]) {
+                Check(!d.contains("card") || !d["card"].contains("body"),
+                      "104-1: DirectionList omits card.body");
+            }
+
+            // 3) CardShow: by number (unique across tasks), by directionId, and ambiguity error.
+            const nlohmann::json showByNum = parse(cTm.CardShow("102-10", "", err));
+            Check(showByNum.value("ok", false) &&
+                      showByNum["card"].value("body", std::string()) == "## Body 10\n" &&
+                      showByNum["card"]["params"].value("build", std::string()) == "cmake --build build",
+                  "104-1: CardShow without --task succeeds when unique and includes body");
+            const nlohmann::json showByDir = parse(cTm.CardShow(dir102_2, "", err));
+            Check(showByDir.value("ok", false) &&
+                      showByDir["card"].value("number", std::string()) == "102-2",
+                  "104-1: CardShow works by directionId");
+
+            Check(parse(cTm.CardAdd(taskB, "102-3", "Other 102-3", "body", {}, "", "{}", "{}", err)).value("ok", false),
+                  "104-1: same number allowed in different task");
+            Check(!parse(cTm.CardShow("102-3", "", err)).value("ok", true),
+                  "104-1: CardShow without --task fails when number exists in multiple tasks");
+            Check(parse(cTm.CardShow("102-3", taskA, err)).value("ok", false),
+                  "104-1: CardShow with --task resolves ambiguity");
+
+            // 4) Validations: duplicate number, unknown after, self-dep, cycle, closed task.
+            Check(!parse(cTm.CardAdd(taskA, "102-2", "Dup", "b", {}, "", "{}", "{}", err)).value("ok", true),
+                  "104-1: duplicate card number in same task rejected");
+            Check(!parse(cTm.CardAdd(taskA, "102-4", "Missing dep", "b", {"102-99"}, "", "{}", "{}", err)).value("ok", true),
+                  "104-1: unknown after number rejected");
+            Check(!parse(cTm.CardAdd(taskA, "102-4", "Self dep", "b", {"102-4"}, "", "{}", "{}", err)).value("ok", true),
+                  "104-1: self dependency rejected");
+
+            // Edit 102-2 to depend on 102-3 -> cycle (102-2 -> 102-3 -> 102-2).
+            Check(!parse(cTm.CardEdit(taskA, "102-2", false, "", false, "", true, {"102-3"},
+                                      false, "", false, "", "", err)).value("ok", true),
+                  "104-1: dependency cycle rejected on edit");
+
+            // 5) CardEdit while planned succeeds.
+            const nlohmann::json ed = parse(cTm.CardEdit(
+                taskA, "102-10", true, "Tenth edited", true, "## Updated 10\n", true, {"102-3"},
+                false, "", true, R"({"test":"ctest"})", "", err));
+            Check(ed.value("ok", false), "104-1: CardEdit while planned succeeds");
+            const nlohmann::json showEd = parse(cTm.CardShow("102-10", taskA, err));
+            Check(showEd["card"].value("title", std::string()) == "Tenth edited" &&
+                      showEd["card"].value("body", std::string()) == "## Updated 10\n" &&
+                      showEd["card"]["params"].value("test", std::string()) == "ctest",
+                  "104-1: CardEdit updates title, body, params");
+
+            // 6) Task with planned cards + a succeeded job stays open (never succeeded).
+            const nlohmann::json addOk = parse(cTm.TaskQueueAdd(
+                "q104-1",
+                R"([{"id":"j104-ok","command":"cmd /c echo ok","summary":"ok","timeoutSec":30,"maxAttempts":1}])",
+                1, "", err, "", taskA));
+            Check(addOk.value("ok", false) && WaitForState(cTm, "j104-ok", "succeeded", 8000),
+                  "104-1: helper job succeeds");
+            Check(cTm.TaskState(taskA).value("state", std::string()) == "open",
+                  "104-1: task with remaining planned cards stays open");
+
+            // 7) Close 102-2 as ignored -> does NOT satisfy 102-3's dependency; edit/remove fail when closed.
+            Check(parse(cTm.DirectionClose(dir102_2, "ignored", "skip", err)).value("ok", false),
+                  "104-1: close card direction as ignored");
+            Check(!parse(cTm.CardEdit(taskA, "102-2", true, "No", false, "", false, {},
+                                      false, "", false, "", "", err)).value("ok", true),
+                  "104-1: CardEdit fails when card is not planned");
+            Check(!parse(cTm.CardRemove(taskA, "102-2", "", err)).value("ok", true),
+                  "104-1: CardRemove fails when card is not planned");
+            const nlohmann::json listAfterIgn = parse(cTm.CardList(taskA, err));
+            Check(listAfterIgn["cards"][1]["waitingFor"].size() == 1,
+                  "104-1: closed(ignored) does not satisfy after dependency");
+
+            // Reopen 102-2 and close as succeeded -> satisfies 102-3's dependency!
+            Check(parse(cTm.DirectionReopen(dir102_2, "recheck", err)).value("ok", false),
+                  "104-1: reopen 102-2");
+            Check(parse(cTm.DirectionClose(dir102_2, "succeeded", "done", err)).value("ok", false),
+                  "104-1: close 102-2 as succeeded");
+            const nlohmann::json listAfterSuc = parse(cTm.CardList(taskA, err));
+            Check(listAfterSuc["cards"][1]["waitingFor"].empty() &&
+                      listAfterSuc["cards"][1].value("ready", false),
+                  "104-1: closed(succeeded) satisfies after dependency");
+
+            // 8) CardRemove on planned card + closed task rejection.
+            Check(parse(cTm.CardAdd(taskA, "102-9", "Temp card", "tmp", {}, "", "{}", "{}", err)).value("ok", false),
+                  "104-1: add temp card");
+            Check(parse(cTm.CardRemove(taskA, "102-9", "", err)).value("ok", false),
+                  "104-1: CardRemove on planned card succeeds");
+            Check(!parse(cTm.CardShow("102-9", taskA, err)).value("ok", true),
+                  "104-1: removed card is gone");
+
+            // Task log has card_added, card_edited, card_removed.
+            const nlohmann::json tShow = parse(cTm.TaskShow(taskA, 50, err));
+            bool hasAdded = false, hasEdited = false, hasRemoved = false;
+            for (const auto& entry : tShow["log"]) {
+                const std::string k = entry.value("kind", std::string());
+                if (k == "card_added") hasAdded = true;
+                if (k == "card_edited") hasEdited = true;
+                if (k == "card_removed") hasRemoved = true;
+            }
+            Check(hasAdded && hasEdited && hasRemoved,
+                  "104-1: task log records card_added, card_edited, card_removed");
+
+            // Closed task rejects CardAdd.
+            Check(parse(cTm.TaskClose(taskB, "succeeded", "done", err)).value("ok", false),
+                  "104-1: close taskB");
+            Check(!parse(cTm.CardAdd(taskB, "102-4", "After close", "b", {}, "", "{}", "{}", err)).value("ok", true),
+                  "104-1: CardAdd on closed task rejected");
+
+            cPm.SetProcessFinishedCallback(nullptr);
+            cTm.ShutdownTaskQueueManager();
+            cTm.SetProcessManager(nullptr);
+        }
+
+        // 9) Reload from disk: planned cards persist.
+        {
+            TaskQueueManager reloadTm;
+            std::string rErr;
+            const nlohmann::json reloadedList = parse(reloadTm.CardList(taskA, rErr));
+            Check(reloadedList.value("ok", false) && reloadedList["cards"].size() == 3,
+                  "104-1: cards persist across restart");
+            const nlohmann::json reloadedShow = parse(reloadTm.CardShow("102-10", taskA, rErr));
+            Check(reloadedShow.value("ok", false) &&
+                      reloadedShow["card"].value("body", std::string()) == "## Updated 10\n",
+                  "104-1: card body persists across restart");
+            Check(reloadTm.TaskState(taskA).value("state", std::string()) == "open",
+                  "104-1: task with planned cards remains open after restart");
+            reloadTm.ShutdownTaskQueueManager();
+        }
+        SetDataDirectoryOverride(dir);
+    }
+
+    // 104-3: CardRedo (rescue cards, lineage, dependency resolution, chain limit).
+    {
+        auto parse = [](const std::string& s) {
+            return nlohmann::json::parse(s, nullptr, false);
+        };
+        const std::wstring cardDir = PathJoinWide(dir, L"dir_104_3");
+        std::filesystem::remove_all(cardDir);
+        std::filesystem::create_directories(cardDir);
+        SetDataDirectoryOverride(cardDir);
+
+        {
+            TaskQueueManager rTm;
+            std::string err;
+            const nlohmann::json t = parse(rTm.TaskCreate("104-3 task", "rescue cards", "", "{}", err));
+            const std::string taskId = t.value("id", std::string());
+            Check(!taskId.empty(), "104-3: task created");
+
+            const nlohmann::json c2 = parse(rTm.CardAdd(
+                taskId, "102-2", "Base card", "## Original body\n", {}, "card",
+                R"({"build":"cmake --build build","test":"ctest"})", "{}", err));
+            const std::string dir2 = c2.value("directionId", std::string());
+            Check(c2.value("ok", false) && !dir2.empty(), "104-3: CardAdd 102-2");
+
+            const nlohmann::json c3 = parse(rTm.CardAdd(
+                taskId, "102-3", "Downstream card", "## Downstream\n", {"102-2"}, "", "{}", "{}", err));
+            Check(c3.value("ok", false), "104-3: CardAdd 102-3 after 102-2");
+
+            // Redo while planned must fail.
+            Check(!parse(rTm.CardRedo(taskId, "102-2", false, "", false, "", "too early", false, "{}", err))
+                       .value("ok", true),
+                  "104-3: CardRedo rejects planned card");
+
+            // Close 102-2 as failed, then redo without body/params -> inherits original body & params.
+            Check(parse(rTm.DirectionClose(dir2, "failed", "compile error", err)).value("ok", false),
+                  "104-3: close 102-2 as failed");
+            const nlohmann::json r1 = parse(rTm.CardRedo(
+                taskId, "102-2", false, "", false, "", "retry with fix", false, "{}", err));
+            Check(r1.value("ok", false) &&
+                      r1.value("number", std::string()) == "102-2-r1" &&
+                      r1.value("supersedes", std::string()) == dir2 &&
+                      r1.value("rescueDepth", 0) == 1 &&
+                      r1.value("state", std::string()) == "planned",
+                  "104-3: first redo creates 102-2-r1 as planned superseding 102-2");
+            const std::string dirR1 = r1.value("directionId", std::string());
+
+            const nlohmann::json showOrig = parse(rTm.CardShow(dir2, taskId, err));
+            Check(showOrig.value("ok", false) &&
+                      showOrig["direction"].value("supersededBy", std::string()) == dirR1,
+                  "104-3: original direction records supersededBy");
+
+            const nlohmann::json showR1 = parse(rTm.CardShow("102-2-r1", taskId, err));
+            Check(showR1.value("ok", false) &&
+                      showR1["direction"].value("supersedes", std::string()) == dir2 &&
+                      showR1["direction"].value("supersedeReason", std::string()) == "retry with fix" &&
+                      showR1["card"].value("body", std::string()) == "## Original body\n" &&
+                      showR1["card"]["params"].value("build", std::string()) == "cmake --build build",
+                  "104-3: rescue card inherits body and params when omitted");
+
+            // Downstream 102-3 is still waiting while 102-2-r1 is planned.
+            const nlohmann::json listWaiting = parse(rTm.CardList(taskId, err));
+            Check(listWaiting.value("ok", false) && listWaiting["cards"].size() == 2 &&
+                      listWaiting["cards"][0].value("number", std::string()) == "102-2-r1" &&
+                      listWaiting["cards"][1].value("number", std::string()) == "102-3" &&
+                      listWaiting["cards"][1]["waitingFor"].size() == 1 &&
+                      !listWaiting["cards"][1].value("ready", true),
+                  "104-3: downstream 102-3 waits on rescue card 102-2-r1");
+
+            // Close 102-2-r1 as failed -> second redo (depth 2) with overridden body & params.
+            Check(parse(rTm.DirectionClose(dirR1, "failed", "still failing", err)).value("ok", false),
+                  "104-3: close 102-2-r1 as failed");
+            const nlohmann::json r2 = parse(rTm.CardRedo(
+                taskId, "102-2-r1", true, "## Rescue body 2\n", true, R"({"engines":["codex"]})",
+                "switch engine", false, "{}", err));
+            Check(r2.value("ok", false) &&
+                      r2.value("number", std::string()) == "102-2-r2" &&
+                      r2.value("supersedes", std::string()) == dirR1 &&
+                      r2.value("rescueDepth", 0) == 2,
+                  "104-3: second redo creates 102-2-r2 (depth 2)");
+            const std::string dirR2 = r2.value("directionId", std::string());
+
+            const nlohmann::json showR2 = parse(rTm.CardShow("102-2-r2", taskId, err));
+            Check(showR2.value("ok", false) &&
+                      showR2["card"].value("body", std::string()) == "## Rescue body 2\n" &&
+                      showR2["card"]["params"].contains("engines"),
+                  "104-3: rescue card overrides body and params when provided");
+
+            // Close 102-2-r2 as failed -> 3rd redo exceeds default limit (2) unless force=true.
+            Check(parse(rTm.DirectionClose(dirR2, "failed", "third fail", err)).value("ok", false),
+                  "104-3: close 102-2-r2 as failed");
+            Check(!parse(rTm.CardRedo(taskId, "102-2", false, "", false, "", "over limit", false, "{}", err))
+                       .value("ok", true),
+                  "104-3: third redo rejected when exceeding default rescue limit (2)");
+            const nlohmann::json r3 = parse(rTm.CardRedo(
+                taskId, "102-2", false, "", false, "", "forced rescue", true, "{}", err));
+            Check(r3.value("ok", false) &&
+                      r3.value("number", std::string()) == "102-2-r3" &&
+                      r3.value("supersedes", std::string()) == dirR2 &&
+                      r3.value("rescueDepth", 0) == 3,
+                  "104-3: third redo succeeds with force=true and follows head to 102-2-r3");
+            const std::string dirR3 = r3.value("directionId", std::string());
+
+            // When 102-2-r3 succeeds (closed as succeeded), downstream 102-3 becomes ready!
+            Check(parse(rTm.DirectionClose(dirR3, "succeeded", "fixed", err)).value("ok", false),
+                  "104-3: close 102-2-r3 as succeeded");
+            const nlohmann::json listReady = parse(rTm.CardList(taskId, err));
+            Check(listReady.value("ok", false) &&
+                      listReady["cards"][1].value("number", std::string()) == "102-3" &&
+                      listReady["cards"][1]["waitingFor"].empty() &&
+                      listReady["cards"][1].value("ready", false),
+                  "104-3: downstream 102-3 becomes ready after rescue card succeeds");
+
+            // Task log records card_redone.
+            const nlohmann::json tShow = parse(rTm.TaskShow(taskId, 50, err));
+            bool hasRedone = false;
+            for (const auto& entry : tShow["log"]) {
+                if (entry.value("kind", std::string()) == "card_redone") hasRedone = true;
+            }
+            Check(hasRedone, "104-3: task log records card_redone");
+
+            rTm.ShutdownTaskQueueManager();
+        }
+        SetDataDirectoryOverride(dir);
+    }
+
+    // Card 104-5: BuildTaskDisplayRows for card directions (planned, waitingFor, redo indentation, resultsCompact).
+    {
+        const std::vector<nlohmann::json> cTasks = {
+            {{"id", "t_cards"}, {"title", "Card Task"}, {"state", "open"}, {"createdAt", "2026-11-24T10:00:00Z"}}
+        };
+        const std::vector<nlohmann::json> cDirs = {
+            {{"id", "dir_c3"}, {"taskId", "t_cards"}, {"kind", "card"}, {"state", "planned"},
+             {"card", {{"number", "104-3"}, {"title", "Third"}}},
+             {"after", nlohmann::json::array({"104-2-r1"})},
+             {"waitingFor", nlohmann::json::array({"104-2-r1"})}},
+            {{"id", "dir_c1"}, {"taskId", "t_cards"}, {"kind", "bt"}, {"state", "succeeded"},
+             {"card", {{"number", "104-1"}, {"title", "First"}}}},
+            {{"id", "dir_c2_r1"}, {"taskId", "t_cards"}, {"kind", "card"}, {"state", "planned"},
+             {"supersedes", "dir_c2"},
+             {"card", {{"number", "104-2-r1"}, {"title", "Second Redo"}}}},
+            {{"id", "dir_c2"}, {"taskId", "t_cards"}, {"kind", "bt"}, {"state", "failed"},
+             {"supersededBy", "dir_c2_r1"},
+             {"card", {{"number", "104-2"}, {"title", "Second"}}}}
+        };
+        const std::vector<nlohmann::json> cJobs;
+        std::unordered_map<std::string, bool> cOv;
+        std::unordered_set<std::string> cAll;
+        TaskViewCounts cCounts;
+        auto cRows = BuildTaskDisplayRows(cJobs, cTasks, true, cOv, cAll, cCounts, 8, cDirs);
+        Check(cCounts.totalTasks == 1, "104-5: totalTasks counts top-level task, not cards");
+        Check(cRows.size() == 5, "104-5: TaskHeading + 4 card DirectionHeading rows");
+        if (cRows.size() == 5) {
+            Check(cRows[0].kind == TaskDisplayRowKind::TaskHeading &&
+                  cRows[0].resultsCompact.find("\xC2\xB7") != std::string::npos,
+                  "104-5: TaskHeading resultsCompact includes planned dot");
+            Check(cRows[1].cardNumber == "104-1" && cRows[1].indent == 1,
+                  "104-5: 104-1 sorted first at indent 1");
+            Check(cRows[2].cardNumber == "104-2" && cRows[2].indent == 1 && cRows[2].isSuperseded,
+                  "104-5: 104-2 at indent 1 marked superseded");
+            Check(cRows[3].cardNumber == "104-2-r1" && cRows[3].indent == 2 &&
+                  cRows[3].directionState == "planned",
+                  "104-5: redo card 104-2-r1 indented under superseded card at indent 2");
+            Check(cRows[4].cardNumber == "104-3" && cRows[4].indent == 1 &&
+                  cRows[4].directionState == "planned" &&
+                  cRows[4].waitingFor == std::vector<std::string>{"104-2-r1"},
+                  "104-5: waiting card 104-3 preserves waitingFor");
+        }
+    }
+
+    // Card 105-3 & 105-5: TaskQueueRunJUnitXml output, BT outcome, direction scoping.
+    {
+        nlohmann::json j1 = {
+            {"id", "J-OK"}, {"name", "J-OK"}, {"state", "succeeded"},
+            {"direction_id", "dir_10"},
+            {"attempts", {{{"n", 1}, {"exit_code", 0}, {"log_file", "ok.log"},
+                           {"start", "2026-11-24 10:00:00"}, {"end", "2026-11-24 10:00:05"}}}}
+        };
+        nlohmann::json j2 = {
+            {"id", "J-OTHER"}, {"name", "J-OTHER"}, {"state", "running"},
+            {"direction_id", "dir_20"}
+        };
+        TaskQueueRunJob r1 = TaskQueueRunJobFromJson(j1);
+        TaskQueueRunJob r2 = TaskQueueRunJobFromJson(j2);
+        Check(r1.directionId == "dir_10" && r1.logFile == "ok.log" &&
+                  r1.startTime == "2026-11-24 10:00:00" && r1.endTime == "2026-11-24 10:00:05",
+              "105-3/105-5: TaskQueueRunJobFromJson parses direction_id, log_file, start, end");
+
+        // Scoping to dir_10 ignores running dir_20.
+        std::vector<TaskQueueRunJob> scoped = {r1};
+        Check(TaskQueueRunDrained(scoped) && TaskQueueRunExitCode(scoped) == 0,
+              "105-3: direction-scoped results are drained even when another direction is running");
+
+        // Default JUnit XML without includeOutput has no <system-out>.
+        r1.outputTail = "hello\x01world\n";
+        std::string defaultXml = TaskQueueRunJUnitXml("q", {r1}, false, false, nullptr);
+        Check(defaultXml.find("<system-out>") == std::string::npos,
+              "105-5: JUnit XML omits <system-out> by default");
+
+        // With includeOutput=true, <system-out> is included and control chars stripped.
+        std::string withOutXml = TaskQueueRunJUnitXml("q", {r1}, false, true, nullptr);
+        Check(withOutXml.find("<system-out>helloworld\n</system-out>") != std::string::npos,
+              "105-5: JUnit XML includes sanitized <system-out> when --report-output is enabled");
+
+        // With btOutcome, one extra testcase is appended.
+        TaskQueueRunJob btOutcome;
+        btOutcome.id = "bt-ci-1";
+        btOutcome.name = "bt-ci-1";
+        btOutcome.state = "failed";
+        btOutcome.failureSummary = "step failed";
+        std::string btXml = TaskQueueRunJUnitXml("q", {r1}, false, false, &btOutcome);
+        Check(btXml.find("tests=\"2\"") != std::string::npos &&
+                  btXml.find("failures=\"1\"") != std::string::npos &&
+                  btXml.find("name=\"bt-ci-1\"") != std::string::npos,
+              "105-3: JUnit XML for --bt includes job testcases plus 1 BT outcome testcase");
+    }
+
+    // Card 105-4: WatchDirectionClient cancels direction on client exit, leaves others alone,
+    // and ReconcileDirectionClientWatches cancels directions whose client PID is dead after restart.
+    {
+        std::wstring wDir = dir + L"\\watch_105_4";
+        EnsureDirectoryWide(wDir);
+        SetDataDirectoryOverride(wDir);
+        {
+            TaskQueueManager wTqm;
+            ProcessManager wPm;
+            wTqm.SetProcessManager(&wPm);
+            wPm.SetProcessFinishedCallback([&wTqm](int pid, int ec, const std::string& kind) {
+                wTqm.OnProcessFinished(pid, ec, kind);
+            });
+
+            std::string wErr;
+            const std::string addA = wTqm.TaskQueueAdd(
+                "wq",
+                R"([{"id":"W-A","command":"cmd /c ping -n 30 127.0.0.1 >nul","summary":"watched","timeoutSec":60,"maxAttempts":1}])",
+                2, "", wErr);
+            const std::string addB = wTqm.TaskQueueAdd(
+                "wq",
+                R"([{"id":"W-B","command":"cmd /c ping -n 30 127.0.0.1 >nul","summary":"unwatched","timeoutSec":60,"maxAttempts":1}])",
+                2, "", wErr);
+            const std::string dirA = nlohmann::json::parse(addA).value("direction_id", std::string());
+            const std::string dirB = nlohmann::json::parse(addB).value("direction_id", std::string());
+            Check(!dirA.empty() && !dirB.empty(), "105-4: created two directions for watch test");
+
+#ifdef _WIN32
+            STARTUPINFOW si{};
+            si.cb = sizeof(si);
+            PROCESS_INFORMATION pi{};
+            std::wstring cmd = L"cmd.exe /c ping -n 30 127.0.0.1 >nul";
+            BOOL spawned = CreateProcessW(nullptr, &cmd[0], nullptr, nullptr, FALSE,
+                                          CREATE_NO_WINDOW, nullptr, nullptr, &si, &pi);
+            Check(spawned != FALSE, "105-4: spawned dummy client process");
+            if (spawned) {
+                CloseHandle(pi.hThread);
+                Check(wTqm.WatchDirectionClient(dirA, static_cast<uint32_t>(pi.dwProcessId), wErr),
+                      "105-4: WatchDirectionClient registered dummy PID: " + wErr);
+                Sleep(150);
+                TerminateProcess(pi.hProcess, 1);
+                WaitForSingleObject(pi.hProcess, 3000);
+                CloseHandle(pi.hProcess);
+
+                Check(WaitForState(wTqm, "W-A", "cancelled", 5000),
+                      "105-4: watched direction W-A cancelled after client exit");
+                const std::string stB = GetState(wTqm, "W-B");
+                Check(stB == "running" || stB == "pending",
+                      "105-4: unwatched direction W-B unaffected (state=" + stB + ")");
+            }
+#endif
+
+            // Simulated restart reconciliation: dead PID cancels the direction.
+            const std::string addC = wTqm.TaskQueueAdd(
+                "wq",
+                R"([{"id":"W-C","command":"cmd /c ping -n 30 127.0.0.1 >nul","summary":"stale watch","timeoutSec":60,"maxAttempts":1}])",
+                2, "", wErr);
+            const std::string dirC = nlohmann::json::parse(addC).value("direction_id", std::string());
+            Check(!dirC.empty(), "105-4: created dirC for restart reconcile test");
+            // Watch with a non-existent PID triggers immediate cancellation or reconcile cancellation.
+            wTqm.WatchDirectionClient(dirC, 99999999u, wErr);
+            Check(WaitForState(wTqm, "W-C", "cancelled", 5000),
+                  "105-4: dead client PID cancels direction");
+
+            wTqm.DirectionCancelJobs(dirB, wErr);
+            wPm.SetProcessFinishedCallback(nullptr);
+            wTqm.ShutdownTaskQueueManager();
+            wTqm.SetProcessManager(nullptr);
+        }
+        SetDataDirectoryOverride(dir);
+    }
+
+    // Card 105-3 & 105-5: direction-scoped wait vs queue-wide wait, and JUnit <failure> class/exitCode.
+    {
+        std::wstring dDir = dir + L"\\scope_105_3";
+        EnsureDirectoryWide(dDir);
+        SetDataDirectoryOverride(dDir);
+        {
+            TaskQueueManager sTqm;
+            ProcessManager sPm;
+            sTqm.SetProcessManager(&sPm);
+            sPm.SetProcessFinishedCallback([&sTqm](int pid, int ec, const std::string& kind) {
+                sTqm.OnProcessFinished(pid, ec, kind);
+            });
+
+            std::string sErr;
+            const std::string addFast = sTqm.TaskQueueAdd(
+                "sq",
+                R"([{"id":"S-FAST","command":"cmd /c echo ok","summary":"fast","timeoutSec":30,"maxAttempts":1}])",
+                2, "", sErr);
+            const std::string addSlow = sTqm.TaskQueueAdd(
+                "sq",
+                R"([{"id":"S-SLOW","command":"cmd /c ping -n 30 127.0.0.1 >nul","summary":"slow","timeoutSec":60,"maxAttempts":1}])",
+                2, "", sErr);
+            const std::string dirFast = nlohmann::json::parse(addFast).value("direction_id", std::string());
+            const std::string dirSlow = nlohmann::json::parse(addSlow).value("direction_id", std::string());
+            Check(!dirFast.empty() && !dirSlow.empty() && dirFast != dirSlow,
+                  "105-3: two separate directions created in same queue");
+            Check(WaitForState(sTqm, "S-FAST", "succeeded", 5000), "105-3: S-FAST succeeded");
+
+            const nlohmann::json waitDoc = nlohmann::json::parse(
+                sTqm.TaskQueueWait("sq", 0, 0, sErr), nullptr, false);
+            Check(waitDoc.is_object() && waitDoc.value("ok", false), "105-3: TaskQueueWait succeeded");
+            std::vector<TaskQueueRunJob> queueJobs, dirJobs;
+            for (const auto& j : waitDoc["jobs"]) {
+                TaskQueueRunJob rj = TaskQueueRunJobFromJson(j);
+                queueJobs.push_back(rj);
+                if (rj.directionId == dirFast) dirJobs.push_back(rj);
+            }
+            Check(TaskQueueRunDrained(dirJobs) && !TaskQueueRunDrained(queueJobs),
+                  "105-3: --wait-scope direction drains dirFast while queue-wide still waits on dirSlow");
+            Check(dirJobs.size() == 1 && dirJobs[0].id == "S-FAST",
+                  "105-3: direction-scoped report excludes other direction jobs");
+
+            TaskQueueRunJob failJob;
+            failJob.id = "J-FAIL";
+            failJob.state = "failed";
+            failJob.exitCode = 7;
+            failJob.failureClass = "exit_nonzero";
+            failJob.failureSummary = "boom";
+            const std::string failXml = TaskQueueRunJUnitXml("sq", {failJob}, false, false, nullptr);
+            Check(failXml.find("<failure ") != std::string::npos &&
+                      failXml.find("exitCode=7") != std::string::npos &&
+                      failXml.find("class=exit_nonzero") != std::string::npos,
+                  "105-5: JUnit <failure> includes failure class and exitCode");
+
+            sTqm.DirectionCancelJobs(dirSlow, sErr);
+            sPm.SetProcessFinishedCallback(nullptr);
+            sTqm.ShutdownTaskQueueManager();
+            sTqm.SetProcessManager(nullptr);
+        }
+        SetDataDirectoryOverride(dir);
+    }
+
+#ifdef _WIN32
+    // Card 105-6 & 103-8: Verify hancho-cli help / help --json expose new CI flags and 0.10 names.
+    {
+        wchar_t exePath[MAX_PATH]{};
+        GetModuleFileNameW(nullptr, exePath, MAX_PATH);
+        std::filesystem::path cliPath = std::filesystem::path(exePath).parent_path() / L"hancho-cli.exe";
+        if (std::filesystem::exists(cliPath)) {
+            auto runCli = [&](const std::wstring& args) {
+                std::wstring cmd = L"\"" + cliPath.wstring() + L"\" " + args;
+                SECURITY_ATTRIBUTES sa{sizeof(sa), nullptr, TRUE};
+                HANDLE rPipe = nullptr, wPipe = nullptr;
+                CreatePipe(&rPipe, &wPipe, &sa, 0);
+                SetHandleInformation(rPipe, HANDLE_FLAG_INHERIT, 0);
+                STARTUPINFOW si{};
+                si.cb = sizeof(si);
+                si.dwFlags = STARTF_USESTDHANDLES;
+                si.hStdOutput = wPipe;
+                si.hStdError = wPipe;
+                PROCESS_INFORMATION pi{};
+                std::string out;
+                if (CreateProcessW(nullptr, &cmd[0], nullptr, nullptr, TRUE,
+                                   CREATE_NO_WINDOW, nullptr, nullptr, &si, &pi)) {
+                    CloseHandle(wPipe);
+                    CloseHandle(pi.hThread);
+                    char buf[4096];
+                    DWORD rd = 0;
+                    while (ReadFile(rPipe, buf, sizeof(buf), &rd, nullptr) && rd > 0) {
+                        out.append(buf, rd);
+                    }
+                    WaitForSingleObject(pi.hProcess, 5000);
+                    CloseHandle(pi.hProcess);
+                } else {
+                    CloseHandle(wPipe);
+                }
+                CloseHandle(rPipe);
+                return out;
+            };
+
+            const std::string helpTxt = runCli(L"help");
+            Check(helpTxt.find("--wait-scope") != std::string::npos &&
+                      helpTxt.find("--cancel-on-exit") != std::string::npos &&
+                      helpTxt.find("--follow") != std::string::npos &&
+                      helpTxt.find("--logs-dir") != std::string::npos &&
+                      helpTxt.find("--report-output") != std::string::npos &&
+                      helpTxt.find("--timeout") != std::string::npos &&
+                      helpTxt.find("--ephemeral") != std::string::npos &&
+                      helpTxt.find("--no-autostart") != std::string::npos &&
+                      helpTxt.find("HANCHO_AUTOSTART") != std::string::npos &&
+                      helpTxt.find("HANCHO_NO_DIALOGS") != std::string::npos &&
+                      helpTxt.find("run --bt") != std::string::npos,
+                  "105-6: hancho-cli help lists all new CI flags and env vars");
+            Check(helpTxt.find("chat hosts") != std::string::npos &&
+                      helpTxt.find("--from-peer") != std::string::npos &&
+                      helpTxt.find("run_agent") != std::string::npos,
+                  "103-8: hancho-cli help lists 0.10 names");
+
+            const std::string helpJsonStr = runCli(L"help --json");
+            const nlohmann::json hj = nlohmann::json::parse(helpJsonStr, nullptr, false);
+            Check(hj.is_object() &&
+                      helpJsonStr.find("--wait-scope") != std::string::npos &&
+                      helpJsonStr.find("run_agent") != std::string::npos,
+                  "105-6/103-8: hancho-cli help --json is valid JSON with CI flags and 0.10 names");
+        }
+    }
+#endif
+
+    // --- 102-2: Monotonic rev, tombstones, and taskqueue_changes -------------------------
+    {
+        const std::wstring revDir = dir + L"_rev_102_2";
+        CreateDirectoryW(revDir.c_str(), nullptr);
+        SetDataDirectoryOverride(revDir);
+
+        uint64_t revBeforeRestart = 0;
+        {
+            TaskQueueManager revTqm;
+            std::string err;
+
+            const std::string taskResp = revTqm.TaskCreate("Rev Test Task", "verify 102-2", "task_rev_1", "", err);
+            Check(JsonGetBool(taskResp, "ok", false), "102-2: TaskCreate succeeds");
+
+            const std::string cardResp = revTqm.CardAdd("task_rev_1", "102-2-c1", "Card Title",
+                                                        "Secret long card body", {}, "", "", "", err);
+            Check(JsonGetBool(cardResp, "ok", false), "102-2: CardAdd succeeds");
+
+            const std::string addResp = revTqm.TaskQueueAdd(
+                "default",
+                R"([{"id":"rev_j1","command":"cmd /c exit 0","summary":"job 1","timeoutSec":30}])",
+                1, "", err, "", "task_rev_1");
+            Check(JsonGetBool(addResp, "ok", false), "102-2: TaskQueueAdd succeeds");
+
+            const std::string c0Str = revTqm.TaskQueueChanges(0, false, err);
+            const nlohmann::json c0 = nlohmann::json::parse(c0Str, nullptr, false);
+            Check(c0.is_object() && c0.value("ok", false), "102-2: initial taskqueue_changes ok");
+            const uint64_t rev1 = c0.value("rev", uint64_t(0));
+            Check(rev1 > 0, "102-2: initial rev > 0");
+            Check(c0.contains("jobs") && c0["jobs"].size() == 1 && c0["jobs"][0].value("id", "") == "rev_j1",
+                  "102-2: initial changes includes added job");
+            Check(c0.contains("tasks") && c0["tasks"].size() == 1 && c0["tasks"][0].value("id", "") == "task_rev_1",
+                  "102-2: initial changes includes task");
+            bool foundCardDir = false;
+            bool omittedBody = true;
+            if (c0.contains("directions") && c0["directions"].is_array()) {
+                for (const auto& d : c0["directions"]) {
+                    if (d.contains("card") && d["card"].is_object()) {
+                        foundCardDir = true;
+                        if (d["card"].contains("body")) omittedBody = false;
+                    }
+                }
+            }
+            Check(foundCardDir && omittedBody, "102-2: directions omit card.body");
+
+            const std::string cEmptyStr = revTqm.TaskQueueChanges(rev1, false, err);
+            const nlohmann::json cEmpty = nlohmann::json::parse(cEmptyStr, nullptr, false);
+            Check(cEmpty.is_object() && cEmpty.value("ok", false) &&
+                      cEmpty.value("rev", uint64_t(0)) == rev1 &&
+                      cEmpty["jobs"].empty() && cEmpty["removed"].empty() &&
+                      cEmpty["tasks"].empty() && cEmpty["directions"].empty(),
+                  "102-2: unchanged taskqueue_changes returns empty delta");
+
+            revTqm.TaskQueueCancel("rev_j1", err, "test cancel");
+            const std::string cStateStr = revTqm.TaskQueueChanges(rev1, false, err);
+            const nlohmann::json cState = nlohmann::json::parse(cStateStr, nullptr, false);
+            const uint64_t rev2 = cState.value("rev", uint64_t(0));
+            Check(rev2 > rev1 && cState["jobs"].size() == 1 &&
+                      cState["jobs"][0].value("state", "") == "cancelled",
+                  "102-2: state change appears in taskqueue_changes");
+
+            revTqm.TaskQueueRemove("rev_j1", true, err);
+            const std::string cRemStr = revTqm.TaskQueueChanges(rev2, false, err);
+            const nlohmann::json cRem = nlohmann::json::parse(cRemStr, nullptr, false);
+            const uint64_t rev3 = cRem.value("rev", uint64_t(0));
+            Check(rev3 > rev2 && cRem["jobs"].empty() &&
+                      cRem["removed"].size() == 1 && cRem["removed"][0] == "rev_j1",
+                  "102-2: job removal appears in removed");
+
+            revTqm.SetMaxTombstonesForTest(2);
+            revTqm.TaskQueueAdd("default", R"([{"id":"rev_j2","command":"cmd /c exit 0","summary":"job 2","timeoutSec":30}])", 1, "", err);
+            revTqm.TaskQueueRemove("rev_j2", true, err);
+            revTqm.TaskQueueAdd("default", R"([{"id":"rev_j3","command":"cmd /c exit 0","summary":"job 3","timeoutSec":30}])", 1, "", err);
+            revTqm.TaskQueueRemove("rev_j3", true, err);
+            revTqm.TaskQueueAdd("default", R"([{"id":"rev_j4","command":"cmd /c exit 0","summary":"job 4","timeoutSec":30}])", 1, "", err);
+            revTqm.TaskQueueRemove("rev_j4", true, err);
+
+            const std::string cResetStr = revTqm.TaskQueueChanges(rev2, false, err);
+            const nlohmann::json cReset = nlohmann::json::parse(cResetStr, nullptr, false);
+            Check(cReset.is_object() && cReset.value("reset", false) == true,
+                  "102-2: old since after tombstone eviction returns reset: true");
+
+            revBeforeRestart = revTqm.GetCurrentRev();
+            Check(revBeforeRestart > rev3, "102-2: rev advanced after further changes");
+        }
+
+        {
+            TaskQueueManager revTqm2;
+            std::string err;
+            Check(revTqm2.GetCurrentRev() == revBeforeRestart,
+                  "102-2: rev does not rewind across restart");
+            revTqm2.TaskQueueAdd("default", R"([{"id":"rev_j5","command":"cmd /c exit 0","summary":"job 5","timeoutSec":30}])", 1, "", err);
+            Check(revTqm2.GetCurrentRev() > revBeforeRestart,
+                  "102-2: rev continues incrementing monotonically after restart");
+        }
+
+        SetDataDirectoryOverride(dir);
+    }
+
+    // --- 102-3: finished_limit, before cursor pagination, query search, config default ---
+    {
+        const std::wstring dir1023 = dir + L"_102_3";
+        CreateDirectoryW(dir1023.c_str(), nullptr);
+        SetDataDirectoryOverride(dir1023);
+        WriteFileAtomicWide(PathJoinWide(dir1023, L"config.json"),
+                            "{\"task_list_recent_count\": 3}\n");
+
+        Check(GetTaskListRecentCount() == 3, "102-3: GetTaskListRecentCount reads config.json (3)");
+
+        TaskQueueManager tm;
+        std::string err;
+
+        // 5 finished tasks (closed) + 2 unfinished tasks (1 open, 1 with failed job)
+        for (int i = 1; i <= 5; ++i) {
+            const std::string tid = "task_fin_" + std::to_string(i);
+            const std::string title = (i == 2) ? "Alpha Needle Task" : ("Finished Task " + std::to_string(i));
+            const std::string intent = (i == 4) ? "Fix BetaIntent issue" : "routine";
+            Check(JsonGetBool(tm.TaskCreate(title, intent, tid, "", err), "ok", false),
+                  "102-3: TaskCreate finished " + tid);
+            Check(JsonGetBool(tm.TaskClose(tid, "succeeded", "done", err), "ok", false),
+                  "102-3: TaskClose " + tid);
+        }
+        Check(JsonGetBool(tm.TaskCreate("Open Needle Task", "active", "task_unfin_open", "", err), "ok", false),
+              "102-3: TaskCreate open");
+        Check(JsonGetBool(tm.TaskCreate("Direction Parent Task", "dir test", "task_unfin_dir", "", err), "ok", false),
+              "102-3: TaskCreate dir parent");
+        Check(JsonGetBool(tm.CardAdd("task_unfin_dir", "102-3-c1", "GammaDirection Title",
+                                     "body", {}, "", "", "", err), "ok", false),
+              "102-3: CardAdd for direction query");
+
+        // Default finishedLimit = -1 uses config.json task_list_recent_count (3)
+        // Returns 2 unfinished + 3 newest finished = 5, with more=true, remaining=2
+        const nlohmann::json tlDef = nlohmann::json::parse(tm.TaskList("", 0, err, -1, -1), nullptr, false);
+        Check(tlDef.value("ok", false) && tlDef["tasks"].size() == 5 &&
+                  tlDef.value("more", false) == true &&
+                  tlDef.value("remaining", int64_t(-1)) == 2 &&
+                  !tlDef.value("next_before", std::string()).empty(),
+              "102-3: TaskList default limit (3) returns 2 unfinished + 3 finished with more=true");
+
+        // finishedLimit = 0 (--all) returns all 7 tasks with more=false
+        const nlohmann::json tlAll = nlohmann::json::parse(tm.TaskList("", 0, err, -1, 0), nullptr, false);
+        Check(tlAll.value("ok", false) && tlAll["tasks"].size() == 7 &&
+                  tlAll.value("more", true) == false &&
+                  tlAll.value("remaining", int64_t(-1)) == 0 &&
+                  tlAll.value("next_before", std::string("x")).empty(),
+              "102-3: TaskList finishedLimit=0 (--all) returns all 7 tasks");
+
+        // Pagination with before cursor (limit=2) covers all 5 finished tasks without overlap
+        std::vector<std::string> pagedFinished;
+        std::string cursor;
+        int pages = 0;
+        while (true) {
+            const nlohmann::json page = nlohmann::json::parse(tm.TaskList("", 0, err, -1, 2, cursor), nullptr, false);
+            Check(page.value("ok", false), "102-3: TaskList page ok");
+            for (const auto& t : page["tasks"]) {
+                const std::string st = t.value("state", "");
+                if (st == "closed" || st == "succeeded" || st == "cancelled") {
+                    pagedFinished.push_back(t.value("id", ""));
+                }
+            }
+            ++pages;
+            if (!page.value("more", false)) break;
+            cursor = page.value("next_before", "");
+            if (pages > 10) break;
+        }
+        std::set<std::string> uniqueFinished(pagedFinished.begin(), pagedFinished.end());
+        Check(pages == 3 && pagedFinished.size() == 5 && uniqueFinished.size() == 5,
+              "102-3: TaskList before pagination returns all 5 finished tasks across 3 pages without overlap");
+
+        // Case-insensitive query on task title, task intent, direction title
+        const nlohmann::json tqTitle = nlohmann::json::parse(tm.TaskList("", 0, err, -1, 0, "", "alpha needle"), nullptr, false);
+        Check(tqTitle["tasks"].size() == 1 && tqTitle["tasks"][0].value("id", "") == "task_fin_2",
+              "102-3: TaskList query matches task title case-insensitively");
+        const nlohmann::json tqIntent = nlohmann::json::parse(tm.TaskList("", 0, err, -1, 0, "", "betaintent"), nullptr, false);
+        Check(tqIntent["tasks"].size() == 1 && tqIntent["tasks"][0].value("id", "") == "task_fin_4",
+              "102-3: TaskList query matches task intent case-insensitively");
+        const nlohmann::json tqDir = nlohmann::json::parse(tm.TaskList("", 0, err, -1, 0, "", "gammadirection"), nullptr, false);
+        Check(tqDir["tasks"].size() == 1 && tqDir["tasks"][0].value("id", "") == "task_unfin_dir",
+              "102-3: TaskList query matches direction title case-insensitively");
+
+        // TaskQueueList: 5 finished (cancelled) jobs + 2 unfinished (pending) jobs
+        for (int i = 1; i <= 5; ++i) {
+            const std::string jid = "tq_fin_" + std::to_string(i);
+            const std::string sum = (i == 3) ? "Delta Job Summary" : ("Job " + std::to_string(i));
+            const std::string tid = (i == 2) ? "task_unfin_open" : "";
+            const std::string spec = "[{\"id\":\"" + jid + "\",\"command\":\"cmd /c exit 0\",\"summary\":\"" + sum + "\",\"timeoutSec\":30}]";
+            Check(JsonGetBool(tm.TaskQueueAdd("q1023", spec, 0, "", err, "", tid), "ok", false),
+                  "102-3: TaskQueueAdd " + jid);
+            Check(JsonGetBool(tm.TaskQueueCancel(jid, err, "done"), "ok", false),
+                  "102-3: TaskQueueCancel " + jid);
+        }
+        Check(JsonGetBool(tm.TaskQueueAdd("q1023",
+                                          R"([{"id":"tq_pend_1","command":"cmd /c exit 0","summary":"Pending 1","timeoutSec":30},{"id":"tq_pend_2","command":"cmd /c exit 0","summary":"Pending 2","timeoutSec":30}])",
+                                          0, "", err, "", "task_unfin_dir"),
+                          "ok", false),
+              "102-3: TaskQueueAdd unfinished jobs");
+
+        const nlohmann::json jlDef = nlohmann::json::parse(
+            tm.TaskQueueList("q1023", "", 0, err, "", "", false, "", -1), nullptr, false);
+        Check(jlDef.value("ok", false) && jlDef["jobs"].size() == 5 &&
+                  jlDef.value("more", false) == true &&
+                  jlDef.value("remaining", int64_t(-1)) == 2 &&
+                  !jlDef.value("next_before", std::string()).empty(),
+              "102-3: TaskQueueList default limit (3) returns 2 unfinished + 3 finished with more=true");
+
+        const nlohmann::json jlAll = nlohmann::json::parse(
+            tm.TaskQueueList("q1023", "", 0, err, "", "", false, "", 0), nullptr, false);
+        Check(jlAll.value("ok", false) && jlAll["jobs"].size() == 7 &&
+                  jlAll.value("more", true) == false,
+              "102-3: TaskQueueList finishedLimit=0 (--all) returns all 7 jobs");
+
+        std::vector<std::string> pagedJobs;
+        std::string jCursor;
+        int jPages = 0;
+        while (true) {
+            const nlohmann::json page = nlohmann::json::parse(
+                tm.TaskQueueList("q1023", "", 0, err, "", "", false, "", 2, jCursor), nullptr, false);
+            Check(page.value("ok", false), "102-3: TaskQueueList page ok");
+            for (const auto& j : page["jobs"]) {
+                const std::string st = j.value("state", "");
+                if (st == "cancelled" || st == "succeeded" || st == "closed" || st == "takenOver") {
+                    pagedJobs.push_back(j.value("id", ""));
+                }
+            }
+            ++jPages;
+            if (!page.value("more", false)) break;
+            jCursor = page.value("next_before", "");
+            if (jPages > 10) break;
+        }
+        std::set<std::string> uniqueJobs(pagedJobs.begin(), pagedJobs.end());
+        Check(jPages == 3 && pagedJobs.size() == 5 && uniqueJobs.size() == 5,
+              "102-3: TaskQueueList before pagination returns all 5 finished jobs across 3 pages without overlap");
+
+        const nlohmann::json jqId = nlohmann::json::parse(
+            tm.TaskQueueList("q1023", "", 0, err, "", "", false, "", 0, "", "TQ_FIN_1"), nullptr, false);
+        Check(jqId["jobs"].size() == 1 && jqId["jobs"][0].value("id", "") == "tq_fin_1",
+              "102-3: TaskQueueList query matches job id case-insensitively");
+        const nlohmann::json jqSum = nlohmann::json::parse(
+            tm.TaskQueueList("q1023", "", 0, err, "", "", false, "", 0, "", "delta job"), nullptr, false);
+        Check(jqSum["jobs"].size() == 1 && jqSum["jobs"][0].value("id", "") == "tq_fin_3",
+              "102-3: TaskQueueList query matches job summary case-insensitively");
+        const nlohmann::json jqTask = nlohmann::json::parse(
+            tm.TaskQueueList("q1023", "", 0, err, "", "", false, "", 0, "", "open needle"), nullptr, false);
+        Check(jqTask["jobs"].size() == 1 && jqTask["jobs"][0].value("id", "") == "tq_fin_2",
+              "102-3: TaskQueueList query matches parent task title case-insensitively");
+
+        SetDataDirectoryOverride(dir);
+    }
+
+    // --- 106-1: Hancho-written notes are English and carry data; non-English summary warns ---
+    {
+        // Three failed attempts in a row write the failure_streak note.
+        std::string streakJobs = R"([{"id":"STREAK","command":"cmd /c exit 1","summary":"streak job",
+            "timeoutSec":30,"maxAttempts":3}])";
+        Check(JsonGetBool(tqm.TaskQueueAdd("streakq", streakJobs, 0, "", err), "ok", false),
+              "106-1: streak job added: " + err);
+        Check(WaitForState(tqm, "STREAK", "failed", 60000), "106-1: streak job failed");
+
+        const std::wstring notesPath = Utf8ToWide(memory::MemoryDirectoryUtf8()) + L"\\notes.jsonl";
+        nlohmann::json streakNote;
+        for (int attempt = 0; attempt < 100 && streakNote.is_null(); ++attempt) {
+            std::istringstream lines(ReadFileUtf8Wide(notesPath));
+            std::string line;
+            while (std::getline(lines, line)) {
+                nlohmann::json n = nlohmann::json::parse(line, nullptr, false);
+                if (n.is_object() && n.contains("data") && n["data"].is_object() &&
+                    n["data"].value("kind", std::string()) == "failure_streak") {
+                    streakNote = n;
+                    break;
+                }
+            }
+            if (streakNote.is_null()) Sleep(100);
+        }
+        Check(!streakNote.is_null(), "106-1: auto-note for the failure streak is written");
+        if (!streakNote.is_null()) {
+            const std::string noteText = streakNote.value("text", std::string());
+            Check(!IsNonEnglishText(noteText) && noteText.find("failed 3 times in a row") != std::string::npos,
+                  "106-1: auto-note text is English: " + noteText);
+            Check(streakNote["data"].value("failureClass", std::string()) == "exit_nonzero",
+                  "106-1: auto-note data carries failureClass");
+            Check(streakNote["data"].value("job", std::string()) != "",
+                  "106-1: auto-note data carries the job name");
+        }
+
+        // The warning helper: a Japanese summary/title is reported, an English one is not.
+        Check(IsNonEnglishText("ひらがな") && IsNonEnglishText("カタカナ") && IsNonEnglishText("漢字") &&
+              IsNonEnglishText("한국어") && !IsNonEnglishText("Café résumé, build 3/3"),
+              "106-1: IsNonEnglishText detects kana, kanji and hangul only");
+        const std::string jpResp = AppendNonEnglishWarnings(
+            R"({"ok":true})", R"({"taskqueue":"q","jobs":[{"id":"J","summary":"ビルドを実行"}]})");
+        const nlohmann::json jp = nlohmann::json::parse(jpResp, nullptr, false);
+        Check(jp.is_object() && jp.value("ok", false) && jp.contains("warnings") &&
+              jp["warnings"].is_array() && jp["warnings"].size() == 1 &&
+              jp["warnings"][0].get<std::string>() == "summary is not English: ビルドを実行",
+              "106-1: a Japanese job summary adds a warning: " + jpResp);
+        const std::string enResp = AppendNonEnglishWarnings(
+            R"({"ok":true})", R"({"taskqueue":"q","jobs":[{"id":"J","summary":"build the project"}]})");
+        Check(enResp == R"({"ok":true})", "106-1: an English job summary adds no warning");
+        const std::string titleResp = AppendNonEnglishWarnings(
+            R"({"ok":true})", R"({"title":"修正","summary":"fix it"})");
+        Check(titleResp.find("title is not English") != std::string::npos &&
+              titleResp.find("summary is not English") == std::string::npos,
+              "106-1: a Japanese title is reported and an English summary is not");
     }
 
     std::printf("%s (%d failures)\n", g_failures == 0 ? "ALL PASSED" : "FAILURES", g_failures);

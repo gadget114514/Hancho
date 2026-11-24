@@ -49,7 +49,12 @@ json ResultError(const std::string& err) {
 } // namespace
 
 bool IsValidList(const std::string& list) {
-    return list == kWorker || list == kConsult || list == kSupervisor;
+    return list == kAgent || list == kWorker || list == kConsult || list == kSupervisor;
+}
+
+std::string CanonicalListName(const std::string& list) {
+    if (list == kWorker || list == kAgent) return kAgent;
+    return list;
 }
 
 json Entry::ToJson() const {
@@ -203,15 +208,15 @@ Result List(const std::wstring& path, const std::string& list) {
         out[name] = rows;
     };
     if (list.empty()) {
-        emit(kWorker);
+        emit(kAgent);
         emit(kConsult);
         emit(kSupervisor);
     } else {
         if (!IsValidList(list)) return {false, "invalid list: " + list, json::object()};
-        emit(list.c_str());
+        emit(CanonicalListName(list).c_str());
     }
     json pending = json::array();
-    for (const auto& name : {kWorker, kConsult, kSupervisor}) {
+    for (const auto& name : {kAgent, kConsult, kSupervisor}) {
         for (const auto& e : cfg.List(name)) {
             if (e.status != "approved") {
                 pending.push_back(json{{"list", name}, {"engine", e.engine}, {"model", e.model}});
@@ -230,6 +235,7 @@ static Result Mutate(const std::wstring& path, const std::string& list,
                      const std::string& reason,
                      std::function<bool(Config&, json&)> change) {
     if (!IsValidList(list)) return {false, "invalid list: " + list, json::object()};
+    const std::string canonical = CanonicalListName(list);
     Config cfg;
     std::string err;
     if (!Load(path, cfg, err)) return {false, err, json::object()};
@@ -238,7 +244,7 @@ static Result Mutate(const std::wstring& path, const std::string& list,
     HistoryEntry h;
     h.at = GetCurrentTimestampStr();
     h.by = by.empty() ? "cli" : by;
-    h.list = list;
+    h.list = canonical;
     h.action = action;
     h.entry = detail;
     h.reason = reason;
@@ -246,7 +252,7 @@ static Result Mutate(const std::wstring& path, const std::string& list,
     if (!Save(path, cfg, err)) return {false, err, json::object()};
     Result r;
     r.ok = true;
-    r.data = json{{"ok", true}, {"list", list}, {"entry", detail}};
+    r.data = json{{"ok", true}, {"list", canonical}, {"entry", detail}};
     return r;
 }
 

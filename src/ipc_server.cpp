@@ -16,6 +16,7 @@
 #include "routine.h"
 #include "triage.h"
 #include "triage_manager.h"
+#include "translation_store.h"
 #include "permit_draft.h"
 #include "webui_server.h"
 #include "term_server.h"
@@ -72,6 +73,7 @@ std::string SnapshotToJson(const ProcessSnapshot& s) {
         << "\"job_key\":\"" << JsonEscape(s.jobKey) << "\","
         << "\"job_id\":" << s.jobId << ","
         << "\"attempt\":" << s.attemptN << ","
+        << "\"engine\":\"" << JsonEscape(s.agentType) << "\","
         << "\"agent_type\":\"" << JsonEscape(s.agentType) << "\","
         << "\"agent_status\":\"" << JsonEscape(s.agentStatus) << "\","
         << "\"current_tool\":\"" << JsonEscape(s.currentTool) << "\","
@@ -360,6 +362,7 @@ static std::string AgentResultToJson(ProcessManager& pm, int id, bool finished) 
         << ",\"state\":\"" << ProcStateToString(ex.snap.state) << "\""
         << ",\"exit_code\":" << ex.snap.exitCode
         << ",\"elapsed_ms\":" << ex.snap.elapsedMs
+        << ",\"engine\":\"" << JsonEscape(ex.agentState.agentType) << "\""
         << ",\"agent_type\":\"" << JsonEscape(ex.agentState.agentType) << "\""
         << ",\"model\":\"" << JsonEscape(ex.agentState.model) << "\""
         << ",\"result\":\"" << JsonEscape(ex.result) << "\""
@@ -553,7 +556,7 @@ std::string IpcServer::HandleChatAction(const std::string& action, const std::st
         out["restarting"] = true;
         return out.dump();
     }
-    if (act == "chat_peers") {
+    if (act == "chat_peers" || act == "chat_hosts") {
         return ipmsg_->Peers().dump();
     }
     if (act == "chat_refresh") {
@@ -566,8 +569,12 @@ std::string IpcServer::HandleChatAction(const std::string& action, const std::st
                 if (f.is_string()) files.push_back(f.get<std::string>());
             }
         }
+        std::string fromPeer = IpmsgReqString(req, "from_peer");
+        if (fromPeer.empty()) fromPeer = IpmsgReqString(req, "from_agent");
+        std::string toPeer = IpmsgReqString(req, "to_peer");
+        if (toPeer.empty()) toPeer = IpmsgReqString(req, "to_agent");
         return ipmsg_->Send(IpmsgReqString(req, "to"), IpmsgReqString(req, "text"),
-                            IpmsgReqString(req, "from_agent"), IpmsgReqString(req, "to_agent"),
+                            fromPeer, toPeer,
                             IpmsgReqUint(req, "reply_to", 0), files,
                             IpmsgReqString(req, "audience"),
                             static_cast<int>(IpmsgReqInt(req, "hops", 0)))
@@ -935,7 +942,7 @@ static json AskSelectWorkers(BtManager* btm, bool& outUsedDefault) {
     llm::Config cfg;
     std::string err;
     if (llm::Load(llm::DefaultPath(), cfg, err)) {
-        for (const auto& entry : llm::Usable(cfg, llm::kWorker)) {
+        for (const auto& entry : llm::Usable(cfg, llm::kAgent)) {
             if (btm && btm->IsDown(entry.engine, entry.model)) continue;
             json candidate;
             candidate["engine"] = entry.engine;
@@ -1268,7 +1275,7 @@ static std::string HandleRoutineAsk(RoutineManager& routines, BtManager* btm,
     out["attempts"] = usedAttempts;
     out["proposal"] = saved;
     if (usedDefault) {
-        out["warning"] = "worker LLM list is empty; used the default engine";
+        out["warning"] = "agent LLM list is empty; used the default engine";
     }
     return out.dump();
 }
@@ -1406,6 +1413,23 @@ std::string IpcServer::HandleRequestJson(const std::string& reqJson) {
                                   JsonGetBool(reqJson, "all_auto", JsonGetBool(reqJson, "allAuto", false)))
                               : "{\"ok\":false,\"error\":\"triage manager is unavailable\"}";
     }
+    else if (action == "translate_get" || action == "translate_status" || action == "translate_clear") {
+        TranslationStore* store = ActiveTranslationStore();
+        if (!store) return "{\"ok\":false,\"error\":\"translation store is unavailable\"}";
+        if (action == "translate_status") return store->Status();
+        if (action == "translate_clear") return store->Clear(JsonGetString(reqJson, "lang", ""));
+        nlohmann::json request = nlohmann::json::parse(reqJson, nullptr, false);
+        if (!request.is_object()) return "{\"ok\":false,\"error\":\"invalid JSON request\"}";
+        std::vector<std::string> texts;
+        auto textsIt = request.find("texts");
+        if (textsIt != request.end() && textsIt->is_array()) {
+            for (const auto& v : *textsIt) if (v.is_string()) texts.push_back(v.get<std::string>());
+        }
+        if (request.contains("text") && request["text"].is_string()) texts.push_back(request["text"].get<std::string>());
+        const std::string lang = request.value("lang", std::string());
+        if (lang.empty()) return "{\"ok\":false,\"error\":\"translate_get requires lang (ja or es)\"}";
+        return store->Get(texts, lang, request.value("field", std::string()));
+    }
     else if (action == "gui_status") {
         // A GUI client can ask whether a dashboard is available without starting one.
         bool canShow = false;
@@ -1434,7 +1458,8 @@ std::string IpcServer::HandleRequestJson(const std::string& reqJson) {
     else if (action == "quit") {
         // Stop the core host. The response is sent before the host begins its
         // shutdown sequence, so the client always gets an answer.
-        std::function<void()> stopCb;
+        const bool cancelJobs = JsonGetBool(reqJson, "cancel_jobs", JsonGetBool(reqJson, "cancelJobs", false));
+        std::function<void(bool)> stopCb;
         {
             std::lock_guard<std::mutex> lock(cbMutex_);
             stopCb = shutdownCb_;
@@ -1443,9 +1468,9 @@ std::string IpcServer::HandleRequestJson(const std::string& reqJson) {
             return "{\"ok\":false,\"error\":\"shutdown is not available\"}";
         }
         // Answer the client first, then let the host tear the pipe down.
-        std::thread([stopCb] {
+        std::thread([stopCb, cancelJobs] {
             SleepMs(200);
-            stopCb();
+            stopCb(cancelJobs);
         }).detach();
         return "{\"ok\":true,\"stopping\":true}";
     }
@@ -1550,7 +1575,8 @@ std::string IpcServer::HandleRequestJson(const std::string& reqJson) {
         req.idleTimeoutSec = static_cast<int>(JsonGetInt(reqJson, "idle_timeout_sec", 0));
         req.idleFirstEventSec = static_cast<int>(JsonGetInt(reqJson, "idle_first_event_sec", 0));
         req.estimatedEndTimeStr = JsonGetString(reqJson, "estimate_end", "");
-        req.agentType = JsonGetString(reqJson, "agent_type", "");
+        req.agentType = JsonGetString(reqJson, "engine", "");
+        if (req.agentType.empty()) req.agentType = JsonGetString(reqJson, "agent_type", "");
         req.jsonStream = JsonGetBool(reqJson, "json_stream", false);
         req.supervisorNotes = JsonGetString(reqJson, "supervisor_notes", "");
         req.supervisorGoal = JsonGetString(reqJson, "supervisor_goal", "");
@@ -1781,6 +1807,7 @@ std::string IpcServer::HandleRequestJson(const std::string& reqJson) {
             auto normalized = ReadHanchoEventsFile(eventsPath, tail > 0 ? static_cast<size_t>(tail) : 0,
                                                    typeFilter, sinceSeq);
             oss << "{\"ok\":true,\"schema\":\"hancho.event/1\",\"id\":" << id
+                << ",\"engine\":\"" << JsonEscape(snap.agentType) << "\""
                 << ",\"agent_type\":\"" << JsonEscape(snap.agentType) << "\""
                 << ",\"status\":\"" << JsonEscape(snap.agentStatus) << "\""
                 << ",\"events_file\":\"" << JsonEscape(eventsPath) << "\""
@@ -1801,7 +1828,9 @@ std::string IpcServer::HandleRequestJson(const std::string& reqJson) {
 
         if (format == "summary") {
             std::string summary = LlmEventsToSummary(events, state);
-            oss << "{\"ok\":true,\"id\":" << id << ",\"agent_type\":\"" << JsonEscape(state.agentType)
+            oss << "{\"ok\":true,\"id\":" << id
+                << ",\"engine\":\"" << JsonEscape(state.agentType) << "\""
+                << ",\"agent_type\":\"" << JsonEscape(state.agentType)
                 << "\",\"status\":\"" << JsonEscape(state.status)
                 << "\",\"summary\":\"" << JsonEscape(summary) << "\"}";
             return oss.str();
@@ -1884,6 +1913,7 @@ std::string IpcServer::HandleRequestJson(const std::string& reqJson) {
             }
         }
         oss << "{\"ok\":true,\"id\":" << id
+            << ",\"engine\":\"" << JsonEscape(st.agentType) << "\""
             << ",\"agent_type\":\"" << JsonEscape(st.agentType) << "\""
             << ",\"status\":\"" << JsonEscape(st.status) << "\""
             << ",\"current_tool\":\"" << JsonEscape(st.currentTool) << "\""
@@ -2033,10 +2063,35 @@ std::string IpcServer::HandleRequestJson(const std::string& reqJson) {
         std::string err;
         std::string resp;
         if (action == "task_create") {
+            std::string cardDefaultsJson;
+            if (req.contains("cardDefaults") && !req["cardDefaults"].is_null()) {
+                cardDefaultsJson = req["cardDefaults"].is_string()
+                    ? req["cardDefaults"].get<std::string>()
+                    : req["cardDefaults"].dump();
+            }
             resp = tqm_.TaskCreate(JsonGetString(reqJson, "title", ""),
                                    JsonGetString(reqJson, "intent", ""),
                                    JsonGetString(reqJson, "id", ""),
-                                   ExtractRawJsonValue(reqJson, "origin"), err);
+                                   ExtractRawJsonValue(reqJson, "origin"), err,
+                                   cardDefaultsJson);
+        } else if (action == "task_update") {
+            std::string session = JsonGetString(reqJson, "session", "");
+            if (session.empty() && req.contains("origin") && req["origin"].is_object()) {
+                session = req["origin"].value("session", std::string());
+            }
+            std::string cardDefaultsJson;
+            const bool hasCardDefaults = req.contains("cardDefaults");
+            if (hasCardDefaults && !req["cardDefaults"].is_null()) {
+                cardDefaultsJson = req["cardDefaults"].is_string()
+                    ? req["cardDefaults"].get<std::string>()
+                    : req["cardDefaults"].dump();
+            }
+            resp = tqm_.TaskUpdate(JsonGetString(reqJson, "id", ""),
+                                   req.contains("title") && req["title"].is_string(),
+                                   req.value("title", std::string()),
+                                   req.contains("intent") && req["intent"].is_string(),
+                                   req.value("intent", std::string()),
+                                   hasCardDefaults, cardDefaultsJson, session, err);
         } else if (action == "task_show") {
             const int64_t logLimit = req.contains("logLimit") ? req.value("logLimit", int64_t(200))
                                                               : req.value("log_limit", int64_t(200));
@@ -2044,8 +2099,17 @@ std::string IpcServer::HandleRequestJson(const std::string& reqJson) {
         } else if (action == "task_list") {
             const int64_t sinceVer = req.contains("since_version") ? req.value("since_version", int64_t(-1))
                                                                  : req.value("sinceVersion", int64_t(-1));
+            int64_t finishedLimit = -1;
+            if (req.contains("finished_limit") && req["finished_limit"].is_number_integer()) {
+                finishedLimit = req["finished_limit"].get<int64_t>();
+            } else if (req.contains("finishedLimit") && req["finishedLimit"].is_number_integer()) {
+                finishedLimit = req["finishedLimit"].get<int64_t>();
+            }
             resp = tqm_.TaskList(JsonGetString(reqJson, "state", ""),
-                                 req.value("limit", int64_t(0)), err, sinceVer);
+                                 req.value("limit", int64_t(0)), err, sinceVer,
+                                 finishedLimit,
+                                 JsonGetString(reqJson, "before", ""),
+                                 JsonGetString(reqJson, "query", ""));
         } else if (action == "task_note") {
             std::string session = JsonGetString(reqJson, "session", "");
             if (session.empty() && req.contains("origin") && req["origin"].is_object()) {
@@ -2109,6 +2173,141 @@ std::string IpcServer::HandleRequestJson(const std::string& reqJson) {
         }
         return resp;
     }
+    else if (action.rfind("card_", 0) == 0) {
+        nlohmann::json req = nlohmann::json::parse(reqJson, nullptr, false);
+        if (!req.is_object()) req = nlohmann::json::object();
+        auto getTaskId = [&]() -> std::string {
+            std::string t = JsonGetString(reqJson, "taskId", "");
+            if (t.empty()) t = JsonGetString(reqJson, "task_id", "");
+            if (t.empty()) t = JsonGetString(reqJson, "task", "");
+            return t;
+        };
+        auto parseAfter = [&]() -> std::vector<std::string> {
+            std::vector<std::string> out;
+            if (!req.contains("after")) return out;
+            if (req["after"].is_array()) {
+                for (const auto& item : req["after"]) {
+                    if (item.is_string() && !item.get<std::string>().empty()) {
+                        out.push_back(item.get<std::string>());
+                    }
+                }
+            } else if (req["after"].is_string()) {
+                std::istringstream iss(req["after"].get<std::string>());
+                std::string tok;
+                while (std::getline(iss, tok, ',')) {
+                    const size_t s = tok.find_first_not_of(" \t\r\n");
+                    if (s == std::string::npos) continue;
+                    const size_t e = tok.find_last_not_of(" \t\r\n");
+                    out.push_back(tok.substr(s, e - s + 1));
+                }
+            }
+            return out;
+        };
+        auto getParamsJson = [&]() -> std::string {
+            if (!req.contains("params") || req["params"].is_null()) return "";
+            if (req["params"].is_string()) return req["params"].get<std::string>();
+            return req["params"].dump();
+        };
+        auto getSession = [&]() -> std::string {
+            std::string session = JsonGetString(reqJson, "session", "");
+            if (session.empty() && req.contains("origin") && req["origin"].is_object()) {
+                session = req["origin"].value("session", std::string());
+            }
+            return session;
+        };
+        std::string err;
+        std::string resp;
+        if (action == "card_add") {
+            resp = tqm_.CardAdd(getTaskId(),
+                                JsonGetString(reqJson, "number", ""),
+                                JsonGetString(reqJson, "title", ""),
+                                JsonGetString(reqJson, "body", ""),
+                                parseAfter(),
+                                JsonGetString(reqJson, "template", ""),
+                                getParamsJson(),
+                                ExtractRawJsonValue(reqJson, "origin"), err);
+        } else if (action == "card_list") {
+            resp = tqm_.CardList(getTaskId(), err);
+        } else if (action == "card_show") {
+            std::string idOrNum = JsonGetString(reqJson, "id", "");
+            if (idOrNum.empty()) idOrNum = JsonGetString(reqJson, "number", "");
+            resp = tqm_.CardShow(idOrNum, getTaskId(), err);
+        } else if (action == "card_edit") {
+            resp = tqm_.CardEdit(getTaskId(),
+                                 JsonGetString(reqJson, "number", ""),
+                                 req.contains("title") && req["title"].is_string(),
+                                 req.value("title", std::string()),
+                                 req.contains("body") && req["body"].is_string(),
+                                 req.value("body", std::string()),
+                                 req.contains("after"),
+                                 parseAfter(),
+                                 req.contains("template") && req["template"].is_string(),
+                                 req.value("template", std::string()),
+                                 req.contains("params"),
+                                 getParamsJson(),
+                                 getSession(), err);
+        } else if (action == "card_remove") {
+            resp = tqm_.CardRemove(getTaskId(),
+                                   JsonGetString(reqJson, "number", ""),
+                                   getSession(), err);
+        } else if (action == "card_run") {
+            if (!btm_) {
+                return "{\"ok\":false,\"error\":\"behavior trees are not available\"}";
+            }
+            const bool ready = JsonGetBool(reqJson, "ready", false);
+            int maxConcurrent = 1;
+            if (req.contains("max") && req["max"].is_number_integer()) {
+                maxConcurrent = req["max"].get<int>();
+            }
+            const bool force = JsonGetBool(reqJson, "force", false);
+            std::string originJson;
+            if (req.contains("origin") && req["origin"].is_object()) {
+                originJson = req["origin"].dump();
+            }
+            resp = btm_->CardRun(getTaskId(),
+                                 JsonGetString(reqJson, "number", ""),
+                                 ready, maxConcurrent, force, originJson);
+        } else if (action == "card_redo") {
+            const bool run = JsonGetBool(reqJson, "run", false);
+            if (run && !btm_) {
+                return "{\"ok\":false,\"error\":\"behavior trees are not available\"}";
+            }
+            const bool force = JsonGetBool(reqJson, "force", false);
+            std::string idOrNum = JsonGetString(reqJson, "id", "");
+            if (idOrNum.empty()) idOrNum = JsonGetString(reqJson, "number", "");
+            std::string originJson;
+            if (req.contains("origin") && req["origin"].is_object()) {
+                originJson = req["origin"].dump();
+            }
+            resp = tqm_.CardRedo(getTaskId(),
+                                 idOrNum,
+                                 req.contains("body") && req["body"].is_string(),
+                                 req.value("body", std::string()),
+                                 req.contains("params"),
+                                 getParamsJson(),
+                                 JsonGetString(reqJson, "reason", ""),
+                                 force,
+                                 originJson, err);
+            if (run) {
+                nlohmann::json redoDoc = nlohmann::json::parse(resp, nullptr, false);
+                if (redoDoc.is_object() && redoDoc.value("ok", false)) {
+                    const std::string newNum = redoDoc.value("number", std::string());
+                    const std::string runResp = btm_->CardRun(getTaskId(), newNum, false, 1, force, originJson);
+                    nlohmann::json runDoc = nlohmann::json::parse(runResp, nullptr, false);
+                    if (!runDoc.is_object() || !runDoc.value("ok", false)) {
+                        return runResp.empty() ? "{\"ok\":false,\"error\":\"failed to run rescue card\"}" : runResp;
+                    }
+                    redoDoc["btId"] = runDoc.value("btId", std::string());
+                    redoDoc["state"] = runDoc.value("state", std::string("running"));
+                    redoDoc["started"] = true;
+                    resp = redoDoc.dump();
+                }
+            }
+        } else {
+            return "{\"ok\":false,\"error\":\"unknown card action: " + JsonEscape(action) + "\"}";
+        }
+        return resp;
+    }
     else if (action == "failure_diagnose" || action.rfind("taskqueue_", 0) == 0) {
         std::string err;
         std::string resp;
@@ -2151,6 +2350,19 @@ std::string IpcServer::HandleRequestJson(const std::string& reqJson) {
                                      JsonGetString(reqJson, "notify_file", ""), err,
                                      ExtractRawJsonValue(reqJson, "origin"),
                                      JsonGetString(reqJson, "task", ""));
+            if (err.empty() && JsonGetBool(reqJson, "cancel_on_client_exit", false)) {
+                const uint32_t clientPid = static_cast<uint32_t>(JsonGetInt(reqJson, "client_pid", 0));
+                if (clientPid > 0) {
+                    nlohmann::json addedDoc = nlohmann::json::parse(resp, nullptr, false);
+                    const std::string dirId = addedDoc.is_object()
+                                                ? addedDoc.value("direction_id", std::string())
+                                                : std::string();
+                    if (!dirId.empty()) {
+                        std::string watchErr;
+                        tqm_.WatchDirectionClient(dirId, clientPid, watchErr);
+                    }
+                }
+            }
         } else if (action == "taskqueue_list") {
             int64_t sinceSec = 0;
             const std::string sinceStr = JsonGetString(reqJson, "since", "");
@@ -2161,12 +2373,27 @@ std::string IpcServer::HandleRequestJson(const std::string& reqJson) {
                 const std::string stateFilter = JsonGetString(reqJson, "state", "");
                 const std::string btFilter = JsonGetString(reqJson, "bt", "");
                 const std::string taskFilter = JsonGetString(reqJson, "task", "");
+                const std::string beforeFilter = JsonGetString(reqJson, "before", "");
+                const std::string queryFilter = JsonGetString(reqJson, "query", "");
+                int64_t finishedLimit = -1;
+                {
+                    nlohmann::json reqObj = nlohmann::json::parse(reqJson, nullptr, false);
+                    if (reqObj.is_object()) {
+                        if (reqObj.contains("finished_limit") && reqObj["finished_limit"].is_number_integer()) {
+                            finishedLimit = reqObj["finished_limit"].get<int64_t>();
+                        } else if (reqObj.contains("finishedLimit") && reqObj["finishedLimit"].is_number_integer()) {
+                            finishedLimit = reqObj["finishedLimit"].get<int64_t>();
+                        }
+                    }
+                }
                 resp = tqm_.TaskQueueList(tqFilter, stateFilter, sinceSec, err,
                                           JsonGetString(reqJson, "origin", ""), btFilter,
-                                          JsonGetBool(reqJson, "include_hidden", false), taskFilter);
+                                          JsonGetBool(reqJson, "include_hidden", false), taskFilter,
+                                          finishedLimit, beforeFilter, queryFilter);
                 // Virtual task-group rows and their provisional leaves, derived from the live
                 // state on every query. Nothing is stored, so a finished group drops both rows.
-                if (err.empty() && btm_ && taskFilter.empty() && JsonGetBool(reqJson, "include_planned", false)) {
+                if (err.empty() && btm_ && taskFilter.empty() && beforeFilter.empty() && queryFilter.empty() &&
+                    JsonGetBool(reqJson, "include_planned", false)) {
                     nlohmann::json doc = nlohmann::json::parse(resp, nullptr, false);
                     if (doc.is_object() && doc.contains("jobs") && doc["jobs"].is_array()) {
                         BtRemainingInfo info = btm_->GetRemainingInfo();
@@ -2223,6 +2450,28 @@ std::string IpcServer::HandleRequestJson(const std::string& reqJson) {
                         resp = doc.dump();
                     }
                 }
+            }
+        } else if (action == "taskqueue_changes") {
+            uint64_t since = 0;
+            nlohmann::json req = nlohmann::json::parse(reqJson, nullptr, false);
+            if (req.is_object() && req.contains("since")) {
+                if (req["since"].is_number_unsigned()) {
+                    since = req["since"].get<uint64_t>();
+                } else if (req["since"].is_number_integer()) {
+                    const int64_t v = req["since"].get<int64_t>();
+                    since = v > 0 ? static_cast<uint64_t>(v) : 0;
+                } else if (req["since"].is_string()) {
+                    try {
+                        since = std::stoull(req["since"].get<std::string>());
+                    } catch (...) {
+                        err = "invalid since";
+                    }
+                } else if (!req["since"].is_null()) {
+                    err = "invalid since";
+                }
+            }
+            if (err.empty()) {
+                resp = tqm_.TaskQueueChanges(since, JsonGetBool(reqJson, "include_hidden", false), err);
             }
         } else if (action == "taskqueue_get") {
             const std::string id = JsonGetString(reqJson, "id", "");
@@ -2774,6 +3023,19 @@ std::string IpcServer::HandleRequestJson(const std::string& reqJson) {
                 }
             }
             resp = btm_->Start(btJson, JsonGetBool(reqJson, "paused", false));
+            if (JsonGetBool(reqJson, "cancel_on_client_exit", false)) {
+                const uint32_t clientPid = static_cast<uint32_t>(JsonGetInt(reqJson, "client_pid", 0));
+                if (clientPid > 0) {
+                    nlohmann::json startedDoc = nlohmann::json::parse(resp, nullptr, false);
+                    if (startedDoc.is_object() && startedDoc.value("ok", false)) {
+                        const std::string dirId = startedDoc.value("directionId", std::string());
+                        if (!dirId.empty()) {
+                            std::string watchErr;
+                            tqm_.WatchDirectionClient(dirId, clientPid, watchErr);
+                        }
+                    }
+                }
+            }
         } else if (action == "bt_get") {
             std::string id = req.value("id", std::string());
             bool compact = req.value("compact", false);

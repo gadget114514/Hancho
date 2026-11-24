@@ -175,7 +175,8 @@ one with `bt resume`.
 **Tasks (grouping jobs & behavior trees with intent and progress log):**
 
 ```powershell
-hancho-cli.exe task create --title "Fix auth bug" --intent "Reproduce and fix token refresh" --json
+hancho-cli.exe task create --title "Fix auth bug" --intent "Reproduce and fix token refresh" --card-defaults '{"build":"cmake --build build","test":"ctest --test-dir build"}' --json
+hancho-cli.exe task update task_1 --card-defaults '{"build":"cmake --build build --config Release"}'
 hancho-cli.exe taskqueue add --file jobs.json --taskqueue main --task task_1
 hancho-cli.exe bt start --file plan.json --task task_1
 hancho-cli.exe task note task_1 --text "Switched to refresh-token retry after inspecting logs"
@@ -189,6 +190,21 @@ hancho-cli.exe task purge --older-than 604800
 ```
 
 Task records are stored under `<data-dir>/tasks/` (`<id>.json` and `<id>.log.jsonl`). A task's state (`open`, `running`, `failed`, `cancelled`, `succeeded`, `closed`) is computed from the latest job of each lineage inside it (unless explicitly closed). `run --exit-on-drain` also evaluates lineages by default (excluding jobs with `superseded_by`); pass `--count-superseded` to count every job as before.
+
+**Task cards (planned directions inside a task):**
+
+```powershell
+hancho-cli.exe card add --task task_1 --number 102-3 --title "Add card list" --body-file card.md --after 102-2
+hancho-cli.exe card list --task task_1
+hancho-cli.exe card show 102-3 --task task_1
+hancho-cli.exe card edit 102-3 --task task_1 --body-file card_v2.md
+hancho-cli.exe card run --ready --task task_1 --max 1
+hancho-cli.exe card run 102-3 --task task_1
+hancho-cli.exe card redo 102-3 --task task_1 --reason "Fix test expectation" --run
+hancho-cli.exe card remove 102-3 --task task_1
+```
+
+Cards are stored as `planned` directions on the task; `card run` instantiates the `card` BT template (filling missing `build`, `test`, `engines`, `cwd` from task `cardDefaults`) and promotes the direction to `running`. Failed cards can be superseded with `card redo` (`<number>-r<n>`).
 
 **Quick fix (tiny deterministic edits):**
 
@@ -411,7 +427,7 @@ hancho-cli.exe export list
 | `cli_exit_codes`, `environment_variables` | Exit codes and `HANCHO_LOG_DIR` |
 | `data_dir_option`, `effective_data_dir` | Per-invocation `--data-dir`, its resolved absolute path for this call, and project consistency rules |
 | `common_examples` | Ready-to-run `hancho-cli.exe` commands |
-| `commands` | Every command and option, including `task create/show/list/note/close/reopen/purge/wait`, `taskqueue add/list/get/retry/supersede/cancel/pause/resume/pause-job/resume-job/graph/wait/purge`, `mcp install/uninstall` and `agent uninstall-template` |
+| `commands` | Every command and option, including `task create/update/show/list/note/close/reopen/purge/wait`, `card add/list/show/edit/remove/run/redo`, `taskqueue add/list/get/retry/supersede/cancel/pause/resume/pause-job/resume-job/graph/wait/purge`, `mcp install/uninstall` and `agent uninstall-template` |
 | `setup.mcp` | MCP registration, a ready-to-use config, and `auto_install` / `uninstall` (`argv` + `command`) |
 | `agent` | `working_model` (supervisor → Hancho → worker LLM), `data_dir_consistency`, `decision`, `states`, `quick_start` |
 | `leaving` | Graduation steps, JSON / JSONL data formats, keep-or-delete-data behavior, and the release checklist |

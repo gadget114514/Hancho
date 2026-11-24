@@ -21,12 +21,12 @@ inline constexpr const char* kBtTemplateNote =
     "bt validate / bt start. {engine}, {model} and the foreach expansions "
     "${t.*} / ${foreach:...} are intentional runtime placeholders.";
 
-inline const char* const kResilientWorkerTemplate = R"JSON({
-  "id": "resilient-worker",
-  "summary": "A worker with hang watch, preflight probe, engine fallback and escalation",
-  "intent": "Run one resilient worker; replace <...> placeholders before validation",
+inline const char* const kResilientAgentTemplate = R"JSON({
+  "id": "resilient-agent",
+  "summary": "An agent with hang watch, preflight probe, engine fallback and escalation",
+  "intent": "Run one resilient agent; replace <...> placeholders before validation",
   "defaults": {
-    "worker": {
+    "agent": {
       "idle": { "firstEventSec": 180, "outputSec": 600 },
       "probe": true
     }
@@ -39,10 +39,10 @@ inline const char* const kResilientWorkerTemplate = R"JSON({
       "id": "impl_and_test",
       "children": [
         {
-          "type": "worker",
+          "type": "agent",
           "id": "impl",
           "summary": "<task summary>",
-          "prompt": "Stay inside the project (cwd): do not read or write files outside it. If the task requires one, add it to needs and request a permit instead. If you cannot find the root cause, print 'HANCHO-RESULT: root_cause_not_found' on its own line, write a 'handoff' object ({suspected, tried, ruledOut}) to PC_BT_RESULT_FILE, and exit non-zero. <worker prompt>",
+          "prompt": "Stay inside the project (cwd): do not read or write files outside it. If the task requires one, add it to needs and request a permit instead. If you cannot find the root cause, print 'HANCHO-RESULT: root_cause_not_found' on its own line, write a 'handoff' object ({suspected, tried, ruledOut}) to PC_BT_RESULT_FILE, and exit non-zero. <agent prompt>",
           "timeoutSec": 5400,
           "engines": [
             { "engine": "opencode", "model": "<primary-model>" },
@@ -58,7 +58,7 @@ inline const char* const kResilientWorkerTemplate = R"JSON({
           ]
         },
         {
-          "type": "job",
+          "type": "exec",
           "id": "test",
           "summary": "Run tests",
           "command": "<test command>",
@@ -87,7 +87,7 @@ inline const char* const kResilientWorkerTemplate = R"JSON({
         "do": {
           "type": "escalate",
           "question": "<what should the supervisor decide?>",
-          "guidance": "The worker failed after all approved engine candidates were tried.",
+          "guidance": "The agent failed after all approved engine candidates were tried.",
           "expect": ["continue", "stop", "takeover"],
           "include": { "logs": ["impl"], "logLines": 100 }
         }
@@ -103,7 +103,7 @@ inline const char* const kCardSequenceTemplate = R"JSON({
   "summary": "Two ww cards in order, each hang-protected, with a build after each card",
   "intent": "Run ww cards with engine switching; replace <...> placeholders before validation",
   "defaults": {
-    "worker": {
+    "agent": {
       "idle": { "firstEventSec": 180, "outputSec": 600 },
       "probe": true
     }
@@ -115,7 +115,7 @@ inline const char* const kCardSequenceTemplate = R"JSON({
         "type": "catch",
         "id": "card_<card-id-1>_guard",
         "child": {
-          "type": "job",
+          "type": "exec",
           "id": "card_<card-id-1>",
           "summary": "Run ww card <card-id-1>",
           "command": "tools\\ww\\ww-run.cmd <card-id-1> -Main -Engine {engine} -Model {model} -Root <root> -JsonStdout",
@@ -158,7 +158,7 @@ inline const char* const kCardSequenceTemplate = R"JSON({
         "maxRetries": 2
       },
       {
-        "type": "job",
+        "type": "exec",
         "id": "build_after_<card-id-1>",
         "summary": "Build after card <card-id-1>",
         "command": "cmake --build build --config Release",
@@ -168,7 +168,7 @@ inline const char* const kCardSequenceTemplate = R"JSON({
         "type": "catch",
         "id": "card_<card-id-2>_guard",
         "child": {
-          "type": "job",
+          "type": "exec",
           "id": "card_<card-id-2>",
           "summary": "Run ww card <card-id-2>",
           "command": "tools\\ww\\ww-run.cmd <card-id-2> -Main -Engine {engine} -Model {model} -Root <root> -JsonStdout",
@@ -211,7 +211,7 @@ inline const char* const kCardSequenceTemplate = R"JSON({
         "maxRetries": 2
       },
       {
-        "type": "job",
+        "type": "exec",
         "id": "build_after_<card-id-2>",
         "summary": "Build after card <card-id-2>",
         "command": "cmake --build build --config Release",
@@ -229,7 +229,7 @@ inline const char* const kTestSuiteTemplate = R"JSON({
     "type": "sequence",
     "children": [
       {
-        "type": "job",
+        "type": "exec",
         "id": "build",
         "summary": "Build Hancho and every smoke test",
         "command": "cmake --build build --config Release --target Hancho HanchoChat HanchoTerm wct hancho-cli ${foreach:tests/*_smoke.cpp:stem: }",
@@ -242,7 +242,7 @@ inline const char* const kTestSuiteTemplate = R"JSON({
         "as": "t",
         "mode": "all",
         "do": {
-          "type": "job",
+          "type": "exec",
           "id": "test_${t.stem}",
           "command": "build\\Release\\${t.stem}.exe",
           "summary": "Run ${t.stem}",
@@ -253,22 +253,110 @@ inline const char* const kTestSuiteTemplate = R"JSON({
   }
 })JSON";
 
+inline const char* const kCardTemplate = R"JSON({
+  "id": "card",
+  "summary": "Run one task card (impl agent -> build -> test) with engine switching and catch",
+  "intent": "Run one task card; replace <...> placeholders before validation",
+  "defaults": {
+    "agent": {
+      "idle": { "firstEventSec": 180, "outputSec": 600 },
+      "probe": true
+    }
+  },
+  "root": {
+    "type": "catch",
+    "id": "impl_guard",
+    "child": {
+      "type": "sequence",
+      "id": "impl_build_test",
+      "children": [
+        {
+          "type": "agent",
+          "id": "impl",
+          "summary": "<card summary>",
+          "prompt": "Stay inside the project (cwd): do not read or write files outside it. If the task requires one, add it to needs and request a permit instead. If you cannot find the root cause, print 'HANCHO-RESULT: root_cause_not_found' on its own line, write a 'handoff' object ({suspected, tried, ruledOut}) to PC_BT_RESULT_FILE, and exit non-zero. <card body>",
+          "timeoutSec": 5400,
+          "engines": [
+            { "engine": "opencode", "model": "<primary-model>" },
+            { "engine": "agy", "model": "<backup-model>" }
+          ],
+          "switchEngineOn": [
+            "startup_hang",
+            "auth_error",
+            "probe_failed",
+            { "class": "fix_no_progress", "after": 1 },
+            { "class": "fix_failed", "after": 2 },
+            { "class": "root_cause_not_found", "after": 1 }
+          ]
+        },
+        {
+          "type": "exec",
+          "id": "build",
+          "summary": "Build",
+          "command": "<build command>",
+          "timeoutSec": 900,
+          "blame": "impl"
+        },
+        {
+          "type": "exec",
+          "id": "test",
+          "summary": "Run tests",
+          "command": "<test command>",
+          "timeoutSec": 900,
+          "blame": "impl"
+        }
+      ]
+    },
+    "handlers": [
+      {
+        "class": ["startup_hang", "idle_stall"],
+        "do": { "type": "set", "var": "hang", "value": "engine-switch-handled" }
+      },
+      {
+        "class": "rate_limited",
+        "do": { "type": "wait", "sec": 600 },
+        "thenRetry": true
+      },
+      {
+        "class": "permission_denied",
+        "do": { "type": "set", "var": "permit", "value": "requested" },
+        "thenRetry": false
+      },
+      {
+        "class": "*",
+        "do": {
+          "type": "escalate",
+          "question": "<what should the supervisor decide?>",
+          "guidance": "The agent failed after all approved engine candidates were tried.",
+          "expect": ["continue", "stop", "takeover"],
+          "include": { "logs": ["impl"], "logLines": 100 }
+        }
+      }
+    ],
+    "otherwise": "fail",
+    "maxRetries": 2
+  }
+})JSON";
+
 inline std::vector<BtTemplateEntry> BtTemplateEntries() {
     return {
-        {"resilient-worker",
-         "Worker with idle defaults, probe, two approved engines, catch handlers and takeover-ready escalation."},
+        {"resilient-agent",
+         "Agent with idle defaults, probe, two approved engines, catch handlers and takeover-ready escalation."},
         {"card-sequence",
-         "ww cards in order, each hang-protected with engines and catch, plus a build job after each card."},
+         "ww cards in order, each hang-protected with engines and catch, plus a build exec after each card."},
         {"test-suite",
-         "Build targets with ${foreach:...}, then run each tests/*_smoke.cpp via a foreach node (mode all)."}
+         "Build targets with ${foreach:...}, then run each tests/*_smoke.cpp via a foreach node (mode all)."},
+        {"card",
+         "Task card flow: impl agent -> build -> test (both blaming impl), with engine switching and catch."}
     };
 }
 
 inline nlohmann::json BtTemplateDefinition(const std::string& name) {
     const char* text = nullptr;
-    if (name == "resilient-worker") text = kResilientWorkerTemplate;
+    if (name == "resilient-agent" || name == "resilient-worker") text = kResilientAgentTemplate;
     else if (name == "card-sequence") text = kCardSequenceTemplate;
     else if (name == "test-suite") text = kTestSuiteTemplate;
+    else if (name == "card") text = kCardTemplate;
     else return nullptr;
     return nlohmann::json::parse(text, nullptr, false);
 }
@@ -287,9 +375,10 @@ inline nlohmann::json BtTemplateResult(const std::string& name) {
     if (def.is_null()) {
         return nlohmann::json{{"ok", false}, {"error", "unknown bt template: " + name}};
     }
+    const std::string canonicalName = (name == "resilient-worker") ? "resilient-agent" : name;
     std::string description;
     for (const auto& e : BtTemplateEntries()) {
-        if (e.name == name) { description = e.description; break; }
+        if (e.name == canonicalName) { description = e.description; break; }
     }
     return nlohmann::json{{"ok", true}, {"name", name}, {"description", description},
                           {"note", kBtTemplateNote}, {"bt", std::move(def)}};

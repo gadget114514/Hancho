@@ -153,8 +153,12 @@ BtManager::BtManager(ProcessManager& pm, TaskQueueManager& tqm)
     tqm_.SetBtRetryCallback([this](const TaskQueueBtRef& ref, bool resetCounters, std::string& outError) {
         return OnTaskQueueBtRetry(ref, resetCounters, outError);
     });
+    tqm_.SetBtCancelCallback([this](const std::string& btId) {
+        Cancel(btId);
+    });
 
     LoadPersistedTrees();
+    tqm_.ReconcileDirectionClientWatches();
     timerThread_ = std::thread(&BtManager::TimerLoop, this);
 }
 
@@ -167,6 +171,7 @@ void BtManager::Shutdown() {
 
     tqm_.SetJobFinishedCallback(nullptr);
     tqm_.SetBtRetryCallback(nullptr);
+    tqm_.SetBtCancelCallback(nullptr);
 
     timerCv_.notify_all();
     waitCv_.notify_all();
@@ -492,6 +497,10 @@ void BtManager::PersistEntryLocked(TreeEntry& entry) {
                  ev.type == "btFailed" || ev.type == "btCancelled")) {
                 tqm_.TaskLog(entry.tree->TaskId(), ev.type == "btStarted" ? "bt_started" : "bt_finished",
                              "", entry.tree->Id(), ev.state, "");
+            }
+            if ((ev.type == "btSucceeded" || ev.type == "btFailed" || ev.type == "btCancelled") &&
+                !entry.tree->DirectionId().empty()) {
+                tqm_.UnwatchDirectionClient(entry.tree->DirectionId());
             }
             if (!entry.tree->TaskId().empty() && ev.type == "engineSwitched") {
                 tqm_.TaskLog(entry.tree->TaskId(), "engine_switched", "", entry.tree->Id(),

@@ -4,6 +4,24 @@
 
 namespace pc {
 
+enum class AutoStartMode {
+    Gui,
+    Headless,
+    Off
+};
+
+// Global process-level opt-out for auto-start (--no-autostart).
+void SetNoAutoStart(bool noAutoStart);
+bool GetNoAutoStart();
+
+// Resolves auto-start mode from --no-autostart and HANCHO_AUTOSTART
+// ("gui" / "headless" / "off"). Defaults to Gui when neither is set.
+// When envValue is non-null, uses it instead of reading HANCHO_AUTOSTART.
+AutoStartMode ResolveAutoStartMode(bool noAutoStartFlag = GetNoAutoStart(),
+                                   const char* envValue = nullptr);
+bool HasAutoStartEnvVar();
+bool ShouldSuppressDialogs();
+
 // Client helper: auto-starts the GUI Dashboard if not running, sends request, returns JSON response
 //
 // timeoutMs bounds how long the client waits for the answer (0 = wait forever).

@@ -123,6 +123,7 @@ int RemoteStart(const std::string& host, const StartProcessRequest& req, std::st
     j["idle_timeout_sec"] = req.idleTimeoutSec;
     j["idle_first_event_sec"] = req.idleFirstEventSec;
     if (!req.estimatedEndTimeStr.empty()) j["estimate_end"] = req.estimatedEndTimeStr;
+    j["engine"] = req.agentType;
     j["agent_type"] = req.agentType;
     j["json_stream"] = req.jsonStream;
     j["supervisor_notes"] = req.supervisorNotes;

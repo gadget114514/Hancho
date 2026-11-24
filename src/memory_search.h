@@ -3,6 +3,7 @@
 #include <cstdint>
 #include <memory>
 #include <string>
+#include <utility>
 #include <vector>
 
 namespace pc {
@@ -67,6 +68,9 @@ struct NoteInput {
     std::string authorClient;
     std::string authorSession;
     std::vector<std::string> sources;
+    // Structured values for the display layer (e.g. {"kind","failure_streak"}, {"job","build"}).
+    // Stored as a JSON object of strings under "data"; the text stays English.
+    std::vector<std::pair<std::string, std::string>> data;
     std::string supersedes;
     std::string expiresAt;
     std::string attemptId; // defaults to the first run source ("rr_...") for agent notes

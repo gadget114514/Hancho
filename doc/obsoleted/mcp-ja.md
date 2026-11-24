@@ -45,7 +45,8 @@ hancho-cli.exe mcp uninstall --delete-data-dir           # データディレク
 
 | ツール | 説明 |
 | :--- | :--- |
-| `task_create` | タスクのレコードを作成（`title` 上限 200 バイト、任意 `intent` 上限 16 KB、任意 `id` `task_` 始まり、任意 `originLabel`）。タスク id を返す。 |
+| `task_create` | タスクのレコードを作成（`title` 上限 200 バイト、任意 `intent` 上限 16 KB、任意 `id` `task_` 始まり、任意 `cardDefaults`、任意 `originLabel`）。タスク id を返す。 |
+| `task_update` | タスクの `title`・`intent`・`cardDefaults` を更新（`id`）。 |
 | `task_show` | タスクのレコード、計算された状態、ジョブと系譜、直近の経過ログを表示（`id`, 任意 `logLimit` 既定 200）。 |
 | `task_list` | タスク一覧と計算された状態（`state?`: `open`\|`running`\|`failed`\|`cancelled`\|`succeeded`\|`closed`, `limit?`）。 |
 | `task_note` | タスクの経過ログにメモを追記（`id`, `text` 上限 4 KB）。 |
@@ -53,6 +54,18 @@ hancho-cli.exe mcp uninstall --delete-data-dir           # データディレク
 | `task_reopen` | 閉じたタスクを理由付きで開き直す（`id`, `reason` 上限 2000 バイト）。 |
 | `task_purge` | 閉じてから `olderThanSec` 秒以上経過したタスクを削除する。 |
 | `task_wait` | タスクの実行中・待機中ジョブがすべて終わるか `timeoutMs` が経過するまで待ち、`task_show` と同じ形を返す（`id`, `timeoutMs?`, `logLimit?`）。 |
+
+**タスクカード操作**
+
+| ツール | 説明 |
+| :--- | :--- |
+| `card_add` | 実行中のタスクに `planned` なタスクカード（direction）を追加（`taskId`, `number`, `title`, `body?` 上限 64 KB, `after?`, `template?` 既定 `card`, `params?`）。 |
+| `card_list` | タスク内のカードを番号順に一覧表示。状態と `waitingFor` を返す（`taskId`。本文は省略）。 |
+| `card_show` | カード番号または direction id でカード詳細（本文・依存・ジョブ）を表示（`id`, `taskId?`）。 |
+| `card_edit` | `planned` なタスクカードを編集（`taskId`, `number`, `title?`, `body?`, `after?`, `template?`, `params?`）。実行開始後は失敗する。 |
+| `card_remove` | `planned` なタスクカードを削除（`taskId`, `number`）。実行開始後は失敗する。 |
+| `card_run` | `planned` なカード（`number`）または依存を満たしたカード（`ready: true`, `max?` 既定 1）を雛形から BT 化して実行する（`taskId`, `force?`, `originLabel?`）。 |
+| `card_redo` | 失敗・キャンセル・終了したカードを引き継ぐ救済カード（`<number>-r<n>`）を作成（`taskId`, `number`, `body?`, `params?`, `reason?`, `run?`, `force?`, `originLabel?`）。 |
 
 **タスクキュー操作**
 

@@ -141,10 +141,10 @@ const BtNode* CatchFailureLeaf(const BtNode& child) {
     CollectFailedLeaves(child, leaves, 0);
     for (auto it = leaves.rbegin(); it != leaves.rend(); ++it) {
         if ((*it)->hasFailureDiagnostic &&
-            ((*it)->type == "job" || (*it)->type == "worker")) return *it;
+            ((*it)->type == "exec" || (*it)->type == "agent")) return *it;
     }
     for (auto it = leaves.rbegin(); it != leaves.rend(); ++it) {
-        if ((*it)->type == "job" || (*it)->type == "worker") return *it;
+        if ((*it)->type == "exec" || (*it)->type == "agent") return *it;
     }
     return leaves.empty() ? nullptr : leaves.back();
 }
@@ -601,7 +601,7 @@ void BehaviorTree::Impl::TickNode(BehaviorTree& bt, BtNode& node, int64_t nowMs)
         return;
     }
 
-    if (t == "job" || t == "worker") {
+    if (t == "exec" || t == "agent") {
         if (node.state == "running") return;
         if (!checkNodeRunLimit()) return;
 
@@ -655,7 +655,7 @@ void BehaviorTree::Impl::TickNode(BehaviorTree& bt, BtNode& node, int64_t nowMs)
         node.lastStartTimestamp = FormatEpochMsIso(nowMs);
 
         std::string jobId;
-        if (t == "job") {
+        if (t == "exec") {
             std::string rawInstr = node.instructionsText;
             if (rawInstr.empty() && !node.instructionsFile.empty()) {
                 std::string relF;

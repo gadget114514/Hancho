@@ -1013,12 +1013,12 @@ int main() {
                 {"type":"job","id":"t","summary":"t","command":"c","timeoutSec":30,"blame":"impl"},
                 {"type":"worker","id":"impl","prompt":"p","summary":"w","timeoutSec":30,"idle":{"firstEventSec":60}}]}})JSON";
             Check(BehaviorTree::ValidateJson(beforeWorkerBt, &catalog3, bErrs, bWarns),
-                  "101-3: blame_before_worker is a warning, not an error");
+                  "101-3: blame_before_agent is a warning, not an error");
             bool hasBeforeWarn = false;
             for (const auto& w : bWarns) {
-                if (w.code == "blame_before_worker") hasBeforeWarn = true;
+                if (w.code == "blame_before_agent" && w.alias == "blame_before_worker") hasBeforeWarn = true;
             }
-            Check(hasBeforeWarn, "101-3: blame_before_worker warning emitted when job precedes worker");
+            Check(hasBeforeWarn, "101-3: blame_before_agent warning (with alias blame_before_worker) emitted when exec/job precedes agent/worker");
 
             // (b) fix_failed -> reload -> fix_no_progress -> switch candidate on next worker run.
             const std::wstring blameDirW = tempDirW + L"\\blame_test";
@@ -1532,28 +1532,28 @@ int main() {
         };
 
         const char* bareWorker = R"JSON({"id":"lint-bare","root":{
-            "type":"worker","id":"impl","summary":"s","prompt":"p","timeoutSec":60}})JSON";
+            "type":"agent","id":"impl","summary":"s","prompt":"p","timeoutSec":60}})JSON";
         std::vector<BtWarning> ws;
         lint(bareWorker, ws);
-        Check(hasCode(ws, "no_hang_watch"), "091-4: no_hang_watch on worker without idle/defaults");
-        Check(hasCode(ws, "unguarded_worker"), "091-4: unguarded_worker on root worker");
+        Check(hasCode(ws, "no_hang_watch"), "091-4: no_hang_watch on agent without idle/defaults");
+        Check(hasCode(ws, "unguarded_agent"), "091-4: unguarded_agent on root agent");
         Check(!suggestionFor(ws, "no_hang_watch").empty(), "091-4: warning carries a suggestion");
 
         const char* guardedDefaults = R"JSON({"id":"lint-guarded","defaults":{
-            "worker":{"idle":{"firstEventSec":180,"outputSec":600}}},
-            "root":{"type":"catch","id":"guard","child":{"type":"worker","id":"impl",
+            "agent":{"idle":{"firstEventSec":180,"outputSec":600}}},
+            "root":{"type":"catch","id":"guard","child":{"type":"agent","id":"impl",
             "summary":"s","prompt":"p","timeoutSec":60},"handlers":[{"do":{"type":"succeed"}}]}})JSON";
         ws.clear();
         lint(guardedDefaults, ws);
-        Check(ws.empty(), "091-4: guarded worker with defaults has no warnings");
+        Check(ws.empty(), "091-4: guarded agent with defaults has no warnings");
 
         const char* unguarded = R"JSON({"id":"lint-unguarded","defaults":{
-            "worker":{"idle":{"firstEventSec":180}}},"root":{"type":"worker","id":"impl",
+            "agent":{"idle":{"firstEventSec":180}}},"root":{"type":"agent","id":"impl",
             "summary":"s","prompt":"p","timeoutSec":60}})JSON";
         ws.clear();
         lint(unguarded, ws);
-        Check(hasCode(ws, "unguarded_worker") && !hasCode(ws, "no_hang_watch"),
-              "091-4: unguarded_worker alone when idle defaults are present");
+        Check(hasCode(ws, "unguarded_agent") && !hasCode(ws, "no_hang_watch"),
+              "091-4: unguarded_agent alone when idle defaults are present");
 
         const char* opencodeNoModel = R"JSON({"id":"lint-opencode","defaults":{
             "worker":{"idle":{"firstEventSec":180}}},"root":{"type":"catch","id":"guard",
@@ -1627,7 +1627,7 @@ int main() {
         std::string strictResp = BehaviorTree::ValidateResponse(unguarded, &lintCatalog, true);
         nlohmann::json strictJson = nlohmann::json::parse(strictResp, nullptr, false);
         Check(!strictJson.value("ok", true) && !strictJson.value("valid", true) &&
-              strictJson.value("error", std::string()).find("unguarded_worker") != std::string::npos,
+              strictJson.value("error", std::string()).find("unguarded_agent") != std::string::npos,
               "091-4: strict mode turns warnings into errors");
         std::string bareResp = BehaviorTree::ValidateResponse(guardedDefaults, &lintCatalog, true);
         Check(nlohmann::json::parse(bareResp, nullptr, false).value("ok", false),
@@ -1636,8 +1636,8 @@ int main() {
         // 091-7 (4): an unapproved `needs` is a warning; --strict makes it an error with the
         // permit_not_approved code and a permit request suggestion.
         const char* needsTree = R"JSON({"id":"lint-needs","defaults":{
-            "worker":{"idle":{"firstEventSec":180,"outputSec":600}}},
-            "root":{"type":"catch","id":"guard","child":{"type":"worker","id":"impl",
+            "agent":{"idle":{"firstEventSec":180,"outputSec":600}}},
+            "root":{"type":"catch","id":"guard","child":{"type":"agent","id":"impl",
             "summary":"s","prompt":"p","timeoutSec":60,
             "needs":[{"kind":"read_path","target":"C:/outside/0917-never-approved/**"}]},
             "handlers":[{"do":{"type":"succeed"}}]}})JSON";
@@ -1673,9 +1673,9 @@ int main() {
         };
         nlohmann::json list = BtTemplateListJson();
         Check(list.value("ok", false) && list["templates"].is_array() &&
-              list["templates"].size() == 3 &&
+              list["templates"].size() == 4 &&
               list.value("note", std::string()).find("<...>") != std::string::npos,
-              "091-4/093-2: template list has three entries and a placeholder note");
+              "091-4/093-2/104-2: template list has four entries and a placeholder note");
         Check(BtTemplateDefinition("does-not-exist").is_null() &&
               !BtTemplateResult("does-not-exist").value("ok", true),
               "091-4: unknown template is rejected");
@@ -1695,6 +1695,13 @@ int main() {
                   j["warnings"].is_array() && j["warnings"].empty(),
                   "091-4: " + entry.name + " passes bt validate --strict with no warnings: " +
                   j.value("error", std::string()));
+        }
+        {
+            nlohmann::json aliasDef = BtTemplateDefinition("resilient-worker");
+            nlohmann::json aliasTool = BtTemplateResult("resilient-worker");
+            Check(aliasDef.is_object() && aliasDef.value("id", std::string()) == "resilient-agent" &&
+                  aliasTool.value("ok", false) && !aliasTool.value("description", std::string()).empty(),
+                  "103-4: resilient-worker alias resolves to resilient-agent template");
         }
 
         // 101-6: fix_class_without_blame warning & --strict error.
@@ -1777,6 +1784,114 @@ int main() {
                 if (w.code == "fix_class_without_blame") hasUnexpectedWarn = true;
             }
             Check(!hasUnexpectedWarn, "101-6: no fix_class_without_blame when a job blames the worker");
+        }
+
+        // 103-4: exec / agent types, defaults.exec / defaults.agent, deprecation warnings, alias, and state migration.
+        {
+            const char* newNamesBt = R"JSON({
+                "id": "bt-103-4-new",
+                "defaults": {
+                    "agent": { "idle": { "firstEventSec": 180, "outputSec": 600 }, "probe": true },
+                    "exec": { "idle": { "outputSec": 300 } }
+                },
+                "root": {
+                    "type": "catch",
+                    "child": {
+                        "type": "sequence",
+                        "children": [
+                            { "type": "agent", "id": "impl", "summary": "impl", "prompt": "p", "timeoutSec": 60 },
+                            { "type": "exec", "id": "test", "summary": "test", "command": "ctest", "timeoutSec": 60, "blame": "impl" }
+                        ]
+                    },
+                    "handlers": [{ "class": "*", "do": { "type": "fail", "detail": "done" } }]
+                }
+            })JSON";
+            nlohmann::json newStrict = nlohmann::json::parse(
+                BehaviorTree::ValidateResponse(newNamesBt, &allApproved, true), nullptr, false);
+            Check(newStrict.value("ok", false) && newStrict["warnings"].empty(),
+                  "103-4: exec/agent + defaults.exec/defaults.agent passes --strict with no warnings");
+
+            const char* oldNamesBt = R"JSON({
+                "id": "bt-103-4-old",
+                "defaults": {
+                    "worker": { "idle": { "firstEventSec": 120 } },
+                    "job": { "idle": { "outputSec": 240 } }
+                },
+                "root": {
+                    "type": "sequence",
+                    "children": [
+                        { "type": "job", "id": "t", "summary": "t", "command": "ctest", "timeoutSec": 60, "blame": "impl" },
+                        { "type": "worker", "id": "impl", "summary": "impl", "prompt": "p", "timeoutSec": 60 }
+                    ]
+                }
+            })JSON";
+            nlohmann::json oldResp = nlohmann::json::parse(
+                BehaviorTree::ValidateResponse(oldNamesBt, &allApproved, false), nullptr, false);
+            Check(oldResp.value("ok", false), "103-4: old job/worker + defaults.job/worker still validates");
+            bool hasDepNode = false, hasDepDefaults = false, hasUnguardedAlias = false, hasBlameAlias = false;
+            for (const auto& w : oldResp["warnings"]) {
+                const std::string code = w.value("code", std::string());
+                const std::string alias = w.value("alias", std::string());
+                if (code == "deprecated_node_type") hasDepNode = true;
+                if (code == "deprecated_defaults_key") hasDepDefaults = true;
+                if (code == "unguarded_agent" && alias == "unguarded_worker") hasUnguardedAlias = true;
+                if (code == "blame_before_agent" && alias == "blame_before_worker") hasBlameAlias = true;
+            }
+            Check(hasDepNode && hasDepDefaults, "103-4: deprecated_node_type and deprecated_defaults_key emitted");
+            Check(hasUnguardedAlias && hasBlameAlias, "103-4: warning JSON includes alias for old warning codes");
+
+            const char* bothDefaultsBt = R"JSON({
+                "id": "bt-103-4-both",
+                "defaults": {
+                    "agent": { "idle": { "firstEventSec": 333 } },
+                    "worker": { "idle": { "firstEventSec": 111 } },
+                    "exec": { "idle": { "outputSec": 444 } },
+                    "job": { "idle": { "outputSec": 222 } }
+                },
+                "root": { "type": "succeed" }
+            })JSON";
+            BehaviorTree btBoth;
+            std::string bErr;
+            Check(btBoth.LoadDefinition(bothDefaultsBt, &allApproved, bErr) &&
+                  btBoth.Defaults().workerIdle.firstEventSec == 333 &&
+                  btBoth.Defaults().jobIdle.outputSec == 444,
+                  "103-4: defaults.agent/exec win over defaults.worker/job when both are present");
+
+            // State saved from old job/worker/defaults writes new names, and 0.9.x state reloads.
+            BehaviorTree btSave;
+            Check(btSave.LoadDefinition(oldNamesBt, &allApproved, bErr), "103-4: load oldNamesBt");
+            std::string savedState = btSave.ToStateJson();
+            nlohmann::json savedJson = nlohmann::json::parse(savedState, nullptr, false);
+            Check(savedJson["defaults"].contains("agent") && !savedJson["defaults"].contains("worker") &&
+                  savedJson["defaults"].contains("exec") && !savedJson["defaults"].contains("job") &&
+                  savedJson["root"]["children"][0]["type"] == "exec" &&
+                  savedJson["root"]["children"][1]["type"] == "agent",
+                  "103-4: ToStateJson writes new exec/agent and defaults.exec/agent names");
+
+            const char* legacyRunningState = R"JSON({
+                "id": "bt-103-4-legacy-state",
+                "state": "running",
+                "nodeRuns": 1,
+                "root": {
+                    "type": "worker",
+                    "id": "impl",
+                    "summary": "impl",
+                    "prompt": "p",
+                    "timeoutSec": 60,
+                    "status": {
+                        "state": "running",
+                        "runs": 1,
+                        "launchSeq": 1,
+                        "jobs": ["bt-103-4-legacy-state-impl-1"]
+                    }
+                }
+            })JSON";
+            BehaviorTree btLegacy;
+            Check(btLegacy.LoadFromStateJson(legacyRunningState, &allApproved, 2000, bErr) &&
+                  btLegacy.IsJobRunning("bt-103-4-legacy-state-impl-1"),
+                  "103-4: 0.9.x running worker state reloads cleanly");
+            btLegacy.OnJobFinished("bt-103-4-legacy-state-impl-1", true, 0, "", "ok", 2100, "done", "{}");
+            Check(btLegacy.State() == "succeeded", "103-4: reloaded 0.9.x state finishes cleanly");
         }
     }
 

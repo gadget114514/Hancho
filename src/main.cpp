@@ -6,6 +6,7 @@
 #include "ipc_server.h"
 #include "taskqueue.h"
 #include "bt_manager.h"
+#include "translation_store.h"
 #include "mcp_server.h"
 #include "gui_dashboard.h"
 #include "gui_ipmsg.h"
@@ -313,6 +314,7 @@ struct CoreHostContext {
     bool guiRunning = false;
     bool guiShowPending = false;
     bool quit = false;
+    bool cancelJobsOnQuit = false;
 };
 
 static std::wstring FileNameOf(const std::wstring& path) {
@@ -475,7 +477,10 @@ static LRESULT CALLBACK CoreHostWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPAR
             }
             return 0;
         case WM_PC_HOST_QUIT:
-            if (ctx) ctx->quit = true;
+            if (ctx) {
+                if (wParam != 0) ctx->cancelJobsOnQuit = true;
+                ctx->quit = true;
+            }
             PostQuitMessage(0);
             return 0;
         case WM_DESTROY:
@@ -516,6 +521,10 @@ static int RunCoreHost(platform::IInstanceLock* instanceLock, bool showGuiAtStar
             tqm.OnProcessFinished(pid, ec, kind);
         });
         BtManager btm(pm, tqm);
+        // Translation cache and translate-llm worker (card 106-2). Started before IPC so the
+        // translate_* actions always find a running store.
+        TranslationStore translations(&pm, [&btm]() { return &btm.Engines(); });
+        SetActiveTranslationStore(&translations);
         tqm.SetSuspendCallback([](const std::string& jobId, const std::string& state,
                                   const std::string& action) {
             (void)jobId;
@@ -554,14 +563,15 @@ static int RunCoreHost(platform::IInstanceLock* instanceLock, bool showGuiAtStar
             ipc.SetGuiShowCallback([hwnd] {
                 PostMessageW(hwnd, WM_PC_HOST_SHOW_GUI, 0, 0);
             });
-            ipc.SetShutdownCallback([hwnd] {
-                PostMessageW(hwnd, WM_PC_HOST_QUIT, 0, 0);
+            ipc.SetShutdownCallback([hwnd](bool cancelJobs) {
+                PostMessageW(hwnd, WM_PC_HOST_QUIT, cancelJobs ? 1 : 0, 0);
             });
             ipc.SetPowerCallback([](const std::string& action, std::string& outError) {
                 return action == "shutdown" ? pc::ShutdownSystem(outError)
                                             : pc::SuspendSystem(action == "hibernate", outError);
             });
 
+            translations.Start();
             ipc.Start();
             if (showGuiAtStart) CoreHostShowGui(&ctx);
 
@@ -593,10 +603,15 @@ static int RunCoreHost(platform::IInstanceLock* instanceLock, bool showGuiAtStar
                 TerminateProcess(GetCurrentProcess(), 1);
             });
 
+            if (ctx.cancelJobsOnQuit) {
+                tqm.CancelAllActiveJobs("ephemeral core quit");
+            }
             ipc.SetGuiShowCallback(nullptr);
             ipc.SetShutdownCallback(nullptr);
             ipc.SetPowerCallback(nullptr);
             ipc.Stop();
+            SetActiveTranslationStore(nullptr);
+            translations.Stop();
             pm.SetProcessFinishedCallback(nullptr);
             tqm.SetSuspendCallback(nullptr);
             btm.Shutdown();
@@ -744,6 +759,15 @@ static bool WaitForCorePing(HANDLE coreProcess, int timeoutMs) {
     return false;
 }
 
+static void ReportCoreStartError(const wchar_t* title, const wchar_t* message) {
+    if (ShouldSuppressDialogs()) {
+        std::cerr << WideToUtf8(message) << std::endl;
+        WriteAuditLog("CORE_START_ERROR", WideToUtf8(message));
+    } else {
+        MessageBoxW(nullptr, message, title, MB_ICONERROR);
+    }
+}
+
 static bool StartCoreHeadless() {
     // Restoring many jobs can make the core slow to open its pipe; the old 5 seconds
     // made callers give up and start yet another core.
@@ -757,7 +781,7 @@ static bool StartCoreHeadless() {
             L"Hancho コアは起動していますが、応答がありません。",
             L"Hancho core is running but does not respond."
         );
-        MessageBoxW(nullptr, waitErrText, TrMain(L"エラー", L"Error"), MB_ICONERROR);
+        ReportCoreStartError(TrMain(L"エラー", L"Error"), waitErrText);
         return false;
     }
 
@@ -787,7 +811,7 @@ static bool StartCoreHeadless() {
             L"Failed to launch Hancho headless core."
         );
         const wchar_t* errTitle = TrMain(L"エラー", L"Error");
-        MessageBoxW(nullptr, errText, errTitle, MB_ICONERROR);
+        ReportCoreStartError(errTitle, errText);
         return false;
     }
     CloseHandle(pi.hThread);
@@ -800,7 +824,7 @@ static bool StartCoreHeadless() {
         L"Timed out waiting for Hancho headless core to start."
     );
     const wchar_t* errTitle = TrMain(L"エラー", L"Error");
-    MessageBoxW(nullptr, waitErrText, errTitle, MB_ICONERROR);
+    ReportCoreStartError(errTitle, waitErrText);
     return false;
 }
 
@@ -880,6 +904,7 @@ int main() {
     for (size_t i = 1; i < args.size(); ++i) {
         if (args[i] == "--json" || args[i] == "-j") jsonOutput = true;
         else if (args[i] == "--no-prompt" || args[i] == "--no-start-core") noPrompt = true;
+        else if (args[i] == "--no-autostart") SetNoAutoStart(true);
         // Starting is now the default; keep the old flag accepted so existing shortcuts still work.
         else if (args[i] == "--auto-start-core" || args[i] == "--start-core") {}
         else if (args[i] == "--webui-port" && i + 1 < args.size()) {
@@ -935,8 +960,12 @@ int main() {
         // not running (same behavior as `Hancho.exe gui`).
         std::string pingResp, pingErr;
         if (!SendIpcRequest("{\"action\":\"ping\"}", pingResp, pingErr, false)) {
-            if (noPrompt) {
-                std::cerr << "Hancho core is not running. Please start it with: Hancho.exe --headless" << std::endl;
+            if (noPrompt || ResolveAutoStartMode() == AutoStartMode::Off) {
+                std::cerr << "Hancho core is not running. Please start it with: Hancho.exe --headless";
+                if (HasCustomDataDirectory()) {
+                    std::cerr << " --data-dir \"" << WideToUtf8(GetEffectiveDataDirectoryWide()) << "\"";
+                }
+                std::cerr << std::endl;
                 return 1;
             }
             if (!StartCoreHeadless()) return 1;
@@ -986,8 +1015,12 @@ int main() {
 
         // 3. If not running, start the core in headless mode automatically.
         if (!coreRunning) {
-            if (noPrompt) {
-                std::cerr << "Hancho core is not running. Please start it with: Hancho.exe --headless" << std::endl;
+            if (noPrompt || ResolveAutoStartMode() == AutoStartMode::Off) {
+                std::cerr << "Hancho core is not running. Please start it with: Hancho.exe --headless";
+                if (HasCustomDataDirectory()) {
+                    std::cerr << " --data-dir \"" << WideToUtf8(GetEffectiveDataDirectoryWide()) << "\"";
+                }
+                std::cerr << std::endl;
                 return 1;
             }
             if (!StartCoreHeadless()) {

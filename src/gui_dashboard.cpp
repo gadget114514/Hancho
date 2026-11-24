@@ -17,6 +17,7 @@
 #include "memory_record.h"
 #include "memory_search.h"
 #include "triage_text.h"
+#include "translation_store.h"
 #include "TerminalView.h"
 #include "TerminalGridView.h"
 #include "SettingsManager.h"
@@ -40,6 +41,7 @@
 #include <thread>
 #include <atomic>
 #include <mutex>
+#include <condition_variable>
 #include <memory>
 #include <iomanip>
 #include <climits>
@@ -81,6 +83,7 @@ constexpr UINT WM_PC_DESTROY_TERMVIEW = WM_APP + 103;
 constexpr UINT WM_PC_TRAYICON         = WM_APP + 104;
 constexpr UINT WM_PC_INITIAL_REFRESH    = WM_APP + 105;
 constexpr UINT WM_PC_INITIAL_TASK_USAGE = WM_APP + 106;
+constexpr UINT WM_PC_DASH_SNAPSHOT = WM_APP + 109;  // 102-4: background data-fetch snapshot
 
 // 初回 usage ワーカースレッドのフェイルセーフタイムアウト (ms)
 constexpr uint64_t kInitialUsageTimeoutMs = 15000;
@@ -110,6 +113,15 @@ constexpr UINT_PTR TIMER_QUIT_WAIT_ID = 5;     // waits for the core to exit aft
 constexpr UINT_PTR TIMER_TRIAGE_LAYOUT_ID = 6; // coalesces expensive triage layout during resize/drag
 constexpr UINT_PTR TIMER_TRIAGE_SETTLE_ID = 7; // repaints children once after a resize/drag settles
 constexpr UINT_PTR TIMER_DASH_LAYOUT_ID = 8;   // coalesces expensive dashboard layout during splitter drag / resize
+constexpr UINT_PTR TIMER_TASK_SEARCH_ID = 9;   // 102-6: debounces the task-list search box
+constexpr int kTaskSearchDebounceMs = 300;
+constexpr int kDefaultVisibleFinishedCount = 30;
+constexpr int kMinVisibleFinishedCount = 5;
+constexpr int kMaxVisibleFinishedCount = 500;
+constexpr size_t kLoadMoreFinishedStep = 20;
+static int ClampTaskListRecentCount(int count) {
+    return (std::clamp)(count, kMinVisibleFinishedCount, kMaxVisibleFinishedCount);
+}
 constexpr UINT kDashLayoutThrottleMs    = 16;  // ~60fps smooth tracking
 constexpr UINT kEndBlinkTimerMs = 200;         // repaint period while a blink is running
 constexpr ULONGLONG kEndBlinkHalfPeriodMs = 400;  // on/off toggle period of the blink
@@ -723,6 +735,7 @@ enum ControlId {
     IDC_SET_TAB = 6053,
     IDC_SET_PROC_FONT = 6054,
     IDC_SET_TASK_FONT = 6055,
+    IDC_SET_TRANSLATE_CARDS = 6150,  // 106-3: translate task cards (all / title / off)
     IDC_SET_DISPLAY_MODE = 6091,
     IDC_SET_SHOW_SUPERVISOR_HINTS = 6056,
     IDC_SET_HINT_AUTO_DISMISS_SEC = 6057,
@@ -773,6 +786,7 @@ enum ControlId {
     IDC_SET_USAGE_REFRESH_INTERVAL = 6073,
     IDC_SET_STREAM_REFRESH_INTERVAL = 6074,
     IDC_SET_PROCESS_METRICS_INTERVAL = 6075,
+    IDC_SET_TASK_LIST_RECENT_COUNT = 6079,
     IDM_TRAY_RESTORE = 4001,
     IDM_TRAY_GRID_VIEW = 4002,
     IDM_TRAY_HIDE = 4003,
@@ -884,6 +898,15 @@ static std::wstring UsageBucketChoiceText(int sec) {
     return std::to_wstring(sec) + L" s";
 }
 
+// 102-4: immutable data handed from the background fetch thread to the UI thread.
+struct DashboardFetchSnapshot {
+    uint64_t seq = 0;
+    std::string taskListJson;
+    std::string tasksJson;
+    std::string directionsJson;
+    bool usedChanges = false;
+};
+
 struct DashboardState {
     ProcessManager* pm = nullptr;
     IpcServer* ipc = nullptr;
@@ -894,7 +917,7 @@ struct DashboardState {
     bool hasWindowPlacement = false;
     WINDOWPLACEMENT windowPlacement = {sizeof(WINDOWPLACEMENT)};
     int processListColumnWidths[14] = {52, 78, 100, 100, 120, 140, 85, 65, 72, 78, 70, 185, 175, 80};
-    int taskListColumnWidths[13] = {90, 350, 104, 100, 150, 105, 115, 190, 110, 82, 150, 140, 200};
+    int taskListColumnWidths[14] = {90, 350, 104, 100, 150, 105, 115, 190, 110, 82, 150, 140, 180, 160};
     HWND hwndBtnSettings = nullptr;
     HWND hwndBtnKillSel = nullptr;
     HWND hwndBtnKillAll = nullptr;
@@ -1009,6 +1032,23 @@ struct DashboardState {
     uint64_t initialUsageStartTickMs = 0;
     std::atomic<bool> cancelInitialUsage{false};
     std::thread initialUsageThread;
+    // 102-4: one background fetch thread; all IPC polling for the task lists happens here.
+    std::atomic<bool> cancelDataFetch{false};
+    std::thread dataFetchThread;
+    std::mutex dataFetchMutex;
+    std::condition_variable dataFetchCv;
+    bool dataFetchWake = false;
+    uint64_t dataFetchSeq = 0;
+    uint64_t dataFetchConsumedSeq = 0;
+    uint64_t changesRev = 0;
+    bool changesSupported = true;
+    std::vector<nlohmann::json> fetchedJobs;
+    std::vector<nlohmann::json> fetchedTasks;
+    std::vector<nlohmann::json> fetchedDirections;
+    std::unordered_map<std::string, size_t> fetchedJobIndex;  // job id -> index (tombstone-friendly)
+    std::unordered_map<std::string, size_t> fetchedTasksIndex;
+    std::unordered_map<std::string, size_t> fetchedDirectionsIndex;
+    DashboardFetchSnapshot fetchedSnapshot;
     std::mutex initialUsageMutex;
     std::map<std::wstring, TaskUsageFileCache> pendingUsageFileCache;
     std::map<std::wstring, std::wstring> pendingAttemptEventsPath;
@@ -1021,7 +1061,6 @@ struct DashboardState {
     int lastTaskListLang = -1;
     std::vector<std::wstring> lastTaskRows;
     std::wstring lastKpiSignature;
-    std::wstring taskFailureSummary;  // "failed: exit_nonzero ×2" shown in the task list caption
     int lastUsagePanelProcId = -2;
     // JSON stream bottom pane below the process / task lists
     HWND hwndBtnStreamPane = nullptr;
@@ -1037,10 +1076,21 @@ struct DashboardState {
     bool showProcSearch = false;
     bool showTaskSearch = false;
     bool taskViewMode = true;  // true = 2-level task view, false = flat job view
+    size_t visibleFinishedCount = kDefaultVisibleFinishedCount;  // 102-6: finished rows shown before "Load 20 more"
+    bool taskHasMoreFinished = false;
+    int taskHiddenFinishedCount = 0;
     std::wstring procSearchText;
     std::wstring taskSearchText;
+    // 106-3: translated display text (see DisplayText). translateCards is "all", "title" or "off".
+    pc::DisplayTextCache translations;
+    std::string translateCards = "all";
+    bool showOriginalCardText = false;  // the card detail shows the original body and title
+    bool translationsChanged = false;   // a translation landed: rebuild the lists on the next tick
+    std::vector<std::wstring> taskTitleTips;  // per task row: the translated title with its original
     int64_t lastTasksVersion = -1;
     std::vector<nlohmann::json> cachedTasks;
+    int64_t lastDirectionsVersion = -1;
+    std::vector<nlohmann::json> cachedDirections;
     std::unordered_map<std::string, bool> taskExpandedOverrides;
     std::unordered_set<std::string> taskShowAllJobs;
     std::vector<pc::TaskDisplayRow> taskDisplayRows;
@@ -1174,6 +1224,138 @@ static const int kGuiIpcTimeoutMs = 30000;
 static bool GuiIpcCall(DashboardState* st, const nlohmann::json& req, nlohmann::json& outResp,
                        std::string* outError = nullptr, int timeoutMs = kGuiIpcTimeoutMs);
 
+// 102-4: callers in the settings/config code run before the worker definition below.
+static void WakeDashboardDataFetch(DashboardState* st);
+
+// 106-3: translated display text. The dashboard is a separate process, so translations come from the
+// core over IPC (translate_get / translate_status). Drawing reads only the table in
+// pc::DisplayTextCache; the misses it queues are fetched by DashFlushTranslations once per list build.
+static const size_t kTranslateBatchMax = 200;
+
+static nlohmann::json DashTranslateConfig(const DashboardState* st) {
+    return nlohmann::json{{"translate_mode", "auto"},
+                          {"translate_cards", st ? st->translateCards : std::string("all")}};
+}
+
+// The text to show for a free-text field: "" for task and job titles, "card.title", "card.body".
+// The original when the UI is English or the translate_cards setting does not translate the field.
+static std::string DisplayText(DashboardState* st, const std::string& text, const char* field) {
+    if (!st) return text;
+    const bool translatable = pc::ShouldTranslate(field, DashTranslateConfig(st));
+    return st->translations.Display(text, LanguageCode(g_uiLanguage), field, translatable);
+}
+
+// A title cell and its hover text. When the shown text is a translation, the hover text gives the
+// original below it.
+static std::wstring DashTitleCell(DashboardState* st, const std::string& original, const char* field,
+                                  std::wstring& tip) {
+    tip.clear();
+    const std::string shown = DisplayText(st, original, field);
+    if (shown != original) {
+        tip = Utf8ToWide(shown) + L"\r\n" + Tr(L"原文: ", L"Original: ", L"Original: ") + Utf8ToWide(original);
+    }
+    return Utf8ToWide(shown);
+}
+
+// Fetches every miss queued since the last call: one translate_get per language and field, in
+// batches. A translation that lands makes the next tick rebuild the lists (translationsChanged).
+static void DashFlushTranslations(DashboardState* st) {
+    if (!st) return;
+    auto misses = st->translations.TakeMisses();
+    if (misses.empty()) return;
+    struct Answer {
+        std::string lang;
+        std::string field;
+        std::string text;
+        std::string translated;
+        bool waiting = false;
+    };
+    std::map<std::pair<std::string, std::string>, std::vector<std::string>> groups;
+    for (const auto& m : misses) groups[{m.lang, m.field}].push_back(m.text);
+    std::vector<Answer> answers;
+    uint64_t revision = 0;
+    bool haveRevision = false;
+    for (const auto& group : groups) {
+        const std::vector<std::string>& texts = group.second;
+        for (size_t start = 0; start < texts.size(); start += kTranslateBatchMax) {
+            nlohmann::json arr = nlohmann::json::array();
+            for (size_t i = start; i < texts.size() && i < start + kTranslateBatchMax; ++i) arr.push_back(texts[i]);
+            nlohmann::json req = {{"action", "translate_get"}, {"lang", group.first.first},
+                                  {"field", group.first.second}, {"texts", arr}};
+            nlohmann::json resp;
+            if (!GuiIpcCall(st, req, resp) || !resp.is_object() || !resp.value("ok", false)) {
+                // Not answered (IPC failed or the core lacks the action): wait for a revision change
+                // instead of asking again on every list build.
+                for (size_t i = start; i < texts.size() && i < start + kTranslateBatchMax; ++i) {
+                    Answer failed;
+                    failed.lang = group.first.first;
+                    failed.field = group.first.second;
+                    failed.text = texts[i];
+                    failed.waiting = true;
+                    answers.push_back(std::move(failed));
+                }
+                continue;
+            }
+            if (resp.contains("revision") && resp["revision"].is_number_unsigned()) {
+                revision = resp["revision"].get<uint64_t>();
+                haveRevision = true;
+            }
+            if (!resp.contains("items") || !resp["items"].is_array()) continue;
+            for (const auto& item : resp["items"]) {
+                if (!item.is_object() || !item.contains("text") || !item["text"].is_string()) continue;
+                Answer a;
+                a.lang = group.first.first;
+                a.field = group.first.second;
+                a.text = item["text"].get<std::string>();
+                if (item.contains("translated") && item["translated"].is_string()) {
+                    a.translated = item["translated"].get<std::string>();
+                }
+                const std::string state = item.value("state", std::string());
+                a.waiting = (state == "pending" || state == "failed");
+                answers.push_back(std::move(a));
+            }
+        }
+    }
+    if (haveRevision && st->translations.SetRevision(revision)) st->translationsChanged = true;
+    for (const auto& a : answers) {
+        st->translations.Store(a.text, a.lang, a.field, a.translated, a.waiting);
+        if (!a.waiting && !a.translated.empty() && a.translated != a.text) st->translationsChanged = true;
+    }
+}
+
+// While a translation waits for the core, checks the core's revision (a cheap call). A change drops
+// the table, so the next list build asks again and the lists are redrawn.
+static void DashPollTranslationRevision(DashboardState* st) {
+    if (!st || !st->translations.HasWaiting()) return;
+    nlohmann::json resp;
+    if (!GuiIpcCall(st, {{"action", "translate_status"}}, resp) || !resp.is_object() || !resp.value("ok", false)) return;
+    if (!resp.contains("revision") || !resp["revision"].is_number_unsigned()) return;
+    if (st->translations.SetRevision(resp["revision"].get<uint64_t>())) st->translationsChanged = true;
+}
+
+// The text for a detail pane that is open now: a miss is fetched right away.
+static std::string DashDisplayNow(DashboardState* st, const std::string& text, const char* field) {
+    std::string shown = DisplayText(st, text, field);
+    if (shown == text) {
+        DashFlushTranslations(st);
+        shown = DisplayText(st, text, field);
+    }
+    return shown;
+}
+
+// The translate_cards choices for the settings combo: all, title, off.
+static void FillTranslateCardsCombo(HWND combo, const std::string& value) {
+    SendMessageW(combo, CB_RESETCONTENT, 0, 0);
+    SendMessageW(combo, CB_ADDSTRING, 0, reinterpret_cast<LPARAM>(
+        Tr(L"すべて (タイトルと本文)", L"All (title and body)", L"Todo (título y cuerpo)")));
+    SendMessageW(combo, CB_ADDSTRING, 0, reinterpret_cast<LPARAM>(
+        Tr(L"タイトルだけ", L"Title only", L"Solo título")));
+    SendMessageW(combo, CB_ADDSTRING, 0, reinterpret_cast<LPARAM>(
+        Tr(L"訳さない", L"Off", L"Desactivado")));
+    SendMessageW(combo, CB_SETCURSEL, (value == "title") ? 1 : ((value == "off") ? 2 : 0), 0);
+}
+
+
 // Chat has no tray icon of its own, so new incoming messages are announced by a
 // balloon on this dashboard's tray icon.
 static void SetChatNotifyBaseline(DashboardState* st) {
@@ -1212,8 +1394,11 @@ static void NotifyNewChatMessages(DashboardState* st) {
     for (const auto& m : resp["messages"]) {
         const uint64_t id = m.value("id", uint64_t(0));
         if (id > st->chatNotifiedMaxId) st->chatNotifiedMaxId = id;
-        if (m.value("direction", std::string()) != "in") continue;
-        if (m.value("audience", std::string()) == "agent") continue;
+        std::string flow = m.value("flow", std::string());
+        if (flow.empty()) flow = m.value("direction", std::string());
+        if (flow != "in") continue;
+        const std::string aud = m.value("audience", std::string());
+        if (aud == "agent" || aud == "peer") continue;
         if (!st->trayAdded) continue;
 
         std::wstring peer;
@@ -1580,6 +1765,243 @@ static std::string TaskListIpc(DashboardState* st, int64_t sinceVersion, std::st
     }
     if (st && st->tqm) {
         return st->tqm->TaskList("", 0, outErr, sinceVersion);
+    }
+    return "";
+}
+
+static std::string DirectionListIpc(DashboardState* st, int64_t sinceVersion, std::string& outErr) {
+    nlohmann::json req = {
+        {"action", "direction_list"},
+        {"since_version", sinceVersion}
+    };
+    nlohmann::json resp;
+    if (GuiIpcCall(st, req, resp, &outErr)) {
+        return resp.dump();
+    }
+    if (st && st->ipc) {
+        std::string direct = st->ipc->HandleRequestJson(req.dump());
+        if (!direct.empty()) return direct;
+    }
+    if (st && st->tqm) {
+        return st->tqm->DirectionList("", "", 0, outErr, sinceVersion);
+    }
+    return "";
+}
+
+// ---- 102-4: background data fetch -------------------------------------------------------
+// One worker owns all task-list IPC. It publishes an immutable snapshot through a mutex and
+// posts WM_PC_DASH_SNAPSHOT; the UI thread only consumes the snapshot and never calls IPC
+// on the refresh path. A pending wake is coalesced, and shutdown cancels and joins the thread.
+
+static void WakeDashboardDataFetch(DashboardState* st) {
+    if (!st) return;
+    {
+        std::lock_guard<std::mutex> lock(st->dataFetchMutex);
+        st->dataFetchWake = true;
+    }
+    st->dataFetchCv.notify_one();
+}
+
+static bool DashboardIpcJson(const nlohmann::json& req, nlohmann::json& out) {
+    std::string response;
+    std::string error;
+    if (!SendIpcRequest(req.dump(), response, error, false, 2000)) return false;
+    out = nlohmann::json::parse(response, nullptr, false);
+    return out.is_object() && out.value("ok", false);
+}
+
+static void DashboardUpsertJson(std::vector<nlohmann::json>& table,
+                                std::unordered_map<std::string, size_t>& index,
+                                const nlohmann::json& item,
+                                const char* idField) {
+    if (!item.is_object()) return;
+    const std::string id = item.value(idField, std::string());
+    if (id.empty()) return;
+    auto it = index.find(id);
+    if (it != index.end() && it->second < table.size()) {
+        table[it->second] = item;
+        return;
+    }
+    index[id] = table.size();
+    table.push_back(item);
+}
+
+static void DashboardSetTable(std::vector<nlohmann::json>& table,
+                              std::unordered_map<std::string, size_t>& index,
+                              const nlohmann::json& values,
+                              const char* idField) {
+    table.clear();
+    index.clear();
+    if (!values.is_array()) return;
+    for (const auto& item : values) DashboardUpsertJson(table, index, item, idField);
+}
+
+static std::string DashboardTableJson(const std::vector<nlohmann::json>& table,
+                                      const char* key,
+                                      int64_t version) {
+    nlohmann::json out = {{"ok", true}, {"version", version}, {key, nlohmann::json::array()}};
+    for (const auto& item : table) {
+        if (item.is_object()) out[key].push_back(item);
+    }
+    return out.dump();
+}
+
+static void DashboardApplyChanges(DashboardState* st, const nlohmann::json& resp) {
+    if (resp.value("reset", false)) {
+        DashboardSetTable(st->fetchedJobs, st->fetchedJobIndex, resp.value("jobs", nlohmann::json::array()), "id");
+    } else {
+        if (resp.contains("removed") && resp["removed"].is_array()) {
+            std::unordered_set<std::string> removed;
+            for (const auto& id : resp["removed"]) {
+                if (id.is_string()) removed.insert(id.get<std::string>());
+            }
+            for (auto& job : st->fetchedJobs) {
+                if (!job.is_object()) continue;
+                if (removed.count(job.value("id", std::string())) > 0) job = nullptr;
+            }
+            if (!removed.empty()) {
+                st->fetchedJobs.erase(
+                    std::remove_if(st->fetchedJobs.begin(), st->fetchedJobs.end(),
+                                   [](const nlohmann::json& j) { return !j.is_object(); }),
+                    st->fetchedJobs.end());
+                st->fetchedJobIndex.clear();
+                for (size_t i = 0; i < st->fetchedJobs.size(); ++i) {
+                    st->fetchedJobIndex[st->fetchedJobs[i].value("id", std::string())] = i;
+                }
+            }
+        }
+        if (resp.contains("jobs") && resp["jobs"].is_array()) {
+            for (const auto& job : resp["jobs"]) {
+                DashboardUpsertJson(st->fetchedJobs, st->fetchedJobIndex, job, "id");
+            }
+        }
+    }
+    st->changesRev = resp.value("rev", st->changesRev);
+}
+
+static void DashboardDataFetchThread(DashboardState* st, HWND hwnd) {
+    if (!st) return;
+    const int waitMs = (std::max)(100, st->refreshIntervalMs);
+    while (!st->cancelDataFetch.load(std::memory_order_relaxed)) {
+        {
+            std::unique_lock<std::mutex> lock(st->dataFetchMutex);
+            st->dataFetchCv.wait_for(lock, std::chrono::milliseconds(waitMs), [st] {
+                return st->dataFetchWake || st->cancelDataFetch.load(std::memory_order_relaxed);
+            });
+            st->dataFetchWake = false;
+        }
+        if (st->cancelDataFetch.load(std::memory_order_relaxed)) break;
+
+        bool usedChanges = false;
+        if (st->changesSupported) {
+            nlohmann::json req = {{"action", "taskqueue_changes"}, {"since", st->changesRev}};
+            nlohmann::json resp;
+            if (DashboardIpcJson(req, resp)) {
+                DashboardApplyChanges(st, resp);
+                usedChanges = true;
+            } else {
+                st->changesSupported = false;  // older core: fall back to full lists
+            }
+        }
+        if (!usedChanges) {
+            nlohmann::json req = {{"action", "taskqueue_list"},
+                                  {"include_planned", true},
+                                  {"include_hidden", st->showHiddenTasks}};
+            nlohmann::json resp;
+            if (DashboardIpcJson(req, resp)) {
+                DashboardSetTable(st->fetchedJobs, st->fetchedJobIndex,
+                                  resp.value("jobs", nlohmann::json::array()), "id");
+            }
+        }
+
+        std::string tasksJson;
+        std::string directionsJson;
+        {
+            nlohmann::json req = {{"action", "task_list"}, {"since_version", st->lastTasksVersion}};
+            nlohmann::json resp;
+            if (DashboardIpcJson(req, resp)) {
+                if (!resp.value("unchanged", false) && resp.contains("tasks") && resp["tasks"].is_array()) {
+                    DashboardSetTable(st->fetchedTasks, st->fetchedTasksIndex,
+                                      resp["tasks"], "id");
+                    st->lastTasksVersion = resp.value("version", st->lastTasksVersion);
+                }
+                tasksJson = resp.dump();
+            }
+        }
+        {
+            nlohmann::json req = {{"action", "direction_list"}, {"since_version", st->lastDirectionsVersion}};
+            nlohmann::json resp;
+            if (DashboardIpcJson(req, resp)) {
+                if (!resp.value("unchanged", false) && resp.contains("directions") && resp["directions"].is_array()) {
+                    DashboardSetTable(st->fetchedDirections, st->fetchedDirectionsIndex,
+                                      resp["directions"], "id");
+                    st->lastDirectionsVersion = resp.value("version", st->lastDirectionsVersion);
+                }
+                directionsJson = resp.dump();
+            }
+        }
+
+        DashboardFetchSnapshot snapshot;
+        snapshot.taskListJson = DashboardTableJson(st->fetchedJobs, "jobs", 0);
+        snapshot.tasksJson = tasksJson.empty()
+            ? DashboardTableJson(st->fetchedTasks, "tasks", st->lastTasksVersion)
+            : tasksJson;
+        snapshot.directionsJson = directionsJson.empty()
+            ? DashboardTableJson(st->fetchedDirections, "directions", st->lastDirectionsVersion)
+            : directionsJson;
+        snapshot.usedChanges = usedChanges;
+        {
+            std::lock_guard<std::mutex> lock(st->dataFetchMutex);
+            snapshot.seq = ++st->dataFetchSeq;
+            st->fetchedSnapshot = snapshot;
+        }
+        PostMessageW(hwnd, WM_PC_DASH_SNAPSHOT, 0, 0);
+    }
+}
+
+static void StartDashboardDataFetch(DashboardState* st, HWND hwnd) {
+    if (!st || st->dataFetchThread.joinable()) return;
+    st->cancelDataFetch.store(false, std::memory_order_relaxed);
+    st->dataFetchThread = std::thread([st, hwnd] { DashboardDataFetchThread(st, hwnd); });
+}
+
+static void StopDashboardDataFetch(DashboardState* st) {
+    if (!st) return;
+    st->cancelDataFetch.store(true, std::memory_order_relaxed);
+    WakeDashboardDataFetch(st);
+    if (st->dataFetchThread.joinable()) st->dataFetchThread.join();
+}
+
+static bool ConsumeDashboardSnapshot(DashboardState* st,
+                                     std::string& outList,
+                                     std::string& outTasks,
+                                     std::string& outDirections) {
+    if (!st) return false;
+    std::lock_guard<std::mutex> lock(st->dataFetchMutex);
+    if (st->fetchedSnapshot.seq == 0 || st->fetchedSnapshot.seq == st->dataFetchConsumedSeq) return false;
+    st->dataFetchConsumedSeq = st->fetchedSnapshot.seq;
+    outList = st->fetchedSnapshot.taskListJson;
+    outTasks = st->fetchedSnapshot.tasksJson;
+    outDirections = st->fetchedSnapshot.directionsJson;
+    return true;
+}
+
+static std::string CardShowIpc(DashboardState* st, const std::string& idOrNumber, const std::string& taskId, std::string& outErr) {
+    nlohmann::json req = {
+        {"action", "card_show"},
+        {"id", idOrNumber}
+    };
+    if (!taskId.empty()) req["taskId"] = taskId;
+    nlohmann::json resp;
+    if (GuiIpcCall(st, req, resp, &outErr)) {
+        return resp.dump();
+    }
+    if (st && st->ipc) {
+        std::string direct = st->ipc->HandleRequestJson(req.dump());
+        if (!direct.empty()) return direct;
+    }
+    if (st && st->tqm) {
+        return st->tqm->CardShow(idOrNumber, taskId, outErr);
     }
     return "";
 }
@@ -2623,7 +3045,8 @@ static void DrawDashboardCanvas(DashboardState* st, HDC hdcWindow, const RECT* u
             } else {
                 // Bottom Row: Tasks (task-based primary counts, job-based secondary counts)
                 const pc::TaskViewCounts& tc = st->taskViewCounts;
-                const bool hasTaskCounts = (tc.totalTasks > 0 || tc.totalJobs > 0);
+                // 102-6: KPI counts come from the whole job table, never from the 30-row display slice.
+    const bool hasTaskCounts = false;
                 if (col == 0) {
                     const int primary = hasTaskCounts ? tc.totalTasks : tqCounts.total;
                     std::wstring sub = hasTaskCounts
@@ -2754,23 +3177,9 @@ static void DrawDashboardCanvas(DashboardState* st, HDC hdcWindow, const RECT* u
         DrawListCaption(hdc, st->rcProcCaption, ProcListCaptionText(), g_theme.accent, st->hFontUiBold);
     }
     if (st->rcTaskCaption.bottom > st->rcTaskCaption.top && RectsOverlap(rcBlit, st->rcTaskCaption)) {
-        DrawListCaption(hdc, st->rcTaskCaption, TaskListCaptionText(),
-                        IsDarkThemeActive() ? RGB(255, 190, 90) : RGB(200, 110, 0), st->hFontUiBold);
-        // The failure summary follows the search button (and its edit box when open).
-        if (!st->taskFailureSummary.empty()) {
-            RECT sumRc = st->rcTaskCaption;
-            sumRc.left = (std::max)(static_cast<LONG>(st->taskCaptionExtraLeft), sumRc.left + 12);
-            sumRc.right -= 8;
-            if (sumRc.right > sumRc.left) {
-                SetBkMode(hdc, TRANSPARENT);
-                SetTextColor(hdc, g_theme.text);
-                HGDIOBJ of = SelectObject(hdc, st->hFontUiBold);
-                DrawTextW(hdc, st->taskFailureSummary.c_str(), -1, &sumRc,
-                          DT_LEFT | DT_VCENTER | DT_SINGLELINE | DT_END_ELLIPSIS);
-                SelectObject(hdc, of);
-            }
-        }
-    }
+    DrawListCaption(hdc, st->rcTaskCaption, TaskListCaptionText(),
+                    IsDarkThemeActive() ? RGB(255, 190, 90) : RGB(200, 110, 0), st->hFontUiBold);
+}
 
     SetBkMode(hdc, TRANSPARENT);
     SetTextColor(hdc, g_theme.text);
@@ -3023,6 +3432,7 @@ struct TaskListRow {
     int64_t endKey = 0;    // epoch seconds of the end, or of the estimated end (0: unknown)
     std::wstring originTip;
     std::wstring usageTip; // full engine / token / cost details, for the Owner / Cost hover tip
+    std::wstring titleTip; // 106-3: the translated title with its original, for the hover tip
     std::string kind;      // running / timeout / failed / other, for the row colour
     int procId = 0;
     int indent = 0;
@@ -4252,8 +4662,31 @@ static void PastRunsLoad(PastRunsDlgState* ds) {
             for (const auto& n : *results) {
                 if (!n.is_object()) continue;
                 if (n.value("kind", std::string()) != "note") continue;
-                text << L"\r\n  - " << Utf8ToWide(n.value("id", std::string())) << L": "
-                     << Utf8ToWide(n.value("summary", std::string()));
+                // Auto notes carry structured data (doc/i18n-cards.md 106-1): compose the text in
+                // the display language. Other notes show their saved text as-is.
+                std::wstring noteText = Utf8ToWide(n.value("summary", std::string()));
+                if (n.contains("data") && n["data"].is_object()) {
+                    const auto& d = n["data"];
+                    const std::string kind = d.value("kind", std::string());
+                    const std::wstring job = Utf8ToWide(d.value("job", std::string()));
+                    if (kind == "failure_streak") {
+                        const std::string cond = d.value("condition", std::string());
+                        noteText = job + Tr(L" は直近 3 回 ", L" failed 3 times in a row: ", L" falló 3 veces seguidas: ") +
+                                   Utf8ToWide(d.value("failureClass", std::string())) +
+                                   (cond.empty() ? std::wstring() : L" (" + Utf8ToWide(cond) + L")") +
+                                   Tr(L"で失敗", L"", L"");
+                    } else if (kind == "timeout_warning") {
+                        noteText = job + Tr(L" は所要時間がタイムアウトに近い", L" is close to its timeout", L" está cerca de su tiempo límite") +
+                                   L" (p90 " + Utf8ToWide(d.value("p90", std::string())) + L" s / " +
+                                   Tr(L"上限 ", L"limit ", L"límite ") + Utf8ToWide(d.value("timeoutSec", std::string())) + L" s)";
+                    } else if (kind == "fix_diff") {
+                        noteText = job + Tr(L" は失敗の後に成功。直した可能性のあるファイル: ",
+                                            L" succeeded after a failure. Files possibly fixed: ",
+                                            L" tuvo éxito tras un fallo. Archivos posiblemente corregidos: ") +
+                                   Utf8ToWide(d.value("files", std::string()));
+                    }
+                }
+                text << L"\r\n  - " << Utf8ToWide(n.value("id", std::string())) << L": " << noteText;
                 anyNote = true;
             }
         }
@@ -5257,9 +5690,12 @@ static const int kTaskListOwnerCol = 10;
 
 // Full text of one task-list cell. The control keeps the whole string even when the column is
 // too narrow to draw it, so this is the text that hover and "copy cell" should use.
-static std::wstring TaskListCellText(HWND list, int row, int col) {
+static std::wstring TaskListCellText(HWND /*list*/, int row, int col, const DashboardState* st = nullptr) {
+    if (col >= 0 && col < kTaskListColumns && row >= 0 && st &&
+        static_cast<size_t>(row) * kTaskListColumns + col < st->lastTaskRows.size()) {
+        return st->lastTaskRows[static_cast<size_t>(row) * kTaskListColumns + col];
+    }
     wchar_t buf[4096] = {};
-    ListView_GetItemText(list, row, col, buf, static_cast<int>(sizeof(buf) / sizeof(buf[0])));
     return buf;
 }
 
@@ -6124,6 +6560,34 @@ static void ShowTaskQueueContextMenu(DashboardState* st, const std::string& jobI
     AppendMenuW(hMenu, MF_STRING | (cellText.empty() ? MF_GRAYED : 0), 3110, Tr(L"セルをコピー", L"Copy cell", L"Copiar celda"));
     AppendMenuW(hMenu, MF_SEPARATOR, 0, nullptr);
     if (virtualJob) {
+        pc::TaskDisplayRow cardRow;
+        bool isCardDir = false;
+        if (directionRow) {
+            const std::string targetDirId = jobId.substr(10);
+            for (const auto& dr : st->taskDisplayRows) {
+                if (dr.kind == pc::TaskDisplayRowKind::DirectionHeading &&
+                    dr.directionId == targetDirId && dr.isCard) {
+                    cardRow = dr;
+                    isCardDir = true;
+                    break;
+                }
+            }
+        }
+        if (isCardDir) {
+            if (cardRow.directionState == "planned") {
+                AppendMenuW(hMenu, MF_STRING, 3230, Tr(L"流す (Run)", L"Run card", L"Ejecutar tarjeta"));
+            }
+            if (cardRow.directionState == "failed" || cardRow.directionState == "closed" ||
+                cardRow.directionState == "cancelled" || cardRow.directionState == "succeeded") {
+                AppendMenuW(hMenu, MF_STRING, 3231,
+                            Tr(L"やり直す（救済）", L"Redo card (rescue)", L"Rehacer tarjeta (rescate)"));
+            }
+            if (cardRow.directionState != "closed") {
+                AppendMenuW(hMenu, MF_STRING, 3232,
+                            Tr(L"閉じる (Close)", L"Close direction", L"Cerrar direction"));
+            }
+            AppendMenuW(hMenu, MF_SEPARATOR, 0, nullptr);
+        }
         HMENU hAnswerMenu = nullptr;
         // A failed direction stays listed until it is retried or closed; answering and pausing
         // only apply while it is still running.
@@ -6220,7 +6684,37 @@ static void ShowTaskQueueContextMenu(DashboardState* st, const std::string& jobI
         int cmd = TrackPopupMenu(hMenu, TPM_RETURNCMD | TPM_RIGHTBUTTON, ptScreen.x, ptScreen.y, 0, st->hwndMain, nullptr);
         if (hAnswerMenu) DestroyMenu(hAnswerMenu);
         DestroyMenu(hMenu);
-        if (cmd == 3221 || cmd == 3222 || cmd == 3223 || cmd == 3224) {
+        if (cmd == 3230 || cmd == 3231 || cmd == 3232) {
+            nlohmann::json req;
+            if (cmd == 3230) {
+                req["action"] = "card_run";
+                req["taskId"] = cardRow.taskId;
+                req["number"] = cardRow.cardNumber;
+            } else if (cmd == 3231) {
+                req["action"] = "card_redo";
+                req["taskId"] = cardRow.taskId;
+                req["number"] = cardRow.cardNumber;
+                req["run"] = true;
+            } else {
+                req["action"] = "direction_close";
+                req["id"] = cardRow.directionId;
+                req["result"] = "ignored";
+                req["reason"] = "closed from dashboard";
+            }
+            nlohmann::json rdoc;
+            std::string ipcErr;
+            if (!GuiIpcCall(st, req, rdoc, &ipcErr) && st->ipc) {
+                std::string direct = st->ipc->HandleRequestJson(req.dump());
+                rdoc = nlohmann::json::parse(direct, nullptr, false);
+                if (rdoc.is_object()) ipcErr.clear();
+            }
+            const bool ok = ipcErr.empty() && rdoc.is_object() && rdoc.value("ok", false);
+            ShowTaskQueueResult(
+                st, Tr(L"カード", L"Card", L"Tarjeta"),
+                ok ? Tr(L"カードを操作しました。", L"Updated card.", L"Tarjeta actualizada.")
+                   : Utf8ToWide(ipcErr.empty() ? rdoc.value("error", std::string("error")) : ipcErr),
+                ok);
+        } else if (cmd == 3221 || cmd == 3222 || cmd == 3223 || cmd == 3224) {
             nlohmann::json req;
             if (cmd == 3221) req["action"] = "taskqueue_retry";
             else if (cmd == 3222) req["action"] = "taskqueue_pause_job";
@@ -7011,8 +7505,12 @@ static void StartInitialTaskUsageWorker(DashboardState* st, const std::vector<st
 }
 
 static std::wstring TaskStateLabelWide(const std::string& state) {
+    if (state == "planned") return Tr(L"予定", L"Planned", L"Planeada");
+    if (state == "waiting") return Tr(L"依存待ち", L"Waiting", L"En espera");
     if (state == "open") return Tr(L"オープン", L"Open", L"Abierta");
     if (state == "running") return Tr(L"実行中", L"Running", L"En curso");
+    if (state == "waitingForLlm") return Tr(L"回答待ち", L"Waiting for LLM", L"Esperando LLM");
+    if (state == "paused") return Tr(L"一時停止", L"Paused", L"Pausada");
     if (state == "failed") return Tr(L"失敗", L"Failed", L"Fallida");
     if (state == "cancelled") return Tr(L"中断", L"Cancelled", L"Cancelada");
     if (state == "succeeded") return Tr(L"成功", L"Succeeded", L"Exitosa");
@@ -7026,12 +7524,16 @@ static void RefreshTaskQueueData(DashboardState* st, bool force = false, bool us
     std::string err;
     // The triage refresh does not change jobs, so re-render from the list already fetched
     // this tick instead of asking the core for the same JSON a second time.
+    std::string snapshotList, snapshotTasks, snapshotDirs;
+    const bool haveSnapshot = !useCachedList && ConsumeDashboardSnapshot(st, snapshotList, snapshotTasks, snapshotDirs);
     std::string resp = useCachedList ? st->lastTaskListJson
-                                     : TaskQueueListIpc(st, "", "", 0, err);
+                     : haveSnapshot ? snapshotList
+                                    : TaskQueueListIpc(st, "", "", 0, err);
     bool tasksChanged = false;
+    bool dirsChanged = false;
     if (!useCachedList) {
         std::string taskErr;
-        std::string taskResp = TaskListIpc(st, st->lastTasksVersion, taskErr);
+        std::string taskResp = haveSnapshot ? snapshotTasks : TaskListIpc(st, st->lastTasksVersion, taskErr);
         if (!taskResp.empty()) {
             nlohmann::json tj = nlohmann::json::parse(taskResp, nullptr, false);
             if (tj.is_object() && tj.value("ok", false)) {
@@ -7046,16 +7548,33 @@ static void RefreshTaskQueueData(DashboardState* st, bool force = false, bool us
                 }
             }
         }
+        std::string dirErr;
+        std::string dirResp = haveSnapshot ? snapshotDirs : DirectionListIpc(st, st->lastDirectionsVersion, dirErr);
+        if (!dirResp.empty()) {
+            nlohmann::json dj = nlohmann::json::parse(dirResp, nullptr, false);
+            if (dj.is_object() && dj.value("ok", false)) {
+                const int64_t newVer = dj.value("version", st->lastDirectionsVersion);
+                if (!dj.value("unchanged", false) && dj.contains("directions") && dj["directions"].is_array()) {
+                    st->cachedDirections.clear();
+                    for (const auto& item : dj["directions"]) {
+                        if (item.is_object()) st->cachedDirections.push_back(item);
+                    }
+                    st->lastDirectionsVersion = newVer;
+                    dirsChanged = true;
+                }
+            }
+        }
     }
     // Nothing to do when the queue is unchanged and no job is running (only running rows show a
     // countdown). Just after a job ends, keep polling its events file for a moment: the final
     // usage / cost line can land slightly after the job's state changes.
     int lang = static_cast<int>(g_uiLanguage);
     const bool settling = GetTickCount64() < st->taskUsagePollUntilMs;
-    if (!force && !settling && !tasksChanged && resp == st->lastTaskListJson && lang == st->lastTaskListLang &&
-        !TaskListHasLiveState(resp)) {
+    if (!force && !settling && !tasksChanged && !dirsChanged && resp == st->lastTaskListJson && lang == st->lastTaskListLang &&
+        !TaskListHasLiveState(resp) && !st->translationsChanged) {
         return;
     }
+    st->translationsChanged = false;
     const bool taskListChanged = (resp != st->lastTaskListJson);
     st->lastTaskListJson = resp;
     st->lastTaskListLang = lang;
@@ -7129,8 +7648,16 @@ static void RefreshTaskQueueData(DashboardState* st, bool force = false, bool us
     pc::TaskViewCounts newCounts;
     std::vector<pc::TaskDisplayRow> displayRows = pc::BuildTaskDisplayRows(
         parsedJobs, st->cachedTasks, st->taskViewMode,
-        st->taskExpandedOverrides, st->taskShowAllJobs, newCounts);
+        st->taskExpandedOverrides, st->taskShowAllJobs, newCounts, 8, st->cachedDirections);
     st->taskViewCounts = newCounts;
+
+    pc::TaskDisplayFilterOptions filterOptions;
+    filterOptions.visibleFinishedCount = st->visibleFinishedCount;
+    filterOptions.query = WideToUtf8(st->taskSearchText);
+    pc::TaskDisplayFilterResult filtered = pc::FilterTaskDisplayRows(displayRows, filterOptions);
+    displayRows = std::move(filtered.rows);
+    st->taskHasMoreFinished = filtered.hasMore;
+    st->taskHiddenFinishedCount = static_cast<int>(filtered.totalFinished - filtered.shownFinished);
 
     std::vector<TaskListRow> rows;  // one entry per visible row, in the order the list shows them
     std::unordered_set<std::string> nowRunning;  // jobs running now, to spot the ones that just ended
@@ -7149,7 +7676,8 @@ static void RefreshTaskQueueData(DashboardState* st, bool force = false, bool us
                      : (drow.taskState == "failed") ? "failed"
                      : "taskHeading";
             row.cells[0] = (drow.expanded ? L"\x25BE " : L"\x25B8 ") + Utf8ToWide(drow.taskId);
-            row.cells[1] = Utf8ToWide(drow.taskTitle.empty() ? drow.taskId : drow.taskTitle);
+            row.cells[1] = drow.taskTitle.empty() ? Utf8ToWide(drow.taskId)
+                                                  : DashTitleCell(st, drow.taskTitle, "", row.titleTip);
             row.cells[2] = std::wstring(Tr(L"タスク", L"Task", L"Tarea")) + L" (" + std::to_wstring(drow.jobCount) + L")";
             row.cells[3] = TaskStateLabelWide(drow.taskState);
             row.cells[4] = Utf8ToWide(drow.resultsCompact);
@@ -7161,6 +7689,7 @@ static void RefreshTaskQueueData(DashboardState* st, bool force = false, bool us
                 for (const auto& cell : row.cells) {
                     if (WideContainsCi(cell, st->taskSearchText)) { matches = true; break; }
                 }
+                if (!matches && WideContainsCi(Utf8ToWide(drow.taskTitle), st->taskSearchText)) matches = true;
                 if (!matches) continue;
             }
             rows.push_back(std::move(row));
@@ -7171,13 +7700,37 @@ static void RefreshTaskQueueData(DashboardState* st, bool force = false, bool us
             TaskListRow row;
             row.id = "direction:" + drow.directionId;
             row.indent = drow.indent;
+            row.isSuperseded = drow.isSuperseded;
             row.kind = (drow.directionState == "running") ? "running"
                      : (drow.directionState == "failed") ? "failed"
+                     : (drow.directionState == "planned") ? "planned"
                      : "taskHeading";
-            row.cells[0] = (drow.expanded ? L"\x25BE " : L"\x25B8 ") + Utf8ToWide("direction:" + drow.directionId);
-            row.cells[1] = Utf8ToWide(drow.directionTitle.empty() ? drow.directionId : drow.directionTitle);
-            row.cells[2] = std::wstring(L"direction (") + std::to_wstring(drow.jobCount) + L")";
-            row.cells[3] = TaskStateLabelWide(drow.directionState);
+            if (drow.isCard) {
+                const std::wstring prefix = drow.jobCount > 0 ? (drow.expanded ? L"\x25BE " : L"\x25B8 ") : L"  ";
+                row.cells[0] = prefix + Utf8ToWide(drow.cardNumber.empty() ? drow.directionId : drow.cardNumber);
+                row.cells[1] = drow.directionTitle.empty() ? Utf8ToWide(drow.cardNumber)
+                             : DashTitleCell(st, drow.directionTitle, "card.title", row.titleTip);
+                row.cells[2] = drow.jobCount > 0
+                    ? (std::wstring(Tr(L"カード", L"Card", L"Tarjeta")) + L" (" + std::to_wstring(drow.jobCount) + L")")
+                    : std::wstring(Tr(L"カード", L"Card", L"Tarjeta"));
+                row.cells[3] = (drow.directionState == "planned" && !drow.waitingFor.empty())
+                    ? std::wstring(Tr(L"依存待ち", L"waiting", L"en espera"))
+                    : TaskStateLabelWide(drow.directionState);
+                if (!drow.waitingFor.empty()) {
+                    std::wstring deps;
+                    for (size_t wi = 0; wi < drow.waitingFor.size(); ++wi) {
+                        if (wi > 0) deps += L", ";
+                        deps += Utf8ToWide(drow.waitingFor[wi]);
+                    }
+                    row.cells[8] = deps;
+                }
+            } else {
+                row.cells[0] = (drow.expanded ? L"\x25BE " : L"\x25B8 ") + Utf8ToWide("direction:" + drow.directionId);
+                row.cells[1] = drow.directionTitle.empty() ? Utf8ToWide(drow.directionId)
+                             : DashTitleCell(st, drow.directionTitle, "", row.titleTip);
+                row.cells[2] = std::wstring(L"direction (") + std::to_wstring(drow.jobCount) + L")";
+                row.cells[3] = TaskStateLabelWide(drow.directionState);
+            }
             row.cells[4] = Utf8ToWide(drow.resultsCompact);
             row.cells[5] = L"-";
             row.cells[6] = L"-";
@@ -7187,6 +7740,7 @@ static void RefreshTaskQueueData(DashboardState* st, bool force = false, bool us
                 for (const auto& cell : row.cells) {
                     if (WideContainsCi(cell, st->taskSearchText)) { matches = true; break; }
                 }
+                if (!matches && WideContainsCi(Utf8ToWide(drow.directionTitle), st->taskSearchText)) matches = true;
                 if (!matches) continue;
             }
             rows.push_back(std::move(row));
@@ -7201,6 +7755,17 @@ static void RefreshTaskQueueData(DashboardState* st, bool force = false, bool us
             row.cells[0] = L"";
             row.cells[1] = Tr(L"\x2026 ほか ", L"\x2026 ", L"\x2026 ") + std::to_wstring(drow.hiddenJobCount) +
                            Tr(L" 件 (クリックで展開)", L" more (click to expand)", L" más (clic para expandir)");
+            row.cells[2] = L"...";
+            rows.push_back(std::move(row));
+            keptDisplayRows.push_back(drow);
+            continue;
+        }
+        if (drow.kind == pc::TaskDisplayRowKind::LoadMoreFinished) {
+            TaskListRow row;
+            row.id = "loadmore:finished";
+            row.kind = "other";
+            row.cells[0] = L"";
+            row.cells[1] = Tr(L"さらに 20 件", L"Load 20 more", L"Cargar 20 más");
             row.cells[2] = L"...";
             rows.push_back(std::move(row));
             keptDisplayRows.push_back(drow);
@@ -7244,7 +7809,7 @@ static void RefreshTaskQueueData(DashboardState* st, bool force = false, bool us
         row.procId = static_cast<int>(latestPid);
 
         std::wstring idStr = Utf8ToWide(jobId);
-        std::wstring summaryStr = Utf8ToWide(JsonGetString(j, "summary", ""));
+        std::wstring summaryStr = Utf8ToWide(DisplayText(st, JsonGetString(j, "summary", ""), ""));
         std::wstring kindStr;
         if (jobId.rfind("group:", 0) == 0 || jobId.rfind("direction:", 0) == 0) {
             summaryStr = L"[direction] " + summaryStr;
@@ -7541,6 +8106,7 @@ static void RefreshTaskQueueData(DashboardState* st, bool force = false, bool us
                     break;
                 }
             }
+            if (!matches && WideContainsCi(Utf8ToWide(JsonGetString(j, "summary", "")), st->taskSearchText)) matches = true;
             if (!matches) continue;
         }
         if (!st->taskOriginFilter.empty()) originJobs.push_back({jobId, state, jobPaused});
@@ -7563,6 +8129,7 @@ static void RefreshTaskQueueData(DashboardState* st, bool force = false, bool us
     std::vector<std::wstring> newRows;  // kTaskListColumns cells per row, flattened
     std::vector<std::wstring> newOriginTips;  // full origin details per row, for the Origin hover tip
     std::vector<std::wstring> newUsageTips;   // full engine / token details per row
+    std::vector<std::wstring> newTitleTips;   // per row: the translated title with its original
     newJobIds.reserve(rows.size());
     newJobStates.reserve(rows.size());
     newJobProcIds.reserve(rows.size());
@@ -7575,11 +8142,13 @@ static void RefreshTaskQueueData(DashboardState* st, bool force = false, bool us
         newJobProcIds.push_back(r.procId);
         newOriginTips.push_back(r.originTip);
         newUsageTips.push_back(r.usageTip);
+        newTitleTips.push_back(r.titleTip);
         for (int col = 0; col < kTaskListColumns; ++col) {
             newRows.push_back(r.cells[col]);
         }
     }
 
+    DashFlushTranslations(st);
     bool justEnded = false;
     for (const auto& id : st->runningTaskJobs) {
         if (!nowRunning.count(id)) {
@@ -7593,19 +8162,15 @@ static void RefreshTaskQueueData(DashboardState* st, bool force = false, bool us
     st->taskJobStates = std::move(newJobStates);
     st->taskJobProcIds = std::move(newJobProcIds);
     st->taskOriginTips = std::move(newOriginTips);
+    st->taskTitleTips = std::move(newTitleTips);
     st->taskUsageTips = std::move(newUsageTips);
-    std::wstring failureSummary = FailureClassSummary(failureCounts);
-    if (!failureSummary.empty()) {
-        failureSummary = Tr(L"失敗: ", L"failed: ", L"fallos: ") + failureSummary;
-    }
     if (newRows == st->lastTaskRows && newJobIds == st->taskJobIds &&
-        failureSummary == st->taskFailureSummary &&
-        ListView_GetItemCount(st->hwndTaskList) == static_cast<int>(newJobIds.size())) {
+        (!st->hwndTaskList || ListView_GetItemCount(st->hwndTaskList) == static_cast<int>(newJobIds.size()))) {
         return;
     }
     // Same jobs in the same order (the usual case: only a countdown or a state moved): rewrite
     // just the cells that changed. Rebuilding every row each refresh was what made the list heavy.
-    if (newJobIds == st->taskJobIds && failureSummary == st->taskFailureSummary &&
+    if (newJobIds == st->taskJobIds &&
         newRows.size() == st->lastTaskRows.size() &&
         ListView_GetItemCount(st->hwndTaskList) == static_cast<int>(newJobIds.size())) {
         bool fitColumnGrew = false;
@@ -7614,7 +8179,12 @@ static void RefreshTaskQueueData(DashboardState* st, bool force = false, bool us
             st->lastTaskRows[i] = std::move(newRows[i]);
             const int row = static_cast<int>(i / kTaskListColumns);
             const int col = static_cast<int>(i % kTaskListColumns);
-            ListView_SetItemText(st->hwndTaskList, row, col, st->lastTaskRows[i].data());
+            // Owner-data rows are supplied by LVN_GETDISPINFO; invalidate the changed cell.
+            RECT cellRect = {};
+            if (ListView_GetItemRect(st->hwndTaskList, row, &cellRect, LVIR_BOUNDS)) {
+                InvalidateRect(st->hwndTaskList, &cellRect, FALSE);
+            }
+            (void)col;
             // Widen a fit column when its new text no longer fits. Shrinking waits for a full rebuild,
             // so this does not measure every row on every tick.
             for (int k = 0; k < 4; ++k) {
@@ -7631,8 +8201,6 @@ static void RefreshTaskQueueData(DashboardState* st, bool force = false, bool us
         if (fitColumnGrew) UpdateTaskListColumnWidths(st);
         return;
     }
-    st->taskFailureSummary = std::move(failureSummary);
-
     // Rebuilding the list drops the highlight, so remember every selected job and select them again.
     std::vector<std::string> keepSelectedJobs;
     {
@@ -7650,21 +8218,10 @@ static void RefreshTaskQueueData(DashboardState* st, bool force = false, bool us
     st->taskJobIds = std::move(newJobIds);
     st->lastTaskRows = std::move(newRows);
     SendMessageW(st->hwndTaskList, WM_SETREDRAW, FALSE, 0);
-    ListView_DeleteAllItems(st->hwndTaskList);
-
-    for (int row = 0; row < static_cast<int>(st->taskJobIds.size()); ++row) {
-        std::wstring* cells = &st->lastTaskRows[static_cast<size_t>(row) * kTaskListColumns];
-        LVITEMW lvi = {};
-        lvi.mask = LVIF_TEXT | LVIF_INDENT;
-        lvi.iItem = row;
-        lvi.iSubItem = 0;
-        lvi.iIndent = (row < static_cast<int>(rows.size())) ? rows[row].indent : 0;
-        lvi.pszText = cells[0].data();
-        ListView_InsertItem(st->hwndTaskList, &lvi);
-        for (int col = 1; col < kTaskListColumns; ++col) {
-            ListView_SetItemText(st->hwndTaskList, row, col, cells[col].data());
-        }
-    }
+    // 102-5: virtual list — the control only needs the row count; text comes from
+    // LVN_GETDISPINFO. Selection is restored by row id, so it survives data swaps.
+    ListView_SetItemCountEx(st->hwndTaskList, static_cast<int>(st->taskJobIds.size()),
+                            LVSICF_NOSCROLL);
     if (!keepSelectedJobs.empty()) {
         bool focused = false;
         for (int r = 0; r < static_cast<int>(st->taskJobIds.size()); ++r) {
@@ -7824,6 +8381,7 @@ static void UpdateTriageFromCore(DashboardState* st);
 
 static void RefreshDashboardData(DashboardState* st) {
     if (!st) return;
+    DashPollTranslationRevision(st);
     if (st->initialTaskUsagePending && st->initialUsageThreadStarted &&
         st->initialUsageStartTickMs > 0 &&
         GetNowTickMs() - st->initialUsageStartTickMs > kInitialUsageTimeoutMs) {
@@ -10374,6 +10932,7 @@ struct LlmStreamDlgState {
     HWND hwndHeader = nullptr;
     HWND hwndList = nullptr;
     HWND hwndEditPreview = nullptr;
+    HWND btnCardOriginal = nullptr;  // 106-3: show the original / the translation of a card
     HWND hwndAgentIcon = nullptr;
     HWND hwndTooltip = nullptr;
     HWND hwnd = nullptr;
@@ -11668,6 +12227,7 @@ static void ReloadMonitorPane(HWND hwnd, LlmStreamDlgState* ds) {
 }
 
 static void ReloadStreamDialogData(HWND hwnd, LlmStreamDlgState* ds) {
+    if (ds && ds->btnCardOriginal) ShowWindow(ds->btnCardOriginal, SW_HIDE);
     if (!ds || !ds->dash) return;
     bool hasLocalSnap = (ds->procId > 0 && FetchProcessSnapshotIpc(ds->dash, ds->procId, ds->snap));
     if (hasLocalSnap) {
@@ -11801,6 +12361,60 @@ static void ReloadStreamDialogData(HWND hwnd, LlmStreamDlgState* ds) {
                 ds->events.clear();
                 LoadMonitorEvents(ds->snap, ds->events);
                 UpdateAgentStateFromMonitorEvents(ds->events, ds->agentState, jobState == "running");
+            }
+        }
+
+        if (!foundJob && selectedJob.rfind("direction:", 0) == 0 && ds->dash) {
+            std::string cErr;
+            std::string cardResp = CardShowIpc(ds->dash, selectedJob.substr(10), ds->selectedTaskId, cErr);
+            nlohmann::json cj = nlohmann::json::parse(cardResp, nullptr, false);
+            if (cj.is_object() && cj.value("ok", false) && cj.contains("card") && cj["card"].is_object()) {
+                const auto& card = cj["card"];
+                const auto& status = cj.value("status", nlohmann::json::object());
+                const std::string num = card.value("number", std::string());
+                const std::string title = card.value("title", std::string());
+                const std::string body = card.value("body", std::string());
+                const std::string tmpl = card.value("template", std::string());
+                const std::string state = status.value("state", std::string("planned"));
+                const auto waiting = cj.value("waitingFor", nlohmann::json::array());
+                const std::string dispState = (state == "planned" && !waiting.empty()) ? "waiting" : state;
+
+                std::wstringstream hdr;
+                hdr << Tr(L"カード: ", L"Card: ", L"Tarjeta: ") << Utf8ToWide(num)
+                    << L"  |  " << TaskStateLabelWide(dispState);
+                if (!tmpl.empty()) hdr << L"  |  " << Utf8ToWide(tmpl);
+                hdr << L"\r\n" << Tr(L"タイトル: ", L"Title: ", L"Título: ")
+                    << Utf8ToWide(ds->dash->showOriginalCardText ? title : DashDisplayNow(ds->dash, title, "card.title"));
+                if (!waiting.empty()) {
+                    hdr << L"\r\n" << Tr(L"依存待ち: ", L"Waiting for: ", L"Esperando a: ");
+                    for (size_t wi = 0; wi < waiting.size(); ++wi) {
+                        if (wi > 0) hdr << L", ";
+                        if (waiting[wi].is_string()) hdr << Utf8ToWide(waiting[wi].get<std::string>());
+                    }
+                }
+                if (ds->hwndHeader) {
+                    SetWindowTextW(ds->hwndHeader, hdr.str().c_str());
+                }
+                if (ds->hwndList) {
+                    ListView_DeleteAllItems(ds->hwndList);
+                }
+                if (ds->hwndEditPreview) {
+                    const std::string bodyShown = (body.empty() || ds->dash->showOriginalCardText)
+                        ? body : DashDisplayNow(ds->dash, body, "card.body");
+                    std::wstring bodyW = bodyShown.empty()
+                        ? Tr(L"(本文なし)", L"(no body)", L"(sin cuerpo)")
+                        : NormalizeCrLfWide(bodyShown);
+                    if (ds->btnCardOriginal) {
+                        SetWindowTextW(ds->btnCardOriginal, ds->dash->showOriginalCardText
+                            ? Tr(L"訳を表示", L"Show translation", L"Ver traducción")
+                            : Tr(L"原文を表示", L"Show original", L"Ver original"));
+                        ShowWindow(ds->btnCardOriginal, SW_SHOW);
+                    }
+                    SetWindowTextW(ds->hwndEditPreview, bodyW.c_str());
+                }
+                ds->lastEventCount = 0;
+                ds->lastEventSeq = 0;
+                return;
             }
         }
 
@@ -12221,6 +12835,9 @@ static LRESULT CALLBACK LlmStreamWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPA
                 WS_CHILD | WS_VISIBLE | WS_VSCROLL | WS_HSCROLL | ES_MULTILINE | ES_READONLY | ES_AUTOVSCROLL | ES_AUTOHSCROLL,
                 12, 365, 820, 180, hwnd, (HMENU)2102, nullptr, nullptr);
             SetWindowSubclass(ds->hwndEditPreview, ListViewSubclassProc, 1, 0);
+            ds->btnCardOriginal = CreateWindowExW(0, L"BUTTON", L"", WS_CHILD | BS_PUSHBUTTON,
+                12, 552, 260, 26, hwnd, (HMENU)2106, nullptr, nullptr);
+            if (ds->hFontUi) SendMessageW(ds->btnCardOriginal, WM_SETFONT, (WPARAM)ds->hFontUi, TRUE);
 
             if (ds->hFontUi) {
                 SendMessageW(ds->hwndHeader, WM_SETFONT, (WPARAM)ds->hFontUi, TRUE);
@@ -12458,6 +13075,9 @@ static LRESULT CALLBACK LlmStreamWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPA
             int editH = (std::max)(60, middleH - listH - 6);
             MoveWindow(ds->hwndList, pad, pad + hdrH + 6, availW, listH, TRUE);
             MoveWindow(ds->hwndEditPreview, pad, pad + hdrH + 6 + listH + 6, availW, editH, TRUE);
+            if (ds->btnCardOriginal) {
+                MoveWindow(ds->btnCardOriginal, pad, pad + hdrH + 6 + listH + 6 + editH + 6, 260, 26, TRUE);
+            }
             InvalidateRect(hwnd, &ds->rcUsageGraph, FALSE);
             return 0;
         }
@@ -12504,7 +13124,10 @@ static LRESULT CALLBACK LlmStreamWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPA
         }
         case WM_COMMAND: {
             int id = LOWORD(wParam);
-            if (id == 2103 && ds) {
+            if (id == 2106 && ds && ds->dash) {
+                ds->dash->showOriginalCardText = !ds->dash->showOriginalCardText;
+                ReloadStreamDialogData(hwnd, ds);
+            } else if (id == 2103 && ds) {
                 ReloadStreamDialogData(hwnd, ds);
             } else if (id == 2104 && ds) {
                 if (!ds->snap.streamFilePath.empty()) {
@@ -12672,6 +13295,7 @@ static void SyncStreamPane(DashboardState* st) {
     if (ds->procId == st->selectedProcId && ds->goalJobKey == st->selectedJobKey &&
         ds->selectedTaskId == st->selectedTaskId) return;
     ds->procId = st->selectedProcId;
+    ds->goalJobKey = st->selectedJobKey;
     ds->selectedTaskId = st->selectedTaskId;
     ds->lastEventCount = static_cast<size_t>(-1);  // force the list to rebuild
     if (ds->hwndEditPreview) SetWindowTextW(ds->hwndEditPreview, L"");
@@ -12891,6 +13515,7 @@ static void ApplyDashboardRefreshTimer(DashboardState* st) {
     if (ms == st->appliedRefreshMs) return;
     st->appliedRefreshMs = ms;
     SetTimer(st->hwndMain, TIMER_REFRESH_ID, static_cast<UINT>(ms), nullptr);
+    WakeDashboardDataFetch(st);  // 102-4: worker picks up the new period on its next wait
 }
 
 // Recreates the process / task list fonts at the configured sizes and applies them to the lists.
@@ -13052,6 +13677,10 @@ static void LoadShellConfig(DashboardState* st) {
         JsonGetInt(content, "process_list_font_px", kDefaultListFontPx)));
     st->taskListFontPx = ClampListFontPx(static_cast<int>(
         JsonGetInt(content, "task_list_font_px", kDefaultListFontPx)));
+    st->translateCards = JsonGetString(content, "translate_cards", "all");
+    if (st->translateCards != "all" && st->translateCards != "title" && st->translateCards != "off") {
+        st->translateCards = "all";
+    }
     st->displayScaleDpi = static_cast<int>(JsonGetInt(content, "display_scale_dpi", 0));
     UpdateDisplayScale(st->hwndMain, st->displayScaleDpi);
     st->refreshIntervalMs = ClampRefreshIntervalMs(
@@ -13064,6 +13693,8 @@ static void LoadShellConfig(DashboardState* st) {
     st->processMetricsIntervalMs = ClampPerformanceIntervalMs(static_cast<int>(
         JsonGetInt(content, "process_metrics_interval_ms", kDefaultProcessMetricsIntervalMs)));
     if (st->pm) st->pm->SetMetricsIntervalMs(st->processMetricsIntervalMs);
+    st->visibleFinishedCount = static_cast<size_t>(ClampTaskListRecentCount(static_cast<int>(
+        JsonGetInt(content, "task_list_recent_count", kDefaultVisibleFinishedCount))));
     st->showSupervisorHints = JsonGetBool(content, "show_supervisor_hints", true);
     st->hintAutoDismissSec = static_cast<int>(JsonGetInt(content, "hint_auto_dismiss_sec", 7));
     // The supervisor runs only in batch; this is the engine name ("" = the default engine).
@@ -13181,6 +13812,7 @@ static void SaveShellConfig(const DashboardState* st) {
         << "  \"memory_max_bytes\": " << st->memoryMaxBytes << ",\n"
         << "  \"process_list_font_px\": " << st->processListFontPx << ",\n"
         << "  \"task_list_font_px\": " << st->taskListFontPx << ",\n"
+        << "  \"translate_cards\": \"" << JsonEscape(st->translateCards) << "\",\n"
         << "  \"task_view_mode\": " << (st->taskViewMode ? "true" : "false") << ",\n"
         << "  \"display_scale_dpi\": " << st->displayScaleDpi << ",\n"
        << "  \"show_supervisor_hints\": " << (st->showSupervisorHints ? "true" : "false") << ",\n"
@@ -13210,7 +13842,8 @@ static void SaveShellConfig(const DashboardState* st) {
         << "  \"refresh_interval_ms\": " << st->refreshIntervalMs << ",\n"
         << "  \"usage_refresh_interval_ms\": " << st->usageRefreshIntervalMs << ",\n"
         << "  \"stream_refresh_interval_ms\": " << st->streamRefreshIntervalMs << ",\n"
-        << "  \"process_metrics_interval_ms\": " << st->processMetricsIntervalMs << "\n"
+        << "  \"process_metrics_interval_ms\": " << st->processMetricsIntervalMs << ",\n"
+        << "  \"task_list_recent_count\": " << static_cast<int>(st->visibleFinishedCount) << "\n"
         << "}\n";
 
     std::string serialized = ss.str();
@@ -14063,6 +14696,8 @@ struct SettingsDlgState {
       HWND editStreamRefreshInterval = nullptr;
       HWND lblProcessMetricsInterval = nullptr;
       HWND editProcessMetricsInterval = nullptr;
+      HWND lblTaskListRecentCount = nullptr;
+      HWND editTaskListRecentCount = nullptr;
       HWND lblPerformanceHint = nullptr;
       HWND lblListBg = nullptr;
       HWND btnListBg[kListRowKeyCount] = {};
@@ -14112,6 +14747,8 @@ struct SettingsDlgState {
        HWND cmbProcFont = nullptr;
         HWND lblTaskFont = nullptr;
         HWND cmbTaskFont = nullptr;
+    HWND lblTranslateCards = nullptr;
+    HWND cmbTranslateCards = nullptr;
         HWND lblDisplayMode = nullptr;
         HWND cmbDisplayMode = nullptr;
        HWND hwndAboutTitle = nullptr;
@@ -14164,11 +14801,11 @@ struct SettingsDlgState {
 };
 
 static std::string LlmSelectedList(SettingsDlgState* ds) {
-    if (!ds || !ds->cmbLlmList) return llm::kWorker;
+    if (!ds || !ds->cmbLlmList) return llm::kAgent;
     int sel = static_cast<int>(SendMessageW(ds->cmbLlmList, CB_GETCURSEL, 0, 0));
     if (sel == 1) return llm::kConsult;
     if (sel == 2) return llm::kSupervisor;
-    return llm::kWorker;
+    return llm::kAgent;
 }
 
 static void RefreshLlmRows(SettingsDlgState* ds) {
@@ -14339,6 +14976,13 @@ static void CommitPerformanceSettings(SettingsDlgState* ds, bool persist = true)
         st->processMetricsIntervalMs = applied;
         if (st->pm) st->pm->SetMetricsIntervalMs(applied);
         SetWindowTextW(ds->editProcessMetricsInterval, std::to_wstring(applied).c_str());
+    }
+    if (ds->editTaskListRecentCount) {
+        const int applied = ClampTaskListRecentCount(readValue(ds->editTaskListRecentCount));
+        st->visibleFinishedCount = static_cast<size_t>(applied);
+        SetWindowTextW(ds->editTaskListRecentCount, std::to_wstring(applied).c_str());
+        WakeDashboardDataFetch(st);
+        RefreshTaskQueueData(st, true);
     }
     if (persist) SaveShellConfig(st);
 }
@@ -15327,9 +15971,9 @@ static void UpdateSettingsDialogTexts(HWND hwnd) {
     SetWindowTextW(ds->chkActivityStyle, Tr(L"実行状態監視ペイン: 行を色分けし、アイコンを表示", L"Execution monitor pane: colour rows and show icons", L"Panel de ejecución: colorear filas y mostrar iconos"));
     SetWindowTextW(ds->chkShowHiddenTasks, Tr(L"hidden タスクも表示", L"Show hidden tasks", L"Mostrar tareas ocultas"));
     SetWindowTextW(ds->btnClose, Tr(L"閉じる", L"Close", L"Cerrar"));
-    SetWindowTextW(ds->lblLlmTitle, Tr(L"LLM リスト（worker / consult / supervisor は独立）",
-                                      L"LLM lists (worker / consult / supervisor are independent)",
-                                      L"Listas LLM (worker / consult / supervisor son independientes)"));
+    SetWindowTextW(ds->lblLlmTitle, Tr(L"LLM リスト（agent / consult / supervisor は独立）",
+                                      L"LLM lists (agent / consult / supervisor are independent)",
+                                      L"Listas LLM (agent / consult / supervisor son independientes)"));
     SetWindowTextW(ds->btnLlmAdd, Tr(L"追加", L"Add", L"Añadir"));
     SetWindowTextW(ds->btnLlmRemove, Tr(L"削除", L"Remove", L"Quitar"));
     SetWindowTextW(ds->btnLlmToggle, Tr(L"有効/無効", L"Enable/Disable", L"Activar/Desactivar"));
@@ -15587,6 +16231,12 @@ static void UpdateSettingsDialogTexts(HWND hwnd) {
             L"Process CPU/memory sampling interval (ms, 1000-60000, default 5000):",
             L"Intervalo de muestreo de CPU/memoria (ms, 1000-60000, predeterminado 5000):"));
     }
+    if (ds->lblTaskListRecentCount) {
+        SetWindowTextW(ds->lblTaskListRecentCount, Tr(
+            L"タスク一覧に出す終わった項目の数 (5〜500, 既定 30):",
+            L"Finished items in task list (5-500, default 30):",
+            L"Elementos terminados en la lista (5-500, predeterminado 30):"));
+    }
     if (ds->lblPerformanceHint) {
         SetWindowTextW(ds->lblPerformanceHint, Tr(
             L"値を大きくするとCPUとディスクI/Oを抑えられます。実行中のジョブが多いときは既定値のままを推奨します。\n"
@@ -15663,6 +16313,10 @@ static void UpdateSettingsDialogTexts(HWND hwnd) {
     if (ds->cmbTaskFont) {
         SendMessageW(ds->cmbTaskFont, CB_SETCURSEL, ListFontSizeIndex(ds->dash->taskListFontPx), 0);
     }
+    if (ds->lblTranslateCards) {
+        SetWindowTextW(ds->lblTranslateCards, Tr(L"タスクカードを訳す", L"Translate task cards", L"Traducir tarjetas de tareas"));
+    }
+    if (ds->cmbTranslateCards) FillTranslateCardsCombo(ds->cmbTranslateCards, ds->dash->translateCards);
     CheckRadioButton(hwnd, IDC_SET_LANG_JA, IDC_SET_LANG_ES,
         g_uiLanguage == UiLanguage::Japanese ? IDC_SET_LANG_JA :
         g_uiLanguage == UiLanguage::Spanish ? IDC_SET_LANG_ES : IDC_SET_LANG_EN);
@@ -15894,8 +16548,16 @@ static LRESULT CALLBACK SettingsWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPAR
             SetWindowTextW(ds->editProcessMetricsInterval,
                            std::to_wstring(ds->dash->processMetricsIntervalMs).c_str());
 
+            ds->lblTaskListRecentCount = CreateWindowExW(0, L"STATIC", L"", WS_CHILD | WS_VISIBLE,
+                18, 192, 530, 20, hwnd, nullptr, hInst, nullptr);
+            ds->editTaskListRecentCount = CreateWindowExW(WS_EX_CLIENTEDGE, L"EDIT", L"",
+                WS_CHILD | WS_VISIBLE | WS_TABSTOP | ES_AUTOHSCROLL | ES_NUMBER,
+                560, 189, 110, 24, hwnd, (HMENU)IDC_SET_TASK_LIST_RECENT_COUNT, hInst, nullptr);
+            SetWindowTextW(ds->editTaskListRecentCount,
+                           std::to_wstring(static_cast<int>(ds->dash->visibleFinishedCount)).c_str());
+
             ds->lblPerformanceHint = CreateWindowExW(0, L"STATIC", L"", WS_CHILD | WS_VISIBLE,
-                18, 196, 700, 70, hwnd, nullptr, hInst, nullptr);
+                18, 228, 700, 70, hwnd, nullptr, hInst, nullptr);
             SendMessageW(ds->lblPerformanceHint, WM_SETFONT, (WPARAM)ds->dash->hFontUi, TRUE);
 
             // Row colors live on their own 色 tab, so these start at the top of the page.
@@ -16072,25 +16734,31 @@ static LRESULT CALLBACK SettingsWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPAR
                 446, 362, 100, 26, hwnd, (HMENU)IDC_SET_WEBUI_TOKEN_ROLL, hInst, nullptr);
 
             ds->lblDisplayMode = CreateWindowExW(0, L"STATIC", L"", WS_CHILD | WS_VISIBLE,
-                18, 440, 530, 20, hwnd, nullptr, hInst, nullptr);
+                18, 486, 530, 20, hwnd, nullptr, hInst, nullptr);
             ds->cmbDisplayMode = CreateWindowExW(WS_EX_CLIENTEDGE, L"COMBOBOX", L"",
                 WS_CHILD | WS_VISIBLE | WS_TABSTOP | CBS_DROPDOWNLIST | WS_VSCROLL,
-                18, 462, 220, 300, hwnd, (HMENU)IDC_SET_DISPLAY_MODE, hInst, nullptr);
+                18, 508, 220, 300, hwnd, (HMENU)IDC_SET_DISPLAY_MODE, hInst, nullptr);
             SendMessageW(ds->cmbDisplayMode, CB_ADDSTRING, 0, (LPARAM)L"Windows");
             SendMessageW(ds->cmbDisplayMode, CB_ADDSTRING, 0, (LPARAM)L"100% (96 DPI)");
             SendMessageW(ds->cmbDisplayMode, CB_ADDSTRING, 0, (LPARAM)L"125% (120 DPI)");
             SendMessageW(ds->cmbDisplayMode, CB_ADDSTRING, 0, (LPARAM)L"150% (144 DPI)");
 
             ds->lblProcFont = CreateWindowExW(0, L"STATIC", L"", WS_CHILD | WS_VISIBLE,
-                18, 500, 530, 20, hwnd, nullptr, hInst, nullptr);
+                18, 546, 530, 20, hwnd, nullptr, hInst, nullptr);
             ds->cmbProcFont = CreateWindowExW(WS_EX_CLIENTEDGE, L"COMBOBOX", L"",
                 WS_CHILD | WS_VISIBLE | WS_TABSTOP | CBS_DROPDOWNLIST | WS_VSCROLL,
-                18, 522, 220, 300, hwnd, (HMENU)IDC_SET_PROC_FONT, hInst, nullptr);
+                18, 568, 220, 300, hwnd, (HMENU)IDC_SET_PROC_FONT, hInst, nullptr);
             ds->lblTaskFont = CreateWindowExW(0, L"STATIC", L"", WS_CHILD | WS_VISIBLE,
-                18, 556, 530, 20, hwnd, nullptr, hInst, nullptr);
+                18, 602, 530, 20, hwnd, nullptr, hInst, nullptr);
             ds->cmbTaskFont = CreateWindowExW(WS_EX_CLIENTEDGE, L"COMBOBOX", L"",
                 WS_CHILD | WS_VISIBLE | WS_TABSTOP | CBS_DROPDOWNLIST | WS_VSCROLL,
-                18, 578, 220, 300, hwnd, (HMENU)IDC_SET_TASK_FONT, hInst, nullptr);
+                18, 624, 220, 300, hwnd, (HMENU)IDC_SET_TASK_FONT, hInst, nullptr);
+            ds->lblTranslateCards = CreateWindowExW(0, L"STATIC", L"", WS_CHILD | WS_VISIBLE,
+                18, 656, 530, 20, hwnd, nullptr, hInst, nullptr);
+            ds->cmbTranslateCards = CreateWindowExW(WS_EX_CLIENTEDGE, L"COMBOBOX", L"",
+                WS_CHILD | WS_VISIBLE | WS_TABSTOP | CBS_DROPDOWNLIST | WS_VSCROLL,
+                18, 678, 300, 200, hwnd, (HMENU)IDC_SET_TRANSLATE_CARDS, hInst, nullptr);
+            FillTranslateCardsCombo(ds->cmbTranslateCards, "all");
             for (int i = 0; i < kListFontSizeCount; ++i) {
                 std::wstring item = std::to_wstring(kListFontSizes[i]) + L" px";
                 SendMessageW(ds->cmbProcFont, CB_ADDSTRING, 0, reinterpret_cast<LPARAM>(item.c_str()));
@@ -16270,6 +16938,10 @@ static LRESULT CALLBACK SettingsWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPAR
                 Tr(L"コアが各プロセスのCPU時間とメモリを取得する間隔です。\n大きくするとプロセスが多いときのCPU使用量を抑えられます。",
                    L"How often the core samples CPU time and memory for each process.\nLarger values reduce CPU usage with many processes.",
                    L"Frecuencia de muestreo de CPU y memoria por proceso en el núcleo.\nValores mayores reducen la CPU con muchos procesos."));
+            helpId(IDC_SET_TASK_LIST_RECENT_COUNT,
+                Tr(L"タスク一覧に表示する終わった項目の数です。\n残りは「さらに 20 件」から読み込めます。",
+                   L"How many finished items the task list shows.\nThe rest are available through \"Load 20 more\".",
+                   L"Cuántos elementos terminados muestra la lista.\nEl resto se carga con \"Cargar 20 más\"."));
             helpId(IDC_SET_END_BLINK_ENABLED,
                 Tr(L"プロセスやタスクが終了したとき、一覧の行をしばらく点滅させます。\n終了を見落としにくくなります。",
                    L"Blinks the list row for a while when a process or task finishes.\nMakes endings harder to miss.",
@@ -16355,8 +17027,9 @@ static LRESULT CALLBACK SettingsWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPAR
                              ds->lblRefreshInterval, ds->editRefreshInterval,
                              ds->lblUsageRefreshInterval, ds->editUsageRefreshInterval,
                              ds->lblStreamRefreshInterval, ds->editStreamRefreshInterval,
-                             ds->lblProcessMetricsInterval, ds->editProcessMetricsInterval,
-                             ds->lblPerformanceHint, ds->btnListBgReset,
+                              ds->lblProcessMetricsInterval, ds->editProcessMetricsInterval,
+                              ds->lblTaskListRecentCount, ds->editTaskListRecentCount,
+                              ds->lblPerformanceHint, ds->btnListBgReset,
                               ds->chkEndBlink, ds->lblEndBlinkSec, ds->editEndBlinkSec,
                               ds->chkSupervisorHints, ds->lblHintAutoDismissSec, ds->editHintAutoDismissSec,
                                ds->lblSupervisorCommand, ds->editSupervisorCommand,
@@ -16368,7 +17041,7 @@ static LRESULT CALLBACK SettingsWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPAR
                              ds->lblWebUiAllowedHosts, ds->editWebUiAllowedHosts,
                              ds->lblWebUiPort, ds->editWebUiPort, ds->lblWebUiUrl, ds->editWebUiUrl,
                              ds->lblWebUiToken, ds->editWebUiToken, ds->btnWebUiTokenRoll,
-                             ds->lblDisplayMode, ds->cmbDisplayMode, ds->lblProcFont, ds->cmbProcFont, ds->lblTaskFont, ds->cmbTaskFont };
+                             ds->lblDisplayMode, ds->cmbDisplayMode, ds->lblProcFont, ds->cmbProcFont, ds->lblTaskFont, ds->cmbTaskFont, ds->lblTranslateCards, ds->cmbTranslateCards };
              for (HWND h : ctrls) SendMessageW(h, WM_SETFONT, (WPARAM)ds->dash->hFontUi, TRUE);
              for (HWND h : ds->chkTriageKinds) if (h) SendMessageW(h, WM_SETFONT, (WPARAM)ds->dash->hFontUi, TRUE);
              for (HWND h : ds->chkTriageLlmPermissions) if (h) SendMessageW(h, WM_SETFONT, (WPARAM)ds->dash->hFontUi, TRUE);
@@ -16387,7 +17060,7 @@ static LRESULT CALLBACK SettingsWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPAR
 
             ds->cmbLlmList = CreateWindowExW(0, L"COMBOBOX", L"", WS_CHILD | WS_VISIBLE | CBS_DROPDOWNLIST | WS_TABSTOP,
                 18, 72, 170, 200, hwnd, (HMENU)IDC_SET_LLM_LIST, hInst, nullptr);
-            SendMessageW(ds->cmbLlmList, CB_ADDSTRING, 0, reinterpret_cast<LPARAM>(L"worker"));
+            SendMessageW(ds->cmbLlmList, CB_ADDSTRING, 0, reinterpret_cast<LPARAM>(L"agent"));
             SendMessageW(ds->cmbLlmList, CB_ADDSTRING, 0, reinterpret_cast<LPARAM>(L"consult"));
             SendMessageW(ds->cmbLlmList, CB_ADDSTRING, 0, reinterpret_cast<LPARAM>(L"supervisor"));
             SendMessageW(ds->cmbLlmList, CB_SETCURSEL, 0, 0);
@@ -16523,7 +17196,8 @@ static LRESULT CALLBACK SettingsWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPAR
                     ds->lblUsageBucketHead, ds->lblUsageBucket[0], ds->cmbUsageBucket[0],
                     ds->lblUsageBucket[1], ds->cmbUsageBucket[1], ds->lblUsageBucket[2], ds->cmbUsageBucket[2],
                     ds->lblUsageBucket[3], ds->cmbUsageBucket[3],
-                    ds->lblProcFont, ds->cmbProcFont, ds->lblTaskFont, ds->cmbTaskFont });
+                    ds->lblDisplayMode, ds->cmbDisplayMode,
+                    ds->lblProcFont, ds->cmbProcFont, ds->lblTaskFont, ds->cmbTaskFont, ds->lblTranslateCards, ds->cmbTranslateCards });
                 auto& colors = ds->tabPages[7];
                 colors.insert(colors.end(), { ds->lblListBg, ds->btnListBgReset });
                 colors.insert(colors.end(), ds->btnListBg, ds->btnListBg + kListRowKeyCount);
@@ -16540,6 +17214,7 @@ static LRESULT CALLBACK SettingsWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPAR
                     ds->lblUsageRefreshInterval, ds->editUsageRefreshInterval,
                     ds->lblStreamRefreshInterval, ds->editStreamRefreshInterval,
                     ds->lblProcessMetricsInterval, ds->editProcessMetricsInterval,
+                    ds->lblTaskListRecentCount, ds->editTaskListRecentCount,
                     ds->lblPerformanceHint });
                 terminal.insert(terminal.end(), {
                     ds->lblTermTitle, ds->chkTermLocal, ds->chkTermRemote,
@@ -16783,7 +17458,8 @@ static LRESULT CALLBACK SettingsWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPAR
                 return 0;
             }
             if (id == IDC_SET_REFRESH_INTERVAL || id == IDC_SET_USAGE_REFRESH_INTERVAL ||
-                id == IDC_SET_STREAM_REFRESH_INTERVAL || id == IDC_SET_PROCESS_METRICS_INTERVAL) {
+                id == IDC_SET_STREAM_REFRESH_INTERVAL || id == IDC_SET_PROCESS_METRICS_INTERVAL ||
+                id == IDC_SET_TASK_LIST_RECENT_COUNT) {
                 if (HIWORD(wParam) == EN_KILLFOCUS) CommitPerformanceSettings(ds);
                 return 0;
             }
@@ -17009,6 +17685,16 @@ static LRESULT CALLBACK SettingsWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPAR
                     }
                     RefreshDashboardData(ds->dash);
                     SaveShellConfig(ds->dash);
+                }
+                return 0;
+            }
+            if (id == IDC_SET_TRANSLATE_CARDS && HIWORD(wParam) == CBN_SELCHANGE) {
+                const int sel = static_cast<int>(SendMessageW(ds->cmbTranslateCards, CB_GETCURSEL, 0, 0));
+                static const char* const kTranslateCardValues[] = {"all", "title", "off"};
+                if (sel >= 0 && sel < 3) {
+                    ds->dash->translateCards = kTranslateCardValues[sel];
+                    SaveShellConfig(ds->dash);
+                    RefreshTaskQueueData(ds->dash, true);
                 }
                 return 0;
             }
@@ -18365,6 +19051,11 @@ struct TriageDlgState {
     std::wstring filterKey = L"pendingTask";  // default filter: task triage awaiting decision
     std::wstring searchText;
     std::string selectedId;
+    // The open card stays in the list after it leaves the filter (e.g. a toast card the BT resolves
+    // seconds later), until the person changes the filter or search. keepSelectedOnce covers a card
+    // opened from outside (the toast), which may already be out of the filter on the first load.
+    std::wstring shownFilterSearch;
+    bool keepSelectedOnce = false;
     int sortColumn = -1;
     bool sortDescending = true;
     nlohmann::json counts = nlohmann::json::object();
@@ -19167,6 +19858,11 @@ static void TriageReload(TriageDlgState* ds, const nlohmann::json* response = nu
     if (hiddenChanged) SaveTriageHiddenCards(ds->dash);
     ds->rows.clear();
     int filterTotal = 0;
+    const std::wstring filterSearch = filter + L"\n" + ds->searchText;
+    const bool keepSelected = !ds->selectedId.empty() &&
+        (ds->keepSelectedOnce || filterSearch == ds->shownFilterSearch);
+    ds->keepSelectedOnce = false;
+    ds->shownFilterSearch = filterSearch;
     for (const auto& card : ds->allCards) {
         const std::string state = card.value("state", std::string());
         const std::string kind = card.value("kind", std::string());
@@ -19184,9 +19880,10 @@ static void TriageReload(TriageDlgState* ds, const nlohmann::json* response = nu
         else if (filter == L"follow_up") match = lifecycle == "follow_up";
         else if (filter == L"done") match = lifecycle == "done";
         else match = state == WideToUtf8(filter);
-        if (!match || ds->dash->hiddenTriageCards.count(card.value("id", std::string()))) continue;
+        const bool kept = keepSelected && card.value("id", std::string()) == ds->selectedId;
+        if ((!match && !kept) || ds->dash->hiddenTriageCards.count(card.value("id", std::string()))) continue;
         ++filterTotal;
-        if (!TriageSearchMatches(card, ds->searchText)) continue;
+        if (!kept && !TriageSearchMatches(card, ds->searchText)) continue;
         ds->rows.push_back(card);
     }
     ds->searchMatches = static_cast<int>(ds->rows.size());
@@ -20341,7 +21038,7 @@ static void ShowTriageDialog(DashboardState* st, const std::wstring& filter, con
     if (st->hwndHintHistory && IsWindow(st->hwndHintHistory)) {
         auto* ds = reinterpret_cast<TriageDlgState*>(GetWindowLongPtrW(st->hwndHintHistory, GWLP_USERDATA));
         if (ds) {
-            ds->filterKey = filter; ds->selectedId = selectId;
+            ds->filterKey = filter; ds->selectedId = selectId; ds->keepSelectedOnce = !selectId.empty();
             static const std::wstring filters[] = {L"pending", L"pendingProcess", L"pendingTask", L"autoUnreviewed",
                 L"handling", L"running", L"waiting", L"follow_up", L"done", L"open", L"all", L"acted", L"ignored", L"resolved"};
             for (size_t i = 0; i < std::size(filters); ++i) if (filters[i] == filter) SendMessageW(ds->filter, CB_SETCURSEL, i, 0);
@@ -20351,7 +21048,7 @@ static void ShowTriageDialog(DashboardState* st, const std::wstring& filter, con
         ShowWindow(st->hwndHintHistory, SW_SHOW); SetForegroundWindow(st->hwndHintHistory); return;
     }
     auto* ds = new TriageDlgState(); ds->dash = st; ds->fontUi = st->hFontUi;
-    ds->filterKey = filter; ds->selectedId = selectId;
+    ds->filterKey = filter; ds->selectedId = selectId; ds->keepSelectedOnce = !selectId.empty();
     ds->activeTile = TriageTileForFilter(filter);
     static bool registered = false; const HINSTANCE instance = GetModuleHandleW(nullptr);
     if (!registered) {
@@ -21320,7 +22017,7 @@ static LRESULT CALLBACK DashboardWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPA
             SetWindowSubclass(st->hwndList, ListViewSubclassProc, 1, 0);
 
             st->hwndTaskList = CreateWindowExW(WS_EX_CLIENTEDGE, WC_LISTVIEWW, L"",
-                WS_CHILD | LVS_REPORT | LVS_SHOWSELALWAYS,
+                WS_CHILD | LVS_REPORT | LVS_SHOWSELALWAYS | LVS_OWNERDATA,
                 0, 0, 600, 160, hwnd, (HMENU)IDC_LIST_TASKS, nullptr, nullptr);
             ListView_SetExtendedListViewStyle(st->hwndTaskList, LVS_EX_FULLROWSELECT | LVS_EX_DOUBLEBUFFER | LVS_EX_INFOTIP);
             ListView_SetBkColor(st->hwndTaskList, g_theme.panel);
@@ -21398,6 +22095,7 @@ static LRESULT CALLBACK DashboardWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPA
 
             SetTimer(hwnd, TIMER_KPI_ANIM_ID, 60, nullptr);
             st->initialTaskUsagePending = true;
+            StartDashboardDataFetch(st, hwnd);
             PostMessageW(hwnd, WM_PC_INITIAL_REFRESH, 0, 0);
             ApplyDashboardRefreshTimer(st);
             return 0;
@@ -21508,6 +22206,11 @@ static LRESULT CALLBACK DashboardWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPA
                     RefreshDashboardData(st);
                     ApplyDashboardRefreshTimer(st);
                 }
+            } else if (wParam == TIMER_TASK_SEARCH_ID && st) {
+                KillTimer(hwnd, TIMER_TASK_SEARCH_ID);
+                WakeDashboardDataFetch(st);
+                RefreshTaskQueueData(st, true);
+                InvalidateRect(st->hwndTaskList, nullptr, FALSE);
             } else if (wParam == TIMER_END_BLINK_ID && st) {
                 if (!TickEndBlink(st)) KillTimer(hwnd, TIMER_END_BLINK_ID);
             } else if (wParam == TIMER_KPI_ANIM_ID && st) {
@@ -21568,6 +22271,14 @@ static LRESULT CALLBACK DashboardWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPA
         case WM_PC_INITIAL_REFRESH: {
             if (st) {
                 RefreshDashboardData(st);
+            }
+            return 0;
+        }
+
+        case WM_PC_DASH_SNAPSHOT: {
+            if (st) {
+                // Only the UI thread touches the controls; the worker picked up the data.
+                RefreshTaskQueueData(st, /*force=*/true);
             }
             return 0;
         }
@@ -21943,6 +22654,7 @@ static LRESULT CALLBACK DashboardWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPA
             } else if (id == IDC_BTN_TERM_SESSIONS) {
                 ShowTermSessionsDialog(st);
             } else if (id == IDC_BTN_REFRESH) {
+                WakeDashboardDataFetch(st);
                 RefreshDashboardData(st);
                 if (st->streamPane && st->hwndStreamPane && IsWindowVisible(st->hwndStreamPane)) {
                     ReloadStreamDialogData(st->hwndStreamPane, st->streamPane);
@@ -22006,8 +22718,11 @@ static LRESULT CALLBACK DashboardWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPA
                 if (!st->showTaskSearch) {
                     st->taskSearchText.clear();
                     SetWindowTextW(st->hwndSearchTaskEdit, L"");
+                    st->visibleFinishedCount = kDefaultVisibleFinishedCount;
+                    KillTimer(hwnd, TIMER_TASK_SEARCH_ID);
                     st->taskOriginFilter.clear();
                     if (st->hwndTaskOriginCombo) SendMessageW(st->hwndTaskOriginCombo, CB_SETCURSEL, 0, 0);
+                    WakeDashboardDataFetch(st);
                     RefreshTaskQueueData(st, true);
                 } else {
                     SetFocus(st->hwndSearchTaskEdit);
@@ -22026,8 +22741,10 @@ static LRESULT CALLBACK DashboardWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPA
                 wchar_t buf[512] = {};
                 GetWindowTextW(st->hwndSearchTaskEdit, buf, 512);
                 st->taskSearchText = buf;
-                RefreshTaskQueueData(st, true);
-                InvalidateRect(st->hwndTaskList, nullptr, FALSE);
+                // 102-6: debounce the query; changing it also resets the "loaded more" count.
+                st->visibleFinishedCount = kDefaultVisibleFinishedCount;
+                KillTimer(hwnd, TIMER_TASK_SEARCH_ID);
+                SetTimer(hwnd, TIMER_TASK_SEARCH_ID, kTaskSearchDebounceMs, nullptr);
             } else if (id == IDC_COMBO_TASK_ORIGIN && HIWORD(wParam) == CBN_SELCHANGE) {
                 const int sel = static_cast<int>(SendMessageW(st->hwndTaskOriginCombo, CB_GETCURSEL, 0, 0));
                 st->taskOriginFilter = (sel > 0 && sel - 1 < static_cast<int>(st->taskOriginItems.size()))
@@ -22073,6 +22790,28 @@ static LRESULT CALLBACK DashboardWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPA
                     }
                 }
             } else if (nmhdr->idFrom == IDC_LIST_TASKS) {
+                if (nmhdr->code == LVN_GETDISPINFOW) {
+                    // 102-5: owner-data list. No cell text lives in the control; every cell is
+                    // read from the immutable row snapshot on demand.
+                    auto* disp = reinterpret_cast<NMLVDISPINFOW*>(lParam);
+                    LVITEMW& item = disp->item;
+                    const int row = item.iItem;
+                    if (row >= 0 && row < static_cast<int>(st->taskJobIds.size())) {
+                        if (item.mask & LVIF_TEXT) {
+                            const int col = item.iSubItem;
+                            if (col >= 0 && col < kTaskListColumns) {
+                                const std::wstring& text =
+                                    st->lastTaskRows[static_cast<size_t>(row) * kTaskListColumns + col];
+                                wcsncpy_s(item.pszText, item.cchTextMax, text.c_str(), _TRUNCATE);
+                            }
+                        }
+                        if (item.mask & LVIF_INDENT) {
+                            item.iIndent = (row < static_cast<int>(st->taskDisplayRows.size()))
+                                ? st->taskDisplayRows[row].indent : 0;
+                        }
+                    }
+                    return 0;
+                }
                 if (nmhdr->code == LVN_COLUMNCLICK) {
                     // Clicking a header sorts by that column; the same column cycles
                     // ascending -> descending -> unsorted.
@@ -22136,6 +22875,10 @@ static LRESULT CALLBACK DashboardWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPA
                         } else if (drow.kind == pc::TaskDisplayRowKind::MoreJobs) {
                             st->taskShowAllJobs.insert(drow.taskId);
                             RefreshTaskQueueData(st, true);
+                        } else if (drow.kind == pc::TaskDisplayRowKind::LoadMoreFinished) {
+                            st->visibleFinishedCount += kLoadMoreFinishedStep;
+                            WakeDashboardDataFetch(st);
+                            RefreshTaskQueueData(st, true);
                         }
                     }
                 } else if (nmhdr->code == NM_RCLICK) {
@@ -22155,7 +22898,7 @@ static LRESULT CALLBACK DashboardWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPA
                             }
                             POINT ptScreen = {};
                             GetCursorPos(&ptScreen);
-                            std::wstring cell = TaskListCellText(st->hwndTaskList, idx, nmia->iSubItem);
+                            std::wstring cell = TaskListCellText(st->hwndTaskList, idx, nmia->iSubItem, st);
                             ShowTaskQueueContextMenu(st, st->taskJobIds[idx], ptScreen, cell);
                         }
                     }
@@ -22175,6 +22918,11 @@ static LRESULT CALLBACK DashboardWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPA
                     } else if (idx >= 0 && idx < static_cast<int>(st->taskDisplayRows.size()) &&
                                st->taskDisplayRows[idx].kind == pc::TaskDisplayRowKind::MoreJobs) {
                         st->taskShowAllJobs.insert(st->taskDisplayRows[idx].taskId);
+                        RefreshTaskQueueData(st, true);
+                    } else if (idx >= 0 && idx < static_cast<int>(st->taskDisplayRows.size()) &&
+                               st->taskDisplayRows[idx].kind == pc::TaskDisplayRowKind::LoadMoreFinished) {
+                        st->visibleFinishedCount += kLoadMoreFinishedStep;
+                        WakeDashboardDataFetch(st);
                         RefreshTaskQueueData(st, true);
                     } else if (idx >= 0 && idx < static_cast<int>(st->taskJobIds.size())) {
                         if (nmia->iSubItem == 3) {
@@ -22196,6 +22944,10 @@ static LRESULT CALLBACK DashboardWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPA
                                tip->iItem < static_cast<int>(st->taskUsageTips.size()) &&
                                !st->taskUsageTips[tip->iItem].empty()) {
                         SetListInfoTip(tip, st->taskUsageTips[tip->iItem]);
+                    } else if (tip->iSubItem == 1 && tip->iItem >= 0 &&
+                               tip->iItem < static_cast<int>(st->taskTitleTips.size()) &&
+                               !st->taskTitleTips[tip->iItem].empty()) {
+                        SetListInfoTip(tip, st->taskTitleTips[tip->iItem]);
                     } else if (tip->iSubItem >= 0 && tip->iSubItem < kTaskListColumns &&
                                tip->iItem >= 0 &&
                                tip->iItem < static_cast<int>(st->lastTaskRows.size() / kTaskListColumns)) {
@@ -22245,7 +22997,10 @@ static LRESULT CALLBACK DashboardWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPA
                             lvcd->clrTextBk = g_theme.panel;
                         }
                         if (idx >= 0 && idx < static_cast<int>(st->taskDisplayRows.size()) &&
-                            st->taskDisplayRows[idx].isSuperseded) {
+                            (st->taskDisplayRows[idx].isSuperseded ||
+                             (st->taskDisplayRows[idx].kind == pc::TaskDisplayRowKind::DirectionHeading &&
+                              st->taskDisplayRows[idx].isCard &&
+                              st->taskDisplayRows[idx].directionState == "planned"))) {
                             lvcd->clrText = g_theme.muted;
                         }
                         if (idx >= 0 && idx < static_cast<int>(st->taskJobIds.size()) &&
@@ -22464,11 +23219,13 @@ static LRESULT CALLBACK DashboardWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPA
             KillTimer(hwnd, TIMER_REFRESH_ID);
             KillTimer(hwnd, TIMER_KPI_ANIM_ID);
             KillTimer(hwnd, TIMER_QUIT_WAIT_ID);
-            if (st) {
-                st->cancelInitialUsage.store(true, std::memory_order_relaxed);
-                if (st->initialUsageThread.joinable()) {
-                    st->initialUsageThread.join();
-                }
+    if (st) {
+        KillTimer(hwnd, TIMER_TASK_SEARCH_ID);
+        StopDashboardDataFetch(st);
+        st->cancelInitialUsage.store(true, std::memory_order_relaxed);
+        if (st->initialUsageThread.joinable()) {
+            st->initialUsageThread.join();
+        }
                 if (st->coreProcessHandle) {
                     CloseHandle(st->coreProcessHandle);
                     st->coreProcessHandle = nullptr;

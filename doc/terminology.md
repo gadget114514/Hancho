@@ -1,180 +1,182 @@
-# 用語集
+# Glossary
 
-状態: 決定（2026-11-24）。名前は 0.10.0 で API・JSON・CLI まで変える。
+Status: decided (2026-11-24). The names change in 0.10.0, including the API, JSON, and CLI.
 
-## なぜ必要か
+Japanese version: `doc/terminology-ja.md`.
 
-同じ言葉が、階層の違う複数のものを指していた。
+## Why this is needed
 
-| 言葉 | 意味 1 | 意味 2 | 意味 3 |
+The same word pointed at several different things at different levels.
+
+| Word | Meaning 1 | Meaning 2 | Meaning 3 |
 |---|---|---|---|
-| job | キューの 1 行（1 プロセスの実行） | BT のノードの型（コマンドを自分で書く） | — |
-| worker | job として動くプロセスという役割 | BT のノードの型（LLM を起動する） | LLM リストの名前 |
-| task | `taskqueue`（job の並び） | タスクグループ（実行中の BT の仮想行） | 0.10 のタスク（依頼 1 件の記録） |
+| job | A row in the queue (one process run) | A BT node type (you write the command yourself) | — |
+| worker | The role of a process run as a job | A BT node type (starts an LLM) | The name of an LLM list |
+| task | `taskqueue` (the order of jobs) | A task group (a virtual row for a running BT) | A 0.10 task (a record of one request) |
 
-これを次のように分ける。
+We split them as follows.
 
-| 今の言葉と意味 | 新しい名前 |
+| Current word and meaning | New name |
 |---|---|
-| job（意味 1: キューの 1 行） | **job**（そのまま） |
-| job（意味 2: ノードの型） | **exec** |
-| worker（意味 1: 役割） | **worker**（そのまま） |
-| worker（意味 2: ノードの型） | **agent** |
-| worker（意味 3: LLM リスト） | **agent list** |
-| task（意味 1: `taskqueue`） | **taskqueue**（そのまま。task を実行する順番の意味） |
-| task（意味 3: 依頼 1 件の記録） | **task**（そのまま） |
-| キューに出す BT や job のまとまり（タスクグループを含む） | **direction** |
+| job (meaning 1: a row in the queue) | **job** (unchanged) |
+| job (meaning 2: node type) | **exec** |
+| worker (meaning 1: role) | **worker** (unchanged) |
+| worker (meaning 2: node type) | **agent** |
+| worker (meaning 3: LLM list) | **agent list** |
+| task (meaning 1: `taskqueue`) | **taskqueue** (unchanged; the order in which tasks run) |
+| task (meaning 3: a record of one request) | **task** (unchanged) |
+| A BT or group of jobs put on the queue (includes task groups) | **direction** |
 
-## 階層
+## Hierarchy
 
 ```
-task                 依頼 1 件。意図・経過ログを持つ
- └ direction         キューへの 1 回の登録。BT 1 本、または taskqueue add 1 回分
-    └ job            1 プロセスの実行。キューの 1 行
-       └ attempt     job の 1 回の実行（maxAttempts の範囲で繰り返す）
+task                 One request. Holds the intent and the progress log
+ └ direction         One registration on the queue: one BT, or one taskqueue add
+    └ job            One process run. One row in the queue
+       └ attempt     One run of a job (repeated within maxAttempts)
 ```
 
-- **direction は task とキューの間の単位。**
-  - BT は 1 本で 1 つの direction になる。ノードを実行するたびに、その direction の job を出す。
-  - `taskqueue add --file jobs.json` は 1 回で 1 つの direction になる。ファイルの中の job がその direction に属する。job を 1 つだけ登録したときも 1 つの direction になる。
-  - `routine run` も 1 つの direction（中身は BT）。
-- **direction を実行する仕組みとして BT を採用している。** direction は「何をするか」（指示の 1 単位）、BT は「それをどう実行するか」（実行の仕組み）。
-  - direction の中身は BT で書く。何を順に・並行に動かし、失敗したら何をするか（`retry`、fix ループ、エンジンの切り替え、escalate）を BT のノードで表す。Hancho は BT を進め、ノードごとに job を出し、結果を見て次のノードを決める。
-  - 成否・回復・判断待ちは BT の状態で決まる。BT の中で直せた失敗は direction の失敗にならず（トリアージのカードにもならない）、BT が `failed` で終わったときだけ direction が失敗する。
-  - タスクカードを流すときも、本文と雛形から BT を作って実行する（`doc/task-card-store-cards.md` の雛形 `card`: agent → build → test → 失敗なら fix）。ルーチンは、名前を付けて保存した direction の仕組み（BT）。
-  - `taskqueue add` 1 回分の direction は BT を使わない。job を `dependsOn` で並べただけの、分岐も回復もない direction（BT で書けば exec ノードを並べただけのものに当たる）。結果によって次を変えたいときは BT にする。
-  - BT 以外の仕組みで direction を実行する予定はない。direction のレコード（下）は BT とは別に持ち、BT の id は `btId` として direction から指す。
-- **BT のノードは exec と agent の 2 種類が job を出す。**
-  - exec: 実行するコマンドを自分で書く。中身は何でもよい（ビルド、テスト、LLM を起動するスクリプト）。
-  - agent: エンジン・モデル・指示文を書き、Hancho が `engines.json` からコマンドを作って LLM を起動する。
-  - どちらも実行時には job を 1 つ出す。違いはコマンドを誰が組み立てるかだけ。成功条件、リトライ、候補の切り替えはどちらにも書ける。
-  - exec で候補を切り替えるには、コマンドに `{engine}` / `{model}` を入れる。
-- **worker と agent の関係:** 同じではない。
-  - worker は、job を実行しているプロセスという役割。ビルド、テスト、スクリプト、LLM のどれでもよい。
-  - agent は engine + model の組。実行していなくても存在する（agent list の 1 行、`engines` の候補、escalate の代理回答の候補、`probe` の相手）。
-  - agent を job として動かしているあいだ、そのプロセスは worker になる（agent ノード、`run_worker`）。ビルドやテストの worker は agent ではない。
-- **系譜**は、やり直し（`supersedes`）でつながった job の列。task の中にあり、direction をまたいでよい（失敗した direction の job を、新しい direction の job でやり直す）。
-- **BT の中のやり直し**（`retry` ノード、fix ループ、`bt retry`）は同じ direction の中で起きる。系譜にはならない。
-- **単発プロセス:** `start` で起動したプロセスは task にも direction にも job にも入らない。成功判定、リトライ、使用量の集計はない。
-- **タスクカードは direction。** 大きな task（機能 1 件）は複数のカードを持ち、1 枚を 1 本の direction として実行する（たとえば BT 1 本: agent → build → test → 失敗なら fix）。カードは task を分けたものではない（task は 1 つのまま）。
-  - task が終わるのは、中のカードがすべて成功したか閉じられたとき。
-  - カードが失敗するとトリアージになる。トリアージの判断（やり直す、閉じるなど）はそのカードに対して行い、task 全体には行わない。
-- **トリアージのカードも direction。** トリアージのカードは、失敗して判断を待っている direction そのもので、別の単位ではない（direction 1 本につきトリアージのカードは多くても 1 枚）。
-  - 原因・候補・推奨・判断は、その direction に付く情報として持つ。カードの id は direction の id。
-  - direction の中で job が何本落ちても、カードは 1 枚。証拠として失敗した job を全部載せる。
-  - 判断で「閉じる」と、その direction が閉じる。「やり直す」と、同じ direction の中でもう一度試すか、`supersedes` で引き継ぐ新しい direction（救済）を作る。救済の direction が失敗すれば、それがまた 1 枚のカードになる。
-  - つまり、タスクカード（まだ実行していない、または実行中の direction）とトリアージのカード（失敗した direction）は、同じ direction を状態で呼び分けたもの。
-  - タスクカードと direction は 1 対多になりうる。実行が失敗し、直して流し直すと、同じタスクカードに direction が 2 本できる。保存した BT（ルーチン）とその実行の関係と同じ。
-  - これまでは `doc/` の Markdown（例: `doc/task-lineage-cards.md` のカード 100-x）にしかなく、Hancho は知らなかった。task の中に保存し、まだ実行していない direction（`planned`）として扱う案がある（下の「direction のレコード」）。
+- **A direction is the unit between a task and the queue.**
+  - A BT is one direction. Each time a node runs, it emits a job for that direction.
+  - `taskqueue add --file jobs.json` is one direction. The jobs in the file belong to that direction. Registering a single job is also one direction.
+  - `routine run` is also one direction (its contents are a BT).
+- **A BT is the mechanism that runs a direction.** A direction is "what to do" (one unit of instruction). A BT is "how to run it" (the execution mechanism).
+  - The contents of a direction are written as a BT. BT nodes express what runs in sequence or in parallel, and what happens on failure (`retry`, the fix loop, engine switching, escalate). Hancho advances the BT, emits a job per node, looks at the result, and decides the next node.
+  - Success, recovery, and waiting for a decision are determined by the BT's state. A failure that the BT recovers from inside does not fail the direction (and does not become a triage card). The direction fails only when the BT ends as `failed`.
+  - When a task card is run, a BT is built from its body and a template and then executed (template `card` in `doc/task-card-store-cards.md`: agent → build → test → fix on failure). A routine is a named, saved direction, and its mechanism is a BT.
+  - A direction from one `taskqueue add` does not use a BT. It is only jobs ordered with `dependsOn`, with no branching or recovery. (Written as a BT, it corresponds to a set of exec nodes in a row.) If the next step should depend on the result, use a BT.
+  - No mechanism other than a BT is planned for running a direction. A direction record (below) is kept separately from the BT, and the BT id is referenced from the direction as `btId`.
+- **Two node types emit jobs in a BT: exec and agent.**
+  - exec: you write the command yourself. It can be anything (a build, a test, a script that starts an LLM).
+  - agent: you write the engine, model, and instruction text, and Hancho builds the command from `engines.json` and starts the LLM.
+  - Both emit one job at run time. The only difference is who builds the command. Success conditions, retries, and candidate switching can be written for either.
+  - To switch candidates in an exec node, put `{engine}` / `{model}` in the command.
+- **Relationship between worker and agent:** they are not the same.
+  - A worker is the role of a process running a job. It can be a build, a test, a script, or an LLM.
+  - An agent is an engine + model pair. It exists even when nothing is running (an agent list row, a candidate in `engines`, a candidate for escalate's proxy answer, or the target of `probe`).
+  - While an agent runs as a job, that process is a worker (agent node, `run_worker`). A build or test worker is not an agent.
+- **A lineage** is the sequence of jobs linked by retries (`supersedes`). It lives inside a task and may cross directions (a job from a failed direction is redone as a job in a new direction).
+- **Retries inside a BT** (the `retry` node, the fix loop, `bt retry`) happen within the same direction. They do not form a lineage.
+- **A standalone process:** a process started with `start` is not part of any task, direction, or job. There is no success check, retry, or usage aggregation.
+- **A task card is a direction.** A large task (one feature) has several cards, and each card is run as one direction (for example, one BT: agent → build → test → fix on failure). Cards do not split the task; the task stays one.
+  - A task ends when all its cards have succeeded or when it is closed.
+  - When a card fails it becomes a triage item. Triage decisions (retry, close, and so on) are made on that card, not on the whole task.
+- **A triage card is also a direction.** A triage card is the failed direction itself, waiting for a decision. It is not a separate unit (one direction has at most one triage card).
+  - The cause, candidates, recommendation, and decision are held as information attached to that direction. The card's id is the direction's id.
+  - However many jobs fail inside a direction, there is only one card. It lists all the failed jobs as evidence.
+  - Deciding "close" closes that direction. Deciding "retry" either tries again inside the same direction, or creates a new direction that carries over via `supersedes` (a rescue). If the rescue direction fails, it becomes one more card.
+  - In short, a task card (a direction not yet run or currently running) and a triage card (a failed direction) are the same direction, referred to differently by state.
+  - A task card and directions can be one-to-many. If a run fails and is fixed and re-run, the same task card gets two directions. This is the same relationship as a saved BT (routine) and its runs.
+  - Until now these lived only as Markdown in `doc/` (for example, cards 100-x in `doc/task-lineage-cards.md`), which Hancho did not know about. They are now saved inside the task and handled as directions not yet run (`planned`) (see "Direction records" below).
 
-## 用語
+## Terms
 
-### 実行の単位
+### Units of execution
 
-| 用語 | 意味 |
+| Term | Meaning |
 |---|---|
-| task | supervisor がやろうとしていること 1 件。`task create` で作るレコード。`--task` なしで出した direction の job は、系譜の最初の job の id を持つ「暗黙の task」に属する |
-| direction | キューへの 1 回の登録。BT 1 本、または `taskqueue add` 1 回分（job 1 つでも）。レコードとして持つ（下の「direction のレコード」）。今「タスクグループ」と呼んでいる BT の仮想行（`group:<id>`）は、実行中の BT の direction |
-| job | 1 つのコマンドを 1 プロセスで実行する単位。キューの 1 行。`id` / `command` / `summary` / `timeoutSec` を持つ |
-| attempt | job の 1 回の実行。`attempts[]` に残る |
-| 系譜（lineage） | `supersedes` でつながった job の列 |
-| 単発プロセス | `start` / `start_process` で起動したプロセス |
+| task | One thing the supervisor is trying to do. A record created by `task create`. A job from a direction without `--task` belongs to an "implicit task" whose id is the first job's id in the lineage |
+| direction | One registration on the queue: one BT, or one `taskqueue add` (even with one job). Held as a record (see "Direction records" below). The BT virtual row that is currently called a "task group" (`group:<id>`) is the direction of a running BT |
+| job | A unit that runs one command as one process. One row in the queue. Has `id` / `command` / `summary` / `timeoutSec` |
+| attempt | One run of a job. Kept in `attempts[]` |
+| lineage | The sequence of jobs linked by `supersedes` |
+| standalone process | A process started with `start` / `start_process` |
 
-### 入れ物と定義
+### Containers and definitions
 
-| 用語 | 意味 |
+| Term | Meaning |
 |---|---|
-| キュー（taskqueue） | task を実行する順番。実際に並ぶのは task の job で、順番・依存つきで並べる。名前は変えない |
-| BT（behavior tree） | ノードの木。結果によって次を変える流れを 1 つの JSON で書いた定義。direction を実行する仕組みとして採用している（direction = 何をするか、BT = どう実行するか）。実行すると direction になる |
-| ルーチン（routine） | 名前を付けて保存した BT |
-| タスクカード（task card） | 大きな task の中に入っている作業の 1 単位（= direction）。task は複数のカードを持つ。1 枚を 1 本の direction として実行する。中身は作業の説明（触るファイル、やること、テスト）と、ほかのタスクカードへの依存。番号は `102-3` のように「計画の番号-連番」で付ける。単に「カード」と言えばタスクカードのこと（`doc/` の「カード 100-x」「カード 102-x」）。失敗した direction を指すときは「トリアージのカード」と書いて区別する（どちらも同じ direction） |
+| queue (taskqueue) | The order in which tasks run. What actually lines up is the task's jobs, ordered with dependencies. The name does not change |
+| BT (behavior tree) | A tree of nodes: a definition, written as one JSON, that changes the flow based on results. It is adopted as the mechanism that runs a direction (direction = what to do, BT = how to run it). Running it creates a direction |
+| routine | A BT saved under a name |
+| task card | A unit of work inside a large task (= a direction). A task has several cards, and each is run as one direction. The contents are the description of the work (files to touch, what to do, tests) and dependencies on other task cards. Numbers look like `102-3`: "plan number-sequence number". Just "card" means a task card (the "card 100-x" and "card 102-x" in `doc/`). To refer to a failed direction, say "triage card" to tell them apart (both are the same direction) |
 
-### BT のノード
+### BT nodes
 
-| 用語 | 今の `type` | 意味 |
+| Term | Current `type` | Meaning |
 |---|---|---|
-| exec ノード | `job` | 実行するコマンドを自分で書く |
-| agent ノード | `worker` | エンジン・モデル・指示文を書き、Hancho が LLM を起動する |
+| exec node | `job` | You write the command to run yourself |
+| agent node | `worker` | You write the engine, model, and instruction text, and Hancho starts the LLM |
 
-ほかのノード（`probe`、`wait`、`set`、`escalate`、`fail`、`succeed`、複合・装飾・条件ノード）は名前を変えない。
+Other nodes (`probe`, `wait`, `set`, `escalate`, `fail`, `succeed`, composite, decorator, and condition nodes) keep their names.
 
-### 登場人物
+### Participants
 
-| 用語 | 意味 |
+| Term | Meaning |
 |---|---|
-| supervisor | ユーザーと話している LLM。task を作り、direction を出し、結果を見て次を決める |
-| Hancho | プロセスを所有し、監視・成功判定・リトライ・記録をする |
-| worker | job を実行しているプロセスという役割（LLM、ビルド、テスト、スクリプト）。supervisor と対になる言葉で、supervisor が決めて任せた仕事を worker が実行する |
-| agent | engine + model の組（定義は下の「LLM まわり」）。job として動かしているあいだは worker になる |
-| peer | Chat でメッセージをやり取りする相手（LLM や Hancho）。今の Chat の `--from-agent` / `--to-agent` の agent。agent（job として動く LLM）とは別 |
-| host | Chat の LAN 上の相手の Hancho（`192.168.1.20:2426` のようなアドレス）。今の `chat peers` の peer |
+| supervisor | The LLM talking with the user. Creates tasks, issues directions, and decides the next step from the results |
+| Hancho | Owns the processes, and does monitoring, success checks, retries, and recording |
+| worker | The role of a process running a job (LLM, build, test, script). The counterpart of supervisor: the supervisor decides and delegates work, and the worker carries it out |
+| agent | An engine + model pair (definition in "LLM terms" below). While running as a job, it is a worker |
+| peer | A party exchanging messages in Chat (an LLM or Hancho). The agent in Chat's current `--from-agent` / `--to-agent`. Different from an agent (an LLM running as a job) |
+| host | A Hancho on the LAN, as a Chat party (an address such as `192.168.1.20:2426`). The peer of the current `chat peers` |
 
-### LLM まわり
+### LLM terms
 
-| 用語 | 意味 |
+| Term | Meaning |
 |---|---|
-| エンジン（engine） | モデルを動かす CLI（`claude` / `opencode` / `codex` / `agy`）。ツールの実行、ファイルの読み書き、会話の管理をする。`engines.json` で追加する。一般には harness と呼ばれるものだが、Hancho では engine と呼ぶ（JSON・CLI・`{engine}` プレースホルダ・使用量の集計と名前を揃える） |
-| モデル（model） | エンジンに渡すモデル名 |
-| agent | **engine + model** の組。例: `claude` + `haiku`、`agy` + `gemini-4-hydrogen-medium`。同じモデルでも、エンジンが違えば別の agent |
-| 候補（candidate） | `engines` に並べた agent 1 つ（エンジンと model の組） |
-| agent list | 使ってよい承認済みの agent の一覧（今の LLM リストの `worker`）。1 行がエンジンと model の組なので、中身はもともと agent の一覧 |
-| consult list | escalate の代理回答に使ってよい承認済みの候補の一覧（今の `consult`。名前は変えない） |
-| 切り替え | 失敗したとき、次の候補で同じノードをやり直すこと |
+| engine | The CLI that runs a model (`claude` / `opencode` / `codex` / `agy`). Handles tool execution, file reads and writes, and conversation management. Added through `engines.json`. Commonly called a harness, but Hancho calls it an engine (to match the names in JSON, CLI, the `{engine}` placeholder, and usage aggregation) |
+| model | The model name passed to the engine |
+| agent | An **engine + model** pair. Example: `claude` + `haiku`, or `agy` + `gemini-4-hydrogen-medium`. The same model under a different engine is a different agent |
+| candidate | One agent listed in `engines` (an engine and model pair) |
+| agent list | The approved agents that may be used (the current LLM list's `worker`). Each row is an engine and model pair, so the contents are already a list of agents |
+| consult list | The approved candidates that may be used for escalate's proxy answer (currently `consult`; the name does not change) |
+| switch | Running the same node again with the next candidate after a failure |
 
-### 失敗と判断
+### Failures and decisions
 
-| 用語 | 意味 |
+| Term | Meaning |
 |---|---|
-| 失敗クラス（failure class） | 失敗の種類（`exit_nonzero`、`startup_hang`、`fix_no_progress` など） |
-| escalate | BT の途中で supervisor に判断を求めるノード。回答は `bt resume` |
-| トリアージ（triage） | task の中でトリアージになった（失敗した）カード（direction）を、どう処理するかを決める仕組み。原因・候補（やり直す、内容を変えてやり直す、閉じる、引き取る）・推奨を出す。判断の対象はカードで、task 全体ではない |
-| トリアージのカード | 失敗して判断を待っている direction そのもの（トリアージのカード = direction）。id は direction の id で、direction 1 本につき多くても 1 枚。原因・候補・推奨・判断は direction に付く。単発プロセス（`start`）は direction を持たないので、カードではなくお知らせにする |
-| 引き取り（takeover） | supervisor が job や escalate を自分で片付けると記録すること |
+| failure class | The kind of failure (`exit_nonzero`, `startup_hang`, `fix_no_progress`, and so on) |
+| escalate | A node in a BT that asks the supervisor for a decision. The answer is given with `bt resume` |
+| triage | The mechanism that decides how to handle a card (direction) that became a triage item (failed) within a task. It gives the cause, candidates (retry, retry with changed content, close, take over), and a recommendation. The target of a decision is the card, not the whole task |
+| triage card | The failed direction itself, waiting for a decision (triage card = direction). Its id is the direction's id, and there is at most one per direction. The cause, candidates, recommendation, and decision are attached to the direction. A standalone process (`start`) has no direction, so it is shown as a notice, not a card |
+| takeover | Recording that the supervisor will finish a job or an escalate itself |
 
-## direction のレコード
+## Direction records
 
-- `bt start`、`routine run`、`taskqueue add`（job 1 つでも）のたびに 1 件作る。
-- 項目: `id`、種類（`bt` / `jobs`）、`taskId`、作成時刻、作成したセッション（`origin`）。
-- job は `directionId` で direction に属する。BT が出す job は、その BT の direction に属する。
-- id の決め方（BT の id をそのまま使うか、`dir_` のようなプレフィックスで採番するか）は実装のカードで決める（仮の答え: `dir_` + 連番。`doc/direction-cards.md`）。
-- 一覧の仮想行は `group:<id>` から `direction:<id>` に変える。
-- 案（未決定）: タスクカードを、まだ実行していない direction（状態 `planned`）として先に作れるようにする。
-  - 中身: タスクカードの本文（または BT の定義そのもの）、使う雛形の名前、ほかの direction への依存（`after`）。
-  - 実行すると BT を作り、同じレコードが `running` になる。
-  - やり直しは、元の direction を引き継ぐ（`supersedes`）新しい direction にする。job の系譜と同じ形を 1 段上で使う。
-  - task を開けば、タスクカードごとの進み具合（済み・実行中・依存待ち）が見える。依存のないものは並行して流せる。
-  - 保存場所（task のレコードの中か、`taskId` を持つ direction のレコードか）と、本文から BT を作る雛形の形は、実装のタスクカードで決める（仮の答え: direction のレコードに持ち、雛形 `card` で BT を作る。`doc/task-card-store-cards.md`）。
+- One record is created each time `bt start`, `routine run`, or `taskqueue add` runs (even with one job).
+- Fields: `id`, kind (`bt` / `jobs`), `taskId`, creation time, and the session that created it (`origin`).
+- A job belongs to a direction through `directionId`. Jobs emitted by a BT belong to that BT's direction.
+- How ids are chosen (using the BT id as-is, or numbering with a prefix such as `dir_`) is decided in the implementation card (tentative answer: `dir_` + sequence number; see `doc/direction-cards.md`).
+- The virtual row in the list changes from `group:<id>` to `direction:<id>`.
+- Decision: a task card can be created first as a direction not yet run (state `planned`).
+  - Contents: the body of the task card (or the BT definition itself), the name of the template used, and dependencies on other directions (`after`).
+  - When run, a BT is built and the same record becomes `running`.
+  - A retry is a new direction that carries over the original (`supersedes`). This uses the same shape as the job lineage, one level up.
+  - Opening a task shows the progress of each task card (done, running, waiting on dependencies). Cards without dependencies can run in parallel.
+  - The records are stored in the direction record, and the template that builds a BT from the body is `card` (`doc/task-card-store-cards.md`).
 
-## 0.10.0 での名前の変更
+## Name changes in 0.10.0 (implemented)
 
-0.10.0 で API・JSON・CLI の名前を変える。古い名前は別名として受け付け続ける（既存の BT、ルーチン、雛形を壊さない）。
+In 0.10.0 the names in the API, JSON, and CLI were changed. The old names are still accepted as aliases (so existing BTs, routines, and templates keep working).
 
-| 場所 | 今 | 0.10.0 |
+| Place | Now | 0.10.0 |
 |---|---|---|
-| BT の JSON | `"type": "job"` | `"type": "exec"` |
-| BT の JSON | `"type": "worker"` | `"type": "agent"` |
-| BT の JSON | `defaults.job` / `defaults.worker` | `defaults.exec` / `defaults.agent` |
-| BT の警告 | `unguarded_worker` など、ノードの型を指すもの | 型の名前に合わせる |
-| LLM リスト | `--list worker` | `--list agent` |
-| 一覧の仮想行 | `group:<id>`、「タスクグループ」 | `direction:<id>`、「direction」 |
-| job の項目 | なし | `directionId` |
+| BT JSON | `"type": "job"` | `"type": "exec"` |
+| BT JSON | `"type": "worker"` | `"type": "agent"` |
+| BT JSON | `defaults.job` / `defaults.worker` | `defaults.exec` / `defaults.agent` |
+| BT warnings | `unguarded_worker` and similar, which refer to node types | Match the type name |
+| LLM list | `--list worker` | `--list agent` |
+| Virtual list row | `group:<id>`, "task group" | `direction:<id>`, "direction" |
+| job fields | none | `directionId` |
 
-## ぶつかる名前は新しく作る
+## New names where the old ones clashed (implemented)
 
-既存の名前が新しい用語とぶつかるところは、新しい名前を作る。古い名前は別名として受け付け続ける。名前は案で、実装のカードで確定する。
+Where an existing name clashed with a new term, a new name was created. The old names are still accepted as aliases.
 
-| 場所 | 今 | 何がぶつかるか | 新しい名前（案） |
+| Place | Old name (alias) | What clashes | New name |
 |---|---|---|---|
-| Chat の CLI | `--from-agent` / `--to-agent` / `--audience agent` | agent（job として動く LLM）とは別物 | `--from-peer` / `--to-peer` / `--audience peer` |
-| Chat の CLI | `chat peers` / `chat refresh` の peer（LAN 上の Hancho） | 上の peer（メッセージの相手）とぶつかる | host（`chat hosts`） |
-| Chat のメッセージの JSON | `direction`（送受信の向き `in` / `out`。`src/cli.cpp`、`src/gui_dashboard.cpp`） | direction（キューへの 1 回の登録） | `flow` |
-| MCP | `agent_type`（`run_worker` など） | 中身はエンジン名で、agent（engine + model）ではない | `engine` |
-| CLI・MCP | `run_worker`、`worker stream` / `worker probe` / `worker health` | 中身は LLM 専用なので agent にあたる | `run_agent`、`agent stream` / `agent probe` / `agent health` |
+| Chat CLI | `--from-agent` / `--to-agent` / `--audience agent` | Different from agent (an LLM running as a job) | `--from-peer` / `--to-peer` / `--audience peer` |
+| Chat CLI | `chat peers` / `chat refresh`'s peer (a Hancho on the LAN) | Clashes with the peer above (a party in a message) | host (`chat hosts`) |
+| Chat message JSON | `direction` (send/receive direction `in` / `out`; `src/cli.cpp`, `src/gui_dashboard.cpp`) | direction (one registration on the queue) | `flow` |
+| MCP | `agent_type` (`run_worker` and others) | The content is an engine name, not an agent (engine + model) | `engine` |
+| CLI and MCP | `run_worker`, `worker stream` / `worker probe` / `worker health` | The content is LLM-only, which corresponds to agent | `run_agent`, `agent stream` / `agent probe` / `agent health` |
 
-- order と instruction は使わない。どちらも direction の前に候補にしたが、既存の項目とぶつかる。`order` は `export` の job の JSON（`src/cli.cpp` の `ExportQueueJobJson`）の並び順の番号、`instructionsText` / `instructionsFile` は job と BT のノードで worker に渡す指示書。
+- `order` and `instruction` are not used. Both were considered as candidates for direction before, but they clash with existing fields. `order` is the sequence number in the exported job JSON (`ExportQueueJobJson` in `src/cli.cpp`). `instructionsText` / `instructionsFile` are the instruction documents passed to the worker by a job and by BT nodes.
 
-## 残っている作業
+## Remaining work
 
-- 0.10.0 の名前の変更と direction のレコード → タスクカード 103-1〜103-8（`doc/direction-cards.md`）。
-- タスクカードを Hancho に保存する仕組み（上の「direction のレコード」の案）→ タスクカード 104-1〜104-6（`doc/task-card-store-cards.md`）。
-- `skills/hancho/SKILL.md`、help、`doc/behavior-tree*.md` などをこの用語集に合わせて書き換える → タスクカード 103-8（名前の変更と同時に行う。名前を変える前に文書だけ新しい名前にすると、まだ受け付けない名前を案内してしまうため）。`doc/task-lineage-plan.md` は書き換え済み。
+- Name changes in 0.10.0 and direction records → task cards 103-1 to 103-8 (`doc/direction-cards.md`).
+- Saving task cards in Hancho (the plan for direction records above) → task cards 104-1 to 104-6 (`doc/task-card-store-cards.md`).
+- Rewrite `skills/hancho/SKILL.md`, help, `doc/behavior-tree*.md`, and similar to match this glossary → task card 103-8 (done together with the name change; updating the documents to new names before the names change would point people at names that are not yet accepted). `doc/task-lineage-plan.md` has already been rewritten.
