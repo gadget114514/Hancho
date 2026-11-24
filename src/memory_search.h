@@ -31,7 +31,7 @@ struct RankCandidate {
     int64_t createdEpoch = 0;
 };
 
-// Inputs for memory_brief (doc/design-v3.md 3.8). jobName and files are both optional; when
+// Inputs for memory_brief (doc/obsoleted/design-v3.md 3.8). jobName and files are both optional; when
 // neither is given the brief is built from the most recent runs.
 struct BriefOptions {
     std::string jobName;
@@ -55,7 +55,7 @@ struct BriefResult {
     bool truncated = false;
 };
 
-// Input for an L2 note (doc/design-v3.md 3.4, 3.10). The writer validates the scope, redacts
+// Input for an L2 note (doc/obsoleted/design-v3.md 3.4, 3.10). The writer validates the scope, redacts
 // known secrets, enforces the agent rules (sources, 5 per attempt, no duplicate scope+text)
 // and appends one replayable line to memory/notes.jsonl.
 struct NoteInput {
@@ -82,7 +82,7 @@ public:
                       std::string& outError) const = 0;
 };
 
-// External ranker plugin (doc/design-v3.md 3.8). Spawns a child process in the data directory,
+// External ranker plugin (doc/obsoleted/design-v3.md 3.8). Spawns a child process in the data directory,
 // sends {"query":..., "candidates":[...]} via stdin, and parses candidate scores from stdout JSON.
 class ProcessRanker : public IMemoryRanker {
 public:

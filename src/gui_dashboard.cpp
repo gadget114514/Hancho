@@ -963,7 +963,7 @@ struct DashboardState {
     bool restoreUsageGraph = true;
     int usageBucketSec[kUsageBucketRanges] = {60, 600, 1800, 3600};  // per range, see kUsageBucketDefaultSec
     int64_t llmMaxEvents = kDefaultLlmMaxEvents;  // events kept per stream tracker; -1 = unlimited
-    bool resourceLocks = true; // task queue resource locks (doc/resource-locks.md)
+    bool resourceLocks = true; // task queue resource locks (doc/obsoleted/resource-locks.md)
     bool showHiddenTasks = false; // include internal (e.g. Chat handler) jobs in the task list
     int64_t memoryMaxBytes = 0; // memory/ capacity limit in bytes; 0 = unlimited
     uint64_t lastMemoryCheckTickMs = 0;
@@ -3609,7 +3609,7 @@ static std::string LastAttemptField(const std::string& jobJson, const std::strin
     return JsonGetString(attempts.back(), key, "");
 }
 
-// The diagnostic attached to the last attempt (doc/design-v3.md 4.3). Empty when the
+// The diagnostic attached to the last attempt (doc/obsoleted/design-v3.md 4.3). Empty when the
 // attempt succeeded or predates the classifier.
 static nlohmann::json LastFailureOfJob(const std::string& jobJson) {
     auto attempts = SplitJsonObjectArray(jobJson, "attempts");
@@ -3927,7 +3927,7 @@ static std::wstring TaskQueueStateLabel(const std::string& state, const std::str
 }
 
 // ---------------------------------------------------------------------------
-// Memory dialogs (doc/design-v3.md 3.11, 3.12).
+// Memory dialogs (doc/obsoleted/design-v3.md 3.11, 3.12).
 //
 // "Past runs" is the third tab of a task queue job's detail window. It lists the
 // L1 RunRecords for the same job name, the failure-class trend and related notes.
@@ -9658,7 +9658,7 @@ static void ShowTaskDetailsDialog(DashboardState* st, int procId) {
 }
 
 // ---------------------------------------------------------------------------
-// Behavior tree debug view (doc/behavior-tree-plan.md 8.1). Developer-only: it opens with
+// Behavior tree debug view (doc/obsoleted/behavior-tree-plan.md 8.1). Developer-only: it opens with
 // Ctrl+Shift+B and is never listed in menus or help, because users are not told about BTs.
 // Reads <logs>/behaviortrees/*.json through bt_debug_view and shows each tree in a TreeView.
 // ---------------------------------------------------------------------------

@@ -1,4 +1,4 @@
-// Headless smoke test for L1 run records (src/memory_record.cpp, doc/design-v3.md 3.3 / 3.7).
+// Headless smoke test for L1 run records (src/memory_record.cpp, doc/obsoleted/design-v3.md 3.3 / 3.7).
 #include "../src/memory_record.h"
 #include "../src/common.h"
 #include "../src/nlohmann/json.hpp"

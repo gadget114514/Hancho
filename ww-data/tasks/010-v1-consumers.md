@@ -5,7 +5,7 @@ Splittable: no
 
 ## 目的
 
-`hancho.event/1` を、GUI・MCP・BT の読み取り経路でも使う（`doc/design-v3.md` 1.7）。
+`hancho.event/1` を、GUI・MCP・BT の読み取り経路でも使う（`doc/obsoleted/design-v3.md` 1.7）。
 
 ## やること
 
@@ -21,7 +21,7 @@ Splittable: no
 
 ## 参照
 
-- `doc/design-v3.md` 1.3, 1.7
+- `doc/obsoleted/design-v3.md` 1.3, 1.7
 - `doc/schema/hancho.event.v1.json`
 
 ## Authorised edits
@@ -33,8 +33,8 @@ Splittable: no
 
 ## Read-only
 
-- `doc/design-v3.md`
-- `doc/design-v3-en.md`
+- `doc/obsoleted/design-v3.md`
+- `doc/obsoleted/design-v3-en.md`
 - `src/event_schema.h`
 
 ## 検証

@@ -133,7 +133,7 @@ Cards run with `-Worktree` can run in parallel.
 ### Parallel runs on the main checkout (`-Shared`)
 
 `-Shared` runs a card on the main checkout next to other runs, as long as the paths they declare
-do not overlap (design: [doc/resource-locks.md](../../doc/resource-locks.md)):
+do not overlap (design: [doc/obsoleted/resource-locks.md](../../doc/obsoleted/resource-locks.md)):
 
 - `## Authorised edits` paths are **written**, `## Read-only` (or `## Reads`) paths are **read**.
   Two runs that only read the same file can run together; an edit of a file another run edits or

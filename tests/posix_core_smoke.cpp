@@ -1,4 +1,4 @@
-// POSIX headless core smoke test (doc/design-v3.md 2.4).
+// POSIX headless core smoke test (doc/obsoleted/design-v3.md 2.4).
 //
 // Covers the platform boundary (shell quoting, instance lock, Unix-socket IPC),
 // a real task queue run through /bin/sh, and one behaviour tree with a job node.

@@ -1,6 +1,6 @@
 #pragma once
 
-// Debug model for behavior trees (doc/behavior-tree-plan.md). Reads the persisted state files
+// Debug model for behavior trees (doc/obsoleted/behavior-tree-plan.md). Reads the persisted state files
 // (<logs>/behaviortrees/<id>.json) and turns each one into a display tree for the hidden debug
 // dialog. No GUI and no process code here, so tests/bt_debug_view_smoke.cpp can drive it.
 

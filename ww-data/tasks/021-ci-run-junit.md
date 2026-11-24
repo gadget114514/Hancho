@@ -5,7 +5,7 @@ Splittable: no
 
 ## 目的
 
-CI からキューを流し、結果を機械可読に受け取れるようにする（`doc/design-v3.md` 2.3）。
+CI からキューを流し、結果を機械可読に受け取れるようにする（`doc/obsoleted/design-v3.md` 2.3）。
 
 ## やること
 
@@ -21,8 +21,8 @@ CI からキューを流し、結果を機械可読に受け取れるように�
 
 ## 参照
 
-- `doc/design-v3.md` 2.3
-- `doc/taskqueue.md`
+- `doc/obsoleted/design-v3.md` 2.3
+- `doc/obsoleted/taskqueue.md`
 
 ## Authorised edits
 
@@ -33,8 +33,8 @@ CI からキューを流し、結果を機械可読に受け取れるように�
 
 ## Read-only
 
-- `doc/design-v3.md`
-- `doc/design-v3-en.md`
+- `doc/obsoleted/design-v3.md`
+- `doc/obsoleted/design-v3-en.md`
 
 ## 検証
 

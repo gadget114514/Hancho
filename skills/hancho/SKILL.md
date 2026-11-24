@@ -305,7 +305,7 @@ test → 失敗なら修正 → 再ビルド → 再テスト、の例:
 }
 ```
 
-ノード: `job` / `worker` / `probe` / `wait` / `set` / `escalate` / `fail` / `succeed`。複合: `sequence` / `fallback` / `parallel` / `if` / **`catch`** / **`foreach`**（glob のファイルごとに `do` を展開、`exclude` 対応）。装飾: `retry` / `repeat` / `invert` / `forceSuccess` / `forceFailure` / `timeout`。条件: `fileExists` / `fileNewer` / `outputMatches` / `exitCode` / **`failure`** / `jsonValue` / `var` / `nodeState`。変数: `${name}`、`${<node>.state|exitCode|logFile|jobId|runs}`、`${<worker>.result}`、`${<escalate>.answer}`、失敗診断の `${<node>.failureClass|failureSummary|likelyCauses|suggestedAction|retryAt|engine|model}`。詳細は `doc/behavior-tree.md` / `doc/behavior-tree-ja.md`。
+ノード: `job` / `worker` / `probe` / `wait` / `set` / `escalate` / `fail` / `succeed`。複合: `sequence` / `fallback` / `parallel` / `if` / **`catch`** / **`foreach`**（glob のファイルごとに `do` を展開、`exclude` 対応）。装飾: `retry` / `repeat` / `invert` / `forceSuccess` / `forceFailure` / `timeout`。条件: `fileExists` / `fileNewer` / `outputMatches` / `exitCode` / **`failure`** / `jsonValue` / `var` / `nodeState`。変数: `${name}`、`${<node>.state|exitCode|logFile|jobId|runs}`、`${<worker>.result}`、`${<escalate>.answer}`、失敗診断の `${<node>.failureClass|failureSummary|likelyCauses|suggestedAction|retryAt|engine|model}`。詳細は `doc/obsoleted/behavior-tree.md` / `doc/obsoleted/behavior-tree-ja.md`。
 
 #### BT を書くときはハング対策を最初から入れる
 
@@ -319,7 +319,7 @@ test → 失敗なら修正 → 再ビルド → 再テスト、の例:
 4. **必要なら事前確認する。** `worker probe`（1 行、`hancho-cli.exe worker probe --engine <e> --model <m> --json`。MCP `worker_probe`）で「1 行返すだけ」の最小プロンプトを走らせ、共有の故障状態は `worker health`（MCP `worker_health`）で見る。本番起動前に壊れたエンジンを除外できる。
 5. そのうえで `bt start` → `bt wait --id <btid> --timeout-ms 600000` → `bt get --id <btid> --compact` で監視する。
 
-worker ノードの `engines` / `switchEngineOn`、`probe` 葉、`{engine}` / `{model}` プレースホルダ、`needs` による権限宣言の詳細は `doc/behavior-tree.md` の 5.3 / 5.4 と 11 章を参照。
+worker ノードの `engines` / `switchEngineOn`、`probe` 葉、`{engine}` / `{model}` プレースホルダ、`needs` による権限宣言の詳細は `doc/obsoleted/behavior-tree.md` の 5.3 / 5.4 と 11 章を参照。
 
 ### ルーチン（名前付き BT）
 
@@ -341,7 +341,7 @@ hancho-cli.exe routine save --name from-past --from-bt <btId>
 
 定義は `<cwd>/.hancho/routines/<name>.json`（project）または `<data-dir>/routines/<name>.json`（data）。実行ごとに `<name>-<yyyymmdd-hhmmss>` の ID が付き、ジョブ ID は衝突しない。MCP は `routine_list` / `routine_show` / `routine_run` / `routine_save` / `routine_check` / `routine_ask` / `routine_approve` / `routine_reject`。入力ファイルの変更で `stale` になっても実行は止まらないが、失敗した場合は triage の `routine_stale_failure` カード（`update_routine` 推奨）が出る。`update_routine` を選ぶと `routine ask`（直す）が起動し、結果は承認待ちの提案になる。
 
-`routine ask` の依頼は `routine-ask` キューの worker ジョブとして登録され、`worker` LLM リスト（rank 順、故障中はスキップ、空なら既定エンジン＋警告）で実行される。 worker の出力は厳格 BT 検証・`foreach` ドライラン・ChainGuard で検査され、不合格なら 1 回だけ直させる。合格した定義は `<dir>/.proposals/<name>.json` に `status: proposed` で保存され、更新提案の間も承認済みの旧版で `run` できる。人手の `routine save`（CLI／ダッシュボード）は承認済み、MCP の `routine_save` は提案になる。詳細は `doc/routines.md` / `doc/routines-ja.md`。
+`routine ask` の依頼は `routine-ask` キューの worker ジョブとして登録され、`worker` LLM リスト（rank 順、故障中はスキップ、空なら既定エンジン＋警告）で実行される。 worker の出力は厳格 BT 検証・`foreach` ドライラン・ChainGuard で検査され、不合格なら 1 回だけ直させる。合格した定義は `<dir>/.proposals/<name>.json` に `status: proposed` で保存され、更新提案の間も承認済みの旧版で `run` できる。人手の `routine save`（CLI／ダッシュボード）は承認済み、MCP の `routine_save` は提案になる。詳細は `doc/obsoleted/routines.md` / `doc/obsoleted/routines-ja.md`。
 
 ### `escalate`（supervisor が呼ばれる唯一の場所）
 

@@ -14,11 +14,11 @@
 - **長時間・並列・対話型のジョブ**（ビルド、テスト、開発サーバー、TUI エージェント）を扱う人。チャットのセッションより長く動かしたい作業、依存関係やリトライのある決まった計画で進めたい作業、Claude 以外のワーカーが混ざる作業向けです。
 - **多数のエージェント端末を 1 つのダッシュボードで見ながら操作したい人**。タイムアウト、リトライ、依存関係を設定でき、ログは再起動後も残ります。
 
-**向いていないケース**: 短い推論やコード修正だけで、LLM のサブエージェントで足りている場合。トークンコストはどちらを使ってもほぼ同じです。Hancho で何が得られるか（耐久性、決定的な制御、可視性）は [サブエージェント vs. Hancho](doc/pros-cons-comparison-ja.md#トークンコストが決め手でなくなった今) を、全体は [Pros/Cons 比較](doc/pros-cons-comparison-ja.md) を参照してください。
+**向いていないケース**: 短い推論やコード修正だけで、LLM のサブエージェントで足りている場合。トークンコストはどちらを使ってもほぼ同じです。Hancho で何が得られるか（耐久性、決定的な制御、可視性）は [サブエージェント vs. Hancho](doc/obsoleted/pros-cons-comparison-ja.md#トークンコストが決め手でなくなった今) を、全体は [Pros/Cons 比較](doc/obsoleted/pros-cons-comparison-ja.md) を参照してください。
 
 ![Hancho Dashboard](doc/images/dashboard.jpg)
 
-ダッシュボードのプロセス一覧・タスクキュー一覧の下には **実行状態監視ペイン** があります。選択中のプロセスに追従し、目標、今何をしているか、TODO の進捗、ジョブの成功条件・試行回数・制限時間、経過時間付きの平易な活動履歴を表示します。JSON ストリーミング中のプロセスはプロセス一覧で `{}` が付きます。詳しくは [主な特徴](doc/features-ja.md) を参照してください。
+ダッシュボードのプロセス一覧・タスクキュー一覧の下には **実行状態監視ペイン** があります。選択中のプロセスに追従し、目標、今何をしているか、TODO の進捗、ジョブの成功条件・試行回数・制限時間、経過時間付きの平易な活動履歴を表示します。JSON ストリーミング中のプロセスはプロセス一覧で `{}` が付きます。詳しくは [主な特徴](doc/obsoleted/features-ja.md) を参照してください。
 
 ---
 
@@ -26,9 +26,9 @@
 
 Hancho には、1 コマンドだけ、順番のあるジョブのキュー、あるいはビヘイビアツリー全体を渡せます。各ステップは専用のタイムアウト・成功判定・リトライ・リソースロック・ログを持つ実際の端末プロセスとして実行され、結果だけが LLM に返ります。計画を決めるのは supervisor LLM、プロセスを所有するのは Hancho です。
 
-詳しくは [概要](doc/overview-ja.md) を参照してください。`run_worker`、ジョブ終了後の PC サスペンド、ビヘイビアツリー、安定したイベントとアダプター、Hancho をやめるとき（卒業）の手順をまとめています。
+詳しくは [概要](doc/obsoleted/overview-ja.md) を参照してください。`run_worker`、ジョブ終了後の PC サスペンド、ビヘイビアツリー、安定したイベントとアダプター、Hancho をやめるとき（卒業）の手順をまとめています。
 
-ビヘイビアツリーは名前付きの**ルーチン**として保存でき、`routine run <name>` で繰り返し実行できます（「全ターゲットをビルドして全スモークを走らせる」などの定型作業向け）。入力の変更や実行結果も自動で追跡します。詳しくは [ルーチン](doc/routines-ja.md)。
+ビヘイビアツリーは名前付きの**ルーチン**として保存でき、`routine run <name>` で繰り返し実行できます（「全ターゲットをビルドして全スモークを走らせる」などの定型作業向け）。入力の変更や実行結果も自動で追跡します。詳しくは [ルーチン](doc/obsoleted/routines-ja.md)。
 
 ### 実行ファイル
 
@@ -88,25 +88,25 @@ New-Item -ItemType Junction -Path .claude\skills\hancho -Target (Resolve-Path sk
 
 | ドキュメント | 内容 |
 | :--- | :--- |
-| [概要](doc/overview-ja.md) | 動作モデル、`run_worker`、サスペンド、ビヘイビアツリー、安定イベント、卒業 |
-| [スタート](doc/start-ja.md) | LLM エージェント向けクイックスタート、ビルド方法、`Hancho.exe` と `hancho-cli.exe` |
-| [主な特徴](doc/features-ja.md) | ダッシュボード GUI、シェル起動、履歴、トレイ、ログ、設定、タスクキュー概要 |
-| [トリアージ改善](doc/triage-improvements.md) | LLM 要約、目的セクション、読みやすさの改善 |
-| [CLI](doc/cli-ja.md) | `hancho-cli.exe` の使い方、stdin モード、完了通知 |
-| [タスクキュー](doc/taskqueue-ja.md) | 順序・依存・ジョブのフィールド・状態・ChainGuard |
-| [ビヘイビアツリー](doc/behavior-tree-ja.md) | BT の形式、ノードの種類、変数、ワーカーのエンジン、escalate、例 |
-| [ルーチン](doc/routines-ja.md) | 名前付き BT の繰り返し実行: `routine list/show/run/save/check`、実行 ID、stale/absorbed、triage、ダッシュボード |
-| [BT トークン削減ガイド](doc/behavior-tree-token-optimization-ja.md) | トークン削減アーキテクチャ、`compact: true`、軽量化パケット |
-| [BT 設計計画書](doc/behavior-tree-plan.md) | ビヘイビアツリーエンジンのアーキテクチャと実装計画 |
-| [MCP サーバー](doc/mcp-ja.md) | MCP 登録と MCP ツール |
-| [WCSP](doc/wcsp.md) | WinConsoleServer プロトコル（WCSP v1）: フレーミング、ハンドシェイク、フレーム、セッション、セキュリティ |
-| [データディレクトリ](doc/data-directory-ja.md) | プロジェクト内・git 管理の `--data-dir` |
-| [Pros/Cons](doc/pros-cons-comparison-ja.md) | サブエージェント等との使い分け |
-| [批判的比較](doc/critical-comparison-ja.md) | Hancho の限界と使うべきでないケースを辛口に整理 |
-| [競合比較](doc/competitive-comparison-ja.md) | エージェントフレームワークやメモリサービスとの位置づけ |
-| [Hancho v3 設計](doc/design-v3.md) | イベントスキーマとアダプター、ヘッドレス/リモート、意味的メモリ、失敗分析、卒業指針 |
-| [リリースチェックリスト](doc/release-checklist-ja.md) | リリースごとの卒業用機能対応表の見直しと片付けコマンドの確認 |
-| [CLI help 出力](doc/cli-help-ja.md) | `Hancho.exe --help` と `hancho-cli.exe help` の全文 |
+| [概要](doc/obsoleted/overview-ja.md) | 動作モデル、`run_worker`、サスペンド、ビヘイビアツリー、安定イベント、卒業 |
+| [スタート](doc/obsoleted/start-ja.md) | LLM エージェント向けクイックスタート、ビルド方法、`Hancho.exe` と `hancho-cli.exe` |
+| [主な特徴](doc/obsoleted/features-ja.md) | ダッシュボード GUI、シェル起動、履歴、トレイ、ログ、設定、タスクキュー概要 |
+| [トリアージ改善](doc/obsoleted/triage-improvements.md) | LLM 要約、目的セクション、読みやすさの改善 |
+| [CLI](doc/obsoleted/cli-ja.md) | `hancho-cli.exe` の使い方、stdin モード、完了通知 |
+| [タスクキュー](doc/obsoleted/taskqueue-ja.md) | 順序・依存・ジョブのフィールド・状態・ChainGuard |
+| [ビヘイビアツリー](doc/obsoleted/behavior-tree-ja.md) | BT の形式、ノードの種類、変数、ワーカーのエンジン、escalate、例 |
+| [ルーチン](doc/obsoleted/routines-ja.md) | 名前付き BT の繰り返し実行: `routine list/show/run/save/check`、実行 ID、stale/absorbed、triage、ダッシュボード |
+| [BT トークン削減ガイド](doc/obsoleted/behavior-tree-token-optimization-ja.md) | トークン削減アーキテクチャ、`compact: true`、軽量化パケット |
+| [BT 設計計画書](doc/obsoleted/behavior-tree-plan.md) | ビヘイビアツリーエンジンのアーキテクチャと実装計画 |
+| [MCP サーバー](doc/obsoleted/mcp-ja.md) | MCP 登録と MCP ツール |
+| [WCSP](doc/obsoleted/wcsp.md) | WinConsoleServer プロトコル（WCSP v1）: フレーミング、ハンドシェイク、フレーム、セッション、セキュリティ |
+| [データディレクトリ](doc/obsoleted/data-directory-ja.md) | プロジェクト内・git 管理の `--data-dir` |
+| [Pros/Cons](doc/obsoleted/pros-cons-comparison-ja.md) | サブエージェント等との使い分け |
+| [批判的比較](doc/obsoleted/critical-comparison-ja.md) | Hancho の限界と使うべきでないケースを辛口に整理 |
+| [競合比較](doc/obsoleted/competitive-comparison-ja.md) | エージェントフレームワークやメモリサービスとの位置づけ |
+| [Hancho v3 設計](doc/obsoleted/design-v3.md) | イベントスキーマとアダプター、ヘッドレス/リモート、意味的メモリ、失敗分析、卒業指針 |
+| [リリースチェックリスト](doc/obsoleted/release-checklist-ja.md) | リリースごとの卒業用機能対応表の見直しと片付けコマンドの確認 |
+| [CLI help 出力](doc/obsoleted/cli-help-ja.md) | `Hancho.exe --help` と `hancho-cli.exe help` の全文 |
 | [Hancho スキル](skills/hancho/SKILL.md) | Hancho をうまく使うためのエージェントスキル |
 | [tools/ww](tools/ww/README-ww.md) | 任意・独立のタスクカード実行テンプレート（Hancho の一部ではない） |
 
@@ -280,7 +280,7 @@ New-Item -ItemType Junction -Path .claude\skills\hancho -Target (Resolve-Path sk
 ### v0.9.17
 - **wct コンソールクライアント**: `wct.exe` は通常のコンソールから WCSP ターミナルサーバーへ接続します。`wct` でローカルの PowerShell、`wct <ジョブID>` で保持中のジョブに接続し、`--host/--port/--token/--shell` でリモートコアへ接続できます。`Ctrl+]` はデタッチ（ConPTY は継続）、`Ctrl+]` を2回で終了です。インストーラーは `hancho-cli.exe` の隣に `wct.exe` を追加し、PATH 設定も両方に適用します。
 - **セッション保持**: 切断しても ConPTY を停止しなくなりました。タブやウィンドウを閉じるときに **終了 / デタッチ / キャンセル** を選べます。終了はサーバー側の ConPTY を閉じ、デタッチは後から接続できるよう保持します。
-- **再接続一覧**: ターミナルクライアントは起動時と `ファイル > セッションに再接続...` で保持中セッションを一覧表示し、選択したジョブへ再接続します。WCSP 1.1 に `LIST_SESSIONS` / `SESSION_LIST` コントロールセッションを追加しました（`doc/wcsp.md`）。
+- **再接続一覧**: ターミナルクライアントは起動時と `ファイル > セッションに再接続...` で保持中セッションを一覧表示し、選択したジョブへ再接続します。WCSP 1.1 に `LIST_SESSIONS` / `SESSION_LIST` コントロールセッションを追加しました（`doc/obsoleted/wcsp.md`）。
 - **ターミナルクライアントのメニュー化**: 新規 / 接続 / リモート / 閉じるのツールバーボタンを削除しました。操作はファイルメニュー、タブの右クリック、`Ctrl+T` / `Ctrl+W` から行います。
 - **テーマ**: タブの背景と余白がシステム色ではなくダッシュボードのテーマ色に追従します。
 - **設定**: WinConsoleServer タブで WCSP 接続の一覧、トークンの再生成、セッションの切断ができます。
@@ -296,8 +296,8 @@ New-Item -ItemType Junction -Path .claude\skills\hancho -Target (Resolve-Path sk
 - **パース**: `sscanf` / `sscanf_s` を `src/parse_util.h` のヘルパーに置き換えました（MSVC C4996 警告なし）。
 
 ### v0.9.15
-- **トリアージ**: 失敗したタスクキュージョブ、BT のエスカレーション失敗、タスクに属さないプロセス失敗、見積もり乖離、リソース待ちのそれぞれに永続カードを作ります。Hancho が原因・背景・環境・条件・理由の情報、処置候補、決定論的な推奨を用意し、人がダッシュボード、`hancho-cli triage`、MCP の `triage_list` / `triage_get` / `triage_decide` から判断を選んで記録します。`triage_mode` で手動・半自動（既定。安全で高確信度の推奨は自動実行）・自動を選べ、任意の LLM 助言は非表示の `_triage` ジョブ、`triage handoff` は判断待ちカードを非表示の `_supervisor` キューのバッチ Supervisor に渡します。自然解消、フォロー、自動処置の確認、種別ごとのオン/オフに対応します。詳細は `doc/triage.md`。
-- **ターミナルセッション（WCSP）**: コアがすべての ConPTY ジョブを WinConsoleServer プロトコル（WCSP v1）で公開し、スタンドアロンのダッシュボードはローカル TCP リスナー（`config.json` の `terminal`）経由で接続します。ダッシュボードを閉じたり、タブを切り替えたり、切断してもジョブは停止しません。`terminal.remote` を有効にすると、別 PC の WinConsoleTerminal から `attach:<id>` で接続できます。暗号化なしのプレーン TCP なので信頼できる LAN でのみ使ってください。詳細は `doc/features-ja.md`。
+- **トリアージ**: 失敗したタスクキュージョブ、BT のエスカレーション失敗、タスクに属さないプロセス失敗、見積もり乖離、リソース待ちのそれぞれに永続カードを作ります。Hancho が原因・背景・環境・条件・理由の情報、処置候補、決定論的な推奨を用意し、人がダッシュボード、`hancho-cli triage`、MCP の `triage_list` / `triage_get` / `triage_decide` から判断を選んで記録します。`triage_mode` で手動・半自動（既定。安全で高確信度の推奨は自動実行）・自動を選べ、任意の LLM 助言は非表示の `_triage` ジョブ、`triage handoff` は判断待ちカードを非表示の `_supervisor` キューのバッチ Supervisor に渡します。自然解消、フォロー、自動処置の確認、種別ごとのオン/オフに対応します。詳細は `doc/obsoleted/triage.md`。
+- **ターミナルセッション（WCSP）**: コアがすべての ConPTY ジョブを WinConsoleServer プロトコル（WCSP v1）で公開し、スタンドアロンのダッシュボードはローカル TCP リスナー（`config.json` の `terminal`）経由で接続します。ダッシュボードを閉じたり、タブを切り替えたり、切断してもジョブは停止しません。`terminal.remote` を有効にすると、別 PC の WinConsoleTerminal から `attach:<id>` で接続できます。暗号化なしのプレーン TCP なので信頼できる LAN でのみ使ってください。詳細は `doc/obsoleted/features-ja.md`。
 - **ダッシュボード**: 判断待ちのタスク／プロセスと未確認の自動処置をトリアージ KPI に表示し、タスク一覧に Triage 列を追加しました。設定ダイアログに **WinConsoleServer** タブ（ローカル／リモート接続のオンオフ）と **トリアージ** タブ（モード・LLM モード・種別スイッチ）を追加しました。
 - **ガント**: 範囲ボタンが時間範囲ではなく直近 3 / 5 / 10 ジョブ（既定 10）を選ぶようになり、ジョブが少なくても表示が変わります。
 - **コア起動**: 起動中のコアを最大 30 秒待ち、自動起動に失敗した後は 60 秒間再試行を抑止し、ダッシュボードを呼び出し元のプロセスツリー外で起動します。コアの二重起動や大量のプロセス発生を防ぎます。
@@ -326,13 +326,13 @@ New-Item -ItemType Junction -Path .claude\skills\hancho -Target (Resolve-Path sk
 - **既定値**: ニックネームは `noname`、エージェント名は `<nickname>-llm` を自動生成し、送信元名に使います。
 
 ### v0.9.11
-- **Chat**: IPMsg 互換機能の名称を Chat に統一しました。`hancho-cli chat`（別名 `msg`）、MCP の `chat_*` ツール、単体 `Hancho.exe chat` ウインドウ、ダッシュボードのツールバーが対象です。`doc/ipmsg-ja.md` は `doc/chat-ja.md` になりました。
+- **Chat**: IPMsg 互換機能の名称を Chat に統一しました。`hancho-cli chat`（別名 `msg`）、MCP の `chat_*` ツール、単体 `Hancho.exe chat` ウインドウ、ダッシュボードのツールバーが対象です。`doc/ipmsg-ja.md` は `doc/obsoleted/chat-ja.md` になりました。
 - **MCP `chat_handler`**: 受信 Chat に応答する LLM を表示・変更できます（エンジン、モデル、エージェント、cwd、指示、タスクキュー、自動返信、タイムアウト、最大ホップ数、同時実行数）。
 - **Chat の信頼性**: ノード再起動を直列化し、未信頼のメッセージ本文を明確な区切りで囲んでから応答 LLM に渡すようにしました。旧 `ipmsg` のメッセージデータは `chat` へ移動します。
 - **ドキュメント**: CLI・MCP・機能ドキュメントを Chat に合わせて更新しました。
 
 ### v0.9.10
-- **Chat（IPMsg 互換）**: コアが古典的な IPMsg プロトコル（参加通知、メッセージ、開封通知、通常ファイル転送）を UDP/TCP ポート 2426 で話します。既定では無効です。LLM 同士のメッセージング用に `from_agent` / `to_agent` / `reply_to`、`audience`（human / agent）、ホップ数ガードを追加し、ワーカー LLM のハンドラが自動返信します。`hancho-cli chat`（別名 `msg`）、MCP の `chat_*` ツール（応答 LLM を変える `chat_handler` を含む）、単体ダイアログ（`Hancho.exe chat [--tray]`、ダッシュボードのツールバーからも起動可）とトレイ通知を利用できます。詳細は `doc/chat-ja.md`。
+- **Chat（IPMsg 互換）**: コアが古典的な IPMsg プロトコル（参加通知、メッセージ、開封通知、通常ファイル転送）を UDP/TCP ポート 2426 で話します。既定では無効です。LLM 同士のメッセージング用に `from_agent` / `to_agent` / `reply_to`、`audience`（human / agent）、ホップ数ガードを追加し、ワーカー LLM のハンドラが自動返信します。`hancho-cli chat`（別名 `msg`）、MCP の `chat_*` ツール（応答 LLM を変える `chat_handler` を含む）、単体ダイアログ（`Hancho.exe chat [--tray]`、ダッシュボードのツールバーからも起動可）とトレイ通知を利用できます。詳細は `doc/obsoleted/chat-ja.md`。
 - **ダッシュボードのホバー**: プロセス・タスク・実行モニタ・ヒント履歴の一覧と JSON ツリーで、省略表示されたセルの全文をツールチップで表示します。
 - **WebUI 設定**: 設定 → 管理タブにポート入力（1〜65535）と、LAN アドレスとセッショントークンを含む読み取り専用のアクセス URL を追加しました。
 - **ダッシュボードのガント**: 6h / 12h / 24h / All の範囲ボタンを追加し、目盛りラベルをローカル時刻の時・日の境界に配置しました。
@@ -354,17 +354,17 @@ New-Item -ItemType Junction -Path .claude\skills\hancho -Target (Resolve-Path sk
 - **`taskqueue list` に `resource_wait`**: 待機中のジョブがどのジョブのどのリソースを待っているかを、`taskqueue graph` と同じく一覧でも返します。
 - **Supervisor ヒントウインドウ**: コピー用プロンプトのコマンドを実在するもの（`taskqueue why` / `retry`、`bt get --id`、`bt resume`）に修正。ビヘイビアツリーのエスカレーションを再び検出します。複数の見積もり乖離・失敗・リソース待ちを順に表示し、表示中のヒントは自動では差し替えず、条件が再発したものは再び表示します。
 - **ヘルプ**: `hancho-cli help` に AUDIT 節、`help --json` に `agent.audit` を追加。`taskqueue add` の任意項目に `estimateSec` を記載。
-- **ドキュメント**: Audit LLM の実装設計書（`doc/audit-llm-design.md`）。
+- **ドキュメント**: Audit LLM の実装設計書（`doc/obsoleted/audit-llm-design.md`）。
 
 ### v0.9.6
-- **Audit LLM / Supervisor フィードバック（プレビュー）**: `estimateSec` を持つジョブは、実実行時間・比率・`accurate` / `diverged_over` / `diverged_under`・具体的な助言を含む `timing_feedback` を返すようになりました。Windows ダッシュボードには見積もり乖離を知らせる Supervisor ガイダンス・ヒントウインドウを追加し、修正用プロンプトのワンクリックコピーと自動消去に対応。詳細は `doc/audit-llm-ja.md`。
+- **Audit LLM / Supervisor フィードバック（プレビュー）**: `estimateSec` を持つジョブは、実実行時間・比率・`accurate` / `diverged_over` / `diverged_under`・具体的な助言を含む `timing_feedback` を返すようになりました。Windows ダッシュボードには見積もり乖離を知らせる Supervisor ガイダンス・ヒントウインドウを追加し、修正用プロンプトのワンクリックコピーと自動消去に対応。詳細は `doc/obsoleted/audit-llm-ja.md`。
 - **WebUI 公開設定**: `<data-dir>/config.json` の `webui` で `enabled`、`scope`（`loopback` / `lan` / `custom`）、`host`、`port`、`allowed_hosts`、`allowed_origins` を設定できます。既定はループバック専用のまま。LAN モードは `0.0.0.0` にバインドし、トークン認証を維持しつつ、IP リテラルと設定したホスト名を許可します。`config_set` で即時反映。設定 → 管理タブから有効/無効、公開範囲、許可ホストを変更できます。
 - **ヘルプとスモークテスト**: `hancho-cli help` に、`start` はプロセスでありタスクではないこと、タスク一覧とモデル別使用量には `taskqueue add` / `run` / `bt start` が必要であることを明記。`fileExists` は末尾要素の glob に対応。v0.9.5 レビューの 5 件（cli_top_smoke 登録、BT IPC のストリーミングとデータディレクトリ分離、headless の待機/エンコーディング、タイムスタンプ競合、イベントスキーマのパス）を修正。
 - **ドキュメント**: Audit LLM 仕様、機能表の更新、アーキテクチャ画像の差し替え。
 
 ### v0.9.5
-- **ブラウザダッシュボード**: `hancho-cli web` で、プロセス / キュー / 監視 / 失敗診断 / メモリの各画面を持つ HTTP + WebSocket ダッシュボード（127.0.0.1:9138、トークン認証）を開けます。`doc/browser-ui-ja.md` を参照。
-- **対話 TUI**: `hancho-cli top` が 5 タブ、行移動、停止 / 再試行 / 取消、リモートジョブ、`--once --json` を備えた端末ダッシュボードになりました。外部 curses 依存はありません。`doc/tui-design-ja.md` を参照。
+- **ブラウザダッシュボード**: `hancho-cli web` で、プロセス / キュー / 監視 / 失敗診断 / メモリの各画面を持つ HTTP + WebSocket ダッシュボード（127.0.0.1:9138、トークン認証）を開けます。`doc/obsoleted/browser-ui-ja.md` を参照。
+- **対話 TUI**: `hancho-cli top` が 5 タブ、行移動、停止 / 再試行 / 取消、リモートジョブ、`--once --json` を備えた端末ダッシュボードになりました。外部 curses 依存はありません。`doc/obsoleted/tui-design-ja.md` を参照。
 - **リモートホストの完成**: 1 本の WebSocket で要求を多重化し、ログ / イベントを seq 再開付きで配信。ローカルダッシュボード再起動後もリモート試行へ再接続し、`success.filesNewer` はリモートホスト側の時計で評価します。
 - **長期使用量集計**: 日次 / 月次の `hancho.usage.day/1` ロールアップ、`hancho-cli usage stats|export|compact`、MCP `usage_stats` / `usage_export`、IPC `get_usage_daily`、ダッシュボードの期間選択。エンジン / モデル別の帰属は、JSON ストリームを出し `--model` を受け取るタスクキュー / ビヘイビアツリージョブから記録されます。
 - **メモリ運用**: 外部ランカープラグイン（失敗時は BM25 に自動フォールバック）、`memory_max_bytes` 上限付きの `memory prune`、設定したワーカーによる L3 昇格、タスクキュー外の通常実行を L1 記録にする仕組み（`taskqueue record-plain`、`memory rebuild`）。
@@ -374,12 +374,12 @@ New-Item -ItemType Junction -Path .claude\skills\hancho -Target (Resolve-Path sk
 ### v0.9.4
 - **意味的メモリ**: L1 実行記録、L2 ノート、L3 承認済み知識を `memory/` に保存。`hancho-cli memory search|get|brief|stats|note|approve|rebuild|prune` と MCP `memory_search` / `memory_get` / `memory_brief` / `memory_stats` / `memory_note` / `memory_retract`。`{memory}` で上限付きの brief を注入し、渡した id を試行に記録します。
 - **失敗分析**: 試行ごとに決定的な診断（分類、確信度、要約、証拠、直前の活動、推奨アクション）。`hancho-cli taskqueue why <id>`、MCP のタスク結果、BT の条件から参照でき、再試行方針を分類ごとに変えられます。
-- **ヘッドレス / POSIX / リモートの基礎**: `Hancho.exe --headless`、`hancho-cli run --exit-on-drain --report junit.xml`、POSIX ビルドとプラットフォーム境界、`hosts.json` とリモートジョブのミラー。初期段階です（`doc/build-posix.md`、`doc/remote-hosts.md`）。
+- **ヘッドレス / POSIX / リモートの基礎**: `Hancho.exe --headless`、`hancho-cli run --exit-on-drain --report junit.xml`、POSIX ビルドとプラットフォーム境界、`hosts.json` とリモートジョブのミラー。初期段階です（`doc/obsoleted/build-posix.md`、`doc/obsoleted/remote-hosts.md`）。
 - **卒業**: キュー / BT / 知識の `hancho-cli export`、`mcp uninstall`、`agent uninstall-template`、リリースチェックリスト。
 - **ETA と paused 起動**: ジョブが `estimateSec` を受け取り、ダッシュボードがタイムアウトではなくカード見積を残り時間に表示。`bt start --paused true` はジョブを作らずにツリーを登録します。
 
 ### v0.9.3
-- **旧ストリーム形式の非推奨化**: `hancho-cli worker stream` と MCP `get_worker_stream` は既定で `hancho.event/1` を返します。旧 `type` 文字列は `--schema legacy` / `schema: "legacy"` で v0.10.x まで利用でき、v0.11.0 で削除します。[移行手順](doc/LLM-jsonstream-format.md#legacy-type-strings-and-migration-to-hanchoevent1)を参照してください。
+- **旧ストリーム形式の非推奨化**: `hancho-cli worker stream` と MCP `get_worker_stream` は既定で `hancho.event/1` を返します。旧 `type` 文字列は `--schema legacy` / `schema: "legacy"` で v0.10.x まで利用でき、v0.11.0 で削除します。[移行手順](doc/obsoleted/LLM-jsonstream-format.md#legacy-type-strings-and-migration-to-hanchoevent1)を参照してください。
 - **BT 全体のタスク一覧**: `hancho-cli bt tasks --id <id>`、`taskqueue list --bt <id>`、MCP `taskqueue_list` の `bt` で、ビヘイビアツリーの全ジョブを並列分岐のキューをまたいで一覧できます。並列分岐は専用キュー（と専用の並列度）を保ち、ダッシュボードは元々すべてのキューをまとめて表示します。
 
 ### v0.9.2
@@ -397,7 +397,7 @@ New-Item -ItemType Junction -Path .claude\skills\hancho -Target (Resolve-Path sk
 - **ProcessCommander 2.9.x から Hancho 0.9.0 へ改名**: 製品名、実行ファイル（`Hancho.exe`）、GUI ウィンドウクラス、Named Pipe / ミューテックス名、既定のデータフォルダ（`.hancho`）、MCP サーバー名（`hancho`）、環境変数 `HANCHO_LOG_DIR` を Hancho に変更しました。コンソールクライアントは `pcder.exe` から `hancho-cli.exe` に改名しました。旧 `.processcommander` のデータや旧パイプ・ミューテックス名は自動移行しません。必要に応じて `--data-dir` で新しく作成してください。
 
 ### v2.9.3
-- **どのセッションが追加したタスクか分かるように**: タスクキューの各ジョブに発行元（エージェントのセッション id、Claude デスクトップのセッション id、MCP クライアント、作業フォルダ、プロセス id）を記録します。MCP の `taskqueue_add`、`hancho-cli taskqueue add`、ビヘイビアツリーで自動的に入ります。`originLabel`、`--origin-label`、`PC_ORIGIN_LABEL` で作業に名前を付けられます。ダッシュボードの新しい **発行元** 列に表示され（マウスを乗せると全項目）、`taskqueue_list` の `origin: "self"`（`hancho-cli taskqueue list --origin self`）で自分のセッションのジョブだけを一覧できます。詳しくは [doc/taskqueue-ja.md](doc/taskqueue-ja.md) を参照してください。
+- **どのセッションが追加したタスクか分かるように**: タスクキューの各ジョブに発行元（エージェントのセッション id、Claude デスクトップのセッション id、MCP クライアント、作業フォルダ、プロセス id）を記録します。MCP の `taskqueue_add`、`hancho-cli taskqueue add`、ビヘイビアツリーで自動的に入ります。`originLabel`、`--origin-label`、`PC_ORIGIN_LABEL` で作業に名前を付けられます。ダッシュボードの新しい **発行元** 列に表示され（マウスを乗せると全項目）、`taskqueue_list` の `origin: "self"`（`hancho-cli taskqueue list --origin self`）で自分のセッションのジョブだけを一覧できます。詳しくは [doc/obsoleted/taskqueue-ja.md](doc/obsoleted/taskqueue-ja.md) を参照してください。
 - **ビヘイビアツリーの応答のトークンを削減**: ツリー全体を返すのは `bt_get` だけになりました。ほかの BT ツールと `bt_wait` の `compact: true` はツリーを省き、長い変数値とプロンプトは先頭部分だけになります。escalate の `include` に `lines` と `maxBytes` を指定できます。ワーカーのノードに `outputSchema` が渡されるようになりました。
 
 ### v2.9.1
@@ -405,7 +405,7 @@ New-Item -ItemType Junction -Path .claude\skills\hancho -Target (Resolve-Path sk
 - **長く待てて取り消せる待機**: MCP の `bt_wait` は既定で最大 10 分待ちます（`timeoutMs` を負にすると無制限）。待っている間もほかの MCP 呼び出しに応答し、`notifications/cancelled` で約 2 秒以内に止まります。`hancho-cli bt wait` の既定は 60 秒のままです。
 
 ### v2.9.0
-- **ビヘイビアツリー**: 監督役の LLM が、複数手順の作業全体（分岐、ビルド修正ループ、リトライ、条件の確認、ワーカー LLM の手順、判断）を 1 つの JSON のツリーとして `bt_start` で渡せるようになりました。Hancho がツリーを実行し、各手順を普通のタスクキューのジョブとして追加します。LLM が呼ばれるのは `escalate` の判断と終了時だけです。MCP ツール `bt_validate`, `bt_start`, `bt_get`, `bt_list`, `bt_wait`, `bt_resume`, `bt_retry`, `bt_update`, `bt_cancel`, `bt_pause` と `hancho-cli bt ...` コマンドを追加しました。詳しくは [ビヘイビアツリー](#ビヘイビアツリー-次に何をするかの判断を-hancho-の中で行う) と [doc/behavior-tree-ja.md](doc/behavior-tree-ja.md) を参照してください。
+- **ビヘイビアツリー**: 監督役の LLM が、複数手順の作業全体（分岐、ビルド修正ループ、リトライ、条件の確認、ワーカー LLM の手順、判断）を 1 つの JSON のツリーとして `bt_start` で渡せるようになりました。Hancho がツリーを実行し、各手順を普通のタスクキューのジョブとして追加します。LLM が呼ばれるのは `escalate` の判断と終了時だけです。MCP ツール `bt_validate`, `bt_start`, `bt_get`, `bt_list`, `bt_wait`, `bt_resume`, `bt_retry`, `bt_update`, `bt_cancel`, `bt_pause` と `hancho-cli bt ...` コマンドを追加しました。詳しくは [ビヘイビアツリー](#ビヘイビアツリー-次に何をするかの判断を-hancho-の中で行う) と [doc/obsoleted/behavior-tree-ja.md](doc/obsoleted/behavior-tree-ja.md) を参照してください。
 - **ワーカーのエンジン**: `worker` の手順は、エンジン（`claude`, `agy`, `opencode`, `codex`、またはデータディレクトリの `engines.json` の独自定義）とモデルで指定します。確認なしで動かすための引数はエンジン定義の側だけに置きます。
 - **ビヘイビアツリーの表示**: ツールバーの **BT** ボタン（Ctrl+Shift+B）か、タスクの右クリックメニュー「ビヘイビアツリーで表示」で、各ツリー、どのノードがどのタスクを起動したか、どこまで進んだかを表示します。実行中のツリーが上に来て、24 時間より前に終わったツリーは「すべて表示」をオンにしない限り隠れます。
 - **LLM 向けの help**: `Hancho.exe --help`、`hancho-cli help`、`hancho-cli help --json` に、ジョブを手で足す代わりにビヘイビアツリーを使う場面と使い方を書きました。

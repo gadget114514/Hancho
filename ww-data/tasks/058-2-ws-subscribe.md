@@ -10,7 +10,7 @@ Parent: 058-remote-stream.md
 
 ## 目的
 
-リモートのログとイベントの追記を、手元に順序どおり流し続ける（`doc/design-v3.md` 2.5）。
+リモートのログとイベントの追記を、手元に順序どおり流し続ける（`doc/obsoleted/design-v3.md` 2.5）。
 
 ## やること
 
@@ -23,8 +23,8 @@ Parent: 058-remote-stream.md
 
 ## 参照
 
-- `doc/design-v3.md` 2.5
-- `doc/remote-hosts.md`
+- `doc/obsoleted/design-v3.md` 2.5
+- `doc/obsoleted/remote-hosts.md`
 - 親カード `ww-data/tasks/058-remote-stream.md`
 
 ## Authorised edits
@@ -35,8 +35,8 @@ Parent: 058-remote-stream.md
 
 ## Read-only
 
-- `doc/design-v3.md`
-- `doc/design-v3-en.md`
+- `doc/obsoleted/design-v3.md`
+- `doc/obsoleted/design-v3-en.md`
 
 ## 検証
 

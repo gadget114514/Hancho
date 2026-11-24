@@ -10,7 +10,7 @@ Parent: 061-linux-gui.md
 
 ## 目的
 
-作ったブラウザ UI を第三者が導入できる形に文書でまとめる（`doc/design-v3-todo.md` 8）。
+作ったブラウザ UI を第三者が導入できる形に文書でまとめる（`doc/obsoleted/design-v3-todo.md` 8）。
 
 ## やること
 
@@ -22,7 +22,7 @@ Parent: 061-linux-gui.md
 
 ## 参照
 
-- `doc/design-v3-todo.md` 8
+- `doc/obsoleted/design-v3-todo.md` 8
 - 親カード `ww-data/tasks/061-linux-gui.md`
 
 ## Authorised edits
@@ -31,8 +31,8 @@ Parent: 061-linux-gui.md
 
 ## Read-only
 
-- `doc/design-v3.md`
-- `doc/design-v3-en.md`
+- `doc/obsoleted/design-v3.md`
+- `doc/obsoleted/design-v3-en.md`
 
 ## 検証
 

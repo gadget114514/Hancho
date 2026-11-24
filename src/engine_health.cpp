@@ -1,4 +1,4 @@
-// Shared engine health registry (doc/HanchoExpectations.md 8.6).
+// Shared engine health registry (doc/obsoleted/HanchoExpectations.md 8.6).
 
 #include "engine_health.h"
 #include "worker_probe.h"

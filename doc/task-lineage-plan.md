@@ -119,7 +119,7 @@ Hancho 経由で worker に実装させる。worker は claude / haiku。haiku �
 | 100-7 | やり直しジョブを追加する経路で `supersedes` を自動で付ける（`taskqueue retry` 系・トリアージ）。skill に「先にタスクを作る・判断は `task note`」を書く | 未決定 1 待ち |
 | 100-8 | 繰り返し失敗の警告とトリアージカード | 未着手 |
 | 100-9 | Web UI の一覧 | 未決定 2 待ち |
-| 100-10 | ドキュメント・ヘルプ・スキル更新（`doc/cli*.md`、`doc/mcp*.md`、`doc/taskqueue*.md`、`doc/hancho-taskqueue-spec.md`、`cli.cpp` のヘルプ出力、skill） | 未着手 |
+| 100-10 | ドキュメント・ヘルプ・スキル更新（`doc/cli*.md`、`doc/mcp*.md`、`doc/taskqueue*.md`、`doc/obsoleted/hancho-taskqueue-spec.md`、`cli.cpp` のヘルプ出力、skill） | 未着手 |
 
 ## 懸念
 

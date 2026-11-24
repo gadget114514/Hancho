@@ -1,6 +1,6 @@
 #pragma once
 
-// Worker permission list (<effective data dir>/permits.json), doc/HanchoExpectations.md 8.8.
+// Worker permission list (<effective data dir>/permits.json), doc/obsoleted/HanchoExpectations.md 8.8.
 // Pure logic only: no GUI, no IPC, no process launching. Callers pass a path so this
 // module stays trivially testable, mirroring src/llm_config.h (091-3).
 

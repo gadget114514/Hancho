@@ -1,6 +1,6 @@
 #pragma once
 
-// Tier 1 declarative adapters (doc/design-v3.md 1.4): a JSON description of how to turn one line
+// Tier 1 declarative adapters (doc/obsoleted/design-v3.md 1.4): a JSON description of how to turn one line
 // of a CLI's JSON output into a hancho.event/1 event. No C++ is needed to add a CLI.
 //
 // Adapter files live at <data-dir>/adapters/<name>.json and are selected by the process agent type.

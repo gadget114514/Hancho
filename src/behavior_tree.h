@@ -1,6 +1,6 @@
 #pragma once
 
-// Core Behavior Tree (BT) engine for Hancho (doc/behavior-tree-plan.md).
+// Core Behavior Tree (BT) engine for Hancho (doc/obsoleted/behavior-tree-plan.md).
 // Pure logic only: no GUI, no IPC, no process launching, no dependency on TaskQueueManager.
 
 #include "worker_engines.h"
@@ -177,7 +177,7 @@ struct BtWorkerDefaults {
     std::string model;
 };
 
-// Tree-level defaults (doc/HanchoExpectations.md 8.2). A node's explicit values always win,
+// Tree-level defaults (doc/obsoleted/HanchoExpectations.md 8.2). A node's explicit values always win,
 // including an explicit 0. `configured` on the idle fields means the default block was present.
 struct BtDefaults {
     BtWorkerDefaults worker;       // engine/model from the top-level "worker" block
@@ -193,7 +193,7 @@ struct BtDefaults {
     bool hasJobIdle() const { return jobIdle.configured; }
 };
 
-// A non-fatal lint finding from `bt validate` (doc/HanchoExpectations.md 8.4). Warnings never
+// A non-fatal lint finding from `bt validate` (doc/obsoleted/HanchoExpectations.md 8.4). Warnings never
 // fail validation; --strict turns them into errors.
 struct BtWarning {
     std::string path;
@@ -307,7 +307,7 @@ public:
                        const std::string& failDetail = "");
 
     // As above, with the taskqueue failure diagnostic JSON for the finished attempt. The
-    // diagnostic fields become ${<node>.failureClass} etc. (doc/HanchoExpectations.md 8.1).
+    // diagnostic fields become ${<node>.failureClass} etc. (doc/obsoleted/HanchoExpectations.md 8.1).
     void OnJobFinished(const std::string& jobId,
                        bool succeeded,
                        int exitCode,

@@ -114,7 +114,7 @@ struct TaskQueueDependency {
     std::string on;
 };
 
-// Declared resources (doc/resource-locks.md). "@name" is a named lock; anything else is a
+// Declared resources (doc/obsoleted/resource-locks.md). "@name" is a named lock; anything else is a
 // path or glob, resolved against the job's cwd when relative. Jobs whose resources conflict
 // (write/write or write/read) never run at the same time.
 struct TaskQueueResources {
@@ -135,7 +135,7 @@ bool FindResourceConflict(const TaskQueueResources& a, const std::string& cwdA,
                           const TaskQueueResources& b, const std::string& cwdB,
                           std::string& outResource);
 // Same, but a resource on hostA never conflicts with the same path on hostB
-// (doc/design-v3.md 2.5: locks are per host).
+// (doc/obsoleted/design-v3.md 2.5: locks are per host).
 bool FindResourceConflict(const TaskQueueResources& a, const std::string& cwdA,
                           const std::string& hostA,
                           const TaskQueueResources& b, const std::string& cwdB,
@@ -143,7 +143,7 @@ bool FindResourceConflict(const TaskQueueResources& a, const std::string& cwdA,
                           std::string& outResource);
 
 // ---------------------------------------------------------------------------
-// Failure diagnostics (doc/design-v3.md 4.2-4.4)
+// Failure diagnostics (doc/obsoleted/design-v3.md 4.2-4.4)
 //
 // One record per attempt. The classifier is an ordered rule chain evaluated from
 // the top: the first matching rule wins, so the same input always yields the same
@@ -171,7 +171,7 @@ struct TaskQueueFailureActivity {
     bool Present() const { return !activity.empty() || !target.empty(); }
 };
 
-// An LLM guess is advisory only (doc/design-v3.md 4.4). It is kept apart from the
+// An LLM guess is advisory only (doc/obsoleted/design-v3.md 4.4). It is kept apart from the
 // deterministic fields and is never consulted by DecideTaskQueueRetry.
 struct TaskQueueFailureLlmGuess {
     std::string failureClass;
@@ -211,7 +211,7 @@ struct TaskQueueFailureDiagnostic {
     bool Empty() const { return failureClass.empty(); }
 };
 
-// One rule from <data-dir>/failure-rules.json (doc/design-v3.md 4.4). Rules are evaluated
+// One rule from <data-dir>/failure-rules.json (doc/obsoleted/design-v3.md 4.4). Rules are evaluated
 // in file order before the built-in chain, so an external rule can add a class or take
 // precedence over a built-in one with the same class. Every condition in `when` must hold.
 struct TaskQueueFailureRule {
@@ -320,14 +320,14 @@ std::vector<TaskQueueFailureRule> LoadTaskQueueFailureRules(const std::string& p
 
 // Deterministic, ordered rules. Returns a record with suggestedAction and evidence filled in.
 TaskQueueFailureDiagnostic ClassifyTaskQueueFailure(const TaskQueueFailureInput& input);
-// The JSON shape stored on an attempt and attached to job events (doc/design-v3.md 4.3).
+// The JSON shape stored on an attempt and attached to job events (doc/obsoleted/design-v3.md 4.3).
 std::string TaskQueueFailureDiagnosticToJson(const TaskQueueFailureDiagnostic& diagnostic);
 
 // True when the deterministic rules left the failure undecided (unknown / low confidence).
 bool TaskQueueFailureNeedsLlmGuess(const TaskQueueFailureDiagnostic& diagnostic);
 // Builds the evidence-only packet handed to an existing `escalate` node. Returns "" when
 // the deterministic rules already decided. The packet never includes instructions, env,
-// command text or anything else the LLM should not see (doc/design-v3.md 4.4).
+// command text or anything else the LLM should not see (doc/obsoleted/design-v3.md 4.4).
 std::string BuildTaskQueueFailureEscalationPacket(const TaskQueueFailureInput& input,
                                                   const TaskQueueFailureDiagnostic& diagnostic);
 // Stores an escalate answer in the advisory `llmGuess` field with confidence "low".
@@ -343,7 +343,7 @@ struct TaskQueueAttempt {
     // remoteProcessId is the process id on that host.
     std::string remoteHost;
     int remoteProcessId = 0;
-    // Remote job tracking (doc/design-v3.md 2.5, 056-1).
+    // Remote job tracking (doc/obsoleted/design-v3.md 2.5, 056-1).
     std::string remoteJobId;
     int remoteAttempt = 0;
     std::string start;
@@ -358,7 +358,7 @@ struct TaskQueueAttempt {
     TestReportSummary testReportSummary;
     // Memory ids handed to this attempt (memory_brief). Empty when injection is off.
     std::vector<std::string> memoryRefs;
-    // Per-attempt diagnosis (doc/design-v3.md 4.3). Empty for a succeeded attempt.
+    // Per-attempt diagnosis (doc/obsoleted/design-v3.md 4.3). Empty for a succeeded attempt.
     TaskQueueFailureDiagnostic failure;
     // Transient (not persisted): launch wall clock used by filesNewer checks.
     uint64_t startFiletime = 0;
@@ -381,7 +381,7 @@ struct TaskQueueDefer {
     int limit = 60;
 };
 
-// Retry policy by failure class (doc/design-v3.md 4.5). When the job omits "retry",
+// Retry policy by failure class (doc/obsoleted/design-v3.md 4.5). When the job omits "retry",
 // configured stays false and every failure retries up to maxAttempts (legacy behaviour).
 // With "retry", "never" wins over "on"; an empty "on" allows every class that is not in
 // "never". rate_limited waits for the reset like TaskQueueDefer and does not use up
@@ -404,7 +404,7 @@ struct TaskQueueRetryDecision {
     bool consumesAttempt = true;
 };
 
-// Memory injection (doc/design-v3.md 3.9). Off unless inject is true.
+// Memory injection (doc/obsoleted/design-v3.md 3.9). Off unless inject is true.
 struct TaskQueueMemory {
     bool inject = false;
     int budgetChars = 1500;
@@ -438,7 +438,7 @@ enum TaskQueueCaller {
     External = 1,
 };
 
-// Minimal state of an execution outside a task queue (doc/design-v3.md §7, card 072-1).
+// Minimal state of an execution outside a task queue (doc/obsoleted/design-v3.md §7, card 072-1).
 struct PlainRunState {
     std::string jobId;
     int attempt = 1;
@@ -592,7 +592,7 @@ inline bool SavePlainRunStateDirect(const PlainRunState& state, std::string& out
     return true;
 }
 
-// Decision record written when a supervisor takes a job over (doc/HanchoExpectations.md 7.5 D2).
+// Decision record written when a supervisor takes a job over (doc/obsoleted/HanchoExpectations.md 7.5 D2).
 // `reason` is why the job was taken over; `completionReason` is the reason given to taskqueue_complete.
 struct TaskQueueTakeoverInfo {
     bool present = false;
@@ -681,7 +681,7 @@ struct TaskQueueJob {
 };
 
 // ---------------------------------------------------------------------------
-// One-shot CI runs (doc/design-v3.md 2.3)
+// One-shot CI runs (doc/obsoleted/design-v3.md 2.3)
 //
 // `hancho-cli run --file queue.json --exit-on-drain --report junit.xml` waits until the
 // queue has no pending/running jobs, then maps the final states to one exit code and a
@@ -850,7 +850,7 @@ inline TaskQueueRunJob TaskQueueRunJobFromJson(const nlohmann::json& job) {
     return out;
 }
 
-// Deterministic retry decision for one classified failure (doc/design-v3.md 4.5).
+// Deterministic retry decision for one classified failure (doc/obsoleted/design-v3.md 4.5).
 // countedAttempts excludes interrupted/deferred attempts. allowRateLimitWait=false is
 // used once defer.limit has been reached, so the class counts as an ordinary failure.
 TaskQueueRetryDecision DecideTaskQueueRetry(const TaskQueueJob& job, const std::string& failureClass,
@@ -867,7 +867,7 @@ struct TaskQueue {
     std::vector<TaskQueueJob> jobs;
 };
 
-// Remote dispatch (doc/design-v3.md 2.5). The IPC layer installs these; the task
+// Remote dispatch (doc/obsoleted/design-v3.md 2.5). The IPC layer installs these; the task
 // queue itself stays free of networking so it can be tested headlessly and the
 // same scheduler works on Windows and POSIX. Without callbacks a job with a
 // host fails to launch instead of silently running locally.
@@ -916,7 +916,7 @@ public:
     // Installed by IpcServer. Passing empty callbacks makes remote jobs fail to launch.
     void SetRemoteCallbacks(RemoteStartCallback start, RemotePollCallback poll,
                             RemoteKillCallback kill);
-    // Reconnect to remote jobs that were running when Hancho restarted (doc/design-v3.md 2.5).
+    // Reconnect to remote jobs that were running when Hancho restarted (doc/obsoleted/design-v3.md 2.5).
     void ReconnectRemoteJobs();
 
     // Task queue operations. Each returns a complete JSON response string
@@ -1019,7 +1019,7 @@ public:
 
     int64_t GetTaskQueueVersion(const std::string& taskqueue) const;
 
-    // Resource locks (doc/resource-locks.md). On by default; when off, declared resources are
+    // Resource locks (doc/obsoleted/resource-locks.md). On by default; when off, declared resources are
     // kept but ignored by the scheduler.
     void SetResourceLocksEnabled(bool enabled);
     bool GetResourceLocksEnabled() const { return resourceLocksEnabled_.load(); }
@@ -1034,7 +1034,7 @@ public:
     std::string ClearPowerWhenDone(std::string& outError);
     std::string PowerStatusJson() const;
 
-    // Plain runs outside a taskqueue (doc/design-v3.md §7, card 072-1).
+    // Plain runs outside a taskqueue (doc/obsoleted/design-v3.md §7, card 072-1).
     static std::string IssuePlainJobId(int processId = 0, const std::string& name = "") {
         return pc::IssuePlainJobId(processId, name);
     }
@@ -1172,7 +1172,7 @@ private:
 };
 
 // ---------------------------------------------------------------------------
-// Automatic L2 notes written by Hancho (doc/design-v3.md 3.4)
+// Automatic L2 notes written by Hancho (doc/obsoleted/design-v3.md 3.4)
 //
 // Evaluates 3 deterministic rules after each attempt finishes:
 // 1. Same job name failed 3 times consecutively with the same failure classification.
@@ -1185,7 +1185,7 @@ int CheckAndRecordAutoNotes(const TaskQueueJob& job, const TaskQueueAttempt& att
 int CheckAndRecordAutoNotes(const std::string& jobName, int timeoutSec = 0);
 
 // ---------------------------------------------------------------------------
-// Memory injection effect (doc/design-v3.md 3.12)
+// Memory injection effect (doc/obsoleted/design-v3.md 3.12)
 //
 // Joins L1 run records (memory/records/*.jsonl) with the memoryRefs recorded on
 // task queue attempts, then compares runs with and without injected memory:

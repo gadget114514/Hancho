@@ -219,7 +219,7 @@ if ($Worktree) {
         $(if ($DryRun) { "DRYRUN" } else { "planned" }), $plan.Path, $plan.Branch, $plan.Base) -ForegroundColor Cyan
 }
 
-# Declared paths (doc/resource-locks.md): Authorised edits are written, Read-only paths are read.
+# Declared paths (doc/obsoleted/resource-locks.md): Authorised edits are written, Read-only paths are read.
 $edits = @(if ($card) { Get-AuthorisedEditPaths -CardPath $card.FullName })
 $reads = @(if ($card) { Get-CardReadPaths -CardPath $card.FullName })
 # Shared is the default whenever the card declares its edits, so runs can go in parallel.

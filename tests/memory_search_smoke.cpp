@@ -883,7 +883,7 @@ int main() {
         Check(foundExitNonzero, "stats failures includes exit_nonzero from failed plain run");
     }
 
-    // 073: L3 worker promotion (doc/design-v3.md §7, 3.5, ww-data/tasks/073-l3-worker-promotion.md)
+    // 073: L3 worker promotion (doc/obsoleted/design-v3.md §7, 3.5, ww-data/tasks/073-l3-worker-promotion.md)
     {
         // 1. Create a note to test promotion
         json notePromo1 = {

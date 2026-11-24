@@ -10,7 +10,7 @@ Parent: 062-linux-tui.md
 
 ## 目的
 
-POSIX 環境での確認と、TUI の自動検証を用意する（`doc/design-v3-todo.md` 8）。
+POSIX 環境での確認と、TUI の自動検証を用意する（`doc/obsoleted/design-v3-todo.md` 8）。
 
 ## やること
 
@@ -23,7 +23,7 @@ POSIX 環境での確認と、TUI の自動検証を用意する（`doc/design-v
 
 ## 参照
 
-- `doc/design-v3-todo.md` 8
+- `doc/obsoleted/design-v3-todo.md` 8
 - 親カード `ww-data/tasks/062-linux-tui.md`
 
 ## Authorised edits
@@ -34,8 +34,8 @@ POSIX 環境での確認と、TUI の自動検証を用意する（`doc/design-v
 
 ## Read-only
 
-- `doc/design-v3.md`
-- `doc/design-v3-en.md`
+- `doc/obsoleted/design-v3.md`
+- `doc/obsoleted/design-v3-en.md`
 
 ## 検証
 

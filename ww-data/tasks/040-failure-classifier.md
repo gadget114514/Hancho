@@ -5,7 +5,7 @@ Splittable: no
 
 ## 目的
 
-「なぜ失敗したか」を分類し、証拠付きの診断を残す（`doc/design-v3.md` 4.2〜4.4）。
+「なぜ失敗したか」を分類し、証拠付きの診断を残す（`doc/obsoleted/design-v3.md` 4.2〜4.4）。
 
 ## やること
 
@@ -23,8 +23,8 @@ Splittable: no
 
 ## 参照
 
-- `doc/design-v3.md` 4.2〜4.4
-- `doc/design-v3-en.md` Section 4
+- `doc/obsoleted/design-v3.md` 4.2〜4.4
+- `doc/obsoleted/design-v3-en.md` Section 4
 
 ## Authorised edits
 
@@ -37,8 +37,8 @@ Splittable: no
 
 ## Read-only
 
-- `doc/design-v3.md`
-- `doc/design-v3-en.md`
+- `doc/obsoleted/design-v3.md`
+- `doc/obsoleted/design-v3-en.md`
 - `doc/schema/hancho.event.v1.json`
 
 ## 検証

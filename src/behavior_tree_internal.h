@@ -50,7 +50,7 @@ struct BtEscalateFallback {
     std::string model;
 };
 
-// One pre-approved engine candidate for a worker node (doc/HanchoExpectations.md 8.3).
+// One pre-approved engine candidate for a worker node (doc/obsoleted/HanchoExpectations.md 8.3).
 struct BtEngineChoice {
     std::string engine;
     std::string model;

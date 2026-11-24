@@ -1,6 +1,6 @@
 #pragma once
 
-// Shared engine health / circuit-breaker state (doc/HanchoExpectations.md 8.6).
+// Shared engine health / circuit-breaker state (doc/obsoleted/HanchoExpectations.md 8.6).
 // Pure logic plus file persistence: no GUI, no IPC and no process launching.
 // Callers pass a path so the state machine is trivially testable.
 

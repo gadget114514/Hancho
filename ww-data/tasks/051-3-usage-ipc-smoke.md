@@ -10,7 +10,7 @@ Parent: 051-usage-daily.md
 
 ## 目的
 
-GUI などの IPC クライアントから日次集計を見られるようにし、U1 全体を検証する（`doc/design-v3.md` 3.6.1 U1）。
+GUI などの IPC クライアントから日次集計を見られるようにし、U1 全体を検証する（`doc/obsoleted/design-v3.md` 3.6.1 U1）。
 
 ## やること
 
@@ -24,7 +24,7 @@ GUI などの IPC クライアントから日次集計を見られるように�
 
 ## 参照
 
-- `doc/design-v3.md` 3.6.1
+- `doc/obsoleted/design-v3.md` 3.6.1
 - 親カード `ww-data/tasks/051-usage-daily.md`
 
 ## Authorised edits
@@ -35,8 +35,8 @@ GUI などの IPC クライアントから日次集計を見られるように�
 
 ## Read-only
 
-- `doc/design-v3.md`
-- `doc/design-v3-en.md`
+- `doc/obsoleted/design-v3.md`
+- `doc/obsoleted/design-v3-en.md`
 
 ## 検証
 

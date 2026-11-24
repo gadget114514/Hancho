@@ -1460,7 +1460,7 @@ target_link_libraries(hancho_test PRIVATE
 
 
 else()
-    # POSIX headless core and CLI (doc/design-v3.md 2.4). There is no GUI here:
+    # POSIX headless core and CLI (doc/obsoleted/design-v3.md 2.4). There is no GUI here:
     # the only screen is `hancho-cli top`.
     find_package(Threads REQUIRED)
 

@@ -1,6 +1,6 @@
 #pragma once
 
-// Per-role LLM candidate lists (doc/HanchoExpectations.md 8.3). Pure logic: no GUI,
+// Per-role LLM candidate lists (doc/obsoleted/HanchoExpectations.md 8.3). Pure logic: no GUI,
 // no IPC, no process launching. Callers pass a path so this module is trivially testable.
 
 #include "common.h"

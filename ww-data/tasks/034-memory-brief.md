@@ -5,7 +5,7 @@ Splittable: no
 
 ## 目的
 
-関係する記録を短くまとめ、ジョブ開始時に渡せるようにする（`doc/design-v3.md` 3.8, 3.9）。
+関係する記録を短くまとめ、ジョブ開始時に渡せるようにする（`doc/obsoleted/design-v3.md` 3.8, 3.9）。
 
 ## やること
 
@@ -23,8 +23,8 @@ Splittable: no
 
 ## 参照
 
-- `doc/design-v3.md` 3.8, 3.9
-- `doc/design-v3-en.md` Section 3
+- `doc/obsoleted/design-v3.md` 3.8, 3.9
+- `doc/obsoleted/design-v3-en.md` Section 3
 
 ## Authorised edits
 
@@ -35,8 +35,8 @@ Splittable: no
 
 ## Read-only
 
-- `doc/design-v3.md`
-- `doc/design-v3-en.md`
+- `doc/obsoleted/design-v3.md`
+- `doc/obsoleted/design-v3-en.md`
 
 ## 検証
 

@@ -372,7 +372,7 @@ namespace pc {
 static std::string StrArrayToJson(const std::vector<std::string>& v);
 
 // ---------------------------------------------------------------------------
-// Failure classifier (doc/design-v3.md 4.2-4.4)
+// Failure classifier (doc/obsoleted/design-v3.md 4.2-4.4)
 //
 // The rules below are evaluated from the top and the first match wins. Each rule
 // records the original event seq or log line it acted on, so a diagnostic can be
@@ -395,7 +395,7 @@ static bool MatchesNoCase(const std::string& text, const char* pattern) {
 }
 
 // External rules may opt into case-insensitive matching with a leading (?i), the form
-// used in doc/design-v3.md. std::regex's ECMAScript grammar does not parse it.
+// used in doc/obsoleted/design-v3.md. std::regex's ECMAScript grammar does not parse it.
 static bool PrepareRegex(std::string pattern, bool defaultIcase, std::regex& out) {
     bool icase = defaultIcase;
     if (pattern.rfind("(?i)", 0) == 0) {
@@ -1080,7 +1080,7 @@ static bool HasWorkerActivityEvents(const std::vector<nlohmann::json>& events) {
 static const char* kSupervisorNoteTakeover =
     "Before implementing this task yourself, record the decision: "
     "escalate with answer \"takeover\" and a rationale, or run taskqueue takeover "
-    "(see doc/HanchoExpectations.md 7.5).";
+    "(see doc/obsoleted/HanchoExpectations.md 7.5).";
 
 static std::vector<TaskQueueFailureLikelyCause> DetectLikelyCauses(const TaskQueueFailureInput& in) {
     std::vector<TaskQueueFailureLikelyCause> causes;
@@ -3626,7 +3626,7 @@ bool TaskQueueManager::IsDepSatisfied(const TaskQueueJob& dep, const std::string
 }
 
 // ---------------------------------------------------------------------------
-// Resource locks (doc/resource-locks.md)
+// Resource locks (doc/obsoleted/resource-locks.md)
 // ---------------------------------------------------------------------------
 
 static void ReplaceAllInPlace(std::string& s, const std::string& from, const std::string& to) {
@@ -6557,7 +6557,7 @@ bool TaskQueueManager::EvaluateSuccess(const TaskQueueJob& job, TaskQueueAttempt
         return false;
     }
     // filesNewer names paths on the machine that ran the job. For a remote job those
-    // paths are evaluated on the remote host (doc/design-v3-todo.md 6, card 057).
+    // paths are evaluated on the remote host (doc/obsoleted/design-v3-todo.md 6, card 057).
     if (!job.host.empty()) {
         if (!job.success.filesNewer.empty()) {
             bool evaluatedFromDone = false;
@@ -7091,7 +7091,7 @@ static bool ModelChangeRequiresApproval() {
 }
 
 // A change to a model already approved and enabled in the worker LLM list is safe: the user
-// gave prior, per-row approval for exactly this kind of switch (doc/HanchoExpectations.md 8.3).
+// gave prior, per-row approval for exactly this kind of switch (doc/obsoleted/HanchoExpectations.md 8.3).
 static bool IsApprovedWorkerModel(const std::string& model) {
     llm::Config cfg;
     std::string err;
@@ -7663,7 +7663,7 @@ void TaskQueueManager::SchedulerLoop() {
     }
 }
 
-// One L1 RunRecord per finished attempt (doc/design-v3.md 3.3). The record is built from
+// One L1 RunRecord per finished attempt (doc/obsoleted/design-v3.md 3.3). The record is built from
 // the same taskqueue facts and .events.jsonl that `memory rebuild` uses, so a live record
 // and a rebuilt one are identical.
 static void AppendRunRecordForAttempt(const TaskQueue& tq, const TaskQueueJob& job,

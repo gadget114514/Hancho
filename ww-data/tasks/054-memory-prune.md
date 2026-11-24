@@ -5,7 +5,7 @@ Splittable: no
 
 ## 目的
 
-メモリの保持期間と容量の上限を設計どおりに効かせる（`doc/design-v3.md` 3.7、`doc/design-v3-todo.md` 4）。
+メモリの保持期間と容量の上限を設計どおりに効かせる（`doc/obsoleted/design-v3.md` 3.7、`doc/obsoleted/design-v3-todo.md` 4）。
 
 ## やること
 
@@ -22,8 +22,8 @@ Splittable: no
 
 ## 参照
 
-- `doc/design-v3.md` 3.7
-- `doc/design-v3-todo.md` 4
+- `doc/obsoleted/design-v3.md` 3.7
+- `doc/obsoleted/design-v3-todo.md` 4
 
 ## Authorised edits
 
@@ -37,8 +37,8 @@ Splittable: no
 
 ## Read-only
 
-- `doc/design-v3.md`
-- `doc/design-v3-en.md`
+- `doc/obsoleted/design-v3.md`
+- `doc/obsoleted/design-v3-en.md`
 
 ## 検証
 

@@ -83,7 +83,7 @@
 
 - `src/bt_templates.h` の `resilient-worker` と `card-sequence` に、テストの job の `blame` と、`switchEngineOn` の `{"class":"fix_no_progress","after":1}`、`{"class":"fix_failed","after":2}`、`{"class":"root_cause_not_found","after":1}` を足す。プロンプトに自己申告と handoff の書き方の一文を入れる。
 - 検証の警告: worker の `switchEngineOn` に `fix_*` があるのに、その worker を `blame` する job がない → `fix_class_without_blame`。`bt validate --strict` でエラーになる。
-- 文書: `doc/behavior-tree.md` / `doc/behavior-tree-ja.md` に「修正失敗で切り替える」節（`after`、`blame`、`fix_*` クラス、自己申告、handoff、`switchLimits`、`onSwitch`）。`skills/hancho/SKILL.md` の「BT を書くときはハング対策を最初から入れる」に 2〜3 行。`hancho-cli help --json` の bt の説明に `blame` と `switchLimits` を足す。
+- 文書: `doc/obsoleted/behavior-tree.md` / `doc/obsoleted/behavior-tree-ja.md` に「修正失敗で切り替える」節（`after`、`blame`、`fix_*` クラス、自己申告、handoff、`switchLimits`、`onSwitch`）。`skills/hancho/SKILL.md` の「BT を書くときはハング対策を最初から入れる」に 2〜3 行。`hancho-cli help --json` の bt の説明に `blame` と `switchLimits` を足す。
 - `doc/fix-failure-engine-switch-plan.md` の状態を「実装済み（カード 101-1〜101-6）」に変える。
 
 ## 共通の約束

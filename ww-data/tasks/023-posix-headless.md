@@ -5,7 +5,7 @@ Splittable: no
 
 ## 目的
 
-POSIX 環境でコアと CLI を動かす（`doc/design-v3.md` 2.4 段階 B）。画面は `hancho-cli top` だけ。
+POSIX 環境でコアと CLI を動かす（`doc/obsoleted/design-v3.md` 2.4 段階 B）。画面は `hancho-cli top` だけ。
 
 ## やること
 
@@ -22,8 +22,8 @@ POSIX 環境でコアと CLI を動かす（`doc/design-v3.md` 2.4 段階 B）�
 
 ## 参照
 
-- `doc/design-v3.md` 2.4
-- `doc/design-v3-en.md` Section 2.4
+- `doc/obsoleted/design-v3.md` 2.4
+- `doc/obsoleted/design-v3-en.md` Section 2.4
 
 ## Authorised edits
 
@@ -35,8 +35,8 @@ POSIX 環境でコアと CLI を動かす（`doc/design-v3.md` 2.4 段階 B）�
 
 ## Read-only
 
-- `doc/design-v3.md`
-- `doc/design-v3-en.md`
+- `doc/obsoleted/design-v3.md`
+- `doc/obsoleted/design-v3-en.md`
 
 ## 検証
 

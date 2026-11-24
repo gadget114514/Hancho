@@ -1,4 +1,4 @@
-// Smoke test for hancho-cli top TUI components (cards 062-1, 062-2, doc/tui-design-ja.md).
+// Smoke test for hancho-cli top TUI components (cards 062-1, 062-2, doc/obsoleted/tui-design-ja.md).
 // Verifies key sequence parsing, tab navigation, 5 dashboard-equivalent views, and format helpers.
 
 #include "cli_top.h"

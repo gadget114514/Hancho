@@ -57,7 +57,7 @@ Check ((Test-RunConflict -Runs @($mainAgy901) -Task "901" -Worktree).Blocked) "s
 Check ((Test-RunConflict -Runs @($mainAgy901) -Task "902").Blocked) "a second main run is blocked by an active agy main run"
 Check (-not (Test-RunConflict -Runs @($wtAgy902) -Task "901").Blocked) "an agy worktree run does not block the main run"
 
-Write-Host "`n== 2b. shared runs: declared paths decide (doc/resource-locks.md) ==" -ForegroundColor Cyan
+Write-Host "`n== 2b. shared runs: declared paths decide (doc/obsoleted/resource-locks.md) ==" -ForegroundColor Cyan
 Check (Test-PathPatternOverlap (ConvertTo-WwPattern 'src/') (ConvertTo-WwPattern 'src/a.cpp')) "directory covers its files"
 Check (-not (Test-PathPatternOverlap (ConvertTo-WwPattern 'src/a.cpp') (ConvertTo-WwPattern 'src/b.cpp'))) "different files do not overlap"
 Check (-not (Test-PathPatternOverlap (ConvertTo-WwPattern 'src/') (ConvertTo-WwPattern 'src2/a.cpp'))) "sibling with common prefix does not overlap"

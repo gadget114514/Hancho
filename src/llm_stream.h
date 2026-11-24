@@ -277,7 +277,7 @@ std::vector<LlmDailyUsageRecord> ReadDailyUsageSummary(const std::string& since 
 // Evaluates usage stats with filtering and optional grouping (day, month, engine, model).
 LlmUsageStatsResult QueryUsageStats(const LlmUsageStatsOptions& options);
 
-// Serializes LlmUsageStatsResult into JSON (matching doc/design-v3.md 3.6.1).
+// Serializes LlmUsageStatsResult into JSON (matching doc/obsoleted/design-v3.md 3.6.1).
 nlohmann::json UsageStatsResultToJson(const LlmUsageStatsResult& res);
 
 // Formats LlmUsageStatsResult as human-readable table for CLI stdout.

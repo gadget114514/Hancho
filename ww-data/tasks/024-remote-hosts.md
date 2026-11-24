@@ -5,7 +5,7 @@ Splittable: no
 
 ## 目的
 
-別マシンのワーカーを手元から見て操作できるようにする（`doc/design-v3.md` 2.5 段階 C）。
+別マシンのワーカーを手元から見て操作できるようにする（`doc/obsoleted/design-v3.md` 2.5 段階 C）。
 
 ## やること
 
@@ -23,8 +23,8 @@ Splittable: no
 
 ## 参照
 
-- `doc/design-v3.md` 2.5
-- `doc/design-v3-en.md` Section 2.5
+- `doc/obsoleted/design-v3.md` 2.5
+- `doc/obsoleted/design-v3-en.md` Section 2.5
 
 ## Authorised edits
 
@@ -36,8 +36,8 @@ Splittable: no
 
 ## Read-only
 
-- `doc/design-v3.md`
-- `doc/design-v3-en.md`
+- `doc/obsoleted/design-v3.md`
+- `doc/obsoleted/design-v3-en.md`
 
 ## 検証
 

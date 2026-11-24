@@ -10,7 +10,7 @@
 
 ## 1. 種別ごとの `data` の型拘束
 
-`doc/design-v3.md` §7 の決定（2026-11-11、課題カード `071-schema-data-types.md`）に基づき、イベントスキーマの `data` は種別（`kind`）ごとに厳格に型付けされています。
+`doc/obsoleted/design-v3.md` §7 の決定（2026-11-11、課題カード `071-schema-data-types.md`）に基づき、イベントスキーマの `data` は種別（`kind`）ごとに厳格に型付けされています。
 
 従前は `additionalProperties` が既定（許可）だったため、未知のフィールドが検証をすり抜ける状態でした。改定後のスキーマでは以下の通り締めています:
 - 全 14 種別の `data` 定義において `"additionalProperties": false` を明示し、未知のフィールドを拒否します。

@@ -170,7 +170,7 @@ worker は 1 枚ずつ順に実装する。前のカードの変更は作業ツ�
 
 ## 100-10: 文書・ヘルプ・skill の仕上げ
 
-ファイル: `doc/cli.md` / `doc/cli-ja.md`、`doc/mcp.md` / `doc/mcp-ja.md`、`doc/taskqueue.md` / `doc/taskqueue-ja.md`、`doc/hancho-taskqueue-spec.md`、`doc/cli-help.md` / `doc/cli-help-ja.md`、`src/cli.cpp` のヘルプ、`skills/`。
+ファイル: `doc/obsoleted/cli.md` / `doc/obsoleted/cli-ja.md`、`doc/obsoleted/mcp.md` / `doc/obsoleted/mcp-ja.md`、`doc/obsoleted/taskqueue.md` / `doc/obsoleted/taskqueue-ja.md`、`doc/obsoleted/hancho-taskqueue-spec.md`、`doc/obsoleted/cli-help.md` / `doc/obsoleted/cli-help-ja.md`、`src/cli.cpp` のヘルプ、`skills/`。
 
 - タスク（`task *`）、`--task`、`supersedes` / `supersede_reason`、`taskqueue supersede`、状態の決め方、`run --exit-on-drain` の変更を書く。英語版と日本語版の両方。
 - `README.md` / `README-ja.md` には書かない（リリース時に書く）。ただし `dist/` に `release-notes-draft-v0.10.0.md` を作り、0.9.x に戻すと系譜とタスクの情報が消える警告（懸念 2）を入れる。

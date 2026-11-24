@@ -216,7 +216,7 @@ bool IsSecretChar(unsigned char c) {
            c == '_' || c == '-' || c == '.' || c == '+' || c == '/' || c == '=' || c == '~';
 }
 
-// Redacts the key shapes named in doc/design-v3.md 3.10 before anything is written. Job env
+// Redacts the key shapes named in doc/obsoleted/design-v3.md 3.10 before anything is written. Job env
 // values are never part of a note, so only free text needs this pass.
 std::string RedactSecrets(const std::string& input, bool& changed) {
     changed = false;
@@ -2386,7 +2386,7 @@ std::string NoteJson(const NoteInput& input) {
         }
 
         // An agent note without an explicit scope stays inside its attempt's job instead of
-        // spreading over the project (doc/design-v3.md 3.4).
+        // spreading over the project (doc/obsoleted/design-v3.md 3.4).
         if (IEquals(author, "agent") && Trim(in.scope).empty()) {
             std::string jobName;
             for (const auto& d : idx.docs) {
@@ -2961,7 +2961,7 @@ std::string BriefJson(const BriefOptions& options) {
 std::string RebuildJson() {
     try {
         // L1 is derived data: recreate it from logs/taskqueues/*.json and the normalized
-        // .events.jsonl files before indexing (doc/design-v3.md 3.3, 3.7).
+        // .events.jsonl files before indexing (doc/obsoleted/design-v3.md 3.3, 3.7).
         json recordInfo = json::parse(RebuildRunRecordsJson(), nullptr, false);
         if (recordInfo.is_discarded() || !recordInfo.is_object() ||
             !recordInfo.value("ok", false)) {

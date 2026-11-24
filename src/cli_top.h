@@ -369,7 +369,7 @@ private:
 #endif
 };
 
-// Remote host and job attribution helpers (card 062-3, doc/remote-hosts.md)
+// Remote host and job attribution helpers (card 062-3, doc/obsoleted/remote-hosts.md)
 inline std::string GetJobHost(const nlohmann::json& job) {
     if (!job.is_object()) return "";
     if (job.contains("host") && job["host"].is_string()) {
@@ -499,7 +499,7 @@ inline bool GetSelectedQueueJob(const TopState& state, nlohmann::json& outJob) {
     return false;
 }
 
-// Request builders for interactive operations (cards 062-3, doc/tui-design-ja.md)
+// Request builders for interactive operations (cards 062-3, doc/obsoleted/tui-design-ja.md)
 inline bool BuildJobStopRequest(const TopState& state, std::string& outReq, std::string& outDesc) {
     if (state.activeTab == TopTab::Processes) {
         if (state.processData.contains("processes") && state.processData["processes"].is_array() &&

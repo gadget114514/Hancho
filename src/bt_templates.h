@@ -1,7 +1,7 @@
 #pragma once
 
 // Embedded behavior-tree templates for `hancho-cli bt template` and MCP `bt_template`
-// (doc/HanchoExpectations.md 8.4). No files are looked up at runtime.
+// (doc/obsoleted/HanchoExpectations.md 8.4). No files are looked up at runtime.
 
 #include "nlohmann/json.hpp"
 

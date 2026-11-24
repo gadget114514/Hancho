@@ -14,12 +14,12 @@ Check the version with `hancho-cli.exe --version` (current: 0.9.26).
 - **People running long, parallel, or interactive jobs** — builds, test suites, dev servers, TUI agents — that must outlive the chat session, follow a fixed plan with dependencies and retries, or mix in non-Claude workers.
 - **Anyone who wants to watch and steer** many agent terminals live on one dashboard, with timeouts, retries, dependencies, and logs that survive restarts.
 
-**Probably not for you if** your tasks are short reasoning or code edits that LLM sub-agents already handle well. Token cost is now about the same either way; see [Sub-agents vs. Hancho](doc/pros-cons-comparison.md#when-token-cost-is-no-longer-the-difference) for what Hancho adds (durability, deterministic control, visibility) and the full [Pros/Cons comparison](doc/pros-cons-comparison.md).
+**Probably not for you if** your tasks are short reasoning or code edits that LLM sub-agents already handle well. Token cost is now about the same either way; see [Sub-agents vs. Hancho](doc/obsoleted/pros-cons-comparison.md#when-token-cost-is-no-longer-the-difference) for what Hancho adds (durability, deterministic control, visibility) and the full [Pros/Cons comparison](doc/obsoleted/pros-cons-comparison.md).
 
 ![Hancho Dashboard](doc/images/dashboardgraph.jpg)
 ![Hancho Dashboard](doc/images/dashboard.jpg)
 
-The dashboard has an **execution monitor pane** below the process and task lists. It follows the selected process and shows its goal, what it is doing now, its TODO progress, job success condition, attempts and time limits, plus a plain-language activity history with elapsed times. JSON-streaming processes are marked `{}` in the process list. See [Key Features](doc/features.md) for details.
+The dashboard has an **execution monitor pane** below the process and task lists. It follows the selected process and shows its goal, what it is doing now, its TODO progress, job success condition, attempts and time limits, plus a plain-language activity history with elapsed times. JSON-streaming processes are marked `{}` in the process list. See [Key Features](doc/obsoleted/features.md) for details.
 
 ![Architecture](doc/images/archimage.jpg)
 
@@ -29,9 +29,9 @@ The dashboard has an **execution monitor pane** below the process and task lists
 
 Hand Hancho one command, a queue of ordered jobs, or a whole behavior tree. It runs each step as a real terminal process with its own timeout, success check, retries, resource locks and logs, and reports the result back to your LLM. The supervisor LLM stays in charge of the plan; Hancho owns the processes.
 
-See [Overview](doc/overview.md) for the working model in detail: `run_worker`, suspending the PC after a job, behavior trees, stable events and adapters, and how to leave Hancho without losing work.
+See [Overview](doc/obsoleted/overview.md) for the working model in detail: `run_worker`, suspending the PC after a job, behavior trees, stable events and adapters, and how to leave Hancho without losing work.
 
-A behavior tree can also be saved as a named **routine** and re-run with `routine run <name>` — ideal for fixed chores like "build all targets and run every smoke test"; stale inputs and run results are tracked automatically. See [Routines](doc/routines.md).
+A behavior tree can also be saved as a named **routine** and re-run with `routine run <name>` — ideal for fixed chores like "build all targets and run every smoke test"; stale inputs and run results are tracked automatically. See [Routines](doc/obsoleted/routines.md).
 
 ### Executables
 
@@ -91,27 +91,27 @@ The skill starts with `hancho-cli.exe help --json`, so the commands it shows alw
 
 | Document | Contents |
 | :--- | :--- |
-| [Overview](doc/overview.md) | Working model, `run_worker`, suspend, behavior trees, stable events, graduation |
-| [Start](doc/start.md) | Quick start for LLM agents, build instructions, `Hancho.exe` vs. `hancho-cli.exe` |
-| [Key Features](doc/features.md) | Dashboard GUI, shell launcher, history, tray, logs, Job Objects, settings, task queue overview |
-| [Triage improvements](doc/triage-improvements.md) | LLM summary, intent section and readability fixes |
-| [Console CLI](doc/cli.md) | `hancho-cli.exe` usage, JSON output, stdin modes, completion, `help --json` keys |
-| [Task Queue](doc/taskqueue.md) | Ordered jobs, dependencies, job fields, states, ChainGuard |
-| [Behavior Trees](doc/behavior-tree.md) | BT format, node types, variables, worker engines, escalate, examples |
-| [Routines](doc/routines.md) | Named, repeatable BT workflows: `routine list/show/run/save/check`, run ids, stale/absorbed, triage and dashboard |
-| [BT Token Optimization](doc/behavior-tree-token-optimization.md) | Token-saving architecture, `compact: true`, lightweight escalation packets |
-| [BT Design Plan](doc/behavior-tree-plan-en.md) | Architecture and implementation plan for the BT engine |
-| [MCP Server](doc/mcp.md) | MCP registration and the MCP tools |
-| [WCSP](doc/wcsp.md) | WinConsoleServer protocol (WCSP v1): framing, handshake, frames, sessions and security |
-| [Data Directory](doc/data-directory.md) | Project-local, git-managed `--data-dir` |
-| [Pros/Cons](doc/pros-cons-comparison.md) | When to use Hancho vs. sub-agents and alternatives |
-| [Critical Comparison](doc/critical-comparison.md) | A skeptical look at Hancho's limits and when not to use it |
-| [Competitive Comparison](doc/competitive-comparison.md) | How Hancho compares with agent frameworks and memory services |
-| [Hancho v3 Design](doc/design-v3-en.md) | Event schema and adapters, headless/remote, semantic memory, failure analysis, graduation guide |
-| [Release Checklist](doc/release-checklist.md) | Per-release review of the graduation feature map and cleanup commands |
-| [CLI help output](doc/cli-help.md) | Full `Hancho.exe --help` and `hancho-cli.exe help` text |
+| [Overview](doc/obsoleted/overview.md) | Working model, `run_worker`, suspend, behavior trees, stable events, graduation |
+| [Start](doc/obsoleted/start.md) | Quick start for LLM agents, build instructions, `Hancho.exe` vs. `hancho-cli.exe` |
+| [Key Features](doc/obsoleted/features.md) | Dashboard GUI, shell launcher, history, tray, logs, Job Objects, settings, task queue overview |
+| [Triage improvements](doc/obsoleted/triage-improvements.md) | LLM summary, intent section and readability fixes |
+| [Console CLI](doc/obsoleted/cli.md) | `hancho-cli.exe` usage, JSON output, stdin modes, completion, `help --json` keys |
+| [Task Queue](doc/obsoleted/taskqueue.md) | Ordered jobs, dependencies, job fields, states, ChainGuard |
+| [Behavior Trees](doc/obsoleted/behavior-tree.md) | BT format, node types, variables, worker engines, escalate, examples |
+| [Routines](doc/obsoleted/routines.md) | Named, repeatable BT workflows: `routine list/show/run/save/check`, run ids, stale/absorbed, triage and dashboard |
+| [BT Token Optimization](doc/obsoleted/behavior-tree-token-optimization.md) | Token-saving architecture, `compact: true`, lightweight escalation packets |
+| [BT Design Plan](doc/obsoleted/behavior-tree-plan-en.md) | Architecture and implementation plan for the BT engine |
+| [MCP Server](doc/obsoleted/mcp.md) | MCP registration and the MCP tools |
+| [WCSP](doc/obsoleted/wcsp.md) | WinConsoleServer protocol (WCSP v1): framing, handshake, frames, sessions and security |
+| [Data Directory](doc/obsoleted/data-directory.md) | Project-local, git-managed `--data-dir` |
+| [Pros/Cons](doc/obsoleted/pros-cons-comparison.md) | When to use Hancho vs. sub-agents and alternatives |
+| [Critical Comparison](doc/obsoleted/critical-comparison.md) | A skeptical look at Hancho's limits and when not to use it |
+| [Competitive Comparison](doc/obsoleted/competitive-comparison.md) | How Hancho compares with agent frameworks and memory services |
+| [Hancho v3 Design](doc/obsoleted/design-v3-en.md) | Event schema and adapters, headless/remote, semantic memory, failure analysis, graduation guide |
+| [Release Checklist](doc/obsoleted/release-checklist.md) | Per-release review of the graduation feature map and cleanup commands |
+| [CLI help output](doc/obsoleted/cli-help.md) | Full `Hancho.exe --help` and `hancho-cli.exe help` text |
 | [Hancho skill](skills/hancho/SKILL.md) | Agent skill for using Hancho well |
-| [CLAUDE.md example](doc/example-claude.md) | Example of CLAUDE.md |
+| [CLAUDE.md example](doc/obsoleted/example-claude.md) | Example of CLAUDE.md |
 | [tools/ww](tools/ww/README-ww.md) | Optional, independent task-card runner template (not part of Hancho) |
 
 ---
@@ -284,7 +284,7 @@ The application icons are modeled on the character "Telephone Cat" (電話猫, D
 ### v0.9.17
 - **wct console client**: `wct.exe` connects to the WCSP terminal server from a normal console. `wct` starts a local PowerShell session, `wct <job-id>` attaches to a retained job, and `--host/--port/--token/--shell` connect to a remote core. `Ctrl+]` detaches (the ConPTY keeps running) and `Ctrl+]` twice terminates it. The installer adds `wct.exe` next to `hancho-cli.exe` and the PATH task now covers both.
 - **Retained sessions**: disconnecting no longer kills the ConPTY. Closing a tab or the window asks **Terminate / Detach / Cancel**: Terminate closes the server-side ConPTY; Detach keeps it for a later connection.
-- **Reconnect list**: the terminal client lists retained sessions on startup (and from `File > Reconnect to session...`) and reattaches the selected jobs. WCSP 1.1 adds the `LIST_SESSIONS` / `SESSION_LIST` control session (documented in `doc/wcsp.md`).
+- **Reconnect list**: the terminal client lists retained sessions on startup (and from `File > Reconnect to session...`) and reattaches the selected jobs. WCSP 1.1 adds the `LIST_SESSIONS` / `SESSION_LIST` control session (documented in `doc/obsoleted/wcsp.md`).
 - **Terminal client menu-only UI**: the New / Attach / Remote / Close toolbar buttons were removed; all commands are in the File menu, the tab right-click menu, and the Ctrl+T / Ctrl+W shortcuts.
 - **Theme**: the tab strip background and empty area now follow the dashboard theme instead of the system colour.
 - **Settings**: the WinConsoleServer tab shows WCSP connections and can refresh the token or disconnect a session.
@@ -300,8 +300,8 @@ The application icons are modeled on the character "Telephone Cat" (電話猫, D
 - **Parsing**: replaced `sscanf`/`sscanf_s` with `src/parse_util.h` helpers (no MSVC C4996 warnings).
 
 ### v0.9.15
-- **Triage**: every failed task-queue job, BT escalation, standalone process failure, timing divergence or resource wait now gets one persistent card. Hancho collects the information (cause, background, environment, conditions, reason), candidate actions and a deterministic recommendation; a person chooses and records a decision from the dashboard, `hancho-cli triage`, or the MCP `triage_list` / `triage_get` / `triage_decide` tools. `triage_mode` selects manual, semi (default; safe high-confidence recommendations run automatically) or auto, optional LLM advice runs as a hidden `_triage` job, and `triage handoff` gives pending cards to a batch supervisor in the hidden `_supervisor` queue. Cards resolve naturally, support follow-up and acknowledgement of automatic decisions, and each kind can be turned on or off. See `doc/triage.md`.
-- **Terminal sessions (WCSP)**: the core exposes every ConPTY job over the WinConsoleServer protocol (WCSP v1), and the standalone dashboard attaches through a local TCP listener (`terminal` in `config.json`), so closing the dashboard, switching tabs or detaching no longer stops the job. Enable `terminal.remote` to attach from WinConsoleTerminal on another PC with `attach:<id>`. Plain TCP without encryption; trusted LAN only. See `doc/features.md`.
+- **Triage**: every failed task-queue job, BT escalation, standalone process failure, timing divergence or resource wait now gets one persistent card. Hancho collects the information (cause, background, environment, conditions, reason), candidate actions and a deterministic recommendation; a person chooses and records a decision from the dashboard, `hancho-cli triage`, or the MCP `triage_list` / `triage_get` / `triage_decide` tools. `triage_mode` selects manual, semi (default; safe high-confidence recommendations run automatically) or auto, optional LLM advice runs as a hidden `_triage` job, and `triage handoff` gives pending cards to a batch supervisor in the hidden `_supervisor` queue. Cards resolve naturally, support follow-up and acknowledgement of automatic decisions, and each kind can be turned on or off. See `doc/obsoleted/triage.md`.
+- **Terminal sessions (WCSP)**: the core exposes every ConPTY job over the WinConsoleServer protocol (WCSP v1), and the standalone dashboard attaches through a local TCP listener (`terminal` in `config.json`), so closing the dashboard, switching tabs or detaching no longer stops the job. Enable `terminal.remote` to attach from WinConsoleTerminal on another PC with `attach:<id>`. Plain TCP without encryption; trusted LAN only. See `doc/obsoleted/features.md`.
 - **Dashboard**: a Triage KPI shows pending task/process cards and unreviewed automatic decisions, and the task list has a Triage column. The Settings dialog gains dedicated **WinConsoleServer** (local/remote connection switches) and **Triage** (mode, LLM mode and per-kind switches) tabs.
 - **Gantt**: the range buttons now pick the latest 3 / 5 / 10 jobs (default 10) instead of a time range, so the chart changes even when there are few jobs.
 - **Core startup**: callers wait up to 30 seconds for a starting core, refuse further auto-starts for 60 seconds after a failure, and launch the dashboard outside the caller's process tree, preventing duplicate cores and spawn storms.
@@ -330,13 +330,13 @@ The application icons are modeled on the character "Telephone Cat" (電話猫, D
 - **Defaults**: nickname `noname`; agent name auto-generated as `<nickname>-llm` and used as the sender name.
 
 ### v0.9.11
-- **Chat**: the IPMsg-compatible feature is now named Chat everywhere: `hancho-cli chat` (alias `msg`), the MCP `chat_*` tools, the standalone `Hancho.exe chat` window and the dashboard toolbar. `doc/ipmsg.md` became `doc/chat.md`.
+- **Chat**: the IPMsg-compatible feature is now named Chat everywhere: `hancho-cli chat` (alias `msg`), the MCP `chat_*` tools, the standalone `Hancho.exe chat` window and the dashboard toolbar. `doc/ipmsg.md` became `doc/obsoleted/chat.md`.
 - **`chat_handler` MCP tool**: show or change the LLM that answers incoming Chat messages (engine, model, agent, cwd, instructions, taskqueue, auto-reply, timeout, max hops, concurrency).
 - **Chat reliability**: restarting the node is serialised, untrusted message text is delimited before it reaches the answering LLM, and older `ipmsg` message data is moved to `chat`.
 - **Docs**: CLI, MCP and feature docs renamed and updated for Chat.
 
 ### v0.9.10
-- **Chat (IPMsg compatible)**: the core speaks the classic IPMsg protocol (presence, messages, read receipts, regular-file transfer) on UDP/TCP port 2426, off by default. LLM-to-LLM messaging adds `from_agent` / `to_agent` / `reply_to`, an `audience` (human or agent) and a hop guard, and a worker-LLM handler replies automatically. Use `hancho-cli chat` (alias `msg`), the MCP `chat_*` tools (including `chat_handler` to change the answering LLM), or the standalone dialog (`Hancho.exe chat [--tray]`, also on the dashboard toolbar) with tray notifications. See `doc/chat.md`.
+- **Chat (IPMsg compatible)**: the core speaks the classic IPMsg protocol (presence, messages, read receipts, regular-file transfer) on UDP/TCP port 2426, off by default. LLM-to-LLM messaging adds `from_agent` / `to_agent` / `reply_to`, an `audience` (human or agent) and a hop guard, and a worker-LLM handler replies automatically. Use `hancho-cli chat` (alias `msg`), the MCP `chat_*` tools (including `chat_handler` to change the answering LLM), or the standalone dialog (`Hancho.exe chat [--tray]`, also on the dashboard toolbar) with tray notifications. See `doc/obsoleted/chat.md`.
 - **Dashboard hover**: truncated cells in the process, task, monitor and hint lists and in the JSON tree show their full text in a tooltip.
 - **WebUI settings**: Settings -> Maintenance has a port field (1-65535) and a read-only access URL that includes the LAN address and session token.
 - **Dashboard Gantt**: range buttons (6h / 12h / 24h / All) and tick labels placed on local hour / day boundaries.
@@ -358,17 +358,17 @@ The application icons are modeled on the character "Telephone Cat" (電話猫, D
 - **`resource_wait` in `taskqueue list`**: each job shows which job and resource a pending job is waiting for, as `taskqueue graph` already did.
 - **Supervisor hint window**: copy prompts use existing commands (`taskqueue why` / `retry`, `bt get --id`, `bt resume`); behavior-tree escalations are detected again; several divergences / failures / resource waits are shown one after another, a visible hint is no longer replaced automatically, and a condition that comes back is shown again.
 - **Help**: new AUDIT section in `hancho-cli help` and `agent.audit` in `help --json`; `estimateSec` is listed in `taskqueue add`.
-- **Docs**: Audit LLM implementation design (`doc/audit-llm-design.md`).
+- **Docs**: Audit LLM implementation design (`doc/obsoleted/audit-llm-design.md`).
 
 ### v0.9.6
-- **Audit LLM / supervisor feedback (preview)**: every finished job with an `estimateSec` now exposes deterministic `timing_feedback` (actual duration, ratio, `accurate` / `diverged_over` / `diverged_under`, and concrete advice). The Windows dashboard adds a supervisor guidance hint window for timing divergences, with a one-click corrective prompt and configurable auto-dismiss. See `doc/audit-llm.md`.
+- **Audit LLM / supervisor feedback (preview)**: every finished job with an `estimateSec` now exposes deterministic `timing_feedback` (actual duration, ratio, `accurate` / `diverged_over` / `diverged_under`, and concrete advice). The Windows dashboard adds a supervisor guidance hint window for timing divergences, with a one-click corrective prompt and configurable auto-dismiss. See `doc/obsoleted/audit-llm.md`.
 - **WebUI exposure settings**: the `<data-dir>/config.json` -> `webui` object controls `enabled`, `scope` (`loopback` / `lan` / `custom`), `host`, `port`, `allowed_hosts` and `allowed_origins`. The default remains loopback-only; LAN mode binds `0.0.0.0`, keeps token authentication, and accepts IP literals plus configured hostnames. Changes apply live through `config_set`. Settings -> Maintenance exposes enable, exposure and allowed hosts.
 - **Help and smoke tests**: `hancho-cli help` states that `start` is a process, not a task, and that task lists / per-model usage require `taskqueue add`, `run` or `bt start`; `fileExists` accepts a final-component glob; fixed the five v0.9.5 review regressions (cli_top_smoke registration, BT IPC streaming and data-dir isolation, headless wait/encoding, timestamp race, event schema path).
 - **Docs**: Audit LLM specification, updated feature tables, and a refreshed architecture image.
 
 ### v0.9.5
-- **Browser dashboard**: `hancho-cli web` opens an embedded HTTP + WebSocket dashboard (127.0.0.1:9138, token auth) with the same process / queue / monitor / why / memory views. See `doc/browser-ui.md`.
-- **Interactive TUI**: `hancho-cli top` is now a full terminal dashboard with five tabs, row navigation, stop/retry/cancel, remote jobs and `--once --json`, with no external curses dependency. See `doc/tui-design.md`.
+- **Browser dashboard**: `hancho-cli web` opens an embedded HTTP + WebSocket dashboard (127.0.0.1:9138, token auth) with the same process / queue / monitor / why / memory views. See `doc/obsoleted/browser-ui.md`.
+- **Interactive TUI**: `hancho-cli top` is now a full terminal dashboard with five tabs, row navigation, stop/retry/cancel, remote jobs and `--once --json`, with no external curses dependency. See `doc/obsoleted/tui-design.md`.
 - **Remote hosts completed**: one persistent WebSocket multiplexes requests and streams logs/events with sequence resume; a restarted local dashboard reattaches to remote attempts, and `success.filesNewer` is evaluated on the remote host's own clock.
 - **Long-term usage**: daily/monthly `hancho.usage.day/1` rollups, `hancho-cli usage stats|export|compact`, MCP `usage_stats` / `usage_export`, IPC `get_usage_daily`, and dashboard range selection. Per-engine/model attribution comes from task-queue / behavior-tree jobs that emit a JSON stream and receive `--model`.
 - **Memory operations**: external ranker plugin with automatic BM25 fallback, `memory prune` with a `memory_max_bytes` cap, L3 promotion by configured workers, and L1 records for plain runs outside task queues (`taskqueue record-plain`, `memory rebuild`).
@@ -378,12 +378,12 @@ The application icons are modeled on the character "Telephone Cat" (電話猫, D
 ### v0.9.4
 - **Semantic memory**: L1 run records, L2 notes and L3 approved knowledge under `memory/`. `hancho-cli memory search|get|brief|stats|note|approve|rebuild|prune` and MCP `memory_search`, `memory_get`, `memory_brief`, `memory_stats`, `memory_note`, `memory_retract`. `{memory}` injects a bounded brief and records the ids on the attempt.
 - **Failure analysis**: deterministic per-attempt diagnosis (class, confidence, summary, evidence, last activity, suggested action); `hancho-cli taskqueue why <id>`, MCP task results and behavior-tree conditions use it; retry policy can be class-dependent.
-- **Headless, POSIX and remote foundations**: `Hancho.exe --headless`, `hancho-cli run --exit-on-drain --report junit.xml`, POSIX build targets and platform boundaries, `hosts.json` and remote job mirroring. These are early; see `doc/build-posix.md` and `doc/remote-hosts.md`.
+- **Headless, POSIX and remote foundations**: `Hancho.exe --headless`, `hancho-cli run --exit-on-drain --report junit.xml`, POSIX build targets and platform boundaries, `hosts.json` and remote job mirroring. These are early; see `doc/obsoleted/build-posix.md` and `doc/obsoleted/remote-hosts.md`.
 - **Graduation**: `hancho-cli export` for queues / BTs / knowledge, `mcp uninstall`, `agent uninstall-template`, and a release checklist.
 - **ETA and paused start**: jobs accept `estimateSec` so the dashboard shows the card estimate instead of the timeout; `bt start --paused true` registers a tree without creating jobs.
 
 ### v0.9.3
-- **Legacy stream shape deprecated**: `hancho-cli worker stream` and MCP `get_worker_stream` return `hancho.event/1` by default. The old `type` strings stay available with `--schema legacy` / `schema: "legacy"` through v0.10.x and are removed in v0.11.0. See [migration steps](doc/LLM-jsonstream-format.md#legacy-type-strings-and-migration-to-hanchoevent1).
+- **Legacy stream shape deprecated**: `hancho-cli worker stream` and MCP `get_worker_stream` return `hancho.event/1` by default. The old `type` strings stay available with `--schema legacy` / `schema: "legacy"` through v0.10.x and are removed in v0.11.0. See [migration steps](doc/obsoleted/LLM-jsonstream-format.md#legacy-type-strings-and-migration-to-hanchoevent1).
 - **BT-wide task list**: `hancho-cli bt tasks --id <id>`, `taskqueue list --bt <id>` and MCP `taskqueue_list` with `bt` list every job of a behavior tree across its parallel branch queues. Parallel branches keep their own queues (and their own concurrency); the dashboard already shows all queues together.
 
 ### v0.9.2
@@ -401,7 +401,7 @@ The application icons are modeled on the character "Telephone Cat" (電話猫, D
 - **Renamed from ProcessCommander 2.9.x to Hancho 0.9.0**: the product, executable (`Hancho.exe`), GUI window classes, Named Pipe / mutex names, default data folder (`.hancho`), MCP server name (`hancho`) and the `HANCHO_LOG_DIR` environment variable were renamed. The console client was renamed from `pcder.exe` to `hancho-cli.exe`. Old `.processcommander` data and the old pipe/mutex names are not reused or migrated automatically; create a fresh data directory with `--data-dir`.
 
 ### v2.9.3
-- **See which session added each task**: every task-queue job records its origin (agent session id, Claude desktop session id, MCP client, working folder, process id), filled in automatically by MCP `taskqueue_add`, `hancho-cli taskqueue add` and behavior trees. Name the work with `originLabel`, `--origin-label` or `PC_ORIGIN_LABEL`. The dashboard shows it in a new **Origin** column (hover for every field), and `taskqueue_list` `origin: "self"` (`hancho-cli taskqueue list --origin self`) lists only your own session's jobs. See [doc/taskqueue.md](doc/taskqueue.md).
+- **See which session added each task**: every task-queue job records its origin (agent session id, Claude desktop session id, MCP client, working folder, process id), filled in automatically by MCP `taskqueue_add`, `hancho-cli taskqueue add` and behavior trees. Name the work with `originLabel`, `--origin-label` or `PC_ORIGIN_LABEL`. The dashboard shows it in a new **Origin** column (hover for every field), and `taskqueue_list` `origin: "self"` (`hancho-cli taskqueue list --origin self`) lists only your own session's jobs. See [doc/obsoleted/taskqueue.md](doc/obsoleted/taskqueue.md).
 - **Fewer tokens in behavior tree replies**: only `bt_get` returns the whole tree; the other BT tools and `bt_wait compact: true` leave it out, and long variable values and prompts are cut to a preview. Escalation `include` takes `lines` and `maxBytes`. Worker nodes now see their `outputSchema`.
 
 ### v2.9.1
@@ -409,7 +409,7 @@ The application icons are modeled on the character "Telephone Cat" (電話猫, D
 - **Long, cancellable waits**: the MCP `bt_wait` waits up to 10 minutes by default (a negative `timeoutMs` waits with no limit). Other MCP calls are still served while it waits, and `notifications/cancelled` stops it within about 2 seconds. `hancho-cli bt wait` keeps a 60-second default.
 
 ### v2.9.0
-- **Behavior trees**: a supervisor LLM can submit a whole multi-step plan (branches, build-fix loops, retries, condition checks, worker LLM steps, decisions) as one JSON tree with `bt_start`. Hancho runs it, adds each step as an ordinary task-queue job, and calls the LLM back only for `escalate` decisions or at the end. New MCP tools `bt_validate`, `bt_start`, `bt_get`, `bt_list`, `bt_wait`, `bt_resume`, `bt_retry`, `bt_update`, `bt_cancel`, `bt_pause` and `hancho-cli bt ...` commands. See [Behavior trees](#behavior-trees-the-next-step-decisions-run-inside-hancho) and [doc/behavior-tree.md](doc/behavior-tree.md).
+- **Behavior trees**: a supervisor LLM can submit a whole multi-step plan (branches, build-fix loops, retries, condition checks, worker LLM steps, decisions) as one JSON tree with `bt_start`. Hancho runs it, adds each step as an ordinary task-queue job, and calls the LLM back only for `escalate` decisions or at the end. New MCP tools `bt_validate`, `bt_start`, `bt_get`, `bt_list`, `bt_wait`, `bt_resume`, `bt_retry`, `bt_update`, `bt_cancel`, `bt_pause` and `hancho-cli bt ...` commands. See [Behavior trees](#behavior-trees-the-next-step-decisions-run-inside-hancho) and [doc/obsoleted/behavior-tree.md](doc/obsoleted/behavior-tree.md).
 - **Worker engines**: `worker` steps name an engine (`claude`, `agy`, `opencode`, `codex`, or your own in `engines.json` in the data directory) and a model; permission flags stay in the engine definition.
 - **Behavior tree view**: the **BT** toolbar button (Ctrl+Shift+B), or "Show in Behavior Tree" on a task's right-click menu, shows each tree, which node started which task, and how far it has run. Active trees come first; finished trees older than 24 hours are hidden unless "Show all" is on.
 - **Help for LLMs**: `Hancho.exe --help`, `hancho-cli help` and `hancho-cli help --json` explain when to use a behavior tree instead of adding jobs by hand.

@@ -78,7 +78,7 @@ Source: "{#PayloadDir}\OpenConsole.exe"; DestDir: "{app}"; Flags: ignoreversion
 Source: "{#PayloadDir}\LICENSE"; DestDir: "{app}"; Flags: ignoreversion
 Source: "{#PayloadDir}\README.md"; DestDir: "{app}"; Flags: ignoreversion
 Source: "{#PayloadDir}\README-ja.md"; DestDir: "{app}"; Flags: ignoreversion
-; doc\: the topic documents the READMEs link to (doc/start.md, doc/cli.md, ...) and doc\images
+; doc\: the topic documents the READMEs link to (doc/obsoleted/start.md, doc/obsoleted/cli.md, ...) and doc\images
 Source: "{#PayloadDir}\doc\*"; DestDir: "{app}\doc"; Flags: ignoreversion recursesubdirs createallsubdirs
 ; skills\: agent skills (skills\hancho\SKILL.md); the README explains how to link them into opencode / Claude Code
 Source: "..\skills\*"; DestDir: "{app}\skills"; Flags: ignoreversion recursesubdirs createallsubdirs

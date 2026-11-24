@@ -134,7 +134,7 @@ static std::string BuildMcpToolResultWithPng(const std::string& rpcIdRaw, const 
 }
 
 // The diagnosis an upper-level agent needs to choose the next step without reading logs
-// (doc/design-v3.md 4.6): the last failure plus the class of every earlier attempt.
+// (doc/obsoleted/design-v3.md 4.6): the last failure plus the class of every earlier attempt.
 static nlohmann::json McpDiagnosisForJob(const nlohmann::json& job) {
     if (!job.is_object()) return nlohmann::json();
     auto attempts = job.find("attempts");

@@ -1,6 +1,6 @@
 #pragma once
 
-// TCP (WebSocket) transport for the Hancho IPC protocol (doc/design-v3.md 2.5).
+// TCP (WebSocket) transport for the Hancho IPC protocol (doc/obsoleted/design-v3.md 2.5).
 //
 // The request shape is unchanged: one JSON object in, one JSON object out. The
 // listener binds to loopback by default. Loopback clients need no token; a

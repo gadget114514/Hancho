@@ -6,7 +6,7 @@ Parent: 051-usage-daily.md
 
 ## 目的
 
-`logs/usage_history.jsonl` の無限成長を止め、生ポイントを日次ファイルに永続化する（`doc/design-v3.md` 3.6.1 U1）。
+`logs/usage_history.jsonl` の無限成長を止め、生ポイントを日次ファイルに永続化する（`doc/obsoleted/design-v3.md` 3.6.1 U1）。
 
 ## やること
 
@@ -20,7 +20,7 @@ Parent: 051-usage-daily.md
 
 ## 参照
 
-- `doc/design-v3.md` 3.6.1
+- `doc/obsoleted/design-v3.md` 3.6.1
 - 親カード `ww-data/tasks/051-usage-daily.md`
 
 ## Authorised edits
@@ -31,8 +31,8 @@ Parent: 051-usage-daily.md
 
 ## Read-only
 
-- `doc/design-v3.md`
-- `doc/design-v3-en.md`
+- `doc/obsoleted/design-v3.md`
+- `doc/obsoleted/design-v3-en.md`
 
 ## 検証
 

@@ -5,7 +5,7 @@ Splittable: no
 
 ## 目的
 
-検索の順位付けを外部プロセスのプラグインで差し替えられるようにする（`doc/design-v3.md` 3.8、`doc/design-v3-todo.md` 5）。
+検索の順位付けを外部プロセスのプラグインで差し替えられるようにする（`doc/obsoleted/design-v3.md` 3.8、`doc/obsoleted/design-v3-todo.md` 5）。
 
 ## やること
 
@@ -21,8 +21,8 @@ Splittable: no
 
 ## 参照
 
-- `doc/design-v3.md` 3.8（埋め込み検索）
-- `doc/design-v3-todo.md` 5
+- `doc/obsoleted/design-v3.md` 3.8（埋め込み検索）
+- `doc/obsoleted/design-v3-todo.md` 5
 
 ## Authorised edits
 
@@ -35,8 +35,8 @@ Splittable: no
 
 ## Read-only
 
-- `doc/design-v3.md`
-- `doc/design-v3-en.md`
+- `doc/obsoleted/design-v3.md`
+- `doc/obsoleted/design-v3-en.md`
 
 ## 検証
 

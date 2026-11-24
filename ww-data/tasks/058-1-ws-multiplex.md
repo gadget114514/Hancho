@@ -6,7 +6,7 @@ Parent: 058-remote-stream.md
 
 ## 目的
 
-リモートとの WebSocket 1 接続で、複数の要求を同時に運べるようにする（`doc/design-v3.md` 2.5）。
+リモートとの WebSocket 1 接続で、複数の要求を同時に運べるようにする（`doc/obsoleted/design-v3.md` 2.5）。
 
 ## やること
 
@@ -18,8 +18,8 @@ Parent: 058-remote-stream.md
 
 ## 参照
 
-- `doc/design-v3.md` 2.5
-- `doc/remote-hosts.md`
+- `doc/obsoleted/design-v3.md` 2.5
+- `doc/obsoleted/remote-hosts.md`
 - 親カード `ww-data/tasks/058-remote-stream.md`
 
 ## Authorised edits
@@ -30,8 +30,8 @@ Parent: 058-remote-stream.md
 
 ## Read-only
 
-- `doc/design-v3.md`
-- `doc/design-v3-en.md`
+- `doc/obsoleted/design-v3.md`
+- `doc/obsoleted/design-v3-en.md`
 
 ## 検証
 

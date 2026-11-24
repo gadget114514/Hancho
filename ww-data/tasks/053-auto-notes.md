@@ -5,7 +5,7 @@ Splittable: no
 
 ## 目的
 
-決定的な規則で L2 ノートを自動記録する（`doc/design-v3.md` 3.4、`doc/design-v3-todo.md` 3）。
+決定的な規則で L2 ノートを自動記録する（`doc/obsoleted/design-v3.md` 3.4、`doc/obsoleted/design-v3-todo.md` 3）。
 
 ## やること
 
@@ -23,8 +23,8 @@ Splittable: no
 
 ## 参照
 
-- `doc/design-v3.md` 3.4, 3.10
-- `doc/design-v3-todo.md` 3
+- `doc/obsoleted/design-v3.md` 3.4, 3.10
+- `doc/obsoleted/design-v3-todo.md` 3
 
 ## Authorised edits
 
@@ -36,9 +36,9 @@ Splittable: no
 
 ## Read-only
 
-- `doc/design-v3.md`
-- `doc/design-v3-en.md`
-- `doc/design-v3-todo.md`
+- `doc/obsoleted/design-v3.md`
+- `doc/obsoleted/design-v3-en.md`
+- `doc/obsoleted/design-v3-todo.md`
 
 ## 検証
 

@@ -116,7 +116,7 @@ int main() {
     Check(!CheckChainGuard("while(-not (Test-Path X)){Start-Sleep 20}", guardMsg), "chain guard rejects wait loop");
     Check(!CheckChainGuard("powershell -Command \"a; b\"", guardMsg), "chain guard rejects powershell semicolon");
 
-    // --- Failure classifier (doc/design-v3.md 4.2-4.4) -------------------------------------
+    // --- Failure classifier (doc/obsoleted/design-v3.md 4.2-4.4) -------------------------------------
     // Rules are ordered and deterministic; every record must point at an event seq or log line.
     {
         auto makeBase = []() {
@@ -391,7 +391,7 @@ int main() {
             TaskQueueFailureInput in = makeBase();
             classified(in, "unknown", "retry");
         }
-        // External rules from failure-rules.json (doc/design-v3.md 4.4).
+        // External rules from failure-rules.json (doc/obsoleted/design-v3.md 4.4).
         {
             TaskQueueFailureInput in = makeBase();
             in.jobName = "lint";
@@ -458,7 +458,7 @@ int main() {
             fallback.externalRules = {bad};
             classified(fallback, "exit_nonzero", "retry");
         }
-        // The LLM guess is advisory only (doc/design-v3.md 4.4).
+        // The LLM guess is advisory only (doc/obsoleted/design-v3.md 4.4).
         {
             TaskQueueFailureInput in = makeBase();
             auto d = ClassifyTaskQueueFailure(in);
@@ -611,7 +611,7 @@ int main() {
     }
 
     {
-        // Retry policy by failure class (doc/design-v3.md 4.5).
+        // Retry policy by failure class (doc/obsoleted/design-v3.md 4.5).
         auto decide = [](const TaskQueueJob& job, const std::string& cls, int counted,
                          bool allowWait = true) {
             return DecideTaskQueueRetry(job, cls, counted, allowWait);
@@ -1521,7 +1521,7 @@ int main() {
         restarted.ShutdownTaskQueueManager();
     }
 
-    // Remote reconnect after restart (056-1, doc/design-v3.md 2.5).
+    // Remote reconnect after restart (056-1, doc/obsoleted/design-v3.md 2.5).
     {
         std::wstring hostsFile = (std::filesystem::path(GetEffectiveDataDirectoryWide()) / L"hosts.json").wstring();
         std::string prevHosts = ReadFileUtf8Wide(hostsFile);
@@ -1798,7 +1798,7 @@ int main() {
         DeleteFileW(TaskQueueManager::GetTaskQueueFileWide("remote_reconnect_q").c_str());
     }
 
-    // Remote success.filesNewer evaluation (057, doc/design-v3-todo.md 6).
+    // Remote success.filesNewer evaluation (057, doc/obsoleted/design-v3-todo.md 6).
     {
         std::wstring hostsFile = (std::filesystem::path(GetEffectiveDataDirectoryWide()) / L"hosts.json").wstring();
         std::string prevHosts = ReadFileUtf8Wide(hostsFile);
@@ -2090,7 +2090,7 @@ int main() {
     }
 
     {
-        // CI one-shot run (doc/design-v3.md 2.3): the three exit codes and the JUnit report.
+        // CI one-shot run (doc/obsoleted/design-v3.md 2.3): the three exit codes and the JUnit report.
         std::vector<TaskQueueRunJob> empty;
         Check(TaskQueueRunDrained(empty), "an empty queue is already drained");
         Check(TaskQueueRunExitCode(empty) == 0, "an empty queue exits 0");
@@ -2213,7 +2213,7 @@ int main() {
     }
 
     {
-        // Resource overlap rules (doc/resource-locks.md).
+        // Resource overlap rules (doc/obsoleted/resource-locks.md).
         Check(NormalizeResource("src\\A.cpp", "C:\\Proj\\") == "c:/proj/src/a.cpp", "relative resource resolves against cwd");
         Check(NormalizeResource("./src/../doc/x.md", "c:/p") == "c:/p/doc/x.md", "resource . and .. are resolved");
         Check(NormalizeResource("@Build", "c:/p") == "@build", "named lock is not resolved against cwd");
@@ -2312,7 +2312,7 @@ int main() {
     }
 
     {
-        // Hancho auto-notes test (doc/design-v3.md 3.4, task 053)
+        // Hancho auto-notes test (doc/obsoleted/design-v3.md 3.4, task 053)
         std::wstring autoRecDir = dir + L"\\memory\\records";
         EnsureDirectoryWide(autoRecDir);
 

@@ -10,7 +10,7 @@ Parent: 062-linux-tui.md
 
 ## 目的
 
-ダッシュボードと同じ情報を端末に出す（`doc/design-v3-todo.md` 8）。
+ダッシュボードと同じ情報を端末に出す（`doc/obsoleted/design-v3-todo.md` 8）。
 
 ## やること
 
@@ -23,7 +23,7 @@ Parent: 062-linux-tui.md
 
 ## 参照
 
-- `doc/design-v3-todo.md` 8
+- `doc/obsoleted/design-v3-todo.md` 8
 - 親カード `ww-data/tasks/062-linux-tui.md`
 
 ## Authorised edits
@@ -34,8 +34,8 @@ Parent: 062-linux-tui.md
 
 ## Read-only
 
-- `doc/design-v3.md`
-- `doc/design-v3-en.md`
+- `doc/obsoleted/design-v3.md`
+- `doc/obsoleted/design-v3-en.md`
 - `src/gui_dashboard.cpp`
 
 ## 検証

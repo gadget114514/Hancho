@@ -10,7 +10,7 @@ Normalized events are written line-by-line (JSON Lines / `.events.jsonl`) to `lo
 
 ## 1. Strictly Typed `data` by Event Kind
 
-As decided in `doc/design-v3.md` §7 (2026-11-11, task card `071-schema-data-types.md`), the schema defines `data` strictly per `kind`.
+As decided in `doc/obsoleted/design-v3.md` §7 (2026-11-11, task card `071-schema-data-types.md`), the schema defines `data` strictly per `kind`.
 
 Previously, `additionalProperties` was unspecified and defaulted to `true`, which allowed arbitrary unknown fields to pass silently. In the tightened schema:
 - Every `kind` definition specifies `"additionalProperties": false` on its `data` schema.

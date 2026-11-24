@@ -1,4 +1,4 @@
-// Smoke test for the platform boundary (doc/design-v3.md 2.4).
+// Smoke test for the platform boundary (doc/obsoleted/design-v3.md 2.4).
 //
 // Uses only platform/platform.h: no Win32 or POSIX headers. The same test is
 // built on Windows and POSIX so both implementations answer to one contract.

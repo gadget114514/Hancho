@@ -10,7 +10,7 @@ Parent: 060-gui-ipc-client.md
 
 ## 目的
 
-GUI をコアと別プロセスとして起動・再接続できる形にする（`doc/design-v3.md` 2.3 段階 A）。
+GUI をコアと別プロセスとして起動・再接続できる形にする（`doc/obsoleted/design-v3.md` 2.3 段階 A）。
 
 ## やること
 
@@ -23,7 +23,7 @@ GUI をコアと別プロセスとして起動・再接続できる形にする�
 
 ## 参照
 
-- `doc/design-v3.md` 2.3
+- `doc/obsoleted/design-v3.md` 2.3
 - 親カード `ww-data/tasks/060-gui-ipc-client.md`
 
 ## Authorised edits
@@ -34,8 +34,8 @@ GUI をコアと別プロセスとして起動・再接続できる形にする�
 
 ## Read-only
 
-- `doc/design-v3.md`
-- `doc/design-v3-en.md`
+- `doc/obsoleted/design-v3.md`
+- `doc/obsoleted/design-v3-en.md`
 
 ## 検証
 
