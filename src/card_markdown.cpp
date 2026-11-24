@@ -33,13 +33,6 @@ bool StartsAt(const std::string& s, size_t pos, const char* prefix) {
     return s.compare(pos, std::char_traits<char>::length(prefix), prefix) == 0;
 }
 
-std::string Trim(const std::string& s) {
-    const size_t b = s.find_first_not_of(" \t\r\n");
-    if (b == std::string::npos) return "";
-    const size_t e = s.find_last_not_of(" \t\r\n");
-    return s.substr(b, e - b + 1);
-}
-
 std::vector<std::string> SplitBy(const std::string& s, const std::string& delim) {
     std::vector<std::string> out;
     size_t start = 0;
