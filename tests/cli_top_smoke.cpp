@@ -757,6 +757,23 @@ void TestQueueTaskColumnAndGrouping() {
     state.showHelp = true;
     std::string withHelp = RenderScreen(state, 100, 30, false);
     Check(withHelp.find("t / T") != std::string::npos, "Help overlay documents t / T toggle");
+
+    // 4. 103-3: DirectionHeading row renders in Tasks view with direction:<id>
+    state.showHelp = false;
+    state.queueGroupByTask = true;
+    state.queueData["jobs"] = nlohmann::json::array({
+        {{"id", "job-d1"}, {"task_id", "task_1"}, {"direction_id", "dir_10"}, {"taskqueue", "default"},
+         {"state", "running"}, {"summary", "Step 1"}, {"created_at", "2026-11-24T10:00:00Z"}},
+        {{"id", "job-d2"}, {"task_id", "task_1"}, {"direction_id", "dir_10"}, {"taskqueue", "default"},
+         {"state", "pending"}, {"summary", "Step 2"}, {"created_at", "2026-11-24T10:01:00Z"}}
+    });
+    std::string withDir = RenderScreen(state, 100, 26, false);
+    Check(withDir.find("direction:dir_10") != std::string::npos,
+          "103-3: Queue grouped view renders DirectionHeading with direction:<id>");
+    state.selectedRow = 1; // DirectionHeading
+    std::string dirDetail = RenderScreen(state, 100, 26, false);
+    Check(dirDetail.find("[Direction Detail: direction:dir_10]") != std::string::npos,
+          "103-3: Selecting DirectionHeading renders Direction Detail subpane");
 }
 
 } // namespace

@@ -901,8 +901,21 @@ inline std::string RenderScreen(const TopState& state, int width, int height, bo
                             << PadOrTruncate(r.resultsCompact.empty() ? "-" : r.resultsCompact, 11) << " "
                             << PadOrTruncate(countStr + (!r.taskTitle.empty() ? (" (" + r.taskId + ")") : ""),
                                              static_cast<size_t>(std::max(10, width - 66)));
+                    } else if (r.kind == pc::TaskDisplayRowKind::DirectionHeading) {
+                        std::string indentStr(static_cast<size_t>(r.indent) * 2, ' ');
+                        std::string dirLabel = indentStr + std::string(r.expanded ? "v " : "> ") +
+                                               (!r.directionTitle.empty() ? r.directionTitle : ("direction:" + r.directionId));
+                        std::string kindCol = "dir:" + (r.directionKind.empty() ? "jobs" : r.directionKind);
+                        std::string countStr = std::to_string(r.jobCount) + (r.jobCount == 1 ? " job" : " jobs");
+                        row << PadOrTruncate(dirLabel, 24) << " "
+                            << PadOrTruncate(kindCol, 14) << " "
+                            << PadOrTruncate(r.directionState, 11) << " "
+                            << PadOrTruncate(r.resultsCompact.empty() ? "-" : r.resultsCompact, 11) << " "
+                            << PadOrTruncate(countStr + " (direction:" + r.directionId + ")",
+                                             static_cast<size_t>(std::max(10, width - 66)));
                     } else if (r.kind == pc::TaskDisplayRowKind::MoreJobs) {
-                        row << PadOrTruncate("  ... (+" + std::to_string(r.hiddenJobCount) + " older)", 24);
+                        std::string indentStr(static_cast<size_t>(std::max(1, r.indent)) * 2, ' ');
+                        row << PadOrTruncate(indentStr + "... (+" + std::to_string(r.hiddenJobCount) + " older)", 24);
                     } else {
                         const auto& j = r.jobJson;
                         std::string jid = j.value("id", j.value("key", "-"));
@@ -918,7 +931,8 @@ inline std::string RenderScreen(const TopState& state, int width, int height, bo
                         if (!r.supersedes.empty()) summary = "[<- " + pc::ShortJobRef(r.supersedes) + "] " + summary;
                         if (!r.supersededBy.empty()) summary = "[-> " + pc::ShortJobRef(r.supersededBy) + "] " + summary;
 
-                        row << PadOrTruncate("  " + jid, 24) << " "
+                        std::string indentStr(static_cast<size_t>(r.indent) * 2, ' ');
+                        row << PadOrTruncate(indentStr + jid, 24) << " "
                             << PadOrTruncate(queueCol, 14) << " "
                             << PadOrTruncate(st, 11) << " "
                             << PadOrTruncate(dur, 11) << " "
@@ -972,6 +986,18 @@ inline std::string RenderScreen(const TopState& state, int width, int height, bo
                     linesRendered++;
                     if (!selRow.taskTitle.empty()) {
                         out << "   Title: " << PadOrTruncate(selRow.taskTitle, static_cast<size_t>(std::max(10, width - 12))) << "\n";
+                        linesRendered++;
+                    }
+                } else if (selRow.kind == pc::TaskDisplayRowKind::DirectionHeading) {
+                    out << bold("[Direction Detail: direction:" + selRow.directionId + "]")
+                        << "  Kind: " << (selRow.directionKind.empty() ? "jobs" : selRow.directionKind)
+                        << "  State: " << colorState(selRow.directionState)
+                        << "  Jobs: " << selRow.jobCount;
+                    if (!selRow.resultsCompact.empty()) out << "  Results: " << selRow.resultsCompact;
+                    out << "\n";
+                    linesRendered++;
+                    if (!selRow.directionTitle.empty()) {
+                        out << "   Title: " << PadOrTruncate(selRow.directionTitle, static_cast<size_t>(std::max(10, width - 12))) << "\n";
                         linesRendered++;
                     }
                 } else if (selRow.kind == pc::TaskDisplayRowKind::Job) {
@@ -1818,6 +1844,8 @@ inline int RunTopLoop(const std::vector<std::string>& args, bool jsonOutput) {
                         const auto& r = rows[static_cast<size_t>(state.selectedRow)];
                         if (r.kind == pc::TaskDisplayRowKind::TaskHeading && !r.taskId.empty()) {
                             state.taskExpandedOverrides[r.taskId] = !r.expanded;
+                        } else if (r.kind == pc::TaskDisplayRowKind::DirectionHeading && !r.directionId.empty()) {
+                            state.taskExpandedOverrides["direction:" + r.directionId] = !r.expanded;
                         }
                     }
                 }

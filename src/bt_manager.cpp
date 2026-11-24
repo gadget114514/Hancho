@@ -294,6 +294,14 @@ std::string BtManager::LookupTaskIdForBtLocked(const std::string& btId) const {
     return "";
 }
 
+std::string BtManager::LookupDirectionIdForBtLocked(const std::string& btId) const {
+    auto it = trees_.find(btId);
+    if (it != trees_.end() && it->second && it->second->tree) {
+        return it->second->tree->DirectionId();
+    }
+    return "";
+}
+
 std::string BtManager::UniqueJobId(const std::string& proposedId) const {
     TaskQueueJob existing;
     if (!tqm_.GetJobSnapshot(proposedId, existing)) return proposedId;
@@ -324,6 +332,8 @@ std::string BtManager::StartJob(const BtJobSpec& spec) {
         spec.idle);
     const std::string taskId = LookupTaskIdForBtLocked(spec.btId);
     if (!taskId.empty()) jobJson["task_id"] = taskId;
+    const std::string directionId = LookupDirectionIdForBtLocked(spec.btId);
+    if (!directionId.empty()) jobJson["direction_id"] = directionId;
 
     TaskQueueBtRef ref;
     ref.id = spec.btId;
@@ -396,6 +406,8 @@ std::string BtManager::StartWorker(const BtWorkerSpec& spec) {
         spec.idle);
     const std::string taskId = LookupTaskIdForBtLocked(spec.btId);
     if (!taskId.empty()) jobJson["task_id"] = taskId;
+    const std::string directionId = LookupDirectionIdForBtLocked(spec.btId);
+    if (!directionId.empty()) jobJson["direction_id"] = directionId;
 
     TaskQueueBtRef ref;
     ref.id = spec.btId;
@@ -424,6 +436,8 @@ BtRemainingInfo BtManager::GetRemainingInfo() const {
         if (!active && state != "failed") continue;
         TaskGroupInfo group;
         group.id = entry->tree->Id();
+        group.directionId = entry->tree->DirectionId();
+        group.taskId = entry->tree->TaskId();
         group.state = state;
         group.summary = entry->tree->Summary();
         group.detail = entry->tree->Detail();
@@ -696,6 +710,17 @@ void BtManager::LoadPersistedTrees() {
         trees_[btId] = std::move(entry);
 
         const std::string st = entryPtr->tree->State();
+        if (entryPtr->tree->DirectionId().empty() &&
+            (st == "running" || st == "waitingForLlm" || st == "paused")) {
+            std::string dirId;
+            std::string dirErr;
+            const std::string btTitle =
+                entryPtr->tree->Summary().empty() ? btId : entryPtr->tree->Summary();
+            if (tqm_.EnsureBtDirection(btId, "", entryPtr->tree->TaskId(), btTitle,
+                                       tqm_.BtOriginJson(btId), dirId, dirErr)) {
+                entryPtr->tree->SetDirectionId(dirId);
+            }
+        }
         if (st == "running" || st == "waitingForLlm") {
             auto runningIds = entryPtr->tree->RunningJobIds();
             for (const auto& jobId : runningIds) {

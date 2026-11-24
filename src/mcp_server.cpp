@@ -574,7 +574,7 @@ int RunMcpServer() {
                 << "},"
                 << "{"
                  << "\"name\":\"taskqueue_list\","
-                 << "\"description\":\"List task queue jobs with state, attempts, last reason and blockedBy. Failed jobs carry the same top-level failure record (class, summary, suggestedAction, evidence) as taskqueue_get. Provisional 'planned' rows for idle job/worker leaves of running behavior trees are included by default; set includePlanned=false to omit them and the task-group row. The active task group (the BT root) appears as a virtual row with id 'group:<id>' and state running, waitingForLlm or paused. Neither row is a stored job; read a task group with bt_get and answer it with bt_resume.\","
+                 << "\"description\":\"List task queue jobs with state, attempts, last reason and blockedBy. Failed jobs carry the same top-level failure record (class, summary, suggestedAction, evidence) as taskqueue_get. Provisional 'planned' rows for idle job/worker leaves of running behavior trees are included by default; set includePlanned=false to omit them and the direction row. The active BT direction appears as a virtual row with id 'direction:<id>' and state running, waitingForLlm or paused (legacy 'group:<btId>' is accepted as an alias on operations). Neither row is a stored job; read a direction with direction_show/bt_get and answer a waiting BT with bt_resume.\","
                 << "\"inputSchema\":{\"type\":\"object\",\"properties\":{"
                 << "\"taskqueue\":{\"type\":\"string\",\"description\":\"Optional task queue name (all queues when omitted)\"},"
                 << "\"state\":{\"type\":\"string\",\"description\":\"Optional state filter: pending, planned, running, succeeded, failed, blocked, cancelled, waitingForPermit\"},"
@@ -817,6 +817,46 @@ int RunMcpServer() {
                 << "\"timeoutMs\":{\"type\":\"integer\",\"description\":\"Max wait in milliseconds (default 30000; negative = no limit)\"},"
                 << "\"logLimit\":{\"type\":\"integer\",\"description\":\"Max recent log entries to return (default 200)\"}"
                 << "},\"required\":[\"id\"]}"
+                << "},"
+                << "{"
+                << "\"name\":\"direction_show\","
+                << "\"description\":\"Show a direction record (or implicit job:<id>), computed state, and its jobs.\","
+                << "\"inputSchema\":{\"type\":\"object\",\"properties\":{"
+                << "\"id\":{\"type\":\"string\",\"description\":\"Direction id (dir_... or job:<jobId>)\"}"
+                << "},\"required\":[\"id\"]}"
+                << "},"
+                << "{"
+                << "\"name\":\"direction_list\","
+                << "\"description\":\"List direction records with computed state, optionally filtered by taskId or state.\","
+                << "\"inputSchema\":{\"type\":\"object\",\"properties\":{"
+                << "\"taskId\":{\"type\":\"string\",\"description\":\"Optional task id filter\"},"
+                << "\"state\":{\"type\":\"string\",\"enum\":[\"planned\",\"open\",\"running\",\"paused\",\"failed\",\"cancelled\",\"succeeded\",\"closed\"],\"description\":\"Optional state filter\"},"
+                << "\"limit\":{\"type\":\"integer\",\"description\":\"Max directions to return\"}"
+                << "}}"
+                << "},"
+                << "{"
+                << "\"name\":\"direction_close\","
+                << "\"description\":\"Close a direction with a final result (succeeded, failed, or ignored) and reason. Fails if any job in the direction is still active.\","
+                << "\"inputSchema\":{\"type\":\"object\",\"properties\":{"
+                << "\"id\":{\"type\":\"string\",\"description\":\"Direction id\"},"
+                << "\"result\":{\"type\":\"string\",\"enum\":[\"succeeded\",\"failed\",\"ignored\"],\"description\":\"Final result\"},"
+                << "\"reason\":{\"type\":\"string\",\"description\":\"Reason for closing (max 2000 bytes)\"}"
+                << "},\"required\":[\"id\",\"result\",\"reason\"]}"
+                << "},"
+                << "{"
+                << "\"name\":\"direction_reopen\","
+                << "\"description\":\"Reopen a closed direction with a reason.\","
+                << "\"inputSchema\":{\"type\":\"object\",\"properties\":{"
+                << "\"id\":{\"type\":\"string\",\"description\":\"Direction id\"},"
+                << "\"reason\":{\"type\":\"string\",\"description\":\"Reason for reopening (max 2000 bytes)\"}"
+                << "},\"required\":[\"id\",\"reason\"]}"
+                << "},"
+                << "{"
+                << "\"name\":\"direction_purge\","
+                << "\"description\":\"Remove old closed directions or completed implicit-task directions older than olderThanSec.\","
+                << "\"inputSchema\":{\"type\":\"object\",\"properties\":{"
+                << "\"olderThanSec\":{\"type\":\"integer\",\"description\":\"Minimum age in seconds\"}"
+                << "},\"required\":[\"olderThanSec\"]}"
                 << "},"
                 << "{"
                 << "\"name\":\"bt_validate\","
@@ -2141,6 +2181,14 @@ int RunMcpServer() {
                     waits.Start(rpcId, toolName, argsObj, PendingLongCalls::Mode::Poll, "timedOut", "timeout_ms");
                     continue;
                 }
+                ipcReq << argsObj.dump();
+            }
+            else if (toolName.rfind("direction_", 0) == 0) {
+                auto argsObj = nlohmann::json::parse(argsJson, nullptr, false);
+                if (argsObj.is_discarded() || !argsObj.is_object()) {
+                    argsObj = nlohmann::json::object();
+                }
+                argsObj["action"] = toolName;
                 ipcReq << argsObj.dump();
             }
             else if (toolName.rfind("bt_", 0) == 0) {

@@ -4589,10 +4589,18 @@ static LRESULT CALLBACK PastRunsWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPAR
     return DefWindowProcW(hwnd, msg, wParam, lParam);
 }
 
+static std::string TaskRowBtId(DashboardState* st, const std::string& jobId);
 static void ShowTaskQueueJobDetails(DashboardState* st, const std::string& jobId, int initialTab = 0) {
     if (!st || jobId.empty()) return;
     if (jobId.rfind("group:", 0) == 0) {
         ShowBtDebugDialog(st, jobId.substr(6));
+        return;
+    }
+    if (jobId.rfind("direction:", 0) == 0) {
+        const std::string btId = TaskRowBtId(st, jobId);
+        if (!btId.empty()) {
+            ShowBtDebugDialog(st, btId);
+        }
         return;
     }
     if (jobId.rfind("btplan:", 0) == 0) {
@@ -5941,13 +5949,18 @@ static std::vector<SelectedTaskRow> SelectedTaskRows(DashboardState* st) {
     return rows;
 }
 
-// Resolves the owning behavior-tree id of a virtual task-list row (group or planned).
+// Resolves the owning behavior-tree id of a virtual task-list row (direction, group or planned).
 static std::string TaskRowBtId(DashboardState* st, const std::string& jobId) {
+    if (jobId.rfind("group:", 0) == 0) return jobId.substr(6);
     if (!st || st->lastTaskListJson.empty()) return "";
     nlohmann::json doc = nlohmann::json::parse(st->lastTaskListJson, nullptr, false);
     if (!doc.is_object() || !doc.contains("jobs") || !doc["jobs"].is_array()) return "";
     for (const auto& j : doc["jobs"]) {
         if (!j.is_object() || j.value("id", std::string()) != jobId) continue;
+        if (j.contains("direction") && j["direction"].is_object()) {
+            const std::string bt = j["direction"].value("bt_id", std::string());
+            if (!bt.empty()) return bt;
+        }
         if (j.contains("bt") && j["bt"].is_object()) return j["bt"].value("id", std::string());
         if (j.contains("group") && j["group"].is_object()) return j["group"].value("id", std::string());
     }
@@ -6017,7 +6030,7 @@ static bool TaskJobIsFinished(const std::string& state) {
 
 // Virtual rows (task groups and planned rows) are not queue jobs, so bulk actions skip them.
 static bool TaskRowIsRealJob(const std::string& id) {
-    return id.rfind("btplan:", 0) != 0 && id.rfind("group:", 0) != 0;
+    return id.rfind("btplan:", 0) != 0 && id.rfind("group:", 0) != 0 && id.rfind("direction:", 0) != 0;
 }
 
 // Stop (3140), pause (3141), remove (3142) or resume (3143) the jobs the origin filter shows.
@@ -6084,17 +6097,22 @@ static void RunOriginJobsAction(DashboardState* st, int cmd) {
 
 static void ShowTaskQueueContextMenu(DashboardState* st, const std::string& jobId, POINT ptScreen, const std::wstring& cellText) {
     if (!st || jobId.empty()) return;
-    const bool virtualJob = jobId.rfind("btplan:", 0) == 0 || jobId.rfind("group:", 0) == 0;
+    const bool directionRow = jobId.rfind("direction:", 0) == 0;
+    const bool groupRow = jobId.rfind("group:", 0) == 0;
+    const bool virtualJob = jobId.rfind("btplan:", 0) == 0 || groupRow || directionRow;
     std::vector<std::string> selectedReal;
     for (const auto& row : SelectedTaskRows(st)) {
-        if (row.id.rfind("btplan:", 0) == 0 || row.id.rfind("group:", 0) == 0) continue;
+        if (row.id.rfind("btplan:", 0) == 0 || row.id.rfind("group:", 0) == 0 ||
+            row.id.rfind("direction:", 0) == 0) {
+            continue;
+        }
         selectedReal.push_back(row.id);
     }
-    const bool groupRow = jobId.rfind("group:", 0) == 0;
-    const std::string groupId = groupRow ? jobId.substr(6) : std::string();
-    const std::string virtualBtId = groupRow ? groupId : TaskRowBtId(st, jobId);
+    const std::string virtualBtId = groupRow ? jobId.substr(6) : TaskRowBtId(st, jobId);
+    const bool btDirectionRow = (groupRow || directionRow) && !virtualBtId.empty();
+    const bool jobsDirectionRow = directionRow && virtualBtId.empty();
     BtWaitDetails btWait;
-    if (groupRow) btWait = FetchBtWaitDetails(st, groupId);
+    if (btDirectionRow) btWait = FetchBtWaitDetails(st, virtualBtId);
     const std::string btNode = btWait.node;
     const std::vector<std::string>& btChoices = btWait.expect;
     std::string err;
@@ -6107,15 +6125,15 @@ static void ShowTaskQueueContextMenu(DashboardState* st, const std::string& jobI
     AppendMenuW(hMenu, MF_SEPARATOR, 0, nullptr);
     if (virtualJob) {
         HMENU hAnswerMenu = nullptr;
-        // A failed group stays listed until it is retried or closed; answering and pausing
+        // A failed direction stays listed until it is retried or closed; answering and pausing
         // only apply while it is still running.
-        const bool groupFailed = groupRow && btWait.state == "failed";
+        const bool groupFailed = btDirectionRow && btWait.state == "failed";
         if (groupFailed) {
             AppendMenuW(hMenu, MF_STRING, 3211,
-                        Tr(L"失敗した枝からタスクグループを再実行",
-                           L"Retry the task group from the failed branch",
-                           L"Reintentar el grupo desde la rama fallida"));
-        } else if (groupRow) {
+                        Tr(L"失敗した枝から direction を再実行",
+                           L"Retry the direction from the failed branch",
+                           L"Reintentar la direction desde la rama fallida"));
+        } else if (btDirectionRow) {
             // Always available: the cause may be a rate limit, auth, a provider outage, a
             // hung request, a context limit, or something else on the LLM side. The dialog
             // shows what was found and offers answer / retry / wait.
@@ -6140,38 +6158,57 @@ static void ShowTaskQueueContextMenu(DashboardState* st, const std::string& jobI
             const bool groupPaused = btWait.state == "paused";
             AppendMenuW(hMenu, MF_STRING, 3213,
                         groupPaused
-                            ? Tr(L"タスクグループを再開 (新規タスクを開始)",
-                                 L"Resume task group (start new tasks)",
-                                 L"Reanudar grupo de tareas (iniciar tareas)")
-                            : Tr(L"タスクグループを一時停止 (新規タスクを止める)",
-                                 L"Pause task group (stop starting new tasks)",
-                                 L"Pausar grupo de tareas (no iniciar tareas)"));
+                            ? Tr(L"direction を再開 (新規タスクを開始)",
+                                 L"Resume direction (start new tasks)",
+                                 L"Reanudar direction (iniciar tareas)")
+                            : Tr(L"direction を一時停止 (新規タスクを止める)",
+                                 L"Pause direction (stop starting new tasks)",
+                                 L"Pausar direction (no iniciar tareas)"));
             AppendMenuW(hMenu, MF_STRING, 3212,
-                        Tr(L"タスクグループを停止 (キャンセル)",
-                           L"Stop task group (cancel)",
-                           L"Detener grupo de tareas (cancelar)"));
+                        Tr(L"direction を停止 (キャンセル)",
+                           L"Stop direction (cancel)",
+                           L"Detener direction (cancelar)"));
+        } else if (jobsDirectionRow) {
+            AppendMenuW(hMenu, MF_STRING, 3221,
+                        Tr(L"direction を再実行 (Retry)",
+                           L"Retry direction",
+                           L"Reintentar direction"));
+            AppendMenuW(hMenu, MF_STRING, 3222,
+                        Tr(L"direction を一時停止 (Pause)",
+                           L"Pause direction",
+                           L"Pausar direction"));
+            AppendMenuW(hMenu, MF_STRING, 3223,
+                        Tr(L"direction を再開 (Resume)",
+                           L"Resume direction",
+                           L"Reanudar direction"));
+            AppendMenuW(hMenu, MF_STRING, 3224,
+                        Tr(L"direction を停止 (キャンセル)",
+                           L"Stop direction (cancel)",
+                           L"Detener direction (cancelar)"));
         }
         if (!virtualBtId.empty()) {
-            if (!groupRow) {
+            if (!btDirectionRow) {
                 AppendMenuW(hMenu, MF_STRING, 3211,
-                            Tr(L"タスクグループを再実行", L"Retry task group",
-                               L"Reintentar grupo de tareas"));
+                            Tr(L"direction を再実行", L"Retry direction",
+                               L"Reintentar direction"));
                 AppendMenuW(hMenu, MF_STRING, 3212,
-                            Tr(L"タスクグループを停止 (キャンセル)",
-                               L"Stop task group (cancel)",
-                               L"Detener grupo de tareas (cancelar)"));
+                            Tr(L"direction を停止 (キャンセル)",
+                               L"Stop direction (cancel)",
+                               L"Detener direction (cancelar)"));
             }
             AppendMenuW(hMenu, MF_STRING, 3214,
-                        Tr(L"タスクリストから削除（グループを停止して消す）",
-                           L"Remove from task list (stop and delete the group)",
-                           L"Quitar de la lista (detener y eliminar el grupo)"));
+                        Tr(L"タスクリストから削除（direction を停止して消す）",
+                           L"Remove from task list (stop and delete the direction)",
+                           L"Quitar de la lista (detener y eliminar la direction)"));
             AppendMenuW(hMenu, MF_STRING, 3215,
-                        Tr(L"状態を closed にする（グループを停止）",
-                           L"Force state to closed (stop the group)",
-                           L"Forzar estado a cerrado (detener el grupo)"));
+                        Tr(L"状態を closed にする（direction を停止）",
+                           L"Force state to closed (stop the direction)",
+                           L"Forzar estado a cerrado (detener la direction)"));
         }
-        // Virtual task-group / planned rows are not queue jobs; retry/cancel have nothing to act on.
-        AppendMenuW(hMenu, MF_STRING, 3111, Tr(L"タスクグループで表示", L"Show Task Group", L"Ver el grupo de tareas"));
+        // Virtual direction / planned rows are not queue jobs; retry/cancel have nothing to act on.
+        if (!jobsDirectionRow) {
+            AppendMenuW(hMenu, MF_STRING, 3111, Tr(L"direction で表示", L"Show direction", L"Ver direction"));
+        }
         if (selectedReal.size() > 1) {
             wchar_t batchLabel[128] = {};
             swprintf_s(batchLabel,
@@ -6183,27 +6220,43 @@ static void ShowTaskQueueContextMenu(DashboardState* st, const std::string& jobI
         int cmd = TrackPopupMenu(hMenu, TPM_RETURNCMD | TPM_RIGHTBUTTON, ptScreen.x, ptScreen.y, 0, st->hwndMain, nullptr);
         if (hAnswerMenu) DestroyMenu(hAnswerMenu);
         DestroyMenu(hMenu);
-        if (cmd == 3133) {
+        if (cmd == 3221 || cmd == 3222 || cmd == 3223 || cmd == 3224) {
+            nlohmann::json req;
+            if (cmd == 3221) req["action"] = "taskqueue_retry";
+            else if (cmd == 3222) req["action"] = "taskqueue_pause_job";
+            else if (cmd == 3223) req["action"] = "taskqueue_resume_job";
+            else req["action"] = "taskqueue_cancel";
+            req["id"] = jobId;
+            std::string ipcErr;
+            std::string ipcResp = (cmd == 3221) ? TaskQueueRetryIpc(st, jobId, true, true, ipcErr) : ((cmd == 3222) ? TaskQueuePauseJobIpc(st, jobId, true, ipcErr) : ((cmd == 3223) ? TaskQueuePauseJobIpc(st, jobId, false, ipcErr) : TaskQueueCancelIpc(st, jobId, ipcErr)));
+            nlohmann::json rdoc = nlohmann::json::parse(ipcResp, nullptr, false);
+            const bool ok = ipcErr.empty() && rdoc.is_object() && rdoc.value("ok", false);
+            ShowTaskQueueResult(
+                st, Tr(L"direction", L"direction", L"direction"),
+                ok ? Tr(L"direction を操作しました。", L"Updated direction.", L"Direction actualizada.")
+                   : Utf8ToWide(ipcErr.empty() ? rdoc.value("error", std::string("error")) : ipcErr),
+                ok);
+        } else if (cmd == 3133) {
             RemoveTaskRows(st, selectedReal, true);
         } else if (cmd == 3214) {
             if (gui_platform::GetGuiPlatform()->ShowMessageBox(
                     st->hwndMain,
-                    Tr(L"タスクグループを削除", L"Delete task group", L"Eliminar grupo de tareas"),
-                    Tr(L"このタスクグループを停止し、一覧から削除しますか？\n"
-                       L"実行中・待機中のタスクはキャンセルされ、グループの状態ファイルも削除されます。",
-                       L"Stop this task group and remove it from the list?\n"
-                       L"Running and queued tasks are cancelled, and the group's state file is deleted.",
-                       L"¿Detener este grupo de tareas y quitarlo de la lista?\n"
+                    Tr(L"direction を削除", L"Delete direction", L"Eliminar direction"),
+                    Tr(L"この direction を停止し、一覧から削除しますか？\n"
+                       L"実行中・待機中のタスクはキャンセルされ、direction の状態ファイルも削除されます。",
+                       L"Stop this direction and remove it from the list?\n"
+                       L"Running and queued tasks are cancelled, and the direction's state file is deleted.",
+                       L"¿Detener esta direction y quitarla de la lista?\n"
                        L"Las tareas en ejecución y en espera se cancelan, y se elimina el archivo de estado."),
                     gui_platform::MessageBoxType::QuestionYesNo,
                     true) == gui_platform::MessageBoxResult::Yes) {
                 std::wstring removeErr;
                 if (SubmitBtRemove(st, virtualBtId, removeErr)) {
                     ShowTaskQueueResult(
-                        st, Tr(L"タスクグループを削除", L"Task group deleted", L"Grupo de tareas eliminado"),
-                        Tr(L"グループを停止し、一覧から削除しました。",
-                           L"Stopped the group and removed it from the list.",
-                           L"Se detuvo el grupo y se quitó de la lista."),
+                        st, Tr(L"direction を削除", L"direction deleted", L"direction eliminada"),
+                        Tr(L"direction を停止し、一覧から削除しました。",
+                           L"Stopped the direction and removed it from the list.",
+                           L"Se detuvo la direction y se quitó de la lista."),
                         true);
                 } else {
                     ShowTaskQueueResult(
@@ -6215,20 +6268,20 @@ static void ShowTaskQueueContextMenu(DashboardState* st, const std::string& jobI
             if (gui_platform::GetGuiPlatform()->ShowMessageBox(
                     st->hwndMain,
                     Tr(L"状態を closed にする", L"Force state to closed", L"Forzar estado a cerrado"),
-                    Tr(L"このタスクグループを停止して closed（終了）にしますか？\n"
-                       L"グループと未起動の予定行は一覧から消えます（ツリーは cancelled として残ります）。",
-                       L"Stop this task group and mark it closed?\n"
-                       L"The group and its planned rows leave the list (the tree stays as cancelled).",
-                       L"¿Detener este grupo y marcarlo como cerrado?\n"
-                       L"El grupo y sus filas previstas salen de la lista (el árbol queda cancelado)."),
+                    Tr(L"この direction を停止して closed（終了）にしますか？\n"
+                       L"direction と未起動の予定行は一覧から消えます（ツリーは cancelled として残ります）。",
+                       L"Stop this direction and mark it closed?\n"
+                       L"The direction and its planned rows leave the list (the tree stays as cancelled).",
+                       L"¿Detener esta direction y marcarla como cerrada?\n"
+                       L"La direction y sus filas previstas salen de la lista (el árbol queda cancelado)."),
                     gui_platform::MessageBoxType::QuestionYesNo,
                     true) == gui_platform::MessageBoxResult::Yes) {
                 std::wstring cancelErr;
                 if (SubmitBtCancel(st, virtualBtId, cancelErr)) {
                     ShowTaskQueueResult(st, Tr(L"closed", L"closed", L"cerrado"),
-                                        Tr(L"グループを停止し、行を一覧から消しました。",
-                                           L"Stopped the group and removed its rows from the list.",
-                                           L"Se detuvo el grupo y se quitaron sus filas de la lista."),
+                                        Tr(L"direction を停止し、行を一覧から消しました。",
+                                           L"Stopped the direction and removed its rows from the list.",
+                                           L"Se detuvo la direction y se quitaron sus filas de la lista."),
                                         true);
                 } else {
                     ShowTaskQueueResult(st, Tr(L"closed にできませんでした", L"Could not close",
@@ -6237,7 +6290,7 @@ static void ShowTaskQueueContextMenu(DashboardState* st, const std::string& jobI
                 }
             }
         } else if (cmd == 3210) {
-            ShowBtAnswerDialog(st, btWait, groupId);
+            ShowBtAnswerDialog(st, btWait, virtualBtId);
         } else if (cmd == 3211) {
             std::wstring retryErr;
             // A failed tree finds its own deepest failed node; a job's recorded failure may be
@@ -6258,57 +6311,57 @@ static void ShowTaskQueueContextMenu(DashboardState* st, const std::string& jobI
         } else if (cmd == 3212) {
             if (gui_platform::GetGuiPlatform()->ShowMessageBox(
                     st->hwndMain,
-                    Tr(L"タスクグループのキャンセル", L"Cancel task group",
-                       L"Cancelar grupo de tareas"),
-                    Tr(L"このタスクグループをキャンセルしますか？\n"
-                       L"グループに属する実行中・待機中・仮登録のタスクもすべてキャンセルされます。",
-                       L"Cancel this task group?\n"
+                    Tr(L"direction のキャンセル", L"Cancel direction",
+                       L"Cancelar direction"),
+                    Tr(L"この direction をキャンセルしますか？\n"
+                       L"direction に属する実行中・待機中・仮登録のタスクもすべてキャンセルされます。",
+                       L"Cancel this direction?\n"
                        L"Tasks that belong to it (running, waiting and provisionally registered) "
                        L"will be cancelled too.",
-                       L"¿Cancelar este grupo de tareas?\n"
+                       L"¿Cancelar esta direction?\n"
                        L"También se cancelarán sus tareas en ejecución, en espera y provisionales."),
                     gui_platform::MessageBoxType::QuestionYesNo,
                     true) == gui_platform::MessageBoxResult::Yes) {
                 std::wstring cancelErr;
                 if (SubmitBtCancel(st, virtualBtId, cancelErr)) {
                     ShowTaskQueueResult(
-                        st, Tr(L"タスクグループをキャンセル", L"Task group cancelled",
-                               L"Grupo de tareas cancelado"),
-                        Tr(L"グループと、それに属する未完了のタスクをキャンセルしました。",
-                           L"Cancelled the group and its unfinished tasks.",
-                           L"Se canceló el grupo y sus tareas sin terminar."),
+                        st, Tr(L"direction をキャンセル", L"direction cancelled",
+                               L"direction cancelada"),
+                        Tr(L"direction と、それに属する未完了のタスクをキャンセルしました。",
+                           L"Cancelled the direction and its unfinished tasks.",
+                           L"Se canceló la direction y sus tareas sin terminar."),
                         true);
                 } else {
                     ShowTaskQueueResult(
-                        st, Tr(L"キャンセルできませんでした", L"Could not cancel the group",
-                               L"No se pudo cancelar el grupo"),
+                        st, Tr(L"キャンセルできませんでした", L"Could not cancel the direction",
+                               L"No se pudo cancelar la direction"),
                         cancelErr, false);
                 }
             }
         } else if (cmd == 3213) {
             const bool groupPaused = btWait.state == "paused";
             std::wstring pauseErr;
-            if (SubmitBtPause(st, groupId, !groupPaused, pauseErr)) {
+            if (SubmitBtPause(st, virtualBtId, !groupPaused, pauseErr)) {
                 ShowTaskQueueResult(
-                    st, Tr(L"タスクグループ", L"Task group", L"Grupo de tareas"),
+                    st, Tr(L"direction", L"direction", L"direction"),
                     groupPaused
-                        ? Tr(L"タスクグループを再開しました。",
-                             L"Resumed the task group.",
-                             L"Se reanudó el grupo de tareas.")
-                        : Tr(L"タスクグループを一時停止しました。実行中のタスクは続きます。",
-                             L"Paused the task group. Running tasks continue.",
-                             L"Se pausó el grupo. Las tareas en ejecución continúan."),
+                        ? Tr(L"direction を再開しました。",
+                             L"Resumed the direction.",
+                             L"Se reanudó la direction.")
+                        : Tr(L"direction を一時停止しました。実行中のタスクは続きます。",
+                             L"Paused the direction. Running tasks continue.",
+                             L"Se pausó la direction. Las tareas en ejecución continúan."),
                     true);
             } else {
                 ShowTaskQueueResult(
-                    st, Tr(L"タスクグループを操作できませんでした",
-                           L"Could not change the task group",
-                           L"No se pudo cambiar el grupo de tareas"),
+                    st, Tr(L"direction を操作できませんでした",
+                           L"Could not change the direction",
+                           L"No se pudo cambiar la direction"),
                     pauseErr, false);
             }
         } else if (cmd >= 3200 && cmd < 3200 + static_cast<int>(btChoices.size())) {
             std::wstring answerErr;
-            if (SubmitBtAnswer(st, groupId, btNode, btChoices[static_cast<size_t>(cmd - 3200)],
+            if (SubmitBtAnswer(st, virtualBtId, btNode, btChoices[static_cast<size_t>(cmd - 3200)],
                                answerErr)) {
                 ShowTaskQueueResult(
                     st, Tr(L"回答して再開", L"Answer and resume", L"Responder y continuar"),
@@ -6368,7 +6421,7 @@ static void ShowTaskQueueContextMenu(DashboardState* st, const std::string& jobI
     if (triageIt != st->triageJobs.end() && !triageIt->second.value("cardId", std::string()).empty())
         AppendMenuW(hMenu, MF_STRING, 3115, Tr(L"トリアージで開く", L"Open in Triage", L"Abrir en Triaje"));
     if (resp.find("\"bt\":{") != std::string::npos) {
-        AppendMenuW(hMenu, MF_STRING, 3111, Tr(L"タスクグループで表示", L"Show Task Group", L"Ver el grupo de tareas"));
+        AppendMenuW(hMenu, MF_STRING, 3111, Tr(L"direction で表示", L"Show direction", L"Ver direction"));
     }
     // With an origin filter on, the clicked job's origin gets bulk actions over every job it shows.
     if (!st->taskOriginFilter.empty()) {
@@ -7114,6 +7167,32 @@ static void RefreshTaskQueueData(DashboardState* st, bool force = false, bool us
             keptDisplayRows.push_back(drow);
             continue;
         }
+        if (drow.kind == pc::TaskDisplayRowKind::DirectionHeading) {
+            TaskListRow row;
+            row.id = "direction:" + drow.directionId;
+            row.indent = drow.indent;
+            row.kind = (drow.directionState == "running") ? "running"
+                     : (drow.directionState == "failed") ? "failed"
+                     : "taskHeading";
+            row.cells[0] = (drow.expanded ? L"\x25BE " : L"\x25B8 ") + Utf8ToWide("direction:" + drow.directionId);
+            row.cells[1] = Utf8ToWide(drow.directionTitle.empty() ? drow.directionId : drow.directionTitle);
+            row.cells[2] = std::wstring(L"direction (") + std::to_wstring(drow.jobCount) + L")";
+            row.cells[3] = TaskStateLabelWide(drow.directionState);
+            row.cells[4] = Utf8ToWide(drow.resultsCompact);
+            row.cells[5] = L"-";
+            row.cells[6] = L"-";
+            row.cells[13] = row.cells[1];
+            if (!st->taskSearchText.empty()) {
+                bool matches = false;
+                for (const auto& cell : row.cells) {
+                    if (WideContainsCi(cell, st->taskSearchText)) { matches = true; break; }
+                }
+                if (!matches) continue;
+            }
+            rows.push_back(std::move(row));
+            keptDisplayRows.push_back(drow);
+            continue;
+        }
         if (drow.kind == pc::TaskDisplayRowKind::MoreJobs) {
             TaskListRow row;
             row.id = "more:" + drow.taskId;
@@ -7167,9 +7246,9 @@ static void RefreshTaskQueueData(DashboardState* st, bool force = false, bool us
         std::wstring idStr = Utf8ToWide(jobId);
         std::wstring summaryStr = Utf8ToWide(JsonGetString(j, "summary", ""));
         std::wstring kindStr;
-        if (jobId.rfind("group:", 0) == 0) {
-            summaryStr = Tr(L"[BT] ", L"[BT] ", L"[BT] ") + summaryStr;
-            kindStr = L"BT";
+        if (jobId.rfind("group:", 0) == 0 || jobId.rfind("direction:", 0) == 0) {
+            summaryStr = L"[direction] " + summaryStr;
+            kindStr = L"direction";
         } else if (jobId.rfind("btplan:", 0) == 0) {
             summaryStr = Tr(L"[BT 予定] ", L"[BT Plan] ", L"[Plan BT] ") + summaryStr;
             kindStr = Tr(L"予定 (BT)", L"Planned (BT)", L"Previsto (BT)");
@@ -7198,7 +7277,7 @@ static void RefreshTaskQueueData(DashboardState* st, bool force = false, bool us
         if (!notes.empty()) stateStr += L" \U0001F4DD";
         std::string attemptStart = LastAttemptField(j, "start");
         std::string attemptEnd = LastAttemptField(j, "end");
-        const bool groupRowForTime = jobId.rfind("group:", 0) == 0;
+        const bool groupRowForTime = jobId.rfind("group:", 0) == 0 || jobId.rfind("direction:", 0) == 0;
         const std::string groupStart = (groupRowForTime && attemptStart.empty())
                                            ? JsonGetString(j, "start_time", "") : std::string();
         // The column shows the time of day only, but the sort uses the full date and time.
@@ -22021,6 +22100,11 @@ static LRESULT CALLBACK DashboardWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPA
                             st->selectedJobKey.clear();
                             st->selectedProcId = 0;
                             SyncStreamPane(st);
+                        } else if (drow.kind == pc::TaskDisplayRowKind::DirectionHeading) {
+                            st->selectedTaskId = drow.taskId;
+                            st->selectedJobKey = "direction:" + drow.directionId;
+                            st->selectedProcId = 0;
+                            SyncStreamPane(st);
                         } else if (drow.kind == pc::TaskDisplayRowKind::Job) {
                             st->selectedTaskId.clear();
                             st->selectedJobKey = drow.jobId;
@@ -22046,6 +22130,9 @@ static LRESULT CALLBACK DashboardWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPA
                         if (drow.kind == pc::TaskDisplayRowKind::TaskHeading && nmia->iSubItem == 0) {
                             st->taskExpandedOverrides[drow.taskId] = !drow.expanded;
                             RefreshTaskQueueData(st, true);
+                        } else if (drow.kind == pc::TaskDisplayRowKind::DirectionHeading && nmia->iSubItem == 0) {
+                            st->taskExpandedOverrides["direction:" + drow.directionId] = !drow.expanded;
+                            RefreshTaskQueueData(st, true);
                         } else if (drow.kind == pc::TaskDisplayRowKind::MoreJobs) {
                             st->taskShowAllJobs.insert(drow.taskId);
                             RefreshTaskQueueData(st, true);
@@ -22055,9 +22142,10 @@ static LRESULT CALLBACK DashboardWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPA
                     auto* nmia = reinterpret_cast<NMITEMACTIVATE*>(lParam);
                     int idx = nmia->iItem;
                     if (idx >= 0 && idx < static_cast<int>(st->taskJobIds.size())) {
-                        const bool isJob = (idx >= static_cast<int>(st->taskDisplayRows.size())) ||
-                                           (st->taskDisplayRows[idx].kind == pc::TaskDisplayRowKind::Job);
-                        if (isJob) {
+                        const bool isActionable = (idx >= static_cast<int>(st->taskDisplayRows.size())) ||
+                                                  (st->taskDisplayRows[idx].kind == pc::TaskDisplayRowKind::Job) ||
+                                                  (st->taskDisplayRows[idx].kind == pc::TaskDisplayRowKind::DirectionHeading);
+                        if (isActionable) {
                             // Keep a multi-selection when the clicked row is already selected;
                             // otherwise make the clicked row the only selection.
                             if (!(ListView_GetItemState(st->hwndTaskList, idx, LVIS_SELECTED) & LVIS_SELECTED)) {
@@ -22078,6 +22166,11 @@ static LRESULT CALLBACK DashboardWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPA
                         st->taskDisplayRows[idx].kind == pc::TaskDisplayRowKind::TaskHeading) {
                         const auto& drow = st->taskDisplayRows[idx];
                         st->taskExpandedOverrides[drow.taskId] = !drow.expanded;
+                        RefreshTaskQueueData(st, true);
+                    } else if (idx >= 0 && idx < static_cast<int>(st->taskDisplayRows.size()) &&
+                               st->taskDisplayRows[idx].kind == pc::TaskDisplayRowKind::DirectionHeading) {
+                        const auto& drow = st->taskDisplayRows[idx];
+                        st->taskExpandedOverrides["direction:" + drow.directionId] = !drow.expanded;
                         RefreshTaskQueueData(st, true);
                     } else if (idx >= 0 && idx < static_cast<int>(st->taskDisplayRows.size()) &&
                                st->taskDisplayRows[idx].kind == pc::TaskDisplayRowKind::MoreJobs) {

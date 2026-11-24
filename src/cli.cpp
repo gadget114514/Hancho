@@ -2672,11 +2672,12 @@ TASK QUEUE:
       --bt <id> lists every job of a behavior tree across its parallel branch queues.
       --origin self keeps only the jobs this session added.
       Idle BT leaves appear as provisional "planned" rows so the queue shows the
-      work a running tree may start; --no-planned hides them and the task-group
-      row. The active task group (the BT root) is also a virtual row with id
-      "group:<id>" and state running, waitingForLlm, paused or failed. Neither row
-      is a stored job. Planned rows disappear when the tree moves on; the group row
-      stays until the tree succeeds or is closed (a failed tree waits for bt retry,
+      work a running tree may start; --no-planned hides them and the direction
+      row. The active BT direction is also a virtual row with id
+      "direction:<id>" (legacy "group:<btId>" accepted as an alias) and state
+      running, waitingForLlm, paused or failed. Neither row is a stored job.
+      Planned rows disappear when the tree moves on; the direction row stays
+      until the tree succeeds or is closed (a failed tree waits for bt retry,
       bt cancel or bt remove).
 
   taskqueue record-plain --cmd <cmd> [--name <name>] [--exit-code <n>] [--log <path>] [--summary <text>]
@@ -2869,6 +2870,8 @@ SETUP FOR LLM AGENTS:
 "                  update_worker_info\n"
 "      Task:       task_create, task_show, task_list, task_note, task_close,\n"
 "                  task_reopen, task_purge, task_wait\n"
+"      Direction:  direction_show, direction_list, direction_close,\n"
+"                  direction_reopen, direction_purge\n"
 "      Task queue: taskqueue_add, taskqueue_list, taskqueue_get, taskqueue_retry,\n"
 "                  taskqueue_supersede, taskqueue_update, taskqueue_cancel, taskqueue_pause, taskqueue_resume,\n"
 "                  taskqueue_pause_job, taskqueue_resume_job, taskqueue_wait,\n"
@@ -3103,7 +3106,7 @@ void PrintCliUsageJson() {
       "usage": "hancho-cli taskqueue <add|list|get|why|retry|supersede|cancel|takeover|complete|pause|resume|pause-job|resume-job|graph|wait|purge|update> ...",
       "subcommands": [
         {"name": "add", "usage": "hancho-cli taskqueue add --file <jobs.json> [--taskqueue <name>] [--concurrency <n>] [--notify-file <path>] [--origin-label <text>] [--task <id>]", "description": "Register jobs. Each job needs id, command, summary and timeoutSec; dependsOn replaces shell chaining. The caller's session id, working folder and --origin-label are recorded as the job's origin. --task attaches the jobs to an open task record. suspendWhenDone/suspendDelaySec/suspendHibernate arm the PC to suspend, and shutdownWhenDone/shutdownDelaySec arm it to shut down, after that job and all other work is idle. Do not set hidden on jobs you register: it is reserved for Hancho's internal jobs and hides the row unless Show hidden tasks is on."},
-        {"name": "list", "usage": "hancho-cli taskqueue list [<name>] [--state <state>] [--since <period>] [--origin <self|label|session>] [--bt <id>] [--task <id>] [--no-planned]", "description": "List jobs with state, queue, summary and blockedBy. --since keeps only jobs updated within the period (e.g. 30m, 6h, 2d). --origin self keeps only the jobs this session added. --bt <id> lists every job of a behavior tree across its parallel branch queues. --task <id> keeps only jobs belonging to that task. Provisional 'planned' rows for idle BT leaves are included by default; --no-planned hides them and the task-group row. The active task group (the BT root) is a virtual row with id 'group:<id>' and state running, waitingForLlm or paused. Neither row is a stored job. Each job also carries resource_wait and, once succeeded with estimateSec, timing_feedback (see audit)."},
+        {"name": "list", "usage": "hancho-cli taskqueue list [<name>] [--state <state>] [--since <period>] [--origin <self|label|session>] [--bt <id>] [--task <id>] [--no-planned]", "description": "List jobs with state, queue, summary and blockedBy. --since keeps only jobs updated within the period (e.g. 30m, 6h, 2d). --origin self keeps only the jobs this session added. --bt <id> lists every job of a behavior tree across its parallel branch queues. --task <id> keeps only jobs belonging to that task. Provisional 'planned' rows for idle BT leaves are included by default; --no-planned hides them and the direction row. The active BT direction is a virtual row with id 'direction:<id>' (legacy 'group:<btId>' accepted as an alias) and state running, waitingForLlm or paused. Neither row is a stored job. Each job also carries resource_wait and, once succeeded with estimateSec, timing_feedback (see audit)."},
         {"name": "record-plain", "usage": "hancho-cli taskqueue record-plain --cmd <cmd> [--name <name>] [--exit-code <n>] [--log <path>] [--summary <text>]", "description": "Record a plain execution outside a queue into logs/taskqueues/plain.json."},
         {"name": "get", "usage": "hancho-cli taskqueue get <id> [--rev <n>] [--no-instructions]", "description": "Show one job with attempts and instructions."},
         {"name": "why", "usage": "hancho-cli taskqueue why <id>", "description": "Explain why the last attempt failed: failure class, confidence, summary, suggested action, last activity and evidence (event seq / log line), plus the class of every attempt. Reads the job without instructions."},
@@ -3459,7 +3462,7 @@ void PrintCliUsageJson() {
           }
         }
       },
-      "tools": ["start_process", "list_processes", "get_process_output", "send_process_input", "wait_process", "kill_process", "run_worker", "wait_worker", "get_worker_stream", "get_worker_state", "update_worker_info", "task_create", "task_show", "task_list", "task_note", "task_close", "task_reopen", "task_purge", "task_wait", "taskqueue_add", "taskqueue_list", "taskqueue_get", "taskqueue_retry", "taskqueue_supersede", "taskqueue_update", "taskqueue_cancel", "taskqueue_takeover", "taskqueue_complete", "taskqueue_pause", "taskqueue_resume", "taskqueue_pause_job", "taskqueue_resume_job", "taskqueue_wait", "taskqueue_purge", "taskqueue_link", "taskqueue_unlink", "taskqueue_graph", "bt_validate", "bt_start", "bt_get", "bt_list", "bt_wait", "bt_resume", "bt_retry", "bt_update", "bt_cancel", "bt_pause", "bt_template", "routine_list", "routine_show", "routine_run", "routine_save", "routine_check", "routine_ask", "routine_approve", "routine_reject", "power_suspend", "power_shutdown", "power_cancel", "power_status", "chat_status", "chat_peers", "chat_refresh", "chat_send", "chat_get", "chat_inbox", "chat_wait", "chat_read", "chat_download", "chat_log", "chat_handler", "memory_search", "memory_get", "memory_brief", "memory_stats", "memory_note", "memory_retract", "memory_approve", "usage_stats", "usage_export", "worker_health"]
+      "tools": ["start_process", "list_processes", "get_process_output", "send_process_input", "wait_process", "kill_process", "run_worker", "wait_worker", "get_worker_stream", "get_worker_state", "update_worker_info", "task_create", "task_show", "task_list", "task_note", "task_close", "task_reopen", "task_purge", "task_wait", "direction_show", "direction_list", "direction_close", "direction_reopen", "direction_purge", "taskqueue_add", "taskqueue_list", "taskqueue_get", "taskqueue_retry", "taskqueue_supersede", "taskqueue_update", "taskqueue_cancel", "taskqueue_takeover", "taskqueue_complete", "taskqueue_pause", "taskqueue_resume", "taskqueue_pause_job", "taskqueue_resume_job", "taskqueue_wait", "taskqueue_purge", "taskqueue_link", "taskqueue_unlink", "taskqueue_graph", "bt_validate", "bt_start", "bt_get", "bt_list", "bt_wait", "bt_resume", "bt_retry", "bt_update", "bt_cancel", "bt_pause", "bt_template", "routine_list", "routine_show", "routine_run", "routine_save", "routine_check", "routine_ask", "routine_approve", "routine_reject", "power_suspend", "power_shutdown", "power_cancel", "power_status", "chat_status", "chat_peers", "chat_refresh", "chat_send", "chat_get", "chat_inbox", "chat_wait", "chat_read", "chat_download", "chat_log", "chat_handler", "memory_search", "memory_get", "memory_brief", "memory_stats", "memory_note", "memory_retract", "memory_approve", "usage_stats", "usage_export", "worker_health"]
     }
   },
   "leaving": {
@@ -3571,7 +3574,7 @@ void PrintCliUsageJson() {
         "conditions": "fileExists, fileNewer, outputMatches, exitCode, jsonValue, var, nodeState"
       },
       "variables": "${name} expands BT vars; in command it is quoted as one argument. Node variables: ${<id>.state|exitCode|logFile|jobId|runs}, ${<worker>.result} (final response), ${<worker>.output.<path>} (JSON the worker wrote to PC_BT_RESULT_FILE), ${<escalate>.answer}.",
-      "remaining": "bt_get/bt_list return pendingEstimateSec (estimated work in job/worker leaves that have not started on the current branch) and plannedTasks (node, type, summary, taskqueue, estimateSec). The desktop dashboard, CLI, Web UI and MCP list them as provisional planned rows and add their estimates to the task remaining time, under a virtual task-group row (id 'group:<id>') for the BT root. They are re-derived on every query, so retry/fallback/if branch changes and completion drop stale rows.",
+      "remaining": "bt_get/bt_list return pendingEstimateSec (estimated work in job/worker leaves that have not started on the current branch) and plannedTasks (node, type, summary, taskqueue, estimateSec). The desktop dashboard, CLI, Web UI and MCP list them as provisional planned rows and add their estimates to the task remaining time, under a virtual direction row (id 'direction:<id>') for the BT root. They are re-derived on every query, so retry/fallback/if branch changes and completion drop stale rows.",
       "engines": "Workers name an engine (claude, agy, opencode, codex, or ones in <data dir>/engines.json) and optionally a model; permission flags live only in the engine definition. An engine may also set adapter (a Tier 1/3 file in <data dir>/adapters/) and capabilities (jsonStream, resume, reportsUsage, reportsSubagents, permissionModes). Use engines + switchEngineOn ([{class, after}]) with job.blame to switch models on repeated fix failures, bounded by switchLimits ({maxCandidates, maxSec, stopOnSameSymptom}).",
       "limits": "retry/repeat max <= 100 (required); limits.maxNodeRuns default 200; limits.maxWallSec default 86400; depth 32; 1000 nodes.",
       "rules": [
@@ -3592,7 +3595,7 @@ void PrintCliUsageJson() {
       "pending": "Not in the run queue yet; dependencies are not satisfied.",
       "blocked": "A success-dependency failed/cancelled; fix and retry the dependency.",
       "planned": "Provisional row for an idle job/worker leaf of a running behavior tree. It is not a stored queue job and disappears when the tree changes branch or finishes. taskqueue_list includes it by default; set include_planned: false (CLI --no-planned) to omit it and the task-group row.",
-      "taskGroup": "The task group (the BT root) is a virtual row with id 'group:<id>' and state running, waitingForLlm, paused or failed. It is re-derived on every query and stays until the group succeeds or is closed; a failed group waits for bt_retry, bt_cancel or bt_remove. It is not a queue job; read it with bt_get and answer a waitingForLlm group with bt_resume. include_planned: false (CLI --no-planned) hides it too.",
+      "taskGroup": "The BT direction is a virtual row with id 'direction:<id>' (legacy 'group:<btId>' accepted as an alias) and state running, waitingForLlm, paused or failed. It is re-derived on every query and stays until the tree succeeds or is closed; a failed tree waits for bt_retry, bt_cancel or bt_remove. It is not a queue job; read it with direction_show/bt_get and answer a waitingForLlm tree with bt_resume. include_planned: false (CLI --no-planned) hides it too.",
       "running": "An attempt is executing.",
       "succeeded": "Success conditions met.",
        "failed": "Attempts exhausted or launch failed.",
@@ -4493,6 +4496,16 @@ int PrintResponse(const std::string& action, const std::string& respJson, bool j
             std::cout << "\n";
             const std::string intent = task.value("intent", std::string());
             if (!intent.empty()) std::cout << "Intent: " << intent << "\n";
+            const auto directions = r.value("directions", nlohmann::json::array());
+            if (!directions.empty()) {
+                std::cout << "Directions (" << directions.size() << "):\n";
+                for (const auto& d : directions) {
+                    std::cout << "  " << d.value("id", std::string())
+                              << " [" << d.value("state", std::string()) << "] "
+                              << "(" << d.value("kind", std::string()) << ") "
+                              << d.value("title", std::string()) << "\n";
+                }
+            }
             const auto jobs = r.value("jobs", nlohmann::json::array());
             if (!jobs.empty()) {
                 std::cout << "Jobs (" << jobs.size() << "):\n";
@@ -4532,6 +4545,75 @@ int PrintResponse(const std::string& action, const std::string& respJson, bool j
         }
         if (action == "task_purge") {
             std::cout << "Purged " << r.value("purged", int64_t(0)) << " closed task(s).\n";
+            return 0;
+        }
+        std::cout << respJson << "\n";
+        return 0;
+    }
+
+    if (action.rfind("direction_", 0) == 0) {
+        if (jsonOutput) {
+            std::cout << respJson << "\n";
+            return 0;
+        }
+        nlohmann::json r = nlohmann::json::parse(respJson, nullptr, false);
+        if (!r.is_object()) {
+            std::cout << respJson << "\n";
+            return 0;
+        }
+        if (action == "direction_list") {
+            const auto dirs = r.value("directions", nlohmann::json::array());
+            if (dirs.empty()) {
+                std::cout << "No directions found.\n";
+                return 0;
+            }
+            std::cout << "Directions (" << dirs.size() << "):\n";
+            for (const auto& d : dirs) {
+                std::cout << "  " << d.value("id", std::string())
+                          << " [" << d.value("state", std::string()) << "] "
+                          << "(" << d.value("kind", std::string()) << ") "
+                          << d.value("title", std::string()) << "\n";
+            }
+            return 0;
+        }
+        if (action == "direction_show") {
+            const nlohmann::json dir = r.value("direction", nlohmann::json::object());
+            const nlohmann::json status = r.value("status", nlohmann::json::object());
+            std::cout << dir.value("id", std::string())
+                      << " [" << status.value("state", std::string()) << "] "
+                      << "(" << dir.value("kind", std::string()) << ") "
+                      << dir.value("title", std::string()) << "\n";
+            const std::string taskId = dir.value("taskId", std::string());
+            if (!taskId.empty()) std::cout << "Task: " << taskId << "\n";
+            const std::string btId = dir.value("btId", std::string());
+            if (!btId.empty()) std::cout << "BT: " << btId << "\n";
+            if (status.value("state", std::string()) == "closed") {
+                std::cout << "Closed: " << status.value("result", std::string())
+                          << " - " << status.value("reason", std::string()) << "\n";
+            }
+            const auto jobs = r.value("jobs", nlohmann::json::array());
+            if (!jobs.empty()) {
+                std::cout << "Jobs (" << jobs.size() << "):\n";
+                for (const auto& j : jobs) {
+                    std::cout << "  " << j.value("id", std::string())
+                              << " [" << j.value("state", std::string()) << "] "
+                              << j.value("taskqueue", std::string()) << "\n";
+                }
+            }
+            return 0;
+        }
+        if (action == "direction_close") {
+            std::cout << "Closed direction " << r.value("id", std::string())
+                      << " [" << r.value("result", std::string()) << "].\n";
+            return 0;
+        }
+        if (action == "direction_reopen") {
+            std::cout << "Reopened direction " << r.value("id", std::string())
+                      << " [" << r.value("state", std::string()) << "].\n";
+            return 0;
+        }
+        if (action == "direction_purge") {
+            std::cout << "Purged " << r.value("purged", int64_t(0)) << " direction(s).\n";
             return 0;
         }
         std::cout << respJson << "\n";
@@ -7283,6 +7365,92 @@ if (subcmd == "start" || subcmd == "run") {
         } else {
             return failWith("unknown task command: " + op +
                             " (create, show, list, note, close, reopen, purge, wait)");
+        }
+        reqJson << req.dump();
+    }
+    else if (subcmd == "direction") {
+        std::string op = (args.size() >= 3) ? args[2] : "";
+        auto argVal = [&args](const std::string& flag, const std::string& def) -> std::string {
+            for (size_t i = 3; i + 1 < args.size(); ++i) {
+                if (args[i] == flag) return args[i + 1];
+            }
+            return def;
+        };
+        auto positionalSkippingValues = [&args](size_t startIdx) -> std::string {
+            for (size_t i = startIdx; i < args.size(); ++i) {
+                const std::string& a = args[i];
+                if (a.empty()) continue;
+                if (a[0] == '-') {
+                    if (a == "--id" || a == "--task" || a == "--state" || a == "--limit" ||
+                        a == "--result" || a == "--reason" || a == "--older-than" ||
+                        a == "--data-dir") {
+                        ++i;
+                    }
+                    continue;
+                }
+                return a;
+            }
+            return "";
+        };
+        auto failWith = [&](const std::string& msg) {
+            if (jsonOutput) std::cout << "{\"ok\":false,\"error\":\"" << JsonEscape(msg) << "\"}\n";
+            else std::cerr << "Error: " << msg << "\n";
+            return 1;
+        };
+        nlohmann::json req = nlohmann::json::object();
+        if (op == "show") {
+            std::string id = argVal("--id", "");
+            if (id.empty()) id = positionalSkippingValues(3);
+            if (id.empty()) return failWith("direction show requires <id>.");
+            req["action"] = "direction_show";
+            req["id"] = id;
+            subcmd = "direction_show";
+        } else if (op == "list") {
+            int64_t limit = 0;
+            const std::string lim = argVal("--limit", "");
+            if (!lim.empty()) {
+                try { limit = std::stoll(lim); } catch (...) { return failWith("invalid --limit"); }
+            }
+            req["action"] = "direction_list";
+            req["taskId"] = argVal("--task", "");
+            req["state"] = argVal("--state", "");
+            req["limit"] = limit;
+            subcmd = "direction_list";
+        } else if (op == "close") {
+            std::string id = argVal("--id", "");
+            if (id.empty()) id = positionalSkippingValues(3);
+            if (id.empty()) return failWith("direction close requires <id>.");
+            const std::string result = argVal("--result", "");
+            if (result != "succeeded" && result != "failed" && result != "ignored")
+                return failWith("direction close requires --result succeeded|failed|ignored.");
+            const std::string reason = argVal("--reason", "");
+            if (reason.empty()) return failWith("direction close requires --reason \"...\".");
+            req["action"] = "direction_close";
+            req["id"] = id;
+            req["result"] = result;
+            req["reason"] = reason;
+            subcmd = "direction_close";
+        } else if (op == "reopen") {
+            std::string id = argVal("--id", "");
+            if (id.empty()) id = positionalSkippingValues(3);
+            if (id.empty()) return failWith("direction reopen requires <id>.");
+            const std::string reason = argVal("--reason", "");
+            if (reason.empty()) return failWith("direction reopen requires --reason \"...\".");
+            req["action"] = "direction_reopen";
+            req["id"] = id;
+            req["reason"] = reason;
+            subcmd = "direction_reopen";
+        } else if (op == "purge") {
+            const std::string olderStr = argVal("--older-than", "");
+            if (olderStr.empty()) return failWith("direction purge requires --older-than <sec>.");
+            int64_t olderSec = -1;
+            try { olderSec = std::stoll(olderStr); } catch (...) { return failWith("invalid --older-than"); }
+            req["action"] = "direction_purge";
+            req["older_than_sec"] = olderSec;
+            subcmd = "direction_purge";
+        } else {
+            return failWith("unknown direction command: " + op +
+                            " (show, list, close, reopen, purge)");
         }
         reqJson << req.dump();
     }

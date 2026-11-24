@@ -19,6 +19,8 @@ namespace pc {
 
 struct TaskGroupInfo {
     std::string id;
+    std::string directionId;
+    std::string taskId;
     std::string state;
     std::string summary;
     std::string detail;
@@ -136,6 +138,7 @@ private:
     void SaveStateFileLocked(const TreeEntry& entry);
     std::string LookupQueueNameForBtLocked(const std::string& btId) const;
     std::string LookupTaskIdForBtLocked(const std::string& btId) const;
+    std::string LookupDirectionIdForBtLocked(const std::string& btId) const;
     // proposedId, or proposedId-r2, -r3, ... when a job with that id is still in the queue
     // (a BT started again under an id used before).
     std::string UniqueJobId(const std::string& proposedId) const;

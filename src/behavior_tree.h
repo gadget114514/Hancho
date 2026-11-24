@@ -361,6 +361,8 @@ public:
     const std::string& Intent() const { return intent_; }
     // Task (lineage) this BT belongs to. Empty when the BT was started without --task.
     const std::string& TaskId() const { return taskId_; }
+    const std::string& DirectionId() const { return directionId_; }
+    void SetDirectionId(const std::string& id) { directionId_ = id; }
     const std::string& TaskQueueName() const { return taskqueue_; }
     const std::string& Cwd() const { return cwd_; }
     const std::string& NotifyFile() const { return notifyFile_; }
@@ -415,6 +417,7 @@ private:
     std::string summary_;
     std::string intent_;
     std::string taskId_;
+    std::string directionId_;
     std::string taskqueue_;
     std::string cwd_;
     std::string notifyFile_;

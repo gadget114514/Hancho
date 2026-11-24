@@ -343,29 +343,33 @@ int main() {
                 json resp = h.Call(req);
                 if (!resp.value("ok", false) || !resp.contains("jobs") || !resp["jobs"].is_array()) return false;
                 for (const auto& job : resp["jobs"]) {
-                    if (job.value("id", "") == "group:ipc-escalate" &&
+                    if (job.value("id", "").rfind("direction:", 0) == 0 &&
+                        job.contains("group") && job["group"].is_object() &&
+                        job["group"].value("id", "") == "ipc-escalate" &&
                         job.value("state", "") == "waitingForLlm" && job.value("virtual", false)) return true;
                 }
                 return false;
             };
             Check(hasWaitingGroup(nullptr),
-                  "taskqueue_list shows the waitingForLlm task group without a state filter");
+                  "taskqueue_list shows the waitingForLlm direction row without a state filter");
             Check(hasWaitingGroup("waitingForLlm"),
-                  "taskqueue_list shows the waitingForLlm task group with state=waitingForLlm");
+                  "taskqueue_list shows the waitingForLlm direction row with state=waitingForLlm");
             Check(hasWaitingGroup("waiting"),
-                  "taskqueue_list shows the waitingForLlm task group with the state=waiting alias");
+                  "taskqueue_list shows the waitingForLlm direction row with the state=waiting alias");
 
             {
                 json resp = h.Call({{"action", "taskqueue_list"}, {"include_planned", true}});
                 bool foundStart = false;
                 if (resp.value("ok", false) && resp.contains("jobs") && resp["jobs"].is_array()) {
                     for (const auto& job : resp["jobs"]) {
-                        if (job.value("id", "") != "group:ipc-escalate") continue;
+                        if (job.value("id", "").rfind("direction:", 0) != 0) continue;
+                        if (!job.contains("group") || !job["group"].is_object() ||
+                            job["group"].value("id", "") != "ipc-escalate") continue;
                         const std::string start = job.value("start_time", "");
                         foundStart = !start.empty() && start != "1970-01-01 00:00:00";
                     }
                 }
-                Check(foundStart, "taskqueue_list group row carries the BT start time");
+                Check(foundStart, "taskqueue_list direction row carries the BT start time");
             }
 
             // Missing rationale must be rejected
@@ -1364,6 +1368,59 @@ int main() {
             Check(!rBtGone.value("ok", true), "taskqueue_remove removed the tree");
             json rJobGone = h.Call({{"action", "taskqueue_get"}, {"id", "ipc-tg-fallback-only-1"}});
             Check(!rJobGone.value("ok", true), "taskqueue_remove removed the tree's jobs");
+
+            // 18b. 103-3: direction:<id> and group:<btId> alias both work on BT and jobs directions.
+            json dirBt = {
+                {"id", "ipc-dir-bt"},
+                {"cwd", tempDirUtf8},
+                {"root", {{"type", "job"}, {"id", "step1"}, {"summary", "DirBT"},
+                          {"command", "cmd /c exit 0"}, {"timeoutSec", 30}}}
+            };
+            json rDirStart = h.Call({{"action", "bt_start"}, {"bt", dirBt}});
+            for (int i = 0; i < 100; ++i) {
+                json g = h.Call({{"action", "bt_get"}, {"id", "ipc-dir-bt"}, {"compact", true}});
+                std::string s = g.value("state", "");
+                if (s == "succeeded" || s == "failed" || s == "cancelled") break;
+                Sleep(50);
+            }
+            const std::string btDirId = rDirStart.value("directionId", "");
+            Check(!btDirId.empty(), "103-3: bt_start returns directionId");
+            if (!btDirId.empty()) {
+                json rGetDir = h.Call({{"action", "taskqueue_get"}, {"id", "direction:" + btDirId}});
+                Check(rGetDir.value("ok", false) && rGetDir.value("direction_id", "") == btDirId,
+                      "103-3: taskqueue_get accepts direction:<id> for BT");
+                json rGetAlias = h.Call({{"action", "taskqueue_get"}, {"id", "group:ipc-dir-bt"}});
+                Check(rGetAlias.value("ok", false) && rGetAlias.value("kind", "") == "taskGroup",
+                      "103-3: taskqueue_get still accepts group:<btId> alias");
+                json rCloseDir = h.Call({{"action", "taskqueue_close"}, {"id", "direction:" + btDirId}});
+                Check(rCloseDir.value("ok", false), "103-3: taskqueue_close accepts direction:<id>");
+                json rRemDir = h.Call({{"action", "taskqueue_remove"}, {"id", "direction:" + btDirId}, {"force", true}});
+                Check(rRemDir.value("ok", false), "103-3: taskqueue_remove accepts direction:<id>");
+            }
+
+            // 18c. 103-3: kind="jobs" direction bulk cancel / retry / remove via direction:<id>.
+            json addJobs = {
+                {"action", "taskqueue_add"},
+                {"taskqueue", "default"},
+                {"jobs", json::array({
+                    {{"id", "ipc-jdir-1"}, {"command", "cmd /c exit 1"}, {"summary", "JDir 1"}, {"timeoutSec", 30}},
+                    {{"id", "ipc-jdir-2"}, {"command", "cmd /c exit 1"}, {"summary", "JDir 2"}, {"timeoutSec", 30}, {"dependsOn", json::array({"ipc-jdir-1"})}}
+                })}
+            };
+            json rAddJ = h.Call(addJobs);
+            const std::string jDirId = rAddJ.value("direction_id", "");
+            Check(!jDirId.empty(), "103-3: taskqueue_add returns direction_id");
+            if (!jDirId.empty()) {
+                json rCancelJ = h.Call({{"action", "taskqueue_cancel"}, {"id", "direction:" + jDirId}});
+                Check(rCancelJ.value("ok", false) && rCancelJ.value("cancelled", 0) >= 1,
+                      "103-3: taskqueue_cancel on direction:<id> cancels jobs in direction");
+                json rRetryJ = h.Call({{"action", "taskqueue_retry"}, {"id", "direction:" + jDirId}});
+                Check(rRetryJ.value("ok", false) && rRetryJ.value("retried", 0) >= 1,
+                      "103-3: taskqueue_retry on direction:<id> retries jobs in direction");
+                json rRemJ = h.Call({{"action", "taskqueue_remove"}, {"id", "direction:" + jDirId}, {"force", true}});
+                Check(rRemJ.value("ok", false) && rRemJ.value("removed", 0) == 2,
+                      "103-3: taskqueue_remove on direction:<id> removes jobs in direction");
+            }
         }
 
         // 19. 100-2c: task_* IPC actions, taskqueue_add --task, bt_start --task, and task_wait.

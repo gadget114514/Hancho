@@ -4,6 +4,7 @@
 #include "parse_util.h"
 #include "engine_health.h"
 #include "task_store.h"
+#include "direction_store.h"
 #include "nlohmann/json.hpp"
 #include <string>
 #include <vector>
@@ -674,6 +675,7 @@ struct TaskQueueJob {
     // job records the job that took over in `supersededBy`. Empty taskId = the job is its own task.
     std::string supersedes;
     std::string taskId;
+    std::string directionId;
     std::string supersededBy;
     // Why this job redoes `supersedes` (JSON `supersede_reason`, at most 2000 bytes). Kept on the
     // job that took over, so the reason stays readable after the session that wrote it is gone.
@@ -1014,6 +1016,32 @@ public:
                  const std::string& btId, const std::string& text, const std::string& session,
                  const nlohmann::json* extra = nullptr);
 
+    // Direction records (doc/direction-cards.md, card 103-1).
+    // Ensures a direction record exists for a behavior tree: uses existingDirectionId when
+    // non-empty, otherwise allocates a new dir_<N> id. Logs direction_started when taskId is set.
+    bool EnsureBtDirection(const std::string& btId, const std::string& existingDirectionId,
+                           const std::string& taskId, const std::string& title,
+                           const std::string& originJson, std::string& outDirectionId,
+                           std::string& outError);
+    bool DirectionGet(const std::string& id, nlohmann::json& outRecord) const;
+    std::vector<nlohmann::json> DirectionAll() const;
+    // Direction state & operations (doc/direction-cards.md, card 103-2).
+    nlohmann::json DirectionState(const std::string& id) const;
+    std::string DirectionShow(const std::string& id, std::string& outError);
+    std::string DirectionList(const std::string& taskIdFilter, const std::string& stateFilter,
+                              int64_t limit, std::string& outError, int64_t sinceVersion = -1);
+    std::string DirectionClose(const std::string& id, const std::string& result,
+                               const std::string& reason, std::string& outError);
+    std::string DirectionReopen(const std::string& id, const std::string& reason,
+                                std::string& outError);
+    std::string DirectionPurgeOlderThan(int64_t olderThanSec, std::string& outError);
+    // Bulk operations on all jobs belonging to a kind="jobs" direction (card 103-3).
+    std::string DirectionCancelJobs(const std::string& id, std::string& outError);
+    std::string DirectionRetryJobs(const std::string& id, bool resetAttempts, bool refreshInstructions,
+                                   TaskQueueCaller caller, std::string& outError);
+    std::string DirectionPauseJobs(const std::string& id, bool paused, std::string& outError);
+    std::string DirectionRemoveJobs(const std::string& id, bool force, std::string& outError);
+
     // Scheduler hooks
     void OnProcessFinished(int processId, int exitCode, const std::string& endKind);
     void RequestSchedulerTick();
@@ -1142,8 +1170,11 @@ private:
     // Before jobs leave a queue, their ids, states and lineage are kept on the task record.
     void RecordRemovedJobsLocked(const std::vector<TaskQueueJob>& gone);
     nlohmann::json TaskStateLocked(const std::string& taskId) const;
+    nlohmann::json DirectionStateLocked(const std::string& id) const;
+    void MaybeLogDirectionFinishedLocked(const std::string& directionId, const std::string& taskId);
 
     TaskStore taskStore_;
+    DirectionStore directionStore_;
     ProcessManager* pm_ = nullptr;
     RemoteStartCallback remoteStartCb_;
     RemotePollCallback remotePollCb_;

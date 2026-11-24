@@ -1,4 +1,4 @@
-﻿#include "webui_assets.h"
+#include "webui_assets.h"
 
 #include "common.h"
 #include <fstream>
@@ -2799,12 +2799,13 @@ const char kAppJs_3[] = R"JS_3(    const syms = jobs.map(j => jobStateSymbol(j.s
     if (supFrom) lineageBadge += ` <span class="text-muted" title="Supersedes ${escapeHtml(supFrom)}">↩ ${escapeHtml(supFrom)}</span>`;
     if (supBy) lineageBadge += ` <span class="text-muted" title="Superseded by ${escapeHtml(supBy)}">→ ${escapeHtml(supBy)}</span>`;
 
-    const padStyle = indent ? ' style="padding-left: 26px;"' : '';
+    const indentLevel = typeof indent === 'number' ? indent : (indent ? 1 : 0);
+    const padStyle = indentLevel > 0 ? ` style="padding-left: ${indentLevel * 24}px;"` : '';
     const rowClass = isSuperseded ? ' class="row-superseded"' : '';
 
     return `<tr${rowClass} data-job-key="${key}">
       <td>${stateBadge}</td>
-      <td class="job-key font-mono"${padStyle} title="${key}">${indent ? '↳ ' : ''}${key}${lineageBadge}</td>
+      <td class="job-key font-mono"${padStyle} title="${key}">${indentLevel > 0 ? '↳ ' : ''}${key}${lineageBadge}</td>
       <td class="job-task">${taskCell}</td>
       <td class="job-name" title="${name}">${name}</td>
       <td>${queue}</td>
@@ -2871,6 +2872,9 @@ const char kAppJs_3[] = R"JS_3(    const syms = jobs.map(j => jobStateSymbol(j.s
           if (!supMap[cur] || supMap[cur] === cur) break;
           cur = supMap[cur];
         }
+        const did = job.direction_id || job.directionId || '';
+        if (did && cur === (job.id || job.key || '')) return did;
+        if (cur.startsWith('direction:')) return cur.slice(10);
         return cur;
       }
 
@@ -2918,34 +2922,116 @@ const char kAppJs_3[] = R"JS_3(    const syms = jobs.map(j => jobStateSymbol(j.s
         return;
       }
 
-      for (const gid of groupOrder) {
+)JS_3";
+const char kAppJs_3b[] = R"JS_3b(      for (const gid of groupOrder) {
         const g = groupMap[gid];
-        if (!g.hasRecord && g.jobs.length === 1) {
-          html += buildJobRowHtml(g.jobs[0], false);
+        const dirMap = {};
+        const dirOrder = [];
+        for (const job of g.jobs) {
+          const jid = job.id || job.key || '';
+          let did = job.direction_id || job.directionId || '';
+          if (!did) {
+            if (jid.startsWith('direction:')) did = jid.slice(10);
+            else if (jid.startsWith('group:')) did = jid;
+            else did = 'job:' + jid;
+          }
+          if (!dirMap[did]) {
+            dirMap[did] = { id: did, kind: 'jobs', title: '', state: '', isVirtualBt: false, isLegacyGroup: false, realJobs: [], virtualJob: null };
+            dirOrder.push(did);
+          }
+          const d = dirMap[did];
+          if (jid.startsWith('direction:') || jid.startsWith('group:')) {
+            d.isVirtualBt = true;
+            d.isLegacyGroup = jid.startsWith('group:');
+            d.kind = 'bt';
+            d.title = job.summary || d.title;
+            d.state = job.state || d.state;
+            d.virtualJob = job;
+          } else {
+            d.realJobs.push(job);
+            if (job.bt && typeof job.bt === 'object') d.kind = 'bt';
+          }
+        }
+        let totalRealJobs = 0;
+        const dirStateObjs = [];
+        for (const did of dirOrder) {
+          const d = dirMap[did];
+          totalRealJobs += d.realJobs.length;
+          if (!d.title && d.realJobs.length) d.title = d.realJobs[0].summary || d.realJobs[0].name || '';
+          if (!d.state) {
+            const lastJ = d.realJobs.length ? d.realJobs[d.realJobs.length - 1] : null;
+            d.state = lastJ ? (lastJ.state || 'open') : 'open';
+          }
+          d.hasHeading = (d.isVirtualBt && (!d.isLegacyGroup || d.realJobs.length > 0)) || d.realJobs.length >= 2;
+          dirStateObjs.push({ state: d.state });
+        }
+
+        if (!g.hasRecord && g.jobs.length === 1 && !dirMap[dirOrder[0]].hasHeading) {
+          html += buildJobRowHtml(g.jobs[0], 0);
           continue;
         }
-        const taskState = g.state || (g.jobs.length ? (g.jobs[g.jobs.length - 1].state || 'open') : 'open');
-        const defaultExp = taskState === 'running' || taskState === 'failed' || taskState === 'open';
-        const expanded = state.expandedTasks[gid] !== undefined ? state.expandedTasks[gid] : defaultExp;
-        const arrow = expanded ? '▾' : '▸';
-        const compact = formatTaskResultsCompact(g.jobs);
-        const titleText = g.title ? `${g.title} (${gid})` : gid;
-        const stateBadge = `<span class="${getBadgeClass(taskState)}">${escapeHtml(taskState)}</span>`;
-        const detailsBtn = g.hasRecord
-          ? `<button class="btn btn-sm btn-task-details" data-task-id="${escapeHtml(gid)}">Task Details</button>`
-          : '';
 
-        html += `<tr class="task-heading-row" data-task-id="${escapeHtml(gid)}">
-          <td>${stateBadge}</td>
-          <td class="font-mono" colspan="2"><strong>${arrow} ${escapeHtml(titleText)}</strong></td>
-          <td colspan="3"><span class="font-mono">${escapeHtml(compact)}</span> <span class="text-muted">(${g.jobs.length} job${g.jobs.length === 1 ? '' : 's'})</span></td>
-          <td colspan="5"></td>
-          <td style="text-align: center;">${detailsBtn}</td>
-        </tr>`;
+        const emitTaskHeading = g.hasRecord || dirOrder.length > 1;
+        let taskExpanded = true;
+        if (emitTaskHeading) {
+          const taskState = g.state || (g.jobs.length ? (g.jobs[g.jobs.length - 1].state || 'open') : 'open');
+          const defaultExp = taskState === 'running' || taskState === 'failed' || taskState === 'open';
+          taskExpanded = state.expandedTasks[gid] !== undefined ? state.expandedTasks[gid] : defaultExp;
+          const arrow = taskExpanded ? '▾' : '▸';
+          const compact = formatTaskResultsCompact(dirStateObjs);
+          const titleText = g.title ? `${g.title} (${gid})` : gid;
+          const stateBadge = `<span class="${getBadgeClass(taskState)}">${escapeHtml(taskState)}</span>`;
+          const detailsBtn = g.hasRecord
+            ? `<button class="btn btn-sm btn-task-details" data-task-id="${escapeHtml(gid)}">Task Details</button>`
+            : '';
 
-        if (expanded) {
-          for (const job of g.jobs) {
-            html += buildJobRowHtml(job, true);
+          html += `<tr class="task-heading-row" data-task-id="${escapeHtml(gid)}">
+            <td>${stateBadge}</td>
+            <td class="font-mono" colspan="2"><strong>${arrow} ${escapeHtml(titleText)}</strong></td>
+            <td colspan="3"><span class="font-mono">${escapeHtml(compact)}</span> <span class="text-muted">(${totalRealJobs} job${totalRealJobs === 1 ? '' : 's'})</span></td>
+            <td colspan="5"></td>
+            <td style="text-align: center;">${detailsBtn}</td>
+          </tr>`;
+        }
+
+        if (taskExpanded) {
+          const baseIndent = emitTaskHeading ? 1 : 0;
+          for (const did of dirOrder) {
+            const d = dirMap[did];
+            if (!d.hasHeading) {
+              for (const job of d.realJobs) {
+                html += buildJobRowHtml(job, baseIndent);
+              }
+              continue;
+            }
+            const dirKey = 'direction:' + d.id;
+            const dExpDef = d.state === 'running' || d.state === 'failed' || d.state === 'open' ||
+                            d.state === 'waitingForLlm' || d.state === 'paused';
+            const dExpanded = state.expandedTasks[dirKey] !== undefined ? state.expandedTasks[dirKey] : dExpDef;
+            const dArrow = dExpanded ? '▾' : '▸';
+            const dCompact = formatTaskResultsCompact(d.realJobs);
+            const dTitle = d.title ? `${d.title} (${dirKey})` : dirKey;
+            const dBadge = `<span class="${getBadgeClass(d.state)}">${escapeHtml(d.state)}</span>`;
+            const dPad = baseIndent > 0 ? ` style="padding-left: ${baseIndent * 24}px;"` : '';
+            const dStLower = (d.state || '').toLowerCase();
+            const dRetryBtn = dStLower === 'failed'
+              ? `<button class="btn btn-sm btn-primary btn-job-retry" data-key="${escapeHtml(dirKey)}">Retry</button>` : '';
+            const dCancelBtn = (dStLower === 'running' || dStLower === 'waitingforllm' || dStLower === 'paused')
+              ? `<button class="btn btn-sm btn-danger btn-job-cancel" data-key="${escapeHtml(dirKey)}">Cancel</button>` : '';
+
+            html += `<tr class="direction-heading-row" data-direction-id="${escapeHtml(dirKey)}">
+              <td>${dBadge}</td>
+              <td class="font-mono" colspan="2"${dPad}><strong>${dArrow} ${escapeHtml(dTitle)}</strong></td>
+              <td colspan="3"><span class="text-muted">direction (${escapeHtml(d.kind)})</span> <span class="font-mono">${escapeHtml(dCompact)}</span> <span class="text-muted">(${d.realJobs.length} job${d.realJobs.length === 1 ? '' : 's'})</span></td>
+              <td colspan="5"></td>
+              <td style="text-align: center;">${dRetryBtn} ${dCancelBtn}</td>
+            </tr>`;
+
+            if (dExpanded) {
+              for (const job of d.realJobs) {
+                html += buildJobRowHtml(job, baseIndent + 1);
+              }
+            }
           }
         }
       }
@@ -2971,6 +3057,19 @@ const char kAppJs_3[] = R"JS_3(    const syms = jobs.map(j => jobStateSymbol(j.s
         const gRowState = (this.querySelector('.badge') ? this.querySelector('.badge').textContent : '').toLowerCase();
         const defExp = gRowState === 'running' || gRowState === 'failed' || gRowState === 'open';
         state.expandedTasks[tid] = cur !== undefined ? !cur : !defExp;
+        renderTaskQueueTable();
+      });
+    });
+
+    elTqTbody.querySelectorAll('.direction-heading-row').forEach(row => {
+      row.addEventListener('click', function() {
+        const did = this.getAttribute('data-direction-id');
+        if (!did) return;
+        const cur = state.expandedTasks[did];
+        const dRowState = (this.querySelector('.badge') ? this.querySelector('.badge').textContent : '').toLowerCase();
+        const defExp = dRowState === 'running' || dRowState === 'failed' || dRowState === 'open' ||
+                       dRowState === 'waitingforllm' || dRowState === 'paused';
+        state.expandedTasks[did] = cur !== undefined ? !cur : !defExp;
         renderTaskQueueTable();
       });
     });
@@ -3009,7 +3108,7 @@ const char kAppJs_3[] = R"JS_3(    const syms = jobs.map(j => jobStateSymbol(j.s
         sendWsRequest({ action: 'taskqueue_cancel', id: key });
         setTimeout(() => {
           sendWsRequest({ action: 'taskqueue_list', include_planned: true });
-)JS_3";
+)JS_3b";
 const char kAppJs_4[] = R"JS_4(          sendWsRequest({ action: 'task_list' });
         }, 200);
       });
@@ -3842,7 +3941,7 @@ const char kAppJs_6[] = R"JS_6(    if (confirm('Reset process IDs? (Only applies
 })();
 )JS_6";
 static const std::string& GetAppJs() {
-    static const std::string s = std::string(kAppJs_0) + kAppJs_1 + kAppJs_2 + kAppJs_3 + kAppJs_4 + kAppJs_5 + kAppJs_6;
+    static const std::string s = std::string(kAppJs_0) + kAppJs_1 + kAppJs_2 + kAppJs_3 + kAppJs_3b + kAppJs_4 + kAppJs_5 + kAppJs_6;
     return s;
 }
 

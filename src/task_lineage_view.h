@@ -14,6 +14,7 @@ namespace pc {
 
 enum class TaskDisplayRowKind {
     TaskHeading,
+    DirectionHeading,
     Job,
     MoreJobs
 };
@@ -21,6 +22,10 @@ enum class TaskDisplayRowKind {
 struct TaskDisplayRow {
     TaskDisplayRowKind kind = TaskDisplayRowKind::Job;
     std::string taskId;
+    std::string directionId;
+    std::string directionKind;
+    std::string directionTitle;
+    std::string directionState;
     std::string jobId;
     int indent = 0;
     bool expanded = false;
@@ -54,7 +59,7 @@ struct TaskViewCounts {
 };
 
 inline bool IsVirtualTaskRowId(const std::string& id) {
-    return id.rfind("group:", 0) == 0 || id.rfind("btplan:", 0) == 0;
+    return id.rfind("direction:", 0) == 0 || id.rfind("group:", 0) == 0 || id.rfind("btplan:", 0) == 0;
 }
 
 inline std::string ShortJobRef(const std::string& jobId) {
@@ -109,7 +114,8 @@ inline std::string FormatTaskResultsCompact(const std::vector<std::string>& jobS
 }
 
 inline bool DefaultTaskExpanded(const std::string& taskState) {
-    return taskState == "running" || taskState == "failed" || taskState == "open";
+    return taskState == "running" || taskState == "failed" || taskState == "open" ||
+           taskState == "waitingForLlm" || taskState == "paused";
 }
 
 inline std::string ComputeImplicitTaskState(const std::vector<nlohmann::json>& jobs) {
@@ -233,6 +239,9 @@ inline std::vector<TaskDisplayRow> BuildTaskDisplayRows(
                 if (cur == jid) return embeddedTid;
             }
         }
+        const std::string dirId = j.value("direction_id", std::string());
+        if (!dirId.empty() && cur == jid) return dirId;
+        if (jid.rfind("direction:", 0) == 0 && cur == jid) return jid.substr(10);
         return cur;
     };
 
@@ -327,12 +336,107 @@ inline std::vector<TaskDisplayRow> BuildTaskDisplayRows(
 
     for (const auto& id : taskOrder) {
         const TaskMeta& m = taskMap[id];
-        // Implicit task with 1 job (no task record): no heading row.
-        if (!m.hasRecord && m.jobs.size() == 1) {
+
+        // Group jobs in this task by direction (card 103-3: 3-level task -> direction -> job).
+        struct DirMeta {
+            std::string id;
+            std::string kind;
+            std::string title;
+            std::string state;
+            std::string sortTs;
+            bool isVirtualBt = false;
+            bool isLegacyGroup = false;
+            bool hasHeading = false;
+            nlohmann::json virtualJob;
+            std::vector<nlohmann::json> realJobs;
+            std::vector<std::string> realStates;
+        };
+        std::unordered_map<std::string, DirMeta> dirMap;
+        std::vector<std::string> dirOrder;
+        auto ensureDir = [&](const std::string& did) -> DirMeta& {
+            auto it = dirMap.find(did);
+            if (it == dirMap.end()) {
+                DirMeta d;
+                d.id = did;
+                auto inserted = dirMap.emplace(did, std::move(d));
+                dirOrder.push_back(did);
+                return inserted.first->second;
+            }
+            return it->second;
+        };
+
+        for (const auto& j : m.jobs) {
+            const std::string jid = j.value("id", std::string());
+            std::string did = j.value("direction_id", std::string());
+            if (did.empty()) {
+                if (jid.rfind("direction:", 0) == 0) did = jid.substr(10);
+                else if (jid.rfind("group:", 0) == 0) did = jid;
+                else did = "job:" + jid;
+            }
+            DirMeta& d = ensureDir(did);
+            if (jid.rfind("direction:", 0) == 0 || jid.rfind("group:", 0) == 0) {
+                d.isVirtualBt = true;
+                d.isLegacyGroup = (jid.rfind("group:", 0) == 0);
+                d.virtualJob = j;
+                d.kind = "bt";
+                if (d.title.empty()) d.title = j.value("summary", std::string());
+                d.state = j.value("state", std::string());
+                const std::string stTs = j.value("start_time", j.value("created_at", std::string()));
+                if (stTs > d.sortTs) d.sortTs = stTs;
+            } else {
+                d.realJobs.push_back(j);
+                if (d.kind.empty() && j.contains("bt") && j["bt"].is_object()) d.kind = "bt";
+                if (d.kind.empty() && !j.value("direction_id", std::string()).empty()) d.kind = "jobs";
+                const std::string jTs = j.value("updated_at", j.value("created_at", std::string()));
+                if (jTs > d.sortTs) d.sortTs = jTs;
+            }
+        }
+
+        int totalRealJobs = 0;
+        std::vector<std::string> dirStatesChrono;
+        for (const auto& did : dirOrder) {
+            DirMeta& d = dirMap[did];
+            std::stable_sort(d.realJobs.begin(), d.realJobs.end(), [](const nlohmann::json& a, const nlohmann::json& b) {
+                return a.value("created_at", std::string()) < b.value("created_at", std::string());
+            });
+            for (const auto& j : d.realJobs) {
+                d.realStates.push_back(j.value("state", std::string()));
+            }
+            totalRealJobs += static_cast<int>(d.realJobs.size());
+            if (d.title.empty() && !d.realJobs.empty()) {
+                d.title = d.realJobs.front().value("summary", std::string());
+            }
+            if (d.state.empty()) {
+                d.state = ComputeImplicitTaskState(d.realJobs);
+            }
+            if (d.kind.empty()) d.kind = "jobs";
+            d.hasHeading = (d.isVirtualBt && (!d.isLegacyGroup || !d.realJobs.empty())) ||
+                           (d.kind == "jobs" && d.realJobs.size() >= 2) ||
+                           (d.kind == "bt" && d.realJobs.size() >= 2);
+            dirStatesChrono.push_back(d.state);
+        }
+
+        // Sort directions chronologically by earliest real job or sortTs for compact task results.
+        std::sort(dirOrder.begin(), dirOrder.end(), [&](const std::string& a, const std::string& b) {
+            const DirMeta& da = dirMap[a];
+            const DirMeta& db = dirMap[b];
+            const std::string ta = !da.realJobs.empty() ? da.realJobs.front().value("created_at", std::string()) : da.sortTs;
+            const std::string tb = !db.realJobs.empty() ? db.realJobs.front().value("created_at", std::string()) : db.sortTs;
+            if (ta != tb) return ta < tb;
+            return a < b;
+        });
+        dirStatesChrono.clear();
+        for (const auto& did : dirOrder) {
+            dirStatesChrono.push_back(dirMap[did].state);
+        }
+
+        // Implicit single job (or legacy single group:<btId> with 0 jobs) and no task record: render flat.
+        if (!m.hasRecord && m.jobs.size() == 1 && !dirMap[dirOrder[0]].hasHeading) {
             const auto& j = m.jobs[0];
             TaskDisplayRow row;
             row.kind = TaskDisplayRowKind::Job;
             row.taskId = id;
+            row.directionId = dirOrder[0];
             row.jobId = j.value("id", std::string());
             row.indent = 0;
             row.hasTaskRecord = false;
@@ -346,67 +450,133 @@ inline std::vector<TaskDisplayRow> BuildTaskDisplayRows(
             continue;
         }
 
-        // Chronological order (oldest -> newest) for compact results string.
-        std::vector<nlohmann::json> chronoJobs = m.jobs;
-        std::stable_sort(chronoJobs.begin(), chronoJobs.end(), [](const nlohmann::json& a, const nlohmann::json& b) {
-            return a.value("created_at", std::string()) < b.value("created_at", std::string());
-        });
-        std::vector<std::string> realStates;
-        for (const auto& j : chronoJobs) {
-            if (!IsVirtualTaskRowId(j.value("id", std::string()))) {
-                realStates.push_back(j.value("state", std::string()));
+        // Implicit single direction with heading (e.g., taskqueue add with >= 2 jobs or BT direction without task):
+        // omit redundant TaskHeading and render DirectionHeading at indent 0.
+        const bool emitTaskHeading = m.hasRecord || dirOrder.size() > 1;
+        bool taskExpanded = true;
+        if (emitTaskHeading) {
+            taskExpanded = DefaultTaskExpanded(m.state);
+            auto ovIt = expandedOverrides.find(id);
+            if (ovIt != expandedOverrides.end()) taskExpanded = ovIt->second;
+
+            TaskDisplayRow hdr;
+            hdr.kind = TaskDisplayRowKind::TaskHeading;
+            hdr.taskId = id;
+            hdr.indent = 0;
+            hdr.expanded = taskExpanded;
+            hdr.hasTaskRecord = m.hasRecord;
+            hdr.taskTitle = m.title;
+            hdr.taskState = m.state;
+            hdr.resultsCompact = FormatTaskResultsCompact(dirStatesChrono);
+            hdr.jobCount = totalRealJobs;
+            out.push_back(std::move(hdr));
+
+            if (!taskExpanded || m.jobs.empty()) continue;
+        }
+
+        const int baseIndent = emitTaskHeading ? 1 : 0;
+        const bool showAllTask = (maxVisibleJobsPerTask == 0) || (showAllJobsTasks.count(id) > 0);
+        size_t emittedSingleDirJobs = 0;
+        int hiddenSingleDirJobs = 0;
+        // Display directions newest-first when under a TaskHeading.
+        std::vector<std::string> dispDirOrder(dirOrder.rbegin(), dirOrder.rend());
+        for (const auto& did : dispDirOrder) {
+            const DirMeta& d = dirMap[did];
+            if (!d.hasHeading) {
+                for (auto it = d.realJobs.rbegin(); it != d.realJobs.rend(); ++it) {
+                    if (!showAllTask && emittedSingleDirJobs >= maxVisibleJobsPerTask) {
+                        ++hiddenSingleDirJobs;
+                        continue;
+                    }
+                    ++emittedSingleDirJobs;
+                    const auto& j = *it;
+                    TaskDisplayRow child;
+                    child.kind = TaskDisplayRowKind::Job;
+                    child.taskId = id;
+                    child.directionId = did;
+                    child.jobId = j.value("id", std::string());
+                    child.indent = baseIndent;
+                    child.hasTaskRecord = m.hasRecord;
+                    child.taskTitle = m.title;
+                    child.taskState = m.state;
+                    child.supersedes = j.value("supersedes", std::string());
+                    child.supersededBy = j.value("superseded_by", std::string());
+                    child.isSuperseded = !child.supersededBy.empty();
+                    child.jobJson = j;
+                    out.push_back(std::move(child));
+                }
+                continue;
+            }
+
+            bool dirExpanded = DefaultTaskExpanded(d.state);
+            auto dirOvIt = expandedOverrides.find("direction:" + did);
+            if (dirOvIt == expandedOverrides.end()) dirOvIt = expandedOverrides.find(did);
+            if (dirOvIt != expandedOverrides.end()) dirExpanded = dirOvIt->second;
+
+            TaskDisplayRow dhdr;
+            dhdr.kind = TaskDisplayRowKind::DirectionHeading;
+            dhdr.taskId = id;
+            dhdr.directionId = did;
+            dhdr.directionKind = d.kind;
+            dhdr.directionTitle = d.title;
+            dhdr.directionState = d.state;
+            dhdr.indent = baseIndent;
+            dhdr.expanded = dirExpanded;
+            dhdr.hasTaskRecord = m.hasRecord;
+            dhdr.taskTitle = m.title;
+            dhdr.taskState = m.state;
+            dhdr.resultsCompact = FormatTaskResultsCompact(d.realStates);
+            dhdr.jobCount = static_cast<int>(d.realStates.size());
+            dhdr.jobJson = d.virtualJob;
+            out.push_back(std::move(dhdr));
+
+            if (!dirExpanded || d.realJobs.empty()) continue;
+
+            std::vector<nlohmann::json> descJobs(d.realJobs.rbegin(), d.realJobs.rend());
+            const bool showAll = (maxVisibleJobsPerTask == 0) ||
+                                 (descJobs.size() <= maxVisibleJobsPerTask) ||
+                                 (showAllJobsTasks.count(id) > 0) ||
+                                 (showAllJobsTasks.count("direction:" + did) > 0);
+            const size_t visibleCount = showAll ? descJobs.size() : maxVisibleJobsPerTask;
+            for (size_t i = 0; i < visibleCount; ++i) {
+                const auto& j = descJobs[i];
+                TaskDisplayRow child;
+                child.kind = TaskDisplayRowKind::Job;
+                child.taskId = id;
+                child.directionId = did;
+                child.jobId = j.value("id", std::string());
+                child.indent = baseIndent + 1;
+                child.hasTaskRecord = m.hasRecord;
+                child.taskTitle = m.title;
+                child.taskState = m.state;
+                child.supersedes = j.value("supersedes", std::string());
+                child.supersededBy = j.value("superseded_by", std::string());
+                child.isSuperseded = !child.supersededBy.empty();
+                child.jobJson = j;
+                out.push_back(std::move(child));
+            }
+            if (!showAll && descJobs.size() > visibleCount) {
+                TaskDisplayRow more;
+                more.kind = TaskDisplayRowKind::MoreJobs;
+                more.taskId = id;
+                more.directionId = did;
+                more.indent = baseIndent + 1;
+                more.hasTaskRecord = m.hasRecord;
+                more.taskTitle = m.title;
+                more.taskState = m.state;
+                more.hiddenJobCount = static_cast<int>(descJobs.size() - visibleCount);
+                out.push_back(std::move(more));
             }
         }
-
-        bool expanded = DefaultTaskExpanded(m.state);
-        auto ovIt = expandedOverrides.find(id);
-        if (ovIt != expandedOverrides.end()) expanded = ovIt->second;
-
-        TaskDisplayRow hdr;
-        hdr.kind = TaskDisplayRowKind::TaskHeading;
-        hdr.taskId = id;
-        hdr.indent = 0;
-        hdr.expanded = expanded;
-        hdr.hasTaskRecord = m.hasRecord;
-        hdr.taskTitle = m.title;
-        hdr.taskState = m.state;
-        hdr.resultsCompact = FormatTaskResultsCompact(realStates);
-        hdr.jobCount = static_cast<int>(realStates.size());
-        out.push_back(std::move(hdr));
-
-        if (!expanded || m.jobs.empty()) continue;
-
-        // Display child jobs newest-first.
-        std::vector<nlohmann::json> descJobs(chronoJobs.rbegin(), chronoJobs.rend());
-        const bool showAll = (maxVisibleJobsPerTask == 0) ||
-                             (descJobs.size() <= maxVisibleJobsPerTask) ||
-                             (showAllJobsTasks.count(id) > 0);
-        const size_t visibleCount = showAll ? descJobs.size() : maxVisibleJobsPerTask;
-        for (size_t i = 0; i < visibleCount; ++i) {
-            const auto& j = descJobs[i];
-            TaskDisplayRow child;
-            child.kind = TaskDisplayRowKind::Job;
-            child.taskId = id;
-            child.jobId = j.value("id", std::string());
-            child.indent = 1;
-            child.hasTaskRecord = m.hasRecord;
-            child.taskTitle = m.title;
-            child.taskState = m.state;
-            child.supersedes = j.value("supersedes", std::string());
-            child.supersededBy = j.value("superseded_by", std::string());
-            child.isSuperseded = !child.supersededBy.empty();
-            child.jobJson = j;
-            out.push_back(std::move(child));
-        }
-        if (!showAll && descJobs.size() > visibleCount) {
+        if (hiddenSingleDirJobs > 0) {
             TaskDisplayRow more;
             more.kind = TaskDisplayRowKind::MoreJobs;
             more.taskId = id;
-            more.indent = 1;
+            more.indent = baseIndent;
             more.hasTaskRecord = m.hasRecord;
             more.taskTitle = m.title;
             more.taskState = m.state;
-            more.hiddenJobCount = static_cast<int>(descJobs.size() - visibleCount);
+            more.hiddenJobCount = hiddenSingleDirJobs;
             out.push_back(std::move(more));
         }
     }
