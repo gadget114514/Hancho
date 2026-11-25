@@ -16119,6 +16119,7 @@ enum RoutineDlgControlId {
     IDC_ROUTINE_DLG_REJECT = 7206,
     IDC_ROUTINE_DLG_REFRESH = 7207,
     IDC_ROUTINE_DLG_CLOSE = 7208,
+    IDC_ROUTINE_DLG_JSON = 7209,
 };
 
 struct RoutinesDlgState {
@@ -16128,6 +16129,9 @@ struct RoutinesDlgState {
     HWND list = nullptr;
     HWND lblDetail = nullptr;
     HWND editDetail = nullptr;
+    HWND lblJson = nullptr;
+    HWND editJson = nullptr;
+    HFONT hFontMono = nullptr;
     HWND btnRun = nullptr;
     HWND btnCheck = nullptr;
     HWND btnApprove = nullptr;
@@ -16395,6 +16399,7 @@ static void UpdateRoutineSelection(RoutinesDlgState* ds, int index) {
     if (index < 0 || index >= static_cast<int>(ds->routines.size())) {
         ds->selectedName.clear();
         if (ds->editDetail) SetWindowTextW(ds->editDetail, L"");
+        if (ds->editJson) SetWindowTextW(ds->editJson, L"");
         if (ds->btnRun) EnableWindow(ds->btnRun, FALSE);
         if (ds->btnCheck) EnableWindow(ds->btnCheck, FALSE);
         if (ds->btnApprove) EnableWindow(ds->btnApprove, FALSE);
@@ -16486,15 +16491,14 @@ static void UpdateRoutineSelection(RoutinesDlgState* ds, int index) {
     }
     ss << L"\r\n";
 
-    ss << L"[BT Definition Preview / BT 定義プレビュー]\r\n";
-    if (!btPreview.empty()) {
-        ss << Utf8ToWide(btPreview) << L"\r\n";
-    } else {
-        ss << L"(no behavior tree definition available)\r\n";
-    }
-
     if (ds->editDetail) {
         SetWindowTextW(ds->editDetail, ss.str().c_str());
+    }
+    if (ds->editJson) {
+        const std::wstring jsonText = btPreview.empty()
+            ? Tr(L"(no behavior tree definition available)", L"(no behavior tree definition available)", L"(no hay definición de árbol de comportamiento)")
+            : Utf8ToWide(btPreview);
+        SetWindowTextW(ds->editJson, jsonText.c_str());
     }
 }
 
@@ -16507,15 +16511,21 @@ static void LayoutRoutinesDialog(RoutinesDlgState* ds, int width, int height) {
     const int bottomAreaH = btnH + margin * 2;
 
     int contentH = (std::max)(100, height - bottomAreaH - margin);
-    int listW = (std::max)(280, (width - margin * 2 - gap) * 45 / 100);
+    int availW = (std::max)(0, width - margin * 2 - gap * 2);
+    int listW = (std::max)(260, availW * 30 / 100);
+    int detailW = (std::max)(280, availW * 35 / 100);
     int detailX = margin + listW + gap;
-    int detailW = (std::max)(200, width - detailX - margin);
+    int jsonX = detailX + detailW + gap;
+    int jsonW = (std::max)(240, width - jsonX - margin);
 
     if (ds->lblList) MoveWindow(ds->lblList, margin, margin, listW, 18, TRUE);
     if (ds->list) MoveWindow(ds->list, margin, margin + 22, listW, contentH - 22, TRUE);
 
     if (ds->lblDetail) MoveWindow(ds->lblDetail, detailX, margin, detailW, 18, TRUE);
     if (ds->editDetail) MoveWindow(ds->editDetail, detailX, margin + 22, detailW, contentH - 22, TRUE);
+
+    if (ds->lblJson) MoveWindow(ds->lblJson, jsonX, margin, jsonW, 18, TRUE);
+    if (ds->editJson) MoveWindow(ds->editJson, jsonX, margin + 22, jsonW, contentH - 22, TRUE);
 
     int btnY = height - margin - btnH;
     int curBtnX = margin;
@@ -16574,6 +16584,14 @@ static LRESULT CALLBACK RoutinesWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPAR
             WS_CHILD | WS_VISIBLE | WS_TABSTOP | WS_VSCROLL | WS_HSCROLL | ES_MULTILINE | ES_READONLY | ES_AUTOVSCROLL | ES_AUTOHSCROLL,
             0, 0, 10, 10, hwnd, reinterpret_cast<HMENU>(static_cast<INT_PTR>(IDC_ROUTINE_DLG_DETAIL)), hInst, nullptr);
 
+        ds->lblJson = CreateWindowExW(0, L"STATIC",
+            Tr(L"BT JSON", L"BT JSON", L"BT JSON"),
+            WS_CHILD | WS_VISIBLE, 0, 0, 10, 10, hwnd, nullptr, hInst, nullptr);
+
+        ds->editJson = CreateWindowExW(WS_EX_CLIENTEDGE, L"EDIT", L"",
+            WS_CHILD | WS_VISIBLE | WS_TABSTOP | WS_VSCROLL | WS_HSCROLL | ES_MULTILINE | ES_READONLY | ES_AUTOVSCROLL | ES_AUTOHSCROLL,
+            0, 0, 10, 10, hwnd, reinterpret_cast<HMENU>(static_cast<INT_PTR>(IDC_ROUTINE_DLG_JSON)), hInst, nullptr);
+
         ds->btnRun = CreateWindowExW(0, L"BUTTON",
             Tr(L"実行", L"Run", L"Ejecutar"),
             WS_CHILD | WS_VISIBLE | WS_TABSTOP | BS_PUSHBUTTON,
@@ -16609,8 +16627,14 @@ static LRESULT CALLBACK RoutinesWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPAR
         for (HWND c : {ds->list, ds->editDetail, ds->btnRun, ds->btnCheck, ds->btnApprove, ds->btnReject, ds->btnRefresh, ds->btnClose}) {
             if (c && hUiFont) SendMessageW(c, WM_SETFONT, reinterpret_cast<WPARAM>(hUiFont), TRUE);
         }
-        for (HWND c : {ds->lblList, ds->lblDetail}) {
+        for (HWND c : {ds->lblList, ds->lblDetail, ds->lblJson}) {
             if (c && (hBoldFont ? hBoldFont : hUiFont)) SendMessageW(c, WM_SETFONT, reinterpret_cast<WPARAM>(hBoldFont ? hBoldFont : hUiFont), TRUE);
+        }
+        ds->hFontMono = CreateFontW(-13, 0, 0, 0, FW_NORMAL, FALSE, FALSE, FALSE, DEFAULT_CHARSET,
+                                    OUT_DEFAULT_PRECIS, CLIP_DEFAULT_PRECIS, CLEARTYPE_QUALITY,
+                                    FIXED_PITCH | FF_MODERN, L"Consolas");
+        if (ds->hFontMono && ds->editJson) {
+            SendMessageW(ds->editJson, WM_SETFONT, reinterpret_cast<WPARAM>(ds->hFontMono), TRUE);
         }
 
         ApplyDashboardNativeTheme(hwnd);
@@ -16619,6 +16643,7 @@ static LRESULT CALLBACK RoutinesWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPAR
             ApplyNativeControlTheme(header, IsDarkThemeActive());
         }
         ApplyNativeControlTheme(ds->editDetail, IsDarkThemeActive());
+        ApplyNativeControlTheme(ds->editJson, IsDarkThemeActive());
         ListView_SetBkColor(ds->list, g_theme.panel);
         ListView_SetTextBkColor(ds->list, g_theme.panel);
         ListView_SetTextColor(ds->list, g_theme.listText);
@@ -16773,7 +16798,7 @@ static LRESULT CALLBACK RoutinesWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPAR
     }
     case WM_GETMINMAXINFO: {
         auto* mmi = reinterpret_cast<MINMAXINFO*>(lParam);
-        mmi->ptMinTrackSize.x = 640;
+        mmi->ptMinTrackSize.x = 1000;
         mmi->ptMinTrackSize.y = 440;
         return 0;
     }
@@ -16807,6 +16832,7 @@ static LRESULT CALLBACK RoutinesWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPAR
             if (ds->dash && ds->dash->hwndRoutinesDlg == hwnd) {
                 ds->dash->hwndRoutinesDlg = nullptr;
             }
+            if (ds->hFontMono) DeleteObject(ds->hFontMono);
             delete ds;
             SetWindowLongPtrW(hwnd, GWLP_USERDATA, 0);
         }
@@ -16852,10 +16878,10 @@ static void ShowRoutinesDialog(DashboardState* st) {
         SystemParametersInfoW(SPI_GETWORKAREA, 0, &rc, 0);
     }
 
-    const int width = 960;
+    const int width = 1440;
     const int height = 620;
-    const int x = rc.left + ((rc.right - rc.left) - width) / 2;
-    const int y = rc.top + ((rc.bottom - rc.top) - height) / 2;
+    const int x = (std::max)(rc.left, rc.left + ((rc.right - rc.left) - width) / 2);
+    const int y = (std::max)(rc.top, rc.top + ((rc.bottom - rc.top) - height) / 2);
 
     HWND hwnd = CreateWindowExW(
         WS_EX_DLGMODALFRAME,
