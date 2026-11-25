@@ -2,7 +2,7 @@
 
 **[English](README.md) | [Japanese](README-ja.md)**
 
-**Hancho** (班長, "foreman") is a job foreman for AI coding agents on Windows: your LLM, or you, hands it work, and Hancho runs that work as real terminal processes, in order, with retries, on a dashboard you can watch.
+**Hancho** (班長, "foreman") is a dashboard for llm task management; thus a job foreman for AI coding agents on Windows: your LLM, or you, hands it work, and Hancho runs that work as real terminal processes, in order, with retries, on a dashboard you can watch.
 
 Built around that one idea: a ConPTY multi-terminal dashboard, a task queue with dependencies, timeouts and retries, behavior trees for multi-step plans, and control from both **MCP** and the **CLI**. It treats `claude`, `opencode`, `codex`, build scripts and interactive shells alike.
 
