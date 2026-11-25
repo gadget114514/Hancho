@@ -50,7 +50,7 @@ Large tasks are split into cards (planned directions) inside a task:
 Behavior tree leaf types are aligned around modern terminology:
 - **`exec`**: Runs a single OS command (alias: `job`).
 - **`agent`**: Delegates work to an LLM agent with engine, model, and automatic engine switching (alias: `worker`).
-- Saved workflows can be registered as named **routines** (`routine list/show/run/save/check/ask/approve/reject`) and executed repeatedly with unique run IDs without LLM intervention. See [Routines](doc/obsoleted/routines.md).
+- Saved workflows can be registered as named **routines** (`routine list/show/run/save/check/ask/approve/reject`) and executed repeatedly with unique run IDs without LLM intervention. Each run is one direction under a task: pass `--task <id>` (`routine_run` MCP: `task`) to attach it to an existing open task, or omit it to have Hancho create a task automatically. See [Routines](doc/obsoleted/routines.md).
 
 ### Dashboard & UI Highlights
 

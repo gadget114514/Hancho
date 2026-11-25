@@ -1,0 +1,92 @@
+{
+  "bt": {
+    "id": "build-and-smoke",
+    "root": {
+      "children": [
+        {
+          "command": "cmake --build build --config Release",
+          "cwd": "D:/wsgit/Hancho",
+          "id": "build",
+          "summary": "Build all Release targets including smoke test executables",
+          "timeoutSec": 3600,
+          "type": "exec"
+        },
+        {
+          "command": "build\\Release\\llm_stream_smoke.exe",
+          "cwd": "D:/wsgit/Hancho",
+          "id": "smoke_llm_stream",
+          "summary": "Run llm_stream_smoke",
+          "timeoutSec": 900,
+          "type": "exec"
+        },
+        {
+          "command": "build\\Release\\headless_smoke.exe",
+          "cwd": "D:/wsgit/Hancho",
+          "id": "smoke_headless",
+          "summary": "Run headless_smoke",
+          "timeoutSec": 900,
+          "type": "exec"
+        },
+        {
+          "command": "build\\Release\\triage_smoke.exe",
+          "cwd": "D:/wsgit/Hancho",
+          "id": "smoke_triage",
+          "summary": "Run triage_smoke",
+          "timeoutSec": 900,
+          "type": "exec"
+        },
+        {
+          "command": "build\\Release\\bt_ipc_smoke.exe",
+          "cwd": "D:/wsgit/Hancho",
+          "id": "smoke_bt_ipc",
+          "summary": "Run bt_ipc_smoke",
+          "timeoutSec": 900,
+          "type": "exec"
+        },
+        {
+          "command": "build\\Release\\bt_integration_smoke.exe",
+          "cwd": "D:/wsgit/Hancho",
+          "id": "smoke_bt_integration",
+          "summary": "Run bt_integration_smoke",
+          "timeoutSec": 900,
+          "type": "exec"
+        },
+        {
+          "command": "build\\Release\\taskqueue_smoke.exe",
+          "cwd": "D:/wsgit/Hancho",
+          "id": "smoke_taskqueue",
+          "summary": "Run taskqueue_smoke",
+          "timeoutSec": 900,
+          "type": "exec"
+        }
+      ],
+      "summary": "Build Release targets first, then run each smoke test in order",
+      "type": "sequence"
+    },
+    "summary": "Build every Release target and run six smoke tests sequentially"
+  },
+  "cwd": "D:\\wsgit\\Hancho",
+  "foreachSnapshot": [],
+  "history": [
+    {
+      "at": "2026-11-25 15:49:06",
+      "by": "chat",
+      "reason": "routine ask (create): Create a routine that builds every Release target and then runs exactly these six smoke tests, in this order: llm_stream_smoke, headless_smoke, triage_smoke, bt_ipc_smoke, bt_integration_smoke, taskqueue_smoke. Build step command: cmake --build build --config Release (do NOT add --target, because the smoke-test executables must be built too); timeoutSec 3600. Then run each smoke as its own separate exec job, command build\\Release\\<name>.exe, cwd D:/wsgit/Hancho, timeoutSec 900, in the order listed above. Do not use foreach or glob; list the six tests explicitly. Give every node an English summary. Use type exec for jobs. The build node must succeed before any smoke runs.",
+      "status": "proposed"
+    },
+    {
+      "approvedVia": "chat",
+      "at": "2026-11-25 15:49:25",
+      "by": "chat",
+      "reason": "approved via chat",
+      "status": "approved",
+      "userSaid": "全ターゲット（Hancho, hancho-cli, HanchoChat, HanchoTerm, wct）のビルドおよび全スモークテスト（llm_stream_smoke, headless_smoke, triage_smoke, bt_ipc_smoke, bt_integration_smoke, taskqueue_smoke）を実行しています。 を Hanchoのルーチンにして登録してくれ。"
+    }
+  ],
+  "inputs": [],
+  "inputsSnapshot": {},
+  "name": "build-and-smoke",
+  "notes": "Builds all Release targets with CMake and runs the six specified smoke tests sequentially.",
+  "status": "approved",
+  "summary": "Build all Release targets and run the six smoke tests in sequence."
+}

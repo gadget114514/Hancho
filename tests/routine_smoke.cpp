@@ -269,6 +269,13 @@ int main() {
         Check(run1.value("runId", std::string()).rfind("build-smoke-", 0) == 0 &&
                   run1.value("taskqueue", std::string()) == "routine-build-smoke",
               "run id and taskqueue naming are correct");
+        const std::string autoTaskId = run1.value("taskId", std::string());
+        Check(!autoTaskId.empty(), "routine run without task creates a task: " + run1.dump());
+        json autoTask = h.Call({{"action", "task_show"}, {"id", autoTaskId}});
+        Check(autoTask.value("ok", false) && autoTask.contains("task") &&
+                  autoTask["task"].value("title", std::string()) == "Routine: build-smoke" &&
+                  autoTask.contains("directions") && !autoTask["directions"].empty(),
+              "auto-created task holds the routine direction: " + autoTask.dump().substr(0, 400));
 
         json run2 = h.Call({{"action", "routine_run"}, {"name", "build-smoke"}, {"cwd", projUtf8},
                             {"wait", true}, {"timeout_ms", 20000}});
@@ -331,6 +338,26 @@ int main() {
                   checked.contains("added") && checked.contains("removed") && checked.contains("changed") &&
                   checked["added"].empty() && checked["removed"].empty() && checked["changed"].empty(),
               "routine check has the placeholder shape: " + checked.dump());
+
+        json madeTask = h.Call({{"action", "task_create"}, {"title", "Existing task"},
+                                {"intent", "routine run target"}});
+        Check(madeTask.value("ok", false), "create a task for routine_run: " + madeTask.dump());
+        const std::string existingTaskId = madeTask.value("id", "");
+        json runWithTask = h.Call({{"action", "routine_run"}, {"name", "build-smoke"}, {"cwd", projUtf8},
+                                   {"task", existingTaskId}, {"wait", true}, {"timeout_ms", 20000}});
+        Check(runWithTask.value("ok", false) && runWithTask.value("state", std::string()) == "succeeded" &&
+                  runWithTask.value("taskId", std::string()) == existingTaskId,
+              "routine_run with task attaches to the existing task: " + runWithTask.dump());
+        json existingTask = h.Call({{"action", "task_show"}, {"id", existingTaskId}});
+        bool attachedJob = false;
+        if (existingTask.contains("jobs") && existingTask["jobs"].is_array()) {
+            for (const auto& job : existingTask["jobs"]) {
+                if (job.value("id", std::string()).find(runWithTask.value("runId", std::string())) != std::string::npos) {
+                    attachedJob = true;
+                }
+            }
+        }
+        Check(attachedJob, "the existing task owns the routine's jobs: " + existingTask.dump().substr(0, 500));
     }
 
     // 093-3: inputs snapshots, stale detection, absorbed foreach changes, and triage.

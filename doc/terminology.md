@@ -75,7 +75,7 @@ task                 One request. Holds the intent and the progress log
 
 | Term | Meaning |
 |---|---|
-| task | One thing the supervisor is trying to do. A record created by `task create`. A job from a direction without `--task` belongs to an "implicit task" whose id is the first job's id in the lineage |
+| task | One thing the supervisor is trying to do. A record created by `task create`. A job from a direction without `--task` belongs to an "implicit task" whose id is the first job's id in the lineage. A `routine run` without `--task` is the exception: it creates a real task (`Routine: <name>`) and adds its direction there |
 | direction | One registration on the queue: one BT, or one `taskqueue add` (even with one job). Held as a record (see "Direction records" below). The BT virtual row that is currently called a "task group" (`group:<id>`) is the direction of a running BT |
 | job | A unit that runs one command as one process. One row in the queue. Has `id` / `command` / `summary` / `timeoutSec` |
 | attempt | One run of a job. Kept in `attempts[]` |

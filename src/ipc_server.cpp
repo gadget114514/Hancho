@@ -3636,26 +3636,42 @@ std::string IpcServer::HandleRequestJson(const std::string& reqJson) {
             for (const char* key : {"state", "added", "removed", "changed", "absorbed"}) {
                 if (resp.contains(key)) inputDiff[key] = resp[key];
             }
-            const std::string taskId = JsonGetString(reqJson, "task", "");
+            json btDef = json::parse(btText, nullptr, false);
+            if (!btDef.is_object()) btDef = json::object();
+            std::string taskId = JsonGetString(reqJson, "task", "");
+            bool createdTask = false;
             if (!taskId.empty()) {
                 if (!tqm_.ValidateTaskActive(taskId, err)) {
                     return "{\"ok\":false,\"error\":\"" + JsonEscape(err) + "\"}";
                 }
-                auto btDef = json::parse(btText, nullptr, false);
-                if (btDef.is_object()) {
-                    btDef["taskId"] = taskId;
-                    btText = btDef.dump();
+            } else {
+                const json created = json::parse(tqm_.TaskCreate("Routine: " + name,
+                                    btDef.value("summary", std::string()), "",
+                                    ExtractRawJsonValue(reqJson, "origin"), err), nullptr, false);
+                if (created.is_discarded() || !created.value("ok", false) ||
+                    created.value("id", std::string()).empty()) {
+                    return "{\"ok\":false,\"error\":\"failed to create task for routine run: " +
+                           JsonEscape(err.empty() ? "unknown error" : err) + "\"}";
                 }
+                taskId = created.value("id", "");
+                createdTask = true;
             }
+            btDef["taskId"] = taskId;
+            btText = btDef.dump();
             if (req.contains("origin") && req["origin"].is_object()) {
                 tqm_.SetBtOrigin(runId, req["origin"].dump());
             }
             json start = json::parse(btm_->Start(btText, false), nullptr, false);
             if (start.is_discarded() || !start.value("ok", false)) {
+                if (createdTask) {
+                    std::string closeErr;
+                    tqm_.TaskClose(taskId, "failed", "routine BT start failed", closeErr);
+                }
                 return start.is_discarded() ? "{\"ok\":false,\"error\":\"BT start failed\"}" : start.dump();
             }
             json runRecord;
             runRecord["runId"] = runId;
+            runRecord["taskId"] = taskId;
             runRecord["name"] = name;
             runRecord["state"] = "running";
             runRecord["startedAt"] = GetCurrentTimestampStr();
@@ -3669,6 +3685,7 @@ std::string IpcServer::HandleRequestJson(const std::string& reqJson) {
             out["ok"] = true;
             out["name"] = name;
             out["runId"] = runId;
+            out["taskId"] = taskId;
             out["taskqueue"] = taskqueue;
             out["state"] = "running";
             out["waited"] = false;

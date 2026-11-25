@@ -47,7 +47,7 @@ Hancho 0.10.0 では、作業は 4 つの明確な階層で管理されます:
 BT の末端ノード名を用語刷新に揃えました:
 - **`exec`**: 1 つの OS コマンドを実行（旧名・別名: `job`）。
 - **`agent`**: エンジン・モデル・自動切り替えを持つ LLM エージェントにタスクを委託（旧名・別名: `worker`）。
-- 決まった定型作業は名前付き**ルーチン**（`routine list/show/run/save/check/ask/approve/reject`）として保存し、LLM なしで一意の実行 ID で繰り返し実行できます。詳しくは [ルーチン](doc/obsoleted/routines-ja.md)。
+- 決まった定型作業は名前付き**ルーチン**（`routine list/show/run/save/check/ask/approve/reject`）として保存し、LLM なしで一意の実行 ID で繰り返し実行できます。実行は必ず 1 つのタスクの下に 1 つの direction として載ります。`--task <id>`（MCP `routine_run` の `task`）を渡すと既存のオープンタスクに追加し、省略すると Hancho がタスクを自動生成します。詳しくは [ルーチン](doc/obsoleted/routines-ja.md)。
 
 ### ダッシュボードと UI の強化
 

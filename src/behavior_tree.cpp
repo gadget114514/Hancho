@@ -95,27 +95,38 @@ bool ExpandBtGlob(const std::string& cwdUtf8, const std::string& globUtf8,
     if (ec) return false;
 
     size_t maxDepth = 0;
-    bool recursive = false;
-    for (const auto& seg : pat) {
-        if (seg == "**") recursive = true;
-        else maxDepth++;
-    }
-    if (!recursive) {
-        for (const auto& ex : exPats) {
-            for (const auto& seg : ex) if (seg == "**") recursive = true;
+    size_t firstDoubleStar = pat.size();
+    for (size_t i = 0; i < pat.size(); ++i) {
+        if (pat[i] == "**") {
+            if (firstDoubleStar == pat.size()) firstDoubleStar = i;
+        } else {
+            maxDepth++;
         }
     }
+    const bool recursive = (firstDoubleStar < pat.size());
 
     std::set<std::string> found;
     std::filesystem::recursive_directory_iterator it(base, std::filesystem::directory_options::skip_permission_denied, ec);
     std::filesystem::recursive_directory_iterator end;
     for (; !ec && it != end; it.increment(ec)) {
-        if (recursive && maxDepth > 0 && it.depth() >= static_cast<int>(maxDepth + 32)) {
-            it.disable_recursion_pending();
+        const size_t depth = static_cast<size_t>(it.depth());
+        if (it->is_directory(ec)) {
+            if (!recursive && depth + 1 >= pat.size()) {
+                it.disable_recursion_pending();
+                continue;
+            }
+            if (depth < firstDoubleStar) {
+                const std::string dirName = WideToUtf8(it->path().filename().wstring());
+                if (!WildcardSegmentMatch(pat[depth], dirName)) {
+                    it.disable_recursion_pending();
+                    continue;
+                }
+            }
+            if (recursive && maxDepth > 0 && it.depth() >= static_cast<int>(maxDepth + 32)) {
+                it.disable_recursion_pending();
+                continue;
+            }
             continue;
-        }
-        if (!recursive && it.depth() >= static_cast<int>(pat.size())) {
-            it.disable_recursion_pending();
         }
         if (!it->is_regular_file(ec)) continue;
         std::filesystem::path rel = it->path().lexically_relative(base);

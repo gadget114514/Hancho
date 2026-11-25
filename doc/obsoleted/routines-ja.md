@@ -29,7 +29,7 @@ hancho-cli.exe routine save --name smoke-all --file plan.json --inputs CMakeList
 | :--- | :--- |
 | `list` | 名前、summary、スコープ、最終実行、鮮度状態（`[STALE]` と差分件数）。 |
 | `show <name>` | 定義全体、最終実行のノード別結果（状態・時間・テスト結果集計）、前回比の `newlyFailed` / `fixed`、入力差分。 |
-| `run <name> [--wait] [--timeout-ms <n>]` | 保存済み BT を新しい実行 ID とタスクキューで起動。`--wait` は完了まで待ち、失敗時は非ゼロ終了。 |
+| `run <name> [--wait] [--timeout-ms <n>] [--task <id>]` | 保存済み BT を新しい実行 ID とタスクキューで起動。実行は `--task` の下に 1 つの direction として載り、省略時は `Routine: <name>` というタスクを自動生成してぶら下げる。`--wait` は完了まで待ち、失敗時は非ゼロ終了。 |
 | `save --name ... --file ... [--inputs <glob> ...] [--summary ...] [--project\|--data] --reason ...` | 登録／更新。BT を検証し、両スナップショットを更新して `history` に 1 行追加する。必ず `--reason` を付ける。 |
 | `check <name>` | 現在の入力ファイルと保存時スナップショットを比較し、`state: ok` / `stale` と `added` / `removed` / `changed` / `absorbed` を返す。 |
 | `ask "<やりたいこと>" [--name <n>] [--cwd <dir>] [--wait] [--scope ...]` | worker LLM にルーチンの作成（`--name` があれば修正）を依頼する。検証後、提案として保存される。 |
@@ -57,11 +57,11 @@ hancho-cli.exe routine save --name smoke-all --file plan.json --inputs CMakeList
 
 ## MCP
 
-同じ操作が MCP ツール `routine_list`、`routine_show`、`routine_run`、`routine_save`、`routine_check`、`routine_ask`、`routine_approve`、`routine_reject` として公開されています。supervisor LLM はシェルを使わずにワークフローの実行やルーチンの作成・承認／却下ができます。
+同じ操作が MCP ツール `routine_list`、`routine_show`、`routine_run`、`routine_save`、`routine_check`、`routine_ask`、`routine_approve`、`routine_reject` として公開されています。supervisor LLM はシェルを使わずにワークフローの実行やルーチンの作成・承認／却下ができます。`routine_run` の `task` は CLI の `--task` と同じ意味で、応答に `taskId` が入ります。
 
 ## 実行 ID とジョブ
 
-`routine run` ごとに `<name>-<yyyymmdd-hhmmss>`（衝突時は連番付き）を生成し、タスクキュー `routine-<name>` を使います。この ID が BT の `id` に書き込まれるため、ツリーが作るジョブはすべてこの接頭辞を持ちます。`routine show` とダッシュボードはこの ID で結果をまとめ、直近 50 件を保持します。
+`routine run` ごとに `<name>-<yyyymmdd-hhmmss>`（衝突時は連番付き）を生成し、タスクキュー `routine-<name>` を使います。この ID が BT の `id` に書き込まれるため、ツリーが作るジョブはすべてこの接頭辞を持ちます。実行は 1 つの direction で、`--task` / `task` で指定したタスク、または省略時に自動生成されたタスクの下に載ります。`routine show` とダッシュボードはこの ID で結果をまとめ、直近 50 件を保持します。
 
 ## `stale` と `absorbed`
 

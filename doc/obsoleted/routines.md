@@ -29,7 +29,7 @@ hancho-cli.exe routine save --name smoke-all --file plan.json --inputs CMakeList
 | :--- | :--- |
 | `list` | Names, summaries, scope, last run and freshness state (`[STALE]` plus a diff count). |
 | `show <name>` | Full definition, the last run's per-node results (state, duration, test report totals), `newlyFailed` / `fixed` versus the previous run, and the input diff. |
-| `run <name> [--wait] [--timeout-ms <n>]` | Starts the saved BT with a fresh run id and task queue. `--wait` blocks and exits non-zero on failure. |
+| `run <name> [--wait] [--timeout-ms <n>] [--task <id>]` | Starts the saved BT with a fresh run id and task queue. The run is one direction under `--task`; if omitted, a new task named `Routine: <name>` is created and the direction is attached to it. `--wait` blocks and exits non-zero on failure. |
 | `save --name ... --file ... [--inputs <glob> ...] [--summary ...] [--project\|--data] --reason ...` | Registers or updates a routine, validates its BT, refreshes both snapshots and appends a history entry. Always give a `--reason`. |
 | `check <name>` | Compares the current input files with the saved snapshot and reports `state: ok` or `stale` plus `added` / `removed` / `changed` / `absorbed`. |
 | `ask "<what you want>" [--name <n>] [--cwd <dir>] [--wait] [--scope ...]` | Asks a worker LLM to create (or, when `--name` exists, fix) a routine. The definition is validated and saved as a proposal. |
@@ -57,11 +57,11 @@ A person using `routine save` (CLI or dashboard) still gets an approved routine;
 
 ## MCP
 
-The same operations are exposed as MCP tools: `routine_list`, `routine_show`, `routine_run`, `routine_save`, `routine_check`, `routine_ask`, `routine_approve` and `routine_reject`. This lets a supervisor agent run a named workflow, ask for a new routine, and approve/reject a proposal without shelling out.
+The same operations are exposed as MCP tools: `routine_list`, `routine_show`, `routine_run`, `routine_save`, `routine_check`, `routine_ask`, `routine_approve` and `routine_reject`. This lets a supervisor agent run a named workflow, ask for a new routine, and approve/reject a proposal without shelling out. `routine_run` accepts an optional `task` id with the same meaning as `--task`; the response carries `taskId`.
 
 ## Run ids and jobs
 
-Each `routine run` generates `<name>-<yyyymmdd-hhmmss>` (with a counter suffix if that id already exists) and uses the task queue `routine-<name>`. The id is written into the BT as its `id`, so every job created by the tree is prefixed with it. `routine show` and the dashboard use the id to group results; the last 50 records are retained even when the dashboard is restarted.
+Each `routine run` generates `<name>-<yyyymmdd-hhmmss>` (with a counter suffix if that id already exists) and uses the task queue `routine-<name>`. The id is written into the BT as its `id`, so every job created by the tree is prefixed with it. A run is one direction: it is added to the task named by `--task` / `task`, or to an automatically created task when that argument is omitted. `routine show` and the dashboard use the id to group results; the last 50 records are retained even when the dashboard is restarted.
 
 ## `stale` and `absorbed`
 

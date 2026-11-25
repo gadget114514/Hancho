@@ -16378,9 +16378,12 @@ static void RefreshRoutinesDialog(RoutinesDlgState* ds) {
     }
 
     if (selectIdx >= 0) {
+        ds->selectedName.clear();
         ListView_SetItemState(ds->list, selectIdx, LVIS_SELECTED | LVIS_FOCUSED, LVIS_SELECTED | LVIS_FOCUSED);
         ListView_EnsureVisible(ds->list, selectIdx, FALSE);
-        UpdateRoutineSelection(ds, selectIdx);
+        if (ds->selectedName.empty()) {
+            UpdateRoutineSelection(ds, selectIdx);
+        }
     } else {
         ds->selectedName.clear();
         UpdateRoutineSelection(ds, -1);
@@ -16411,9 +16414,6 @@ static void UpdateRoutineSelection(RoutinesDlgState* ds, int index) {
 
     nlohmann::json respShow;
     GuiIpcCall(ds->dash, {{"action", "routine_show"}, {"name", r.name}}, respShow);
-
-    nlohmann::json respCheck;
-    GuiIpcCall(ds->dash, {{"action", "routine_check"}, {"name", r.name}}, respCheck);
 
     std::wostringstream ss;
     ss << L"================================================================================\r\n";
@@ -16457,13 +16457,7 @@ static void UpdateRoutineSelection(RoutinesDlgState* ds, int index) {
     nlohmann::json changed = nlohmann::json::array();
     nlohmann::json absorbed = nlohmann::json::array();
 
-    if (respCheck.is_object() && respCheck.value("ok", false)) {
-        diffState = respCheck.value("state", "ok");
-        added = respCheck.value("added", nlohmann::json::array());
-        removed = respCheck.value("removed", nlohmann::json::array());
-        changed = respCheck.value("changed", nlohmann::json::array());
-        absorbed = respCheck.value("absorbed", nlohmann::json::array());
-    } else if (respShow.is_object() && respShow.contains("state")) {
+    if (respShow.is_object() && respShow.contains("state")) {
         diffState = respShow.value("state", "ok");
         added = respShow.value("added", nlohmann::json::array());
         removed = respShow.value("removed", nlohmann::json::array());
@@ -16632,7 +16626,11 @@ static LRESULT CALLBACK RoutinesWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPAR
         RECT rc = {};
         GetClientRect(hwnd, &rc);
         LayoutRoutinesDialog(ds, rc.right, rc.bottom);
-        RefreshRoutinesDialog(ds);
+        PostMessageW(hwnd, WM_APP + 1, 0, 0);
+        return 0;
+    }
+    case WM_APP + 1: {
+        if (ds) RefreshRoutinesDialog(ds);
         return 0;
     }
     case WM_SIZE: {

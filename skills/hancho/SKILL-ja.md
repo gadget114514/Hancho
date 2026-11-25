@@ -135,7 +135,7 @@ hancho-cli.exe power status
 | 大きな依頼をカードに分割して順に進める | `task create` → `direction add`（または `direction import`）→ `direction run --ready` |
 | 複数ステップに順番・依存がある | `taskqueue add` + `taskqueue wait` |
 | 前の結果で次が変わる（分岐、修正ループ、if/else） | `bt start` + `bt wait` / `bt resume` |
-| 毎回同じ定型作業（ビルド＋全スモークなど） | `routine run <name>`（BT を書き直さない） |
+| 毎回同じ定型作業（ビルド＋全スモークなど） | `routine run <name>`（BT を書き直さない）。実行は `--task <id>` の下に 1 つの direction として載り、省略時はタスクを自動生成する（MCP `routine_run` の `task`）。 |
 | 定型作業を言葉で作らせたい／古くなったルーチンを直させたい | `routine ask "..."` → `routine show` → `routine approve`（提案は承認まで run 不可） |
 | 実行を一時的に止めたい（原因は直さない） | `taskqueue pause-job <id>` / `taskqueue pause <name>` / `bt pause --id <id>`（再開は resume） |
 | worker LLM に1件任せて最終結果だけ欲しい | MCP `run_worker` |
@@ -151,7 +151,7 @@ hancho-cli.exe power status
 - **`summary` / `title` / カード / 理由は英語で書く（ユーザーとの会話の言語に合わせない）。** 表示は Hancho が表示言語に訳す。英語以外で書かれた `summary` は結果に警告が付く。
 - **成功を偽装しない。** Hancho が `success.exitCode`（既定 0）と `filesNewer` / `outputRegex` / `testReport` で検証する。exit 0 だけでは成果物を保証できないときは `filesNewer` を足す。
 - **待つ。ポーリングしない。** `taskqueue wait` / `bt wait` / `wait_process` を使う。
-- **定型作業はルーチンにする。毎回 BT を書かない。** `routine run <name>` で名前付き BT を実行する。`stale` で失敗したときだけ `routine show` と差分を見て直す。LLM に作らせてもよいが、その場合は `routine ask` の結果を必ず `routine show` で確認し、ユーザーの言葉を付けて `routine approve` してから `run` する（提案は承認まで実行されない）。人手で直すなら `routine save --reason "..."`（理由なしの保存はしない）。
+- **定型作業はルーチンにする。毎回 BT を書かない。** `routine run <name>` で名前付き BT を実行する。実行は 1 つの direction で、`--task <id>`（MCP `routine_run` の `task`）を付けると既存のオープンタスクに追加し、省略すると Hancho が `Routine: <name>` というタスクを自動生成する。`stale` で失敗したときだけ `routine show` と差分を見て直す。LLM に作らせてもよいが、その場合は `routine ask` の結果を必ず `routine show` で確認し、ユーザーの言葉を付けて `routine approve` してから `run` する（提案は承認まで実行されない）。人手で直すなら `routine save --reason "..."`（理由なしの保存はしない）。
 - **一時停止は原因を直さない。** `taskqueue pause-job` / `taskqueue pause` / `bt pause` は実行（とローカル実行中ジョブの時計）を止めるだけ。LLM 応答待ち（`waitingForLlm`、rate limit、auth、provider 障害、ハング）は pause では解消しない。escalate は `bt resume` で回答するか `bt retry`、LLM 側の失敗は原因を直して `taskqueue retry`、無理なら `taskqueue cancel` / `bt cancel`。pause した実行中ジョブを resume しても同じリクエストが続く。
 - **supervisor の文脈を小さく保つ。** 詳細な指示は worker に渡し、成果物とログの末尾だけ読む。
 - **1文字修正にコーディングエージェントを起動しない。** `quickfix --file <path> --find <text> --replace <text>` を使う。決定的で数秒〜数十秒で終わる。
@@ -369,6 +369,7 @@ hancho-cli.exe routine list
 hancho-cli.exe routine show smoke-all
 hancho-cli.exe routine check smoke-all
 hancho-cli.exe routine run smoke-all --wait --timeout-ms 3600000
+hancho-cli.exe routine run smoke-all --task 123 --wait --timeout-ms 3600000  # 既存タスクに追加（--task なしなら新規タスクを作る）
 
 # LLM に作らせる／直させる（結果は提案。承認するまで run できない）
 hancho-cli.exe routine ask "全スモークを流して" --name smoke-all
@@ -380,7 +381,7 @@ hancho-cli.exe routine reject smoke-all --reason "不要になった"
 hancho-cli.exe routine save --name from-past --from-bt <btId>
 ```
 
-定義は `<cwd>/.hancho/routines/<name>.json`（project）または `<data-dir>/routines/<name>.json`（data）。実行ごとに `<name>-<yyyymmdd-hhmmss>` の ID が付き、ジョブ ID は衝突しない。MCP は `routine_list` / `routine_show` / `routine_run` / `routine_save` / `routine_check` / `routine_ask` / `routine_approve` / `routine_reject`。入力ファイルの変更で `stale` になっても実行は止まらないが、失敗した場合は triage の `routine_stale_failure` カード（`update_routine` 推奨）が出る。`update_routine` を選ぶと `routine ask`（直す）が起動し、結果は承認待ちの提案になる。
+定義は `<cwd>/.hancho/routines/<name>.json`（project）または `<data-dir>/routines/<name>.json`（data）。実行ごとに `<name>-<yyyymmdd-hhmmss>` の ID が付き、ジョブ ID は衝突しない。実行は `--task` / `task` のタスクにぶら下がる 1 つの direction で、省略時はタスクを自動生成し、応答と実行記録に `taskId` が入る。MCP は `routine_list` / `routine_show` / `routine_run` / `routine_save` / `routine_check` / `routine_ask` / `routine_approve` / `routine_reject`。入力ファイルの変更で `stale` になっても実行は止まらないが、失敗した場合は triage の `routine_stale_failure` カード（`update_routine` 推奨）が出る。`update_routine` を選ぶと `routine ask`（直す）が起動し、結果は承認待ちの提案になる。
 
 `routine ask` の依頼は `routine-ask` キューの worker ジョブとして登録され、`worker` LLM リスト（rank 順、故障中はスキップ、空なら既定エンジン＋警告）で実行される。 worker の出力は厳格 BT 検証・`foreach` ドライラン・ChainGuard で検査され、不合格なら 1 回だけ直させる。合格した定義は `<dir>/.proposals/<name>.json` に `status: proposed` で保存され、更新提案の間も承認済みの旧版で `run` できる。人手の `routine save`（CLI／ダッシュボード）は承認済み、MCP の `routine_save` は提案になる。詳細は `doc/obsoleted/routines.md` / `doc/obsoleted/routines-ja.md`。
 

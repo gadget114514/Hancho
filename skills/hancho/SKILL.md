@@ -135,7 +135,7 @@ When registering a job you can also add `"suspendWhenDone": true` / `"shutdownWh
 | Split a large request into cards and advance them in order | `task create` → `direction add` (or `direction import`) → `direction run --ready` |
 | Multiple steps with order and dependencies | `taskqueue add` + `taskqueue wait` |
 | The next step changes based on the previous result (branching, fix loops, if/else) | `bt start` + `bt wait` / `bt resume` |
-| The same routine work every time (build plus full smoke test, etc.) | `routine run <name>` (no need to rewrite the BT) |
+| The same routine work every time (build plus full smoke test, etc.) | `routine run <name>` (no need to rewrite the BT). It becomes one direction under `--task <id>`, or under a new task created automatically when omitted (MCP `routine_run`: `task`). |
 | Have an LLM create a routine from words / have an outdated routine fixed | `routine ask "..."` → `routine show` → `routine approve` (a proposal cannot run until approved) |
 | Temporarily stop execution (without fixing the cause) | `taskqueue pause-job <id>` / `taskqueue pause <name>` / `bt pause --id <id>` (resume with resume) |
 | Have a worker LLM do one task and get only the final result | MCP `run_agent` |
@@ -151,7 +151,7 @@ When registering a job you can also add `"suspendWhenDone": true` / `"shutdownWh
 - **Write `summary` / `title` / cards / reasons in English (do not match the language of the conversation with the user).** Hancho translates them for display. A `summary` written in a language other than English gets a warning in the result.
 - **Do not fake success.** Hancho verifies with `success.exitCode` (default 0) and `filesNewer` / `outputRegex` / `testReport`. When exit 0 alone cannot guarantee the artifact, add `filesNewer`.
 - **Wait; do not poll.** Use `taskqueue wait` / `bt wait` / `wait_process`.
-- **Make routine work a routine. Do not write a BT every time.** Run a named BT with `routine run <name>`. Only when it fails with `stale`, look at `routine show` and the differences, then fix it. If an LLM created it, always check the `routine ask` result with `routine show`, then approve it with the user's words via `routine approve` before running (a proposal is not executed until approved). If a person fixes it by hand, use `routine save --reason "..."` (saving without a reason is not allowed).
+- **Make routine work a routine. Do not write a BT every time.** Run a named BT with `routine run <name>`. A run is one direction under a task: pass `--task <id>` (MCP `routine_run`: `task`) to add it to an existing open task, or omit it and Hancho creates a new task (`Routine: <name>`) automatically. Only when it fails with `stale`, look at `routine show` and the differences, then fix it. If an LLM created it, always check the `routine ask` result with `routine show`, then approve it with the user's words via `routine approve` before running (a proposal is not executed until approved). If a person fixes it by hand, use `routine save --reason "..."` (saving without a reason is not allowed).
 - **Pausing does not fix the cause.** `taskqueue pause-job` / `taskqueue pause` / `bt pause` only stop execution (and the clock of locally running jobs). LLM response waits (`waitingForLlm`, rate limits, auth, provider outages, hangs) are not resolved by pausing. For an escalate, answer with `bt resume` or use `bt retry`. For an LLM-side failure, fix the cause and use `taskqueue retry`. If that is not possible, use `taskqueue cancel` / `bt cancel`. Resuming a paused running job continues the same request.
 - **Keep the supervisor's context small.** Pass the detailed instructions to the worker, and read only the artifacts and the end of the log.
 - **Do not start a coding agent for a one-character fix.** Use `quickfix --file <path> --find <text> --replace <text>`. It is deterministic and finishes in seconds to tens of seconds.
@@ -369,6 +369,7 @@ hancho-cli.exe routine list
 hancho-cli.exe routine show smoke-all
 hancho-cli.exe routine check smoke-all
 hancho-cli.exe routine run smoke-all --wait --timeout-ms 3600000
+hancho-cli.exe routine run smoke-all --task 123 --wait --timeout-ms 3600000  # existing task (without --task, a new task is created)
 
 # Have an LLM create / fix one (the result is a proposal. It cannot run until approved)
 hancho-cli.exe routine ask "Run all smoke tests" --name smoke-all
@@ -380,7 +381,7 @@ hancho-cli.exe routine reject smoke-all --reason "No longer needed"
 hancho-cli.exe routine save --name from-past --from-bt <btId>
 ```
 
-A definition lives at `<cwd>/.hancho/routines/<name>.json` (project) or `<data-dir>/routines/<name>.json` (data). Each run gets an ID `<name>-<yyyymmdd-hhmmss>`, so job IDs do not collide. MCP: `routine_list` / `routine_show` / `routine_run` / `routine_save` / `routine_check` / `routine_ask` / `routine_approve` / `routine_reject`. A change to an input file makes a routine `stale`, but execution does not stop; if it fails, a triage card `routine_stale_failure` (recommending `update_routine`) appears. Choosing `update_routine` starts `routine ask` (the fix), and the result is a proposal waiting for approval.
+A definition lives at `<cwd>/.hancho/routines/<name>.json` (project) or `<data-dir>/routines/<name>.json` (data). Each run gets an ID `<name>-<yyyymmdd-hhmmss>`, so job IDs do not collide. Each run is one direction attached to the task given by `--task` / `task`, or to a new task created automatically when omitted; the response and run record carry `taskId`. MCP: `routine_list` / `routine_show` / `routine_run` / `routine_save` / `routine_check` / `routine_ask` / `routine_approve` / `routine_reject`. A change to an input file makes a routine `stale`, but execution does not stop; if it fails, a triage card `routine_stale_failure` (recommending `update_routine`) appears. Choosing `update_routine` starts `routine ask` (the fix), and the result is a proposal waiting for approval.
 
 A `routine ask` request is registered as a worker job in the `routine-ask` queue, and runs on the `agent` LLM list (in rank order; failing ones are skipped; if empty, the default engine is used with a warning). The worker's output is checked by strict BT validation, a `foreach` dry run, and ChainGuard, and if it fails, it is asked to fix it once. An accepted definition is saved as `<dir>/.proposals/<name>.json` with `status: proposed`, and while an update is pending, `run` still uses the approved older version. A manual `routine save` (CLI / dashboard) is approved; the MCP `routine_save` becomes a proposal. For details see `doc/obsoleted/routines.md` / `doc/obsoleted/routines-ja.md`.
 

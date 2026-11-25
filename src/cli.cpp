@@ -2821,9 +2821,11 @@ BEHAVIOR TREES (for LLM agents; next step depends on results):
    routine save --name <n> --file <bt.json> [--inputs <glob> ...]
                [--summary <text>] [--project|--data] --reason <text>
    routine list | routine show <name> | routine check <name>
-   routine run <name> [--wait] [--timeout-ms <n>]
+   routine run <name> [--wait] [--timeout-ms <n>] [--task <id>]
        Each run gets a fresh <name>-<yyyymmdd-hhmmss> id, so job ids never
-       collide. Definitions: <cwd>/.hancho/routines/<name>.json (project) or
+       collide. The run is one direction under --task, or under a new task
+       created automatically when --task is omitted.
+       Definitions: <cwd>/.hancho/routines/<name>.json (project) or
        <data-dir>/routines/<name>.json (data); project wins. History: the
        data-dir .runs.json (last 50). `routine --help` for all options.
 
@@ -3281,7 +3283,7 @@ void PrintCliUsageJson() {
       "subcommands": [
         {"name": "list", "usage": "hancho-cli routine list [--json]", "description": "List saved routines with name, summary, location and last run (run id, state, time)."},
         {"name": "show", "usage": "hancho-cli routine show <name> [--json]", "description": "Show the definition and the last run's per-node results (state, duration, test report totals)."},
-        {"name": "run", "usage": "hancho-cli routine run <name> [--wait] [--timeout-ms <n>] [--json]", "description": "Start the routine with a fresh run id; --wait blocks until it finishes and exits 1 on failure."},
+        {"name": "run", "usage": "hancho-cli routine run <name> [--wait] [--timeout-ms <n>] [--task <id>] [--json]", "description": "Start the routine with a fresh run id. The run is one direction attached to --task, or to a new task created automatically when --task is omitted; --wait blocks until it finishes and exits 1 on failure."},
         {"name": "save", "usage": "hancho-cli routine save --name <n> --file <bt.json> [--inputs <glob> ...] [--summary <text>] [--project|--data] --reason <text>", "description": "Register or update a routine. The BT is validated exactly as bt validate does; history records {at, by, reason}."},
         {"name": "check", "usage": "hancho-cli routine check <name>", "description": "Input freshness check. Placeholder for 093-3: always returns state ok with empty added/removed/changed."}
       ],
@@ -4274,7 +4276,8 @@ int PrintResponse(const std::string& action, const std::string& respJson, bool j
             }
             std::cout << "runId: " << r.value("runId", std::string())
                       << "  state: " << r.value("state", std::string())
-                      << "  taskqueue: " << r.value("taskqueue", std::string()) << "\n";
+                      << "  taskqueue: " << r.value("taskqueue", std::string())
+                      << "  task: " << r.value("taskId", std::string()) << "\n";
             if (r.contains("nodes") && r["nodes"].is_array()) {
                 for (const auto& node : r["nodes"]) {
                     std::cout << "  " << node.value("node", std::string()) << "  "
@@ -8965,7 +8968,8 @@ if (subcmd == "start" || subcmd == "run") {
                 << "Subcommands:\n"
                 << "  list                                               List saved routines\n"
                 << "  show <name>                                        Definition and last run's node results\n"
-                << "  run <name> [--wait] [--timeout-ms <n>]             Run by name with a fresh run id\n"
+                << "  run <name> [--wait] [--timeout-ms <n>] [--task <id>]\n"
+                << "                                Run by name; without --task a new task is created\n"
                 << "  save --name <n> --file <bt.json> [--inputs <glob> ...]\n"
                 << "                                [--summary <text>] [--project|--data] --reason <text>\n"
                 << "                                                     Register or update a routine\n"
@@ -9004,6 +9008,7 @@ if (subcmd == "start" || subcmd == "run") {
         std::string request;
         std::string userSaid;
         std::string fromBt;
+        std::string taskId;
         std::vector<std::string> inputs;
         bool wait = false;
         int timeoutMs = 60000;
@@ -9019,6 +9024,7 @@ if (subcmd == "start" || subcmd == "run") {
             else if (a == "--request" && i + 1 < args.size()) request = args[++i];
             else if (a == "--user-said" && i + 1 < args.size()) userSaid = args[++i];
             else if (a == "--from-bt" && i + 1 < args.size()) fromBt = args[++i];
+            else if (a == "--task" && i + 1 < args.size()) taskId = args[++i];
             else if ((a == "--inputs" || a == "--input") && i + 1 < args.size()) inputs.push_back(args[++i]);
             else if (a == "--wait") wait = true;
             else if (a == "--timeout-ms" && i + 1 < args.size()) timeoutMs = std::atoi(args[++i].c_str());
@@ -9046,6 +9052,7 @@ if (subcmd == "start" || subcmd == "run") {
             if (op == "run") {
                 jReq["wait"] = wait;
                 jReq["timeout_ms"] = timeoutMs;
+                if (!taskId.empty()) jReq["task"] = taskId;
                 jReq["origin"] = nlohmann::json::parse(BuildCallerOriginJson("hancho-cli-cli", ""), nullptr, false);
             }
             subcmd = "routine_" + op;

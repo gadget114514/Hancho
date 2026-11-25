@@ -73,7 +73,7 @@ task                 依頼 1 件。意図・経過ログを持つ
 
 | 用語 | 意味 |
 |---|---|
-| task | supervisor がやろうとしていること 1 件。`task create` で作るレコード。`--task` なしで出した direction の job は、系譜の最初の job の id を持つ「暗黙の task」に属する |
+| task | supervisor がやろうとしていること 1 件。`task create` で作るレコード。`--task` なしで出した direction の job は、系譜の最初の job の id を持つ「暗黙の task」に属する。ただし `routine run` に `--task` がないときは実タスク（`Routine: <name>`）を生成して direction を載せる |
 | direction | キューへの 1 回の登録。BT 1 本、または `taskqueue add` 1 回分（job 1 つでも）。レコードとして持つ（下の「direction のレコード」）。今「タスクグループ」と呼んでいる BT の仮想行（`group:<id>`）は、実行中の BT の direction |
 | job | 1 つのコマンドを 1 プロセスで実行する単位。キューの 1 行。`id` / `command` / `summary` / `timeoutSec` を持つ |
 | attempt | job の 1 回の実行。`attempts[]` に残る |
