@@ -132,7 +132,7 @@ hancho-cli.exe power status
 | :--- | :--- |
 | 1コマンドだけ（ビルド、テスト、インストール、dev サーバー） | `start` / MCP `start_process` |
 | 1文字修正・単純な文字列置換 | `quickfix`（LLM を使わない） |
-| 大きな依頼をカードに分割して順に進める | `task create` → `card add`（または `card import`）→ `card run --ready` |
+| 大きな依頼をカードに分割して順に進める | `task create` → `direction add`（または `direction import`）→ `direction run --ready` |
 | 複数ステップに順番・依存がある | `taskqueue add` + `taskqueue wait` |
 | 前の結果で次が変わる（分岐、修正ループ、if/else） | `bt start` + `bt wait` / `bt resume` |
 | 毎回同じ定型作業（ビルド＋全スモークなど） | `routine run <name>`（BT を書き直さない） |
@@ -156,7 +156,7 @@ hancho-cli.exe power status
 - **supervisor の文脈を小さく保つ。** 詳細な指示は worker に渡し、成果物とログの末尾だけ読む。
 - **1文字修正にコーディングエージェントを起動しない。** `quickfix --file <path> --find <text> --replace <text>` を使う。決定的で数秒〜数十秒で終わる。
 - **supervisor 自身にコードを書かせない。** 監督はパッチ/置換/ジョブを出す。適用は `quickfix` か worker ジョブにやらせる。
-- **作業はタスクとカードでまとめる。** 大きな依頼は `task create` → カードを `card add`（または `card import`）→ `card run --ready` → 終わったら次の `--ready` の順で進める。判断と理由は `task note <id> --text "..."` に書き、カードを 1 本の BT に詰めない（失敗したカードは `card redo` で救済する）。終わったら `task close <id> --result succeeded|failed --reason "..."` で閉じる。単発のジョブや BT も `--task <id>` でタスクに付け、内容を変えたやり直しは `taskqueue supersede <jobId> --reason "..."` を使う。
+- **作業はタスクとカードでまとめる。** 大きな依頼は `task create` → カードを `direction add`（または `direction import`）→ `direction run --ready` → 終わったら次の `--ready` の順で進める。判断と理由は `task note <id> --text "..."` に書き、カードを 1 本の BT に詰めない（失敗したカードは `direction redo` で救済する）。終わったら `task close <id> --result succeeded|failed --reason "..."` で閉じる。単発のジョブや BT も `--task <id>` でタスクに付け、内容を変えたやり直しは `taskqueue supersede <jobId> --reason "..."` を使う。
 - **モデル / provider を勝手に変えない。** `taskqueue update` で `--model` を変えるには `--approve-model-change --reason "..."` が必要。監督は変更せず、カードを判断待ちに残す。
 - **data-dir を1つに固定する。** 例: `<project>/.hancho`。毎回 `--data-dir` を付けるか、`hancho-cli.exe mcp install --data-dir .hancho` で埋め込む。
 
@@ -239,25 +239,25 @@ hancho-cli.exe task close <taskId> --result succeeded --reason "..."
 - 失敗ジョブを**同じ内容**で再実行するときは `taskqueue retry <id>`、**内容を変えて**やり直すときは `taskqueue supersede <id> --reason "..."`（MCP `taskqueue_supersede`）を使う。
 - 作業が終わったら `task close` で結果（`succeeded` / `failed`）と理由を記録する。
 
-### タスクカード（大きな依頼の分割・実行・救済）
+### 指示（direction）とタスクカード（大きな依頼の分割・実行・救済）
 
-大きな依頼を 1 本の BT に詰めず、カード（`planned` な direction）として task に登録し、依存を満たしたものから `card run --ready` で流す。失敗したカードは `card redo` で救済する。
+UI の表示名は `指示`。大きな依頼を 1 本の BT に詰めず、カード（`planned` な direction）として task に登録し、依存を満たしたものから `direction run --ready` で流す。失敗したカードは `direction redo` で救済する。`card` コマンドは廃止したので、カード操作はすべて `direction` のサブコマンドを使う。
 
 ```powershell
-hancho-cli.exe card add --task <taskId> --number 102-3 --title "Add card list" --body-file card.md --after 102-2
-hancho-cli.exe card list --task <taskId>
-hancho-cli.exe card show 102-3 --task <taskId>
-hancho-cli.exe card edit 102-3 --task <taskId> --body-file card_v2.md   # planned の間だけ
-hancho-cli.exe card run --ready --task <taskId>                       # 依存を満たしたカードを流す（既定 --max 1）
-hancho-cli.exe card run 102-3 --task <taskId>                         # 指定したカードだけ流す
-hancho-cli.exe card redo 102-3 --task <taskId> --reason "Fix test" --run
-hancho-cli.exe card remove 102-3 --task <taskId>                      # planned の間だけ
+hancho-cli.exe direction add --task <taskId> --number 102-3 --title "Add card list" --body-file card.md --after 102-2
+hancho-cli.exe direction list --task <taskId>
+hancho-cli.exe direction show 102-3 --task <taskId>              # dir_<id> も指定できる
+hancho-cli.exe direction edit 102-3 --task <taskId> --body-file card_v2.md   # planned の間だけ
+hancho-cli.exe direction run --ready --task <taskId>             # 依存を満たしたカードを流す（既定 --max 1）
+hancho-cli.exe direction run 102-3 --task <taskId>               # 指定したカードだけ流す
+hancho-cli.exe direction redo 102-3 --task <taskId> --reason "Fix test" --run
+hancho-cli.exe direction remove 102-3 --task <taskId>            # planned の間だけ
 ```
 
 - カードは `card` テンプレート（`hancho-cli.exe bt template card --json`）で BT（agent → build → test → 失敗なら fix ループ）に展開される。`build` / `test` / `engines` は `--params` またはタスクの `--card-defaults` から補われる。
-- MCP は `card_add` / `card_list` / `card_show` / `card_edit` / `card_remove` / `card_run` / `card_redo`。
-- Markdown からの一括取り込み・書き出し: `card import --task <taskId> --file doc/xxx-cards.md [--dry-run]`、`card export --task <taskId> [--file <md>] [--lang <en|ja|es>]`。`--dry-run` は書き込まずに確認だけする。
-- `card translate --task <taskId> [--translate-cards <all|title|off>]` で、タスクのカードの英語以外のタイトル・本文を英語に訳す。`card import` も同じ `--translate-cards` を取る。
+- MCP は `direction_add` / `direction_show` / `direction_list` / `direction_edit` / `direction_remove` / `direction_run` / `direction_redo` / `direction_import` / `direction_export` / `direction_translate`（および `direction_close` / `direction_reopen` / `direction_purge`）。`card_*` ツールはない。
+- Markdown からの一括取り込み・書き出し: `direction import --task <taskId> --file doc/xxx-cards.md [--dry-run]`、`direction export --task <taskId> [--file <md>] [--lang <en|ja|es>]`。`--dry-run` は書き込まずに確認だけする。
+- `direction translate --task <taskId> [--translate-cards <all|title|off>]` で、タスクのカードの英語以外のタイトル・本文を英語に訳す。`direction import` も同じ `--translate-cards` を取る。
 
 ### 翻訳（保存は英語、表示は好みの言語）
 
@@ -352,7 +352,7 @@ test → 失敗なら修正 → 再ビルド → 再テスト、の例:
 
 ハングしてから気付くのではなく、BT を書く時点で監視・退避・エスカレーションを組み込む。手順:
 
-1. **`bt template resilient-worker` から始める**（ww カード列なら `card-sequence`）。 `<...>` プレースホルダを実値に置き換える。テンプレートには `defaults.worker.idle` / `probe: true` / `engines` + `switchEngineOn` / `catch` / `escalate` が最初から入っている。`hancho-cli.exe bt template resilient-worker --json` で実物を取得できる。
+1. **`bt template resilient-agent` から始める**（ww カード列なら `card-sequence`）。 `<...>` プレースホルダを実値に置き換える。テンプレートには `defaults.agent.idle` / `probe: true` / `engines` + `switchEngineOn` / `catch` / `escalate` が最初から入っている。`hancho-cli.exe bt template resilient-agent --json` で実物を取得できる。
 2. **`bt validate --strict` で警告ゼロにする。** `bt validate` の `warnings[]` はそのままでは検証成功なので、`--strict`（MCP `bt_validate` の `strict: true`）でエラーに昇格させてから直す。`no_hang_watch` / `opencode_without_model` / `unguarded_worker` / `engines_without_switch` / `switch_without_engines` / `engine_not_permitted` / `unswitchable_command` / `escalate_without_takeover` / `permit_not_approved` / `fix_class_without_blame` / `blame_before_worker` が主な警告。
    - **修正失敗の切り替えも最初から組む**: `switchEngineOn` に `{"class":"fix_no_progress","after":1}`・`{"class":"fix_failed","after":2}`・`{"class":"root_cause_not_found","after":1}` を入れ、テスト `job` に `"blame": "<worker id>"` を付ける（`fix_*` があるのに `blame` がないと `fix_class_without_blame` 警告になる）。
    - worker には `switchLimits`（既定 `maxCandidates: 3`, `stopOnSameSymptom: true`）で切り替え上限を設け、プロンプトには原因不明時の `HANCHO-RESULT: root_cause_not_found` と `PC_BT_RESULT_FILE` への `handoff` 出力を指示しておく。
@@ -480,7 +480,7 @@ data-dir は `--data-dir` → 環境変数 `HANCHO_LOG_DIR` → `<exe のフォ�
 - git に入る `.mcp.json` では相対パスの `.hancho` のままにする（どこに clone しても使える）。相対パスはサーバーの起動フォルダ（ふつうはプロジェクトのルート）から解決されるので、エージェントはルートで起動する。絶対パスは git に入らない local スコープでだけ使う。`.hancho/` は git に入れない（`routines/` だけ残すなら `.hancho/*` と `!.hancho/routines/`）。登録を変えたらセッションを開き直す。
 - data-dir が違えば別の Hancho（キュー、BT、履歴、ダッシュボードが別）。実行中の BT やジョブがある間は切り替えない。今どこを使っているかはダッシュボードのタイトル（`Hancho - <data-dir>`）でわかる。
 
-主なツール: `start_process`、`list_processes`、`get_process_output`、`wait_process`、`send_process_input`、`kill_process`、`task_*`、`card_*`、`direction_*`、`taskqueue_*`、`bt_*`、`run_agent` / `wait_agent`（別名: `run_worker` / `wait_worker`）、`triage_list/get/decide`、`power_suspend/shutdown/cancel/status`、`memory_*`、`usage_*`、`chat_*`。
+主なツール: `start_process`、`list_processes`、`get_process_output`、`wait_process`、`send_process_input`、`kill_process`、`task_*`、`direction_*`、`taskqueue_*`、`bt_*`、`run_agent` / `wait_agent`（別名: `run_worker` / `wait_worker`）、`triage_list/get/decide`、`power_suspend/shutdown/cancel/status`、`memory_*`、`usage_*`、`chat_*`。
 
 ## よくある失敗
 

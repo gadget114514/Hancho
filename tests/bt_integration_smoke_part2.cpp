@@ -1,6 +1,7 @@
 // Headless integration smoke test for BtManager + TaskQueueManager + ProcessManager (Part 2).
 
 #include "bt_integration_smoke_common.h"
+#include "triage_manager.h"
 
 namespace bt_int_test {
 
@@ -596,6 +597,130 @@ void RunPart2IntegrationTests(const std::wstring& tempDirW, const std::string& t
               "history: attempt_finished recorded the failed and the succeeded job");
         DeleteFileW(Utf8ToWide(flag).c_str());
         DeleteFileW(flakyBatW.c_str());
+    }
+
+    // 10. BtManager::Start with triage:false parameter and in definition creates direction with triage:false immediately
+    {
+        TestHarness h;
+        json btDef1 = {
+            {"id", "bt-triage-flag-def"},
+            {"cwd", tempDirUtf8},
+            {"triage", false},
+            {"root", {
+                {"type", "job"},
+                {"id", "j1"},
+                {"summary", "Job 1"},
+                {"command", "cmd.exe /c exit 0"},
+                {"timeoutSec", 10}
+            }}
+        };
+        std::string resp1 = h.btm->Start(btDef1.dump());
+        json r1 = json::parse(resp1, nullptr, false);
+        Check(r1.value("ok", false), "bt_start with triage:false in def succeeded: " + resp1);
+        std::string dirId1 = r1.value("directionId", "");
+        Check(!dirId1.empty(), "got directionId for bt-triage-flag-def");
+        json dirRec1;
+        Check(h.tqm.DirectionGet(dirId1, dirRec1) && dirRec1.contains("triage") && !dirRec1["triage"].get<bool>(),
+              "bt_start with triage:false in def creates direction with triage:false immediately");
+
+        json btDef2 = {
+            {"id", "bt-triage-flag-param"},
+            {"cwd", tempDirUtf8},
+            {"root", {
+                {"type", "job"},
+                {"id", "j2"},
+                {"summary", "Job 2"},
+                {"command", "cmd.exe /c exit 0"},
+                {"timeoutSec", 10}
+            }}
+        };
+        std::string resp2 = h.btm->Start(btDef2.dump(), false, false);
+        json r2 = json::parse(resp2, nullptr, false);
+        Check(r2.value("ok", false), "bt_start with triage=false param succeeded: " + resp2);
+        std::string dirId2 = r2.value("directionId", "");
+        Check(!dirId2.empty(), "got directionId for bt-triage-flag-param");
+        json dirRec2;
+        Check(h.tqm.DirectionGet(dirId2, dirRec2) && dirRec2.contains("triage") && !dirRec2["triage"].get<bool>(),
+              "bt_start with triage=false param creates direction with triage:false immediately");
+
+        json btDef3 = {
+            {"id", "bt-triage-flag-def-true"},
+            {"cwd", tempDirUtf8},
+            {"root", {
+                {"type", "job"},
+                {"id", "j3"},
+                {"summary", "Job 3"},
+                {"command", "cmd.exe /c exit 0"},
+                {"timeoutSec", 10}
+            }}
+        };
+        std::string resp3 = h.btm->Start(btDef3.dump());
+        json r3 = json::parse(resp3, nullptr, false);
+        Check(r3.value("ok", false), "bt_start default succeeded: " + resp3);
+        std::string dirId3 = r3.value("directionId", "");
+        json dirRec3;
+        Check(h.tqm.DirectionGet(dirId3, dirRec3) && dirRec3.value("triage", true),
+              "bt_start default has triage:true");
+    }
+
+    // 11. Triage redo on card direction delegates to CardRedo + CardRun and uses direction terminology
+    {
+        TestHarness h;
+        std::string tErr;
+        std::string taskResp = h.tqm.TaskCreate("Triage Redo Task", "", "", "", tErr);
+        json taskDoc = json::parse(taskResp, nullptr, false);
+        Check(taskDoc.value("ok", false), "created task for triage redo: " + taskResp);
+        const std::string taskId = taskDoc.value("id", "");
+        Check(!taskId.empty(), "got taskId for triage redo");
+
+        std::string cardErr;
+        std::string addCardResp = h.tqm.CardAdd(taskId, "110-1", "Test Card 110-1", "Card body",
+                                                {}, "card", "{}", "", cardErr);
+        json addCardJson = json::parse(addCardResp, nullptr, false);
+        Check(addCardJson.value("ok", false), "CardAdd succeeded: " + addCardResp);
+
+        std::string runResp = h.btm->CardRun(taskId, "110-1", false, 1, false, "");
+        json runDoc = json::parse(runResp, nullptr, false);
+        Check(runDoc.value("ok", false), "CardRun succeeded: " + runResp);
+        const std::string originalDirId = runDoc.value("directionId", "");
+        Check(!originalDirId.empty(), "CardRun returned directionId");
+        const std::string btId = runDoc.value("btId", "");
+        if (!btId.empty()) {
+            h.btm->Cancel(btId);
+        }
+
+        TriageManager tm(h.pm, h.tqm, h.btm.get());
+        json triageCard = {
+            {"key", "dir:" + originalDirId},
+            {"id", "card-dir-failure-test"},
+            {"kind", "direction_failure"},
+            {"state", "pending"},
+            {"target", {{"directionId", originalDirId}, {"taskId", taskId}}},
+            {"candidates", json::array({
+                {{"id", "redo"}, {"name", "Redo"}, {"safe", true}},
+                {{"id", "retry"}, {"name", "Retry"}, {"safe", true}}
+            })}
+        };
+        const std::string cardId = tm.AddCard(triageCard);
+        Check(!cardId.empty(), "AddCard succeeded: " + cardId);
+
+        const std::string decideResp = tm.Decide(cardId, "redo", "rescued card failure", json::object(), "human");
+        json decideDoc = json::parse(decideResp, nullptr, false);
+        Check(decideDoc.value("ok", false), "triage redo decide succeeded: " + decideResp);
+        const std::string resMsg = decideDoc.value("result", "");
+        Check(resMsg.find("Created rescue direction ") != std::string::npos &&
+              resMsg.find(" (110-1-r1).") != std::string::npos,
+              "result uses direction terminology with rescue number: " + resMsg);
+
+        json origRec;
+        Check(h.tqm.DirectionGet(originalDirId, origRec), "got original direction");
+        const std::string supersededBy = origRec.value("supersededBy", "");
+        Check(!supersededBy.empty(), "original direction marked supersededBy: " + supersededBy);
+
+        json rescueRec;
+        Check(h.tqm.DirectionGet(supersededBy, rescueRec), "got rescue direction");
+        Check(rescueRec.contains("card") && rescueRec["card"].value("number", "") == "110-1-r1",
+              "rescue direction has card.number == 110-1-r1");
     }
 }
 

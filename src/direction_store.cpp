@@ -11,7 +11,12 @@ namespace pc {
 namespace {
 
 std::wstring RecordPathWide(const std::wstring& dir, const std::string& id) {
-    return PathJoinWide(dir, Utf8ToWide(id + ".json"));
+    // Implicit direction ids are "job:<jobId>"; ':' is not a legal Windows file name character.
+    std::string safe = id;
+    for (char& c : safe) {
+        if (c == ':') c = '_';
+    }
+    return PathJoinWide(dir, Utf8ToWide(safe + ".json"));
 }
 
 bool ParseAutoNumber(const std::string& id, long long& outN) {
@@ -43,11 +48,14 @@ void DirectionStore::Open(const std::wstring& dir) {
         if (!entry.is_regular_file(entryEc)) continue;
         const std::filesystem::path p = entry.path();
         if (p.extension() != ".json") continue;
-        const std::string id = p.stem().string();
-        nlohmann::json record = nlohmann::json::parse(ReadFileUtf8Wide(p.wstring()), nullptr, false);
+        const std::string raw = ReadFileUtf8Wide(p.wstring());
+        nlohmann::json record = nlohmann::json::parse(raw, nullptr, false);
         if (record.is_discarded() || !record.is_object()) continue;
         if (!record.contains("id") || !record["id"].is_string()) continue;
-        records_[id] = std::move(record);
+        // Key by the stored id, not the file stem: an implicit "job:<id>" direction is stored
+        // under a sanitized file name.
+        const std::string key = record["id"].get<std::string>();
+        records_[key] = std::move(record);
     }
 }
 
@@ -60,6 +68,21 @@ bool DirectionStore::ValidateId(const std::string& id, std::string& outError) {
     if (id.size() > kIdMaxLength) {
         outError = "direction id must be at most 64 characters";
         return false;
+    }
+    // 102-7: a legacy job without direction_id gets an implicit direction named "job:<jobId>".
+    if (id.rfind("job:", 0) == 0) {
+        if (id.size() == 4) {
+            outError = "direction id is required";
+            return false;
+        }
+        for (size_t i = 4; i < id.size(); ++i) {
+            const unsigned char u = static_cast<unsigned char>(id[i]);
+            if (!(std::isalnum(u) || id[i] == '_' || id[i] == '-')) {
+                outError = "direction id may contain only letters, digits, '_' and '-'";
+                return false;
+            }
+        }
+        return true;
     }
     if (id.compare(0, std::char_traits<char>::length(kIdPrefix), kIdPrefix) != 0) {
         outError = "direction id must start with 'dir_'";

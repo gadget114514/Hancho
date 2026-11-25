@@ -45,6 +45,9 @@ struct TaskDisplayRow {
     std::string cardNumber;
     std::vector<std::string> waitingFor;
     nlohmann::json jobJson;
+    std::string startTime;
+    std::string endTime;
+    std::string runningDetail;
 };
 
 struct TaskViewCounts {
@@ -204,6 +207,122 @@ inline bool CompareCardNumberNatural(const std::string& a, const std::string& b)
     return a.size() < b.size();
 }
 
+inline void InitializeTaskExpandedOverrides(
+    std::unordered_map<std::string, bool>& expandedOverrides,
+    const std::vector<nlohmann::json>& jobs,
+    const std::vector<nlohmann::json>& tasks,
+    const std::vector<nlohmann::json>& directions = {}) {
+    for (const auto& t : tasks) {
+        if (!t.is_object()) continue;
+        const std::string id = t.value("id", std::string());
+        if (id.empty()) continue;
+        if (expandedOverrides.find(id) == expandedOverrides.end()) {
+            expandedOverrides[id] = DefaultTaskExpanded(t.value("state", std::string()));
+        }
+    }
+    for (const auto& d : directions) {
+        if (!d.is_object()) continue;
+        const std::string did = d.value("id", std::string());
+        if (did.empty()) continue;
+        const std::string key = (did.rfind("direction:", 0) == 0) ? did : ("direction:" + did);
+        if (expandedOverrides.find(key) == expandedOverrides.end()) {
+            expandedOverrides[key] = DefaultTaskExpanded(d.value("state", std::string()));
+        }
+    }
+
+    std::unordered_map<std::string, std::string> supersedesMap;
+    std::unordered_map<std::string, std::string> explicitTaskMap;
+    for (const auto& j : jobs) {
+        if (!j.is_object()) continue;
+        const std::string jid = j.value("id", std::string());
+        const std::string sup = j.value("supersedes", std::string());
+        const std::string tid = j.value("task_id", std::string());
+        if (!jid.empty() && !sup.empty()) supersedesMap[jid] = sup;
+        if (!jid.empty() && !tid.empty()) explicitTaskMap[jid] = tid;
+    }
+
+    auto resolveEffTaskId = [&](const nlohmann::json& j) -> std::string {
+        const std::string jid = j.value("id", std::string());
+        const std::string tid = j.value("task_id", std::string());
+        if (!tid.empty()) return tid;
+        std::string cur = jid;
+        for (int step = 0; step < 256; ++step) {
+            auto eit = explicitTaskMap.find(cur);
+            if (eit != explicitTaskMap.end()) return eit->second;
+            auto sit = supersedesMap.find(cur);
+            if (sit == supersedesMap.end() || sit->second.empty() || sit->second == cur) break;
+            cur = sit->second;
+        }
+        if (j.contains("task") && j["task"].is_object()) {
+            const std::string embeddedTid = j["task"].value("id", std::string());
+            if (!embeddedTid.empty() && !IsVirtualTaskRowId(jid)) {
+                if (cur == jid) return embeddedTid;
+            }
+        }
+        const std::string dirId = j.value("direction_id", std::string());
+        if (!dirId.empty() && cur == jid) return dirId;
+        if (jid.rfind("direction:", 0) == 0 && cur == jid) return jid.substr(10);
+        return cur;
+    };
+
+    std::unordered_map<std::string, std::vector<nlohmann::json>> implicitTaskJobs;
+    std::unordered_map<std::string, std::string> implicitTaskState;
+    std::unordered_map<std::string, std::vector<nlohmann::json>> implicitDirJobs;
+    std::unordered_map<std::string, std::string> implicitDirState;
+
+    for (const auto& j : jobs) {
+        if (!j.is_object()) continue;
+        const std::string jid = j.value("id", std::string());
+
+        // Direction
+        std::string did = j.value("direction_id", std::string());
+        if (did.empty()) {
+            if (jid.rfind("direction:", 0) == 0) did = jid.substr(10);
+            else if (jid.rfind("group:", 0) == 0) did = jid;
+            else did = "job:" + jid;
+        }
+        if (!did.empty()) {
+            const std::string dirKey = (did.rfind("direction:", 0) == 0) ? did : ("direction:" + did);
+            if (expandedOverrides.find(dirKey) == expandedOverrides.end()) {
+                implicitDirJobs[dirKey].push_back(j);
+                const std::string st = j.value("state", std::string());
+                if (st == "running" || st == "failed" || st == "waitingForLlm" || st == "paused" || implicitDirState[dirKey].empty()) {
+                    implicitDirState[dirKey] = st;
+                }
+            }
+        }
+
+        // Task
+        const std::string effTid = resolveEffTaskId(j);
+        if (!effTid.empty() && expandedOverrides.find(effTid) == expandedOverrides.end()) {
+            implicitTaskJobs[effTid].push_back(j);
+            std::string st;
+            if (j.contains("task") && j["task"].is_object()) {
+                st = j["task"].value("state", std::string());
+            }
+            if (st.empty()) st = j.value("state", std::string());
+            if (st == "running" || st == "failed" || st == "waitingForLlm" || st == "paused" || implicitTaskState[effTid].empty()) {
+                implicitTaskState[effTid] = st;
+            }
+        }
+    }
+
+    for (const auto& kv : implicitDirJobs) {
+        if (expandedOverrides.find(kv.first) == expandedOverrides.end()) {
+            std::string st = implicitDirState[kv.first];
+            if (st.empty()) st = ComputeImplicitTaskState(kv.second);
+            expandedOverrides[kv.first] = DefaultTaskExpanded(st);
+        }
+    }
+    for (const auto& kv : implicitTaskJobs) {
+        if (expandedOverrides.find(kv.first) == expandedOverrides.end()) {
+            std::string st = implicitTaskState[kv.first];
+            if (st.empty()) st = ComputeImplicitTaskState(kv.second);
+            expandedOverrides[kv.first] = DefaultTaskExpanded(st);
+        }
+    }
+}
+
 inline std::vector<TaskDisplayRow> BuildTaskDisplayRows(
     const std::vector<nlohmann::json>& jobs,
     const std::vector<nlohmann::json>& tasks,
@@ -222,6 +341,7 @@ inline std::vector<TaskDisplayRow> BuildTaskDisplayRows(
         std::string state;
         std::string sortTs;
         bool hasRecord = false;
+        nlohmann::json taskRecord;
         std::vector<nlohmann::json> jobs;
         std::vector<nlohmann::json> directions;
     };
@@ -246,6 +366,7 @@ inline std::vector<TaskDisplayRow> BuildTaskDisplayRows(
         if (id.empty()) continue;
         TaskMeta& m = ensureTask(id);
         m.hasRecord = true;
+        m.taskRecord = t;
         m.title = t.value("title", std::string());
         m.state = t.value("state", std::string());
         m.sortTs = t.value("updatedAt", t.value("createdAt", std::string()));
@@ -407,9 +528,13 @@ inline std::vector<TaskDisplayRow> BuildTaskDisplayRows(
             std::string supersedes;
             std::string supersededBy;
             std::vector<std::string> waitingFor;
+            nlohmann::json dirRecord;
             nlohmann::json virtualJob;
             std::vector<nlohmann::json> realJobs;
             std::vector<std::string> realStates;
+            std::string startTime;
+            std::string endTime;
+            std::string runningDetail;
         };
         std::unordered_map<std::string, DirMeta> dirMap;
         std::vector<std::string> dirOrder;
@@ -429,6 +554,7 @@ inline std::vector<TaskDisplayRow> BuildTaskDisplayRows(
             const std::string did = dirRec.value("id", std::string());
             if (did.empty()) continue;
             DirMeta& d = ensureDir(did);
+            d.dirRecord = dirRec;
             const std::string k = dirRec.value("kind", std::string());
             if (!k.empty()) d.kind = k;
             const std::string t = dirRec.value("title", std::string());
@@ -501,6 +627,124 @@ inline std::vector<TaskDisplayRow> BuildTaskDisplayRows(
                            (d.kind == "jobs" && d.realJobs.size() >= 2) ||
                            (d.kind == "bt" && d.realJobs.size() >= 2);
             dirStatesChrono.push_back(d.state);
+
+            // Compute startTime for DirectionHeading:
+            std::string dirEarliestStart;
+            auto checkAttemptStart = [&](const nlohmann::json& jobObj) {
+                if (!jobObj.is_object() || !jobObj.contains("attempts") || !jobObj["attempts"].is_array()) return;
+                for (const auto& a : jobObj["attempts"]) {
+                    if (!a.is_object()) continue;
+                    const std::string st = a.value("start", std::string());
+                    if (!st.empty() && (dirEarliestStart.empty() || st < dirEarliestStart)) {
+                        dirEarliestStart = st;
+                    }
+                }
+            };
+            for (const auto& j : d.realJobs) {
+                checkAttemptStart(j);
+            }
+            checkAttemptStart(d.virtualJob);
+
+            if (dirEarliestStart.empty()) {
+                if (d.state == "planned") {
+                    std::string sAt;
+                    if (d.virtualJob.is_object()) {
+                        sAt = d.virtualJob.value("started_at", d.virtualJob.value("start_time", std::string()));
+                    }
+                    if (sAt.empty() && d.dirRecord.is_object()) {
+                        sAt = d.dirRecord.value("startedAt", d.dirRecord.value("started_at", std::string()));
+                    }
+                    dirEarliestStart = sAt;
+                } else {
+                    std::string sAt;
+                    if (d.virtualJob.is_object()) {
+                        sAt = d.virtualJob.value("started_at", d.virtualJob.value("start_time", std::string()));
+                    }
+                    if (sAt.empty() && d.dirRecord.is_object()) {
+                        sAt = d.dirRecord.value("startedAt", d.dirRecord.value("started_at", std::string()));
+                    }
+                    if (sAt.empty() && d.virtualJob.is_object()) {
+                        sAt = d.virtualJob.value("created_at", std::string());
+                    }
+                    if (sAt.empty() && d.dirRecord.is_object()) {
+                        sAt = d.dirRecord.value("createdAt", d.dirRecord.value("created_at", std::string()));
+                    }
+                    dirEarliestStart = sAt;
+                }
+            }
+            d.startTime = dirEarliestStart;
+
+            // Compute endTime for DirectionHeading:
+            const bool dirFinished = (d.state == "succeeded" || d.state == "failed" ||
+                                      d.state == "cancelled" || d.state == "closed");
+            if (dirFinished) {
+                std::string closedAt;
+                if (d.dirRecord.is_object() && d.dirRecord.contains("closed") && d.dirRecord["closed"].is_object()) {
+                    closedAt = d.dirRecord["closed"].value("at", std::string());
+                }
+                if (closedAt.empty() && d.virtualJob.is_object() && d.virtualJob.contains("closed") && d.virtualJob["closed"].is_object()) {
+                    closedAt = d.virtualJob["closed"].value("at", std::string());
+                }
+                if (!closedAt.empty()) {
+                    d.endTime = closedAt;
+                } else {
+                    std::string dirLatestEnd;
+                    auto checkJobEnd = [&](const nlohmann::json& jobObj) {
+                        if (!jobObj.is_object()) return;
+                        if (jobObj.contains("attempts") && jobObj["attempts"].is_array()) {
+                            for (const auto& a : jobObj["attempts"]) {
+                                if (!a.is_object()) continue;
+                                const std::string e = a.value("end", std::string());
+                                if (!e.empty() && (dirLatestEnd.empty() || e > dirLatestEnd)) {
+                                    dirLatestEnd = e;
+                                }
+                            }
+                        }
+                        const std::string up = jobObj.value("updated_at", jobObj.value("updatedAt", std::string()));
+                        if (!up.empty() && (dirLatestEnd.empty() || up > dirLatestEnd)) {
+                            dirLatestEnd = up;
+                        }
+                    };
+                    for (const auto& j : d.realJobs) {
+                        checkJobEnd(j);
+                    }
+                    checkJobEnd(d.virtualJob);
+                    if (dirLatestEnd.empty() && d.dirRecord.is_object()) {
+                        dirLatestEnd = d.dirRecord.value("updatedAt", d.dirRecord.value("updated_at", std::string()));
+                    }
+                    d.endTime = dirLatestEnd;
+                }
+            } else {
+                d.endTime = "";
+            }
+
+            // Compute runningDetail for DirectionHeading:
+            std::vector<std::string> activeJobDescs;
+            auto checkActiveJob = [&](const nlohmann::json& jobObj) {
+                if (!jobObj.is_object()) return;
+                const std::string st = jobObj.value("state", std::string());
+                if (st == "running" || st == "waitingForPermit" || st == "waitingForLlm") {
+                    std::string jid = jobObj.value("id", std::string());
+                    std::string sum = jobObj.value("summary", std::string());
+                    if (!sum.empty()) {
+                        activeJobDescs.push_back(jid + ": " + sum);
+                    } else if (!jid.empty()) {
+                        activeJobDescs.push_back(jid);
+                    }
+                }
+            };
+            for (const auto& j : d.realJobs) {
+                checkActiveJob(j);
+            }
+            if (activeJobDescs.empty()) {
+                checkActiveJob(d.virtualJob);
+            }
+            std::string dRunningDetail;
+            for (size_t ai = 0; ai < activeJobDescs.size(); ++ai) {
+                if (ai > 0) dRunningDetail += ", ";
+                dRunningDetail += activeJobDescs[ai];
+            }
+            d.runningDetail = dRunningDetail;
         }
 
         // Sort non-card directions chronologically by earliest real job or sortTs,
@@ -552,6 +796,89 @@ inline std::vector<TaskDisplayRow> BuildTaskDisplayRows(
             auto ovIt = expandedOverrides.find(id);
             if (ovIt != expandedOverrides.end()) taskExpanded = ovIt->second;
 
+            // Compute startTime for TaskHeading:
+            std::string taskEarliestStart;
+            for (const auto& did : dirOrder) {
+                const DirMeta& d = dirMap[did];
+                if (!d.startTime.empty() && (taskEarliestStart.empty() || d.startTime < taskEarliestStart)) {
+                    taskEarliestStart = d.startTime;
+                }
+            }
+            for (const auto& j : m.jobs) {
+                if (!j.is_object()) continue;
+                if (j.contains("attempts") && j["attempts"].is_array()) {
+                    for (const auto& a : j["attempts"]) {
+                        if (!a.is_object()) continue;
+                        const std::string st = a.value("start", std::string());
+                        if (!st.empty() && (taskEarliestStart.empty() || st < taskEarliestStart)) {
+                            taskEarliestStart = st;
+                        }
+                    }
+                }
+            }
+            if (taskEarliestStart.empty() && (m.state != "open" || !m.jobs.empty())) {
+                if (m.taskRecord.is_object()) {
+                    taskEarliestStart = m.taskRecord.value("createdAt", m.taskRecord.value("created_at", std::string()));
+                }
+            }
+
+            // Compute endTime for TaskHeading:
+            std::string taskLatestEnd;
+            const bool taskFinished = (m.state == "succeeded" || m.state == "failed" ||
+                                       m.state == "cancelled" || m.state == "closed");
+            if (taskFinished) {
+                for (const auto& did : dirOrder) {
+                    const DirMeta& d = dirMap[did];
+                    if (!d.endTime.empty() && (taskLatestEnd.empty() || d.endTime > taskLatestEnd)) {
+                        taskLatestEnd = d.endTime;
+                    }
+                }
+                for (const auto& j : m.jobs) {
+                    if (!j.is_object()) continue;
+                    if (j.contains("attempts") && j["attempts"].is_array()) {
+                        for (const auto& a : j["attempts"]) {
+                            if (!a.is_object()) continue;
+                            const std::string e = a.value("end", std::string());
+                            if (!e.empty() && (taskLatestEnd.empty() || e > taskLatestEnd)) {
+                                taskLatestEnd = e;
+                            }
+                        }
+                    }
+                    const std::string up = j.value("updated_at", j.value("updatedAt", std::string()));
+                    if (!up.empty() && (taskLatestEnd.empty() || up > taskLatestEnd)) {
+                        taskLatestEnd = up;
+                    }
+                }
+                std::string closedAt;
+                if (m.taskRecord.is_object() && m.taskRecord.contains("closed") && m.taskRecord["closed"].is_object()) {
+                    closedAt = m.taskRecord["closed"].value("at", std::string());
+                }
+                if (!closedAt.empty()) {
+                    if (taskLatestEnd.empty() || closedAt > taskLatestEnd) {
+                        taskLatestEnd = closedAt;
+                    }
+                }
+                if (taskLatestEnd.empty() && m.taskRecord.is_object()) {
+                    taskLatestEnd = m.taskRecord.value("updatedAt", m.taskRecord.value("updated_at", std::string()));
+                }
+            }
+
+            // Compute runningDetail for TaskHeading:
+            std::vector<std::string> activeDirDescs;
+            for (const auto& did : dirOrder) {
+                const DirMeta& d = dirMap[did];
+                if (d.state == "running" || d.state == "waitingForLlm" || d.state == "paused") {
+                    std::string label = d.cardNumber.empty() ? (d.id.rfind("job:", 0) == 0 ? d.id.substr(4) : d.id) : d.cardNumber;
+                    if (!d.title.empty()) label += ": " + d.title;
+                    activeDirDescs.push_back(label);
+                }
+            }
+            std::string tRunningDetail;
+            for (size_t di = 0; di < activeDirDescs.size(); ++di) {
+                if (di > 0) tRunningDetail += ", ";
+                tRunningDetail += activeDirDescs[di];
+            }
+
             TaskDisplayRow hdr;
             hdr.kind = TaskDisplayRowKind::TaskHeading;
             hdr.taskId = id;
@@ -562,6 +889,31 @@ inline std::vector<TaskDisplayRow> BuildTaskDisplayRows(
             hdr.taskState = m.state;
             hdr.resultsCompact = FormatTaskResultsCompact(dirStatesChrono);
             hdr.jobCount = totalRealJobs;
+            hdr.startTime = taskEarliestStart;
+            hdr.endTime = taskLatestEnd;
+            hdr.runningDetail = tRunningDetail;
+
+            if (m.taskRecord.is_object()) {
+                hdr.jobJson = m.taskRecord;
+            } else {
+                hdr.jobJson = nlohmann::json::object();
+            }
+            if (!hdr.jobJson.contains("origin")) {
+                nlohmann::json taskOrigin;
+                if (m.taskRecord.is_object() && m.taskRecord.contains("origin")) {
+                    taskOrigin = m.taskRecord["origin"];
+                } else {
+                    for (const auto& j : m.jobs) {
+                        if (j.is_object() && j.contains("origin")) {
+                            taskOrigin = j["origin"];
+                            break;
+                        }
+                    }
+                }
+                if (!taskOrigin.is_null() && !taskOrigin.empty()) {
+                    hdr.jobJson["origin"] = taskOrigin;
+                }
+            }
             out.push_back(std::move(hdr));
 
             if (!taskExpanded || (m.jobs.empty() && dirOrder.empty())) continue;
@@ -646,7 +998,35 @@ inline std::vector<TaskDisplayRow> BuildTaskDisplayRows(
             dhdr.isCard = d.isCard;
             dhdr.cardNumber = d.cardNumber;
             dhdr.waitingFor = d.waitingFor;
-            dhdr.jobJson = d.virtualJob;
+            dhdr.startTime = d.startTime;
+            dhdr.endTime = d.endTime;
+            dhdr.runningDetail = d.runningDetail;
+
+            if (d.virtualJob.is_object()) {
+                dhdr.jobJson = d.virtualJob;
+            } else if (d.dirRecord.is_object()) {
+                dhdr.jobJson = d.dirRecord;
+            } else {
+                dhdr.jobJson = nlohmann::json::object();
+            }
+            if (!dhdr.jobJson.contains("origin")) {
+                nlohmann::json dirOrigin;
+                if (d.virtualJob.is_object() && d.virtualJob.contains("origin")) {
+                    dirOrigin = d.virtualJob["origin"];
+                } else if (d.dirRecord.is_object() && d.dirRecord.contains("origin")) {
+                    dirOrigin = d.dirRecord["origin"];
+                } else {
+                    for (const auto& j : d.realJobs) {
+                        if (j.is_object() && j.contains("origin")) {
+                            dirOrigin = j["origin"];
+                            break;
+                        }
+                    }
+                }
+                if (!dirOrigin.is_null() && !dirOrigin.empty()) {
+                    dhdr.jobJson["origin"] = dirOrigin;
+                }
+            }
             out.push_back(std::move(dhdr));
 
             if (!dirExpanded || d.realJobs.empty()) continue;

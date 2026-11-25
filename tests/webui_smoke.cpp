@@ -214,6 +214,13 @@ int main() {
     Check(appJs.find("translate_get") != std::string::npos &&
               appJs.find("handleTranslateResponse") != std::string::npos,
           "embedded Web UI app.js requests and applies translate_get answers");
+    Check(appJs.find("'direction_show'") != std::string::npos &&
+              appJs.find("'direction_run'") != std::string::npos &&
+              appJs.find("'direction_redo'") != std::string::npos &&
+              appJs.find("'card_show'") == std::string::npos,
+          "embedded Web UI uses direction_* IPC actions, not card_*");
+    Check(appJs.find("'direction': '指示'") != std::string::npos,
+          "embedded Web UI labels direction as 指示 in Japanese");
 
     // Mock IPC handler simulating core
     auto mockIpcHandler = [](const std::string& reqJson) -> std::string {

@@ -69,7 +69,7 @@ hancho-cli.exe logs --id 1 --tail 80
 
 ```json
 {
-  "name": "run_worker",
+  "name": "run_agent",
   "arguments": {
     "cmd": "opencode run --format json --model <provider/model> \"Summarize the test failures\"",
     "name": "summarize-failures",
@@ -132,13 +132,13 @@ When registering a job you can also add `"suspendWhenDone": true` / `"shutdownWh
 | :--- | :--- |
 | One command only (build, test, install, dev server) | `start` / MCP `start_process` |
 | A one-character fix or a simple string replacement | `quickfix` (does not use an LLM) |
-| Split a large request into cards and advance them in order | `task create` → `card add` (or `card import`) → `card run --ready` |
+| Split a large request into cards and advance them in order | `task create` → `direction add` (or `direction import`) → `direction run --ready` |
 | Multiple steps with order and dependencies | `taskqueue add` + `taskqueue wait` |
 | The next step changes based on the previous result (branching, fix loops, if/else) | `bt start` + `bt wait` / `bt resume` |
 | The same routine work every time (build plus full smoke test, etc.) | `routine run <name>` (no need to rewrite the BT) |
 | Have an LLM create a routine from words / have an outdated routine fixed | `routine ask "..."` → `routine show` → `routine approve` (a proposal cannot run until approved) |
 | Temporarily stop execution (without fixing the cause) | `taskqueue pause-job <id>` / `taskqueue pause <name>` / `bt pause --id <id>` (resume with resume) |
-| Have a worker LLM do one task and get only the final result | MCP `run_worker` |
+| Have a worker LLM do one task and get only the final result | MCP `run_agent` |
 | An interactive TUI (opencode / claude without `run`) | `start --pty` |
 | Sleep / shut down the PC after a night batch | `power suspend` / `power shutdown --after-job <id>` |
 
@@ -156,7 +156,7 @@ When registering a job you can also add `"suspendWhenDone": true` / `"shutdownWh
 - **Keep the supervisor's context small.** Pass the detailed instructions to the worker, and read only the artifacts and the end of the log.
 - **Do not start a coding agent for a one-character fix.** Use `quickfix --file <path> --find <text> --replace <text>`. It is deterministic and finishes in seconds to tens of seconds.
 - **The supervisor does not write code itself.** The supervisor issues patches, replacements, or jobs. Application is done by `quickfix` or a worker job.
-- **Group work into tasks and cards.** For a large request: `task create` → add cards with `card add` (or `card import`) → `card run --ready` → after each finishes, the next `--ready`. Record decisions and reasons with `task note <id> --text "..."`, and do not pack cards into one BT (a failed card can be rescued with `card redo`). When finished, close with `task close <id> --result succeeded|failed --reason "..."`. Attach single jobs and BTs to a task with `--task <id>`, and for a redo with changed content use `taskqueue supersede <jobId> --reason "..."`.
+- **Group work into tasks and cards.** For a large request: `task create` → add cards with `direction add` (or `direction import`) → `direction run --ready` → after each finishes, the next `--ready`. Record decisions and reasons with `task note <id> --text "..."`, and do not pack cards into one BT (a failed card can be rescued with `direction redo`). When finished, close with `task close <id> --result succeeded|failed --reason "..."`. Attach single jobs and BTs to a task with `--task <id>`, and for a redo with changed content use `taskqueue supersede <jobId> --reason "..."`.
 - **Do not change the model / provider on your own.** To change `--model` with `taskqueue update`, `--approve-model-change --reason "..."` is required. The supervisor does not change it; it leaves the card waiting for a decision.
 - **Fix one data-dir.** For example, `<project>/.hancho`. Pass `--data-dir` every time, or embed it with `hancho-cli.exe mcp install --data-dir .hancho`.
 
@@ -176,14 +176,14 @@ A hang before the first normalized event is stopped early by the worker job's fi
 
 - Decide the success condition first ("`build/Release/app.exe` is updated", not "the build passes").
 - Be specific in instructions to a worker. Put long instructions in `instructionsFile` and pass only the file path in the job.
-- Read results with `taskqueue get` / the end of the log / `worker stream --summary`. Do not paste the full text into the supervisor.
+- Read results with `taskqueue get` / the end of the log / `agent stream --summary`. Do not paste the full text into the supervisor.
 - When something fails, fix the cause before `taskqueue retry`. Fixing a dependency automatically re-queues the blocked downstream jobs.
 - Leave the mechanical judgments in a BT (exit code, file existence, regex) to conditions. Only `escalate` wakes the supervisor.
 - Keep the `include` of `escalate` to a minimum (`logs`, `vars`, `files`, `lines`, `maxBytes`). Pass only what is needed for the decision.
 
 ## How to write a worker
 
-Hancho auto-detects `claude` / `opencode` / `codex` / `agy` and parses their JSON streams. In a BT `worker` node, specifying the engine name is enough (do not hand-write the command).
+Hancho auto-detects `claude` / `opencode` / `codex` / `agy` and parses their JSON streams. In a BT `agent` node, specifying the engine name is enough (do not hand-write the command).
 
 ```json
 { "type": "agent", "id": "fixer", "engine": "claude", "model": "sonnet",
@@ -193,7 +193,7 @@ Hancho auto-detects `claude` / `opencode` / `codex` / `agy` and parses their JSO
 
 - The launch command of a built-in engine can be overridden or added in `<data-dir>/engines.json` (example: `claude -p {prompt} --output-format stream-json --verbose --model {model} {permissionArgs}`).
 - Permission flags (such as `--dangerously-skip-permissions`) go in **`permissionArgs` in `engines.json`**. Do not put them in the node's `prompt`.
-- If you add `outputSchema`, Hancho validates the JSON the worker writes to `PC_BT_RESULT_FILE`, and fails the node if it is invalid. You can extract values with `${<worker>.output.<path>}`.
+- If you add `outputSchema`, Hancho validates the JSON the worker writes to `PC_BT_RESULT_FILE`, and fails the node if it is invalid. You can extract values with `${<agent>.output.<path>}`.
 - When running a worker CLI directly with `start`, do not forget `--close-stdin` (`opencode run` and similar wait for EOF and stop otherwise). For a TUI, use `--pty`.
 - For the stream, use `hancho-cli agent stream <id> --tail 50 --summary`; for probes, `agent probe`; for health, `agent health`; for state, `worker status <id>`.
 
@@ -239,25 +239,25 @@ hancho-cli.exe task close <taskId> --result succeeded --reason "..."
 - To re-run a failed job with the **same** content, use `taskqueue retry <id>`. To redo it with **changed** content, use `taskqueue supersede <id> --reason "..."` (MCP `taskqueue_supersede`).
 - When the work is done, record the result (`succeeded` / `failed`) and the reason with `task close`.
 
-### Task cards (splitting, running, and rescuing large requests)
+### Directions and task cards (指示; splitting, running, and rescuing large requests)
 
-Do not pack a large request into one BT. Register it as cards (`planned` directions) on a task, and run whichever cards have their dependencies met with `card run --ready`. Rescue a failed card with `card redo`.
+Do not pack a large request into one BT. Register it as cards (planned directions, shown as `指示` in the Japanese UI) on a task, and run whichever cards have their dependencies met with `direction run --ready`. Rescue a failed card with `direction redo`. There is no `card` command; every card operation is a `direction` subcommand.
 
 ```powershell
-hancho-cli.exe card add --task <taskId> --number 102-3 --title "Add card list" --body-file card.md --after 102-2
-hancho-cli.exe card list --task <taskId>
-hancho-cli.exe card show 102-3 --task <taskId>
-hancho-cli.exe card edit 102-3 --task <taskId> --body-file card_v2.md   # only while planned
-hancho-cli.exe card run --ready --task <taskId>                       # run cards whose dependencies are met (default --max 1)
-hancho-cli.exe card run 102-3 --task <taskId>                         # run only the specified card
-hancho-cli.exe card redo 102-3 --task <taskId> --reason "Fix test" --run
-hancho-cli.exe card remove 102-3 --task <taskId>                      # only while planned
+hancho-cli.exe direction add --task <taskId> --number 102-3 --title "Add card list" --body-file card.md --after 102-2
+hancho-cli.exe direction list --task <taskId>
+hancho-cli.exe direction show 102-3 --task <taskId>              # also accepts dir_<id>
+hancho-cli.exe direction edit 102-3 --task <taskId> --body-file card_v2.md   # only while planned
+hancho-cli.exe direction run --ready --task <taskId>             # run cards whose dependencies are met (default --max 1)
+hancho-cli.exe direction run 102-3 --task <taskId>               # run only the specified card
+hancho-cli.exe direction redo 102-3 --task <taskId> --reason "Fix test" --run
+hancho-cli.exe direction remove 102-3 --task <taskId>            # only while planned
 ```
 
 - A card is expanded into a BT (agent → build → test → fix loop on failure) by the `card` template (`hancho-cli.exe bt template card --json`). `build` / `test` / `engines` are filled in from `--params` or the task's `--card-defaults`.
-- MCP: `card_add` / `card_list` / `card_show` / `card_edit` / `card_remove` / `card_run` / `card_redo`.
-- Batch import / export of Markdown card files: `card import --task <taskId> --file doc/xxx-cards.md [--dry-run]`, `card export --task <taskId> [--file <md>] [--lang <en|ja|es>]`. `--dry-run` checks the file without writing.
-- `card translate --task <taskId> [--translate-cards <all|title|off>]` translates the non-English titles and bodies of the task's cards to English. `card import` takes the same `--translate-cards` option.
+- MCP: `direction_add` / `direction_show` / `direction_list` / `direction_edit` / `direction_remove` / `direction_run` / `direction_redo` / `direction_import` / `direction_export` / `direction_translate` (plus `direction_close` / `direction_reopen` / `direction_purge`). There are no `card_*` tools.
+- Batch import / export of Markdown card files: `direction import --task <taskId> --file doc/xxx-cards.md [--dry-run]`, `direction export --task <taskId> [--file <md>] [--lang <en|ja|es>]`. `--dry-run` checks the file without writing.
+- `direction translate --task <taskId> [--translate-cards <all|title|off>]` translates the non-English titles and bodies of the task's cards to English. `direction import` takes the same `--translate-cards` option.
 
 ### Translation (stored in English, shown in your language)
 
@@ -331,36 +331,36 @@ Example: test → on failure, fix → rebuild → re-test:
 ```json
 { "id": "test-fix-retest", "cwd": "D:/repo",
   "root": { "type": "fallback", "children": [
-    { "type": "job", "id": "initial_test", "command": "ctest --test-dir build --output-on-failure",
+    { "type": "exec", "id": "initial_test", "command": "ctest --test-dir build --output-on-failure",
       "summary": "Run tests", "timeoutSec": 300 },
     { "type": "sequence", "children": [
-      { "type": "worker", "id": "fix", "engine": "claude",
+      { "type": "agent", "id": "fix", "engine": "claude",
         "prompt": "Tests failed (exit ${initial_test.exitCode}, log ${initial_test.logFile}). Fix the bug without changing test expectations.",
         "summary": "Fix failing tests", "timeoutSec": 900 },
-      { "type": "job", "id": "rebuild", "command": "cmake --build build --config Release",
+      { "type": "exec", "id": "rebuild", "command": "cmake --build build --config Release",
         "summary": "Rebuild after fix", "timeoutSec": 600 },
-      { "type": "job", "id": "retest", "command": "ctest --test-dir build --output-on-failure",
+      { "type": "exec", "id": "retest", "command": "ctest --test-dir build --output-on-failure",
         "summary": "Re-run tests", "timeoutSec": 300 }
     ]}
   ]}
 }
 ```
 
-Nodes: `job` / `worker` / `probe` / `wait` / `set` / `escalate` / `fail` / `succeed`. Composites: `sequence` / `fallback` / `parallel` / `if` / **`catch`** / **`foreach`** (expands `do` for each file matching a glob, with `exclude` support). Decorators: `retry` / `repeat` / `invert` / `forceSuccess` / `forceFailure` / `timeout`. Conditions: `fileExists` / `fileNewer` / `outputMatches` / `exitCode` / **`failure`** / `jsonValue` / `var` / `nodeState`. Variables: `${name}`, `${<node>.state|exitCode|logFile|jobId|runs}`, `${<worker>.result}`, `${<escalate>.answer}`, and the failure diagnostics `${<node>.failureClass|failureSummary|likelyCauses|suggestedAction|retryAt|engine|model}`. For details see `doc/obsoleted/behavior-tree.md` / `doc/obsoleted/behavior-tree-ja.md`.
+Nodes: `exec` / `agent` / `probe` / `wait` / `set` / `escalate` / `fail` / `succeed`. Composites: `sequence` / `fallback` / `parallel` / `if` / **`catch`** / **`foreach`** (expands `do` for each file matching a glob, with `exclude` support). Decorators: `retry` / `repeat` / `invert` / `forceSuccess` / `forceFailure` / `timeout`. Conditions: `fileExists` / `fileNewer` / `outputMatches` / `exitCode` / **`failure`** / `jsonValue` / `var` / `nodeState`. Variables: `${name}`, `${<node>.state|exitCode|logFile|jobId|runs}`, `${<agent>.result}`, `${<escalate>.answer}`, and the failure diagnostics `${<node>.failureClass|failureSummary|likelyCauses|suggestedAction|retryAt|engine|model}`. For details see `doc/obsoleted/behavior-tree.md` / `doc/obsoleted/behavior-tree-ja.md`.
 
 #### Build in hang guards from the start when writing a BT
 
 Do not notice a hang only after it happens; build monitoring, fallback, and escalation into the BT when you write it. Steps:
 
-1. **Start from `bt template resilient-worker`** (for a ww card sequence, `card-sequence`). Replace the `<...>` placeholders with real values. The template already includes `defaults.worker.idle` / `probe: true` / `engines` + `switchEngineOn` / `catch` / `escalate`. You can get the actual template with `hancho-cli.exe bt template resilient-worker --json`.
+1. **Start from `bt template resilient-agent`** (for a ww card sequence, `card-sequence`). Replace the `<...>` placeholders with real values. The template already includes `defaults.agent.idle` / `probe: true` / `engines` + `switchEngineOn` / `catch` / `escalate`. You can get the actual template with `hancho-cli.exe bt template resilient-agent --json`.
 2. **Make `bt validate --strict` report zero warnings.** The `warnings[]` of `bt validate` still passes validation as is, so promote them to errors with `--strict` (MCP `bt_validate` with `strict: true`), then fix them. The main warnings are `no_hang_watch` / `opencode_without_model` / `unguarded_worker` / `engines_without_switch` / `switch_without_engines` / `engine_not_permitted` / `unswitchable_command` / `escalate_without_takeover` / `permit_not_approved` / `fix_class_without_blame` / `blame_before_worker`.
-   - **Build in the switch on fix failure from the start**: put `{"class":"fix_no_progress","after":1}`, `{"class":"fix_failed","after":2}`, and `{"class":"root_cause_not_found","after":1}` in `switchEngineOn`, and add `"blame": "<worker id>"` to the test `job` (if `fix_*` exists without `blame`, you get the `fix_class_without_blame` warning).
-   - Give the worker `switchLimits` (default `maxCandidates: 3`, `stopOnSameSymptom: true`) to cap switching, and in the prompt instruct it to answer `HANCHO-RESULT: root_cause_not_found` and to write a `handoff` to `PC_BT_RESULT_FILE` when the cause is unknown.
-3. **Choose candidates from the approved list.** Worker candidates must come from `llm list --list worker`, and the escalate proxy answer (`fallback`) must come from `llm list --list consult`. If something is missing, propose it with `llm add --list <l> --engine <e> --model <m> --reason "..."`, get the user's approval before using it (either approve on the LLM page of the dashboard, or confirm in chat and record with `llm approve --list <l> --engine <e> --model <m> --user-said "<the user's words>"`). MCP: `llm_list` / `llm_add` / `llm_remove` / `llm_set_enabled` / `llm_approve`.
-4. **Check in advance if needed.** `worker probe` (one line, `hancho-cli.exe worker probe --engine <e> --model <m> --json`; MCP `worker_probe`) runs a minimal prompt that returns one line. Check the shared failure state with `worker health` (MCP `worker_health`). This lets you exclude a broken engine before the real launch.
+   - **Build in the switch on fix failure from the start**: put `{"class":"fix_no_progress","after":1}`, `{"class":"fix_failed","after":2}`, and `{"class":"root_cause_not_found","after":1}` in `switchEngineOn`, and add `"blame": "<agent id>"` to the test `exec` node (if `fix_*` exists without `blame`, you get the `fix_class_without_blame` warning).
+   - Give the agent `switchLimits` (default `maxCandidates: 3`, `stopOnSameSymptom: true`) to cap switching, and in the prompt instruct it to answer `HANCHO-RESULT: root_cause_not_found` and to write a `handoff` to `PC_BT_RESULT_FILE` when the cause is unknown.
+3. **Choose candidates from the approved list.** Agent candidates must come from `llm list --list agent`, and the escalate proxy answer (`fallback`) must come from `llm list --list consult`. If something is missing, propose it with `llm add --list <l> --engine <e> --model <m> --reason "..."`, get the user's approval before using it (either approve on the LLM page of the dashboard, or confirm in chat and record with `llm approve --list <l> --engine <e> --model <m> --user-said "<the user's words>"`). MCP: `llm_list` / `llm_add` / `llm_remove` / `llm_set_enabled` / `llm_approve`.
+4. **Check in advance if needed.** `agent probe` (one line, `hancho-cli.exe agent probe --engine <e> --model <m> --json`; MCP `agent_probe`) runs a minimal prompt that returns one line. Check the shared failure state with `agent health` (MCP `agent_health`). This lets you exclude a broken engine before the real launch.
 5. Then monitor with `bt start` → `bt wait --id <btid> --timeout-ms 600000` → `bt get --id <btid> --compact`.
 
-For details on the `engines` / `switchEngineOn` of worker nodes, the `probe` leaf, the `{engine}` / `{model}` placeholders, and permission declarations with `needs`, see sections 5.3 / 5.4 and chapter 11 of `doc/obsoleted/behavior-tree.md`.
+For details on the `engines` / `switchEngineOn` of agent nodes, the `probe` leaf, the `{engine}` / `{model}` placeholders, and permission declarations with `needs`, see sections 5.3 / 5.4 and chapter 11 of `doc/obsoleted/behavior-tree.md`.
 
 ### Routines (named BTs)
 
@@ -382,7 +382,7 @@ hancho-cli.exe routine save --name from-past --from-bt <btId>
 
 A definition lives at `<cwd>/.hancho/routines/<name>.json` (project) or `<data-dir>/routines/<name>.json` (data). Each run gets an ID `<name>-<yyyymmdd-hhmmss>`, so job IDs do not collide. MCP: `routine_list` / `routine_show` / `routine_run` / `routine_save` / `routine_check` / `routine_ask` / `routine_approve` / `routine_reject`. A change to an input file makes a routine `stale`, but execution does not stop; if it fails, a triage card `routine_stale_failure` (recommending `update_routine`) appears. Choosing `update_routine` starts `routine ask` (the fix), and the result is a proposal waiting for approval.
 
-A `routine ask` request is registered as a worker job in the `routine-ask` queue, and runs on the `worker` LLM list (in rank order; failing ones are skipped; if empty, the default engine is used with a warning). The worker's output is checked by strict BT validation, a `foreach` dry run, and ChainGuard, and if it fails, it is asked to fix it once. An accepted definition is saved as `<dir>/.proposals/<name>.json` with `status: proposed`, and while an update is pending, `run` still uses the approved older version. A manual `routine save` (CLI / dashboard) is approved; the MCP `routine_save` becomes a proposal. For details see `doc/obsoleted/routines.md` / `doc/obsoleted/routines-ja.md`.
+A `routine ask` request is registered as a worker job in the `routine-ask` queue, and runs on the `agent` LLM list (in rank order; failing ones are skipped; if empty, the default engine is used with a warning). The worker's output is checked by strict BT validation, a `foreach` dry run, and ChainGuard, and if it fails, it is asked to fix it once. An accepted definition is saved as `<dir>/.proposals/<name>.json` with `status: proposed`, and while an update is pending, `run` still uses the approved older version. A manual `routine save` (CLI / dashboard) is approved; the MCP `routine_save` becomes a proposal. For details see `doc/obsoleted/routines.md` / `doc/obsoleted/routines-ja.md`.
 
 ### `escalate` (the only place the supervisor is called)
 
@@ -480,7 +480,7 @@ The data-dir is chosen in this order: `--data-dir` → environment variable `HAN
 - In a `.mcp.json` that goes into git, keep the relative path `.hancho` (so it works wherever it is cloned). A relative path is resolved from the server's start folder (usually the project root), so start the agent from the root. Absolute paths do not go into git; use them only in the local scope, which is not committed. Do not commit `.hancho/` to git (to keep only `routines/`, use `.hancho/*` and `!.hancho/routines/`). After changing the registration, reopen the session.
 - Different data-dirs mean different Hancho instances (separate queues, BTs, history, and dashboards). Do not switch while a BT or job is running. The data-dir in use is shown in the dashboard title (`Hancho - <data-dir>`).
 
-Main tools: `start_process`, `list_processes`, `get_process_output`, `wait_process`, `send_process_input`, `kill_process`, `task_*`, `card_*`, `direction_*`, `taskqueue_*`, `bt_*`, `run_agent` / `wait_agent` (aliases: `run_worker` / `wait_worker`), `triage_list/get/decide`, `power_suspend/shutdown/cancel/status`, `memory_*`, `usage_*`, `chat_*`.
+Main tools: `start_process`, `list_processes`, `get_process_output`, `wait_process`, `send_process_input`, `kill_process`, `task_*`, `direction_*`, `taskqueue_*`, `bt_*`, `run_agent` / `wait_agent` (aliases: `run_worker` / `wait_worker`), `triage_list/get/decide`, `power_suspend/shutdown/cancel/status`, `memory_*`, `usage_*`, `chat_*`.
 
 ## Common mistakes
 

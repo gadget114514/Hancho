@@ -32,6 +32,7 @@ static int g_failures = 0;
 
 static void Check(bool cond, const std::string& label) {
     std::printf("%s %s\n", cond ? "[PASS]" : "[FAIL]", label.c_str());
+    std::fflush(stdout);
     if (!cond) g_failures++;
 }
 
@@ -481,14 +482,14 @@ static void TestCardMarkdownTranslation() {
               jaMd.find("## 201-1: ビルドを直す") != std::string::npos,
           "106-5: card export --lang ja writes the translation");
 
-    // card translate: a stored Japanese title is translated and written back with card_edit.
+    // direction translate: a stored Japanese title is translated and written back with card_edit.
     FakeCardCore tr;
     tr.cards = nlohmann::json::parse(
         R"([{"number":"201-1","title":"ビルドを直す","directionId":"d1","state":"planned"}])");
     const CardTranslateResult res = TranslateCardsInTask("t1", "", "en", tr.Send());
     Check(res.ok && res.updated == 1, "106-5: card translate updates one stored card");
     Check(FindCardRequest(tr, "card_edit").value("title", std::string()) == "Fix the build",
-          "106-5: card translate writes the English title with card_edit");
+          "106-5: direction translate writes the English title with card_edit");
 }
 
 int main() {
@@ -4185,6 +4186,9 @@ int main() {
             std::unordered_map<std::string, bool> fOv;
             std::unordered_set<std::string> fAll;
             auto fRows = BuildTaskDisplayRows(fJobs, fTasks, /*taskViewMode=*/false, fOv, fAll, fCounts, 8);
+            Check(fCounts.totalTasks == 6 && fCounts.succeededTasks == 5 && fCounts.runningTasks == 1 &&
+                      fCounts.totalJobs == 6,
+                  "102-6: TaskViewCounts reflect the whole task/job tables, not the display slice");
 
             auto limited = FilterTaskDisplayRows(fRows, /*visibleFinishedCount=*/2, /*query=*/"");
             Check(limited.totalFinished == 5 && limited.shownFinished == 2 && limited.hasMore,
@@ -5042,6 +5046,98 @@ int main() {
         }
     }
 
+    // Card 110-3: TaskHeading & DirectionHeading startTime, endTime, runningDetail, origin.
+    {
+        const std::vector<nlohmann::json> t110Tasks = {
+            {{"id", "task_110"}, {"title", "Heading Time Task"}, {"state", "running"},
+             {"createdAt", "2026-11-25 09:00:00"}, {"origin", {{"client", "cli_test"}, {"session", "sess110"}}}}
+        };
+        const std::vector<nlohmann::json> t110Dirs = {
+            {{"id", "dir_done"}, {"taskId", "task_110"}, {"kind", "card"}, {"state", "succeeded"},
+             {"card", {{"number", "110-1"}, {"title", "First Card"}}},
+             {"origin", {{"client", "cli_test"}, {"session", "sess110"}}},
+             {"closed", {{"at", "2026-11-25 09:15:00"}}}},
+            {{"id", "dir_run"}, {"taskId", "task_110"}, {"kind", "card"}, {"state", "running"},
+             {"card", {{"number", "110-2"}, {"title", "Second Card"}}}},
+            {{"id", "dir_plan"}, {"taskId", "task_110"}, {"kind", "card"}, {"state", "planned"},
+             {"card", {{"number", "110-3"}, {"title", "Third Card"}}}}
+        };
+        const std::vector<nlohmann::json> t110Jobs = {
+            {{"id", "j_110_1"}, {"task_id", "task_110"}, {"direction_id", "dir_done"}, {"state", "succeeded"},
+             {"summary", "Done job"},
+             {"attempts", {{{"n", 1}, {"start", "2026-11-25 09:05:00"}, {"end", "2026-11-25 09:10:00"}}}}},
+            {{"id", "j_110_2"}, {"task_id", "task_110"}, {"direction_id", "dir_run"}, {"state", "running"},
+             {"summary", "Running job"},
+             {"attempts", {{{"n", 1}, {"start", "2026-11-25 09:12:00"}}}}}
+        };
+        std::unordered_map<std::string, bool> tOv;
+        std::unordered_set<std::string> tAll;
+        TaskViewCounts tCounts;
+        auto tRows = BuildTaskDisplayRows(t110Jobs, t110Tasks, true, tOv, tAll, tCounts, 8, t110Dirs);
+        const TaskDisplayRow* rTask = nullptr;
+        const TaskDisplayRow* rDone = nullptr;
+        const TaskDisplayRow* rRun = nullptr;
+        const TaskDisplayRow* rPlan = nullptr;
+        for (const auto& r : tRows) {
+            if (r.kind == TaskDisplayRowKind::TaskHeading && r.taskId == "task_110") rTask = &r;
+            if (r.kind == TaskDisplayRowKind::DirectionHeading && r.directionId == "dir_done") rDone = &r;
+            if (r.kind == TaskDisplayRowKind::DirectionHeading && r.directionId == "dir_run") rRun = &r;
+            if (r.kind == TaskDisplayRowKind::DirectionHeading && r.directionId == "dir_plan") rPlan = &r;
+        }
+        Check(rTask != nullptr, "110-3: task row found");
+        if (rTask) {
+            Check(rTask->startTime == "2026-11-25 09:05:00", "110-3: TaskHeading startTime is earliest across jobs");
+            Check(rTask->endTime.empty(), "110-3: running TaskHeading endTime is empty");
+            Check(rTask->runningDetail.find("110-2") != std::string::npos, "110-3: TaskHeading runningDetail includes running card 110-2");
+            Check(rTask->jobJson.is_object() && rTask->jobJson.contains("origin"), "110-3: TaskHeading jobJson has origin");
+        }
+        Check(rDone != nullptr, "110-3: dir_done row found");
+        if (rDone) {
+            Check(rDone->startTime == "2026-11-25 09:05:00", "110-3: dir_done startTime is attempt start");
+            Check(rDone->endTime == "2026-11-25 09:15:00", "110-3: dir_done endTime uses closed.at");
+            Check(rDone->runningDetail.empty(), "110-3: dir_done runningDetail is empty");
+            Check(rDone->jobJson.is_object() && rDone->jobJson.contains("origin"), "110-3: dir_done jobJson has origin");
+        }
+        Check(rRun != nullptr, "110-3: dir_run row found");
+        if (rRun) {
+            Check(rRun->startTime == "2026-11-25 09:12:00", "110-3: dir_run startTime is attempt start");
+            Check(rRun->endTime.empty(), "110-3: running dir_run endTime is empty");
+            Check(rRun->runningDetail == "j_110_2: Running job", "110-3: dir_run runningDetail has job.id + summary");
+        }
+        Check(rPlan != nullptr, "110-3: dir_plan row found");
+        if (rPlan) {
+            Check(rPlan->startTime.empty(), "110-3: planned dir_plan startTime is empty (-)");
+            Check(rPlan->endTime.empty(), "110-3: planned dir_plan endTime is empty");
+            Check(rPlan->runningDetail.empty(), "110-3: planned dir_plan runningDetail is empty");
+        }
+
+        // Test finished task end time
+        {
+            std::vector<nlohmann::json> doneTasks = {
+                {{"id", "task_done"}, {"title", "Done Task"}, {"state", "succeeded"},
+                 {"createdAt", "2026-11-25 09:00:00"}, {"updatedAt", "2026-11-25 09:20:00"}}
+            };
+            std::vector<nlohmann::json> doneDirs = {
+                {{"id", "dir_d1"}, {"taskId", "task_done"}, {"kind", "card"}, {"state", "succeeded"},
+                 {"card", {{"number", "110-9"}, {"title", "Single Card"}}}}
+            };
+            std::vector<nlohmann::json> doneJobs = {
+                {{"id", "j_done"}, {"task_id", "task_done"}, {"direction_id", "dir_d1"}, {"state", "succeeded"},
+                 {"attempts", {{{"n", 1}, {"start", "2026-11-25 09:01:00"}, {"end", "2026-11-25 09:08:00"}}}}}
+            };
+            auto doneRows = BuildTaskDisplayRows(doneJobs, doneTasks, true, tOv, tAll, tCounts, 8, doneDirs);
+            const TaskDisplayRow* dTask = nullptr;
+            for (const auto& r : doneRows) {
+                if (r.kind == TaskDisplayRowKind::TaskHeading && r.taskId == "task_done") dTask = &r;
+            }
+            Check(dTask != nullptr, "110-3: done task row found");
+            if (dTask) {
+                Check(dTask->startTime == "2026-11-25 09:01:00", "110-3: done task startTime matches attempt");
+                Check(dTask->endTime == "2026-11-25 09:08:00" || dTask->endTime == "2026-11-25 09:20:00", "110-3: done task endTime is populated");
+            }
+        }
+    }
+
     // Card 105-3 & 105-5: TaskQueueRunJUnitXml output, BT outcome, direction scoping.
     {
         nlohmann::json j1 = {
@@ -5607,6 +5703,71 @@ int main() {
         Check(titleResp.find("title is not English") != std::string::npos &&
               titleResp.find("summary is not English") == std::string::npos,
               "106-1: a Japanese title is reported and an English summary is not");
+    }
+
+    // --- 102-7: legacy implicit directions, task state and bulk migration ---
+    {
+        const std::wstring legacyDir = dir + L"\\legacy_102_7";
+        std::filesystem::remove_all(legacyDir);
+        std::filesystem::create_directories(legacyDir);
+        SetDataDirectoryOverride(legacyDir);
+        // Pre-0.10 queue files have no direction_id; each failed job becomes an implicit direction.
+        WriteFileAtomicWide(TaskQueueManager::GetTaskQueueFileWide("legacy1027"),
+            R"({"name":"legacy1027","concurrency":1,"jobs":[
+              {"id":"legacy-old","summary":"old failure","command":"cmd /c exit 1","state":"failed",
+               "timeout_sec":30,"max_attempts":1,"updated_at":"2026-01-01 10:00:00",
+               "attempts":[{"n":1,"start":"2026-01-01 09:59:00","end":"2026-01-01 10:00:00","exit_code":1}]},
+              {"id":"legacy-new","summary":"new failure","command":"cmd /c exit 1","state":"failed",
+               "timeout_sec":30,"max_attempts":1,"updated_at":"2026-11-01 10:00:00",
+               "attempts":[{"n":1,"start":"2026-11-01 09:59:00","end":"2026-11-01 10:00:00","exit_code":1}]}
+            ]})");
+        auto parse = [](const std::string& s) { return nlohmann::json::parse(s, nullptr, false); };
+        TaskQueueManager tm;
+        std::string err;
+
+        Check(tm.DirectionState("job:legacy-old").value("state", std::string()) == "failed" &&
+              tm.TaskState("legacy-old").value("state", std::string()) == "failed",
+              "102-7: a legacy failed job is a failed implicit direction and task");
+
+        const nlohmann::json bulk = parse(tm.DirectionCloseMany(
+            "failed", "2026-06-01 00:00:00", "migrate old failures", err));
+        Check(bulk.value("ok", false) && bulk.value("closed", int64_t(-1)) == 1 &&
+              bulk["ids"].is_array() && bulk["ids"][0] == "job:legacy-old",
+              "102-7: bulk close honours state and before and closes only the old failure");
+        Check(tm.DirectionState("job:legacy-old").value("state", std::string()) == "closed" &&
+              tm.TaskState("legacy-old").value("state", std::string()) == "succeeded" &&
+              tm.TaskState("legacy-old").value("closedDirections", 0) == 1,
+              "102-7: a closed implicit direction finishes its task without failing it");
+        Check(tm.DirectionState("job:legacy-new").value("state", std::string()) == "failed" &&
+              tm.TaskState("legacy-new").value("state", std::string()) == "failed",
+              "102-7: a newer failed direction is left for a decision");
+
+        const nlohmann::json decision = {{"candidateId", "ignore"}, {"result", "Closed direction."},
+                                         {"reason", "reviewed by hand"}, {"by", "human"}};
+        const nlohmann::json one = parse(tm.DirectionClose("job:legacy-new", "ignored",
+                                                           "reviewed by hand", err, decision));
+        nlohmann::json record;
+        Check(one.value("ok", false) && tm.DirectionGet("job:legacy-new", record) &&
+              record["closed"].value("result", std::string()) == "ignored" &&
+              record["closed"].value("reason", std::string()) == "reviewed by hand" &&
+              record["closed"]["decision"].value("candidateId", std::string()) == "ignore",
+              "102-7: closing a direction stores the decision result and reason");
+        Check(tm.TaskState("legacy-new").value("state", std::string()) == "succeeded",
+              "102-7: closing the last failing direction finishes the task");
+        const nlohmann::json again = parse(tm.DirectionCloseMany(
+            "failed", "", "migrate remaining failures", err));
+        Check(again.value("closed", int64_t(-1)) == 0,
+              "102-7: bulk close skips directions that are already decided and closed");
+
+        const nlohmann::json delta = parse(tm.TaskQueueChanges(0, false, err));
+        bool closedInChanges = false;
+        for (const auto& d : delta.value("directions", nlohmann::json::array())) {
+            if (d.value("id", std::string()) == "job:legacy-old" &&
+                d.value("state", std::string()) == "closed") closedInChanges = true;
+        }
+        Check(closedInChanges,
+              "102-7/102-8: a closed direction is reported by taskqueue_changes");
+        SetDataDirectoryOverride(dir);
     }
 
     TestCardMarkdown();

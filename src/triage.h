@@ -13,6 +13,9 @@ struct TriageInputs {
     nlohmann::json btStates;
     nlohmann::json config;
     std::string now;
+    // 102-10: direction records (id, kind, btId, taskId, title, closed, supersededBy, triage).
+    // May be empty: directions are then inferred from the jobs' directionId.
+    nlohmann::json directions;
 };
 
 nlohmann::json BuildTriageCandidates(const TriageInputs& in);
@@ -56,7 +59,8 @@ bool ParseTriageAdvice(const std::string& resultJson,
 //          "branch": {"total", "succeeded", "running", "failed", "blocked", "cancelled",
 //                     "jobs": [{"id","state","key"}], "done"},   (jobs that depend on this one)
 //          "bt": {"id", "state"},                              (the tree the job or node belongs to)
-//          "complete": true when the job and every branch reached a final state}
+//          "direction": {"id", "kind", "state"},               (the direction a direction_failure card tracks)
+//          "complete": true when the job / direction and every branch reached a final state}
 // or null when there is nothing to follow (still pending and untouched, ignored, no target).
 nlohmann::json TriageOutcome(const nlohmann::json& card, const nlohmann::json& jobs,
                              const nlohmann::json& btStates);

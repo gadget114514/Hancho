@@ -594,6 +594,12 @@ constexpr int kHeaderKpiRow1Bottom = 30;
 constexpr int kHeaderKpiRow2Top    = 34;
 constexpr int kHeaderKpiBottom     = 58;
 constexpr int kToolbarTop          = 64;
+// KPI rows are packed from the top with a fixed pitch. Hiding a row collapses
+// the strip so the toolbar and lists move up instead of leaving an empty band.
+constexpr int kKpiRowH             = kHeaderKpiRow1Bottom - kHeaderKpiTop;
+constexpr int kKpiRowGap           = kHeaderKpiRow2Top - kHeaderKpiRow1Bottom;
+constexpr int kKpiRowPitch         = kHeaderKpiRow2Top - kHeaderKpiTop;
+constexpr int kKpiToToolbarGap     = kToolbarTop - kHeaderKpiBottom;
 constexpr int kToolbarH            = 24;
 constexpr int kListTop             = 106;
 constexpr int kSplitterH           = 6;
@@ -642,7 +648,7 @@ static int ListFontSizeIndex(int px) {
     return idx;
 }
 constexpr int kMinTerminalH        = 200;
-constexpr int kNumKpiCards         = 16;
+constexpr int kNumKpiCards         = 24;  // 8 columns x 3 rows: processes, tasks, jobs
 constexpr int kUsagePanelH         = 170;
 constexpr int kMinStreamPaneH      = 160;
 constexpr int64_t kLongStepMs      = 30000;
@@ -678,10 +684,11 @@ enum ControlId {
     IDC_EDIT_SEARCH_TASK = 1050,
     IDC_BTN_IPMSG = 1051,
     IDC_BTN_TERM_SESSIONS = 1052,  // active WCSP terminal connections
-    IDC_BTN_REEVAL_PLANNED = 1053,
+    IDC_BTN_COLLAPSE_ALL_TASKS = 1053,
     IDC_SAVE_SNAPSHOT = 1054,  // Ctrl+Shift+S / tray menu: save a PNG of the dashboard window
     IDC_COMBO_TASK_ORIGIN = 1055,  // origin filter for the task list (shown with the task search bar)
     IDC_BTN_TASK_VIEW_MODE = 1056, // toggle between Task view (2-level) and Job view (flat)
+    IDC_BTN_ROUTINES = 1057,
     IDC_SET_LANG_JA = 6001,
     IDC_SET_LANG_EN = 6002,
     IDC_SET_LANG_ES = 6003,
@@ -778,6 +785,9 @@ enum ControlId {
     IDC_SET_PERMIT_REFRESH = 6120,
     IDC_SET_PERMIT_DRAFT_TEXT = 6121,  // outside the REQUEST..REFRESH range on purpose
     IDC_SET_PERMIT_DRAFT = 6122,
+    IDC_SET_SHOW_PROCESS_KPI = 6126,
+    IDC_SET_SHOW_TASK_KPI = 6127,
+    IDC_SET_SHOW_JOB_KPI = 6128,
     IDC_SET_TERM_LOCAL = 6071,
     IDC_SET_TERM_REMOTE = 6072,
     IDC_SET_TERM_TOKEN = 6076,
@@ -929,6 +939,8 @@ struct DashboardState {
     HWND hwndBtnToggleTerm = nullptr;
     HWND hwndBtnTermSessions = nullptr;
     HWND hwndTermSessionsDlg = nullptr;
+    HWND hwndBtnRoutines = nullptr;
+    HWND hwndRoutinesDlg = nullptr;
     bool notifyTerminalSessions = true;
     bool termSessionNotifyInitialized = false;
     std::map<uint32_t, std::wstring> knownTermSessions;
@@ -1020,6 +1032,7 @@ struct DashboardState {
     POINT pendingSplitterPt = {};           // latest mouse coords buffered during drag
     int lastToolbarWidth = -1;
     int lastToolbarUsageOffset = -1;
+    int lastToolbarKpiRows = -1;
     int lastTotalListHeight = 0;
     std::vector<std::string> taskJobIds;
     std::vector<std::string> taskJobStates;
@@ -1067,7 +1080,7 @@ struct DashboardState {
     HWND hwndBtnStreamPane = nullptr;
     HWND hwndBtnBtView = nullptr;
     HWND hwndBtnRefresh = nullptr;
-    HWND hwndBtnReevalPlanned = nullptr;
+    HWND hwndBtnCollapseAllTasks = nullptr;
     // Inline search bars in the process / task list captions.
     HWND hwndSearchProcBtn = nullptr;
     HWND hwndSearchTaskBtn = nullptr;
@@ -1119,6 +1132,9 @@ struct DashboardState {
     HWND hwndClock = nullptr;
     HWND hwndKpiTip = nullptr;
     HWND hwndToolbarTip = nullptr;
+    bool showProcessKpiRow = true;
+    bool showTaskKpiRow = true;
+    bool showJobKpiRow = true;
     RECT kpiCardRects[kNumKpiCards] = {};
     std::wstring kpiTipText[kNumKpiCards];
     int activeRunningCount = 0;
@@ -1201,6 +1217,27 @@ struct DashboardState {
     std::vector<TermSlotBanner> termBanners;
 };
 
+// Number of KPI rows that are currently enabled. Rows are packed from the top,
+// so this also determines where the toolbar and everything below it begins.
+static int ActiveKpiRowCount(const DashboardState* st) {
+    if (!st) return 0;
+    return (st->showProcessKpiRow ? 1 : 0) +
+           (st->showTaskKpiRow ? 1 : 0) +
+           (st->showJobKpiRow ? 1 : 0);
+}
+
+// Bottom edge (unscaled) of the packed KPI strip; kHeaderKpiTop when empty.
+static int KpiRowsBottomPx(int activeRows) {
+    if (activeRows <= 0) return kHeaderKpiTop;
+    return kHeaderKpiTop + activeRows * kKpiRowPitch - kKpiRowGap;
+}
+
+// Toolbar top (unscaled) directly below the packed KPI strip.
+static int KpiToolbarTopPx(int activeRows) {
+    if (activeRows <= 0) return kHeaderKpiTop;
+    return KpiRowsBottomPx(activeRows) + kKpiToToolbarGap;
+}
+
 static DashboardState* GetState(HWND hwnd) {
     return reinterpret_cast<DashboardState*>(GetWindowLongPtrW(hwnd, GWLP_USERDATA));
 }
@@ -1222,6 +1259,49 @@ static TerminalView* GetTerminalViewForProcess(DashboardState* st, int id) {
 // that is not answered in time is reported as an error instead of blocking the
 // UI thread forever.
 static const int kGuiIpcTimeoutMs = 30000;
+
+// 102-9: optional timing log. The path is read once on first use. With
+// HANCHO_PERF_OUT unset no clock is read and no file is opened.
+static const std::wstring& PerfOutPath() {
+    static const std::wstring path = []() -> std::wstring {
+        wchar_t buf[1024] = {};
+        const DWORD n = GetEnvironmentVariableW(
+            L"HANCHO_PERF_OUT", buf, static_cast<DWORD>(sizeof(buf) / sizeof(buf[0])));
+        return (n > 0 && n < sizeof(buf) / sizeof(buf[0])) ? std::wstring(buf, n) : std::wstring();
+    }();
+    return path;
+}
+
+static void PerfOutWrite(const char* kind, const std::string& detail, uint64_t startMs) {
+    static std::mutex fileMutex;
+    static FILE* file = nullptr;
+    std::lock_guard<std::mutex> lock(fileMutex);
+    if (!file) file = _wfopen(PerfOutPath().c_str(), L"a");
+    if (!file) return;
+    std::fprintf(file, "%llu,%s,%s,%llu\n", static_cast<unsigned long long>(startMs), kind,
+                 detail.c_str(), static_cast<unsigned long long>(GetNowTickMs() - startMs));
+    std::fflush(file);
+}
+
+class PerfOutScope {
+public:
+    PerfOutScope(const char* kind, const char* detail = "", const nlohmann::json* req = nullptr)
+        : kind_(kind), detail_(detail ? detail : ""), active_(!PerfOutPath().empty()),
+          start_(active_ ? GetNowTickMs() : 0) {
+        if (active_ && req) detail_ = req->value("action", std::string());
+    }
+    ~PerfOutScope() {
+        if (active_) PerfOutWrite(kind_, detail_, start_);
+    }
+    PerfOutScope(const PerfOutScope&) = delete;
+    PerfOutScope& operator=(const PerfOutScope&) = delete;
+
+private:
+    const char* kind_;
+    std::string detail_;
+    bool active_;
+    uint64_t start_;
+};
 
 static bool GuiIpcCall(DashboardState* st, const nlohmann::json& req, nlohmann::json& outResp,
                        std::string* outError = nullptr, int timeoutMs = kGuiIpcTimeoutMs);
@@ -1428,6 +1508,7 @@ static void NotifyNewChatMessages(DashboardState* st) {
 
 static bool GuiIpcCall(DashboardState* st, const nlohmann::json& req, nlohmann::json& outResp,
                        std::string* outError, int timeoutMs) {
+    PerfOutScope perf("ipc", "", &req);
     std::string resp;
     std::string err;
     bool ok = false;
@@ -1990,7 +2071,7 @@ static bool ConsumeDashboardSnapshot(DashboardState* st,
 
 static std::string CardShowIpc(DashboardState* st, const std::string& idOrNumber, const std::string& taskId, std::string& outErr) {
     nlohmann::json req = {
-        {"action", "card_show"},
+        {"action", "direction_show"},
         {"id", idOrNumber}
     };
     if (!taskId.empty()) req["taskId"] = taskId;
@@ -2645,58 +2726,130 @@ static void UpdateKpiTooltips(DashboardState* st, uint32_t totalTreeProcs,
         L"Process failure, timeout, or forced-stop cards awaiting a decision.",
         L"Tarjetas de procesos fallidos, agotados o terminados que esperan una decisión.");
 
-    // Row 1: Tasks (Cards 8..15)
+    // Row 1: Tasks (Cards 8..15) - actual task counts from taskViewCounts.
+    const pc::TaskViewCounts& tc = st->taskViewCounts;
     st->kpiTipText[8] = Tr(
-        L"タスクキューに登録されている全ジョブの総数。",
-        L"Total number of jobs in the task queue.",
-        L"Total de tareas en la cola de tareas.");
+        L"タスクビューに登録されている全タスクの総数 (補助表記はジョブ数)。",
+        L"Total number of tasks in the task view (job count shown as secondary).",
+        L"Total de tareas en la vista de tareas (número de trabajos como dato secundario).");
+    if (tc.totalJobs > 0) {
+        st->kpiTipText[8] += std::wstring(L"\n") + Tr(L"ジョブ: ", L"Jobs: ", L"Trabajos: ") + std::to_wstring(tc.totalJobs);
+    }
 
     st->kpiTipText[9] = Tr(
         L"現在実行中のタスク数。",
         L"Number of tasks currently running.",
         L"Número de tareas en ejecución actualmente.");
-
-    std::wstring tqWaitTip = std::to_wstring(tqCounts.waiting);
-    if (tqCounts.pending > 0) {
-        tqWaitTip += std::wstring(L" (+") + std::to_wstring(tqCounts.pending) +
-            Tr(L" 依存関係保留)", L" pending for deps)", L" pendientes por dependencias)");
+    if (tc.runningJobs > 0) {
+        st->kpiTipText[9] += std::wstring(L"\n") + Tr(L"ジョブ: ", L"Jobs: ", L"Trabajos: ") + std::to_wstring(tc.runningJobs);
     }
-    st->kpiTipText[10] = std::wstring(Tr(
-        L"依存関係が満たされ実行準備が整っているタスク。",
-        L"Tasks ready to run with all dependencies satisfied.",
-        L"Tareas listas para ejecutarse con dependencias cumplidas.")) + L" (" + tqWaitTip + L")";
+
+    st->kpiTipText[10] = Tr(
+        L"開始待ち・オープンのタスク数。",
+        L"Tasks that are open and waiting to start.",
+        L"Tareas abiertas esperando para empezar.");
+    if (tc.waitingJobs > 0) {
+        st->kpiTipText[10] += std::wstring(L"\n") + Tr(L"ジョブ: ", L"Jobs: ", L"Trabajos: ") + std::to_wstring(tc.waitingJobs);
+    }
 
     st->kpiTipText[11] = Tr(
-        L"正常に成功・完了したタスク。",
-        L"Tasks that finished successfully.",
-        L"Tareas finalizadas con éxito.");
+        L"成功・完了したタスク数。",
+        L"Tasks that finished successfully or were closed.",
+        L"Tareas finalizadas con éxito o cerradas.");
+    if (tc.closedTasks > 0) {
+        st->kpiTipText[11] += std::wstring(L"\n") + Tr(L"クローズ済み: ", L"Closed: ", L"Cerradas: ") + std::to_wstring(tc.closedTasks);
+    }
 
     st->kpiTipText[12] = Tr(
-        L"試行回数上限またはタイムアウト等で失敗したタスク、またはキャンセルされたタスク。",
-        L"Tasks that failed after max attempts/timeout, or were cancelled.",
-        L"Tareas fallidas tras agotar intentos/tiempo límite o canceladas.");
+        L"試行回数上限またはタイムアウト等で失敗したタスク数。",
+        L"Tasks that failed after max attempts/timeout.",
+        L"Tareas fallidas tras agotar intentos/tiempo límite.");
+    if (tc.failedJobs > 0) {
+        st->kpiTipText[12] += std::wstring(L"\n") + Tr(L"ジョブ: ", L"Jobs: ", L"Trabajos: ") + std::to_wstring(tc.failedJobs);
+    }
 
     st->kpiTipText[13] = Tr(
-        L"未完了の先行タスク待ち (依存保留)、または先行タスク失敗によりブロックされたタスク。",
-        L"Tasks waiting for unfinished dependencies, or blocked by upstream failure.",
-        L"Tareas en espera de dependencias o bloqueadas por fallo aguas arriba.");
+        L"キャンセルされたタスク数。",
+        L"Tasks that were cancelled.",
+        L"Tareas canceladas.");
+    if (tc.cancelledJobs > 0) {
+        st->kpiTipText[13] += std::wstring(L"\n") + Tr(L"ジョブ: ", L"Jobs: ", L"Trabajos: ") + std::to_wstring(tc.cancelledJobs);
+    }
 
     st->kpiTipText[14] = Tr(
-        L"未完了タスク（実行中・待機・保留のうち実行されうるもの）の残り時間の合計。見積もり時間があればそれを使い、なければタイムアウト値で見積もります。ブロックされて実行されないタスクは含みません。",
-        L"Total remaining time across unfinished tasks that can still run (running, waiting, pending). Uses the job's estimate when present, otherwise its timeout. Blocked tasks that will never run are not included.",
-        L"Tiempo restante total de las tareas sin terminar que aún pueden ejecutarse (en ejecución, en espera, pendientes). Usa la estimación del trabajo si existe; si no, su tiempo límite. Las tareas bloqueadas que nunca se ejecutarán no se incluyen.");
-    if (tqCounts.sumRemainingSec >= 0) {
-        st->kpiTipText[14] += std::wstring(L"\n") + Tr(L"合計残り時間: ", L"Total remaining: ", L"Restante total: ") + FormatRemainingTime(tqCounts.sumRemainingSec);
+        L"タスクビューに読み込まれている指示 / カードの件数。タスクビューでない場合は N/A。",
+        L"Number of directions/cards loaded in the task view; N/A outside task view.",
+        L"Número de direcciones/tarjetas cargadas en la vista de tareas; N/D fuera de esa vista.");
+    if (!st->taskViewMode) {
+        st->kpiTipText[14] += std::wstring(L"\n") + Tr(L"タスクビューを有効にしてください。", L"Enable Task view to see this count.", L"Activa la vista de tareas para ver este recuento.");
     }
-    if (taskMinRemainSec >= 0) {
-        st->kpiTipText[14] += std::wstring(L"\n") + Tr(L"最短: ", L"Shortest: ", L"Más corto: ") + FormatRemainingTime(taskMinRemainSec);
-    }
+
     st->kpiTipText[15] = Tr(
         L"失敗・タイムアウトしたタスクのうち判断待ちの件数。自動処置が未確認の場合は併記します。",
         L"Task failures and timeouts awaiting a decision; includes the count of unreviewed automatic actions.",
         L"Fallos y tiempos agotados que esperan decisión; incluye acciones automáticas sin revisar.");
     if (st->autoTriageUnreviewed > 0) {
         st->kpiTipText[15] += L"\n" + std::to_wstring(st->autoTriageUnreviewed) +
+            Tr(L" 件の自動処置が未確認", L" automatic action(s) unreviewed", L" acción(es) automáticas sin revisar");
+    }
+
+    // Row 2: Jobs (Cards 16..23) - job counts from the task queue.
+    st->kpiTipText[16] = Tr(
+        L"タスクキューに登録されているジョブの総数。",
+        L"Total number of jobs in the task queue.",
+        L"Total de trabajos en la cola de tareas.");
+    st->kpiTipText[17] = Tr(
+        L"現在実行中のジョブ数。",
+        L"Number of jobs currently running.",
+        L"Número de trabajos en ejecución actualmente.");
+
+    std::wstring tqWaitTip = std::to_wstring(tqCounts.waiting);
+    if (tqCounts.pending > 0) {
+        tqWaitTip += std::wstring(L" (+") + std::to_wstring(tqCounts.pending) +
+            Tr(L" 依存関係保留)", L" pending for deps)", L" pendientes por dependencias)");
+    }
+    st->kpiTipText[18] = std::wstring(Tr(
+        L"実行待ちのジョブ数。",
+        L"Jobs waiting to run.",
+        L"Trabajos esperando para ejecutarse.")) + L" (" + tqWaitTip + L")";
+
+    st->kpiTipText[19] = Tr(
+        L"正常に成功したジョブ数。",
+        L"Jobs that finished successfully.",
+        L"Trabajos finalizados con éxito.");
+
+    st->kpiTipText[20] = Tr(
+        L"失敗またはキャンセルされたジョブ数。",
+        L"Jobs that failed or were cancelled.",
+        L"Trabajos fallidos o cancelados.");
+    if (tqCounts.cancelled > 0) {
+        st->kpiTipText[20] += std::wstring(L"\n") + Tr(L"キャンセル: ", L"Cancelled: ", L"Cancelados: ") + std::to_wstring(tqCounts.cancelled);
+    }
+
+    st->kpiTipText[21] = Tr(
+        L"依存関係待ち (保留) または先行ジョブ失敗でブロックされたジョブ数。",
+        L"Jobs pending on dependencies or blocked by an upstream failure.",
+        L"Trabajos pendientes de dependencias o bloqueados por un fallo previo.");
+    if (tqCounts.blocked > 0) {
+        st->kpiTipText[21] += std::wstring(L"\n") + Tr(L"ブロック: ", L"Blocked: ", L"Bloqueados: ") + std::to_wstring(tqCounts.blocked);
+    }
+
+    st->kpiTipText[22] = Tr(
+        L"未完了タスク（実行中・待機・保留のうち実行されうるもの）の残り時間の合計。見積もり時間があればそれを使い、なければタイムアウト値で見積もります。ブロックされて実行されないタスクは含みません。",
+        L"Total remaining time across unfinished tasks that can still run (running, waiting, pending). Uses the job's estimate when present, otherwise its timeout. Blocked tasks that will never run are not included.",
+        L"Tiempo restante total de las tareas sin terminar que aún pueden ejecutarse (en ejecución, en espera, pendientes). Usa la estimación del trabajo si existe; si no, su tiempo límite. Las tareas bloqueadas que nunca se ejecutarán no se incluyen.");
+    if (tqCounts.sumRemainingSec >= 0) {
+        st->kpiTipText[22] += std::wstring(L"\n") + Tr(L"合計残り時間: ", L"Total remaining: ", L"Restante total: ") + FormatRemainingTime(tqCounts.sumRemainingSec);
+    }
+    if (taskMinRemainSec >= 0) {
+        st->kpiTipText[22] += std::wstring(L"\n") + Tr(L"最短: ", L"Shortest: ", L"Más corto: ") + FormatRemainingTime(taskMinRemainSec);
+    }
+    st->kpiTipText[23] = Tr(
+        L"失敗・タイムアウトしたジョブのうち判断待ちの件数。自動処置が未確認の場合は併記します。",
+        L"Job failures and timeouts awaiting a decision; includes the count of unreviewed automatic actions.",
+        L"Fallos y tiempos agotados de trabajos que esperan decisión; incluye acciones automáticas sin revisar.");
+    if (st->autoTriageUnreviewed > 0) {
+        st->kpiTipText[23] += L"\n" + std::to_wstring(st->autoTriageUnreviewed) +
             Tr(L" 件の自動処置が未確認", L" automatic action(s) unreviewed", L" acción(es) automáticas sin revisar");
     }
 
@@ -2982,7 +3135,8 @@ static void DrawDashboardCanvas(DashboardState* st, HDC hdcWindow, const RECT* u
         }
     }
 
-    // 1. Top KPI Cards (2 rows: Row 0 = Processes, Row 1 = Tasks)
+    // 1. Top KPI cards. Enabled rows are packed from the top; hidden rows are
+    //    skipped and their tooltip rects cleared so nothing lingers there.
     int kpiMargin = S(10);
     int kpiGap = S(7);
     int numCols = 8;
@@ -2994,12 +3148,23 @@ static void DrawDashboardCanvas(DashboardState* st, HDC hdcWindow, const RECT* u
     const bool kpiVisible = st->rcKpiArea.bottom <= st->rcKpiArea.top ||
                             RectsOverlap(rcBlit, st->rcKpiArea);
 
-    for (int row = 0; kpiVisible && row < 2; ++row) {
-        int cardTop = S((row == 0) ? kHeaderKpiTop : kHeaderKpiRow2Top);
-        int cardBottom = S((row == 0) ? kHeaderKpiRow1Bottom : kHeaderKpiBottom);
+    // Card indices stay fixed (0..7 processes, 8..15 tasks, 16..23 jobs) so the
+    // triage click targets keep working even when other rows are hidden.
+    enum { KpiProcesses = 0, KpiTasks = 1, KpiJobs = 2 };
+    const bool rowVisible[3] = {st->showProcessKpiRow, st->showTaskKpiRow, st->showJobKpiRow};
+    int packedRow = 0;
+    for (int cat = 0; cat < 3; ++cat) {
+        const int base = cat * numCols;
+        if (!rowVisible[cat]) {
+            for (int col = 0; col < numCols; ++col) st->kpiCardRects[base + col] = {};
+            continue;
+        }
+        int cardTop = S(kHeaderKpiTop + packedRow * kKpiRowPitch);
+        int cardBottom = cardTop + S(kKpiRowH);
+        ++packedRow;
 
         for (int col = 0; col < numCols; ++col) {
-            int i = row * numCols + col;
+            int i = base + col;
             RECT rcCard;
             rcCard.left = kpiMargin + col * (cardW + kpiGap);
             rcCard.right = (col == numCols - 1) ? (width - kpiMargin) : (rcCard.left + cardW);
@@ -3007,10 +3172,10 @@ static void DrawDashboardCanvas(DashboardState* st, HDC hdcWindow, const RECT* u
             rcCard.bottom = cardBottom;
             st->kpiCardRects[i] = rcCard;
             // The animation repaints only its two cards; leave the other cards alone.
-            if (!RectsOverlap(rcBlit, rcCard)) continue;
+            if (!kpiVisible || !RectsOverlap(rcBlit, rcCard)) continue;
 
-            if (row == 0) {
-                // Top Row: Processes
+            if (cat == KpiProcesses) {
+                // Processes row
                 if (col == 0) {
                     std::wstring sub = (totalTreeProcs > static_cast<uint32_t>(totalCount))
                         ? (std::to_wstring(totalTreeProcs) + Tr(L" 子", L" child", L" sub")) : L"";
@@ -3044,54 +3209,93 @@ static void DrawDashboardCanvas(DashboardState* st, HDC hdcWindow, const RECT* u
                                 st->pendingTriageProcess > 0 ? KpiAccent(4) : KpiAccent(0),
                                 st->hFontUiBold, st->hFontKpiVal);
                 }
-            } else {
-                // Bottom Row: Tasks (task-based primary counts, job-based secondary counts)
+            } else if (cat == KpiTasks) {
+                // Tasks row - actual task counts from taskViewCounts. BuildTaskDisplayRows
+                // computes these from the whole task table before the display-row slice.
                 const pc::TaskViewCounts& tc = st->taskViewCounts;
-                // 102-6: KPI counts come from the whole job table, never from the 30-row display slice.
-    const bool hasTaskCounts = false;
                 if (col == 0) {
-                    const int primary = hasTaskCounts ? tc.totalTasks : tqCounts.total;
-                    std::wstring sub = hasTaskCounts
-                        ? (Tr(L"ジョブ ", L"jobs ", L"trabajos ") + std::to_wstring(tc.totalJobs))
-                        : L"";
+                    std::wstring sub = (tc.totalJobs > 0)
+                        ? (Tr(L"ジョブ ", L"jobs ", L"trabajos ") + std::to_wstring(tc.totalJobs)) : L"";
                     DrawKpiCard(hdc, rcCard, Tr(L"タスク総数", L"TOTAL TASKS", L"TAREAS TOTALES"),
-                                std::to_wstring(primary), KpiAccent(0), st->hFontUiBold, st->hFontKpiVal,
+                                std::to_wstring(tc.totalTasks), KpiAccent(0), st->hFontUiBold, st->hFontKpiVal,
                                 -1.0f, sub);
                 } else if (col == 1) {
-                    const int primary = hasTaskCounts ? tc.runningTasks : tqCounts.running;
-                    std::wstring sub = hasTaskCounts
-                        ? (Tr(L"ジョブ ", L"jobs ", L"trabajos ") + std::to_wstring(tqCounts.running))
-                        : L"";
+                    std::wstring sub = (tc.runningJobs > 0)
+                        ? (Tr(L"ジョブ ", L"jobs ", L"trabajos ") + std::to_wstring(tc.runningJobs)) : L"";
                     DrawKpiCard(hdc, rcCard, Tr(L"稼働中タスク", L"RUNNING TASKS", L"TAREAS EN EJECUCIÓN"),
-                                std::to_wstring(primary), KpiAccent(1), st->hFontUiBold, st->hFontKpiVal,
-                                (primary > 0 ? g_kpiBarPhase : -1.0f), sub);
+                                std::to_wstring(tc.runningTasks), KpiAccent(1), st->hFontUiBold, st->hFontKpiVal,
+                                (tc.runningTasks > 0 ? g_kpiBarPhase : -1.0f), sub);
                 } else if (col == 2) {
-                    const int primary = hasTaskCounts ? tc.waitingTasks : tqCounts.waiting;
-                    std::wstring sub = hasTaskCounts
-                        ? (Tr(L"ジョブ ", L"jobs ", L"trabajos ") + std::to_wstring(tqCounts.waiting + tqCounts.pending))
-                        : ((tqCounts.pending > 0) ? (L"(+" + std::to_wstring(tqCounts.pending) + L")") : L"");
-                    DrawKpiCard(hdc, rcCard, Tr(L"実行待ちタスク", L"WAITING TASKS", L"TAREAS EN ESPERA"),
-                                std::to_wstring(primary), KpiAccent(2), st->hFontUiBold, st->hFontKpiVal,
+                    std::wstring sub = (tc.waitingJobs > 0)
+                        ? (Tr(L"ジョブ ", L"jobs ", L"trabajos ") + std::to_wstring(tc.waitingJobs)) : L"";
+                    DrawKpiCard(hdc, rcCard, Tr(L"オープン / 待ちタスク", L"OPEN / WAITING TASKS", L"TAREAS ABIERTAS / EN ESPERA"),
+                                std::to_wstring(tc.waitingTasks), KpiAccent(2), st->hFontUiBold, st->hFontKpiVal,
                                 -1.0f, sub);
                 } else if (col == 3) {
-                    const int primary = hasTaskCounts ? tc.succeededTasks : tqCounts.succeeded;
-                    std::wstring sub = hasTaskCounts
-                        ? (Tr(L"ジョブ ", L"jobs ", L"trabajos ") + std::to_wstring(tqCounts.succeeded))
-                        : L"";
-                    DrawKpiCard(hdc, rcCard, Tr(L"タスク成功 (OK)", L"SUCCEEDED TASKS", L"TAREAS EXITOSAS"),
-                                std::to_wstring(primary), KpiAccent(3), st->hFontUiBold, st->hFontKpiVal,
+                    std::wstring sub = (tc.closedTasks > 0)
+                        ? (Tr(L"クローズ ", L"closed ", L"cerradas ") + std::to_wstring(tc.closedTasks)) : L"";
+                    DrawKpiCard(hdc, rcCard, Tr(L"成功 / 完了タスク", L"SUCCEEDED / CLOSED TASKS", L"TAREAS EXITOSAS / CERRADAS"),
+                                std::to_wstring(tc.succeededTasks + tc.closedTasks), KpiAccent(3), st->hFontUiBold, st->hFontKpiVal,
                                 -1.0f, sub);
                 } else if (col == 4) {
-                    const int primary = hasTaskCounts ? (tc.failedTasks + tc.cancelledTasks) : (tqCounts.failed + tqCounts.cancelled);
-                    std::wstring sub = hasTaskCounts
-                        ? (Tr(L"ジョブ ", L"jobs ", L"trabajos ") + std::to_wstring(tqCounts.failed + tqCounts.cancelled))
-                        : ((tqCounts.cancelled > 0) ? (L"(" + std::to_wstring(tqCounts.cancelled) + L")") : L"");
-                    DrawKpiCard(hdc, rcCard, Tr(L"タスク失敗/中断", L"FAILED / CANCELLED", L"FALLIDAS / CANCELADAS"),
-                                std::to_wstring(primary), KpiAccent(4), st->hFontUiBold, st->hFontKpiVal,
+                    std::wstring sub = (tc.failedJobs > 0)
+                        ? (Tr(L"ジョブ ", L"jobs ", L"trabajos ") + std::to_wstring(tc.failedJobs)) : L"";
+                    DrawKpiCard(hdc, rcCard, Tr(L"失敗タスク", L"FAILED TASKS", L"TAREAS FALLIDAS"),
+                                std::to_wstring(tc.failedTasks), KpiAccent(4), st->hFontUiBold, st->hFontKpiVal,
                                 -1.0f, sub);
                 } else if (col == 5) {
-                    std::wstring sub = (tqCounts.blocked > 0) ? (L"(" + std::to_wstring(tqCounts.blocked) + L")") : L"";
-                    DrawKpiCard(hdc, rcCard, Tr(L"保留 / ブロック", L"PENDING / BLOCKED", L"PENDIENTES / BLOQ"),
+                    std::wstring sub = (tc.cancelledJobs > 0)
+                        ? (Tr(L"ジョブ ", L"jobs ", L"trabajos ") + std::to_wstring(tc.cancelledJobs)) : L"";
+                    DrawKpiCard(hdc, rcCard, Tr(L"キャンセルタスク", L"CANCELLED TASKS", L"TAREAS CANCELADAS"),
+                                std::to_wstring(tc.cancelledTasks), KpiAccent(5), st->hFontUiBold, st->hFontKpiVal,
+                                -1.0f, sub);
+                } else if (col == 6) {
+                    const std::wstring val = (st->taskViewMode && !st->cachedDirections.empty())
+                        ? std::to_wstring(st->cachedDirections.size()) : std::wstring(Tr(L"N/A", L"N/A", L"N/D"));
+                    DrawKpiCard(hdc, rcCard, Tr(L"指示 / カード", L"DIRECTIONS / CARDS", L"DIRECCIONES / TARJETAS"),
+                                val, KpiAccent(6), st->hFontUiBold, st->hFontKpiVal);
+                } else if (col == 7) {
+                    std::wstring sub;
+                    if (st->autoTriageUnreviewed > 0)
+                        sub = Tr(L"自動 ", L"Auto ", L"Auto ") + std::to_wstring(st->autoTriageUnreviewed) +
+                            Tr(L" 未確認", L" unreviewed", L" sin revisar");
+                    if (st->triageFollowUp > 0) {
+                        if (!sub.empty()) sub += L" / ";
+                        sub += Tr(L"要フォロー ", L"Follow-up ", L"Seguimiento ") + std::to_wstring(st->triageFollowUp);
+                    }
+                    DrawKpiCard(hdc, rcCard, Tr(L"タスク判断待ち", L"TASK TRIAGE", L"TRIAJE TAREAS"),
+                                std::to_wstring(st->pendingTriageTask),
+                                st->pendingTriageTask > 0 ? KpiAccent(4) : KpiAccent(0),
+                                st->hFontUiBold, st->hFontKpiVal, -1.0f, sub);
+                }
+            } else {
+                // Jobs row - job counts from the task queue.
+                if (col == 0) {
+                    DrawKpiCard(hdc, rcCard, Tr(L"ジョブ総数", L"TOTAL JOBS", L"TRABAJOS TOTALES"),
+                                std::to_wstring(tqCounts.total), KpiAccent(0), st->hFontUiBold, st->hFontKpiVal);
+                } else if (col == 1) {
+                    DrawKpiCard(hdc, rcCard, Tr(L"稼働中ジョブ", L"RUNNING JOBS", L"TRABAJOS ACTIVOS"),
+                                std::to_wstring(tqCounts.running), KpiAccent(1), st->hFontUiBold, st->hFontKpiVal,
+                                (tqCounts.running > 0 ? g_kpiBarPhase : -1.0f));
+                } else if (col == 2) {
+                    std::wstring sub = (tqCounts.pending > 0)
+                        ? (L"(+" + std::to_wstring(tqCounts.pending) + L")") : L"";
+                    DrawKpiCard(hdc, rcCard, Tr(L"実行待ちジョブ", L"WAITING JOBS", L"TRABAJOS EN ESPERA"),
+                                std::to_wstring(tqCounts.waiting), KpiAccent(2), st->hFontUiBold, st->hFontKpiVal,
+                                -1.0f, sub);
+                } else if (col == 3) {
+                    DrawKpiCard(hdc, rcCard, Tr(L"ジョブ成功 (OK)", L"SUCCEEDED JOBS", L"TRABAJOS EXITOSOS"),
+                                std::to_wstring(tqCounts.succeeded), KpiAccent(3), st->hFontUiBold, st->hFontKpiVal);
+                } else if (col == 4) {
+                    std::wstring sub = (tqCounts.cancelled > 0)
+                        ? (L"(" + std::to_wstring(tqCounts.cancelled) + L")") : L"";
+                    DrawKpiCard(hdc, rcCard, Tr(L"ジョブ失敗/中断", L"FAILED / CANCELLED JOBS", L"TRABAJOS FALLIDOS / CANCELADOS"),
+                                std::to_wstring(tqCounts.failed + tqCounts.cancelled), KpiAccent(4), st->hFontUiBold, st->hFontKpiVal,
+                                -1.0f, sub);
+                } else if (col == 5) {
+                    std::wstring sub = (tqCounts.blocked > 0)
+                        ? (L"(" + std::to_wstring(tqCounts.blocked) + L")") : L"";
+                    DrawKpiCard(hdc, rcCard, Tr(L"保留 / ブロック", L"PENDING / BLOCKED JOBS", L"PENDIENTES / BLOQUEADOS"),
                                 std::to_wstring(tqCounts.pending + tqCounts.blocked), KpiAccent(5), st->hFontUiBold, st->hFontKpiVal,
                                 ((tqCounts.pending + tqCounts.blocked) > 0 ? g_kpiBarPhase : -1.0f), sub);
                 } else if (col == 6) {
@@ -3107,7 +3311,7 @@ static void DrawDashboardCanvas(DashboardState* st, HDC hdcWindow, const RECT* u
                         if (!sub.empty()) sub += L" / ";
                         sub += Tr(L"要フォロー ", L"Follow-up ", L"Seguimiento ") + std::to_wstring(st->triageFollowUp);
                     }
-                    DrawKpiCard(hdc, rcCard, Tr(L"タスク判断待ち", L"TASK TRIAGE", L"TRIAJE TAREAS"),
+                    DrawKpiCard(hdc, rcCard, Tr(L"ジョブ判断待ち", L"JOB TRIAGE", L"TRIAJE TRABAJOS"),
                                 std::to_wstring(st->pendingTriageTask),
                                 st->pendingTriageTask > 0 ? KpiAccent(4) : KpiAccent(0),
                                 st->hFontUiBold, st->hFontKpiVal, -1.0f, sub);
@@ -3516,13 +3720,30 @@ static int CompareTaskRows(const TaskListRow& a, const TaskListRow& b, int col) 
 }
 
 // Sorts the task rows by one column. SortDirection::None keeps the natural order.
-static void SortTaskRows(std::vector<TaskListRow>& rows, int col, SortDirection dir) {
+static void SortTaskRows(std::vector<TaskListRow>& rows, std::vector<pc::TaskDisplayRow>& displayRows,
+                         int col, SortDirection dir) {
     if (dir == SortDirection::None || col < 0 || col >= kTaskListColumns) return;
     const bool asc = (dir == SortDirection::Ascending);
-    std::stable_sort(rows.begin(), rows.end(), [col, asc](const TaskListRow& a, const TaskListRow& b) {
-        const int cmp = CompareTaskRows(a, b, col);
+    std::vector<size_t> order;
+    order.reserve(rows.size());
+    for (size_t i = 0; i < rows.size(); ++i) order.push_back(i);
+    std::stable_sort(order.begin(), order.end(), [&](size_t a, size_t b) {
+        const int cmp = CompareTaskRows(rows[a], rows[b], col);
         return asc ? (cmp < 0) : (cmp > 0);
     });
+    // 102-5: the owner-data list indexes taskDisplayRows by row, so it must be
+    // reordered together with rows; otherwise a sorted flat job view reports the
+    // wrong job/task for clicks and the wrong indent for LVN_GETDISPINFO.
+    std::vector<TaskListRow> sortedRows;
+    std::vector<pc::TaskDisplayRow> sortedDisplay;
+    sortedRows.reserve(rows.size());
+    sortedDisplay.reserve(displayRows.size());
+    for (size_t i : order) {
+        sortedRows.push_back(std::move(rows[i]));
+        if (i < displayRows.size()) sortedDisplay.push_back(std::move(displayRows[i]));
+    }
+    rows = std::move(sortedRows);
+    displayRows = std::move(sortedDisplay);
 }
 
 static void UpdateControlTooltip(HWND hwndTip, HWND hwndParent, HWND hwndCtrl, const wchar_t* text) {
@@ -3628,17 +3849,23 @@ static void UpdatePanelToggleLabels(DashboardState* st) {
                    L"Refreshes the process list, task queue, terminals and monitor pane now.\nThey otherwise update automatically at the configured interval.",
                    L"Actualiza ahora las listas, las terminales y el panel de monitor.\nNormalmente se actualizan solos según el intervalo configurado."));
         }
-        if (st->hwndBtnReevalPlanned) {
-            UpdateControlTooltip(st->hwndToolbarTip, st->hwndMain, st->hwndBtnReevalPlanned,
-                Tr(L"タスク一覧の「予定 (未登録)」行を再評価します。\nコアからタスクキューとタスクグループの現在の状態を取得し直し、実行されない枝の行を消します。\nタスクグループが一時停止中か LLM の応答待ちの場合は、その間は行が残ります。",
-                   L"Re-evaluates the \"planned\" rows in the task list.\nIt re-reads the task queue and current task group state from the core and drops rows for branches that will not run.\nRows remain while a task group is paused or waiting for an LLM reply.",
-                   L"Vuelve a evaluar las filas «previstas» de la lista de tareas.\nVuelve a leer la cola y el estado actual de los grupos de tareas del núcleo y quita las ramas que no se ejecutarán.\nLas filas permanecen mientras un grupo esté en pausa o esperando una respuesta del LLM."));
+        if (st->hwndBtnCollapseAllTasks) {
+            UpdateControlTooltip(st->hwndToolbarTip, st->hwndMain, st->hwndBtnCollapseAllTasks,
+                Tr(L"タスク一覧の見出し（タスクとディレクション）をすべて折りたたみます。",
+                   L"Collapses all task and direction headings in the task list.",
+                   L"Contrae todos los encabezados de tareas y direcciones en la lista de tareas."));
         }
         if (st->hwndBtnSettings) {
             UpdateControlTooltip(st->hwndToolbarTip, st->hwndMain, st->hwndBtnSettings,
                 Tr(L"表示・動作・通知・トリアージ・Web UI などの設定を開きます。\n変更はダイアログを閉じると保存され、次回起動時にも引き継がれます。",
                    L"Opens settings for appearance, behavior, alerts, triage and the Web UI.\nChanges are saved when you close the dialog and persist across restarts.",
                    L"Abre los ajustes de apariencia, comportamiento, avisos, triaje y Web UI.\nLos cambios se guardan al cerrar y se conservan tras reiniciar."));
+        }
+        if (st->hwndBtnRoutines) {
+            UpdateControlTooltip(st->hwndToolbarTip, st->hwndMain, st->hwndBtnRoutines,
+                Tr(L"ルーチン管理ダイアログを開きます。\n登録されたビヘイビアツリールーチンの確認、実行、承認・却下が行えます。",
+                   L"Opens the routine management dialog.\nReview, run, approve or reject saved behavior tree routines.",
+                   L"Abre el diálogo de gestión de rutinas.\nRevisa, ejecuta, aprueba o rechaza rutinas de árbol de comportamiento guardadas."));
         }
         if (st->hwndBtnKillAll) {
             UpdateControlTooltip(st->hwndToolbarTip, st->hwndMain, st->hwndBtnKillAll,
@@ -3822,6 +4049,7 @@ static bool TickEndBlink(DashboardState* st) {
 
 static void RefreshDashboardData(DashboardState* st);
 static void ShowBtDebugDialog(DashboardState* st, const std::string& selectTreeId = "");
+static void ShowRoutinesDialog(DashboardState* st);
 static void SyncTermSessionNotifications(DashboardState* st);
 static void SyncStreamPane(DashboardState* st);
 static void EnsureStreamPane(DashboardState* st);
@@ -4259,6 +4487,14 @@ static std::wstring EvidenceContextText(const nlohmann::json& job, const nlohman
 static std::string TimeOfDayText(const std::string& ts) {
     size_t space = ts.find(' ');
     if (space != std::string::npos && ts.size() >= space + 9) return ts.substr(space + 1);
+    size_t tpos = ts.find('T');
+    if (tpos != std::string::npos && ts.size() >= tpos + 9) {
+        std::string sub = ts.substr(tpos + 1);
+        if (sub.size() >= 8 && sub[2] == ':' && sub[5] == ':') {
+            return sub.substr(0, 8);
+        }
+        return sub;
+    }
     return ts;
 }
 
@@ -4319,6 +4555,13 @@ static std::wstring TaskQueueStateLabel(const std::string& state, const std::str
             ? Tr(L"一時停止 (実行中)", L"Paused (running)", L"En pausa (en ejecución)")
             : Tr(L"一時停止 (待機)", L"Paused (queued)", L"En pausa (en espera)");
     }
+    if (state == "running") return Tr(L"実行中", L"Running", L"En curso");
+    if (state == "succeeded") return Tr(L"成功", L"Succeeded", L"Exitosa");
+    if (state == "failed") return Tr(L"失敗", L"Failed", L"Fallida");
+    if (state == "cancelled") return Tr(L"中断", L"Cancelled", L"Cancelada");
+    if (state == "blocked") return Tr(L"ブロック", L"Blocked", L"Bloqueada");
+    if (state == "waitingForPermit") return Tr(L"許可待ち", L"Waiting for permit", L"Esperando permiso");
+    if (state == "waiting") return Tr(L"実行待ち", L"Queued", L"En cola");
     if (state != "pending") return Utf8ToWide(state);
     bool waitingForDeps = false;
     for (const auto& dep : TaskQueueDepList(jobJson)) {
@@ -4335,7 +4578,8 @@ static std::wstring TaskQueueStateLabel(const std::string& state, const std::str
     }
     // waiting: queued and ready to run (waiting for a free slot).
     // pending: not in the run queue (dependencies not satisfied yet).
-    return waitingForDeps ? std::wstring(L"pending") : std::wstring(L"waiting");
+    return waitingForDeps ? Tr(L"依存待ち", L"Waiting (deps)", L"En espera (deps)")
+                          : Tr(L"実行待ち", L"Queued", L"En cola");
 }
 
 // ---------------------------------------------------------------------------
@@ -5687,8 +5931,8 @@ static void DisplaySupervisorHint(DashboardState* st, const std::wstring& catego
                                   int autoDismissSec);
 
 // Column indexes in the task list (see UpdateTaskListColumnWidths).
-static const int kTaskListOriginCol = 9;
-static const int kTaskListOwnerCol = 10;
+static const int kTaskListOriginCol = 10;
+static const int kTaskListOwnerCol = 11;
 
 // Full text of one task-list cell. The control keeps the whole string even when the column is
 // too narrow to draw it, so this is the text that hover and "copy cell" should use.
@@ -6596,7 +6840,7 @@ static void ShowTaskQueueContextMenu(DashboardState* st, const std::string& jobI
         const bool groupFailed = btDirectionRow && btWait.state == "failed";
         if (groupFailed) {
             AppendMenuW(hMenu, MF_STRING, 3211,
-                        Tr(L"失敗した枝から direction を再実行",
+                        Tr(L"失敗した枝から 指示を再実行",
                            L"Retry the direction from the failed branch",
                            L"Reintentar la direction desde la rama fallida"));
         } else if (btDirectionRow) {
@@ -6624,56 +6868,56 @@ static void ShowTaskQueueContextMenu(DashboardState* st, const std::string& jobI
             const bool groupPaused = btWait.state == "paused";
             AppendMenuW(hMenu, MF_STRING, 3213,
                         groupPaused
-                            ? Tr(L"direction を再開 (新規タスクを開始)",
+                            ? Tr(L"指示を再開 (新規タスクを開始)",
                                  L"Resume direction (start new tasks)",
                                  L"Reanudar direction (iniciar tareas)")
-                            : Tr(L"direction を一時停止 (新規タスクを止める)",
+                            : Tr(L"指示を一時停止 (新規タスクを止める)",
                                  L"Pause direction (stop starting new tasks)",
                                  L"Pausar direction (no iniciar tareas)"));
             AppendMenuW(hMenu, MF_STRING, 3212,
-                        Tr(L"direction を停止 (キャンセル)",
+                        Tr(L"指示を停止 (キャンセル)",
                            L"Stop direction (cancel)",
                            L"Detener direction (cancelar)"));
         } else if (jobsDirectionRow) {
             AppendMenuW(hMenu, MF_STRING, 3221,
-                        Tr(L"direction を再実行 (Retry)",
+                        Tr(L"指示を再実行 (Retry)",
                            L"Retry direction",
                            L"Reintentar direction"));
             AppendMenuW(hMenu, MF_STRING, 3222,
-                        Tr(L"direction を一時停止 (Pause)",
+                        Tr(L"指示を一時停止 (Pause)",
                            L"Pause direction",
                            L"Pausar direction"));
             AppendMenuW(hMenu, MF_STRING, 3223,
-                        Tr(L"direction を再開 (Resume)",
+                        Tr(L"指示を再開 (Resume)",
                            L"Resume direction",
                            L"Reanudar direction"));
             AppendMenuW(hMenu, MF_STRING, 3224,
-                        Tr(L"direction を停止 (キャンセル)",
+                        Tr(L"指示を停止 (キャンセル)",
                            L"Stop direction (cancel)",
                            L"Detener direction (cancelar)"));
         }
         if (!virtualBtId.empty()) {
             if (!btDirectionRow) {
                 AppendMenuW(hMenu, MF_STRING, 3211,
-                            Tr(L"direction を再実行", L"Retry direction",
+                            Tr(L"指示を再実行", L"Retry direction",
                                L"Reintentar direction"));
                 AppendMenuW(hMenu, MF_STRING, 3212,
-                            Tr(L"direction を停止 (キャンセル)",
+                            Tr(L"指示を停止 (キャンセル)",
                                L"Stop direction (cancel)",
                                L"Detener direction (cancelar)"));
             }
             AppendMenuW(hMenu, MF_STRING, 3214,
-                        Tr(L"タスクリストから削除（direction を停止して消す）",
+                        Tr(L"タスクリストから削除（指示を停止して消す）",
                            L"Remove from task list (stop and delete the direction)",
                            L"Quitar de la lista (detener y eliminar la direction)"));
             AppendMenuW(hMenu, MF_STRING, 3215,
-                        Tr(L"状態を closed にする（direction を停止）",
+                        Tr(L"状態を closed にする（指示を停止）",
                            L"Force state to closed (stop the direction)",
                            L"Forzar estado a cerrado (detener la direction)"));
         }
         // Virtual direction / planned rows are not queue jobs; retry/cancel have nothing to act on.
         if (!jobsDirectionRow) {
-            AppendMenuW(hMenu, MF_STRING, 3111, Tr(L"direction で表示", L"Show direction", L"Ver direction"));
+            AppendMenuW(hMenu, MF_STRING, 3111, Tr(L"指示で表示", L"Show direction", L"Ver direction"));
         }
         if (selectedReal.size() > 1) {
             wchar_t batchLabel[128] = {};
@@ -6689,11 +6933,11 @@ static void ShowTaskQueueContextMenu(DashboardState* st, const std::string& jobI
         if (cmd == 3230 || cmd == 3231 || cmd == 3232) {
             nlohmann::json req;
             if (cmd == 3230) {
-                req["action"] = "card_run";
+                req["action"] = "direction_run";
                 req["taskId"] = cardRow.taskId;
                 req["number"] = cardRow.cardNumber;
             } else if (cmd == 3231) {
-                req["action"] = "card_redo";
+                req["action"] = "direction_redo";
                 req["taskId"] = cardRow.taskId;
                 req["number"] = cardRow.cardNumber;
                 req["run"] = true;
@@ -6712,8 +6956,8 @@ static void ShowTaskQueueContextMenu(DashboardState* st, const std::string& jobI
             }
             const bool ok = ipcErr.empty() && rdoc.is_object() && rdoc.value("ok", false);
             ShowTaskQueueResult(
-                st, Tr(L"カード", L"Card", L"Tarjeta"),
-                ok ? Tr(L"カードを操作しました。", L"Updated card.", L"Tarjeta actualizada.")
+                st, Tr(L"指示", L"Direction", L"Dirección"),
+                ok ? Tr(L"指示を操作しました。", L"Updated direction.", L"Dirección actualizada.")
                    : Utf8ToWide(ipcErr.empty() ? rdoc.value("error", std::string("error")) : ipcErr),
                 ok);
         } else if (cmd == 3221 || cmd == 3222 || cmd == 3223 || cmd == 3224) {
@@ -6728,8 +6972,8 @@ static void ShowTaskQueueContextMenu(DashboardState* st, const std::string& jobI
             nlohmann::json rdoc = nlohmann::json::parse(ipcResp, nullptr, false);
             const bool ok = ipcErr.empty() && rdoc.is_object() && rdoc.value("ok", false);
             ShowTaskQueueResult(
-                st, Tr(L"direction", L"direction", L"direction"),
-                ok ? Tr(L"direction を操作しました。", L"Updated direction.", L"Direction actualizada.")
+                st, Tr(L"指示", L"Direction", L"Dirección"),
+                ok ? Tr(L"指示を操作しました。", L"Updated direction.", L"Direction actualizada.")
                    : Utf8ToWide(ipcErr.empty() ? rdoc.value("error", std::string("error")) : ipcErr),
                 ok);
         } else if (cmd == 3133) {
@@ -6737,9 +6981,9 @@ static void ShowTaskQueueContextMenu(DashboardState* st, const std::string& jobI
         } else if (cmd == 3214) {
             if (gui_platform::GetGuiPlatform()->ShowMessageBox(
                     st->hwndMain,
-                    Tr(L"direction を削除", L"Delete direction", L"Eliminar direction"),
-                    Tr(L"この direction を停止し、一覧から削除しますか？\n"
-                       L"実行中・待機中のタスクはキャンセルされ、direction の状態ファイルも削除されます。",
+                    Tr(L"指示を削除", L"Delete direction", L"Eliminar direction"),
+                    Tr(L"この 指示を停止し、一覧から削除しますか？\n"
+                       L"実行中・待機中のタスクはキャンセルされ、指示の状態ファイルも削除されます。",
                        L"Stop this direction and remove it from the list?\n"
                        L"Running and queued tasks are cancelled, and the direction's state file is deleted.",
                        L"¿Detener esta direction y quitarla de la lista?\n"
@@ -6749,8 +6993,8 @@ static void ShowTaskQueueContextMenu(DashboardState* st, const std::string& jobI
                 std::wstring removeErr;
                 if (SubmitBtRemove(st, virtualBtId, removeErr)) {
                     ShowTaskQueueResult(
-                        st, Tr(L"direction を削除", L"direction deleted", L"direction eliminada"),
-                        Tr(L"direction を停止し、一覧から削除しました。",
+                        st, Tr(L"指示を削除", L"direction deleted", L"direction eliminada"),
+                        Tr(L"指示を停止し、一覧から削除しました。",
                            L"Stopped the direction and removed it from the list.",
                            L"Se detuvo la direction y se quitó de la lista."),
                         true);
@@ -6764,8 +7008,8 @@ static void ShowTaskQueueContextMenu(DashboardState* st, const std::string& jobI
             if (gui_platform::GetGuiPlatform()->ShowMessageBox(
                     st->hwndMain,
                     Tr(L"状態を closed にする", L"Force state to closed", L"Forzar estado a cerrado"),
-                    Tr(L"この direction を停止して closed（終了）にしますか？\n"
-                       L"direction と未起動の予定行は一覧から消えます（ツリーは cancelled として残ります）。",
+                    Tr(L"この 指示を停止して closed（終了）にしますか？\n"
+                       L"指示と未起動の予定行は一覧から消えます（ツリーは cancelled として残ります）。",
                        L"Stop this direction and mark it closed?\n"
                        L"The direction and its planned rows leave the list (the tree stays as cancelled).",
                        L"¿Detener esta direction y marcarla como cerrada?\n"
@@ -6775,7 +7019,7 @@ static void ShowTaskQueueContextMenu(DashboardState* st, const std::string& jobI
                 std::wstring cancelErr;
                 if (SubmitBtCancel(st, virtualBtId, cancelErr)) {
                     ShowTaskQueueResult(st, Tr(L"closed", L"closed", L"cerrado"),
-                                        Tr(L"direction を停止し、行を一覧から消しました。",
+                                        Tr(L"指示を停止し、行を一覧から消しました。",
                                            L"Stopped the direction and removed its rows from the list.",
                                            L"Se detuvo la direction y se quitaron sus filas de la lista."),
                                         true);
@@ -6807,10 +7051,10 @@ static void ShowTaskQueueContextMenu(DashboardState* st, const std::string& jobI
         } else if (cmd == 3212) {
             if (gui_platform::GetGuiPlatform()->ShowMessageBox(
                     st->hwndMain,
-                    Tr(L"direction のキャンセル", L"Cancel direction",
+                    Tr(L"指示のキャンセル", L"Cancel direction",
                        L"Cancelar direction"),
-                    Tr(L"この direction をキャンセルしますか？\n"
-                       L"direction に属する実行中・待機中・仮登録のタスクもすべてキャンセルされます。",
+                    Tr(L"この 指示をキャンセルしますか？\n"
+                       L"指示に属する実行中・待機中・仮登録のタスクもすべてキャンセルされます。",
                        L"Cancel this direction?\n"
                        L"Tasks that belong to it (running, waiting and provisionally registered) "
                        L"will be cancelled too.",
@@ -6821,9 +7065,9 @@ static void ShowTaskQueueContextMenu(DashboardState* st, const std::string& jobI
                 std::wstring cancelErr;
                 if (SubmitBtCancel(st, virtualBtId, cancelErr)) {
                     ShowTaskQueueResult(
-                        st, Tr(L"direction をキャンセル", L"direction cancelled",
+                        st, Tr(L"指示をキャンセル", L"direction cancelled",
                                L"direction cancelada"),
-                        Tr(L"direction と、それに属する未完了のタスクをキャンセルしました。",
+                        Tr(L"指示と、それに属する未完了のタスクをキャンセルしました。",
                            L"Cancelled the direction and its unfinished tasks.",
                            L"Se canceló la direction y sus tareas sin terminar."),
                         true);
@@ -6839,18 +7083,18 @@ static void ShowTaskQueueContextMenu(DashboardState* st, const std::string& jobI
             std::wstring pauseErr;
             if (SubmitBtPause(st, virtualBtId, !groupPaused, pauseErr)) {
                 ShowTaskQueueResult(
-                    st, Tr(L"direction", L"direction", L"direction"),
+                    st, Tr(L"指示", L"Direction", L"Dirección"),
                     groupPaused
-                        ? Tr(L"direction を再開しました。",
+                        ? Tr(L"指示を再開しました。",
                              L"Resumed the direction.",
                              L"Se reanudó la direction.")
-                        : Tr(L"direction を一時停止しました。実行中のタスクは続きます。",
+                        : Tr(L"指示を一時停止しました。実行中のタスクは続きます。",
                              L"Paused the direction. Running tasks continue.",
                              L"Se pausó la direction. Las tareas en ejecución continúan."),
                     true);
             } else {
                 ShowTaskQueueResult(
-                    st, Tr(L"direction を操作できませんでした",
+                    st, Tr(L"指示を操作できませんでした",
                            L"Could not change the direction",
                            L"No se pudo cambiar la direction"),
                     pauseErr, false);
@@ -6917,7 +7161,7 @@ static void ShowTaskQueueContextMenu(DashboardState* st, const std::string& jobI
     if (triageIt != st->triageJobs.end() && !triageIt->second.value("cardId", std::string()).empty())
         AppendMenuW(hMenu, MF_STRING, 3115, Tr(L"トリアージで開く", L"Open in Triage", L"Abrir en Triaje"));
     if (resp.find("\"bt\":{") != std::string::npos) {
-        AppendMenuW(hMenu, MF_STRING, 3111, Tr(L"direction で表示", L"Show direction", L"Ver direction"));
+        AppendMenuW(hMenu, MF_STRING, 3111, Tr(L"指示で表示", L"Show direction", L"Ver direction"));
     }
     // With an origin filter on, the clicked job's origin gets bulk actions over every job it shows.
     if (!st->taskOriginFilter.empty()) {
@@ -7520,6 +7764,55 @@ static std::wstring TaskStateLabelWide(const std::string& state) {
     return Utf8ToWide(state);
 }
 
+static std::wstring TaskResultsSummary(const std::string& resultsCompact) {
+    struct ResultCategory {
+        wchar_t symbol;
+        const wchar_t* ja;
+        const wchar_t* en;
+        const wchar_t* es;
+        int count;
+    };
+    ResultCategory cats[] = {
+        {L'\x2713', L"\x6210\x529F", L"ok", L"ok", 0},
+        {L'\x2717', L"\x5931\x6557", L"fail", L"fallo", 0},
+        {L'\x25B6', L"\x5B9F\x884C", L"run", L"curso", 0},
+        {L'\x2212', L"\x4E2D\x65AD", L"cancel", L"cancelada", 0},
+        {L'\x00B7', L"\x4E88\x5B9A", L"plan", L"plan", 0},
+    };
+    const std::wstring wide = Utf8ToWide(resultsCompact);
+    for (size_t i = 0; i < wide.size(); ++i) {
+        ResultCategory* cat = nullptr;
+        for (auto& c : cats) {
+            if (c.symbol == wide[i]) { cat = &c; break; }
+        }
+        if (!cat) continue;
+        int n = 1;
+        if (i + 1 < wide.size() && wide[i + 1] == L'\x00D7') {
+            size_t j = i + 2;
+            int digits = 0;
+            while (j < wide.size() && wide[j] >= L'0' && wide[j] <= L'9') {
+                digits = digits * 10 + (wide[j] - L'0');
+                ++j;
+            }
+            if (digits > 0) {
+                n = digits;
+                i = j - 1;
+            }
+        }
+        cat->count += n;
+    }
+    const bool western = g_uiLanguage == UiLanguage::English || g_uiLanguage == UiLanguage::Spanish;
+    std::wstring out;
+    for (const auto& c : cats) {
+        if (c.count <= 0) continue;
+        const std::wstring label = Tr(c.ja, c.en, c.es);
+        if (!out.empty()) out += western ? L", " : L" / ";
+        out += western ? std::to_wstring(c.count) + L" " + label
+                       : label + L" " + std::to_wstring(c.count);
+    }
+    return out.empty() ? L"-" : out;
+}
+
 static void RefreshTaskQueueData(DashboardState* st, bool force = false, bool useCachedList = false) {
     if (!st || !st->hwndTaskList) return;
     if (st->listDisplayMode == ListDisplayMode::ProcessOnly) return;
@@ -7647,6 +7940,9 @@ static void RefreshTaskQueueData(DashboardState* st, bool force = false, bool us
         if (pj.is_object()) parsedJobs.push_back(std::move(pj));
     }
 
+    pc::InitializeTaskExpandedOverrides(
+        st->taskExpandedOverrides, parsedJobs, st->cachedTasks, st->cachedDirections);
+
     pc::TaskViewCounts newCounts;
     std::vector<pc::TaskDisplayRow> displayRows = pc::BuildTaskDisplayRows(
         parsedJobs, st->cachedTasks, st->taskViewMode,
@@ -7682,9 +7978,41 @@ static void RefreshTaskQueueData(DashboardState* st, bool force = false, bool us
                                                   : DashTitleCell(st, drow.taskTitle, "", row.titleTip);
             row.cells[2] = std::wstring(Tr(L"タスク", L"Task", L"Tarea")) + L" (" + std::to_wstring(drow.jobCount) + L")";
             row.cells[3] = TaskStateLabelWide(drow.taskState);
-            row.cells[4] = Utf8ToWide(drow.resultsCompact);
-            row.cells[5] = L"-";
-            row.cells[6] = L"-";
+            row.cells[4] = TaskResultsSummary(drow.resultsCompact);
+
+            std::wstring startStr = L"-";
+            if (!drow.startTime.empty()) {
+                startStr = Utf8ToWide(TimeOfDayText(drow.startTime));
+            }
+            row.cells[5] = std::move(startStr);
+
+            std::wstring endStr = L"-";
+            if (!drow.endTime.empty()) {
+                endStr = Utf8ToWide(TimeOfDayText(drow.endTime));
+                const int64_t sEpoch = ParseTimestampStrToEpoch(drow.startTime);
+                const int64_t eEpoch = ParseTimestampStrToEpoch(drow.endTime);
+                if (sEpoch > 0 && eEpoch >= sEpoch) {
+                    endStr += L" (" + FormatCompactDuration(eEpoch - sEpoch) + L")";
+                }
+            }
+            row.cells[6] = std::move(endStr);
+
+            if (!drow.runningDetail.empty()) {
+                row.cells[7] = Utf8ToWide(drow.runningDetail);
+            }
+
+            std::wstring originTip;
+            std::wstring originStr;
+            if (drow.jobJson.is_object()) {
+                originStr = TaskQueueOriginDisplay(drow.jobJson.dump(), originTip);
+            }
+            row.cells[10] = std::move(originStr);
+            row.originTip = std::move(originTip);
+            if (!row.cells[10].empty()) ++originCounts[row.cells[10]];
+
+            row.startKey = !drow.startTime.empty() ? ParseTimestampStrToEpoch(drow.startTime) : 0;
+            row.endKey = !drow.endTime.empty() ? ParseTimestampStrToEpoch(drow.endTime) : 0;
+
             row.cells[13] = row.cells[1];
             if (!st->taskSearchText.empty()) {
                 bool matches = false;
@@ -7709,15 +8037,12 @@ static void RefreshTaskQueueData(DashboardState* st, bool force = false, bool us
                      : "taskHeading";
             if (drow.isCard) {
                 const std::wstring prefix = drow.jobCount > 0 ? (drow.expanded ? L"\x25BE " : L"\x25B8 ") : L"  ";
-                row.cells[0] = prefix + Utf8ToWide(drow.cardNumber.empty() ? drow.directionId : drow.cardNumber);
+                row.cells[0] = L" " + prefix + Utf8ToWide(drow.cardNumber.empty() ? drow.directionId : drow.cardNumber);
                 row.cells[1] = drow.directionTitle.empty() ? Utf8ToWide(drow.cardNumber)
                              : DashTitleCell(st, drow.directionTitle, "card.title", row.titleTip);
                 row.cells[2] = drow.jobCount > 0
-                    ? (std::wstring(Tr(L"カード", L"Card", L"Tarjeta")) + L" (" + std::to_wstring(drow.jobCount) + L")")
-                    : std::wstring(Tr(L"カード", L"Card", L"Tarjeta"));
-                row.cells[3] = (drow.directionState == "planned" && !drow.waitingFor.empty())
-                    ? std::wstring(Tr(L"依存待ち", L"waiting", L"en espera"))
-                    : TaskStateLabelWide(drow.directionState);
+                    ? (std::wstring(Tr(L"指示", L"Direction", L"Dirección")) + L" (" + std::to_wstring(drow.jobCount) + L")")
+                    : std::wstring(Tr(L"指示", L"Direction", L"Dirección"));
                 if (!drow.waitingFor.empty()) {
                     std::wstring deps;
                     for (size_t wi = 0; wi < drow.waitingFor.size(); ++wi) {
@@ -7726,16 +8051,66 @@ static void RefreshTaskQueueData(DashboardState* st, bool force = false, bool us
                     }
                     row.cells[8] = deps;
                 }
+                if (drow.directionState == "planned" && !drow.waitingFor.empty()) {
+                    std::wstring shortDeps;
+                    const size_t maxDeps = 3;
+                    const size_t shown = drow.waitingFor.size() < maxDeps ? drow.waitingFor.size() : maxDeps;
+                    for (size_t wi = 0; wi < shown; ++wi) {
+                        if (wi > 0) shortDeps += L", ";
+                        shortDeps += Utf8ToWide(drow.waitingFor[wi]);
+                    }
+                    if (drow.waitingFor.size() > maxDeps) {
+                        shortDeps += L" +" + std::to_wstring(drow.waitingFor.size() - maxDeps);
+                    }
+                    row.cells[3] = std::wstring(Tr(L"依存待ち", L"Waiting", L"En espera")) +
+                                   L" (" + shortDeps + L")";
+                } else {
+                    row.cells[3] = TaskStateLabelWide(drow.directionState);
+                }
             } else {
-                row.cells[0] = (drow.expanded ? L"\x25BE " : L"\x25B8 ") + Utf8ToWide("direction:" + drow.directionId);
+                row.cells[0] = L" " + std::wstring(drow.expanded ? L"\x25BE " : L"\x25B8 ") + Utf8ToWide("direction:" + drow.directionId);
                 row.cells[1] = drow.directionTitle.empty() ? Utf8ToWide(drow.directionId)
                              : DashTitleCell(st, drow.directionTitle, "", row.titleTip);
-                row.cells[2] = std::wstring(L"direction (") + std::to_wstring(drow.jobCount) + L")";
+                row.cells[2] = drow.jobCount > 0
+                    ? (std::wstring(Tr(L"指示", L"Direction", L"Dirección")) + L" (" + std::to_wstring(drow.jobCount) + L")")
+                    : std::wstring(Tr(L"指示", L"Direction", L"Dirección"));
                 row.cells[3] = TaskStateLabelWide(drow.directionState);
             }
-            row.cells[4] = Utf8ToWide(drow.resultsCompact);
-            row.cells[5] = L"-";
-            row.cells[6] = L"-";
+            row.cells[4] = TaskResultsSummary(drow.resultsCompact);
+
+            std::wstring startStr = L"-";
+            if (!drow.startTime.empty()) {
+                startStr = Utf8ToWide(TimeOfDayText(drow.startTime));
+            }
+            row.cells[5] = std::move(startStr);
+
+            std::wstring endStr = L"-";
+            if (!drow.endTime.empty()) {
+                endStr = Utf8ToWide(TimeOfDayText(drow.endTime));
+                const int64_t sEpoch = ParseTimestampStrToEpoch(drow.startTime);
+                const int64_t eEpoch = ParseTimestampStrToEpoch(drow.endTime);
+                if (sEpoch > 0 && eEpoch >= sEpoch) {
+                    endStr += L" (" + FormatCompactDuration(eEpoch - sEpoch) + L")";
+                }
+            }
+            row.cells[6] = std::move(endStr);
+
+            if (!drow.runningDetail.empty()) {
+                row.cells[7] = Utf8ToWide(drow.runningDetail);
+            }
+
+            std::wstring originTip;
+            std::wstring originStr;
+            if (drow.jobJson.is_object()) {
+                originStr = TaskQueueOriginDisplay(drow.jobJson.dump(), originTip);
+            }
+            row.cells[10] = std::move(originStr);
+            row.originTip = std::move(originTip);
+            if (!row.cells[10].empty()) ++originCounts[row.cells[10]];
+
+            row.startKey = !drow.startTime.empty() ? ParseTimestampStrToEpoch(drow.startTime) : 0;
+            row.endKey = !drow.endTime.empty() ? ParseTimestampStrToEpoch(drow.endTime) : 0;
+
             row.cells[13] = row.cells[1];
             if (!st->taskSearchText.empty()) {
                 bool matches = false;
@@ -7811,6 +8186,9 @@ static void RefreshTaskQueueData(DashboardState* st, bool force = false, bool us
         row.procId = static_cast<int>(latestPid);
 
         std::wstring idStr = Utf8ToWide(jobId);
+        if (drow.kind == pc::TaskDisplayRowKind::Job && drow.indent > 0) {
+            idStr = L"  " + idStr;
+        }
         // Card 106-5: a summary that was written in the display language shows its original text.
         std::string summaryText = JsonGetString(j, "summary", "");
         const nlohmann::json jobObj = nlohmann::json::parse(j, nullptr, false);
@@ -7821,7 +8199,7 @@ static void RefreshTaskQueueData(DashboardState* st, bool force = false, bool us
         std::wstring kindStr;
         if (jobId.rfind("group:", 0) == 0 || jobId.rfind("direction:", 0) == 0) {
             summaryStr = L"[direction] " + summaryStr;
-            kindStr = L"direction";
+            kindStr = Tr(L"指示", L"Direction", L"Dirección");
         } else if (jobId.rfind("btplan:", 0) == 0) {
             summaryStr = Tr(L"[BT 予定] ", L"[BT Plan] ", L"[Plan BT] ") + summaryStr;
             kindStr = Tr(L"予定 (BT)", L"Planned (BT)", L"Previsto (BT)");
@@ -8127,7 +8505,7 @@ static void RefreshTaskQueueData(DashboardState* st, bool force = false, bool us
     // The header click picks the column, so in flat Job view sort the rows here.
     // In 2-level Task view, keep tasks grouped with their children.
     if (!st->taskViewMode) {
-        SortTaskRows(rows, st->taskSortColumn, st->taskSortDirection);
+        SortTaskRows(rows, keptDisplayRows, st->taskSortColumn, st->taskSortDirection);
     }
     st->taskDisplayRows = std::move(keptDisplayRows);
 
@@ -8380,9 +8758,17 @@ static std::wstring KpiSignature(DashboardState* st) {
                static_cast<long long>(minRemainingSec), tq.running, tq.waiting, tq.pending, tq.blocked,
                tq.succeeded, tq.failed, tq.cancelled, tq.total,
                static_cast<long long>(tq.minRemainingSec), static_cast<long long>(tq.sumRemainingSec));
+    // Bottom KPI cards show task counts in task view; include them (and the view mode)
+    // so a task state change repaints the strip even when the job counts did not change.
+    const pc::TaskViewCounts& tc = st->taskViewCounts;
     return std::wstring(buf) + Utf8ToWide(FormatBytes(memBytes)) + L"|" +
         std::to_wstring(st->pendingTriageTask) + L"|" + std::to_wstring(st->pendingTriageProcess) + L"|" +
-        std::to_wstring(st->autoTriageUnreviewed) + L"|" + std::to_wstring(st->triageFollowUp);
+        std::to_wstring(st->autoTriageUnreviewed) + L"|" + std::to_wstring(st->triageFollowUp) + L"|" +
+        (st->taskViewMode ? L"T" : L"J") + L"|" +
+        std::to_wstring(tc.totalTasks) + L"|" + std::to_wstring(tc.runningTasks) + L"|" +
+        std::to_wstring(tc.waitingTasks) + L"|" + std::to_wstring(tc.succeededTasks) + L"|" +
+        std::to_wstring(tc.failedTasks) + L"|" + std::to_wstring(tc.cancelledTasks) + L"|" +
+        std::to_wstring(tc.closedTasks) + L"|" + std::to_wstring(tc.totalJobs);
 }
 
 static void UpdateTriageFromCore(DashboardState* st);
@@ -8966,12 +9352,14 @@ static void LayoutControls(DashboardState* st, int width, int height) {
     if (!st) return;
     int margin = S(10);
 
-    st->rcKpiArea = {margin, S(kHeaderKpiTop), width - margin, S(kHeaderKpiBottom)};
+    const int activeKpiRows = ActiveKpiRowCount(st);
+    const int kpiBottomPx = KpiRowsBottomPx(activeKpiRows);
+    st->rcKpiArea = {margin, S(kHeaderKpiTop), width - margin, S(kpiBottomPx)};
 
     int usageOffset = 0;
     if (st->showUsagePanel) {
         if (st->usagePanelHeight < 60) st->usagePanelHeight = 60;
-        int usageTop = S(kHeaderKpiBottom + 2);
+        int usageTop = S(kpiBottomPx + 2);
         st->rcUsagePanel = {margin, usageTop, width - margin, usageTop + st->usagePanelHeight};
         st->rcUsageSplitter = {margin, usageTop + st->usagePanelHeight, width - margin, usageTop + st->usagePanelHeight + S(12)};
         usageOffset = st->usagePanelHeight + S(12);
@@ -8990,6 +9378,7 @@ static void LayoutControls(DashboardState* st, int width, int height) {
     const ToolbarButton buttons[] = {
         {st->hwndBtnViewTasks, S(150)},
         {st->hwndBtnSettings, S(90)},
+        {st->hwndBtnRoutines, S(78)},
         {st->hwndBtnKillAll, S(74)},
         {st->hwndBtnGridView, S(28)},
         {st->hwndBtnToggleList, S(28)},
@@ -9000,7 +9389,6 @@ static void LayoutControls(DashboardState* st, int width, int height) {
         {st->hwndBtnUsage, S(28)},
         {st->hwndBtnHideTray, S(28)},
         {st->hwndBtnRefresh, S(28)},
-        {st->hwndBtnReevalPlanned, S(56)},
         {st->hwndBtnHint, S(28)},
         {st->hwndBtnHistory, S(28)},
         {st->hwndBtnIpmsg, S(28)},
@@ -9008,8 +9396,9 @@ static void LayoutControls(DashboardState* st, int width, int height) {
     };
     const int gap = S(7);
     int xCur = margin;
-    int yBar = S(kToolbarTop) + usageOffset;
-    const bool toolbarMoved = (width != st->lastToolbarWidth || usageOffset != st->lastToolbarUsageOffset);
+    int yBar = S(KpiToolbarTopPx(activeKpiRows)) + usageOffset;
+    const bool toolbarMoved = (width != st->lastToolbarWidth || usageOffset != st->lastToolbarUsageOffset ||
+                               activeKpiRows != st->lastToolbarKpiRows);
     for (const auto& b : buttons) {
         if (!b.hwnd) continue;
         if (xCur > margin && xCur + b.w > width - margin) {
@@ -9024,6 +9413,7 @@ static void LayoutControls(DashboardState* st, int width, int height) {
     if (toolbarMoved) {
         st->lastToolbarWidth = width;
         st->lastToolbarUsageOffset = usageOffset;
+        st->lastToolbarKpiRows = activeKpiRows;
     }
     st->processListTop = yBar + S(kToolbarH + 6);
 
@@ -9246,6 +9636,20 @@ static void LayoutControls(DashboardState* st, int width, int height) {
             ShowWindow(st->hwndBtnTaskViewMode, SW_HIDE);
         }
     }
+    if (st->hwndBtnCollapseAllTasks) {
+        const int capH = st->rcTaskCaption.bottom - st->rcTaskCaption.top;
+        const int bw = 84;
+        const int bh = (std::max)(18, capH - 4);
+        if (capH > 0 && st->taskCaptionExtraLeft + bw + 8 <= st->rcTaskCaption.right) {
+            SetWindowTextW(st->hwndBtnCollapseAllTasks,
+                Tr(L"全部閉じる", L"Collapse All", L"Contraer todo"));
+            MoveWindow(st->hwndBtnCollapseAllTasks, st->taskCaptionExtraLeft, st->rcTaskCaption.top + 2, bw, bh, TRUE);
+            ShowWindow(st->hwndBtnCollapseAllTasks, SW_SHOW);
+            st->taskCaptionExtraLeft += bw + 8;
+        } else {
+            ShowWindow(st->hwndBtnCollapseAllTasks, SW_HIDE);
+        }
+    }
     // The origin combo follows the task search edit while the search bar is open.
     if (st->hwndTaskOriginCombo) {
         const int capH = st->rcTaskCaption.bottom - st->rcTaskCaption.top;
@@ -9325,6 +9729,14 @@ static void ApplySplitterDragLayout(HWND hwnd, DashboardState* st, POINT pt) {
             GetWindowRect(st->hwndBtnTaskViewMode, &rcBtn);
             MapWindowPoints(nullptr, hwnd, reinterpret_cast<POINT*>(&rcBtn), 2);
             hdwp = DeferWindowPos(hdwp, st->hwndBtnTaskViewMode, nullptr, rcBtn.left, taskTop + 2,
+                                  rcBtn.right - rcBtn.left, rcBtn.bottom - rcBtn.top,
+                                  SWP_NOZORDER | SWP_NOACTIVATE | SWP_NOCOPYBITS);
+        }
+        if (hdwp && st->hwndBtnCollapseAllTasks && IsWindowVisible(st->hwndBtnCollapseAllTasks)) {
+            RECT rcBtn = {};
+            GetWindowRect(st->hwndBtnCollapseAllTasks, &rcBtn);
+            MapWindowPoints(nullptr, hwnd, reinterpret_cast<POINT*>(&rcBtn), 2);
+            hdwp = DeferWindowPos(hdwp, st->hwndBtnCollapseAllTasks, nullptr, rcBtn.left, taskTop + 2,
                                   rcBtn.right - rcBtn.left, rcBtn.bottom - rcBtn.top,
                                   SWP_NOZORDER | SWP_NOACTIVATE | SWP_NOCOPYBITS);
         }
@@ -9640,7 +10052,7 @@ static void ApplySplitterDragLayout(HWND hwnd, DashboardState* st, POINT pt) {
     }
 
     if (st->usageSplitterDragging) {
-        int usageTop = S(kHeaderKpiBottom + 2);
+        int usageTop = S(KpiRowsBottomPx(ActiveKpiRowCount(st)) + 2);
         int newH = pt.y - usageTop;
         if (newH < 60) newH = 60;
         if (newH > 400) newH = 400;
@@ -9657,7 +10069,7 @@ static void ApplySplitterDragLayout(HWND hwnd, DashboardState* st, POINT pt) {
         rcDirty.top -= 2; rcDirty.bottom += 2;
         InvalidateRect(hwnd, &rcDirty, FALSE);
 
-        RECT rcToolbar = {0, S(kToolbarTop), rcClient.right, st->processListTop};
+        RECT rcToolbar = {0, S(KpiToolbarTopPx(ActiveKpiRowCount(st))), rcClient.right, st->processListTop};
         InvalidateRect(hwnd, &rcToolbar, FALSE);
         return;
     }
@@ -13579,6 +13991,9 @@ static void LoadShellConfig(DashboardState* st) {
     st->cmdCommand = "cmd.exe";
     st->powershellCommand = "powershell.exe";
     st->bashCommand = GetDefaultBashCommand();
+    st->showProcessKpiRow = true;
+    st->showTaskKpiRow = true;
+    st->showJobKpiRow = true;
 
     std::string content;
     nlohmann::json req = {{"action", "config_get"}};
@@ -13650,6 +14065,9 @@ static void LoadShellConfig(DashboardState* st) {
     st->hideProcessList = JsonGetBool(content, "hide_process_list", false);
     st->hideTerminalGrid = JsonGetBool(content, "hide_terminal_grid", true);
     st->taskViewMode = JsonGetBool(content, "task_view_mode", true);
+    st->showProcessKpiRow = JsonGetBool(content, "show_process_kpi_row", true);
+    st->showTaskKpiRow = JsonGetBool(content, "show_task_kpi_row", true);
+    st->showJobKpiRow = JsonGetBool(content, "show_job_kpi_row", true);
     st->notifyTerminalSessions = JsonGetBool(content, "terminal_notify", true);
     // The standalone dashboard no longer embeds the WCSP client. Terminals are
     // shown by the separate terminal client window (Hancho.exe terminal).
@@ -13851,6 +14269,9 @@ static void SaveShellConfig(const DashboardState* st) {
         << "  \"translate_mode\": \"" << JsonEscape(st->translateMode) << "\",\n"
         << "  \"translate_cards\": \"" << JsonEscape(st->translateCards) << "\",\n"
         << "  \"task_view_mode\": " << (st->taskViewMode ? "true" : "false") << ",\n"
+        << "  \"show_process_kpi_row\": " << (st->showProcessKpiRow ? "true" : "false") << ",\n"
+        << "  \"show_task_kpi_row\": " << (st->showTaskKpiRow ? "true" : "false") << ",\n"
+        << "  \"show_job_kpi_row\": " << (st->showJobKpiRow ? "true" : "false") << ",\n"
         << "  \"display_scale_dpi\": " << st->displayScaleDpi << ",\n"
        << "  \"show_supervisor_hints\": " << (st->showSupervisorHints ? "true" : "false") << ",\n"
        << "  \"hint_auto_dismiss_sec\": " << st->hintAutoDismissSec << ",\n"
@@ -13975,6 +14396,8 @@ static void UpdateClock(DashboardState* st) {
 
 static void UpdateToolbarLabels(DashboardState* st) {
     if (!st) return;
+    if (st->hwndBtnRoutines)
+        SetWindowTextW(st->hwndBtnRoutines, Tr(L"ルーチン", L"Routines", L"Rutinas"));
     if (st->hwndBtnSettings)
         SetWindowTextW(st->hwndBtnSettings, Tr(L"設定", L"Settings", L"Ajustes"));
     if (st->hwndBtnKillAll)
@@ -13995,8 +14418,8 @@ static void UpdateToolbarLabels(DashboardState* st) {
         SetWindowTextW(st->hwndBtnHistory, L"🩺");
     if (st->hwndBtnIpmsg)
         SetWindowTextW(st->hwndBtnIpmsg, L"💬");
-    if (st->hwndBtnReevalPlanned)
-        SetWindowTextW(st->hwndBtnReevalPlanned, Tr(L"予定↻", L"Plan↻", L"Prev↻"));
+    if (st->hwndBtnCollapseAllTasks)
+        SetWindowTextW(st->hwndBtnCollapseAllTasks, Tr(L"全部閉じる", L"Collapse All", L"Contraer todo"));
 
     if (st->hwndToolbarTip) {
         if (st->hwndBtnGridView)
@@ -14671,7 +15094,7 @@ static int ThemeButtonId(UiTheme theme) {
     }
 }
 
-static constexpr int kSettingsTabCount = 11;
+static constexpr int kSettingsTabCount = 12;
 
 struct SettingsDlgState {
     DashboardState* dash = nullptr;
@@ -14780,10 +15203,13 @@ struct SettingsDlgState {
         HWND lblWebUiUrl = nullptr;
        HWND editWebUiUrl = nullptr;
        nlohmann::json webuiConfig;
-       HWND lblProcFont = nullptr;
-       HWND cmbProcFont = nullptr;
-        HWND lblTaskFont = nullptr;
-        HWND cmbTaskFont = nullptr;
+    HWND lblProcFont = nullptr;
+    HWND cmbProcFont = nullptr;
+     HWND lblTaskFont = nullptr;
+     HWND cmbTaskFont = nullptr;
+     HWND chkShowProcessKpi = nullptr;
+     HWND chkShowTaskKpi = nullptr;
+     HWND chkShowJobKpi = nullptr;
     HWND lblTranslateCards = nullptr;
     HWND cmbTranslateCards = nullptr;
     HWND chkTranslateMode = nullptr;
@@ -14800,6 +15226,11 @@ struct SettingsDlgState {
         HWND lblLlmTitle = nullptr;
         HWND cmbLlmList = nullptr;
         HWND lstLlmRows = nullptr;
+        HWND lblLlmEngine = nullptr;
+        HWND lblLlmModel = nullptr;
+        HWND lblLlmProvider = nullptr;
+        HWND lblLlmRank = nullptr;
+        HWND lblLlmNote = nullptr;
         HWND editLlmEngine = nullptr;
         HWND editLlmModel = nullptr;
         HWND editLlmProvider = nullptr;
@@ -15666,6 +16097,788 @@ static void ShowTermSessionsDialog(DashboardState* st) {
     ShowWindow(hwnd, SW_SHOW);
     SetForegroundWindow(hwnd);
 }
+
+// ---------------------------------------------------------------------------
+// Routine Management Dialog
+// ---------------------------------------------------------------------------
+
+struct RoutineRowData {
+    std::string name;
+    std::string status;       // "approved", "proposed", "rejected"
+    std::string summary;
+    std::string scope;
+    std::string state;        // "ok", "stale", etc.
+    std::string lastRunState; // e.g. "succeeded" or "-"
+    std::string lastRunId;
+    std::string lastRunStartedAt;
+    std::string staleIndicator;
+    bool hasProposal = false;
+};
+
+enum RoutineDlgControlId {
+    IDC_ROUTINE_DLG_LIST = 7201,
+    IDC_ROUTINE_DLG_DETAIL = 7202,
+    IDC_ROUTINE_DLG_RUN = 7203,
+    IDC_ROUTINE_DLG_CHECK = 7204,
+    IDC_ROUTINE_DLG_APPROVE = 7205,
+    IDC_ROUTINE_DLG_REJECT = 7206,
+    IDC_ROUTINE_DLG_REFRESH = 7207,
+    IDC_ROUTINE_DLG_CLOSE = 7208,
+};
+
+struct RoutinesDlgState {
+    DashboardState* dash = nullptr;
+    HWND hwnd = nullptr;
+    HWND lblList = nullptr;
+    HWND list = nullptr;
+    HWND lblDetail = nullptr;
+    HWND editDetail = nullptr;
+    HWND btnRun = nullptr;
+    HWND btnCheck = nullptr;
+    HWND btnApprove = nullptr;
+    HWND btnReject = nullptr;
+    HWND btnRefresh = nullptr;
+    HWND btnClose = nullptr;
+
+    std::vector<RoutineRowData> routines;
+    std::string selectedName;
+};
+
+struct RoutinePromptState {
+    HWND edit = nullptr;
+    bool done = false;
+    bool accepted = false;
+    std::wstring text;
+};
+
+static LRESULT CALLBACK RoutinePromptWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
+    auto* state = reinterpret_cast<RoutinePromptState*>(GetWindowLongPtrW(hwnd, GWLP_USERDATA));
+    switch (msg) {
+    case WM_CREATE: {
+        auto* cs = reinterpret_cast<CREATESTRUCTW*>(lParam);
+        state = static_cast<RoutinePromptState*>(cs->lpCreateParams);
+        SetWindowLongPtrW(hwnd, GWLP_USERDATA, reinterpret_cast<LONG_PTR>(state));
+        return 0;
+    }
+    case WM_COMMAND: {
+        if (!state) break;
+        int id = LOWORD(wParam);
+        if (id == IDOK || id == 1) {
+            wchar_t buf[2048] = {};
+            if (state->edit) GetWindowTextW(state->edit, buf, static_cast<int>(std::size(buf)));
+            state->text = buf;
+            state->accepted = true;
+            state->done = true;
+            DestroyWindow(hwnd);
+            return 0;
+        }
+        if (id == IDCANCEL || id == 2) {
+            state->accepted = false;
+            state->done = true;
+            DestroyWindow(hwnd);
+            return 0;
+        }
+        break;
+    }
+    case WM_CLOSE:
+        if (state) {
+            state->accepted = false;
+            state->done = true;
+            DestroyWindow(hwnd);
+        }
+        return 0;
+    case WM_CTLCOLORSTATIC:
+    case WM_CTLCOLORBTN: {
+        HDC hdc = reinterpret_cast<HDC>(wParam);
+        SetTextColor(hdc, g_theme.text);
+        SetBkColor(hdc, g_theme.windowBg);
+        SetBkMode(hdc, TRANSPARENT);
+        return reinterpret_cast<LRESULT>(g_dialogBgBrush ? g_dialogBgBrush : GetStockObject(WHITE_BRUSH));
+    }
+    case WM_CTLCOLOREDIT: {
+        HDC hdc = reinterpret_cast<HDC>(wParam);
+        SetTextColor(hdc, g_theme.listText);
+        SetBkColor(hdc, g_theme.panel);
+        return reinterpret_cast<LRESULT>(g_dialogBgBrush ? g_dialogBgBrush : GetStockObject(BLACK_BRUSH));
+    }
+    case WM_ERASEBKGND: {
+        HDC hdc = reinterpret_cast<HDC>(wParam);
+        RECT rc = {};
+        GetClientRect(hwnd, &rc);
+        FillRect(hdc, &rc, g_dialogBgBrush ? g_dialogBgBrush : reinterpret_cast<HBRUSH>(COLOR_BTNFACE + 1));
+        return 1;
+    }
+    default:
+        break;
+    }
+    return DefWindowProcW(hwnd, msg, wParam, lParam);
+}
+
+static bool ShowRoutinePromptDialog(HWND parent, const std::wstring& title,
+                                    const std::wstring& promptLabel,
+                                    const std::wstring& defaultVal,
+                                    std::wstring& outText) {
+    static bool registered = false;
+    HINSTANCE hInst = GetModuleHandleW(nullptr);
+    if (!registered) {
+        WNDCLASSEXW wc = {};
+        wc.cbSize = sizeof(wc);
+        wc.lpfnWndProc = RoutinePromptWndProc;
+        wc.hInstance = hInst;
+        wc.hCursor = LoadCursorW(nullptr, IDC_ARROW);
+        wc.hbrBackground = g_dialogBgBrush;
+        wc.lpszClassName = L"HanchoRoutinePromptWnd";
+        RegisterClassExW(&wc);
+        registered = true;
+    }
+    RoutinePromptState state;
+    RECT owner = {};
+    GetWindowRect(parent, &owner);
+    int dlgW = 480;
+    int dlgH = 180;
+    int x = owner.left + ((owner.right - owner.left) - dlgW) / 2;
+    int y = owner.top + ((owner.bottom - owner.top) - dlgH) / 2;
+    HWND dialog = CreateWindowExW(WS_EX_DLGMODALFRAME, L"HanchoRoutinePromptWnd",
+        title.c_str(), WS_CAPTION | WS_SYSMENU | WS_POPUP,
+        x, y, dlgW, dlgH, parent, nullptr, hInst, &state);
+    if (!dialog) return false;
+
+    HWND lbl = CreateWindowExW(0, L"STATIC", promptLabel.c_str(),
+        WS_CHILD | WS_VISIBLE, 16, 16, dlgW - 48, 36, dialog, nullptr, hInst, nullptr);
+    state.edit = CreateWindowExW(WS_EX_CLIENTEDGE, L"EDIT", defaultVal.c_str(),
+        WS_CHILD | WS_VISIBLE | WS_TABSTOP | ES_AUTOHSCROLL,
+        16, 56, dlgW - 48, 26, dialog, nullptr, hInst, nullptr);
+    HWND btnOk = CreateWindowExW(0, L"BUTTON", Tr(L"OK", L"OK", L"Aceptar"),
+        WS_CHILD | WS_VISIBLE | WS_TABSTOP | BS_DEFPUSHBUTTON,
+        dlgW - 210, 96, 88, 28, dialog, reinterpret_cast<HMENU>(1), hInst, nullptr);
+    HWND btnCancel = CreateWindowExW(0, L"BUTTON", Tr(L"キャンセル", L"Cancel", L"Cancelar"),
+        WS_CHILD | WS_VISIBLE | WS_TABSTOP | BS_PUSHBUTTON,
+        dlgW - 110, 96, 88, 28, dialog, reinterpret_cast<HMENU>(2), hInst, nullptr);
+
+    HFONT hFont = static_cast<HFONT>(GetStockObject(DEFAULT_GUI_FONT));
+    for (HWND h : {lbl, state.edit, btnOk, btnCancel}) {
+        if (h && hFont) SendMessageW(h, WM_SETFONT, reinterpret_cast<WPARAM>(hFont), TRUE);
+    }
+    ApplyDashboardNativeTheme(dialog);
+    ApplyNativeControlTheme(state.edit, IsDarkThemeActive());
+
+    EnableWindow(parent, FALSE);
+    ShowWindow(dialog, SW_SHOW);
+    SetForegroundWindow(dialog);
+    if (state.edit) {
+        SetFocus(state.edit);
+        SendMessageW(state.edit, EM_SETSEL, 0, -1);
+    }
+
+    MSG msg;
+    while (!state.done && GetMessageW(&msg, nullptr, 0, 0) > 0) {
+        if (msg.message == WM_KEYDOWN) {
+            if (msg.wParam == VK_RETURN) {
+                SendMessageW(dialog, WM_COMMAND, MAKEWPARAM(1, 0), 0);
+                continue;
+            }
+            if (msg.wParam == VK_ESCAPE) {
+                SendMessageW(dialog, WM_COMMAND, MAKEWPARAM(2, 0), 0);
+                continue;
+            }
+        }
+        if (!IsDialogMessageW(dialog, &msg)) {
+            TranslateMessage(&msg);
+            DispatchMessageW(&msg);
+        }
+    }
+    EnableWindow(parent, TRUE);
+    SetForegroundWindow(parent);
+    if (state.accepted) {
+        outText = state.text;
+        return true;
+    }
+    return false;
+}
+
+static void UpdateRoutineSelection(RoutinesDlgState* ds, int index);
+
+static void RefreshRoutinesDialog(RoutinesDlgState* ds) {
+    if (!ds || !ds->dash || !ds->list) return;
+    nlohmann::json resp;
+    if (!GuiIpcCall(ds->dash, {{"action", "routine_list"}}, resp) || !resp.value("ok", false)) {
+        return;
+    }
+
+    std::string prevSelected = ds->selectedName;
+    ds->routines.clear();
+    ListView_DeleteAllItems(ds->list);
+
+    if (resp.contains("routines") && resp["routines"].is_array()) {
+        for (const auto& item : resp["routines"]) {
+            if (!item.is_object()) continue;
+            RoutineRowData r;
+            r.name = item.value("name", "");
+            r.status = item.value("status", "approved");
+            r.summary = item.value("summary", "");
+            r.scope = item.value("scope", "project");
+            r.hasProposal = item.value("hasProposal", false);
+            r.state = item.value("state", "ok");
+
+            if (item.contains("lastRun") && item["lastRun"].is_object()) {
+                r.lastRunState = item["lastRun"].value("state", "-");
+                r.lastRunId = item["lastRun"].value("runId", "");
+                r.lastRunStartedAt = item["lastRun"].value("startedAt", "");
+            } else {
+                r.lastRunState = "-";
+            }
+
+            if (r.state == "stale") {
+                int addCount = static_cast<int>(item.value("added", nlohmann::json::array()).size());
+                int remCount = static_cast<int>(item.value("removed", nlohmann::json::array()).size());
+                int chgCount = static_cast<int>(item.value("changed", nlohmann::json::array()).size());
+                r.staleIndicator = "STALE (+" + std::to_string(addCount) + " -" + std::to_string(remCount) + " ~" + std::to_string(chgCount) + ")";
+            } else if (!r.state.empty()) {
+                r.staleIndicator = r.state;
+            } else {
+                r.staleIndicator = "ok";
+            }
+
+            ds->routines.push_back(r);
+        }
+    }
+
+    int selectIdx = -1;
+    for (size_t i = 0; i < ds->routines.size(); ++i) {
+        const auto& r = ds->routines[i];
+        LVITEMW lvi = {};
+        lvi.mask = LVIF_TEXT | LVIF_PARAM;
+        lvi.iItem = static_cast<int>(i);
+        lvi.iSubItem = 0;
+        std::wstring wName = Utf8ToWide(r.name);
+        lvi.pszText = const_cast<wchar_t*>(wName.c_str());
+        lvi.lParam = static_cast<LPARAM>(i);
+        ListView_InsertItem(ds->list, &lvi);
+
+        std::wstring wStatus = Utf8ToWide(r.status);
+        if (r.hasProposal && r.status != "proposed") {
+            wStatus += L" [proposed]";
+        }
+        ListView_SetItemText(ds->list, static_cast<int>(i), 1, const_cast<wchar_t*>(wStatus.c_str()));
+
+        std::wstring wSummary = Utf8ToWide(r.summary);
+        ListView_SetItemText(ds->list, static_cast<int>(i), 2, const_cast<wchar_t*>(wSummary.c_str()));
+
+        std::wstring wLastRun = Utf8ToWide(r.lastRunState);
+        if (!r.lastRunId.empty()) {
+            wLastRun += L" (" + Utf8ToWide(r.lastRunId) + L")";
+        }
+        ListView_SetItemText(ds->list, static_cast<int>(i), 3, const_cast<wchar_t*>(wLastRun.c_str()));
+
+        std::wstring wStale = Utf8ToWide(r.staleIndicator);
+        ListView_SetItemText(ds->list, static_cast<int>(i), 4, const_cast<wchar_t*>(wStale.c_str()));
+
+        if (r.name == prevSelected) {
+            selectIdx = static_cast<int>(i);
+        }
+    }
+
+    if (selectIdx < 0 && !ds->routines.empty()) {
+        selectIdx = 0;
+    }
+
+    if (selectIdx >= 0) {
+        ListView_SetItemState(ds->list, selectIdx, LVIS_SELECTED | LVIS_FOCUSED, LVIS_SELECTED | LVIS_FOCUSED);
+        ListView_EnsureVisible(ds->list, selectIdx, FALSE);
+        UpdateRoutineSelection(ds, selectIdx);
+    } else {
+        ds->selectedName.clear();
+        UpdateRoutineSelection(ds, -1);
+    }
+}
+
+static void UpdateRoutineSelection(RoutinesDlgState* ds, int index) {
+    if (!ds) return;
+    if (index < 0 || index >= static_cast<int>(ds->routines.size())) {
+        ds->selectedName.clear();
+        if (ds->editDetail) SetWindowTextW(ds->editDetail, L"");
+        if (ds->btnRun) EnableWindow(ds->btnRun, FALSE);
+        if (ds->btnCheck) EnableWindow(ds->btnCheck, FALSE);
+        if (ds->btnApprove) EnableWindow(ds->btnApprove, FALSE);
+        if (ds->btnReject) EnableWindow(ds->btnReject, FALSE);
+        return;
+    }
+
+    const auto& r = ds->routines[index];
+    ds->selectedName = r.name;
+
+    if (ds->btnRun) EnableWindow(ds->btnRun, TRUE);
+    if (ds->btnCheck) EnableWindow(ds->btnCheck, TRUE);
+
+    const bool isProposed = (r.status == "proposed" || r.hasProposal);
+    if (ds->btnApprove) EnableWindow(ds->btnApprove, isProposed ? TRUE : FALSE);
+    if (ds->btnReject) EnableWindow(ds->btnReject, isProposed ? TRUE : FALSE);
+
+    nlohmann::json respShow;
+    GuiIpcCall(ds->dash, {{"action", "routine_show"}, {"name", r.name}}, respShow);
+
+    nlohmann::json respCheck;
+    GuiIpcCall(ds->dash, {{"action", "routine_check"}, {"name", r.name}}, respCheck);
+
+    std::wostringstream ss;
+    ss << L"================================================================================\r\n";
+    ss << L"ROUTINE: " << Utf8ToWide(r.name) << L"  [" << Utf8ToWide(r.scope) << L"]\r\n";
+    ss << L"Status:  " << Utf8ToWide(r.status) << (r.hasProposal ? L" (has pending proposal)" : L"") << L"\r\n";
+    ss << L"================================================================================\r\n\r\n";
+
+    std::string summary = r.summary;
+    std::string cwd;
+    std::string notes;
+    std::string btPreview;
+
+    if (respShow.is_object() && respShow.value("ok", false)) {
+        if (respShow.contains("definition") && respShow["definition"].is_object()) {
+            const auto& def = respShow["definition"];
+            if (summary.empty()) summary = def.value("summary", "");
+            cwd = def.value("cwd", "");
+            notes = def.value("notes", "");
+            if (def.contains("bt")) {
+                if (def["bt"].is_string()) {
+                    btPreview = def["bt"].get<std::string>();
+                    auto parsedBt = nlohmann::json::parse(btPreview, nullptr, false);
+                    if (!parsedBt.is_discarded()) {
+                        btPreview = parsedBt.dump(2);
+                    }
+                } else {
+                    btPreview = def["bt"].dump(2);
+                }
+            }
+        }
+    }
+
+    ss << L"[Summary / 概要]\r\n" << (summary.empty() ? L"(none)" : Utf8ToWide(summary)) << L"\r\n\r\n";
+    ss << L"[Working Directory / 作業ディレクトリ (cwd)]\r\n" << (cwd.empty() ? L"(project root)" : Utf8ToWide(cwd)) << L"\r\n\r\n";
+    ss << L"[Notes / メモ]\r\n" << (notes.empty() ? L"(none)" : Utf8ToWide(notes)) << L"\r\n\r\n";
+
+    ss << L"[Stale Input Diff / 入力差分]\r\n";
+    std::string diffState = "ok";
+    nlohmann::json added = nlohmann::json::array();
+    nlohmann::json removed = nlohmann::json::array();
+    nlohmann::json changed = nlohmann::json::array();
+    nlohmann::json absorbed = nlohmann::json::array();
+
+    if (respCheck.is_object() && respCheck.value("ok", false)) {
+        diffState = respCheck.value("state", "ok");
+        added = respCheck.value("added", nlohmann::json::array());
+        removed = respCheck.value("removed", nlohmann::json::array());
+        changed = respCheck.value("changed", nlohmann::json::array());
+        absorbed = respCheck.value("absorbed", nlohmann::json::array());
+    } else if (respShow.is_object() && respShow.contains("state")) {
+        diffState = respShow.value("state", "ok");
+        added = respShow.value("added", nlohmann::json::array());
+        removed = respShow.value("removed", nlohmann::json::array());
+        changed = respShow.value("changed", nlohmann::json::array());
+        absorbed = respShow.value("absorbed", nlohmann::json::array());
+    }
+
+    ss << L"State: " << Utf8ToWide(diffState) << L"\r\n";
+    if (diffState == "stale") {
+        ss << L"  Added:    " << Utf8ToWide(added.dump()) << L"\r\n";
+        ss << L"  Removed:  " << Utf8ToWide(removed.dump()) << L"\r\n";
+        ss << L"  Changed:  " << Utf8ToWide(changed.dump()) << L"\r\n";
+        ss << L"  Absorbed: " << Utf8ToWide(absorbed.dump()) << L"\r\n";
+    } else {
+        ss << L"  Inputs are up to date.\r\n";
+    }
+    ss << L"\r\n";
+
+    ss << L"[Last Run / 最終実行]\r\n";
+    if (!r.lastRunId.empty() || r.lastRunState != "-") {
+        ss << L"  Run ID:     " << Utf8ToWide(r.lastRunId) << L"\r\n";
+        ss << L"  State:      " << Utf8ToWide(r.lastRunState) << L"\r\n";
+        ss << L"  Started At: " << Utf8ToWide(r.lastRunStartedAt) << L"\r\n";
+    } else {
+        ss << L"  (never run)\r\n";
+    }
+    ss << L"\r\n";
+
+    ss << L"[BT Definition Preview / BT 定義プレビュー]\r\n";
+    if (!btPreview.empty()) {
+        ss << Utf8ToWide(btPreview) << L"\r\n";
+    } else {
+        ss << L"(no behavior tree definition available)\r\n";
+    }
+
+    if (ds->editDetail) {
+        SetWindowTextW(ds->editDetail, ss.str().c_str());
+    }
+}
+
+static void LayoutRoutinesDialog(RoutinesDlgState* ds, int width, int height) {
+    if (!ds) return;
+    const int margin = 12;
+    const int gap = 10;
+    const int btnH = 28;
+    const int btnW = 80;
+    const int bottomAreaH = btnH + margin * 2;
+
+    int contentH = (std::max)(100, height - bottomAreaH - margin);
+    int listW = (std::max)(280, (width - margin * 2 - gap) * 45 / 100);
+    int detailX = margin + listW + gap;
+    int detailW = (std::max)(200, width - detailX - margin);
+
+    if (ds->lblList) MoveWindow(ds->lblList, margin, margin, listW, 18, TRUE);
+    if (ds->list) MoveWindow(ds->list, margin, margin + 22, listW, contentH - 22, TRUE);
+
+    if (ds->lblDetail) MoveWindow(ds->lblDetail, detailX, margin, detailW, 18, TRUE);
+    if (ds->editDetail) MoveWindow(ds->editDetail, detailX, margin + 22, detailW, contentH - 22, TRUE);
+
+    int btnY = height - margin - btnH;
+    int curBtnX = margin;
+    HWND btns[] = {ds->btnRun, ds->btnCheck, ds->btnApprove, ds->btnReject, ds->btnRefresh};
+    for (HWND b : btns) {
+        if (b) {
+            MoveWindow(b, curBtnX, btnY, btnW, btnH, TRUE);
+            curBtnX += btnW + gap;
+        }
+    }
+    if (ds->btnClose) {
+        MoveWindow(ds->btnClose, width - margin - btnW, btnY, btnW, btnH, TRUE);
+    }
+}
+
+static LRESULT CALLBACK RoutinesWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
+    auto* ds = reinterpret_cast<RoutinesDlgState*>(GetWindowLongPtrW(hwnd, GWLP_USERDATA));
+    switch (msg) {
+    case WM_CREATE: {
+        auto* cs = reinterpret_cast<CREATESTRUCTW*>(lParam);
+        ds = static_cast<RoutinesDlgState*>(cs->lpCreateParams);
+        ds->hwnd = hwnd;
+        SetWindowLongPtrW(hwnd, GWLP_USERDATA, reinterpret_cast<LONG_PTR>(ds));
+        HINSTANCE hInst = cs->hInstance;
+
+        ds->lblList = CreateWindowExW(0, L"STATIC",
+            Tr(L"ルーチン一覧", L"Routines", L"Rutinas"),
+            WS_CHILD | WS_VISIBLE, 0, 0, 10, 10, hwnd, nullptr, hInst, nullptr);
+
+        ds->list = CreateWindowExW(WS_EX_CLIENTEDGE, WC_LISTVIEWW, L"",
+            WS_CHILD | WS_VISIBLE | WS_TABSTOP | LVS_REPORT | LVS_SINGLESEL | LVS_SHOWSELALWAYS,
+            0, 0, 10, 10, hwnd, reinterpret_cast<HMENU>(static_cast<INT_PTR>(IDC_ROUTINE_DLG_LIST)), hInst, nullptr);
+        ListView_SetExtendedListViewStyle(ds->list, LVS_EX_FULLROWSELECT | LVS_EX_DOUBLEBUFFER | LVS_EX_INFOTIP);
+
+        const struct { const wchar_t* title; int width; } cols[] = {
+            {Tr(L"名前", L"Name", L"Nombre"), 130},
+            {Tr(L"状態", L"Status", L"Estado"), 85},
+            {Tr(L"概要", L"Summary", L"Resumen"), 200},
+            {Tr(L"最終実行", L"Last Run", L"Última ejec."), 130},
+            {Tr(L"入力差分", L"Stale / Inputs", L"Diferencia"), 110}
+        };
+        for (int i = 0; i < 5; ++i) {
+            LVCOLUMNW lvc = {};
+            lvc.mask = LVCF_TEXT | LVCF_WIDTH | LVCF_SUBITEM;
+            lvc.pszText = const_cast<wchar_t*>(cols[i].title);
+            lvc.cx = cols[i].width;
+            lvc.iSubItem = i;
+            ListView_InsertColumn(ds->list, i, &lvc);
+        }
+
+        ds->lblDetail = CreateWindowExW(0, L"STATIC",
+            Tr(L"詳細・プレビュー", L"Details & Preview", L"Detalles y vista previa"),
+            WS_CHILD | WS_VISIBLE, 0, 0, 10, 10, hwnd, nullptr, hInst, nullptr);
+
+        ds->editDetail = CreateWindowExW(WS_EX_CLIENTEDGE, L"EDIT", L"",
+            WS_CHILD | WS_VISIBLE | WS_TABSTOP | WS_VSCROLL | WS_HSCROLL | ES_MULTILINE | ES_READONLY | ES_AUTOVSCROLL | ES_AUTOHSCROLL,
+            0, 0, 10, 10, hwnd, reinterpret_cast<HMENU>(static_cast<INT_PTR>(IDC_ROUTINE_DLG_DETAIL)), hInst, nullptr);
+
+        ds->btnRun = CreateWindowExW(0, L"BUTTON",
+            Tr(L"実行", L"Run", L"Ejecutar"),
+            WS_CHILD | WS_VISIBLE | WS_TABSTOP | BS_PUSHBUTTON,
+            0, 0, 10, 10, hwnd, reinterpret_cast<HMENU>(static_cast<INT_PTR>(IDC_ROUTINE_DLG_RUN)), hInst, nullptr);
+
+        ds->btnCheck = CreateWindowExW(0, L"BUTTON",
+            Tr(L"確認", L"Check", L"Comprobar"),
+            WS_CHILD | WS_VISIBLE | WS_TABSTOP | BS_PUSHBUTTON,
+            0, 0, 10, 10, hwnd, reinterpret_cast<HMENU>(static_cast<INT_PTR>(IDC_ROUTINE_DLG_CHECK)), hInst, nullptr);
+
+        ds->btnApprove = CreateWindowExW(0, L"BUTTON",
+            Tr(L"承認", L"Approve", L"Aprobar"),
+            WS_CHILD | WS_VISIBLE | WS_TABSTOP | BS_PUSHBUTTON,
+            0, 0, 10, 10, hwnd, reinterpret_cast<HMENU>(static_cast<INT_PTR>(IDC_ROUTINE_DLG_APPROVE)), hInst, nullptr);
+
+        ds->btnReject = CreateWindowExW(0, L"BUTTON",
+            Tr(L"却下", L"Reject", L"Rechazar"),
+            WS_CHILD | WS_VISIBLE | WS_TABSTOP | BS_PUSHBUTTON,
+            0, 0, 10, 10, hwnd, reinterpret_cast<HMENU>(static_cast<INT_PTR>(IDC_ROUTINE_DLG_REJECT)), hInst, nullptr);
+
+        ds->btnRefresh = CreateWindowExW(0, L"BUTTON",
+            Tr(L"更新", L"Refresh", L"Actualizar"),
+            WS_CHILD | WS_VISIBLE | WS_TABSTOP | BS_PUSHBUTTON,
+            0, 0, 10, 10, hwnd, reinterpret_cast<HMENU>(static_cast<INT_PTR>(IDC_ROUTINE_DLG_REFRESH)), hInst, nullptr);
+
+        ds->btnClose = CreateWindowExW(0, L"BUTTON",
+            Tr(L"閉じる", L"Close", L"Cerrar"),
+            WS_CHILD | WS_VISIBLE | WS_TABSTOP | BS_PUSHBUTTON,
+            0, 0, 10, 10, hwnd, reinterpret_cast<HMENU>(static_cast<INT_PTR>(IDC_ROUTINE_DLG_CLOSE)), hInst, nullptr);
+
+        HFONT hUiFont = ds->dash ? ds->dash->hFontUi : nullptr;
+        HFONT hBoldFont = ds->dash ? ds->dash->hFontUiBold : nullptr;
+        for (HWND c : {ds->list, ds->editDetail, ds->btnRun, ds->btnCheck, ds->btnApprove, ds->btnReject, ds->btnRefresh, ds->btnClose}) {
+            if (c && hUiFont) SendMessageW(c, WM_SETFONT, reinterpret_cast<WPARAM>(hUiFont), TRUE);
+        }
+        for (HWND c : {ds->lblList, ds->lblDetail}) {
+            if (c && (hBoldFont ? hBoldFont : hUiFont)) SendMessageW(c, WM_SETFONT, reinterpret_cast<WPARAM>(hBoldFont ? hBoldFont : hUiFont), TRUE);
+        }
+
+        ApplyDashboardNativeTheme(hwnd);
+        ApplyNativeControlTheme(ds->list, IsDarkThemeActive());
+        if (HWND header = ListView_GetHeader(ds->list)) {
+            ApplyNativeControlTheme(header, IsDarkThemeActive());
+        }
+        ApplyNativeControlTheme(ds->editDetail, IsDarkThemeActive());
+        ListView_SetBkColor(ds->list, g_theme.panel);
+        ListView_SetTextBkColor(ds->list, g_theme.panel);
+        ListView_SetTextColor(ds->list, g_theme.listText);
+
+        RECT rc = {};
+        GetClientRect(hwnd, &rc);
+        LayoutRoutinesDialog(ds, rc.right, rc.bottom);
+        RefreshRoutinesDialog(ds);
+        return 0;
+    }
+    case WM_SIZE: {
+        if (ds) LayoutRoutinesDialog(ds, LOWORD(lParam), HIWORD(lParam));
+        return 0;
+    }
+    case WM_NOTIFY: {
+        auto* nm = reinterpret_cast<NMHDR*>(lParam);
+        if (ds && nm->idFrom == IDC_ROUTINE_DLG_LIST) {
+            if (nm->code == LVN_ITEMCHANGED) {
+                auto* nmlv = reinterpret_cast<NMLISTVIEW*>(lParam);
+                if ((nmlv->uChanged & LVIF_STATE) && (nmlv->uNewState & LVIS_SELECTED)) {
+                    UpdateRoutineSelection(ds, nmlv->iItem);
+                }
+            } else if (nm->code == NM_DBLCLK) {
+                SendMessageW(hwnd, WM_COMMAND, MAKEWPARAM(IDC_ROUTINE_DLG_RUN, 0), 0);
+            }
+        }
+        break;
+    }
+    case WM_COMMAND: {
+        if (!ds) break;
+        const int id = LOWORD(wParam);
+        if (id == IDC_ROUTINE_DLG_REFRESH) {
+            RefreshRoutinesDialog(ds);
+            return 0;
+        }
+        if (id == IDC_ROUTINE_DLG_CLOSE || id == IDCANCEL) {
+            DestroyWindow(hwnd);
+            return 0;
+        }
+        if (id == IDC_ROUTINE_DLG_RUN) {
+            if (ds->selectedName.empty()) return 0;
+            nlohmann::json resp;
+            if (GuiIpcCall(ds->dash, {{"action", "routine_run"}, {"name", ds->selectedName}, {"wait", false}}, resp) &&
+                resp.value("ok", false)) {
+                std::string runId = resp.value("runId", "");
+                std::wstring startMsg = Tr(L"ルーチンを開始しました: ", L"Routine started: ", L"Rutina iniciada: ") + Utf8ToWide(runId);
+                gui_platform::GetGuiPlatform()->ShowMessageBox(hwnd,
+                    Tr(L"ルーチン実行", L"Routine Run", L"Ejecutar rutina"),
+                    startMsg, gui_platform::MessageBoxType::Info);
+                RefreshRoutinesDialog(ds);
+            } else {
+                std::string err = resp.value("error", "Failed to run routine");
+                gui_platform::GetGuiPlatform()->ShowMessageBox(hwnd,
+                    Tr(L"エラー", L"Error", L"Error"),
+                    Utf8ToWide(err), gui_platform::MessageBoxType::Error);
+            }
+            return 0;
+        }
+        if (id == IDC_ROUTINE_DLG_CHECK) {
+            if (ds->selectedName.empty()) return 0;
+            nlohmann::json resp;
+            if (GuiIpcCall(ds->dash, {{"action", "routine_check"}, {"name", ds->selectedName}}, resp) &&
+                resp.value("ok", false)) {
+                int curSel = ListView_GetNextItem(ds->list, -1, LVNI_SELECTED);
+                UpdateRoutineSelection(ds, curSel);
+                std::string state = resp.value("state", "ok");
+                if (state == "stale") {
+                    gui_platform::GetGuiPlatform()->ShowMessageBox(hwnd,
+                        Tr(L"ルーチン確認", L"Routine Check", L"Comprobar rutina"),
+                        Tr(L"ルーチンの入力が古くなっています (STALE)。詳細を確認してください。",
+                           L"Routine inputs are stale. Please check details.",
+                           L"Las entradas de la rutina están obsoletas (STALE). Revise los detalles."),
+                        gui_platform::MessageBoxType::Warning);
+                } else {
+                    gui_platform::GetGuiPlatform()->ShowMessageBox(hwnd,
+                        Tr(L"ルーチン確認", L"Routine Check", L"Comprobar rutina"),
+                        Tr(L"ルーチンの入力は最新です (OK)。",
+                           L"Routine inputs are up to date (OK).",
+                           L"Las entradas de la rutina están actualizadas (OK)."),
+                        gui_platform::MessageBoxType::Info);
+                }
+            } else {
+                std::string err = resp.value("error", "Failed to check routine");
+                gui_platform::GetGuiPlatform()->ShowMessageBox(hwnd,
+                    Tr(L"エラー", L"Error", L"Error"),
+                    Utf8ToWide(err), gui_platform::MessageBoxType::Error);
+            }
+            return 0;
+        }
+        if (id == IDC_ROUTINE_DLG_APPROVE) {
+            if (ds->selectedName.empty()) return 0;
+            std::wstring userSaid = Tr(L"承認する", L"Approved", L"Aprobado");
+            if (ShowRoutinePromptDialog(hwnd,
+                Tr(L"ルーチンの承認", L"Approve Routine", L"Aprobar rutina"),
+                Tr(L"承認の言葉を入力してください（空欄で拒否）:", L"Enter approval statement (leave empty to cancel):", L"Ingrese la declaración de aprobación:"),
+                userSaid, userSaid)) {
+                nlohmann::json resp;
+                if (GuiIpcCall(ds->dash, {
+                    {"action", "routine_approve"},
+                    {"name", ds->selectedName},
+                    {"userSaid", WideToUtf8(userSaid)},
+                    {"by", "user"},
+                    {"via", "gui"}
+                }, resp) && resp.value("ok", false)) {
+                    gui_platform::GetGuiPlatform()->ShowMessageBox(hwnd,
+                        Tr(L"ルーチン承認", L"Approve Routine", L"Aprobar rutina"),
+                        Tr(L"ルーチンを承認しました。", L"Routine approved.", L"Rutina aprobada."),
+                        gui_platform::MessageBoxType::Info);
+                    RefreshRoutinesDialog(ds);
+                } else {
+                    std::string err = resp.value("error", "Failed to approve routine");
+                    gui_platform::GetGuiPlatform()->ShowMessageBox(hwnd,
+                        Tr(L"エラー", L"Error", L"Error"),
+                        Utf8ToWide(err), gui_platform::MessageBoxType::Error);
+                }
+            }
+            return 0;
+        }
+        if (id == IDC_ROUTINE_DLG_REJECT) {
+            if (ds->selectedName.empty()) return 0;
+            std::wstring reason;
+            if (ShowRoutinePromptDialog(hwnd,
+                Tr(L"ルーチンの却下", L"Reject Routine", L"Rechazar rutina"),
+                Tr(L"却下の理由を入力してください:", L"Enter rejection reason:", L"Ingrese el motivo del rechazo:"),
+                L"", reason)) {
+                nlohmann::json resp;
+                if (GuiIpcCall(ds->dash, {
+                    {"action", "routine_reject"},
+                    {"name", ds->selectedName},
+                    {"reason", WideToUtf8(reason)},
+                    {"by", "user"}
+                }, resp) && resp.value("ok", false)) {
+                    gui_platform::GetGuiPlatform()->ShowMessageBox(hwnd,
+                        Tr(L"ルーチン却下", L"Reject Routine", L"Rechazar rutina"),
+                        Tr(L"ルーチン提案を却下しました。", L"Routine proposal rejected.", L"Propuesta de rutina rechazada."),
+                        gui_platform::MessageBoxType::Info);
+                    RefreshRoutinesDialog(ds);
+                } else {
+                    std::string err = resp.value("error", "Failed to reject routine");
+                    gui_platform::GetGuiPlatform()->ShowMessageBox(hwnd,
+                        Tr(L"エラー", L"Error", L"Error"),
+                        Utf8ToWide(err), gui_platform::MessageBoxType::Error);
+                }
+            }
+            return 0;
+        }
+        break;
+    }
+    case WM_GETMINMAXINFO: {
+        auto* mmi = reinterpret_cast<MINMAXINFO*>(lParam);
+        mmi->ptMinTrackSize.x = 640;
+        mmi->ptMinTrackSize.y = 440;
+        return 0;
+    }
+    case WM_ERASEBKGND: {
+        RECT rc = {};
+        GetClientRect(hwnd, &rc);
+        FillRect(reinterpret_cast<HDC>(wParam), &rc,
+                 g_dialogBgBrush ? g_dialogBgBrush : reinterpret_cast<HBRUSH>(COLOR_BTNFACE + 1));
+        return 1;
+    }
+    case WM_CTLCOLORSTATIC:
+    case WM_CTLCOLORBTN: {
+        HDC hdc = reinterpret_cast<HDC>(wParam);
+        SetTextColor(hdc, g_theme.text);
+        SetBkColor(hdc, g_theme.windowBg);
+        SetBkMode(hdc, TRANSPARENT);
+        return reinterpret_cast<LRESULT>(g_dialogBgBrush ? g_dialogBgBrush
+                                                         : GetStockObject(WHITE_BRUSH));
+    }
+    case WM_CTLCOLOREDIT: {
+        HDC hdc = reinterpret_cast<HDC>(wParam);
+        SetTextColor(hdc, g_theme.listText);
+        SetBkColor(hdc, g_theme.panel);
+        return reinterpret_cast<LRESULT>(g_dialogBgBrush ? g_dialogBgBrush : GetStockObject(BLACK_BRUSH));
+    }
+    case WM_CLOSE:
+        DestroyWindow(hwnd);
+        return 0;
+    case WM_DESTROY:
+        if (ds) {
+            if (ds->dash && ds->dash->hwndRoutinesDlg == hwnd) {
+                ds->dash->hwndRoutinesDlg = nullptr;
+            }
+            delete ds;
+            SetWindowLongPtrW(hwnd, GWLP_USERDATA, 0);
+        }
+        return 0;
+    default:
+        break;
+    }
+    return DefWindowProcW(hwnd, msg, wParam, lParam);
+}
+
+static void ShowRoutinesDialog(DashboardState* st) {
+    if (!st) return;
+    if (st->hwndRoutinesDlg && IsWindow(st->hwndRoutinesDlg)) {
+        if (IsIconic(st->hwndRoutinesDlg)) ShowWindow(st->hwndRoutinesDlg, SW_RESTORE);
+        else ShowWindow(st->hwndRoutinesDlg, SW_SHOW);
+        SetForegroundWindow(st->hwndRoutinesDlg);
+        return;
+    }
+
+    constexpr const wchar_t* kRoutinesWndClass = L"HanchoRoutinesWnd";
+    static bool registered = false;
+    HINSTANCE hInst = GetModuleHandleW(nullptr);
+    if (!registered) {
+        WNDCLASSEXW wc = {};
+        wc.cbSize = sizeof(wc);
+        wc.style = CS_HREDRAW | CS_VREDRAW;
+        wc.lpfnWndProc = RoutinesWndProc;
+        wc.hInstance = hInst;
+        wc.hCursor = LoadCursorW(nullptr, IDC_ARROW);
+        wc.hbrBackground = g_dialogBgBrush ? g_dialogBgBrush : reinterpret_cast<HBRUSH>(COLOR_BTNFACE + 1);
+        wc.lpszClassName = kRoutinesWndClass;
+        RegisterClassExW(&wc);
+        registered = true;
+    }
+
+    auto* ds = new RoutinesDlgState();
+    ds->dash = st;
+
+    RECT rc = {};
+    if (st->hwndMain && IsWindow(st->hwndMain)) {
+        GetWindowRect(st->hwndMain, &rc);
+    } else {
+        SystemParametersInfoW(SPI_GETWORKAREA, 0, &rc, 0);
+    }
+
+    const int width = 960;
+    const int height = 620;
+    const int x = rc.left + ((rc.right - rc.left) - width) / 2;
+    const int y = rc.top + ((rc.bottom - rc.top) - height) / 2;
+
+    HWND hwnd = CreateWindowExW(
+        WS_EX_DLGMODALFRAME,
+        kRoutinesWndClass,
+        Tr(L"ルーチン管理", L"Routine Management", L"Gestión de rutinas"),
+        WS_OVERLAPPEDWINDOW | WS_CLIPCHILDREN | WS_VISIBLE,
+        x, y, width, height,
+        st->hwndMain, nullptr, hInst, ds);
+    if (!hwnd) {
+        delete ds;
+        return;
+    }
+    st->hwndRoutinesDlg = hwnd;
+    ShowWindow(hwnd, SW_SHOW);
+    SetForegroundWindow(hwnd);
+}
 // Shows the controls of one tab page and hides the rest.
 static void SelectSettingsTab(SettingsDlgState* ds, int tab) {
     if (!ds) return;
@@ -16008,10 +17221,33 @@ static void UpdateSettingsDialogTexts(HWND hwnd) {
     SetWindowTextW(ds->chkResourceLocks, Tr(L"タスクキュー: リソースが競合するジョブを同時に実行しない", L"Task queue: never run jobs with conflicting resources together", L"Cola de tareas: no ejecutar a la vez trabajos con recursos en conflicto"));
     SetWindowTextW(ds->chkActivityStyle, Tr(L"実行状態監視ペイン: 行を色分けし、アイコンを表示", L"Execution monitor pane: colour rows and show icons", L"Panel de ejecución: colorear filas y mostrar iconos"));
     SetWindowTextW(ds->chkShowHiddenTasks, Tr(L"hidden タスクも表示", L"Show hidden tasks", L"Mostrar tareas ocultas"));
+    if (ds->chkShowProcessKpi) {
+        SetWindowTextW(ds->chkShowProcessKpi,
+            Tr(L"プロセス KPI 行を表示", L"Show Process KPI row", L"Mostrar fila KPI de procesos"));
+    }
+    if (ds->chkShowTaskKpi) {
+        SetWindowTextW(ds->chkShowTaskKpi,
+            Tr(L"タスク KPI 行を表示", L"Show Task KPI row", L"Mostrar fila KPI de tareas"));
+    }
+    if (ds->chkShowJobKpi) {
+        SetWindowTextW(ds->chkShowJobKpi,
+            Tr(L"ジョブ KPI 行を表示", L"Show Job KPI row", L"Mostrar fila KPI de trabajos"));
+    }
     SetWindowTextW(ds->btnClose, Tr(L"閉じる", L"Close", L"Cerrar"));
     SetWindowTextW(ds->lblLlmTitle, Tr(L"LLM リスト（agent / consult / supervisor は独立）",
                                       L"LLM lists (agent / consult / supervisor are independent)",
                                       L"Listas LLM (agent / consult / supervisor son independientes)"));
+    SetWindowTextW(ds->lblLlmEngine, Tr(L"エンジン名 (engines.json の名前):",
+                                        L"Engine (name in engines.json):",
+                                        L"Motor (nombre en engines.json):"));
+    SetWindowTextW(ds->lblLlmModel, Tr(L"モデル名 (model):", L"Model:", L"Modelo:"));
+    SetWindowTextW(ds->lblLlmProvider, Tr(L"プロバイダ (空欄なら model から推定):",
+                                          L"Provider (inferred from model if empty):",
+                                          L"Proveedor (del modelo si está vacío):"));
+    SetWindowTextW(ds->lblLlmRank, Tr(L"優先順位 (rank, 小さい数が優先):",
+                                      L"Priority (rank, lower first):",
+                                      L"Prioridad (rank, menor primero):"));
+    SetWindowTextW(ds->lblLlmNote, Tr(L"メモ (note):", L"Note:", L"Nota:"));
     SetWindowTextW(ds->btnLlmAdd, Tr(L"追加", L"Add", L"Añadir"));
     SetWindowTextW(ds->btnLlmRemove, Tr(L"削除", L"Remove", L"Quitar"));
     SetWindowTextW(ds->btnLlmToggle, Tr(L"有効/無効", L"Enable/Disable", L"Activar/Desactivar"));
@@ -16071,6 +17307,7 @@ static void UpdateSettingsDialogTexts(HWND hwnd) {
             Tr(L"版", L"About", L"Acerca de"),
             Tr(L"LLM", L"LLM", L"LLM"),
             Tr(L"権限", L"Permits", L"Permisos"),
+            Tr(L"KPI", L"KPI", L"KPI"),
         };
         for (int t = 0; t < kSettingsTabCount; ++t) {
             std::wstring name = tabNames[t];
@@ -16809,6 +18046,25 @@ static LRESULT CALLBACK SettingsWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPAR
             ds->chkTranslateMode = CreateWindowExW(0, L"BUTTON", L"",
                 WS_CHILD | WS_VISIBLE | WS_TABSTOP | BS_AUTOCHECKBOX,
                 334, 678, 340, 24, hwnd, (HMENU)IDC_SET_TRANSLATE_MODE, hInst, nullptr);
+
+            // KPI page: independent visibility for each KPI row. Changes apply
+            // immediately (relayout + repaint + save) rather than on dialog close.
+            ds->chkShowProcessKpi = CreateWindowExW(0, L"BUTTON", L"",
+                WS_CHILD | WS_VISIBLE | WS_TABSTOP | BS_AUTOCHECKBOX,
+                18, 48, 620, 24, hwnd, (HMENU)IDC_SET_SHOW_PROCESS_KPI, hInst, nullptr);
+            SendMessageW(ds->chkShowProcessKpi, BM_SETCHECK,
+                ds->dash->showProcessKpiRow ? BST_CHECKED : BST_UNCHECKED, 0);
+            ds->chkShowTaskKpi = CreateWindowExW(0, L"BUTTON", L"",
+                WS_CHILD | WS_VISIBLE | WS_TABSTOP | BS_AUTOCHECKBOX,
+                18, 82, 620, 24, hwnd, (HMENU)IDC_SET_SHOW_TASK_KPI, hInst, nullptr);
+            SendMessageW(ds->chkShowTaskKpi, BM_SETCHECK,
+                ds->dash->showTaskKpiRow ? BST_CHECKED : BST_UNCHECKED, 0);
+            ds->chkShowJobKpi = CreateWindowExW(0, L"BUTTON", L"",
+                WS_CHILD | WS_VISIBLE | WS_TABSTOP | BS_AUTOCHECKBOX,
+                18, 116, 620, 24, hwnd, (HMENU)IDC_SET_SHOW_JOB_KPI, hInst, nullptr);
+            SendMessageW(ds->chkShowJobKpi, BM_SETCHECK,
+                ds->dash->showJobKpiRow ? BST_CHECKED : BST_UNCHECKED, 0);
+
             for (int i = 0; i < kListFontSizeCount; ++i) {
                 std::wstring item = std::to_wstring(kListFontSizes[i]) + L" px";
                 SendMessageW(ds->cmbProcFont, CB_ADDSTRING, 0, reinterpret_cast<LPARAM>(item.c_str()));
@@ -16972,6 +18228,18 @@ static LRESULT CALLBACK SettingsWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPAR
                 Tr(L"内部用の hidden タスク（チャット処理など）もタスクキューに表示します。",
                    L"Also shows internal hidden tasks (such as chat handling) in the task queue.",
                    L"Muestra también las tareas internas ocultas (como el chat) en la cola."));
+            helpId(IDC_SET_SHOW_PROCESS_KPI,
+                Tr(L"プロセスの KPI 行を表示します。off にすると行を畳み、ツールバーが上へ詰められます。",
+                   L"Shows the process KPI row. Turning it off collapses the row and moves the toolbar up.",
+                   L"Muestra la fila KPI de procesos. Al desactivarla, la fila se oculta y la barra sube."));
+            helpId(IDC_SET_SHOW_TASK_KPI,
+                Tr(L"タスクの KPI 行を表示します。off にすると行を畳み、ツールバーが上へ詰められます。",
+                   L"Shows the task KPI row. Turning it off collapses the row and moves the toolbar up.",
+                   L"Muestra la fila KPI de tareas. Al desactivarla, la fila se oculta y la barra sube."));
+            helpId(IDC_SET_SHOW_JOB_KPI,
+                Tr(L"ジョブの KPI 行を表示します。off にすると行を畳み、ツールバーが上へ詰められます。",
+                   L"Shows the job KPI row. Turning it off collapses the row and moves the toolbar up.",
+                   L"Muestra la fila KPI de trabajos. Al desactivarla, la fila se oculta y la barra sube."));
             helpId(IDC_SET_REFRESH_INTERVAL,
                 Tr(L"プロセス一覧・タスクキュー・ターミナルの自動更新間隔です。\n大きくするとアイドル時のCPU使用量を抑えられます。",
                    L"Automatic refresh interval for the process list, task queue and terminals.\nLarger values reduce idle CPU usage.",
@@ -17091,7 +18359,8 @@ static LRESULT CALLBACK SettingsWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPAR
                              ds->lblWebUiAllowedHosts, ds->editWebUiAllowedHosts,
                              ds->lblWebUiPort, ds->editWebUiPort, ds->lblWebUiUrl, ds->editWebUiUrl,
                              ds->lblWebUiToken, ds->editWebUiToken, ds->btnWebUiTokenRoll,
-                             ds->lblDisplayMode, ds->cmbDisplayMode, ds->lblProcFont, ds->cmbProcFont, ds->lblTaskFont, ds->cmbTaskFont, ds->lblTranslateCards, ds->cmbTranslateCards, ds->chkTranslateMode };
+                              ds->lblDisplayMode, ds->cmbDisplayMode, ds->lblProcFont, ds->cmbProcFont, ds->lblTaskFont, ds->cmbTaskFont, ds->lblTranslateCards, ds->cmbTranslateCards, ds->chkTranslateMode,
+                              ds->chkShowProcessKpi, ds->chkShowTaskKpi, ds->chkShowJobKpi };
              for (HWND h : ctrls) SendMessageW(h, WM_SETFONT, (WPARAM)ds->dash->hFontUi, TRUE);
              for (HWND h : ds->chkTriageKinds) if (h) SendMessageW(h, WM_SETFONT, (WPARAM)ds->dash->hFontUi, TRUE);
              for (HWND h : ds->chkTriageLlmPermissions) if (h) SendMessageW(h, WM_SETFONT, (WPARAM)ds->dash->hFontUi, TRUE);
@@ -17120,6 +18389,20 @@ static LRESULT CALLBACK SettingsWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPAR
                 WS_CHILD | WS_VISIBLE | WS_BORDER | WS_VSCROLL | LBS_NOTIFY | WS_TABSTOP,
                 18, 104, 500, 340, hwnd, (HMENU)IDC_SET_LLM_ROWS, hInst, nullptr);
             SendMessageW(ds->lstLlmRows, WM_SETFONT, (WPARAM)ds->dash->hFontUi, TRUE);
+
+            struct LlmFieldLabel { HWND* slot; int y; };
+            LlmFieldLabel llmLabels[] = {
+                { &ds->lblLlmEngine, 86 },
+                { &ds->lblLlmModel, 118 },
+                { &ds->lblLlmProvider, 150 },
+                { &ds->lblLlmRank, 182 },
+                { &ds->lblLlmNote, 214 },
+            };
+            for (const auto& l : llmLabels) {
+                *l.slot = CreateWindowExW(0, L"STATIC", L"", WS_CHILD | WS_VISIBLE,
+                    532, l.y, 340, 18, hwnd, nullptr, hInst, nullptr);
+                SendMessageW(*l.slot, WM_SETFONT, (WPARAM)ds->dash->hFontUi, TRUE);
+            }
 
             ds->editLlmEngine = CreateWindowExW(WS_EX_CLIENTEDGE, L"EDIT", L"", WS_CHILD | WS_VISIBLE | WS_TABSTOP,
                 532, 104, 200, 24, hwnd, (HMENU)IDC_SET_LLM_ENGINE, hInst, nullptr);
@@ -17288,6 +18571,8 @@ static LRESULT CALLBACK SettingsWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPAR
                 auto& llmPage = ds->tabPages[9];
                 llmPage.insert(llmPage.end(), {
                     ds->lblLlmTitle, ds->cmbLlmList, ds->lstLlmRows,
+                    ds->lblLlmEngine, ds->lblLlmModel, ds->lblLlmProvider,
+                    ds->lblLlmRank, ds->lblLlmNote,
                     ds->editLlmEngine, ds->editLlmModel, ds->editLlmProvider,
                     ds->editLlmRank, ds->editLlmNote,
                     ds->btnLlmAdd, ds->btnLlmRemove, ds->btnLlmToggle,
@@ -17299,9 +18584,12 @@ static LRESULT CALLBACK SettingsWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPAR
                     ds->lblPermitKind, ds->lblPermitTarget, ds->lblPermitEngine,
                     ds->lblPermitScope, ds->lblPermitNote, ds->lblPermitHint,
                     ds->lblPermitDraft, ds->editPermitDraft, ds->btnPermitDraft, ds->lblPermitDraftStatus,
-                    ds->lblPermitRows,
-                    ds->btnPermitRequest, ds->btnPermitApprove, ds->btnPermitReject,
-                    ds->btnPermitRevoke, ds->btnPermitRefresh });
+                     ds->lblPermitRows,
+                     ds->btnPermitRequest, ds->btnPermitApprove, ds->btnPermitReject,
+                     ds->btnPermitRevoke, ds->btnPermitRefresh });
+                auto& kpiPage = ds->tabPages[11];
+                kpiPage.insert(kpiPage.end(), {
+                    ds->chkShowProcessKpi, ds->chkShowTaskKpi, ds->chkShowJobKpi });
             }
             SelectSettingsTab(ds, 0);
             UpdateSettingsDialogTexts(hwnd);
@@ -17636,6 +18924,22 @@ static LRESULT CALLBACK SettingsWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPAR
                     (SendMessageW(ds->chkShowHiddenTasks, BM_GETCHECK, 0, 0) == BST_CHECKED);
                 SaveShellConfig(ds->dash);
                 RefreshDashboardData(ds->dash);
+                return 0;
+            }
+            if (id == IDC_SET_SHOW_PROCESS_KPI || id == IDC_SET_SHOW_TASK_KPI || id == IDC_SET_SHOW_JOB_KPI) {
+                HWND chk = (id == IDC_SET_SHOW_PROCESS_KPI) ? ds->chkShowProcessKpi
+                         : (id == IDC_SET_SHOW_TASK_KPI) ? ds->chkShowTaskKpi : ds->chkShowJobKpi;
+                const bool checked = (SendMessageW(chk, BM_GETCHECK, 0, 0) == BST_CHECKED);
+                if (id == IDC_SET_SHOW_PROCESS_KPI) ds->dash->showProcessKpiRow = checked;
+                else if (id == IDC_SET_SHOW_TASK_KPI) ds->dash->showTaskKpiRow = checked;
+                else ds->dash->showJobKpiRow = checked;
+                ds->dash->lastToolbarWidth = -1;  // force the toolbar to follow the new KPI height
+                RECT rc = {};
+                if (GetClientRect(ds->dash->hwndMain, &rc)) {
+                    LayoutControls(ds->dash, rc.right, rc.bottom);
+                }
+                InvalidateRect(ds->dash->hwndMain, nullptr, TRUE);
+                SaveShellConfig(ds->dash);
                 return 0;
             }
             if (id == IDC_SET_ACTIVITY_STYLE) {
@@ -21932,6 +23236,8 @@ static LRESULT CALLBACK DashboardWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPA
 
             st->hwndBtnSettings = CreateWindowExW(0, L"BUTTON", Tr(L"設定", L"Settings", L"Ajustes"),
                 WS_CHILD | WS_VISIBLE | BS_OWNERDRAW, 0, 0, 90, 24, hwnd, (HMENU)IDC_BTN_SETTINGS, nullptr, nullptr);
+            st->hwndBtnRoutines = CreateWindowExW(0, L"BUTTON", Tr(L"ルーチン", L"Routines", L"Rutinas"),
+                WS_CHILD | WS_VISIBLE | BS_OWNERDRAW, 0, 0, 78, 24, hwnd, (HMENU)IDC_BTN_ROUTINES, nullptr, nullptr);
             st->hwndBtnKillAll = CreateWindowExW(0, L"BUTTON", L"Kill All",
                 WS_CHILD | WS_VISIBLE | BS_OWNERDRAW, 0, 0, 74, 24, hwnd, (HMENU)IDC_BTN_KILL_ALL, nullptr, nullptr);
             if (st->pm) {
@@ -21950,8 +23256,6 @@ static LRESULT CALLBACK DashboardWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPA
                 WS_CHILD | WS_VISIBLE | BS_OWNERDRAW, 0, 0, 150, 24, hwnd, (HMENU)IDC_BTN_VIEW_TASKS, nullptr, nullptr);
             st->hwndBtnRefresh = CreateWindowExW(0, L"BUTTON", L"↻",
                 WS_CHILD | WS_VISIBLE | BS_OWNERDRAW, 0, 0, 28, 24, hwnd, (HMENU)IDC_BTN_REFRESH, nullptr, nullptr);
-            st->hwndBtnReevalPlanned = CreateWindowExW(0, L"BUTTON", L"予定↻",
-                WS_CHILD | WS_VISIBLE | BS_OWNERDRAW, 0, 0, 56, 24, hwnd, (HMENU)IDC_BTN_REEVAL_PLANNED, nullptr, nullptr);
             st->hwndBtnHint = CreateWindowExW(0, L"BUTTON", L"💡",
                 WS_CHILD | WS_VISIBLE | BS_OWNERDRAW, 0, 0, 28, 24, hwnd, (HMENU)IDC_BTN_HINT, nullptr, nullptr);
             st->hwndBtnHistory = CreateWindowExW(0, L"BUTTON", L"🕘",
@@ -21974,6 +23278,9 @@ static LRESULT CALLBACK DashboardWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPA
             st->hwndBtnTaskViewMode = CreateWindowExW(0, L"BUTTON",
                 Tr(L"タスク表示", L"Tasks", L"Tareas"),
                 WS_CHILD | BS_OWNERDRAW, 0, 0, 84, 20, hwnd, (HMENU)IDC_BTN_TASK_VIEW_MODE, nullptr, nullptr);
+            st->hwndBtnCollapseAllTasks = CreateWindowExW(0, L"BUTTON",
+                Tr(L"全部閉じる", L"Collapse All", L"Contraer todo"),
+                WS_CHILD | BS_OWNERDRAW, 0, 0, 84, 20, hwnd, (HMENU)IDC_BTN_COLLAPSE_ALL_TASKS, nullptr, nullptr);
             st->hwndSearchProcEdit = CreateWindowExW(WS_EX_CLIENTEDGE, L"EDIT", L"",
                 WS_CHILD | ES_AUTOHSCROLL, 0, 0, 160, 20, hwnd, (HMENU)IDC_EDIT_SEARCH_PROC, nullptr, nullptr);
             st->hwndSearchTaskEdit = CreateWindowExW(WS_EX_CLIENTEDGE, L"EDIT", L"",
@@ -22028,17 +23335,18 @@ static LRESULT CALLBACK DashboardWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPA
                 addTool(st->hwndBtnBtView);
                 addTool(st->hwndBtnHideTray);
                 addTool(st->hwndBtnRefresh);
-                addTool(st->hwndBtnReevalPlanned);
                 addTool(st->hwndBtnHint);
                 addTool(st->hwndBtnHistory);
                 addTool(st->hwndBtnIpmsg);
                 addTool(st->hwndBtnSettings);
+                addTool(st->hwndBtnRoutines);
                 addTool(st->hwndBtnKillAll);
                 addTool(st->hwndBtnViewTasks);
                 addTool(st->hwndBtnUsage);
                 addTool(st->hwndClock);
                 addTool(st->hwndSearchProcBtn);
                 addTool(st->hwndSearchTaskBtn);
+                addTool(st->hwndBtnCollapseAllTasks);
             }
 
             LoadShellConfig(st);
@@ -22115,11 +23423,11 @@ static LRESULT CALLBACK DashboardWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPA
             SetWindowSubclass(st->hwndTab, TabSubclassProc, 1, 0);
 
             HWND uiCtrls[] = {
-                st->hwndBtnSettings, st->hwndBtnKillAll,
+                st->hwndBtnSettings, st->hwndBtnRoutines, st->hwndBtnKillAll,
                 st->hwndBtnGridView,
                 st->hwndBtnToggleList, st->hwndBtnToggleTerm, st->hwndBtnTermSessions, st->hwndBtnStreamPane, st->hwndBtnBtView, st->hwndBtnHideTray, st->hwndBtnRefresh,
-                st->hwndBtnReevalPlanned, st->hwndBtnHint, st->hwndBtnHistory, st->hwndBtnIpmsg, st->hwndClock,
-                st->hwndBtnViewTasks, st->hwndBtnTaskViewMode, st->hwndList, st->hwndTaskList, st->hwndTab
+                st->hwndBtnHint, st->hwndBtnHistory, st->hwndBtnIpmsg, st->hwndClock,
+                st->hwndBtnViewTasks, st->hwndBtnTaskViewMode, st->hwndBtnCollapseAllTasks, st->hwndList, st->hwndTaskList, st->hwndTab
             };
             for (HWND h : uiCtrls) {
                 if (h) SendMessageW(h, WM_SETFONT, (WPARAM)st->hFontUi, TRUE);
@@ -22259,6 +23567,7 @@ static LRESULT CALLBACK DashboardWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPA
                 ApplySplitterDragLayout(hwnd, st, st->pendingSplitterPt);
                 return 0;
             } else if (wParam == TIMER_REFRESH_ID && st) {
+                PerfOutScope perf("tick", "refresh");
                 UpdateClock(st);
                 // The core is shutting down after "Quit Hancho"; polling it
                 // now would only produce failed IPC calls.
@@ -22281,6 +23590,14 @@ static LRESULT CALLBACK DashboardWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPA
                     if (g_kpiBarPhase >= 1.0f) g_kpiBarPhase -= 1.0f;
                     InvalidateRect(hwnd, &st->kpiCardRects[1], FALSE);
                     InvalidateRect(hwnd, &st->kpiCardRects[9], FALSE);
+                    if (st->showJobKpiRow) {
+                        if (st->kpiCardRects[17].bottom > st->kpiCardRects[17].top) {
+                            InvalidateRect(hwnd, &st->kpiCardRects[17], FALSE);
+                        }
+                        if (st->kpiCardRects[21].bottom > st->kpiCardRects[21].top) {
+                            InvalidateRect(hwnd, &st->kpiCardRects[21], FALSE);
+                        }
+                    }
                 }
             } else if (wParam == TIMER_QUIT_WAIT_ID && st) {
                 auto finishQuit = [&] {
@@ -22385,18 +23702,22 @@ static LRESULT CALLBACK DashboardWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPA
         case WM_LBUTTONDOWN: {
             if (st) {
                 POINT pt = {GET_X_LPARAM(lParam), GET_Y_LPARAM(lParam)};
-                RECT subRc = st->kpiCardRects[15];
-                subRc.top = subRc.bottom - 22;
-                if (PtInRect(&subRc, pt)) {
-                    if (st->triageFollowUp > 0 && pt.x >= (subRc.left + subRc.right) / 2)
-                        ShowTriageDialog(st, L"follow_up");
-                    else if (st->autoTriageUnreviewed > 0)
-                        ShowTriageDialog(st, L"autoUnreviewed");
-                    else if (st->triageFollowUp > 0)
-                        ShowTriageDialog(st, L"follow_up");
-                    return 0;
+                for (int cardIdx : {15, 23}) {
+                    RECT subRc = st->kpiCardRects[cardIdx];
+                    if (subRc.bottom > subRc.top) {
+                        subRc.top = subRc.bottom - 22;
+                        if (PtInRect(&subRc, pt)) {
+                            if (st->triageFollowUp > 0 && pt.x >= (subRc.left + subRc.right) / 2)
+                                ShowTriageDialog(st, L"follow_up");
+                            else if (st->autoTriageUnreviewed > 0)
+                                ShowTriageDialog(st, L"autoUnreviewed");
+                            else if (st->triageFollowUp > 0)
+                                ShowTriageDialog(st, L"follow_up");
+                            return 0;
+                        }
+                    }
                 }
-                for (int i : {7, 15}) {
+                for (int i : {7, 15, 23}) {
                     if (!PtInRect(&st->kpiCardRects[i], pt)) continue;
                     ShowTriageDialog(st, i == 7 ? L"pendingProcess" : L"pendingTask");
                     return 0;
@@ -22713,13 +24034,40 @@ static LRESULT CALLBACK DashboardWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPA
                 }
             } else if (id == IDC_BTN_TERM_SESSIONS) {
                 ShowTermSessionsDialog(st);
+            } else if (id == IDC_BTN_ROUTINES) {
+                ShowRoutinesDialog(st);
             } else if (id == IDC_BTN_REFRESH) {
                 WakeDashboardDataFetch(st);
                 RefreshDashboardData(st);
                 if (st->streamPane && st->hwndStreamPane && IsWindowVisible(st->hwndStreamPane)) {
                     ReloadStreamDialogData(st->hwndStreamPane, st->streamPane);
                 }
-            } else if (id == IDC_BTN_REEVAL_PLANNED) {
+            } else if (id == IDC_BTN_COLLAPSE_ALL_TASKS) {
+                for (const auto& drow : st->taskDisplayRows) {
+                    if (drow.kind == pc::TaskDisplayRowKind::TaskHeading && !drow.taskId.empty()) {
+                        st->taskExpandedOverrides[drow.taskId] = false;
+                    } else if (drow.kind == pc::TaskDisplayRowKind::DirectionHeading && !drow.directionId.empty()) {
+                        st->taskExpandedOverrides["direction:" + drow.directionId] = false;
+                    }
+                }
+                for (auto& kv : st->taskExpandedOverrides) {
+                    kv.second = false;
+                }
+                for (const auto& t : st->cachedTasks) {
+                    if (t.is_object()) {
+                        const std::string tid = t.value("id", "");
+                        if (!tid.empty()) st->taskExpandedOverrides[tid] = false;
+                    }
+                }
+                for (const auto& d : st->cachedDirections) {
+                    if (d.is_object()) {
+                        const std::string did = d.value("id", "");
+                        if (!did.empty()) {
+                            const std::string key = (did.rfind("direction:", 0) == 0) ? did : ("direction:" + did);
+                            st->taskExpandedOverrides[key] = false;
+                        }
+                    }
+                }
                 RefreshTaskQueueData(st, true);
             } else if (id == IDC_BTN_TASK_VIEW_MODE) {
                 st->taskViewMode = !st->taskViewMode;
@@ -22966,12 +24314,12 @@ static LRESULT CALLBACK DashboardWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPA
                     auto* nmia = reinterpret_cast<NMITEMACTIVATE*>(lParam);
                     int idx = nmia->iItem;
                     if (idx >= 0 && idx < static_cast<int>(st->taskDisplayRows.size()) &&
-                        st->taskDisplayRows[idx].kind == pc::TaskDisplayRowKind::TaskHeading) {
+                        st->taskDisplayRows[idx].kind == pc::TaskDisplayRowKind::TaskHeading && nmia->iSubItem == 0) {
                         const auto& drow = st->taskDisplayRows[idx];
                         st->taskExpandedOverrides[drow.taskId] = !drow.expanded;
                         RefreshTaskQueueData(st, true);
                     } else if (idx >= 0 && idx < static_cast<int>(st->taskDisplayRows.size()) &&
-                               st->taskDisplayRows[idx].kind == pc::TaskDisplayRowKind::DirectionHeading) {
+                               st->taskDisplayRows[idx].kind == pc::TaskDisplayRowKind::DirectionHeading && nmia->iSubItem == 0) {
                         const auto& drow = st->taskDisplayRows[idx];
                         st->taskExpandedOverrides["direction:" + drow.directionId] = !drow.expanded;
                         RefreshTaskQueueData(st, true);

@@ -982,6 +982,8 @@ add_executable(bt_integration_smoke
     src/task_store.cpp
     src/direction_store.cpp
     src/triage.cpp
+    src/triage_manager.cpp
+    src/triage_text.cpp
     src/memory_record.cpp
     src/memory_search.cpp
     src/chain_guard.cpp

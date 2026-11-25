@@ -978,7 +978,7 @@ public:
     // ({"ok":true,...} or {"ok":false,"error":"..."}).
     // originJson: optional {"label","client","session","hostSession","cwd","pid"} recorded on every added job.
     std::string TaskQueueAdd(const std::string& taskqueue, const std::string& jobsJson, int64_t concurrency, const std::string& notifyFile, std::string& outError,
-                             const std::string& originJson = "", const std::string& taskId = "");
+                             const std::string& originJson = "", const std::string& taskId = "", bool triage = true);
     // Internal entry point used only by the BT layer to add a BT-managed job.
     // The job inherits the origin recorded for its tree with SetBtOrigin.
     std::string AddBtJob(const std::string& taskqueue, const std::string& jobJson, const TaskQueueBtRef& ref, std::string& outError);
@@ -1092,16 +1092,26 @@ public:
     bool EnsureBtDirection(const std::string& btId, const std::string& existingDirectionId,
                            const std::string& taskId, const std::string& title,
                            const std::string& originJson, std::string& outDirectionId,
-                           std::string& outError);
+                           std::string& outError, bool triage = true);
     bool DirectionGet(const std::string& id, nlohmann::json& outRecord) const;
     std::vector<nlohmann::json> DirectionAll() const;
+    // 102-10: triage: false on a direction suppresses its triage card.
+    bool SetDirectionTriage(const std::string& id, bool triage, std::string& outError);
+    // 102-10: links a rescue direction to the direction it supersedes.
+    bool DirectionSetRedo(const std::string& oldId, const std::string& newId,
+                          const std::string& reason, std::string& outError);
     // Direction state & operations (doc/direction-cards.md, card 103-2).
     nlohmann::json DirectionState(const std::string& id) const;
     std::string DirectionShow(const std::string& id, std::string& outError);
     std::string DirectionList(const std::string& taskIdFilter, const std::string& stateFilter,
                               int64_t limit, std::string& outError, int64_t sinceVersion = -1);
     std::string DirectionClose(const std::string& id, const std::string& result,
-                               const std::string& reason, std::string& outError);
+                               const std::string& reason, std::string& outError,
+                               const nlohmann::json& decision = nullptr);
+    // 102-7: bulk-close legacy failed directions (implicit "job:<id>" directions included).
+    // `before` limits the operation to failures at or before that timestamp; empty means all.
+    std::string DirectionCloseMany(const std::string& state, const std::string& before,
+                                   const std::string& reason, std::string& outError);
     std::string DirectionReopen(const std::string& id, const std::string& reason,
                                 std::string& outError);
     std::string DirectionPurgeOlderThan(int64_t olderThanSec, std::string& outError);
@@ -1278,6 +1288,10 @@ private:
     void RecordRemovedJobsLocked(const std::vector<TaskQueueJob>& gone);
     nlohmann::json TaskStateLocked(const std::string& taskId) const;
     nlohmann::json DirectionStateLocked(const std::string& id) const;
+    // Caller holds mutex_. Creates a record for an implicit "job:<id>" direction when needed.
+    std::string DirectionCloseUnlocked(const std::string& id, const std::string& result,
+                                       const std::string& reason, const nlohmann::json& decision,
+                                       std::string& outError);
     void MaybeLogDirectionFinishedLocked(const std::string& directionId, const std::string& taskId);
 
     struct ClientWatchEntry {

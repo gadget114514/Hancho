@@ -1,6 +1,7 @@
 #include "mcp_server.h"
 #include "ipc_client.h"
 #include "common.h"
+#include "card_markdown.h"
 #include "memory_search.h"
 #include "llm_stream.h"
 #include "llm_config.h"
@@ -606,7 +607,8 @@ int RunMcpServer() {
                 << "\"concurrency\":{\"type\":\"integer\",\"description\":\"Max jobs running at the same time for this queue (default 1)\"},"
                 << "\"notifyFile\":{\"type\":\"string\",\"description\":\"Optional file updated on jobFailed / taskqueueStalled / taskqueueDrained\"},"
                 << "\"originLabel\":{\"type\":\"string\",\"description\":\"Optional short name for the work these jobs belong to (e.g. 'release v2.9.2'), shown in the dashboard's Origin column. Your session id and working folder are recorded automatically.\"},"
-                << "\"task\":{\"type\":\"string\",\"description\":\"Optional task id to attach these jobs to (must exist and not be closed).\"}"
+                << "\"task\":{\"type\":\"string\",\"description\":\"Optional task id to attach these jobs to (must exist and not be closed).\"},"
+                << "\"triage\":{\"type\":\"boolean\",\"description\":\"Set false to suppress triage cards for this direction (failed jobs are closed without a card).\"}"
                 << "},\"required\":[\"taskqueue\",\"jobs\"]}"
                 << "},"
                 << "{"
@@ -628,7 +630,7 @@ int RunMcpServer() {
                 << "},"
                 << "{"
                  << "\"name\":\"taskqueue_list\","
-                 << "\"description\":\"List task queue jobs with state, attempts, last reason and blockedBy. Failed jobs carry the same top-level failure record (class, summary, suggestedAction, evidence) as taskqueue_get. Provisional 'planned' rows for idle job/worker leaves of running behavior trees are included by default; set includePlanned=false to omit them and the direction row. The active BT direction appears as a virtual row with id 'direction:<id>' and state running, waitingForLlm or paused (legacy 'group:<btId>' is accepted as an alias on operations). Neither row is a stored job; read a direction with direction_show/bt_get and answer a waiting BT with bt_resume.\","
+                 << "\"description\":\"List task queue jobs with state, attempts, last reason and blockedBy. Failed jobs carry the same top-level failure record (class, summary, suggestedAction, evidence) as taskqueue_get. Provisional 'planned' rows for idle exec/agent leaves of running behavior trees are included by default; set includePlanned=false to omit them and the direction row. The active BT direction appears as a virtual row with id 'direction:<id>' and state running, waitingForLlm or paused (legacy 'group:<btId>' is accepted as an alias on operations). Neither row is a stored job; read a direction with direction_show/bt_get and answer a waiting BT with bt_resume.\","
                 << "\"inputSchema\":{\"type\":\"object\",\"properties\":{"
                 << "\"taskqueue\":{\"type\":\"string\",\"description\":\"Optional task queue name (all queues when omitted)\"},"
                 << "\"state\":{\"type\":\"string\",\"description\":\"Optional state filter: pending, planned, running, succeeded, failed, blocked, cancelled, waitingForPermit\"},"
@@ -891,9 +893,10 @@ int RunMcpServer() {
                 << "},"
                 << "{"
                 << "\"name\":\"direction_show\","
-                << "\"description\":\"Show a direction record (or implicit job:<id>), computed state, and its jobs.\","
+                << "\"description\":\"Show a direction record (or implicit job:<id>), computed state, and its jobs. A task card can also be addressed by its number.\","
                 << "\"inputSchema\":{\"type\":\"object\",\"properties\":{"
-                << "\"id\":{\"type\":\"string\",\"description\":\"Direction id (dir_... or job:<jobId>)\"}"
+                << "\"id\":{\"type\":\"string\",\"description\":\"Direction id (dir_..., direction:<id>, job:<jobId>) or card number\"},"
+                << "\"taskId\":{\"type\":\"string\",\"description\":\"Optional task id (needed when a card number exists in more than one task)\"}"
                 << "},\"required\":[\"id\"]}"
                 << "},"
                 << "{"
@@ -930,8 +933,8 @@ int RunMcpServer() {
                 << "},\"required\":[\"olderThanSec\"]}"
                 << "},"
                 << "{"
-                << "\"name\":\"card_add\","
-                << "\"description\":\"Add a planned task card (direction) to an active task.\","
+                << "\"name\":\"direction_add\","
+                << "\"description\":\"Add a planned task card (direction 指示) to an active task.\","
                 << "\"inputSchema\":{\"type\":\"object\",\"properties\":{"
                 << "\"taskId\":{\"type\":\"string\",\"description\":\"Task id (required)\"},"
                 << "\"number\":{\"type\":\"string\",\"description\":\"Card number unique within the task, e.g. 102-3\"},"
@@ -943,22 +946,7 @@ int RunMcpServer() {
                 << "},\"required\":[\"taskId\",\"number\",\"title\"]}"
                 << "},"
                 << "{"
-                << "\"name\":\"card_list\","
-                << "\"description\":\"List task cards in a task sorted by card number, with state and waitingFor dependencies (body omitted).\","
-                << "\"inputSchema\":{\"type\":\"object\",\"properties\":{"
-                << "\"taskId\":{\"type\":\"string\",\"description\":\"Task id\"}"
-                << "},\"required\":[\"taskId\"]}"
-                << "},"
-                << "{"
-                << "\"name\":\"card_show\","
-                << "\"description\":\"Show a task card by card number or direction id, including its body, dependencies, and jobs.\","
-                << "\"inputSchema\":{\"type\":\"object\",\"properties\":{"
-                << "\"id\":{\"type\":\"string\",\"description\":\"Card number or direction id (dir_...)\"},"
-                << "\"taskId\":{\"type\":\"string\",\"description\":\"Optional task id (required when a card number exists in multiple tasks)\"}"
-                << "},\"required\":[\"id\"]}"
-                << "},"
-                << "{"
-                << "\"name\":\"card_edit\","
+                << "\"name\":\"direction_edit\","
                 << "\"description\":\"Edit a planned task card (title, body, after, template, params). Fails once the card is no longer planned.\","
                 << "\"inputSchema\":{\"type\":\"object\",\"properties\":{"
                 << "\"taskId\":{\"type\":\"string\",\"description\":\"Task id\"},"
@@ -971,7 +959,7 @@ int RunMcpServer() {
                 << "},\"required\":[\"taskId\",\"number\"]}"
                 << "},"
                 << "{"
-                << "\"name\":\"card_remove\","
+                << "\"name\":\"direction_remove\","
                 << "\"description\":\"Remove a planned task card from a task. Fails once the card is no longer planned.\","
                 << "\"inputSchema\":{\"type\":\"object\",\"properties\":{"
                 << "\"taskId\":{\"type\":\"string\",\"description\":\"Task id\"},"
@@ -979,7 +967,7 @@ int RunMcpServer() {
                 << "},\"required\":[\"taskId\",\"number\"]}"
                 << "},"
                 << "{"
-                << "\"name\":\"card_run\","
+                << "\"name\":\"direction_run\","
                 << "\"description\":\"Run a planned task card (or ready cards with ready=true) by instantiating its BT template and promoting its direction.\","
                 << "\"inputSchema\":{\"type\":\"object\",\"properties\":{"
                 << "\"taskId\":{\"type\":\"string\",\"description\":\"Task id (required)\"},"
@@ -991,7 +979,7 @@ int RunMcpServer() {
                 << "},\"required\":[\"taskId\"]}"
                 << "},"
                 << "{"
-                << "\"name\":\"card_redo\","
+                << "\"name\":\"direction_redo\","
                 << "\"description\":\"Create a rescue card (<number>-r<n>) superseding a failed, cancelled, or closed card, optionally running it immediately.\","
                 << "\"inputSchema\":{\"type\":\"object\",\"properties\":{"
                 << "\"taskId\":{\"type\":\"string\",\"description\":\"Task id (required)\"},"
@@ -1003,6 +991,36 @@ int RunMcpServer() {
                 << "\"force\":{\"type\":\"boolean\",\"description\":\"Override rescue chain depth limit (default 2) and unsatisfied dependencies when running\"},"
                 << "\"originLabel\":{\"type\":\"string\",\"description\":\"Optional short name for the Origin column\"}"
                 << "},\"required\":[\"taskId\",\"number\"]}"
+                << "},"
+                << "{"
+                << "\"name\":\"direction_import\","
+                << "\"description\":\"Import task cards from a Markdown file into an active task (dryRun changes nothing).\","
+                << "\"inputSchema\":{\"type\":\"object\",\"properties\":{"
+                << "\"taskId\":{\"type\":\"string\",\"description\":\"Task id (required)\"},"
+                << "\"file\":{\"type\":\"string\",\"description\":\"Path to the Markdown file to import\"},"
+                << "\"markdown\":{\"type\":\"string\",\"description\":\"Markdown text to import instead of a file\"},"
+                << "\"text\":{\"type\":\"string\",\"description\":\"Alias for markdown\"},"
+                << "\"dryRun\":{\"type\":\"boolean\",\"description\":\"Only report the plan (default false)\"},"
+                << "\"translateCards\":{\"type\":\"string\",\"enum\":[\"all\",\"title\",\"off\"],\"description\":\"Override translation of non-English card text\"},"
+                << "\"lang\":{\"type\":\"string\",\"description\":\"Display language for the result (en, ja, es)\"}"
+                << "},\"required\":[\"taskId\"]}"
+                << "},"
+                << "{"
+                << "\"name\":\"direction_export\","
+                << "\"description\":\"Export all cards of a task as Markdown.\","
+                << "\"inputSchema\":{\"type\":\"object\",\"properties\":{"
+                << "\"taskId\":{\"type\":\"string\",\"description\":\"Task id (required)\"},"
+                << "\"lang\":{\"type\":\"string\",\"description\":\"en writes stored English; ja or es writes the translation\"}"
+                << "},\"required\":[\"taskId\"]}"
+                << "},"
+                << "{"
+                << "\"name\":\"direction_translate\","
+                << "\"description\":\"Translate stored non-English card titles and bodies to English; items not ready stay pending.\","
+                << "\"inputSchema\":{\"type\":\"object\",\"properties\":{"
+                << "\"taskId\":{\"type\":\"string\",\"description\":\"Task id (required)\"},"
+                << "\"translateCards\":{\"type\":\"string\",\"enum\":[\"all\",\"title\",\"off\"],\"description\":\"Override translation scope\"},"
+                << "\"lang\":{\"type\":\"string\",\"description\":\"Display language for the result (en, ja, es)\"}"
+                << "},\"required\":[\"taskId\"]}"
                 << "},"
                 << "{"
                 << "\"name\":\"bt_validate\","
@@ -2001,6 +2019,7 @@ int RunMcpServer() {
                        << ",\"concurrency\":" << JsonGetInt(argsJson, "concurrency", 0)
                        << ",\"notify_file\":\"" << JsonEscape(notifyFile) << "\""
                        << ",\"task\":\"" << JsonEscape(JsonGetString(argsJson, "task", "")) << "\""
+                       << ",\"triage\":" << (JsonGetBool(argsJson, "triage", true) ? "true" : "false")
                        << ",\"origin\":" << BuildCallerOriginJson(mcpClient, JsonGetString(argsJson, "originLabel", "")) << "}";
             }
             else if (toolName == "taskqueue_list") {
@@ -2394,18 +2413,77 @@ int RunMcpServer() {
                 if (argsObj.is_discarded() || !argsObj.is_object()) {
                     argsObj = nlohmann::json::object();
                 }
-                argsObj["action"] = toolName;
-                ipcReq << argsObj.dump();
-            }
-            else if (toolName.rfind("card_", 0) == 0) {
-                auto argsObj = nlohmann::json::parse(argsJson, nullptr, false);
-                if (argsObj.is_discarded() || !argsObj.is_object()) {
-                    argsObj = nlohmann::json::object();
+                if (toolName == "direction_import" || toolName == "direction_export" ||
+                    toolName == "direction_translate") {
+                    const std::string taskId = argsObj.value("taskId", std::string());
+                    if (taskId.empty()) {
+                        EmitLine(BuildMcpToolResult(rpcId, toolName + " requires taskId", true));
+                        continue;
+                    }
+                    const std::string originLabel = argsObj.value("originLabel", std::string());
+                    const std::string lang = argsObj.value("lang", std::string("en"));
+                    const CardMarkdownSend cardSend = [&](const nlohmann::json& q,
+                                                          nlohmann::json& outResp,
+                                                          std::string& outErr) -> bool {
+                        nlohmann::json sent = q;
+                        const std::string act = sent.value("action", std::string());
+                        if (act == "direction_add" || act == "direction_edit" ||
+                            act == "card_add" || act == "card_edit") {
+                            sent["origin"] = nlohmann::json::parse(
+                                BuildCallerOriginJson(mcpClient, originLabel), nullptr, false);
+                        }
+                        std::string raw;
+                        if (!SendIpcRequest(sent.dump(), raw, outErr, true)) return false;
+                        outResp = nlohmann::json::parse(raw, nullptr, false);
+                        if (outResp.is_discarded() || !outResp.is_object()) {
+                            outErr = "invalid response from hancho: " + raw;
+                            return false;
+                        }
+                        return true;
+                    };
+                    nlohmann::json out;
+                    if (toolName == "direction_import") {
+                        std::string md = argsObj.value("markdown", argsObj.value("text", std::string()));
+                        const std::string file = argsObj.value("file", std::string());
+                        if (md.empty() && !file.empty()) {
+                            std::ifstream ifs(ResolveAbsolutePathWide(Utf8ToWide(file)), std::ios::binary);
+                            if (!ifs) {
+                                EmitLine(BuildMcpToolResult(rpcId, "cannot open file: " + file, true));
+                                continue;
+                            }
+                            std::ostringstream ss;
+                            ss << ifs.rdbuf();
+                            md = ss.str();
+                        }
+                        const bool dryRun = argsObj.value("dryRun", false);
+                        const std::string translateCards = argsObj.value(
+                            "translateCards", argsObj.value("translate_cards", std::string()));
+                        const CardMarkdownImportResult res =
+                            ImportCardMarkdown(taskId, md, dryRun, lang, cardSend, translateCards);
+                        out = CardMarkdownImportResultJson(res);
+                    } else if (toolName == "direction_export") {
+                        std::string md, exportErr;
+                        if (!ExportCardMarkdown(taskId, lang, cardSend, md, exportErr)) {
+                            out = nlohmann::json{{"ok", false}, {"error", exportErr}};
+                        } else {
+                            out = nlohmann::json{{"ok", true}, {"markdown", md}};
+                        }
+                    } else {
+                        const std::string translateCards = argsObj.value(
+                            "translateCards", argsObj.value("translate_cards", std::string()));
+                        const CardTranslateResult tr =
+                            TranslateCardsInTask(taskId, translateCards, lang, cardSend);
+                        out = nlohmann::json{{"ok", tr.ok}, {"updated", tr.updated},
+                                             {"pending", tr.pending}, {"actions", tr.actions},
+                                             {"warnings", tr.warnings}, {"errors", tr.errors}};
+                    }
+                    EmitLine(BuildMcpToolResult(rpcId, out.dump(), !out.value("ok", false)));
+                    continue;
                 }
                 argsObj["action"] = toolName;
-                if (toolName == "card_add" || toolName == "card_edit" ||
-                    toolName == "card_remove" || toolName == "card_run" ||
-                    toolName == "card_redo") {
+                if (toolName == "direction_add" || toolName == "direction_edit" ||
+                    toolName == "direction_remove" || toolName == "direction_run" ||
+                    toolName == "direction_redo") {
                     std::string label = argsObj.value("originLabel", std::string());
                     argsObj.erase("originLabel");
                     argsObj["origin"] = nlohmann::json::parse(BuildCallerOriginJson(mcpClient, label), nullptr, false);

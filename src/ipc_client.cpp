@@ -50,7 +50,7 @@ static const int kCoreStartWaitMs = 30000;
 // callers that retry (MCP clients, hooks, scripts) cannot turn it into a spawn storm.
 static const ULONGLONG kAutoStartCooldownMs = 60000;
 
-static bool TryConnectPipe(HANDLE& outPipe) {
+static bool TryConnectPipe(HANDLE& outPipe, DWORD openFlags) {
     const std::wstring pipeName = GetPipeNameWide();
     // Bounded: a pipe that stays busy must not spin this caller forever.
     for (int busyTries = 0; busyTries < 20; ++busyTries) {
@@ -60,7 +60,7 @@ static bool TryConnectPipe(HANDLE& outPipe) {
             0,
             nullptr,
             OPEN_EXISTING,
-            0,
+            openFlags,
             nullptr
         );
         if (hPipe != INVALID_HANDLE_VALUE) {
@@ -79,10 +79,10 @@ static bool TryConnectPipe(HANDLE& outPipe) {
     return false;
 }
 
-static bool WaitForPipe(HANDLE& outPipe, int timeoutMs) {
+static bool WaitForPipe(HANDLE& outPipe, int timeoutMs, DWORD openFlags) {
     const ULONGLONG deadline = GetTickCount64() + static_cast<ULONGLONG>(timeoutMs);
     while (true) {
-        if (TryConnectPipe(outPipe)) return true;
+        if (TryConnectPipe(outPipe, openFlags)) return true;
         if (GetTickCount64() >= deadline) return false;
         Sleep(100);
     }
@@ -275,11 +275,11 @@ static void LaunchHeadlessOutsideCallerTree() {
 }
 
 // Connects to the core, starting it at most once across all concurrent callers.
-static bool ConnectOrAutoStart(HANDLE& hPipe, std::string& outError) {
+static bool ConnectOrAutoStart(HANDLE& hPipe, std::string& outError, DWORD openFlags) {
     // A core that already holds the instance mutex is still starting: wait for its
     // pipe and never launch a second one.
     if (IsHanchoRunningForDataDirWide()) {
-        if (WaitForPipe(hPipe, kCoreStartWaitMs)) return true;
+        if (WaitForPipe(hPipe, kCoreStartWaitMs, openFlags)) return true;
         outError = "Hancho core is running but did not open its IPC pipe within " +
                    std::to_string(kCoreStartWaitMs / 1000) + " seconds (still starting or stuck).";
         return false;
@@ -312,20 +312,20 @@ static bool ConnectOrAutoStart(HANDLE& hPipe, std::string& outError) {
 
     bool connected = false;
     if (!owner) {
-        connected = WaitForPipe(hPipe, kCoreStartWaitMs + 10000);
+        connected = WaitForPipe(hPipe, kCoreStartWaitMs + 10000, openFlags);
     } else {
         // Someone may have finished starting it while we took the mutex.
-        if (TryConnectPipe(hPipe)) {
+        if (TryConnectPipe(hPipe, openFlags)) {
             connected = true;
         } else if (IsHanchoRunningForDataDirWide()) {
-            connected = WaitForPipe(hPipe, kCoreStartWaitMs);
+            connected = WaitForPipe(hPipe, kCoreStartWaitMs, openFlags);
         } else {
             if (mode == AutoStartMode::Headless) {
                 LaunchHeadlessOutsideCallerTree();
             } else {
                 LaunchGuiOutsideCallerTree();
             }
-            connected = WaitForPipe(hPipe, kCoreStartWaitMs + 5000);
+            connected = WaitForPipe(hPipe, kCoreStartWaitMs + 5000, openFlags);
             if (connected) ClearAutoStartFailure();
             else MarkAutoStartFailed();
         }
@@ -341,69 +341,92 @@ static bool ConnectOrAutoStart(HANDLE& hPipe, std::string& outError) {
     return connected;
 }
 
-// Waits until the pipe has an answer to read. Returns false when the wait
-// timed out. The pipe is a message-mode pipe: PeekNamedPipe reports the size
-// of the next message without consuming it.
-static bool WaitForPipeData(HANDLE hPipe, int timeoutMs) {
-    const ULONGLONG deadline = GetTickCount64() + static_cast<ULONGLONG>(timeoutMs);
-    char peekBuf[4096];
-    while (true) {
-        DWORD bytesAvail = 0;
-        SetLastError(ERROR_SUCCESS);
-        const BOOL ok = PeekNamedPipe(hPipe, peekBuf, sizeof(peekBuf), nullptr, &bytesAvail, nullptr);
-        if (ok) {
-            if (bytesAvail > 0) return true;
-            // A pending message that is larger than the peek buffer still means
-            // that there is something to read.
-            if (GetLastError() == ERROR_MORE_DATA) return true;
-        } else if (GetLastError() == ERROR_BROKEN_PIPE) {
-            // The core closed the pipe: let the read below report the error.
-            return true;
-        }
-        if (GetTickCount64() >= deadline) return false;
-        Sleep(10);
-    }
-}
-
 bool SendIpcRequest(const std::string& reqJson, std::string& outRespJson, std::string& outError,
-                     bool autoStartGui, int timeoutMs, bool* outTimedOut) {
+                    bool autoStartGui, int timeoutMs, bool* outTimedOut) {
     if (outTimedOut) *outTimedOut = false;
+    // Bounded calls open the pipe in overlapped mode so the answer is awaited on
+    // an event instead of polling PeekNamedPipe with Sleep(10).
+    const DWORD openFlags = (timeoutMs > 0) ? FILE_FLAG_OVERLAPPED : 0;
     HANDLE hPipe = INVALID_HANDLE_VALUE;
-    if (!TryConnectPipe(hPipe)) {
+    if (!TryConnectPipe(hPipe, openFlags)) {
         if (!autoStartGui) {
             outError = "Hancho GUI daemon is not running.";
             return false;
         }
-        if (!ConnectOrAutoStart(hPipe, outError)) return false;
+        if (!ConnectOrAutoStart(hPipe, outError, openFlags)) return false;
     }
 
+    OVERLAPPED writeOv = {};
+    writeOv.hEvent = CreateEventW(nullptr, TRUE, FALSE, nullptr);
+    if (writeOv.hEvent == nullptr) {
+        CloseHandle(hPipe);
+        outError = "CreateEventW for overlapped pipe write failed.";
+        return false;
+    }
     DWORD written = 0;
-    if (!WriteFile(hPipe, reqJson.data(), static_cast<DWORD>(reqJson.size()), &written, nullptr)) {
+    BOOL writeOk = WriteFile(hPipe, reqJson.data(), static_cast<DWORD>(reqJson.size()), &written, &writeOv);
+    if (!writeOk && GetLastError() == ERROR_IO_PENDING) {
+        writeOk = GetOverlappedResult(hPipe, &writeOv, &written, TRUE);
+    }
+    CloseHandle(writeOv.hEvent);
+    if (!writeOk) {
         CloseHandle(hPipe);
         outError = "WriteFile to Named Pipe failed.";
         return false;
     }
 
-    if (timeoutMs > 0 && !WaitForPipeData(hPipe, timeoutMs)) {
+    OVERLAPPED readOv = {};
+    readOv.hEvent = CreateEventW(nullptr, TRUE, FALSE, nullptr);
+    if (readOv.hEvent == nullptr) {
         CloseHandle(hPipe);
-        outError = "The core did not answer within " + std::to_string(timeoutMs) + " ms.";
-        if (outTimedOut) *outTimedOut = true;
+        outError = "CreateEventW for overlapped pipe read failed.";
         return false;
     }
 
     outRespJson.clear();
     char buf[16384];
-    DWORD bytesRead = 0;
+    bool firstRead = true;
     while (true) {
-        BOOL ok = ReadFile(hPipe, buf, sizeof(buf), &bytesRead, nullptr);
+        OVERLAPPED ov = {};
+        ov.hEvent = readOv.hEvent;
+        DWORD bytesRead = 0;
+        BOOL ok = ReadFile(hPipe, buf, sizeof(buf), &bytesRead, &ov);
+        if (!ok) {
+            const DWORD err = GetLastError();
+            if (err == ERROR_IO_PENDING) {
+                // Only the first read is bounded: a slow core must not hold the
+                // caller forever, but once it answered, later chunks can wait.
+                const DWORD waitMs = (firstRead && timeoutMs > 0)
+                    ? static_cast<DWORD>(timeoutMs) : INFINITE;
+                const DWORD waitResult = WaitForSingleObject(ov.hEvent, waitMs);
+                if (waitResult == WAIT_TIMEOUT) {
+                    CancelIoEx(hPipe, &ov);
+                    // Drain the cancelled operation before its OVERLAPPED dies.
+                    GetOverlappedResult(hPipe, &ov, &bytesRead, TRUE);
+                    CloseHandle(readOv.hEvent);
+                    CloseHandle(hPipe);
+                    outError = "The core did not answer within " + std::to_string(timeoutMs) + " ms.";
+                    if (outTimedOut) *outTimedOut = true;
+                    return false;
+                }
+                ok = GetOverlappedResult(hPipe, &ov, &bytesRead, FALSE);
+            } else if (err != ERROR_MORE_DATA && err != ERROR_BROKEN_PIPE) {
+                CloseHandle(readOv.hEvent);
+                CloseHandle(hPipe);
+                outError = "ReadFile from Named Pipe failed (GetLastError=" + std::to_string(err) + ")";
+                return false;
+            }
+        }
+        firstRead = false;
         if (bytesRead > 0) {
             outRespJson.append(buf, bytesRead);
         }
         if (ok) break;
         if (GetLastError() != ERROR_MORE_DATA) break;
     }
-
+    CloseHandle(readOv.hEvent);
     CloseHandle(hPipe);
+
     if (outRespJson.empty()) {
         outError = "Named Pipe read returned empty response (GetLastError=" + std::to_string(GetLastError()) + ")";
         return false;

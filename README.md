@@ -6,7 +6,7 @@
 
 Built around that one idea: a ConPTY multi-terminal dashboard, a task queue with dependencies, timeouts and retries, behavior trees for multi-step plans, and control from both **MCP** and the **CLI**. It treats `claude`, `opencode`, `codex`, build scripts and interactive shells alike.
 
-Check the version with `hancho-cli.exe --version` (current: 0.9.26).
+Check the version with `hancho-cli.exe --version` (current: 0.10.0).
 
 ### Who is this for?
 
@@ -29,9 +29,34 @@ The dashboard has an **execution monitor pane** below the process and task lists
 
 Hand Hancho one command, a queue of ordered jobs, or a whole behavior tree. It runs each step as a real terminal process with its own timeout, success check, retries, resource locks and logs, and reports the result back to your LLM. The supervisor LLM stays in charge of the plan; Hancho owns the processes.
 
-See [Overview](doc/obsoleted/overview.md) for the working model in detail: `run_worker`, suspending the PC after a job, behavior trees, stable events and adapters, and how to leave Hancho without losing work.
+### Execution Model: task → direction (指示) → job → attempt
 
-A behavior tree can also be saved as a named **routine** and re-run with `routine run <name>` — ideal for fixed chores like "build all targets and run every smoke test"; stale inputs and run results are tracked automatically. See [Routines](doc/obsoleted/routines.md).
+In Hancho 0.10.0, work is organized in four distinct hierarchical layers:
+1. **`task`**: High-level goal or user request grouping multiple directions, jobs, and execution logs (`task create/update/show/list/note/close/reopen/purge/wait`, MCP `task_*`).
+2. **`direction` (`指示`)**: Work packages within a task, including behavior trees and planned task cards (`direction add/list/show/edit/remove/run/redo/import/export/translate/close/reopen/purge`, MCP `direction_*`).
+3. **`job`**: A concrete, single command queued in a task queue with strict timeouts, retry limits, success checks, and resource locks (`taskqueue add/list/get/retry/supersede/cancel/takeover/complete/pause/resume/graph/wait/purge/update`, MCP `taskqueue_*`).
+4. **`attempt`**: A single runtime execution of a job with isolated logs, events, and failure analysis records.
+
+### Direction & Task Card Workflow
+
+Large tasks are split into cards (planned directions) inside a task:
+- **Add / Import**: Add individual cards via `hancho-cli direction add --task <id> --number <num> --title "..."` or batch import from Markdown files via `direction import --task <id> --file <md> [--translate-cards <all|title|off>]`.
+- **Run Ready Cards**: Advance dependency-satisfied cards with `hancho-cli direction run --ready --task <id> [--max <n>]` (or run a specific card with `direction run <num>`).
+- **Rescue & Redo**: Rescue failed, cancelled, or closed cards with `hancho-cli direction redo <num> --task <id> [--run] [--force]`, creating an explicit superseding `<number>-r<n>` card.
+- **Export & Translate**: Export task cards back to Markdown with `direction export --task <id> [--lang <en|ja|es>]`, and translate stored non-English cards with `direction translate --task <id>`.
+
+### Modernized Behavior Tree Nodes (exec & agent)
+
+Behavior tree leaf types are aligned around modern terminology:
+- **`exec`**: Runs a single OS command (alias: `job`).
+- **`agent`**: Delegates work to an LLM agent with engine, model, and automatic engine switching (alias: `worker`).
+- Saved workflows can be registered as named **routines** (`routine list/show/run/save/check/ask/approve/reject`) and executed repeatedly with unique run IDs without LLM intervention. See [Routines](doc/obsoleted/routines.md).
+
+### Dashboard & UI Highlights
+
+- **3-Row KPI Cards & Settings KPI Tab**: The dashboard features dedicated KPI rows for Processes, Tasks, and Jobs. Each row can be shown or hidden independently via the **KPI** tab in the Settings dialog (`Show Process KPI row`, `Show Task KPI row`, `Show Job KPI row`).
+- **Routine Management Dialog**: The `Routines` (`ルーチン`) button on the toolbar opens the Routine Management dialog (`IDC_BTN_ROUTINES`) to inspect definitions, view run history, check stale inputs, and trigger runs.
+- **Task List Collapse All (`全部閉じる`) & Stable Expand State**: The `Collapse All` (`全部閉じる`, `IDC_BTN_COLLAPSE_ALL_TASKS`) button on the toolbar collapses all task and direction groups. Expanding or collapsing groups is preserved stably across background refresh ticks and queue updates (`taskExpandedOverrides`).
 
 For CI pipelines (Jenkins, GitHub Actions self-hosted runners), see [CI Guide](doc/ci.md): opt-in `run --ephemeral`, `run --bt`, `--wait-scope direction`, `--cancel-on-exit`, `--follow`, `--logs-dir`, `--report-output`, `--timeout`, `HANCHO_AUTOSTART`, and `HANCHO_NO_DIALOGS`. Without those flags, interactive defaults remain unchanged.
 
@@ -145,10 +170,23 @@ The application icons are modeled on the character "Telephone Cat" (電話猫, D
 
 ## Release Notes
 
-
+### v0.10.0
+- **`task` → `direction` (指示) → `job` → `attempt` Architecture**: Full domain model hierarchy separating high-level tasks, execution directions/cards, queued jobs, and individual run attempts.
+- **`direction` CLI & MCP Suite**: Complete card workflow (`direction add/list/show/edit/remove/run/redo/import/export/translate/close/reopen/purge`, MCP `direction_*`) with Markdown import/export, dependency-ready dispatch (`direction run --ready`), and redo rescue (`direction redo`).
+- **`exec` / `agent` Behavior Tree Nodes**: Modernized BT leaf names to `exec` (single command, alias `job`) and `agent` (LLM worker, alias `worker`), matching `run_agent` and `llm list --list agent`.
+- **3-Row KPI Cards & Settings KPI Tab**: Split dashboard KPI cards into three configurable rows (Process, Task, Job), toggleable in the Settings dialog's KPI tab (`Show Process KPI row`, `Show Task KPI row`, `Show Job KPI row`).
+- **Routine Management Dialog**: Dedicated dialog accessed from the toolbar `Routines` (`ルーチン`) button to view, execute, check, and manage reusable behavior trees.
+- **Task List Collapse All & Stable Expansion State**: Toolbar `Collapse All` (`全部閉じる`) button collapses all groups at once; group expansion state is preserved stably across list refreshes.
+- **CI / Headless Automation**: Opt-in `run --ephemeral`, `run --bt`, `--wait-scope direction`, `--cancel-on-exit`, `--follow`, `--logs-dir`, `--report-output`, and `HANCHO_AUTOSTART` for non-interactive CI execution.
 
 ### v0.9.47
 - **Behavior tree engine fallback**: when a worker's attempt fails and its engine is then marked down (for example after `idle_stall`), the node now switches to the next approved candidate in `engines` that is up, even if the failure class is not listed in `switchEngineOn`. The `engineSwitched` event says "engine down". The node waits for recovery only when no later candidate can be used (before, it waited for the down engine while other candidates were healthy).
+
+### v0.9.46
+- **Task list performance**: IPC pipe reads now use overlapped I/O (`FILE_FLAG_OVERLAPPED` with event waits) instead of `Sleep(10)` polling, removing the 10-16 ms delay from every wait with a timeout. The dashboard caches task-list rows and updates the ListView incrementally, so a large queue no longer repaints every row on each refresh.
+
+### v0.9.45
+- **Structured LLM error classification**: failures are now classified from the HTTP status (401 / 403 / 429 / 5xx) and error codes (`authentication_error`, `insufficient_quota`, `overloaded_error`, and so on) instead of matching text in logs. `ww-run` uses the same classification, so rate limits and quota errors switch engines reliably.
 
 ### v0.9.44
 - **Failure classifier fix**: a plain (non-LLM) job whose output merely contains a permission-like identifier, such as the job JSON key `"on_permission_denied"`, is no longer classified as `permission_denied` and parked in `waitingForPermit`; it now fails normally so behavior trees take their fallback branch. The log-line permission rule matches whole words only and applies only to LLM worker jobs.
@@ -236,7 +274,7 @@ The application icons are modeled on the character "Telephone Cat" (電話猫, D
 
 ### v0.9.27
 - **Task groups in the task list**: the active task group (the BT root) now appears as a virtual `group:<id>` row above its `planned` leaves, with its current state (`running`, `waiting for LLM`, `paused`). It is re-derived from the live state on every query and disappears together with its planned rows when the group finishes.
-- **Re-evaluate planned rows**: a `予定↻` toolbar button re-reads the task queue and task-group state from the core and re-renders the provisional rows immediately.
+- **Re-evaluate planned rows**: a refresh button (`↻`) re-reads the task queue and task-group state from the core and re-renders the provisional rows immediately.
 - **Task group wording**: user-facing labels now say "task group"; the group's state has a readable label, and its detail and context menu are handled without trying to fetch a queue job that does not exist.
 - **Docs**: the task queue documentation describes the task-group row.
 

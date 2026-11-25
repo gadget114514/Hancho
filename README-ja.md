@@ -6,7 +6,7 @@
 
 この考えを軸に、ConPTY マルチターミナルのダッシュボード、依存関係・タイムアウト・リトライ付きのタスクキュー、複数手順の計画を任せられるビヘイビアツリー、**MCP** と **CLI** の両方からの操作を備えています。`claude`、`opencode`、`codex`、ビルドスクリプト、対話シェル（PowerShell、cmd、Git Bash）を同じように扱えます。
 
-バージョンは `hancho-cli.exe --version` で確認できます（現在: 0.9.26）。
+バージョンは `hancho-cli.exe --version` で確認できます（現在: 0.10.0）。
 
 ### 対象ユーザー
 
@@ -26,9 +26,34 @@
 
 Hancho には、1 コマンドだけ、順番のあるジョブのキュー、あるいはビヘイビアツリー全体を渡せます。各ステップは専用のタイムアウト・成功判定・リトライ・リソースロック・ログを持つ実際の端末プロセスとして実行され、結果だけが LLM に返ります。計画を決めるのは supervisor LLM、プロセスを所有するのは Hancho です。
 
-詳しくは [概要](doc/obsoleted/overview-ja.md) を参照してください。`run_worker`、ジョブ終了後の PC サスペンド、ビヘイビアツリー、安定したイベントとアダプター、Hancho をやめるとき（卒業）の手順をまとめています。
+### 実行モデル: task → direction (指示) → job → attempt
 
-ビヘイビアツリーは名前付きの**ルーチン**として保存でき、`routine run <name>` で繰り返し実行できます（「全ターゲットをビルドして全スモークを走らせる」などの定型作業向け）。入力の変更や実行結果も自動で追跡します。詳しくは [ルーチン](doc/obsoleted/routines-ja.md)。
+Hancho 0.10.0 では、作業は 4 つの明確な階層で管理されます:
+1. **`task`**: 複数の direction、ジョブ、進捗ログを束ねる上位の依頼・目標（`task create/update/show/list/note/close/reopen/purge/wait`、MCP `task_*`）。
+2. **`direction`（`指示`）**: タスク内の作業パッケージ、ビヘイビアツリー計画、またはタスクカード（`direction add/list/show/edit/remove/run/redo/import/export/translate/close/reopen/purge`、MCP `direction_*`）。
+3. **`job`**: 依存関係・タイムアウト・リトライ上限・成功判定・リソースロックを持つキュー内の個別のコマンド（`taskqueue add/list/get/retry/supersede/cancel/takeover/complete/pause/resume/graph/wait/purge/update`、MCP `taskqueue_*`）。
+4. **`attempt`**: 独立したログ、イベント、失敗診断を持つジョブの 1 回の実行試行。
+
+### Direction とタスクカードのワークフロー
+
+大きな依頼は、タスク内のカード（planned な direction）に分割して進めます:
+- **追加とインポート**: `hancho-cli direction add --task <id> --number <num> --title "..."` で個別に追加するか、`direction import --task <id> --file <md> [--translate-cards <all|title|off>]` で Markdown から一括取り込み。
+- **依存を満たしたカードの一括実行**: `hancho-cli direction run --ready --task <id> [--max <n>]` で依存が満たされたカードを順に実行（`direction run <num>` で単体実行も可能）。
+- **救済とやり直し**: 失敗・キャンセル・クローズされたカードは `hancho-cli direction redo <num> --task <id> [--run] [--force]` で救済カード（`<number>-r<n>`）を作成して再試行。
+- **エクスポートと翻訳**: `direction export --task <id> [--lang <en|ja|es>]` で Markdown に書き出し、`direction translate --task <id>` で非英語カードを英語に翻訳。
+
+### 刷新されたビヘイビアツリーノード（exec / agent）
+
+BT の末端ノード名を用語刷新に揃えました:
+- **`exec`**: 1 つの OS コマンドを実行（旧名・別名: `job`）。
+- **`agent`**: エンジン・モデル・自動切り替えを持つ LLM エージェントにタスクを委託（旧名・別名: `worker`）。
+- 決まった定型作業は名前付き**ルーチン**（`routine list/show/run/save/check/ask/approve/reject`）として保存し、LLM なしで一意の実行 ID で繰り返し実行できます。詳しくは [ルーチン](doc/obsoleted/routines-ja.md)。
+
+### ダッシュボードと UI の強化
+
+- **3 行 KPI カードと設定の KPI タブ**: プロセス、タスク、ジョブの各 KPI 行を独立して表示。設定ダイアログの「KPI」タブから各行の表示／非表示を個別に切り替えられます（「プロセス KPI 行を表示」「タスク KPI 行を表示」「ジョブ KPI 行を表示」）。
+- **ルーチン管理ダイアログ**: ツールバーの「ルーチン」ボタン（`IDC_BTN_ROUTINES`）からルーチン管理ダイアログを開き、定義確認、実行履歴、入力鮮度チェック、実行を行えます。
+- **タスク一覧の「全部閉じる」と展開状態の保持**: ツールバーの「全部閉じる」（`IDC_BTN_COLLAPSE_ALL_TASKS`）ボタンで、すべてのタスク・direction グループを一括で折りたためます。展開／折りたたみ状態は一覧の定期更新後も安定して保持されます（`taskExpandedOverrides`）。
 
 CI（Jenkins や GitHub Actions のセルフホストランナー）での利用は [CI ガイド](doc/ci-ja.md)（[English](doc/ci.md)）を参照してください。`run --ephemeral`、`run --bt`、`--wait-scope direction`、`--cancel-on-exit`、`--follow`、`--logs-dir`、`--report-output`、`--timeout`、`HANCHO_AUTOSTART`、`HANCHO_NO_DIALOGS` はすべてオプトインで、付けなければ従来の既定動作のままです。
 
@@ -141,10 +166,23 @@ New-Item -ItemType Junction -Path .claude\skills\hancho -Target (Resolve-Path sk
 
 ## リリースノート
 
-
+### v0.10.0
+- **`task` → `direction` (指示) → `job` → `attempt` 階層モデル**: 上位タスク、実行指示/カード、キューのジョブ、試行を整理した 4 階層モデル。
+- **`direction` CLI / MCP コマンド群**: Markdown インポート／エクスポート、依存解決による順次実行（`direction run --ready`）、失敗時の救済カード作成（`direction redo`）を含むカードワークフロー（`direction add/list/show/edit/remove/run/redo/import/export/translate/close/reopen/purge`、MCP `direction_*`）。
+- **`exec` / `agent` BT ノード**: BT 末端ノードを用語刷新に揃え、`exec`（単一コマンド、別名 `job`）と `agent`（LLM ワーカー、別名 `worker`）に変更。
+- **3 行 KPI カードと設定の KPI タブ**: プロセス、タスク、ジョブの 3 行 KPI を導入。設定ダイアログの「KPI」タブで個別に表示切り替え可能（「プロセス KPI 行を表示」「タスク KPI 行を表示」「ジョブ KPI 行を表示」）。
+- **ルーチン管理ダイアログ**: ツールバーの「ルーチン」ボタンから名前付きルーチンの確認・実行・鮮度チェックができる専用ダイアログを追加。
+- **タスク一覧の「全部閉じる」と展開状態の保持**: ツールバー「全部閉じる」ボタンの追加、および定期更新を挟んでもグループの展開・折りたたみ状態を安定して維持。
+- **CI / ヘッドレス自動化**: 非対話環境向けのオプトイン `run --ephemeral`、`run --bt`、`--wait-scope direction`、`--cancel-on-exit`、`--follow`、`--logs-dir`、`--report-output`、`HANCHO_AUTOSTART` をサポート。
 
 ### v0.9.47
 - **BT のエンジン切り替え**: worker の試行が失敗し、そのエンジンが停止（down）と判定されたとき（`idle_stall` の後など）、`switchEngineOn` にその失敗クラスがなくても、`engines` の次の承認済みで動いている候補に切り替えるようにしました。`engineSwitched` イベントには「engine down」と出ます。使える候補が残っていないときだけ復旧を待ちます（これまでは、ほかの候補が正常でも、止まったエンジンの復旧を待ち続けていました）。
+
+### v0.9.46
+- **タスク一覧の高速化**: IPC のパイプ読み取りを `Sleep(10)` によるポーリングからオーバーラップ I/O（`FILE_FLAG_OVERLAPPED` とイベント待ち）に変更し、タイムアウト付きの待ちごとに発生していた 10〜16 ms の遅延をなくしました。ダッシュボードはタスク一覧の行をキャッシュし、ListView を差分描画するようになり、ジョブが多くても毎回すべての行を描き直さなくて済みます。
+
+### v0.9.45
+- **LLM エラーの構造化分類**: ログ文字列の正規表現ではなく、HTTP ステータス（401 / 403 / 429 / 5xx）とエラーコード（`authentication_error`、`insufficient_quota`、`overloaded_error` など）から失敗を分類するようになりました。`ww-run` も同じ分類を使うため、レート制限やクォータ超過のときにエンジンが確実に切り替わります。
 
 ### v0.9.44
 - **失敗分類の修正**: 普通の（LLM でない）ジョブの出力に、ジョブ JSON のキー `"on_permission_denied"` のような権限らしい識別子が含まれているだけで、`permission_denied` と判定されて `waitingForPermit` で止まる不具合を直しました。今は通常の失敗として扱われ、behavior tree のフォールバックの枝に進みます。ログ行による権限拒否の判定は単語単位で照合し、LLM ワーカーのジョブだけに適用します。
@@ -232,7 +270,7 @@ New-Item -ItemType Junction -Path .claude\skills\hancho -Target (Resolve-Path sk
 
 ### v0.9.27
 - **タスクグループをタスク一覧に表示**: 活動中のタスクグループ（BT のルート）が `group:<id>` の仮想行として `予定 (未登録)` 行の上に出ます。状態（実行中・LLM 応答待ち・一時停止）を表示し、問い合わせのたびに実状態から作り直され、グループが終わると予定行と一緒に消えます。
-- **予定行の再評価**: ツールバーの `予定↻` ボタンで、コアからタスクキューとタスクグループの状態を取得し直し、仮の行をすぐに描き直します。
+- **予定行の再評価**: ツールバーの更新ボタン（`↻`）で、コアからタスクキューとタスクグループの状態を取得し直し、仮の行をすぐに描き直します。
 - **タスクグループ表記**: ユーザー向けの文言を「タスクグループ」に統一しました。状態の日本語表示、詳細ダイアログ、右クリックメニューも、存在しないキュージョブを問い合わせずに動作します。
 - **ドキュメント**: タスクキューの説明にタスクグループ行を追加しました。
 

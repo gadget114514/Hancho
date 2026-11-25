@@ -1,5 +1,6 @@
 #include "../src/triage.h"
 #include "../src/triage_text.h"
+#include "../src/triage_manager.h"
 #include "../src/common.h"
 
 #include <windows.h>
@@ -651,6 +652,199 @@ int main() {
         MergeTriageCards(store, cards4, now);
         Check(countLineageCards(store["cards"]) == 1,
               "100-8: 4th failure in same lineage does not duplicate card");
+    }
+
+    // 18. 102-10: triage cards target failed directions, not individual jobs.
+    {
+        auto failedInDirection = [](const std::string& id, const std::string& dirId,
+                                    const std::string& btId, const std::string& className,
+                                    int exitCode, const std::string& summary) {
+            json job = TimeoutJob(50);
+            job["id"] = id;
+            job["summary"] = summary;
+            job["direction_id"] = dirId;
+            job["taskqueue"] = "main";
+            job["task_id"] = "task_dir";
+            job["failure"]["class"] = className;
+            job["failure"]["summary"] = summary;
+            job["attempts"].back()["failure"]["class"] = className;
+            job["attempts"].back()["exit_code"] = exitCode;
+            if (!btId.empty()) job["bt"] = {{"id", btId}, {"node", "test"}};
+            return job;
+        };
+        auto direction = [](const std::string& id, const std::string& kind,
+                            const std::string& btId, bool triage = true) {
+            return json{{"id", id}, {"kind", kind}, {"btId", btId}, {"taskId", "task_dir"},
+                        {"title", "Build and test"}, {"closed", nullptr}, {"triage", triage}};
+        };
+        auto countDirectionCards = [](const json& cards) {
+            int count = 0;
+            for (const auto& card : cards)
+                if (card.value("kind", std::string()) == "direction_failure") ++count;
+            return count;
+        };
+        auto hasCandidate = [](const json& card, const char* id) {
+            for (const auto& candidate : card.value("candidates", json::array()))
+                if (candidate.value("id", std::string()) == id) return true;
+            return false;
+        };
+
+        // A test that fails inside a fix loop is not a card while the BT keeps running.
+        {
+            json fixed = failedInDirection("test-1-r1", "dir_bt", "bt1", "nonzero_exit", 0, "Test fixed");
+            fixed["state"] = "succeeded";
+            TriageInputs in;
+            in.jobs = json::array({failedInDirection("test-1", "dir_bt", "bt1", "nonzero_exit", 1, "Test failed"), fixed});
+            in.directions = json::array({direction("dir_bt", "bt", "bt1")});
+            in.btStates = {{"bt1", "running"}};
+            in.now = now;
+            Check(BuildTriageCandidates(in).empty(),
+                  "102-10: a test fixed inside a running BT creates no triage card");
+        }
+
+        // A BT that ends failed creates one card carrying every failed job as evidence.
+        {
+            json fixed = failedInDirection("test-3", "dir_bt", "bt1", "nonzero_exit", 0, "Test passed");
+            fixed["state"] = "succeeded";
+            TriageInputs in;
+            in.jobs = json::array({
+                failedInDirection("test-1", "dir_bt", "bt1", "nonzero_exit", 1, "Test 1 failed"),
+                failedInDirection("test-2", "dir_bt", "bt1", "timeout", 1460, "Test 2 timed out"),
+                fixed});
+            in.directions = json::array({direction("dir_bt", "bt", "bt1")});
+            in.btStates = {{"bt1", "failed"}};
+            in.now = now;
+            const json cards = BuildTriageCandidates(in);
+            const json card = FindCard(cards, "dir:dir_bt");
+            const json evidence = FindInfoItem(card, "cause", "failedJobs");
+            const json failedJobs = evidence.value("v", json::array());
+            bool evidenceOk = failedJobs.size() == 2 &&
+                failedJobs[0].value("id", std::string()) == "test-1" &&
+                failedJobs[0].value("failureClass", std::string()) == "nonzero_exit" &&
+                failedJobs[0].value("exitCode", 0) == 1 &&
+                failedJobs[1].value("id", std::string()) == "test-2";
+            Check(countDirectionCards(cards) == 1 && card.value("id", std::string()) == "dir_bt" &&
+                  card.value("target", json::object()).value("btId", std::string()) == "bt1" &&
+                  evidenceOk && hasCandidate(card, "retry") && hasCandidate(card, "redo") &&
+                  hasCandidate(card, "ignore") && hasCandidate(card, "ack"),
+                  "102-10: a failed BT creates one direction card with all failed jobs and direction candidates");
+        }
+
+        // A jobs direction is reported once all its jobs have finished and one or more failed.
+        {
+            json fixed = failedInDirection("j3", "dir_jobs", "", "nonzero_exit", 0, "Build ok");
+            fixed["state"] = "succeeded";
+            TriageInputs in;
+            in.jobs = json::array({
+                failedInDirection("j1", "dir_jobs", "", "nonzero_exit", 2, "Build failed"),
+                failedInDirection("j2", "dir_jobs", "", "timeout", 1460, "Test timed out"),
+                fixed});
+            in.directions = json::array({direction("dir_jobs", "jobs", "")});
+            in.now = now;
+            const json cards = BuildTriageCandidates(in);
+            const json card = FindCard(cards, "dir:dir_jobs");
+            const json evidence = FindInfoItem(card, "cause", "failedJobs");
+            Check(countDirectionCards(cards) == 1 && card.value("id", std::string()) == "dir_jobs" &&
+                  evidence.value("v", json::array()).size() == 2,
+                  "102-10: a jobs direction with several failures creates one card");
+
+            json stillRunning = failedInDirection("j4", "dir_jobs2", "", "nonzero_exit", 1, "Still running");
+            stillRunning["state"] = "running";
+            TriageInputs running;
+            running.jobs = json::array({failedInDirection("j5", "dir_jobs2", "", "timeout", 1460, "Timed out"), stillRunning});
+            running.directions = json::array({direction("dir_jobs2", "jobs", "")});
+            running.now = now;
+            Check(FindCard(BuildTriageCandidates(running), "dir:dir_jobs2").empty(),
+                  "102-10: no card until every job in the direction has finished");
+        }
+
+        // triage: false and triage_mode: off suppress direction cards.
+        {
+            TriageInputs off;
+            off.jobs = json::array({failedInDirection("j-off", "dir_off", "", "nonzero_exit", 1, "Skipped")});
+            off.directions = json::array({direction("dir_off", "jobs", "", false)});
+            off.now = now;
+            Check(BuildTriageCandidates(off).empty(),
+                  "102-10: triage false on the direction creates no card");
+
+            TriageInputs mode;
+            mode.jobs = json::array({failedInDirection("j-mode", "dir_mode", "", "nonzero_exit", 1, "Off")});
+            mode.directions = json::array({direction("dir_mode", "jobs", "")});
+            mode.config = {{"triage_mode", "off"}};
+            mode.now = now;
+            Check(BuildTriageCandidates(mode).empty(),
+                  "102-10: triage_mode off creates no card");
+        }
+
+        // 100-8: repeated lineage failures are a badge on the direction card, not a second card.
+        {
+            auto lineageJob = [&](const std::string& id, const std::string& prev, const std::string& next) {
+                json job = failedInDirection(id, "dir_lineage", "", "nonzero_exit", 1, "Rescue failed");
+                job["supersedes"] = prev;
+                job["superseded_by"] = next;
+                return job;
+            };
+            TriageInputs in;
+            in.jobs = json::array({lineageJob("L1", "", "L2"), lineageJob("L2", "L1", "L3"),
+                                   lineageJob("L3", "L2", "")});
+            in.directions = json::array({direction("dir_lineage", "jobs", "")});
+            in.now = now;
+            const json cards = BuildTriageCandidates(in);
+            const json card = FindCard(cards, "dir:dir_lineage");
+            const json badge = FindInfoItem(card, "cause", "repeatedFailure");
+            bool noSeparate = true;
+            for (const auto& c : cards)
+                noSeparate = noSeparate && c.value("kind", std::string()) != "lineage_repeated_failure";
+            Check(countDirectionCards(cards) == 1 && noSeparate &&
+                  badge.value("v", json::object()).value("count", 0) == 3 &&
+                  card["flags"].value("repeatedFailure", json::object()).value("count", 0) == 3,
+                  "100-8: repeated failures badge the direction card instead of adding a card");
+        }
+
+        // A standalone process stays a per-process notice, never a direction card.
+        {
+            const json processes = json::array({
+                {{"id", 21}, {"name", "worker"}, {"command", "worker.exe"}, {"cwd", "C:/work"},
+                 {"state", "failed"}, {"exit_code", 1}, {"start_time", "2026-11-14 11:00:00"}}});
+            const json cards = BuildProcessTriageCandidates(processes);
+            Check(cards.size() == 1 && cards[0].value("kind", std::string()) == "process_failure" &&
+                  hasCandidate(cards[0], "ack") && countDirectionCards(cards) == 0,
+                  "102-10: a standalone process remains a per-process notice with ack");
+        }
+    }
+
+    // 19. 102-7/102-8: decision semantics used when closing a direction and migrating legacy cards.
+    {
+        Check(TriageDecisionClosesDirection("ignore") && TriageDecisionClosesDirection("ack") &&
+              !TriageDecisionClosesDirection("retry") && !TriageDecisionClosesDirection("redo") &&
+              !TriageDecisionClosesDirection("cancel") && !TriageDecisionClosesDirection("investigate"),
+              "102-7: only ignore and ack close the direction");
+        Check(TriageDecisionCloseResult("ignore") == "ignored" &&
+              TriageDecisionCloseResult("ack") == "succeeded",
+              "102-7: the decision result is mapped onto the direction close result");
+        Check(TriageLegacyDecisionIsClosed("ignored") && TriageLegacyDecisionIsClosed("resolved") &&
+              TriageLegacyDecisionIsClosed("acted") && !TriageLegacyDecisionIsClosed("pending") &&
+              !TriageLegacyDecisionIsClosed("all"),
+              "102-7: an already-decided legacy failure counts as closed");
+
+        json card = TimeoutJob(50);
+        card["id"] = "dir-close-target";
+        card["direction_id"] = "dir_close_1";
+        TriageInputs in;
+        in.jobs = json::array({card});
+        in.directions = json::array({{{"id", "dir_close_1"}, {"kind", "jobs"},
+                                      {"title", "Build and test"}, {"state", "failed"}}});
+        in.now = now;
+        const json candidate = FindCard(BuildTriageCandidates(in), "dir:dir_close_1");
+        bool hasCloseActions = false;
+        bool hasNoCloseActions = false;
+        for (const auto& c : candidate.value("candidates", json::array())) {
+            const std::string id = c.value("id", std::string());
+            if (TriageDecisionClosesDirection(id)) hasCloseActions = true;
+            if (id == "retry" || id == "redo") hasNoCloseActions = true;
+        }
+        Check(hasCloseActions && hasNoCloseActions,
+              "102-7: a failed direction offers both closing and non-closing decisions");
     }
 
     return g_failures == 0 ? 0 : 1;

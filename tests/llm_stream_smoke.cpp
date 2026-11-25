@@ -327,6 +327,15 @@ int main() {
     ptRecent.agentType = "claude";
     ptRecent.totalTokens = 200;
     int64_t oneDayAgo = nowSec - 1 * 86400;
+    std::tm oneDayAgoTm = {};
+    time_t oneDayAgoTime = static_cast<time_t>(oneDayAgo);
+    int64_t oneDayAgoDayStart = oneDayAgo;
+    if (LocalTimeFromSec(&oneDayAgoTime, &oneDayAgoTm)) {
+        oneDayAgoTm.tm_hour = 0;
+        oneDayAgoTm.tm_min = 0;
+        oneDayAgoTm.tm_sec = 0;
+        oneDayAgoDayStart = static_cast<int64_t>(std::mktime(&oneDayAgoTm));
+    }
     RecordLlmUsagePoint(oneDayAgo, ptRecent);
 
     // Call prune with 7-day retention relative to nowSec
@@ -352,7 +361,7 @@ int main() {
     bool hasRecent = false;
     for (int64_t ep : keptEpochs) {
         if (ep == tenDaysAgo) hasOld = true;
-        if (ep == oneDayAgo) hasRecent = true;
+        if (ep == oneDayAgo || ep == oneDayAgoDayStart) hasRecent = true;
     }
     Check(!hasOld, "point older than 7 days was pruned from usage_history.jsonl");
     Check(hasRecent, "point within 7 days was kept in usage_history.jsonl");

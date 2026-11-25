@@ -176,7 +176,7 @@ std::string CardTargetQueue(const json& card) {
 
 bool TracksOutcome(const json& card) {
     const std::string kind = GetString(card, "kind");
-    return kind == "job_failure" || kind == "bt_escalation_failure";
+    return kind == "job_failure" || kind == "bt_escalation_failure" || kind == "direction_failure";
 }
 
 bool IsClosedCard(const json& card) {
@@ -257,6 +257,7 @@ void TriageManager::Loop() {
 void TriageManager::SaveLocked() {
     EnsureDirectoryWide(TriageDirectory());
     WriteFileAtomicWide(CardsPath(), store_.dump(2));
+    ++storeRev_;
 }
 
 std::string TriageManager::AddCard(const json& card) {
@@ -302,13 +303,43 @@ void TriageManager::Refresh() {
     const std::string language = GetString(config, "language", "en");
 
     std::string err;
-    json listed = json::parse(tqm_.TaskQueueList("", "", 0, err, "", "", true), nullptr, false);
-    if (!err.empty() || !listed.is_object() || !listed.value("ok", false)) {
-        WriteAuditLog("TRIAGE_REFRESH_ERR", err.empty() ? "taskqueue list returned an invalid response" : err);
+    // 102-8: ask only for what changed since the last refresh instead of rebuilding every job.
+    json changes = json::parse(tqm_.TaskQueueChanges(lastTaskRev_, true, err), nullptr, false);
+    if (!err.empty() || !changes.is_object() || !changes.value("ok", false) ||
+        !changes.contains("rev") || !changes["rev"].is_number_unsigned()) {
+        WriteAuditLog("TRIAGE_REFRESH_ERR", err.empty() ? "taskqueue changes returned an invalid response" : err);
         return;
     }
-    json jobs = listed.is_object() && listed.contains("jobs") && listed["jobs"].is_array()
-        ? listed["jobs"] : json::array();
+    const uint64_t rev = changes["rev"].get<uint64_t>();
+    if (changes.value("reset", false) || lastTaskRev_ == 0) {
+        jobsById_.clear();
+        directionsById_.clear();
+    }
+    for (const auto& job : changes.value("jobs", json::array())) {
+        if (!job.is_object()) continue;
+        const std::string id = GetString(job, "id");
+        if (!id.empty()) jobsById_[id] = job;
+    }
+    for (const auto& id : changes.value("removed", json::array())) {
+        if (id.is_string()) jobsById_.erase(id.get<std::string>());
+    }
+    for (const auto& change : changes.value("directions", json::array())) {
+        const std::string id = GetString(change, "id");
+        if (id.empty()) continue;
+        json record = change;
+        json full;
+        if (tqm_.DirectionGet(id, full) && full.is_object()) {
+            for (auto it = full.begin(); it != full.end(); ++it) {
+                if (!record.contains(it.key())) record[it.key()] = it.value();
+            }
+        }
+        directionsById_[id] = std::move(record);
+    }
+    json jobs = json::array();
+    for (const auto& [id, job] : jobsById_) {
+        (void)id;
+        jobs.push_back(job);
+    }
     // The list RPC omits the instructions text to keep its payload small. For a failed job the
     // captured instructions say most clearly what it was trying to do, so fetch them (cached by
     // job id + revision) and add them to the card's intent section.
@@ -338,6 +369,50 @@ void TriageManager::Refresh() {
     inputs.jobs = jobs;
     inputs.config = config;
     inputs.now = GetCurrentTimestampStr();
+    // 102-10: direction records drive per-direction cards. DirectionState is read outside our
+    // mutex, so the lock order stays TaskQueueManager -> DirectionStore.
+    inputs.directions = json::array();
+    for (const auto& [id, record] : directionsById_) {
+        (void)id;
+        inputs.directions.push_back(record);
+    }
+    for (const auto& dir : inputs.directions) {
+        const std::string dirId = GetString(dir, "id");
+        const bool disabled = dir.contains("triage") && dir["triage"].is_boolean() &&
+                              !dir["triage"].get<bool>();
+        if (!disabled || dirId.empty() || GetString(dir, "state") != "failed") continue;
+        if (dir.contains("closed") && dir["closed"].is_object()) continue;
+        std::string closeErr;
+        tqm_.DirectionClose(dirId, "failed", "triage disabled for this direction", closeErr);
+    }
+
+    // 102-7: a pre-0.10 failure has no direction record; its implicit direction (job:<jobId>) is
+    // considered closed when the old per-job card already carries a decision.
+    json legacyCards;
+    {
+        std::lock_guard<std::mutex> lock(mutex_);
+        legacyCards = store_["cards"];
+    }
+    for (const auto& card : legacyCards) {
+        const std::string legacyState = GetString(card, "state");
+        if (!TriageLegacyDecisionIsClosed(legacyState)) continue;
+        const std::string jobId = GetString(GetObject(card, "target"), "jobId");
+        if (jobId.empty()) continue;
+        TaskQueueJob snapshot;
+        if (!tqm_.GetJobSnapshot(jobId, snapshot) || !snapshot.directionId.empty()) continue;
+        const std::string dirId = "job:" + jobId;
+        json record;
+        if (tqm_.DirectionGet(dirId, record) && record.is_object() &&
+            record.contains("closed") && record["closed"].is_object()) continue;
+        const json decision = GetObject(card, "decision");
+        const std::string reason = GetString(decision, "reason", "legacy triage decision");
+        json closeDecision = {{"candidateId", GetString(decision, "candidateId")},
+                              {"result", GetString(decision, "result")},
+                              {"reason", reason}, {"by", GetString(decision, "by")}};
+        std::string closeErr;
+        tqm_.DirectionClose(dirId, legacyState == "ignored" ? "ignored" : "succeeded",
+                            reason, closeErr, closeDecision);
+    }
 
     if (btm_) {
         json treesDoc = json::parse(btm_->List(), nullptr, false);
@@ -422,6 +497,16 @@ void TriageManager::Refresh() {
         supervisorTimeoutSec_ = static_cast<int>(std::clamp<long long>(supervisorTimeout, 60, 7200));
         language_ = language.empty() ? "en" : language;
         const json before = store_;
+        // triage_mode: off is a data-directory wide switch: no new cards, and any card left
+        // pending from an earlier run is closed without a decision.
+        if (mode == "off") {
+            for (auto& card : store_["cards"]) {
+                if (GetString(card, "state") != "pending") continue;
+                card["state"] = "resolved";
+                card["resolvedReason"] = "triage_off";
+                card["updatedAt"] = inputs.now;
+            }
+        }
         ApplyTriageKindSettings(store_, fresh, config, inputs.now);
         const std::vector<std::string> addedCardIds = MergeTriageCards(store_, fresh, inputs.now);
         for (const std::string& addedId : addedCardIds) {
@@ -475,6 +560,9 @@ void TriageManager::Refresh() {
         DecideInternal(cardId, candidateId, "Automatic triage recommendation", json::object(), by);
     }
     PumpAdvice();
+    // Record the revision we consumed even when nothing needed a card, otherwise the next
+    // refresh would ask the task queue for the same changes again.
+    lastTaskRev_ = rev;
 }
 
 void TriageManager::PumpAdvice() {
@@ -748,6 +836,10 @@ std::string TriageManager::List(const std::string& requestedState) {
     if (state != "pending" && state != "all" && state != "acted" && state != "ignored" && state != "resolved" &&
         state != "open" && state != "follow_up")
         return Error("state must be pending, all, acted, ignored, resolved, open, or follow_up").dump();
+    // 102-8: a triage_list is pure output of the card store plus the current mode, so it can be
+    // reused until any of those change (every mutation of store_ goes through SaveLocked).
+    const std::string cacheKey = std::to_string(storeRev_) + "|" + mode_ + "|" + llmMode_ + "|" + state;
+    if (!listCache_.empty() && listCacheKey_ == cacheKey) return listCache_;
     json cards = json::array();
     int pendingTask = 0;
     int pendingProcess = 0;
@@ -781,7 +873,7 @@ std::string TriageManager::List(const std::string& requestedState) {
         if (cardState == "pending" && (handoffState == "queued" || handoffState == "running")) ++withSupervisor;
         if (cardState == "pending") {
             const std::string kind = GetString(*card, "kind");
-            if (kind == "job_failure" || kind == "bt_escalation_failure") ++pendingTask;
+            if (kind == "job_failure" || kind == "bt_escalation_failure" || kind == "direction_failure") ++pendingTask;
             else if (kind == "process_failure") ++pendingProcess;
             else ++pendingOther;
         }
@@ -811,8 +903,10 @@ std::string TriageManager::List(const std::string& requestedState) {
                     {"withSupervisor", withSupervisor}, {"handling", handling}, {"running", running},
                     {"waitingBranch", waitingBranch}, {"waitingNext", waitingNext},
                     {"followUp", followUp}, {"done", done}, {"open", open}};
-    return json{{"ok", true}, {"cards", std::move(cards)}, {"counts", std::move(counts)},
-                {"jobs", std::move(jobs)}, {"mode", mode_}, {"llmMode", llmMode_}}.dump();
+    listCacheKey_ = cacheKey;
+    listCache_ = json{{"ok", true}, {"cards", std::move(cards)}, {"counts", std::move(counts)},
+                      {"jobs", std::move(jobs)}, {"mode", mode_}, {"llmMode", llmMode_}}.dump();
+    return listCache_;
 }
 
 std::string TriageManager::Get(const std::string& id) {
@@ -922,7 +1016,116 @@ std::string TriageManager::DecideInternal(const std::string& id, const std::stri
     std::string result = "Recorded " + candidateId + ".";
     std::string actionError;
     json routineAskResult;
-    if (candidateId == "retry" || candidateId == "retry_raise_timeout") {
+    const std::string directionId = GetString(target, "directionId");
+    if (candidateId == "retry" && !directionId.empty()) {
+        // 102-10: retry applies to the failed direction, never to a single job inside it.
+        const std::string btId = GetString(target, "btId");
+        if (!btId.empty() && btm_) {
+            const std::string response = btm_->Retry(btId, "", false);
+            if (!ResponseOk(response, actionError)) return Error(actionError).dump();
+            result = "Retried behavior tree " + btId + ".";
+        } else {
+            const std::string response = tqm_.DirectionRetryJobs(directionId, false, false,
+                                                                 TaskQueueCaller::External, actionError);
+            if (!actionError.empty() || !ResponseOk(response, actionError)) return Error(actionError).dump();
+            result = "Retried failed jobs in direction " + directionId + ".";
+        }
+    } else if (candidateId == "redo" && !directionId.empty()) {
+        // Rescue: a superseding direction in the same task, capped at two hops by default.
+        int hops = 0;
+        std::unordered_set<std::string> visited;
+        std::string walk = directionId;
+        while (!walk.empty() && visited.insert(walk).second) {
+            json previousRecord;
+            if (!tqm_.DirectionGet(walk, previousRecord)) break;
+            const std::string previous = GetString(previousRecord, "supersedes");
+            if (previous.empty()) break;
+            ++hops;
+            walk = previous;
+        }
+        const long long maxHops = GetNumber(target, "maxHops", 2);
+        const bool automatic = by == "hancho-auto" || by == "llm-auto";
+        if (automatic && hops >= maxHops)
+            return Error("rescue direction chain has reached the configured limit").dump();
+        const std::string taskId = GetString(target, "taskId");
+        json dirRecord;
+        tqm_.DirectionGet(directionId, dirRecord);
+        const std::string cardNumber = (dirRecord.contains("card") && dirRecord["card"].is_object())
+            ? GetString(dirRecord["card"], "number") : std::string();
+        const std::string effTaskId = taskId.empty() ? GetString(dirRecord, "taskId") : taskId;
+
+        if (!cardNumber.empty()) {
+            std::string redoErr;
+            const std::string redoResponse = tqm_.CardRedo(effTaskId, cardNumber, false, "", false, "",
+                                                           reason, false, "", redoErr);
+            if (!redoErr.empty() || !ResponseOk(redoResponse, redoErr)) return Error(redoErr).dump();
+            json redone = json::parse(redoResponse, nullptr, false);
+            const std::string rescueDirId = redone.value("directionId", redone.value("id", std::string()));
+            const std::string newNumber = redone.value("number", std::string());
+            result = "Created rescue direction " + rescueDirId + " (" + newNumber + ").";
+            if (btm_) {
+                std::string runErr;
+                const std::string runResp = btm_->CardRun(effTaskId, newNumber, false, 1, false, "");
+                if (!ResponseOk(runResp, runErr)) {
+                    result += " Direction run failed: " + runErr;
+                }
+            }
+        } else {
+            std::string queue = GetString(target, "queue");
+            json rescueJobs = json::array();
+            const json failedIds = target.value("failedJobIds", json::array());
+            for (const auto& idValue : failedIds) {
+                const std::string jobId = idValue.is_string() ? idValue.get<std::string>() : std::string();
+                if (jobId.empty()) continue;
+                std::string getErr;
+                json got = json::parse(tqm_.TaskQueueGet(jobId, true, 0, getErr), nullptr, false);
+                if (!got.is_object() || !got.value("ok", false)) continue;
+                json job = GetObject(got, "job");
+                if (job.empty()) continue;
+                job["id"] = jobId + "-r" + std::to_string(hops + 1);
+                job["supersedes"] = jobId;
+                if (queue.empty()) queue = GetString(job, "taskqueue");
+                job.erase("taskqueue");
+                rescueJobs.push_back(std::move(job));
+            }
+            if (rescueJobs.empty()) return Error("no failed jobs left to rescue").dump();
+            if (queue.empty()) queue = "main";
+            // An implicit task has no task record; with no explicit task the new jobs inherit the
+            // superseded job's task through `supersedes`, which keeps them in the same task.
+            std::string rescueTaskId;
+            std::string taskErr;
+            if (!effTaskId.empty() && tqm_.ValidateTaskActive(effTaskId, taskErr)) rescueTaskId = effTaskId;
+            std::string addErr;
+            const std::string addResponse = tqm_.TaskQueueAdd(queue, rescueJobs.dump(), 1, "", addErr, "", rescueTaskId);
+            if (!addErr.empty() || !ResponseOk(addResponse, addErr)) return Error(addErr).dump();
+            json added = json::parse(addResponse, nullptr, false);
+            const std::string rescueDirId = added.value("direction_id", std::string());
+            if (!rescueDirId.empty()) {
+                std::string linkErr;
+                tqm_.DirectionSetRedo(directionId, rescueDirId, reason, linkErr);
+                if (!linkErr.empty()) result += " Direction link failed: " + linkErr;
+            }
+            result = "Created rescue direction " + rescueDirId + " with " +
+                     std::to_string(rescueJobs.size()) + " job(s).";
+        }
+    } else if (TriageDecisionClosesDirection(candidateId) && !directionId.empty()) {
+        // 102-7: closing the card closes only its direction, never the parent task. Retry and
+        // redo deliberately take their own branches below and leave the direction open.
+        result = "Closed direction " + directionId + " without rerunning it.";
+        json closeDecision = {{"candidateId", candidateId}, {"result", result},
+                              {"reason", reason}, {"by", by}};
+        std::string closeErr;
+        const std::string closeResponse = tqm_.DirectionClose(
+            directionId, TriageDecisionCloseResult(candidateId),
+            reason.empty() ? candidateId : reason, closeErr, closeDecision);
+        if (closeErr.empty()) {
+            json closed = json::parse(closeResponse, nullptr, false);
+            if (closed.is_object() && !closed.value("ok", false))
+                closeErr = closed.value("error", closeErr);
+        }
+        if (!closeErr.empty())
+            result = "Recorded " + candidateId + "; direction close failed: " + closeErr;
+    } else if (candidateId == "retry" || candidateId == "retry_raise_timeout") {
         const std::string jobId = GetString(target, "jobId");
         if (jobId.empty()) return Error("job target is missing").dump();
         if (candidateId == "retry_raise_timeout") {
@@ -1044,12 +1247,12 @@ std::string TriageManager::DecideInternal(const std::string& id, const std::stri
         return Error("unsupported candidate: " + candidateId).dump();
     }
 
-    std::string targetTaskId;
+    std::string targetTaskId = GetString(GetObject(card, "target"), "taskId");
     const std::string jobId = CardTargetJob(card);
     if (!jobId.empty()) {
         TaskQueueJob jobSnapshot;
         if (tqm_.GetJobSnapshot(jobId, jobSnapshot)) {
-            targetTaskId = jobSnapshot.taskId;
+            if (targetTaskId.empty()) targetTaskId = jobSnapshot.taskId;
             const std::string actor = by == "human" ? "human" : by == "hancho-auto" ? "hancho" : "llm";
             const std::string line = "[triage] " + actor + " (" + by + ") chose " + candidateId + ": " + reason;
             const std::string notes = jobSnapshot.notes.empty() ? line : jobSnapshot.notes + "\n" + line;
@@ -1098,7 +1301,13 @@ std::string TriageManager::DecideInternal(const std::string& id, const std::stri
         }
         if (by == "hancho-auto" || by == "llm-auto") (*found)["decision"]["reviewed"] = false;
         if (by != "human" && (candidateId == "retry" || candidateId == "retry_raise_timeout")) {
-            const std::string retry = CardTargetJob(*found) + "|" + FailureClassFor(*found);
+            const bool directionRetry = CardTargetJob(*found).empty();
+            const std::string retryTarget = directionRetry
+                ? GetString(GetObject(*found, "target"), "directionId") : CardTargetJob(*found);
+            // A direction card has no single failure class; TriageAutoChoice uses the same
+            // "<directionId>|" key for its one automatic retry guard.
+            const std::string retry = retryTarget + "|" +
+                (directionRetry ? std::string() : FailureClassFor(*found));
             if (std::find(store_["autoRetries"].begin(), store_["autoRetries"].end(), json(retry)) == store_["autoRetries"].end())
                 store_["autoRetries"].push_back(retry);
         }

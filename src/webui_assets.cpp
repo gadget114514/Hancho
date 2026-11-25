@@ -3138,7 +3138,7 @@ const char kAppJs_6[] = R"JS_6(                <td class="font-mono" colspan="2"
               html += `<tr class="direction-heading-row" data-direction-id="${escapeHtml(dirKey)}">
                 <td>${dBadge}</td>
                 <td class="font-mono" colspan="2"${dPad}><strong>${dArrow} ${escapeHtml(dTitle)}</strong></td>
-                <td colspan="3"><span class="text-muted">direction (${escapeHtml(d.kind)})</span> <span class="font-mono">${escapeHtml(dCompact)}</span> <span class="text-muted">(${d.realJobs.length} job${d.realJobs.length === 1 ? '' : 's'})</span></td>
+                <td colspan="3"><span class="text-muted">${T('direction')} (${escapeHtml(d.kind)})</span> <span class="font-mono">${escapeHtml(dCompact)}</span> <span class="text-muted">(${d.realJobs.length} job${d.realJobs.length === 1 ? '' : 's'})</span></td>
                 <td colspan="5"></td>
                 <td style="text-align: center;">${dRetryBtn} ${dCancelBtn}</td>
               </tr>`;
@@ -3266,7 +3266,7 @@ const char kAppJs_6[] = R"JS_6(                <td class="font-mono" colspan="2"
     elTaskModalTitle.textContent = `Card: ${dirId}`;
     elTaskModalBody.innerHTML = '<div class="empty-message">Loading card details...</div>';
     elModalTaskDetails.classList.remove('hidden');
-    sendWsRequest({ action: 'card_show', id: dirId, taskId: taskId || '' });
+    sendWsRequest({ action: 'direction_show', id: dirId, taskId: taskId || '' });
   }
 
   function renderCardDetailsModal(data) {
@@ -3313,14 +3313,14 @@ const char kAppJs_6[] = R"JS_6(                <td class="font-mono" colspan="2"
     };
     if (card.state === 'planned') {
       addItem('Run card', () => {
-        sendWsRequest({ action: 'card_run', taskId: card.taskId, number: card.number });
+        sendWsRequest({ action: 'direction_run', taskId: card.taskId, number: card.number });
         setTimeout(() => { sendWsRequest({ action: 'direction_list' }); sendWsRequest({ action: 'taskqueue_list', include_planned: true }); }, 250);
       });
     }
     if (card.state === 'failed' || card.state === 'closed' || card.state === 'cancelled' || card.state === 'succeeded') {
       addItem('Redo card (rescue)', () => {
 )JS_6";
-const char kAppJs_7[] = R"JS_7(        sendWsRequest({ action: 'card_redo', taskId: card.taskId, number: card.number, run: true });
+const char kAppJs_7[] = R"JS_7(        sendWsRequest({ action: 'direction_redo', taskId: card.taskId, number: card.number, run: true });
         setTimeout(() => { sendWsRequest({ action: 'direction_list' }); sendWsRequest({ action: 'taskqueue_list', include_planned: true }); }, 250);
       });
     }
@@ -4182,7 +4182,10 @@ const char kAppJs_10[] = R"JS_10(    if (confirm('Purge completed, failed, and c
       'Created': '作成',
       'Created At': '作成日時',
       'Date / Time': '日時',
-      'Direction ID': 'Direction ID',
+      'Direction ID': '指示 ID',
+      'direction': '指示',
+      'Direction': '指示',
+      'Close direction': '指示を閉じる',
       'Disconnected': '切断中',
       'Display language': '表示言語',
       'Dry run only (calculate space without deleting)': '試し実行のみ（削除せず容量だけ計算）',
@@ -4323,6 +4326,9 @@ const char kAppJs_11[] = R"JS_11(      'Retention (days)': '保持期間（日�
       'Created At': 'Creado el',
       'Date / Time': 'Fecha / hora',
       'Direction ID': 'ID de dirección',
+      'direction': 'dirección',
+      'Direction': 'Dirección',
+      'Close direction': 'Cerrar dirección',
       'Disconnected': 'Desconectado',
       'Display language': 'Idioma de la interfaz',
       'Dry run only (calculate space without deleting)': 'Solo simulación (calcular el espacio sin borrar)',

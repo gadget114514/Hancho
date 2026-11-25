@@ -1,6 +1,6 @@
 # CI（Jenkins など）で使えるようにする — タスクカード 105-1〜105-6
 
-状態: タスクカードまで書いた（2026-11-24）。未着手。0.10 系（`main`）。105-3 以降は direction のレコード（タスクカード 103-1・103-2、`doc/direction-cards.md`）を前提にする。
+状態: 実装済み（2026-11-25、`main` / 0.10.0）。105-1〜105-6 は実装・テスト済み。105-3 以降は direction のレコード（タスクカード 103-1・103-2、`doc/direction-cards.md`）を前提にする。
 
 用語は `doc/terminology.md` に合わせる（task / direction / job、コア = `Hancho.exe --headless` / `HanchoCore.exe`）。
 

@@ -2259,7 +2259,7 @@ USAGE:
 
 GLOBAL OPTIONS:
   --json, -j               Print machine-readable JSON instead of human-friendly text.
-  -h, --help               Show this help.
+  -h, --help, --list       Show this help / list CLI commands.
   -V, --version            Show the version (also: hancho-cli version).
 
 DATA DIRECTORY (per invocation):
@@ -2778,19 +2778,23 @@ AUDIT (feedback on the supervisor's plan; preview, rule-based, no LLM call yet):
   task close <id> --result succeeded|failed --reason "..."
   task reopen <id> --reason "..."
   task purge --older-than <sec>
-  task wait <id> [--timeout-ms N]
+   task wait <id> [--timeout-ms N]
 
-CARDS (task cards stored as planned directions inside a task):
-  card add --task <id> --number <num> --title "..." [--body "..." | --body-file <md>] [--after <n1,n2>] [--template <name>] [--params <json>]
-  card list --task <id> [--json]
-  card show <number|directionId> [--task <id>] [--json]
-  card edit <number> --task <id> [--title "..."] [--body "..." | --body-file <md>] [--after <n1,n2>] [--template <name>] [--params <json>]
-  card remove <number> --task <id>
-  card run (<number> | --ready [--max <n>]) --task <id> [--force]
-  card redo <number> --task <id> [--body "..." | --body-file <md>] [--params <json>] [--reason "..."] [--run] [--force]
-  card import --task <id> --file <md> [--dry-run] [--translate-cards <all|title|off>]
-  card export --task <id> [--file <md>] [--lang <en|ja|es>]
-  card translate --task <id> [--translate-cards <all|title|off>]
+DIRECTIONS (指示; a task card is a planned direction inside a task):
+   direction add --task <id> --number <num> --title "..." [--body "..." | --body-file <md>] [--after <n1,n2>] [--template <name>] [--params <json>]
+   direction list [--task <id>] [--state <state>] [--limit N]
+   direction show <number|dir_<id>> [--task <id>]
+   direction edit <number> --task <id> [--title "..."] [--body "..." | --body-file <md>] [--after <n1,n2>] [--template <name>] [--params <json>]
+   direction remove <number> --task <id>
+   direction run (<number> | --ready [--max <n>]) --task <id> [--force]
+   direction redo <number> --task <id> [--body "..." | --body-file <md>] [--params <json>] [--reason "..."] [--run] [--force]
+   direction import --task <id> --file <md> [--dry-run] [--translate-cards <all|title|off>]
+   direction export --task <id> [--file <md>] [--lang <en|ja|es>]
+   direction translate --task <id> [--translate-cards <all|title|off>]
+   direction close <id> --result succeeded|failed|ignored --reason "..."
+   direction close --state failed --before <timestamp> --reason "..."   (bulk-close legacy failures)
+   direction reopen <id> --reason "..." | direction purge --older-than <sec>
+
 
 BEHAVIOR TREES (for LLM agents; next step depends on results):
   bt validate|start --file <bt.json> [--task <id>]    Check / register and run a behavior tree
@@ -2805,7 +2809,7 @@ BEHAVIOR TREES (for LLM agents; next step depends on results):
   bt retry --id <id> [--from <node>] [--reset-counters]
   bt update --id <id> [--node <node>] (--file <path> | --bt <json> | --patch <json>)
   bt cancel --id <id>  |  bt pause --id <id> [--paused true|false]
-      Leaves: job (one command), worker (one task for a worker LLM; engine/model);
+      Leaves: exec (one command; alias: job), agent (one task for a worker LLM; engine/model; alias: worker);
       composites: sequence, fallback, parallel, if, retry/repeat (max required),
       timeout; conditions: fileExists, fileNewer, outputMatches, exitCode,
       jsonValue, var, nodeState; escalate returns a decision packet to you.
@@ -2920,7 +2924,9 @@ SETUP FOR LLM AGENTS:
 "                  update_agent_info (aliases: *_worker)\n"
 "      Task:       task_create, task_show, task_list, task_note, task_close,\n"
 "                  task_reopen, task_purge, task_wait\n"
-"      Direction:  direction_show, direction_list, direction_close,\n"
+"      Direction:  direction_add, direction_show, direction_list, direction_edit,\n"
+"                  direction_remove, direction_run, direction_redo, direction_import,\n"
+"                  direction_export, direction_translate, direction_close,\n"
 "                  direction_reopen, direction_purge\n"
 "      Task queue: taskqueue_add, taskqueue_list, taskqueue_get, taskqueue_retry,\n"
 "                  taskqueue_supersede, taskqueue_update, taskqueue_cancel, taskqueue_pause, taskqueue_resume,\n"
@@ -2957,6 +2963,7 @@ void PrintCliUsageJson() {
   "global_options": [
     {"name": "--json", "alias": "-j", "description": "Print the raw machine-readable JSON response. May be placed before or after the command."},
     {"name": "--help", "alias": "-h", "description": "Show usage. Combine with --json to get this machine-readable help."},
+    {"name": "--list", "description": "List commands and usage (alias for --help; supports '--list cli --json')."},
     {"name": "--version", "alias": "-V", "description": "Show the version. Combine with --json for {\"ok\":true,\"version\":...}."}
   ],
   "data_dir_option": {
@@ -3227,17 +3234,23 @@ void PrintCliUsageJson() {
       "options": [{"name": "--json", "description": "Print the raw IPC response."}]
     },
     {
-      "name": "card",
-      "description": "Manage task cards stored as planned directions inside a task; run ready cards via the card BT template and redo failed cards.",
-      "usage": "hancho-cli card <add|list|show|edit|remove|run|redo> ...",
+      "name": "direction",
+      "description": "Manage directions (指示): the lifecycle of BTs, job groups and the planned cards of a task; add, run and rescue cards through the card BT template.",
+      "usage": "hancho-cli direction <add|list|show|edit|remove|run|redo|import|export|translate|close|reopen|purge> ...",
       "subcommands": [
-        {"name": "add", "usage": "hancho-cli card add --task <id> --number <num> --title \"...\" [--body \"...\" | --body-file <md>] [--after <n1,n2>] [--template <name>] [--params <json>]", "description": "Add a planned task card to an open task."},
-        {"name": "list", "usage": "hancho-cli card list --task <id> [--json]", "description": "List task cards in a task sorted by number, with state and waitingFor dependencies."},
-        {"name": "show", "usage": "hancho-cli card show <number|directionId> [--task <id>] [--json]", "description": "Show a task card including its body, dependencies, and jobs."},
-        {"name": "edit", "usage": "hancho-cli card edit <number> --task <id> [--title \"...\"] [--body \"...\" | --body-file <md>] [--after <n1,n2>] [--template <name>] [--params <json>]", "description": "Edit a planned task card."},
-        {"name": "remove", "usage": "hancho-cli card remove <number> --task <id>", "description": "Remove a planned task card from a task."},
-        {"name": "run", "usage": "hancho-cli card run (<number> | --ready [--max <n>]) --task <id> [--force]", "description": "Run a planned card or all dependency-satisfied ready cards."},
-        {"name": "redo", "usage": "hancho-cli card redo <number> --task <id> [--body \"...\" | --body-file <md>] [--params <json>] [--reason \"...\"] [--run] [--force]", "description": "Create a rescue card (<number>-r<n>) superseding a failed, cancelled, or closed card."}
+        {"name": "add", "usage": "hancho-cli direction add --task <id> --number <num> --title \"...\" [--body \"...\" | --body-file <md>] [--after <n1,n2>] [--template <name>] [--params <json>]", "description": "Add a planned task card to an open task."},
+        {"name": "list", "usage": "hancho-cli direction list [--task <id>] [--state <state>] [--limit N]", "description": "List directions, optionally filtered by task or state."},
+        {"name": "show", "usage": "hancho-cli direction show <number|dir_<id>> [--task <id>] [--json]", "description": "Show a direction or task card by direction id or card number, including its body, dependencies and jobs."},
+        {"name": "edit", "usage": "hancho-cli direction edit <number> --task <id> [--title \"...\"] [--body \"...\" | --body-file <md>] [--after <n1,n2>] [--template <name>] [--params <json>]", "description": "Edit a planned task card."},
+        {"name": "remove", "usage": "hancho-cli direction remove <number> --task <id>", "description": "Remove a planned task card from a task."},
+        {"name": "run", "usage": "hancho-cli direction run (<number> | --ready [--max <n>]) --task <id> [--force]", "description": "Run a planned card or all dependency-satisfied ready cards."},
+        {"name": "redo", "usage": "hancho-cli direction redo <number> --task <id> [--body \"...\" | --body-file <md>] [--params <json>] [--reason \"...\"] [--run] [--force]", "description": "Create a rescue card (<number>-r<n>) superseding a failed, cancelled, or closed card."},
+        {"name": "import", "usage": "hancho-cli direction import --task <id> --file <md> [--dry-run] [--translate-cards <all|title|off>]", "description": "Import task cards from Markdown."},
+        {"name": "export", "usage": "hancho-cli direction export --task <id> [--file <md>] [--lang <en|ja|es>]", "description": "Export the task's cards as Markdown."},
+        {"name": "translate", "usage": "hancho-cli direction translate --task <id> [--translate-cards <all|title|off>]", "description": "Translate stored non-English card titles and bodies to English."},
+        {"name": "close", "usage": "hancho-cli direction close <id> --result succeeded|failed|ignored --reason \"...\"", "description": "Close a direction with a final result; also supports --state failed --before <timestamp> for bulk migration."},
+        {"name": "reopen", "usage": "hancho-cli direction reopen <id> --reason \"...\"", "description": "Reopen a closed direction."},
+        {"name": "purge", "usage": "hancho-cli direction purge --older-than <sec>", "description": "Remove old closed directions."}
       ],
       "options": [{"name": "--json", "description": "Print the raw IPC response."}]
     },)";
@@ -3301,7 +3314,8 @@ void PrintCliUsageJson() {
     std::cout << R"(
     {
       "name": "worker",
-      "description": "Inspect and supervise LLM workers (Claude, agy, opencode, codex, aider, ollama) running under Hancho. JSON stream events are parsed into <log>.stream.jsonl, and normalized hancho.event/1 events into <log>.events.jsonl, both visible in the GUI (LLM JSON Stream dialog). Use hancho-cli/Hancho to supervise and watch streams.",
+      "aliases": ["agent"],
+      "description": "Inspect and supervise LLM agents and workers (Claude, agy, opencode, codex, aider, ollama) running under Hancho. JSON stream events are parsed into <log>.stream.jsonl, and normalized hancho.event/1 events into <log>.events.jsonl, both visible in the GUI (LLM JSON Stream dialog). Use hancho-cli/Hancho to supervise and watch streams.",
       "usage": "hancho-cli worker <status|stream|info|install-template|uninstall-template> [<id>] [options]",
       "subcommands": [
         {"name": "status", "usage": "hancho-cli worker status <id>", "description": "Display current worker status, model, active tool, thoughts, message, supervisor context, and Claude sub-agents (subagents array)."},
@@ -3531,7 +3545,7 @@ void PrintCliUsageJson() {
           }
         }
       },
-      "tools": ["start_process", "list_processes", "get_process_output", "send_process_input", "wait_process", "kill_process", "run_agent", "wait_agent", "get_agent_stream", "get_agent_state", "update_agent_info", "task_create", "task_show", "task_list", "task_note", "task_close", "task_reopen", "task_purge", "task_wait", "direction_show", "direction_list", "direction_close", "direction_reopen", "direction_purge", "taskqueue_add", "taskqueue_list", "taskqueue_get", "taskqueue_retry", "taskqueue_supersede", "taskqueue_update", "taskqueue_cancel", "taskqueue_takeover", "taskqueue_complete", "taskqueue_pause", "taskqueue_resume", "taskqueue_pause_job", "taskqueue_resume_job", "taskqueue_wait", "taskqueue_purge", "taskqueue_link", "taskqueue_unlink", "taskqueue_graph", "bt_validate", "bt_start", "bt_get", "bt_list", "bt_wait", "bt_resume", "bt_retry", "bt_update", "bt_cancel", "bt_pause", "bt_template", "routine_list", "routine_show", "routine_run", "routine_save", "routine_check", "routine_ask", "routine_approve", "routine_reject", "power_suspend", "power_shutdown", "power_cancel", "power_status", "chat_status", "chat_peers", "chat_refresh", "chat_send", "chat_get", "chat_inbox", "chat_wait", "chat_read", "chat_download", "chat_log", "chat_handler", "memory_search", "memory_get", "memory_brief", "memory_stats", "memory_note", "memory_retract", "memory_approve", "usage_stats", "usage_export", "agent_health"]
+      "tools": ["start_process", "list_processes", "get_process_output", "send_process_input", "wait_process", "kill_process", "run_agent", "wait_agent", "get_agent_stream", "get_agent_state", "update_agent_info", "task_create", "task_show", "task_list", "task_note", "task_close", "task_reopen", "task_purge", "task_wait", "direction_add", "direction_show", "direction_list", "direction_edit", "direction_remove", "direction_run", "direction_redo", "direction_import", "direction_export", "direction_translate", "direction_close", "direction_reopen", "direction_purge", "taskqueue_add", "taskqueue_list", "taskqueue_get", "taskqueue_retry", "taskqueue_supersede", "taskqueue_update", "taskqueue_cancel", "taskqueue_takeover", "taskqueue_complete", "taskqueue_pause", "taskqueue_resume", "taskqueue_pause_job", "taskqueue_resume_job", "taskqueue_wait", "taskqueue_purge", "taskqueue_link", "taskqueue_unlink", "taskqueue_graph", "bt_validate", "bt_start", "bt_get", "bt_list", "bt_wait", "bt_resume", "bt_retry", "bt_update", "bt_cancel", "bt_pause", "bt_template", "routine_list", "routine_show", "routine_run", "routine_save", "routine_check", "routine_ask", "routine_approve", "routine_reject", "power_suspend", "power_shutdown", "power_cancel", "power_status", "chat_status", "chat_peers", "chat_refresh", "chat_send", "chat_get", "chat_inbox", "chat_wait", "chat_read", "chat_download", "chat_log", "chat_handler", "memory_search", "memory_get", "memory_brief", "memory_stats", "memory_note", "memory_retract", "memory_approve", "usage_stats", "usage_export", "agent_health"]
     }
   },
   "leaving": {
@@ -3637,13 +3651,13 @@ void PrintCliUsageJson() {
         "On failure read bt_get {id, compact: true}; fix the cause (bt_update changes a non-running node's definition) and call bt_retry {id, from}."
       ],
       "nodes": {
-        "leaves": "job {command, summary, timeoutSec, success, capture, blame}, worker {prompt, summary, timeoutSec, engine, model, engines, switchEngineOn, switchLimits, onSwitch, outputSchema}, wait {sec}, set {var, value}, escalate {question, guidance, expect, include, timeoutSec, fallback {afterSec, engine, model}}, fail, succeed",
+        "leaves": "exec {command, summary, timeoutSec, success, capture, blame; alias: job}, agent {prompt, summary, timeoutSec, engine, model, engines, switchEngineOn, switchLimits, onSwitch, outputSchema; alias: worker}, wait {sec}, set {var, value}, escalate {question, guidance, expect, include, timeoutSec, fallback {afterSec, engine, model}}, fail, succeed",
         "composites": "sequence, fallback (selector), parallel {success: all|any|n}, if {cond, then, else}",
         "decorators": "retry {max}, repeat {max, until}, invert, forceSuccess, forceFailure, timeout {sec}",
         "conditions": "fileExists, fileNewer, outputMatches, exitCode, jsonValue, var, nodeState"
       },
-      "variables": "${name} expands BT vars; in command it is quoted as one argument. Node variables: ${<id>.state|exitCode|logFile|jobId|runs}, ${<worker>.result} (final response), ${<worker>.output.<path>} (JSON the worker wrote to PC_BT_RESULT_FILE), ${<escalate>.answer}.",
-      "remaining": "bt_get/bt_list return pendingEstimateSec (estimated work in job/worker leaves that have not started on the current branch) and plannedTasks (node, type, summary, taskqueue, estimateSec). The desktop dashboard, CLI, Web UI and MCP list them as provisional planned rows and add their estimates to the task remaining time, under a virtual direction row (id 'direction:<id>') for the BT root. They are re-derived on every query, so retry/fallback/if branch changes and completion drop stale rows.",
+      "variables": "${name} expands BT vars; in command it is quoted as one argument. Node variables: ${<id>.state|exitCode|logFile|jobId|runs}, ${<agent>.result} (final response), ${<agent>.output.<path>} (JSON the agent wrote to PC_BT_RESULT_FILE), ${<escalate>.answer}.",
+      "remaining": "bt_get/bt_list return pendingEstimateSec (estimated work in exec/agent leaves that have not started on the current branch) and plannedTasks (node, type, summary, taskqueue, estimateSec). The desktop dashboard, CLI, Web UI and MCP list them as provisional planned rows and add their estimates to the task remaining time, under a virtual direction row (id 'direction:<id>') for the BT root. They are re-derived on every query, so retry/fallback/if branch changes and completion drop stale rows.",
       "engines": "Workers name an engine (claude, agy, opencode, codex, or ones in <data dir>/engines.json) and optionally a model; permission flags live only in the engine definition. An engine may also set adapter (a Tier 1/3 file in <data dir>/adapters/) and capabilities (jsonStream, resume, reportsUsage, reportsSubagents, permissionModes). Use engines + switchEngineOn ([{class, after}]) with job.blame to switch models on repeated fix failures, bounded by switchLimits ({maxCandidates, maxSec, stopOnSameSymptom}).",
       "limits": "retry/repeat max <= 100 (required); limits.maxNodeRuns default 200; limits.maxWallSec default 86400; depth 32; 1000 nodes.",
       "rules": [
@@ -3663,7 +3677,7 @@ void PrintCliUsageJson() {
       "waiting": "Queued and ready; waiting for a free slot or the retry delay.",
       "pending": "Not in the run queue yet; dependencies are not satisfied.",
       "blocked": "A success-dependency failed/cancelled; fix and retry the dependency.",
-      "planned": "Provisional row for an idle job/worker leaf of a running behavior tree. It is not a stored queue job and disappears when the tree changes branch or finishes. taskqueue_list includes it by default; set include_planned: false (CLI --no-planned) to omit it and the task-group row.",
+      "planned": "Provisional row for an idle exec/agent leaf of a running behavior tree. It is not a stored queue job and disappears when the tree changes branch or finishes. taskqueue_list includes it by default; set include_planned: false (CLI --no-planned) to omit it and the direction row.",
       "taskGroup": "The BT direction is a virtual row with id 'direction:<id>' (legacy 'group:<btId>' accepted as an alias) and state running, waitingForLlm, paused or failed. It is re-derived on every query and stays until the tree succeeds or is closed; a failed tree waits for bt_retry, bt_cancel or bt_remove. It is not a queue job; read it with direction_show/bt_get and answer a waitingForLlm tree with bt_resume. include_planned: false (CLI --no-planned) hides it too.",
       "running": "An attempt is executing.",
       "succeeded": "Success conditions met.",
@@ -4719,11 +4733,27 @@ int PrintResponse(const std::string& action, const std::string& respJson, bool j
                               << j.value("taskqueue", std::string()) << "\n";
                 }
             }
+            const nlohmann::json card = r.value("card", nlohmann::json::object());
+            if (!card.empty()) {
+                const std::string num = card.value("number", std::string());
+                if (!num.empty()) std::cout << "Card: " << num << "\n";
+                const std::string tmpl = card.value("template", std::string());
+                if (!tmpl.empty()) std::cout << "Template: " << tmpl << "\n";
+                const std::string body = card.value("body", std::string());
+                if (!body.empty()) {
+                    std::cout << "\n" << body;
+                    if (body.back() != '\n') std::cout << "\n";
+                }
+            }
             return 0;
         }
         if (action == "direction_close") {
-            std::cout << "Closed direction " << r.value("id", std::string())
-                      << " [" << r.value("result", std::string()) << "].\n";
+            if (r.contains("closed")) {
+                std::cout << "Closed " << r.value("closed", int64_t(0)) << " direction(s).\n";
+            } else {
+                std::cout << "Closed direction " << r.value("id", std::string())
+                          << " [" << r.value("result", std::string()) << "].\n";
+            }
             return 0;
         }
         if (action == "direction_reopen") {
@@ -4735,98 +4765,23 @@ int PrintResponse(const std::string& action, const std::string& respJson, bool j
             std::cout << "Purged " << r.value("purged", int64_t(0)) << " direction(s).\n";
             return 0;
         }
-        std::cout << respJson << "\n";
-        return 0;
-    }
-
-    if (action.rfind("card_", 0) == 0) {
-        if (jsonOutput) {
-            std::cout << respJson << "\n";
-            return 0;
-        }
-        nlohmann::json r = nlohmann::json::parse(respJson, nullptr, false);
-        if (!r.is_object()) {
-            std::cout << respJson << "\n";
-            return 0;
-        }
-        if (action == "card_add") {
+        if (action == "direction_add") {
             std::cout << "Added card " << r.value("number", std::string())
                       << " (" << r.value("directionId", std::string()) << ") to "
                       << r.value("taskId", std::string()) << ".\n";
             return 0;
         }
-        if (action == "card_list") {
-            const auto cards = r.value("cards", nlohmann::json::array());
-            if (cards.empty()) {
-                std::cout << "No cards found.\n";
-                return 0;
-            }
-            std::cout << "Cards (" << cards.size() << "):\n";
-            for (const auto& c : cards) {
-                std::cout << "  " << c.value("number", std::string())
-                          << " [" << c.value("state", std::string()) << "] "
-                          << c.value("title", std::string());
-                const auto waiting = c.value("waitingFor", nlohmann::json::array());
-                if (!waiting.empty()) {
-                    std::cout << " (waiting:";
-                    for (size_t i = 0; i < waiting.size(); ++i) {
-                        if (i > 0) std::cout << ",";
-                        std::cout << " " << waiting[i].get<std::string>();
-                    }
-                    std::cout << ")";
-                }
-                std::cout << "\n";
-            }
-            return 0;
-        }
-        if (action == "card_show") {
-            const nlohmann::json dir = r.value("direction", nlohmann::json::object());
-            const nlohmann::json card = r.value("card", nlohmann::json::object());
-            const nlohmann::json status = r.value("status", nlohmann::json::object());
-            const std::string num = card.value("number", dir.value("id", std::string()));
-            std::cout << num << " [" << status.value("state", std::string()) << "] "
-                      << card.value("title", dir.value("title", std::string()))
-                      << " (" << dir.value("id", std::string()) << ")\n";
-            const std::string taskId = dir.value("taskId", std::string());
-            if (!taskId.empty()) std::cout << "Task: " << taskId << "\n";
-            const std::string tmpl = card.value("template", std::string());
-            if (!tmpl.empty()) std::cout << "Template: " << tmpl << "\n";
-            const auto after = r.value("after", nlohmann::json::array());
-            if (!after.empty()) {
-                std::cout << "After:";
-                for (size_t i = 0; i < after.size(); ++i) {
-                    if (i > 0) std::cout << ",";
-                    std::cout << " " << after[i].get<std::string>();
-                }
-                std::cout << "\n";
-            }
-            const auto waiting = r.value("waitingFor", nlohmann::json::array());
-            if (!waiting.empty()) {
-                std::cout << "Waiting for:";
-                for (size_t i = 0; i < waiting.size(); ++i) {
-                    if (i > 0) std::cout << ",";
-                    std::cout << " " << waiting[i].get<std::string>();
-                }
-                std::cout << "\n";
-            }
-            const std::string body = card.value("body", std::string());
-            if (!body.empty()) {
-                std::cout << "\n" << body;
-                if (body.back() != '\n') std::cout << "\n";
-            }
-            return 0;
-        }
-        if (action == "card_edit") {
+        if (action == "direction_edit") {
             std::cout << "Updated card " << r.value("number", std::string())
                       << " (" << r.value("directionId", std::string()) << ").\n";
             return 0;
         }
-        if (action == "card_remove") {
+        if (action == "direction_remove") {
             std::cout << "Removed card " << r.value("number", std::string())
                       << " (" << r.value("directionId", std::string()) << ").\n";
             return 0;
         }
-        if (action == "card_run") {
+        if (action == "direction_run") {
             if (r.contains("started") && r["started"].is_array()) {
                 const auto& started = r["started"];
                 if (started.empty()) {
@@ -4849,7 +4804,7 @@ int PrintResponse(const std::string& action, const std::string& respJson, bool j
             }
             return 0;
         }
-        if (action == "card_redo") {
+        if (action == "direction_redo") {
             std::cout << "Created rescue card " << r.value("number", std::string())
                       << " (" << r.value("directionId", std::string())
                       << ", supersedes=" << r.value("supersedesNumber", r.value("supersedes", std::string())) << ")";
@@ -5727,6 +5682,7 @@ static int RunTaskQueueFileCommand(const std::vector<std::string>& args, bool js
     bool ephemeral = false;
     std::string seedFrom;
     bool triage = false;
+    bool reqTriage = true;
 
     auto fail = [&](const std::string& message) {
         if (jsonOutput) {
@@ -5985,6 +5941,8 @@ static int RunTaskQueueFileCommand(const std::vector<std::string>& args, bool js
         if (tqName.empty()) tqName = jsonString(doc, "taskqueue", "main");
         if (concurrency == 0) concurrency = jsonInt(doc, "concurrency", 0);
         if (notifyFile.empty()) notifyFile = jsonString(doc, "notify_file", "");
+        if (doc.contains("triage") && doc["triage"].is_boolean() && !doc["triage"].get<bool>())
+            reqTriage = false;
     } else {
         return fail("queue file must be an array or an object with jobs: " + file);
     }
@@ -6016,6 +5974,7 @@ static int RunTaskQueueFileCommand(const std::vector<std::string>& args, bool js
         req["concurrency"] = concurrency;
         req["notify_file"] = notifyFile;
         if (!taskId.empty()) req["task"] = taskId;
+        req["triage"] = reqTriage;
         req["origin"] = json::parse(BuildCallerOriginJson("hancho-cli-cli", originLabel), nullptr, false);
         if (cancelOnExit) {
             req["client_pid"] = GetCurrentProcessIdPortable();
@@ -7478,7 +7437,7 @@ int RunCli(const std::vector<std::string>& rawArgs) {
         else PrintCliUsage();
         return 1;
     }
-    if (subcmd == "--help" || subcmd == "-h" || subcmd == "help") {
+    if (subcmd == "--help" || subcmd == "-h" || subcmd == "help" || subcmd == "--list") {
         if (jsonOutput) PrintCliUsageJson();
         else PrintCliUsage();
         return 0;
@@ -8188,92 +8147,6 @@ if (subcmd == "start" || subcmd == "run") {
             }
             return def;
         };
-        auto positionalSkippingValues = [&args](size_t startIdx) -> std::string {
-            for (size_t i = startIdx; i < args.size(); ++i) {
-                const std::string& a = args[i];
-                if (a.empty()) continue;
-                if (a[0] == '-') {
-                    if (a == "--id" || a == "--task" || a == "--state" || a == "--limit" ||
-                        a == "--result" || a == "--reason" || a == "--older-than" ||
-                        a == "--data-dir") {
-                        ++i;
-                    }
-                    continue;
-                }
-                return a;
-            }
-            return "";
-        };
-        auto failWith = [&](const std::string& msg) {
-            if (jsonOutput) std::cout << "{\"ok\":false,\"error\":\"" << JsonEscape(msg) << "\"}\n";
-            else std::cerr << "Error: " << msg << "\n";
-            return 1;
-        };
-        nlohmann::json req = nlohmann::json::object();
-        if (op == "show") {
-            std::string id = argVal("--id", "");
-            if (id.empty()) id = positionalSkippingValues(3);
-            if (id.empty()) return failWith("direction show requires <id>.");
-            req["action"] = "direction_show";
-            req["id"] = id;
-            subcmd = "direction_show";
-        } else if (op == "list") {
-            int64_t limit = 0;
-            const std::string lim = argVal("--limit", "");
-            if (!lim.empty()) {
-                try { limit = std::stoll(lim); } catch (...) { return failWith("invalid --limit"); }
-            }
-            req["action"] = "direction_list";
-            req["taskId"] = argVal("--task", "");
-            req["state"] = argVal("--state", "");
-            req["limit"] = limit;
-            subcmd = "direction_list";
-        } else if (op == "close") {
-            std::string id = argVal("--id", "");
-            if (id.empty()) id = positionalSkippingValues(3);
-            if (id.empty()) return failWith("direction close requires <id>.");
-            const std::string result = argVal("--result", "");
-            if (result != "succeeded" && result != "failed" && result != "ignored")
-                return failWith("direction close requires --result succeeded|failed|ignored.");
-            const std::string reason = argVal("--reason", "");
-            if (reason.empty()) return failWith("direction close requires --reason \"...\".");
-            req["action"] = "direction_close";
-            req["id"] = id;
-            req["result"] = result;
-            req["reason"] = reason;
-            subcmd = "direction_close";
-        } else if (op == "reopen") {
-            std::string id = argVal("--id", "");
-            if (id.empty()) id = positionalSkippingValues(3);
-            if (id.empty()) return failWith("direction reopen requires <id>.");
-            const std::string reason = argVal("--reason", "");
-            if (reason.empty()) return failWith("direction reopen requires --reason \"...\".");
-            req["action"] = "direction_reopen";
-            req["id"] = id;
-            req["reason"] = reason;
-            subcmd = "direction_reopen";
-        } else if (op == "purge") {
-            const std::string olderStr = argVal("--older-than", "");
-            if (olderStr.empty()) return failWith("direction purge requires --older-than <sec>.");
-            int64_t olderSec = -1;
-            try { olderSec = std::stoll(olderStr); } catch (...) { return failWith("invalid --older-than"); }
-            req["action"] = "direction_purge";
-            req["older_than_sec"] = olderSec;
-            subcmd = "direction_purge";
-        } else {
-            return failWith("unknown direction command: " + op +
-                            " (show, list, close, reopen, purge)");
-        }
-        reqJson << req.dump();
-    }
-    else if (subcmd == "card") {
-        std::string op = (args.size() >= 3) ? args[2] : "";
-        auto argVal = [&args](const std::string& flag, const std::string& def) -> std::string {
-            for (size_t i = 3; i + 1 < args.size(); ++i) {
-                if (args[i] == flag) return args[i + 1];
-            }
-            return def;
-        };
         auto hasFlag = [&args](const std::string& flag) -> bool {
             for (size_t i = 3; i < args.size(); ++i) {
                 if (args[i] == flag) return true;
@@ -8285,10 +8158,12 @@ if (subcmd == "start" || subcmd == "run") {
                 const std::string& a = args[i];
                 if (a.empty()) continue;
                 if (a[0] == '-') {
-                    if (a == "--task" || a == "--number" || a == "--id" || a == "--title" ||
-                        a == "--body" || a == "--body-file" || a == "--after" ||
-                        a == "--template" || a == "--params" || a == "--max" ||
-                        a == "--reason" || a == "--origin-label" || a == "--data-dir" || a == "--file") {
+                    if (a == "--id" || a == "--task" || a == "--state" || a == "--limit" ||
+                        a == "--number" || a == "--title" || a == "--body" || a == "--body-file" ||
+                        a == "--after" || a == "--template" || a == "--params" || a == "--max" ||
+                        a == "--result" || a == "--reason" || a == "--before" || a == "--file" ||
+                        a == "--older-than" || a == "--origin-label" || a == "--translate-cards" ||
+                        a == "--lang" || a == "--data-dir") {
                         ++i;
                     }
                     continue;
@@ -8314,30 +8189,106 @@ if (subcmd == "start" || subcmd == "run") {
             else std::cerr << "Error: " << msg << "\n";
             return 1;
         };
+        nlohmann::json req = nlohmann::json::object();
         if (op.empty() || op == "--help" || op == "-h" || op == "help") {
-            std::cout
-                << "Usage: hancho-cli card <subcommand> [options] [--json]\n\n"
-                << "Subcommands:\n"
-                << "  add     --task <id> --number <num> --title \"...\" [--body \"...\" | --body-file <md>] [--after <n1,n2>] [--template <name>] [--params <json>]\n"
-                << "  list    --task <id>\n"
-                << "  show    <number|directionId> [--task <id>]\n"
-                << "  edit    <number> --task <id> [--title \"...\"] [--body \"...\" | --body-file <md>] [--after <n1,n2>] [--template <name>] [--params <json>]\n"
-                << "  remove  <number> --task <id>\n"
-                << "  run     (<number> | --ready [--max <n>]) --task <id> [--force]\n"
-                << "  redo    <number> --task <id> [--body \"...\" | --body-file <md>] [--params <json>] [--reason \"...\"] [--run] [--force]\n"
-                << "  import  --task <id> --file <md> [--dry-run]\n"
-                << "  export  --task <id> [--file <md>] [--lang <en|ja|es>]\n"
-                << "  translate --task <id> [--translate-cards <all|title|off>]\n";
+            if (jsonOutput) {
+                std::cout << nlohmann::json{
+                    {"ok", true},
+                    {"command", "direction"},
+                    {"subcommands", nlohmann::json::array({
+                        "add", "list", "show", "edit", "remove", "run", "redo",
+                        "import", "export", "translate", "close", "reopen", "purge"
+                    })}
+                }.dump() << "\n";
+            } else {
+                std::cout
+                    << "Usage: hancho-cli direction <subcommand> [options] [--json]\n\n"
+                    << "Subcommands:\n"
+                    << "  add       --task <id> --number <num> --title \"...\" [--body \"...\" | --body-file <md>] [--after <n1,n2>] [--template <name>] [--params <json>]\n"
+                    << "  list      [--task <id>] [--state <state>] [--limit N]\n"
+                    << "  show      <number|dir_<id>> [--task <id>]\n"
+                    << "  edit      <number> --task <id> [--title \"...\"] [--body \"...\" | --body-file <md>] [--after <n1,n2>] [--template <name>] [--params <json>]\n"
+                    << "  remove    <number> --task <id>\n"
+                    << "  run       (<number> | --ready [--max <n>]) --task <id> [--force]\n"
+                    << "  redo      <number> --task <id> [--body \"...\" | --body-file <md>] [--params <json>] [--reason \"...\"] [--run] [--force]\n"
+                    << "  import    --task <id> --file <md> [--dry-run] [--translate-cards <all|title|off>]\n"
+                    << "  export    --task <id> [--file <md>] [--lang <en|ja|es>]\n"
+                    << "  translate --task <id> [--translate-cards <all|title|off>]\n"
+                    << "  close     <id> --result succeeded|failed|ignored --reason \"...\"\n"
+                    << "  reopen    <id> --reason \"...\"\n"
+                    << "  purge     --older-than <sec>\n";
+            }
             return 0;
         }
-        nlohmann::json req = nlohmann::json::object();
-        if (op == "add") {
+        if (op == "show") {
+            std::string id = argVal("--id", "");
+            if (id.empty()) id = argVal("--number", "");
+            if (id.empty()) id = positionalSkippingValues(3);
+            if (id.empty()) return failWith("direction show requires <id> or <number>.");
+            req["action"] = "direction_show";
+            req["id"] = id;
+            const std::string showTaskId = argVal("--task", "");
+            if (!showTaskId.empty()) req["taskId"] = showTaskId;
+            subcmd = "direction_show";
+        } else if (op == "list") {
+            int64_t limit = 0;
+            const std::string lim = argVal("--limit", "");
+            if (!lim.empty()) {
+                try { limit = std::stoll(lim); } catch (...) { return failWith("invalid --limit"); }
+            }
+            req["action"] = "direction_list";
+            req["taskId"] = argVal("--task", "");
+            req["state"] = argVal("--state", "");
+            req["limit"] = limit;
+            subcmd = "direction_list";
+        } else if (op == "close") {
+            std::string id = argVal("--id", "");
+            if (id.empty()) id = positionalSkippingValues(3);
+            const std::string reason = argVal("--reason", "");
+            if (reason.empty()) return failWith("direction close requires --reason \"...\".");
+            req["action"] = "direction_close";
+            req["reason"] = reason;
+            subcmd = "direction_close";
+            if (id.empty()) {
+                // 102-7: bulk migration, e.g. --state failed --before "2026-10-01 00:00:00".
+                const std::string state = argVal("--state", "");
+                const std::string before = argVal("--before", "");
+                if (state.empty()) return failWith("direction close requires <id> or --state <state>.");
+                if (before.empty()) return failWith("direction close --state requires --before <timestamp>.");
+                req["state"] = state;
+                req["before"] = before;
+            } else {
+                const std::string result = argVal("--result", "");
+                if (result != "succeeded" && result != "failed" && result != "ignored")
+                    return failWith("direction close requires --result succeeded|failed|ignored.");
+                req["id"] = id;
+                req["result"] = result;
+            }
+        } else if (op == "reopen") {
+            std::string id = argVal("--id", "");
+            if (id.empty()) id = positionalSkippingValues(3);
+            if (id.empty()) return failWith("direction reopen requires <id>.");
+            const std::string reason = argVal("--reason", "");
+            if (reason.empty()) return failWith("direction reopen requires --reason \"...\".");
+            req["action"] = "direction_reopen";
+            req["id"] = id;
+            req["reason"] = reason;
+            subcmd = "direction_reopen";
+        } else if (op == "purge") {
+            const std::string olderStr = argVal("--older-than", "");
+            if (olderStr.empty()) return failWith("direction purge requires --older-than <sec>.");
+            int64_t olderSec = -1;
+            try { olderSec = std::stoll(olderStr); } catch (...) { return failWith("invalid --older-than"); }
+            req["action"] = "direction_purge";
+            req["older_than_sec"] = olderSec;
+            subcmd = "direction_purge";
+        } else if (op == "add") {
             const std::string taskId = argVal("--task", "");
-            if (taskId.empty()) return failWith("card add requires --task <id>.");
+            if (taskId.empty()) return failWith("direction add requires --task <id>.");
             const std::string number = argVal("--number", "");
-            if (number.empty()) return failWith("card add requires --number <number>.");
+            if (number.empty()) return failWith("direction add requires --number <number>.");
             const std::string title = argVal("--title", "");
-            if (title.empty()) return failWith("card add requires --title \"...\".");
+            if (title.empty()) return failWith("direction add requires --title \"...\".");
             std::string body = argVal("--body", "");
             const std::string bodyFile = argVal("--body-file", "");
             if (!bodyFile.empty()) {
@@ -8348,7 +8299,7 @@ if (subcmd == "start" || subcmd == "run") {
                 bss << ifs.rdbuf();
                 body = bss.str();
             }
-            req["action"] = "card_add";
+            req["action"] = "direction_add";
             req["taskId"] = taskId;
             req["number"] = number;
             req["title"] = title;
@@ -8364,30 +8315,14 @@ if (subcmd == "start" || subcmd == "run") {
             }
             req["origin"] = nlohmann::json::parse(
                 BuildCallerOriginJson("hancho-cli-cli", argVal("--origin-label", "")), nullptr, false);
-            subcmd = "card_add";
-        } else if (op == "list") {
-            const std::string taskId = argVal("--task", "");
-            if (taskId.empty()) return failWith("card list requires --task <id>.");
-            req["action"] = "card_list";
-            req["taskId"] = taskId;
-            subcmd = "card_list";
-        } else if (op == "show") {
-            std::string id = argVal("--id", "");
-            if (id.empty()) id = argVal("--number", "");
-            if (id.empty()) id = positionalSkippingValues(3);
-            if (id.empty()) return failWith("card show requires <number|directionId>.");
-            req["action"] = "card_show";
-            req["id"] = id;
-            const std::string taskId = argVal("--task", "");
-            if (!taskId.empty()) req["taskId"] = taskId;
-            subcmd = "card_show";
+            subcmd = "direction_add";
         } else if (op == "edit") {
             std::string number = argVal("--number", "");
             if (number.empty()) number = positionalSkippingValues(3);
-            if (number.empty()) return failWith("card edit requires <number>.");
+            if (number.empty()) return failWith("direction edit requires <number>.");
             const std::string taskId = argVal("--task", "");
-            if (taskId.empty()) return failWith("card edit requires --task <id>.");
-            req["action"] = "card_edit";
+            if (taskId.empty()) return failWith("direction edit requires --task <id>.");
+            req["action"] = "direction_edit";
             req["taskId"] = taskId;
             req["number"] = number;
             if (hasFlag("--title")) req["title"] = argVal("--title", "");
@@ -8412,31 +8347,31 @@ if (subcmd == "start" || subcmd == "run") {
             }
             req["origin"] = nlohmann::json::parse(
                 BuildCallerOriginJson("hancho-cli-cli", argVal("--origin-label", "")), nullptr, false);
-            subcmd = "card_edit";
+            subcmd = "direction_edit";
         } else if (op == "remove") {
             std::string number = argVal("--number", "");
             if (number.empty()) number = positionalSkippingValues(3);
-            if (number.empty()) return failWith("card remove requires <number>.");
+            if (number.empty()) return failWith("direction remove requires <number>.");
             const std::string taskId = argVal("--task", "");
-            if (taskId.empty()) return failWith("card remove requires --task <id>.");
-            req["action"] = "card_remove";
+            if (taskId.empty()) return failWith("direction remove requires --task <id>.");
+            req["action"] = "direction_remove";
             req["taskId"] = taskId;
             req["number"] = number;
             req["origin"] = nlohmann::json::parse(
                 BuildCallerOriginJson("hancho-cli-cli", argVal("--origin-label", "")), nullptr, false);
-            subcmd = "card_remove";
+            subcmd = "direction_remove";
         } else if (op == "run") {
             const std::string taskId = argVal("--task", "");
-            if (taskId.empty()) return failWith("card run requires --task <id>.");
+            if (taskId.empty()) return failWith("direction run requires --task <id>.");
             const bool ready = hasFlag("--ready");
             const bool force = hasFlag("--force");
             std::string number = argVal("--number", "");
             if (number.empty()) number = positionalSkippingValues(3);
             if (!ready && number.empty()) {
-                return failWith("card run requires <number> or --ready.");
+                return failWith("direction run requires <number> or --ready.");
             }
             if (ready && !number.empty()) {
-                return failWith("card run cannot combine <number> with --ready.");
+                return failWith("direction run cannot combine <number> with --ready.");
             }
             int maxConcurrent = 1;
             const std::string maxStr = argVal("--max", "");
@@ -8445,7 +8380,7 @@ if (subcmd == "start" || subcmd == "run") {
                 catch (...) { return failWith("invalid --max"); }
                 if (maxConcurrent < 1) return failWith("--max must be >= 1.");
             }
-            req["action"] = "card_run";
+            req["action"] = "direction_run";
             req["taskId"] = taskId;
             if (!number.empty()) req["number"] = number;
             req["ready"] = ready;
@@ -8453,15 +8388,15 @@ if (subcmd == "start" || subcmd == "run") {
             req["force"] = force;
             req["origin"] = nlohmann::json::parse(
                 BuildCallerOriginJson("hancho-cli-cli", argVal("--origin-label", "")), nullptr, false);
-            subcmd = "card_run";
+            subcmd = "direction_run";
         } else if (op == "redo") {
             const std::string taskId = argVal("--task", "");
-            if (taskId.empty()) return failWith("card redo requires --task <id>.");
+            if (taskId.empty()) return failWith("direction redo requires --task <id>.");
             std::string number = argVal("--number", "");
             if (number.empty()) number = argVal("--id", "");
             if (number.empty()) number = positionalSkippingValues(3);
-            if (number.empty()) return failWith("card redo requires <number>.");
-            req["action"] = "card_redo";
+            if (number.empty()) return failWith("direction redo requires <number>.");
+            req["action"] = "direction_redo";
             req["taskId"] = taskId;
             req["number"] = number;
             if (hasFlag("--body-file")) {
@@ -8487,17 +8422,18 @@ if (subcmd == "start" || subcmd == "run") {
             req["force"] = hasFlag("--force");
             req["origin"] = nlohmann::json::parse(
                 BuildCallerOriginJson("hancho-cli-cli", argVal("--origin-label", "")), nullptr, false);
-            subcmd = "card_redo";
+            subcmd = "direction_redo";
         } else if (op == "import" || op == "export" || op == "translate") {
             const std::string taskId = argVal("--task", "");
-            if (taskId.empty()) return failWith("card " + op + " requires --task <id>.");
+            if (taskId.empty()) return failWith("direction " + op + " requires --task <id>.");
             const std::string cardLang = DisplayLangSetting();
             const std::string originLabel = argVal("--origin-label", "");
             const CardMarkdownSend cardSend = [&](const nlohmann::json& q, nlohmann::json& outResp,
                                                   std::string& outErr) -> bool {
                 nlohmann::json sent = q;
                 const std::string act = sent.value("action", std::string());
-                if (act == "card_add" || act == "card_edit") {
+                if (act == "direction_add" || act == "direction_edit" ||
+                    act == "card_add" || act == "card_edit") {
                     sent["origin"] = nlohmann::json::parse(
                         BuildCallerOriginJson("hancho-cli-cli", originLabel), nullptr, false);
                 }
@@ -8515,7 +8451,7 @@ if (subcmd == "start" || subcmd == "run") {
             };
             if (op == "import") {
                 const std::string file = argVal("--file", "");
-                if (file.empty()) return failWith("card import requires --file <md>.");
+                if (file.empty()) return failWith("direction import requires --file <md>.");
                 const std::wstring absW = ResolveAbsolutePathWide(Utf8ToWide(file));
                 std::ifstream ifs(absW, std::ios::binary);
                 if (!ifs) return failWith("cannot open file: " + file);
@@ -8551,7 +8487,6 @@ if (subcmd == "start" || subcmd == "run") {
                 return res.ok ? 0 : 1;
             }
             if (op == "translate") {
-                // card 106-5: translate the stored non-English titles and bodies to English.
                 const std::string translateCards = argVal("--translate-cards", "");
                 if (!translateCards.empty() && translateCards != "all" && translateCards != "title" &&
                     translateCards != "off") {
@@ -8573,8 +8508,6 @@ if (subcmd == "start" || subcmd == "run") {
                 }
                 return tr.ok ? 0 : 1;
             }
-            // card 106-5: export writes the stored English unless --lang asks for another language.
-            // The global --lang flag (display language) is taken by the caller, so it is read here too.
             const std::string exportLang = langGiven ? NormalizeDisplayLang(langArg) : std::string("en");
             const std::string file = argVal("--file", "");
             std::string md;
@@ -8600,8 +8533,8 @@ if (subcmd == "start" || subcmd == "run") {
             }
             return 0;
         } else {
-            return failWith("unknown card command: " + op +
-                            " (add, list, show, edit, remove, run, redo, import, export)");
+            return failWith("unknown direction command: " + op +
+                            " (add, list, show, edit, remove, run, redo, import, export, translate, close, reopen, purge)");
         }
         reqJson << req.dump();
     }
@@ -8678,6 +8611,7 @@ if (subcmd == "start" || subcmd == "run") {
                     << ",\"concurrency\":" << concurrency
                     << ",\"notify_file\":\"" << JsonEscape(notifyFile) << "\""
                     << ",\"task\":\"" << JsonEscape(argVal("--task", "")) << "\""
+                    << ",\"triage\":" << (JsonGetBool(content, "triage", true) ? "true" : "false")
                     << ",\"origin\":" << BuildCallerOriginJson("hancho-cli-cli", argVal("--origin-label", "")) << "}";
             subcmd = "taskqueue_add";
         } else if (op == "record-plain") {

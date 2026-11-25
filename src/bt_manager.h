@@ -82,7 +82,7 @@ public:
     // JSON API (stage 2 & stage 3)
     // strict=true promotes 091-4 lint warnings to errors.
     std::string Validate(const std::string& json, bool strict = false);
-    std::string Start(const std::string& json, bool paused = false);
+    std::string Start(const std::string& json, bool paused = false, bool triage = true);
     std::string Get(const std::string& id, bool compact = false);
     std::string List();
     std::string Wait(const std::string& id, uint64_t sinceVersion, int timeoutMs, bool compact = false);

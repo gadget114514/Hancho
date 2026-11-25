@@ -18,6 +18,22 @@ class BtManager;
 class ProcessManager;
 class TaskQueueManager;
 
+// 102-7: an ignore/ack decision closes its direction; every other decision leaves it open.
+inline bool TriageDecisionClosesDirection(const std::string& candidateId) {
+    return candidateId == "ignore" || candidateId == "ack";
+}
+
+// DirectionClose keeps its small result vocabulary; a decision is mapped onto it here so the
+// closed record can still say what the person chose.
+inline std::string TriageDecisionCloseResult(const std::string& candidateId) {
+    return candidateId == "ack" ? "succeeded" : "ignored";
+}
+
+// Legacy (pre-0.10) failures whose triage decision was already recorded count as closed.
+inline bool TriageLegacyDecisionIsClosed(const std::string& state) {
+    return state == "ignored" || state == "resolved" || state == "acted";
+}
+
 class TriageManager {
 public:
     TriageManager(ProcessManager& pm, TaskQueueManager& tqm, BtManager* btm);
@@ -100,6 +116,15 @@ private:
     // Captured instructions text per "jobId#rev", so the once-a-second refresh does not
     // re-fetch it from the task queue for every failed job.
     std::unordered_map<std::string, std::string> instructionsCache_;
+    // 102-8: only jobs/directions reported by taskqueue_changes are inspected; these maps keep
+    // the last known snapshot for everything else.
+    std::unordered_map<std::string, nlohmann::json> jobsById_;
+    std::unordered_map<std::string, nlohmann::json> directionsById_;
+    uint64_t lastTaskRev_ = 0;
+    // triage_list is rebuilt only when the card store, the mode or the requested state changes.
+    uint64_t storeRev_ = 0;
+    std::string listCacheKey_;
+    std::string listCache_;
     // Cards whose decision is in progress (action running, not yet recorded). A second decision for
     // the same card is refused, so a person's click and an automatic decision cannot both act on it.
     std::unordered_set<std::string> deciding_;

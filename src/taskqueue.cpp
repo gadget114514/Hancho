@@ -4781,7 +4781,7 @@ static std::wstring ResolveJobPathWide(const TaskQueueJob& job, const std::strin
 
 std::string TaskQueueManager::TaskQueueAdd(const std::string& taskqueue, const std::string& jobsJson,
                                            int64_t concurrency, const std::string& notifyFile, std::string& outError,
-                                           const std::string& originJson, const std::string& taskId) {
+                                           const std::string& originJson, const std::string& taskId, bool triage) {
     outError.clear();
     const TaskQueueOrigin origin = ParseOriginJson(originJson);
     if (taskqueue.empty()) {
@@ -4981,6 +4981,7 @@ std::string TaskQueueManager::TaskQueueAdd(const std::string& taskqueue, const s
             {"origin", originRecord},
             {"title", dirTitle},
             {"closed", nullptr},
+            {"triage", triage},
             {"removedJobs", nlohmann::json::array()},
             {"rev", BumpRevLocked()}
         };
@@ -9202,7 +9203,8 @@ bool TaskQueueManager::EnsureBtDirection(const std::string& btId,
                                          const std::string& title,
                                          const std::string& originJson,
                                          std::string& outDirectionId,
-                                         std::string& outError) {
+                                         std::string& outError,
+                                         bool triage) {
     outDirectionId.clear();
     outError.clear();
     const TaskQueueOrigin origin = ParseOriginJson(originJson);
@@ -9221,29 +9223,37 @@ bool TaskQueueManager::EnsureBtDirection(const std::string& btId,
             const bool needsPromote =
                 existing.value("kind", std::string()) == "card" ||
                 existing.value("btId", std::string()).empty();
-            if (needsPromote) {
-                existing["kind"] = "bt";
-                existing["btId"] = btId;
-                existing["updatedAt"] = GetCurrentTimestampStr();
-                if (!taskId.empty() && existing.value("taskId", std::string()).empty()) {
-                    existing["taskId"] = taskId;
+            const bool needsTriageUpdate = !triage && existing.value("triage", true);
+            if (needsPromote || needsTriageUpdate) {
+                if (needsPromote) {
+                    existing["kind"] = "bt";
+                    existing["btId"] = btId;
+                    if (!taskId.empty() && existing.value("taskId", std::string()).empty()) {
+                        existing["taskId"] = taskId;
+                    }
                 }
+                if (!triage) {
+                    existing["triage"] = false;
+                }
+                existing["updatedAt"] = GetCurrentTimestampStr();
                 existing["rev"] = BumpRevLocked();
                 if (!directionStore_.Save(existing, outError)) return false;
-                const std::string effTaskId =
-                    taskId.empty() ? existing.value("taskId", std::string()) : taskId;
-                if (!effTaskId.empty()) {
-                    nlohmann::json extra = {
-                        {"directionId", existingDirectionId},
-                        {"directionKind", "bt"},
-                        {"title", existing.value("title", dirTitle)}
-                    };
-                    if (existing.contains("card") && existing["card"].is_object()) {
-                        const std::string cardNum = existing["card"].value("number", std::string());
-                        if (!cardNum.empty()) extra["cardNumber"] = cardNum;
+                if (needsPromote) {
+                    const std::string effTaskId =
+                        taskId.empty() ? existing.value("taskId", std::string()) : taskId;
+                    if (!effTaskId.empty()) {
+                        nlohmann::json extra = {
+                            {"directionId", existingDirectionId},
+                            {"directionKind", "bt"},
+                            {"title", existing.value("title", dirTitle)}
+                        };
+                        if (existing.contains("card") && existing["card"].is_object()) {
+                            const std::string cardNum = existing["card"].value("number", std::string());
+                            if (!cardNum.empty()) extra["cardNumber"] = cardNum;
+                        }
+                        TaskLog(effTaskId, "direction_started", "", btId,
+                                existing.value("title", dirTitle), origin.session, &extra);
                     }
-                    TaskLog(effTaskId, "direction_started", "", btId,
-                            existing.value("title", dirTitle), origin.session, &extra);
                 }
             }
             outDirectionId = existingDirectionId;
@@ -9266,6 +9276,9 @@ bool TaskQueueManager::EnsureBtDirection(const std::string& btId,
             {"removedJobs", nlohmann::json::array()},
             {"rev", BumpRevLocked()}
         };
+        if (!triage) {
+            record["triage"] = false;
+        }
         if (!directionStore_.Create(record, outError)) return false;
         outDirectionId = existingDirectionId;
     } else {
@@ -9284,6 +9297,9 @@ bool TaskQueueManager::EnsureBtDirection(const std::string& btId,
             {"removedJobs", nlohmann::json::array()},
             {"rev", BumpRevLocked()}
         };
+        if (!triage) {
+            record["triage"] = false;
+        }
         if (!directionStore_.Create(record, outError)) return false;
         outDirectionId = newId;
     }
@@ -9301,6 +9317,53 @@ bool TaskQueueManager::DirectionGet(const std::string& id, nlohmann::json& outRe
 
 std::vector<nlohmann::json> TaskQueueManager::DirectionAll() const {
     return directionStore_.All();
+}
+
+bool TaskQueueManager::SetDirectionTriage(const std::string& id, bool triage, std::string& outError) {
+    outError.clear();
+    nlohmann::json record;
+    if (!directionStore_.Get(id, record)) {
+        outError = "direction not found: " + id;
+        return false;
+    }
+    record["triage"] = triage;
+    record["updatedAt"] = GetCurrentTimestampStr();
+    std::lock_guard<std::mutex> lock(mutex_);
+    record["rev"] = BumpRevLocked();
+    return directionStore_.Save(record, outError);
+}
+
+bool TaskQueueManager::DirectionSetRedo(const std::string& oldId, const std::string& newId,
+                                        const std::string& reason, std::string& outError) {
+    outError.clear();
+    if (oldId.empty() || newId.empty()) {
+        outError = "both directions are required for a rescue link";
+        return false;
+    }
+    nlohmann::json oldRecord;
+    nlohmann::json newRecord;
+    if (!directionStore_.Get(oldId, oldRecord)) {
+        outError = "direction not found: " + oldId;
+        return false;
+    }
+    if (!directionStore_.Get(newId, newRecord)) {
+        outError = "direction not found: " + newId;
+        return false;
+    }
+    const std::string now = GetCurrentTimestampStr();
+    oldRecord["supersededBy"] = newId;
+    oldRecord["updatedAt"] = now;
+    newRecord["supersedes"] = oldId;
+    newRecord["redoReason"] = reason;
+    newRecord["updatedAt"] = now;
+    std::lock_guard<std::mutex> lock(mutex_);
+    const uint64_t rev = BumpRevLocked();
+    oldRecord["rev"] = rev;
+    newRecord["rev"] = rev;
+    std::string err;
+    if (!directionStore_.Save(oldRecord, err)) { outError = err; return false; }
+    if (!directionStore_.Save(newRecord, err)) { outError = err; return false; }
+    return true;
 }
 
 bool JobOrRemovedExists(const std::map<std::string, TaskQueue>& queues,
@@ -9332,19 +9395,21 @@ nlohmann::json TaskQueueManager::DirectionStateLocked(const std::string& id) con
     auto externalHas = [this](const std::string& jobId) {
         return JobOrRemovedExists(queues_, taskStore_, directionStore_, jobId);
     };
-    if (id.rfind("job:", 0) == 0) {
-        const std::vector<TaskNode> nodes = CollectDirectionNodes(queues_, id, nlohmann::json());
-        if (nodes.empty()) return nlohmann::json{{"state", "open"}};
-        return ComputeTaskState(nodes, externalHas);
-    }
     nlohmann::json record;
     directionStore_.Get(id, record);
     if (record.is_object() && record.contains("closed") && record["closed"].is_object()) {
-        return nlohmann::json{
+        nlohmann::json closed = {
             {"state", "closed"},
             {"result", record["closed"].value("result", std::string())},
             {"reason", record["closed"].value("reason", std::string())}
         };
+        if (record["closed"].contains("decision")) closed["decision"] = record["closed"]["decision"];
+        return closed;
+    }
+    if (id.rfind("job:", 0) == 0) {
+        const std::vector<TaskNode> nodes = CollectDirectionNodes(queues_, id, record);
+        if (nodes.empty()) return nlohmann::json{{"state", "open"}};
+        return ComputeTaskState(nodes, externalHas);
     }
     if (record.is_object() && record.value("kind", std::string()) == "bt") {
         const std::string btState = ReadBtStateFromFile(record.value("btId", std::string()));
@@ -9624,8 +9689,27 @@ std::string TaskQueueManager::DirectionList(const std::string& taskIdFilter, con
     return nlohmann::json{{"ok", true}, {"version", version}, {"directions", directions}}.dump();
 }
 
+namespace {
+
+std::string JobFailureTime(const TaskQueueJob& job) {
+    if (!job.attempts.empty() && !job.attempts.back().end.empty()) return job.attempts.back().end;
+    return job.updatedAt.empty() ? job.createdAt : job.updatedAt;
+}
+
+bool AtOrBeforeTimestamp(const std::string& value, const std::string& before) {
+    if (before.empty()) return true;
+    if (value.empty()) return false;
+    const int64_t valueEpoch = ParseTimestampStrToEpoch(value);
+    const int64_t beforeEpoch = ParseTimestampStrToEpoch(before);
+    if (valueEpoch > 0 && beforeEpoch > 0) return valueEpoch <= beforeEpoch;
+    return value <= before;
+}
+
+} // namespace
+
 std::string TaskQueueManager::DirectionClose(const std::string& id, const std::string& result,
-                                             const std::string& reason, std::string& outError) {
+                                             const std::string& reason, std::string& outError,
+                                             const nlohmann::json& decision) {
     outError.clear();
     if (result != "succeeded" && result != "failed" && result != "ignored") {
         outError = "result must be succeeded, failed, or ignored";
@@ -9639,23 +9723,44 @@ std::string TaskQueueManager::DirectionClose(const std::string& id, const std::s
         return BuildError(outError);
     }
     std::lock_guard<std::mutex> lock(mutex_);
+    return DirectionCloseUnlocked(id, result, reason, decision, outError);
+}
+
+std::string TaskQueueManager::DirectionCloseUnlocked(const std::string& id, const std::string& result,
+                                                     const std::string& reason,
+                                                     const nlohmann::json& decision,
+                                                     std::string& outError) {
+    outError.clear();
     nlohmann::json record;
     if (!directionStore_.Get(id, record)) {
-        outError = "direction not found: " + id;
-        return BuildError(outError);
+        // A pre-0.10 job has no direction record; closing it creates the implicit direction.
+        if (id.rfind("job:", 0) != 0) {
+            outError = "direction not found: " + id;
+            return BuildError(outError);
+        }
+        const TaskQueueJob* job = FindJobConst(id.substr(4));
+        if (!job || !job->directionId.empty()) {
+            outError = "direction not found: " + id;
+            return BuildError(outError);
+        }
+        record = {{"id", id}, {"kind", "jobs"}, {"taskId", job->taskId}, {"btId", ""},
+                  {"title", job->summary.empty() ? job->name : job->summary},
+                  {"createdAt", GetCurrentTimestampStr()}, {"removedJobs", nlohmann::json::array()}};
+        if (!directionStore_.Create(record, outError)) return BuildError(outError);
     }
     if (record.contains("closed") && record["closed"].is_object()) {
         outError = "direction '" + id + "' is already closed";
         return BuildError(outError);
     }
+    const bool implicit = id.rfind("job:", 0) == 0;
     for (const auto& [name, tq] : queues_) {
         (void)name;
         for (const auto& job : tq.jobs) {
-            if (job.directionId != id) continue;
-            if (IsJobUnfinishedForDirection(job)) {
-                outError = "direction '" + id + "' has active job '" + job.id + "'; cancel it first";
-                return BuildError(outError);
-            }
+            const bool belongs = implicit ? (job.directionId.empty() && job.id == id.substr(4))
+                                          : (job.directionId == id);
+            if (!belongs || !IsJobUnfinishedForDirection(job)) continue;
+            outError = "direction '" + id + "' has active job '" + job.id + "'; cancel it first";
+            return BuildError(outError);
         }
     }
     if (record.value("kind", std::string()) == "bt") {
@@ -9666,7 +9771,9 @@ std::string TaskQueueManager::DirectionClose(const std::string& id, const std::s
         }
     }
     const std::string now = GetCurrentTimestampStr();
-    record["closed"] = nlohmann::json{{"result", result}, {"reason", reason}, {"at", now}};
+    nlohmann::json closed = {{"result", result}, {"reason", reason}, {"at", now}};
+    if (decision.is_object()) closed["decision"] = decision;
+    record["closed"] = std::move(closed);
     record["updatedAt"] = now;
     record["rev"] = BumpRevLocked();
     if (!directionStore_.Save(record, outError)) return BuildError(outError);
@@ -9677,6 +9784,63 @@ std::string TaskQueueManager::DirectionClose(const std::string& id, const std::s
                 result + ": " + reason, "", &extra);
     }
     return nlohmann::json{{"ok", true}, {"id", id}, {"state", "closed"}, {"result", result}}.dump();
+}
+
+std::string TaskQueueManager::DirectionCloseMany(const std::string& state, const std::string& before,
+                                                 const std::string& reason, std::string& outError) {
+    outError.clear();
+    if (state != "failed" && state != "running" && state != "cancelled") {
+        outError = "state must be failed, running, or cancelled";
+        return BuildError(outError);
+    }
+    if (reason.empty()) {
+        outError = "reason is required";
+        return BuildError(outError);
+    }
+    if (!DirectionStore::ValidateSize("reason", reason, DirectionStore::kReasonMaxBytes, outError)) {
+        return BuildError(outError);
+    }
+    std::lock_guard<std::mutex> lock(mutex_);
+    std::vector<std::string> ids;
+    for (const auto& record : directionStore_.All()) {
+        const std::string id = record.value("id", std::string());
+        if (id.empty() || (record.contains("closed") && record["closed"].is_object())) continue;
+        if (DirectionStateLocked(id).value("state", std::string()) != state) continue;
+        std::string at = record.value("updatedAt", std::string());
+        for (const auto& [name, tq] : queues_) {
+            (void)name;
+            for (const auto& job : tq.jobs) {
+                if (job.directionId != id) continue;
+                const std::string jobAt = JobFailureTime(job);
+                if (jobAt > at) at = jobAt;
+            }
+        }
+        if (at.empty()) at = record.value("createdAt", std::string());
+        if (!AtOrBeforeTimestamp(at, before)) continue;
+        ids.push_back(id);
+    }
+    std::unordered_set<std::string> seen(ids.begin(), ids.end());
+    for (const auto& [name, tq] : queues_) {
+        (void)name;
+        for (const auto& job : tq.jobs) {
+            if (!job.directionId.empty() || job.hidden || job.state != state) continue;
+            const std::string id = "job:" + job.id;
+            if (seen.count(id) > 0) continue;
+            if (!AtOrBeforeTimestamp(JobFailureTime(job), before)) continue;
+            seen.insert(id);
+            ids.push_back(id);
+        }
+    }
+    nlohmann::json closedIds = nlohmann::json::array();
+    for (const auto& id : ids) {
+        nlohmann::json decision = {{"candidateId", "ignore"}, {"result", "ignored"},
+                                   {"reason", reason}, {"by", "bulk"}};
+        std::string closeError;
+        const std::string response = DirectionCloseUnlocked(id, "ignored", reason, decision, closeError);
+        const nlohmann::json parsed = nlohmann::json::parse(response, nullptr, false);
+        if (closeError.empty() && parsed.is_object() && parsed.value("ok", false)) closedIds.push_back(id);
+    }
+    return nlohmann::json{{"ok", true}, {"closed", closedIds.size()}, {"ids", std::move(closedIds)}}.dump();
 }
 
 std::string TaskQueueManager::DirectionReopen(const std::string& id, const std::string& reason,
@@ -9767,16 +9931,14 @@ nlohmann::json TaskQueueManager::TaskStateLocked(const std::string& taskId) cons
     bool anyCancelled = false;
     int64_t closedDirections = 0;
     for (const std::string& dirId : dirIds) {
-        if (dirId.rfind("job:", 0) != 0) {
-            nlohmann::json dirRecord;
-            if (directionStore_.Get(dirId, dirRecord) && dirRecord.is_object()) {
-                if (dirRecord.contains("closed") && dirRecord["closed"].is_object()) {
-                    ++closedDirections;
-                    continue;
-                }
-                if (!dirRecord.value("supersededBy", std::string()).empty()) {
-                    continue;
-                }
+        nlohmann::json dirRecord;
+        if (directionStore_.Get(dirId, dirRecord) && dirRecord.is_object()) {
+            if (dirRecord.contains("closed") && dirRecord["closed"].is_object()) {
+                ++closedDirections;
+                continue;
+            }
+            if (!dirRecord.value("supersededBy", std::string()).empty()) {
+                continue;
             }
         }
         const nlohmann::json ds = DirectionStateLocked(dirId);

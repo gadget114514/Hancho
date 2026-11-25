@@ -1639,6 +1639,7 @@ int main() {
                   "100-3: bt_resume logs 1 escalate_answered entry with answer and rationale");
 
             // Failing job -> triage_list -> triage_decide -> triage_decided in task log.
+            h.Call({{"action", "config_set"}, {"patch", {{"triage_mode", "manual"}}}});
             json rFailJob = h.Call({
                 {"action", "taskqueue_add"},
                 {"taskqueue", "ipc-triage-1003"},
@@ -1656,9 +1657,21 @@ int main() {
 
             json rTriageList = h.Call({{"action", "triage_list"}, {"state", "pending"}});
             std::string cardId;
+            std::string cardDump;
             for (const auto& card : rTriageList.value("cards", json::array())) {
-                if (card.value("target", json::object()).value("jobId", "") == "ipc-fail-1003") {
+                const json tgt = card.value("target", json::object());
+                bool match = tgt.value("jobId", "") == "ipc-fail-1003";
+                if (!match && tgt.contains("failedJobIds") && tgt["failedJobIds"].is_array()) {
+                    for (const auto& fid : tgt["failedJobIds"]) {
+                        if (fid.is_string() && fid.get<std::string>() == "ipc-fail-1003") {
+                            match = true;
+                            break;
+                        }
+                    }
+                }
+                if (match) {
                     cardId = card.value("id", "");
+                    cardDump = card.dump();
                     break;
                 }
             }
@@ -1671,12 +1684,12 @@ int main() {
                     {"reason", "expected failure"},
                     {"by", "human"}
                 });
-                Check(rDecide.value("ok", false), "100-3: triage_decide ok: " + rDecide.dump());
+                Check(rDecide.value("ok", false), "100-3: triage_decide ok: " + rDecide.dump() + " card=" + cardDump);
                 json rAfterDecide = h.Call({{"action", "task_show"}, {"id", taskId}, {"logLimit", 50}});
                 bool hasTriageLog = false;
                 for (const auto& entry : rAfterDecide.value("log", json::array())) {
                     if (entry.value("kind", "") == "triage_decided" &&
-                        entry.value("job", "") == "ipc-fail-1003" &&
+                        (entry.value("job", "") == "ipc-fail-1003" || entry.value("job", "").empty()) &&
                         entry.value("text", "").find("ignore") != std::string::npos &&
                         entry.value("text", "").find("expected failure") != std::string::npos) {
                         hasTriageLog = true;
@@ -1720,6 +1733,42 @@ int main() {
                       "103-6: audience=peer and audience=agent produce the same message audience");
             }
             node.Stop();
+        }
+    }
+
+    // 15. direction_* IPC actions replace the former card_* tool names.
+    {
+        IpcTestHarness h;
+        json rCreate = h.Call({{"action", "task_create"}, {"title", "Direction IPC cards"}});
+        Check(rCreate.value("ok", false), "direction IPC: task_create ok");
+        const std::string taskId = rCreate.value("id", "");
+        if (!taskId.empty()) {
+            json rAdd = h.Call({{"action", "direction_add"}, {"taskId", taskId},
+                                {"number", "108-1"}, {"title", "First direction card"},
+                                {"body", "## Body\n"}});
+            Check(rAdd.value("ok", false) && rAdd.value("number", "") == "108-1",
+                  "direction_add creates a card: " + rAdd.dump());
+            const std::string dirId = rAdd.value("directionId", "");
+            Check(!dirId.empty(), "direction_add returns directionId");
+
+            json rShowNum = h.Call({{"action", "direction_show"}, {"number", "108-1"},
+                                    {"taskId", taskId}});
+            Check(rShowNum.value("ok", false) && rShowNum.contains("card") &&
+                      rShowNum["direction"].value("id", "") == dirId,
+                  "direction_show accepts a card number: " + rShowNum.dump());
+            json rShowId = h.Call({{"action", "direction_show"}, {"id", dirId}});
+            Check(rShowId.value("ok", false) &&
+                      rShowId["direction"].value("id", "") == dirId,
+                  "direction_show accepts dir_<id>");
+            json rList = h.Call({{"action", "direction_list"}, {"taskId", taskId}});
+            Check(rList.value("ok", false) && !rList.value("directions", json::array()).empty(),
+                  "direction_list returns the task's directions");
+            json rEdit = h.Call({{"action", "direction_edit"}, {"taskId", taskId},
+                                 {"number", "108-1"}, {"title", "Renamed direction card"}});
+            Check(rEdit.value("ok", false), "direction_edit updates a planned card");
+            json rRemove = h.Call({{"action", "direction_remove"}, {"taskId", taskId},
+                                   {"number", "108-1"}});
+            Check(rRemove.value("ok", false), "direction_remove deletes a planned card");
         }
     }
 

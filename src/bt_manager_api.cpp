@@ -316,7 +316,7 @@ std::string BtManager::Validate(const std::string& jsonText, bool strict) {
     return BehaviorTree::ValidateResponse(jsonText, this, strict);
 }
 
-std::string BtManager::Start(const std::string& jsonText, bool paused) {
+std::string BtManager::Start(const std::string& jsonText, bool paused, bool triage) {
     std::string err;
     std::lock_guard<std::mutex> lock(mutex_);
 
@@ -338,11 +338,19 @@ std::string BtManager::Start(const std::string& jsonText, bool paused) {
         }
     }
 
+    bool effTriage = triage;
+    if (effTriage) {
+        auto parsedDef = json::parse(jsonText, nullptr, false);
+        if (parsedDef.is_object() && parsedDef.contains("triage") && parsedDef["triage"].is_boolean()) {
+            effTriage = parsedDef["triage"].get<bool>();
+        }
+    }
+
     std::string dirId;
     std::string dirErr;
     const std::string btTitle = tree->Summary().empty() ? btId : tree->Summary();
     if (!tqm_.EnsureBtDirection(btId, tree->DirectionId(), tree->TaskId(), btTitle,
-                                tqm_.BtOriginJson(btId), dirId, dirErr)) {
+                                tqm_.BtOriginJson(btId), dirId, dirErr, effTriage)) {
         return MakeErrorJson(dirErr);
     }
     tree->SetDirectionId(dirId);

@@ -29,6 +29,17 @@ bool Bool(const json& value, const char* key, bool fallback = false) {
     return it != value.end() && it->is_boolean() ? it->get<bool>() : fallback;
 }
 
+// TaskQueueList emits snake_case; hand-built test jobs may use camelCase.
+std::string JobDirectionId(const json& job) {
+    std::string id = String(job, "direction_id");
+    return id.empty() ? String(job, "directionId") : id;
+}
+
+std::string JobTaskId(const json& job) {
+    std::string id = String(job, "task_id");
+    return id.empty() ? String(job, "taskId") : id;
+}
+
 long long Number(const json& value, const char* key, long long fallback = 0) {
     const auto it = value.find(key);
     if (it == value.end() || !it->is_number()) return fallback;
@@ -216,6 +227,33 @@ json Candidate(const char* id, const char* label, const char* effect, bool safe,
 void AddCandidate(json& candidates, const char* id, const char* label,
                   const char* effect, bool safe, json params = json::object()) {
     candidates.push_back(Candidate(id, label, effect, safe, std::move(params)));
+}
+
+bool IsFinishedJobState(const std::string& state) {
+    return state == "succeeded" || state == "failed" || state == "cancelled" ||
+           state == "closed" || state == "takenOver";
+}
+
+bool SupersededJob(const std::string& id, const json& jobs) {
+    if (id.empty()) return false;
+    for (const auto& other : jobs) {
+        if (other.is_object() && String(other, "supersedes") == id) return true;
+    }
+    return false;
+}
+
+std::string LogExcerpt(const json& job) {
+    json output = TailOutput(LastAttempt(job));
+    if (output.is_null()) output = TailOutput(Object(FailureFor(job), "lastAttempt"));
+    if (output.is_null()) return "";
+    std::string text;
+    for (const auto& line : Array(output, "lines")) {
+        const std::string value = InfoText(line);
+        if (value.empty()) continue;
+        if (!text.empty()) text += "\n";
+        text += value;
+    }
+    return Clip(text, 1200);
 }
 
 std::string PreviousFailureClass(const json& job) {
@@ -668,6 +706,170 @@ json BuildSimpleCard(const std::string& key, const std::string& kind,
             {"flags", {{"needsHuman", false}, {"timeoutPattern", ""}}}};
 }
 
+// 102-10: one card per failed direction. Jobs that carry a directionId are represented by this
+// card instead of a job_failure card; legacy jobs without one keep their implicit job card.
+struct DirectionFailure {
+    std::string id;
+    std::string kind;
+    std::string btId;
+    std::string taskId;
+    std::string title;
+    bool disabled = false;
+    std::vector<const json*> jobs;
+    std::vector<const json*> failedJobs;
+};
+
+std::vector<DirectionFailure> CollectDirections(const TriageInputs& in) {
+    const json records = in.directions.is_array() ? in.directions : json::array();
+    std::unordered_map<std::string, size_t> byId;
+    std::vector<DirectionFailure> dirs;
+    for (const auto& record : records) {
+        if (!record.is_object()) continue;
+        const std::string id = String(record, "id");
+        if (id.empty()) continue;
+        DirectionFailure d;
+        d.id = id;
+        d.kind = String(record, "kind", "jobs");
+        d.btId = String(record, "btId");
+        d.taskId = String(record, "taskId");
+        d.title = String(record, "title");
+        d.disabled = !Bool(record, "triage", true) ||
+                     (record.contains("closed") && record["closed"].is_object()) ||
+                     !String(record, "supersededBy").empty();
+        byId[id] = dirs.size();
+        dirs.push_back(std::move(d));
+    }
+    if (!in.jobs.is_array()) return dirs;
+    for (const auto& job : in.jobs) {
+        if (!job.is_object() || Bool(job, "virtual")) continue;
+        const std::string id = JobDirectionId(job);
+        if (id.empty()) continue;
+        auto it = byId.find(id);
+        if (it == byId.end()) {
+            DirectionFailure d;
+            d.id = id;
+            d.btId = String(Object(job, "bt"), "id");
+            d.kind = d.btId.empty() ? "jobs" : "bt";
+            d.taskId = JobTaskId(job);
+            d.title = String(job, "summary", String(job, "name", id));
+            byId[id] = dirs.size();
+            dirs.push_back(std::move(d));
+            it = byId.find(id);
+        }
+        DirectionFailure& d = dirs[it->second];
+        if (!Bool(job, "triage", true)) d.disabled = true;
+        if (d.btId.empty()) d.btId = String(Object(job, "bt"), "id");
+        if (d.taskId.empty()) d.taskId = JobTaskId(job);
+        if (d.title.empty()) d.title = String(job, "summary", String(job, "name", d.id));
+        d.jobs.push_back(&job);
+    }
+    return dirs;
+}
+
+json BuildDirectionFailureCard(const DirectionFailure& dir, const TriageInputs& in,
+                               const json* repeatedBadge) {
+    const std::string key = "dir:" + dir.id;
+    json info = {{"intent", json::array()}, {"cause", json::array()}, {"background", json::array()},
+                 {"environment", json::array()}, {"conditions", json::array()},
+                 {"reason", json::array()}};
+    AddItem(info["intent"], "summary", dir.title, dir.title);
+    AddItem(info["intent"], "direction", {{"id", dir.id}, {"kind", dir.kind}},
+            "direction " + dir.id + " (" + dir.kind + ")");
+    AddItem(info["cause"], "failedCount", static_cast<long long>(dir.failedJobs.size()),
+            "failed jobs in direction: " + std::to_string(dir.failedJobs.size()));
+    json failedJobs = json::array();
+    std::string queue;
+    for (const json* job : dir.failedJobs) {
+        const std::string jobId = String(*job, "id");
+        const json failure = FailureFor(*job);
+        const json last = LastAttempt(*job);
+        json item = {{"id", jobId},
+                     {"summary", String(*job, "summary")},
+                     {"failureClass", FailureClass(failure)},
+                     {"exitCode", last.contains("exit_code") && last["exit_code"].is_number()
+                         ? last["exit_code"] : json(-1)},
+                     {"logExcerpt", LogExcerpt(*job)}};
+        if (queue.empty()) queue = String(*job, "taskqueue");
+        AddItem(info["cause"], "failedJob", item,
+                "failed job " + jobId + " (" + String(item, "failureClass") + "): " +
+                String(item, "summary"));
+        failedJobs.push_back(std::move(item));
+    }
+    AddItem(info["cause"], "failedJobs", failedJobs, "failed jobs: " + failedJobs.dump());
+    if (repeatedBadge && repeatedBadge->is_object()) {
+        json badge = {{"count", Number(*repeatedBadge, "failedCount", 0)},
+                      {"threshold", Number(*repeatedBadge, "threshold", 3)},
+                      {"lineageRoot", String(*repeatedBadge, "rootId")}};
+        AddItem(info["cause"], "repeatedFailure", badge,
+                "repeated lineage failures in this direction: " +
+                std::to_string(Number(*repeatedBadge, "failedCount", 0)));
+        AddItem(info["background"], "lineageRoot", String(*repeatedBadge, "rootId"),
+                "lineage root: " + String(*repeatedBadge, "rootId"));
+    }
+    AddItem(info["background"], "directionKind", dir.kind, "direction kind: " + dir.kind);
+    AddItem(info["background"], "directionTitle", dir.title, "title: " + dir.title);
+    AddItem(info["environment"], "queue", queue, "queue: " + queue);
+    AddItem(info["conditions"], "directionState", std::string("failed"), "direction state: failed");
+    if (!dir.btId.empty())
+        AddItem(info["background"], "behaviorTree", dir.btId, "BT: " + dir.btId);
+    if (!dir.taskId.empty())
+        AddItem(info["background"], "task", dir.taskId, "task: " + dir.taskId);
+    AddItem(info["reason"], "directionFailure", dir.id,
+            "direction " + dir.id + " ended in failure; decide whether to retry, rescue or ignore it.");
+    AddItem(info["reason"], "recommendationRationale",
+            {{"key", "directionRetry"}, {"params", json::object()}},
+            "recommendation: retry the failed jobs in this direction before changing its specification.");
+
+    long long maxHops = 2;
+    if (in.config.is_object() && in.config.contains("triage_redo_max_hops") &&
+        in.config["triage_redo_max_hops"].is_number()) {
+        const long long configured = in.config["triage_redo_max_hops"].get<long long>();
+        if (configured >= 0) maxHops = configured;
+    }
+    json retryParams = {{"directionId", dir.id}, {"failedJobIds", json::array()}};
+    for (const json* job : dir.failedJobs) retryParams["failedJobIds"].push_back(String(*job, "id"));
+    if (!dir.btId.empty()) retryParams["btId"] = dir.btId;
+    json redoParams = {{"directionId", dir.id}, {"maxHops", maxHops}};
+    if (!dir.taskId.empty()) redoParams["taskId"] = dir.taskId;
+    json candidates = json::array();
+    AddCandidate(candidates, "retry", "Retry direction",
+                 "Retry every failed job in this direction, or retry the behavior tree.",
+                 true, std::move(retryParams));
+    AddCandidate(candidates, "redo", "Rescue with changes",
+                 "Create a superseding direction in this task with changed instructions.",
+                 false, std::move(redoParams));
+    AddCandidate(candidates, "ignore", "Ignore", "Record that this direction needs no action.", false);
+    AddCandidate(candidates, "ack", "Acknowledge", "Confirm that this direction was reviewed.", false);
+
+    json target = {{"directionId", dir.id}, {"directionKind", dir.kind},
+                   {"failedCount", static_cast<long long>(dir.failedJobs.size())},
+                   {"failedJobIds", json::array()}, {"maxHops", maxHops}};
+    for (const json* job : dir.failedJobs) target["failedJobIds"].push_back(String(*job, "id"));
+    if (!dir.btId.empty()) target["btId"] = dir.btId;
+    if (!dir.taskId.empty()) target["taskId"] = dir.taskId;
+    if (!queue.empty()) target["queue"] = queue;
+    if (repeatedBadge && repeatedBadge->is_object()) {
+        target["repeatedFailureCount"] = Number(*repeatedBadge, "failedCount", 0);
+        target["lineageRoot"] = String(*repeatedBadge, "rootId");
+    }
+    json flags = {{"needsHuman", false}, {"timeoutPattern", ""}, {"directionId", dir.id},
+                  {"directionKind", dir.kind}};
+    if (repeatedBadge && repeatedBadge->is_object())
+        flags["repeatedFailure"] = {{"count", Number(*repeatedBadge, "failedCount", 0)},
+                                    {"threshold", Number(*repeatedBadge, "threshold", 3)},
+                                    {"lineageRoot", String(*repeatedBadge, "rootId")}};
+    json card = {{"id", dir.id}, {"key", key}, {"kind", "direction_failure"},
+                 {"target", std::move(target)}, {"createdAt", in.now}, {"updatedAt", in.now},
+                 {"state", "pending"}, {"info", std::move(info)}, {"candidates", std::move(candidates)},
+                 {"recommendation", {{"source", "hancho"}, {"candidateId", "retry"},
+                                     {"confidence", "high"},
+                                     {"rationale", "The direction ended in failure; retrying its failed jobs is the safest first step."},
+                                     {"rationaleKey", "directionRetry"}, {"rationaleParams", json::object()}}},
+                 {"advice", nullptr}, {"adviceState", "none"}, {"decision", nullptr},
+                 {"flags", std::move(flags)}};
+    return card;
+}
+
 const json* FindCandidate(const json& card, const std::string& candidateId) {
     const auto candidates = card.find("candidates");
     if (candidates == card.end() || !candidates->is_array()) return nullptr;
@@ -710,6 +912,7 @@ std::string TriageTimeoutPattern(const nlohmann::json& job) {
 
 nlohmann::json BuildTriageCandidates(const TriageInputs& in) {
     json fresh = json::array();
+    if (Lower(String(in.config, "triage_mode", "semi")) == "off") return fresh;
     const json jobs = in.jobs.is_array() ? in.jobs : json::array();
     const json btFailures = in.btFailures.is_array() ? in.btFailures : json::array();
     const json btStates = in.btStates.is_object() ? in.btStates : json::object();
@@ -725,7 +928,9 @@ nlohmann::json BuildTriageCandidates(const TriageInputs& in) {
             const auto state = btStates.find(btId);
             if (state != btStates.end() && state->is_string()) btFailed = state->get<std::string>() == "failed";
         }
-        if (String(job, "state") == "failed" && btFailed && !IsJobInsideEscalation(job, btFailures))
+        // 102-10: a failed job that belongs to a direction is reported on the direction's card.
+        if (JobDirectionId(job).empty() &&
+            String(job, "state") == "failed" && btFailed && !IsJobInsideEscalation(job, btFailures))
             fresh.push_back(BuildJobFailureCard(job, in));
 
         const json timing = Object(job, "timing_feedback");
@@ -875,6 +1080,7 @@ nlohmann::json BuildTriageCandidates(const TriageInputs& in) {
         if (inserted) rootOrder.push_back(rootId);
         it->second.push_back(jobById[jobId]);
     }
+    std::unordered_map<std::string, json> repeatedByDirection;
     for (const std::string& rootId : rootOrder) {
         const auto& chain = lineages[rootId];
         long long failedCount = 0;
@@ -902,6 +1108,14 @@ nlohmann::json BuildTriageCandidates(const TriageInputs& in) {
             if (cur) latestJob = cur;
         }
         const std::string targetJobId = String(*latestJob, "id", String(*latestFailed, "id"));
+        const std::string targetDirectionId = JobDirectionId(*latestJob);
+        // 102-10 / 100-8: a repeated lineage is a badge on the latest job's direction card, not
+        // an extra card. Legacy jobs without directionId keep the standalone escalation card.
+        if (!targetDirectionId.empty()) {
+            repeatedByDirection[targetDirectionId] = {
+                {"failedCount", failedCount}, {"threshold", repeatThreshold}, {"rootId", rootId}};
+            continue;
+        }
         const std::string taskId = String(*latestJob, "task_id");
         const std::string key = "lineage:" + rootId;
         json info = {{"intent", json::array()}, {"cause", json::array()}, {"background", json::array()},
@@ -948,11 +1162,46 @@ nlohmann::json BuildTriageCandidates(const TriageInputs& in) {
         fresh.push_back(std::move(card));
     }
 
+    // 102-10: build at most one card per failed direction. A BT direction is only reported when
+    // the tree itself ended in `failed`; intermediate fix-loop, retry and escalation failures
+    // are left to the tree. A jobs direction is reported once all its jobs have finished.
+    const std::vector<DirectionFailure> directions = CollectDirections(in);
+    std::unordered_set<std::string> directionBtIds;
+    for (const auto& dir : directions) {
+        if (!dir.btId.empty()) directionBtIds.insert(dir.btId);
+        if (dir.disabled) continue;
+        bool finished = false;
+        if (dir.kind == "bt" || (!dir.btId.empty() && !btStates.empty())) {
+            const std::string treeState = String(btStates, dir.btId.c_str());
+            finished = treeState == "failed";
+        } else {
+            finished = !dir.jobs.empty();
+            for (const json* job : dir.jobs) {
+                if (SupersededJob(String(*job, "id"), jobs)) continue;
+                if (!IsFinishedJobState(String(*job, "state"))) { finished = false; break; }
+            }
+        }
+        if (!finished) continue;
+        DirectionFailure ready = dir;
+        for (const json* job : dir.jobs) {
+            if (String(*job, "state") != "failed" || SupersededJob(String(*job, "id"), jobs)) continue;
+            ready.failedJobs.push_back(job);
+        }
+        if (ready.failedJobs.empty()) continue;
+        const json* badge = nullptr;
+        auto badgeIt = repeatedByDirection.find(dir.id);
+        if (badgeIt != repeatedByDirection.end()) badge = &badgeIt->second;
+        fresh.push_back(BuildDirectionFailureCard(ready, in, badge));
+    }
+
     for (const auto& failure : btFailures) {
         if (!failure.is_object()) continue;
         const std::string btId = String(failure, "btId");
         const std::string nodeId = String(failure, "nodeId");
         if (btId.empty() || nodeId.empty()) continue;
+        // A tree with a direction is represented by its direction card; intermediate escalation
+        // failures are not separate triage decisions (102-10).
+        if (directionBtIds.count(btId)) continue;
         const std::string key = "esc:" + btId + "/" + nodeId;
         const std::string detail = String(failure, "detail", "escalation failed");
         json info = {{"intent", json::array()}, {"cause", json::array()}, {"background", json::array()},
@@ -1188,7 +1437,8 @@ std::vector<std::string> MergeTriageCards(nlohmann::json& store,
             const std::string state = String(*it, "state");
             const std::string kind = String(*it, "kind");
             const json outcome = Object(*it, "outcome");
-            const bool tracksOutcome = kind == "job_failure" || kind == "bt_escalation_failure";
+            const bool tracksOutcome = kind == "job_failure" || kind == "bt_escalation_failure" ||
+                                       kind == "direction_failure";
             const bool done = String(*it, "lifecycle") == "done" || state == "ignored" ||
                 (outcome.is_object() && Bool(outcome, "complete")) ||
                 (!tracksOutcome && (state == "acted" || state == "resolved"));
@@ -1340,7 +1590,9 @@ std::string TriageAutoChoice(const nlohmann::json& store, const nlohmann::json& 
                 break;
             }
         }
-        const std::string retryKey = String(target, "jobId") + "|" + failureClass;
+        const std::string retryKey = String(target, "jobId").empty()
+            ? String(target, "directionId") + "|" + failureClass
+            : String(target, "jobId") + "|" + failureClass;
         const json retries = Array(store, "autoRetries");
         for (const auto& retry : retries) {
             if (retry.is_string() && retry.get<std::string>() == retryKey) {
@@ -1496,6 +1748,60 @@ nlohmann::json TriageOutcome(const nlohmann::json& card, const nlohmann::json& j
             out["state"] = "not_rerun";
             out["detail"] = "tree failed"; out["complete"] = false;
         } else { out["state"] = "rerunning"; out["detail"] = "tree " + treeState; out["complete"] = false; }
+        return out;
+    }
+
+    if (kind == "direction_failure") {
+        const std::string dirId = String(target, "directionId");
+        if (dirId.empty()) return nullptr;
+        const std::string dirKind = String(target, "directionKind");
+        json out = {{"direction", {{"id", dirId}, {"kind", dirKind}}}};
+        if (!String(target, "btId").empty()) {
+            const std::string btId = String(target, "btId");
+            const std::string treeState = btStates.is_object() ? String(btStates, btId.c_str()) : std::string();
+            out["bt"] = {{"id", btId}, {"state", treeState}};
+            if (treeState.empty()) {
+                out["state"] = "gone"; out["detail"] = "the behavior tree no longer exists";
+                out["complete"] = true;
+            } else if (treeState == "succeeded" || treeState == "cancelled") {
+                out["state"] = treeState; out["detail"] = "tree " + treeState; out["complete"] = true;
+            } else if (treeState == "failed") {
+                if (state != "acted") return nullptr;
+                out["state"] = "not_rerun"; out["detail"] = "tree failed"; out["complete"] = false;
+            } else {
+                out["state"] = "rerunning"; out["detail"] = "tree " + treeState; out["complete"] = false;
+            }
+            out["direction"]["state"] = treeState;
+            return out;
+        }
+        int failed = 0, running = 0, done = 0;
+        for (const auto& tracked : Array(target, "failedJobIds")) {
+            const std::string id = tracked.is_string() ? tracked.get<std::string>() : std::string();
+            if (id.empty()) continue;
+            json trackedJob;
+            for (const auto& candidate : jobs.is_array() ? jobs : json::array())
+                if (String(candidate, "id") == id) { trackedJob = candidate; break; }
+            if (trackedJob.empty()) { ++done; continue; }
+            const std::string js = String(trackedJob, "state");
+            if (js == "failed") ++failed;
+            else if (IsFinishedJobState(js)) ++done;
+            else ++running;
+        }
+        out["direction"]["state"] = failed > 0 ? "failed" : running > 0 ? "running" : "succeeded";
+        if (failed > 0) {
+            if (state != "acted") return nullptr;
+            out["state"] = "not_rerun"; out["detail"] = "the direction failed again";
+            out["complete"] = false;
+        } else if (running > 0) {
+            out["state"] = "rerunning"; out["detail"] = "failed jobs are running again";
+            out["complete"] = false;
+        } else {
+            out["state"] = "succeeded"; out["detail"] = "all failed jobs finished";
+            out["complete"] = true;
+        }
+        json branch = {{"total", failed + running + done}, {"failed", failed}, {"running", running},
+                       {"succeeded", done}, {"jobs", json::array()}, {"done", failed == 0 && running == 0}};
+        out["branch"] = std::move(branch);
         return out;
     }
 

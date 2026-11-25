@@ -450,7 +450,7 @@ int main() {
               "103-1: bt-dir-103-reuse succeeds");
     }
 
-    // 104-2: card run, --ready, --max, dependency check, and task cardDefaults
+    // 104-2: direction run, --ready, --max, dependency check, and task cardDefaults
     {
         TestHarness h;
         std::string tErr;
@@ -506,7 +506,7 @@ int main() {
                   ready1["started"].size() == 1 &&
                   ready1["started"][0].value("number", std::string()) == "104-a" &&
                   ready1["started"][0].value("directionId", std::string()) == dirA,
-              "104-2: card run --ready --max 1 starts only 104-a");
+              "104-2: direction run --ready --max 1 starts only 104-a");
 
         const std::string btA = ready1["started"][0].value("btId", std::string());
         nlohmann::json dirARec;
@@ -543,7 +543,7 @@ int main() {
             h.btm->CardRun(taskId, "", true, 2, false), nullptr, false);
         Check(ready2.value("ok", false) && ready2["started"].is_array() &&
                   ready2["started"].size() == 2,
-              "104-2: card run --ready --max 2 starts remaining 2 ready cards");
+              "104-2: direction run --ready --max 2 starts remaining 2 ready cards");
         for (const auto& s : ready2["started"]) {
             const std::string btId = s.value("btId", std::string());
             const json w = json::parse(h.btm->Wait(btId, 0, 15000), nullptr, false);
