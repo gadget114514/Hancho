@@ -1,0 +1,42 @@
+{
+  "taskqueue": "loadtest",
+  "concurrency": 16,
+  "jobs": [
+    {
+      "id": "lt-0001",
+      "command": "cmd /c exit 0",
+      "summary": "loadtest fast 0001",
+      "timeoutSec": 30
+    },
+    {
+      "id": "lt-0002",
+      "command": "cmd /c exit 0",
+      "summary": "loadtest fast 0002",
+      "timeoutSec": 30
+    },
+    {
+      "id": "lt-0013",
+      "command": "cmd /c exit 1",
+      "summary": "loadtest fast 0013 (planned failure)",
+      "timeoutSec": 30
+    },
+    {
+      "id": "lt-long-1",
+      "command": "ping -n 1800 127.0.0.1",
+      "summary": "loadtest long 1",
+      "timeoutSec": 3600
+    },
+    {
+      "id": "lt-long-2",
+      "command": "ping -n 1800 127.0.0.1",
+      "summary": "loadtest long 2",
+      "timeoutSec": 3600
+    },
+    {
+      "id": "lt-long-3",
+      "command": "ping -n 1800 127.0.0.1",
+      "summary": "loadtest long 3",
+      "timeoutSec": 3600
+    }
+  ]
+}

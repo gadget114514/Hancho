@@ -2777,9 +2777,9 @@ static void UpdateKpiTooltips(DashboardState* st, uint32_t totalTreeProcs,
     }
 
     st->kpiTipText[14] = Tr(
-        L"タスクビューに読み込まれている指示 / カードの件数。タスクビューでない場合は N/A。",
-        L"Number of directions/cards loaded in the task view; N/A outside task view.",
-        L"Número de direcciones/tarjetas cargadas en la vista de tareas; N/D fuera de esa vista.");
+        L"タスクビューに読み込まれている指示の件数。タスクビューでない場合は N/A。",
+        L"Number of directions loaded in the task view; N/A outside task view.",
+        L"Número de direcciones cargadas en la vista de tareas; N/D fuera de esa vista.");
     if (!st->taskViewMode) {
         st->kpiTipText[14] += std::wstring(L"\n") + Tr(L"タスクビューを有効にしてください。", L"Enable Task view to see this count.", L"Activa la vista de tareas para ver este recuento.");
     }
@@ -3214,11 +3214,8 @@ static void DrawDashboardCanvas(DashboardState* st, HDC hdcWindow, const RECT* u
                 // computes these from the whole task table before the display-row slice.
                 const pc::TaskViewCounts& tc = st->taskViewCounts;
                 if (col == 0) {
-                    std::wstring sub = (tc.totalJobs > 0)
-                        ? (Tr(L"ジョブ ", L"jobs ", L"trabajos ") + std::to_wstring(tc.totalJobs)) : L"";
                     DrawKpiCard(hdc, rcCard, Tr(L"タスク総数", L"TOTAL TASKS", L"TAREAS TOTALES"),
-                                std::to_wstring(tc.totalTasks), KpiAccent(0), st->hFontUiBold, st->hFontKpiVal,
-                                -1.0f, sub);
+                                std::to_wstring(tc.totalTasks), KpiAccent(0), st->hFontUiBold, st->hFontKpiVal);
                 } else if (col == 1) {
                     std::wstring sub = (tc.runningJobs > 0)
                         ? (Tr(L"ジョブ ", L"jobs ", L"trabajos ") + std::to_wstring(tc.runningJobs)) : L"";
@@ -3252,7 +3249,7 @@ static void DrawDashboardCanvas(DashboardState* st, HDC hdcWindow, const RECT* u
                 } else if (col == 6) {
                     const std::wstring val = (st->taskViewMode && !st->cachedDirections.empty())
                         ? std::to_wstring(st->cachedDirections.size()) : std::wstring(Tr(L"N/A", L"N/A", L"N/D"));
-                    DrawKpiCard(hdc, rcCard, Tr(L"指示 / カード", L"DIRECTIONS / CARDS", L"DIRECCIONES / TARJETAS"),
+                    DrawKpiCard(hdc, rcCard, Tr(L"指示", L"DIRECTIONS", L"DIRECCIONES"),
                                 val, KpiAccent(6), st->hFontUiBold, st->hFontKpiVal);
                 } else if (col == 7) {
                     std::wstring sub;
@@ -8008,7 +8005,6 @@ static void RefreshTaskQueueData(DashboardState* st, bool force = false, bool us
             }
             row.cells[10] = std::move(originStr);
             row.originTip = std::move(originTip);
-            if (!row.cells[10].empty()) ++originCounts[row.cells[10]];
 
             row.startKey = !drow.startTime.empty() ? ParseTimestampStrToEpoch(drow.startTime) : 0;
             row.endKey = !drow.endTime.empty() ? ParseTimestampStrToEpoch(drow.endTime) : 0;
@@ -8106,7 +8102,6 @@ static void RefreshTaskQueueData(DashboardState* st, bool force = false, bool us
             }
             row.cells[10] = std::move(originStr);
             row.originTip = std::move(originTip);
-            if (!row.cells[10].empty()) ++originCounts[row.cells[10]];
 
             row.startKey = !drow.startTime.empty() ? ParseTimestampStrToEpoch(drow.startTime) : 0;
             row.endKey = !drow.endTime.empty() ? ParseTimestampStrToEpoch(drow.endTime) : 0;
