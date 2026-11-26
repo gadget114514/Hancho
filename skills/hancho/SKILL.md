@@ -133,6 +133,7 @@ When registering a job you can also add `"suspendWhenDone": true` / `"shutdownWh
 | One command only (build, test, install, dev server) | `start` / MCP `start_process` |
 | A one-character fix or a simple string replacement | `quickfix` (does not use an LLM) |
 | Split a large request into cards and advance them in order | `task create` → `direction add` (or `direction import`) → `direction run --ready` |
+| Start a task / register work as a task | Create the task first with `task create --title "..." --intent "..."`, then attach that id to every submission: `routine run --task <id>`, `bt start --task <id>`, `taskqueue add --task <id>` (MCP: `task`). Never submit without a task. |
 | Multiple steps with order and dependencies | `taskqueue add` + `taskqueue wait` |
 | The next step changes based on the previous result (branching, fix loops, if/else) | `bt start` + `bt wait` / `bt resume` |
 | The same routine work every time (build plus full smoke test, etc.) | `routine run <name>` (no need to rewrite the BT). It becomes one direction under `--task <id>`, or under a new task created automatically when omitted (MCP `routine_run`: `task`). |
@@ -157,6 +158,7 @@ When registering a job you can also add `"suspendWhenDone": true` / `"shutdownWh
 - **Do not start a coding agent for a one-character fix.** Use `quickfix --file <path> --find <text> --replace <text>`. It is deterministic and finishes in seconds to tens of seconds.
 - **The supervisor does not write code itself.** The supervisor issues patches, replacements, or jobs. Application is done by `quickfix` or a worker job.
 - **Group work into tasks and cards.** For a large request: `task create` → add cards with `direction add` (or `direction import`) → `direction run --ready` → after each finishes, the next `--ready`. Record decisions and reasons with `task note <id> --text "..."`, and do not pack cards into one BT (a failed card can be rescued with `direction redo`). When finished, close with `task close <id> --result succeeded|failed --reason "..."`. Attach single jobs and BTs to a task with `--task <id>`, and for a redo with changed content use `taskqueue supersede <jobId> --reason "..."`.
+- **When asked to "start a task", create the task first and then submit. Never submit without a task.** Get an id with `task create --title "..." --intent "..."`, then attach it to every submission: `routine run <name> --task <id>`, `bt start --file <bt> --task <id>`, `taskqueue add --file <jobs> --task <id>` (MCP: `task`). Calling `taskqueue add` without `--task` creates an implicit task: no task record, no direction, and the list shows the rows as "Job". Finish with `task close <id> --result succeeded|failed --reason "..."`.
 - **Do not change the model / provider on your own.** To change `--model` with `taskqueue update`, `--approve-model-change --reason "..."` is required. The supervisor does not change it; it leaves the card waiting for a decision.
 - **Fix one data-dir.** For example, `<project>/.hancho`. Pass `--data-dir` every time, or embed it with `hancho-cli.exe mcp install --data-dir .hancho`.
 

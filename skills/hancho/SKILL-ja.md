@@ -133,6 +133,7 @@ hancho-cli.exe power status
 | 1コマンドだけ（ビルド、テスト、インストール、dev サーバー） | `start` / MCP `start_process` |
 | 1文字修正・単純な文字列置換 | `quickfix`（LLM を使わない） |
 | 大きな依頼をカードに分割して順に進める | `task create` → `direction add`（または `direction import`）→ `direction run --ready` |
+| タスクをはじめて／タスクとして登録して | まず `task create --title "..." --intent "..."` で id を作り、`routine run --task <id>` / `bt start --task <id>` / `taskqueue add --task <id>`（MCP は `task`）で全投入に付ける。task なしの投入は禁止。 |
 | 複数ステップに順番・依存がある | `taskqueue add` + `taskqueue wait` |
 | 前の結果で次が変わる（分岐、修正ループ、if/else） | `bt start` + `bt wait` / `bt resume` |
 | 毎回同じ定型作業（ビルド＋全スモークなど） | `routine run <name>`（BT を書き直さない）。実行は `--task <id>` の下に 1 つの direction として載り、省略時はタスクを自動生成する（MCP `routine_run` の `task`）。 |
@@ -157,6 +158,7 @@ hancho-cli.exe power status
 - **1文字修正にコーディングエージェントを起動しない。** `quickfix --file <path> --find <text> --replace <text>` を使う。決定的で数秒〜数十秒で終わる。
 - **supervisor 自身にコードを書かせない。** 監督はパッチ/置換/ジョブを出す。適用は `quickfix` か worker ジョブにやらせる。
 - **作業はタスクとカードでまとめる。** 大きな依頼は `task create` → カードを `direction add`（または `direction import`）→ `direction run --ready` → 終わったら次の `--ready` の順で進める。判断と理由は `task note <id> --text "..."` に書き、カードを 1 本の BT に詰めない（失敗したカードは `direction redo` で救済する）。終わったら `task close <id> --result succeeded|failed --reason "..."` で閉じる。単発のジョブや BT も `--task <id>` でタスクに付け、内容を変えたやり直しは `taskqueue supersede <jobId> --reason "..."` を使う。
+- **「タスクをはじめて」と言われたら、まずタスクを作ってから投入する。task なしの投入は禁止。** `task create --title "..." --intent "..."` で id を取り、`routine run <name> --task <id>` / `bt start --file <bt> --task <id>` / `taskqueue add --file <jobs> --task <id>`（MCP は `task`）ですべての投入にその id を付ける。`taskqueue add` を `--task` なしで呼ぶと暗黙タスクになり、タスクレコードも direction も作られず、一覧の種別は「ジョブ」と表示される。終わったら `task close <id> --result succeeded|failed --reason "..."` で閉じる。
 - **モデル / provider を勝手に変えない。** `taskqueue update` で `--model` を変えるには `--approve-model-change --reason "..."` が必要。監督は変更せず、カードを判断待ちに残す。
 - **data-dir を1つに固定する。** 例: `<project>/.hancho`。毎回 `--data-dir` を付けるか、`hancho-cli.exe mcp install --data-dir .hancho` で埋め込む。
 
