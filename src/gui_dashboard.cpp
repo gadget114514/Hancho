@@ -8558,7 +8558,7 @@ static void RefreshTaskQueueData(DashboardState* st, bool force = false, bool us
     if (sameCount) {
         for (size_t i = 0; i < newRows.size(); ++i) {
             if (newRows[i] == st->lastTaskRows[i]) continue;
-            st->lastTaskRows[i] = std::move(newRows[i]);
+            st->lastTaskRows[i] = newRows[i];
             const int row = static_cast<int>(i / kTaskListColumns);
             // Owner-data rows are supplied by LVN_GETDISPINFO; invalidate the changed cell.
             RECT cellRect = {};
