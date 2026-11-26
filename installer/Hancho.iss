@@ -62,6 +62,10 @@ AppMutex=Hancho_GUI_Mutex_v1
 Name: "english"; MessagesFile: "compiler:Default.isl"
 Name: "japanese"; MessagesFile: "compiler:Languages\Japanese.isl"
 
+[Messages]
+FinishedLabel=Setup has finished installing [name] on your computer. Ask your agent, find hancho and read its help to start.
+FinishedLabelNoIcons=Setup has finished installing [name] on your computer. Ask your agent, find hancho and read its help to start.
+
 [Tasks]
 Name: "desktopicon"; Description: "{cm:CreateDesktopIcon}"; GroupDescription: "{cm:AdditionalIcons}"; Flags: unchecked
 Name: "addtopath"; Description: "Add hancho-cli.exe and wct.exe to the user PATH (recommended for CLI / LLM agents)"; GroupDescription: "Integration:"; Flags: checkedonce
@@ -96,9 +100,6 @@ Name: "{autodesktop}\{#MyAppName}"; Filename: "{app}\{#MyAppExeName}"; WorkingDi
 [Registry]
 Root: HKCU; Subkey: "Environment"; ValueType: expandsz; ValueName: "Path"; ValueData: "{olddata};{app}"; Tasks: addtopath; Check: NeedsAddPath('{app}'); Flags: preservestringtype
 Root: HKCU; Subkey: "Software\Microsoft\Windows\CurrentVersion\Run"; ValueType: string; ValueName: "Hancho"; ValueData: """{app}\{#MyAppExeName}"" gui"; Tasks: autostartgui; Flags: uninsdeletevalue
-
-[Run]
-Filename: "{app}\{#MyAppExeName}"; Description: "{cm:LaunchProgram,{#StringChange(MyAppName, '&', '&&')}}"; Flags: nowait postinstall skipifsilent
 
 [InstallDelete]
 ; Role copies of Hancho.exe (created at launch). Remove stale ones so the next launch recreates them from the new Hancho.exe.
