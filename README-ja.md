@@ -166,6 +166,13 @@ New-Item -ItemType Junction -Path .claude\skills\hancho -Target (Resolve-Path sk
 
 ## リリースノート
 
+### v0.10.1
+- **タスク一覧の更新**: 行数が変わらない 5 秒ごとの更新で全行を作り直さなくなり、カラム幅も更新のたびにリセットされなくなりました。タスク番号や ID が重複していても、一覧が消えて描き直される現象が起きません。
+- **ルーチンの JSON ビューワ**: ルーチン管理ダイアログを広げ、右側に読み取り専用の BT JSON ビューワ（等幅フォント）を追加しました。詳細欄から BT プレビューを分離しています。
+- **インストーラーの完了画面**: インストール後に Hancho を起動しなくなりました。「Ask your agent, find hancho and read its help to start」と表示します。
+- **CLI help の整備**: 全 `bt` サブコマンド（`tasks`、`template`、`remove` / `rm`）を通常 help と JSON help の両方に載せました。
+- **タスク優先の指示**: Hancho skill に、作業投入前にタスクを作り、routine / BT / ジョブの全投入にその id を付けるルールを追加しました。
+
 ### v0.10.0
 - **`task` → `direction` (指示) → `job` → `attempt` 階層モデル**: 上位タスク、実行指示/カード、キューのジョブ、試行を整理した 4 階層モデル。
 - **`direction` CLI / MCP コマンド群**: Markdown インポート／エクスポート、依存解決による順次実行（`direction run --ready`）、失敗時の救済カード作成（`direction redo`）を含むカードワークフロー（`direction add/list/show/edit/remove/run/redo/import/export/translate/close/reopen/purge`、MCP `direction_*`）。

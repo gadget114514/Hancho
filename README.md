@@ -170,6 +170,13 @@ The application icons are modeled on the character "Telephone Cat" (電話猫, D
 
 ## Release Notes
 
+### v0.10.1
+- **Task list refresh**: the list no longer recreates all rows on every 5-second refresh when the row count is unchanged, and column widths are no longer reset by the refresh loop. Duplicate task numbers or ids no longer make the list clear and redraw on each tick.
+- **Routine JSON viewer**: the Routine Management dialog is wider and has a read-only, monospace BT JSON viewer on the right; the BT preview is no longer mixed into the details pane.
+- **Installer finish page**: no longer launches Hancho after installation. It now says "Ask your agent, find hancho and read its help to start".
+- **CLI help completeness**: all `bt` subcommands (`tasks`, `template`, `remove` / `rm`) are now listed in both plain and JSON help.
+- **Task-first guidance**: the Hancho skills now require creating a task before submitting work and attaching that task id to every routine, BT and job submission.
+
 ### v0.10.0
 - **`task` → `direction` (指示) → `job` → `attempt` Architecture**: Full domain model hierarchy separating high-level tasks, execution directions/cards, queued jobs, and individual run attempts.
 - **`direction` CLI & MCP Suite**: Complete card workflow (`direction add/list/show/edit/remove/run/redo/import/export/translate/close/reopen/purge`, MCP `direction_*`) with Markdown import/export, dependency-ready dispatch (`direction run --ready`), and redo rescue (`direction redo`).

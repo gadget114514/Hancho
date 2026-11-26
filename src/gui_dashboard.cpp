@@ -8545,42 +8545,27 @@ static void RefreshTaskQueueData(DashboardState* st, bool force = false, bool us
     st->taskOriginTips = std::move(newOriginTips);
     st->taskTitleTips = std::move(newTitleTips);
     st->taskUsageTips = std::move(newUsageTips);
-    if (newRows == st->lastTaskRows && newJobIds == st->taskJobIds &&
-        (!st->hwndTaskList || ListView_GetItemCount(st->hwndTaskList) == static_cast<int>(newJobIds.size()))) {
+    const bool sameCount = newRows.size() == st->lastTaskRows.size() &&
+        (!st->hwndTaskList ||
+         ListView_GetItemCount(st->hwndTaskList) == static_cast<int>(newJobIds.size()));
+    if (newRows == st->lastTaskRows && newJobIds == st->taskJobIds && sameCount) {
         return;
     }
-    // Same jobs in the same order (the usual case: only a countdown or a state moved): rewrite
-    // just the cells that changed. Rebuilding every row each refresh was what made the list heavy.
-    if (newJobIds == st->taskJobIds &&
-        newRows.size() == st->lastTaskRows.size() &&
-        ListView_GetItemCount(st->hwndTaskList) == static_cast<int>(newJobIds.size())) {
-        bool fitColumnGrew = false;
+    // Same row count (the usual case, including when duplicate ids reshuffle the order): rewrite
+    // the changed cells in place. A virtual list reads text from lastTaskRows through
+    // LVN_GETDISPINFO, so SetItemCountEx is only needed when the number of rows actually changes.
+    // Recreating the items on every 5 s tick made the whole task list blink.
+    if (sameCount) {
         for (size_t i = 0; i < newRows.size(); ++i) {
             if (newRows[i] == st->lastTaskRows[i]) continue;
             st->lastTaskRows[i] = std::move(newRows[i]);
             const int row = static_cast<int>(i / kTaskListColumns);
-            const int col = static_cast<int>(i % kTaskListColumns);
             // Owner-data rows are supplied by LVN_GETDISPINFO; invalidate the changed cell.
             RECT cellRect = {};
             if (ListView_GetItemRect(st->hwndTaskList, row, &cellRect, LVIR_BOUNDS)) {
                 InvalidateRect(st->hwndTaskList, &cellRect, FALSE);
             }
-            (void)col;
-            // Widen a fit column when its new text no longer fits. Shrinking waits for a full rebuild,
-            // so this does not measure every row on every tick.
-            for (int k = 0; k < 4; ++k) {
-                if (kTaskFitCols[k] != col || st->taskFitColW[k] <= 0) continue;
-                const int need = (std::min)(
-                    ListView_GetStringWidth(st->hwndTaskList, st->lastTaskRows[i].c_str()) + 18,
-                    kTaskFitColMax[k]);
-                if (need > st->taskFitColW[k]) {
-                    st->taskFitColW[k] = need;
-                    fitColumnGrew = true;
-                }
-            }
         }
-        if (fitColumnGrew) UpdateTaskListColumnWidths(st);
-        return;
     }
     // Rebuilding the list drops the highlight, so remember every selected job and select them again.
     std::vector<std::string> keepSelectedJobs;
@@ -8598,11 +8583,13 @@ static void RefreshTaskQueueData(DashboardState* st, bool force = false, bool us
 
     st->taskJobIds = std::move(newJobIds);
     st->lastTaskRows = std::move(newRows);
-    SendMessageW(st->hwndTaskList, WM_SETREDRAW, FALSE, 0);
-    // 102-5: virtual list — the control only needs the row count; text comes from
-    // LVN_GETDISPINFO. Selection is restored by row id, so it survives data swaps.
-    ListView_SetItemCountEx(st->hwndTaskList, static_cast<int>(st->taskJobIds.size()),
-                            LVSICF_NOSCROLL);
+    if (!sameCount) {
+        SendMessageW(st->hwndTaskList, WM_SETREDRAW, FALSE, 0);
+        // 102-5: virtual list — the control only needs the row count; text comes from
+        // LVN_GETDISPINFO. Selection is restored by row id, so it survives data swaps.
+        ListView_SetItemCountEx(st->hwndTaskList, static_cast<int>(st->taskJobIds.size()),
+                                LVSICF_NOSCROLL);
+    }
     if (!keepSelectedJobs.empty()) {
         bool focused = false;
         for (int r = 0; r < static_cast<int>(st->taskJobIds.size()); ++r) {
@@ -8613,14 +8600,13 @@ static void RefreshTaskQueueData(DashboardState* st, bool force = false, bool us
             focused = true;
         }
     }
-    RECT firstRow = {};
-    int rowHeight = ListView_GetItemRect(st->hwndTaskList, 0, &firstRow, LVIR_BOUNDS) ? firstRow.bottom - firstRow.top : 0;
-    ListView_Scroll(st->hwndTaskList, keepScrollX - GetScrollPos(st->hwndTaskList, SB_HORZ),
-                    (keepTopIndex - ListView_GetTopIndex(st->hwndTaskList)) * rowHeight);
-    SendMessageW(st->hwndTaskList, WM_SETREDRAW, TRUE, 0);
-    // Widen the time columns when their text grew (or shrank by a lot). Done after redraw is back on,
-    // so the client width already leaves out a vertical scroll bar the new rows brought.
-    if (MeasureTaskFitColumns(st)) UpdateTaskListColumnWidths(st);
+    if (!sameCount) {
+        RECT firstRow = {};
+        int rowHeight = ListView_GetItemRect(st->hwndTaskList, 0, &firstRow, LVIR_BOUNDS) ? firstRow.bottom - firstRow.top : 0;
+        ListView_Scroll(st->hwndTaskList, keepScrollX - GetScrollPos(st->hwndTaskList, SB_HORZ),
+                        (keepTopIndex - ListView_GetTopIndex(st->hwndTaskList)) * rowHeight);
+        SendMessageW(st->hwndTaskList, WM_SETREDRAW, TRUE, 0);
+    }
     InvalidateRect(st->hwndTaskList, nullptr, FALSE);
 }
 
