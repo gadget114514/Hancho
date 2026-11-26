@@ -2806,9 +2806,12 @@ BEHAVIOR TREES (for LLM agents; next step depends on results):
       branch) and plannedTasks. The dashboard shows those leaves as "planned"
       rows and includes their estimates in the task remaining time; rows for
       branches the tree leaves disappear automatically.
+  bt tasks --id <id>                        List every job of the tree across branch queues
+  bt template [<name>] [--json]             Show a hang-safe BT template (list when no name)
   bt retry --id <id> [--from <node>] [--reset-counters]
   bt update --id <id> [--node <node>] (--file <path> | --bt <json> | --patch <json>)
-  bt cancel --id <id>  |  bt pause --id <id> [--paused true|false]
+  bt cancel --id <id>  |  bt remove --id <id> (alias: rm)
+  bt pause --id <id> [--paused true|false]
       Leaves: exec (one command; alias: job), agent (one task for a worker LLM; engine/model; alias: worker);
       composites: sequence, fallback, parallel, if, retry/repeat (max required),
       timeout; conditions: fileExists, fileNewer, outputMatches, exitCode,
@@ -3260,9 +3263,10 @@ void PrintCliUsageJson() {
     {
       "name": "bt",
       "description": "Behavior trees: submit a whole multi-step workflow (branches, fix loops, checks, worker LLM steps, escalations) as one JSON document; Hancho runs it and each leaf becomes an ordinary task-queue job. See agent.behavior_tree and doc/obsoleted/behavior-tree.md.",
-      "usage": "hancho-cli bt <validate|start|get|list|wait|resume|retry|update|cancel|pause> ...",
+      "usage": "hancho-cli bt <validate|template|start|get|tasks|list|wait|resume|retry|update|cancel|remove|pause> ...",
       "subcommands": [
         {"name": "validate", "usage": "hancho-cli bt validate --file <bt.json> | --bt <json>", "description": "Check a tree without running it."},
+        {"name": "template", "usage": "hancho-cli bt template [<name>] [--json]", "description": "Show a hang-safe BT template; omit the name to list them."},
         {"name": "start", "usage": "hancho-cli bt start --file <bt.json> | --bt <json> [--paused true|false] [--task <id>]", "description": "Register and start a tree. --paused true registers it paused without creating any jobs. --task attaches the tree and its jobs to an open task."},
         {"name": "wait", "usage": "hancho-cli bt wait --id <id> [--since-version <n>] [--timeout-ms <ms>]", "description": "Long-poll until the tree finishes or waits for a decision (state waitingForLlm, with the decision packet)."},
         {"name": "resume", "usage": "hancho-cli bt resume --id <id> --node <node> --answer <answer> --rationale <text> [--vars <json>]", "description": "Answer an escalate node; rationale is required."},
@@ -3272,6 +3276,7 @@ void PrintCliUsageJson() {
         {"name": "retry", "usage": "hancho-cli bt retry --id <id> [--from <node>] [--reset-counters]", "description": "Resume a failed tree from the failed leaf or the given node."},
         {"name": "update", "usage": "hancho-cli bt update --id <id> [--node <node>] --file <path> | --bt <json> | --patch <json>", "description": "Replace the definition of non-running nodes; the tree shape cannot change."},
         {"name": "cancel", "usage": "hancho-cli bt cancel --id <id>", "description": "Cancel the tree and its running jobs."},
+        {"name": "remove", "usage": "hancho-cli bt remove --id <id>", "description": "Stop the tree and remove its state and event files. Alias: rm."},
         {"name": "pause", "usage": "hancho-cli bt pause --id <id> [--paused true|false]", "description": "Stop or resume starting new leaves; running jobs continue."}
       ],
       "options": []
@@ -9142,6 +9147,7 @@ if (subcmd == "start" || subcmd == "run") {
                 << "  update    --id <id> [--node <node>] (--file <path> | --bt <json> | --patch <json>)\n"
                 << "                                                     Replace definition of non-running nodes\n"
                 << "  cancel    --id <id>                                Cancel a behavior tree and its running jobs\n"
+                << "  remove    --id <id>                                Remove a tree and its state (alias: rm)\n"
                 << "  pause     --id <id> [--paused true|false]          Pause or resume a behavior tree\n\n"
                 << "See doc/obsoleted/behavior-tree.md for the full JSON format and guide.\n";
         };
@@ -9343,7 +9349,7 @@ if (subcmd == "start" || subcmd == "run") {
             subcmd = "bt_pause";
         } else {
             return failWith("unknown bt command: " + op +
-                            " (validate, start, get, list, wait, resume, retry, update, cancel, remove, pause)");
+                            " (validate, template, start, get, tasks, list, wait, resume, retry, update, cancel, remove, pause)");
         }
         reqJson << jReq.dump();
     }
