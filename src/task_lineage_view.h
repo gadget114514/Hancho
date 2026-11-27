@@ -622,8 +622,10 @@ inline std::vector<TaskDisplayRow> BuildTaskDisplayRows(
                 d.state = ComputeImplicitTaskState(d.realJobs);
             }
             if (d.kind.empty()) d.kind = "jobs";
+            const bool hasExplicitRecord = !d.dirRecord.empty() && !d.dirRecord.value("implicit", false);
             d.hasHeading = d.isCard || (d.state == "planned") ||
                            (d.isVirtualBt && (!d.isLegacyGroup || !d.realJobs.empty())) ||
+                           hasExplicitRecord ||
                            (d.kind == "jobs" && d.realJobs.size() >= 2) ||
                            (d.kind == "bt" && d.realJobs.size() >= 2);
             dirStatesChrono.push_back(d.state);

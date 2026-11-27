@@ -170,6 +170,10 @@ The application icons are modeled on the character "Telephone Cat" (電話猫, D
 
 ## Release Notes
 
+### v0.10.2
+- **Task list tree stays intact**: explicit direction records now always keep their heading, even when the behavior tree has finished and has only one job. The task → direction → job shape remains visible; the "Running" column still shows only work that is currently running.
+- **Task list refresh fix**: changed cells are no longer blanked out after an in-place refresh. The installer setup carries the copyright line for gadget114514 and 2nek.
+
 ### v0.10.1
 - **Task list refresh**: the list no longer recreates all rows on every 5-second refresh when the row count is unchanged, and column widths are no longer reset by the refresh loop. Duplicate task numbers or ids no longer make the list clear and redraw on each tick.
 - **Routine JSON viewer**: the Routine Management dialog is wider and has a read-only, monospace BT JSON viewer on the right; the BT preview is no longer mixed into the details pane.
