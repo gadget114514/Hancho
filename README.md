@@ -177,6 +177,7 @@ The application icons are modeled on the character "Telephone Cat" (電話猫, D
 - **BT state and lineage propagate**: every BT run belongs to a task and records `supersedes` lineage. The tree's state is cached on its direction, replaced directions follow their successor, and direction/task states are recomputed on job and attempt changes. Change events are emitted only when the derived state actually changes.
 - **Task list job indentation**: job rows in the task tree use four spaces in both the dashboard and the CLI.
 - **BT working directory**: behavior trees start in the submitter's working directory.
+- **BT specification document**: `doc/bt-spec.md` documents the direction ↔ BT relationship, state derivation and propagation, node types, variables, escalation and routines.
 
 ### v0.10.1
 - **Task list refresh**: the list no longer recreates all rows on every 5-second refresh when the row count is unchanged, and column widths are no longer reset by the refresh loop. Duplicate task numbers or ids no longer make the list clear and redraw on each tick.

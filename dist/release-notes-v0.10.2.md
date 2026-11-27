@@ -8,6 +8,7 @@
 - **BT state and lineage propagate**: every BT run belongs to a task and records `supersedes` lineage. The tree's state is cached on its direction, replaced directions follow their successor, and direction/task states are recomputed on job and attempt changes. Change events are emitted only when the derived state actually changes.
 - **Task list job indentation**: job rows in the task tree use four spaces in both the dashboard and the CLI.
 - **BT working directory**: behavior trees start in the submitter's working directory.
+- **BT specification document**: `doc/bt-spec.md` documents the direction ↔ BT relationship, state derivation and propagation, node types, variables, escalation and routines.
 
 ### 変更（日本語）
 - **タスク一覧のツリー形状を維持**: 明示的な direction レコード（`implicit` の `job:` 行ではないもの）は、BT が終了してジョブが1本だけになっても見出しを残します。タスク → direction → ジョブの階層が見え続け、「実行中」列は今実行中のものだけを表示します。
@@ -17,3 +18,4 @@
 - **BT の状態と系譜が伝播します**: すべての BT 実行がタスクに属し、`supersedes` の系譜を保存します。BT の状態は direction にキャッシュされ、置き換えられた direction は後継の状態を反映します。ジョブ／attempt の変化で direction とタスクの状態を再計算し、状態が実際に変わったときだけ変更イベントを発行します。
 - **タスク一覧のジョブ行のインデント**: ダッシュボードと CLI の両方で、ジョブ行を 4 スペース字下げにしました。
 - **BT の作業ディレクトリ**: ビヘイビアツリーは投入者の作業ディレクトリで起動します。
+- **BT 仕様ドキュメント**: `doc/bt-spec.md` に direction と BT の関係、状態の導出・伝播、ノード種別、変数、escalate、routine を整理しました。
