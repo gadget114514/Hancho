@@ -232,12 +232,14 @@ hancho-cli.exe taskqueue add --file jobs.json --taskqueue main --task <taskId>
 hancho-cli.exe bt start --file plan.json --task <taskId>
 hancho-cli.exe task note <taskId> --text "Record decisions and reasons here"
 hancho-cli.exe task show <taskId> --json
+hancho-cli.exe task show <taskId> --why
 hancho-cli.exe task wait <taskId> --timeout-ms 300000
 hancho-cli.exe task close <taskId> --result succeeded --reason "..."
 ```
 
 - Before starting work, create a task with `task create`, and add `--task <taskId>` to later `taskqueue add` / `bt start` calls (MCP: `task_create` / `task_note` / `task_close`, and the `task` argument of `taskqueue_add` / `bt_start`).
 - Write decisions and reasons, such as a change of direction or research findings, in `task note` (they stay in the task's progress log even if the session ends).
+- To see **why a task is still open**, run `task show <taskId> --why`. It prints a deterministic list of blockers (`kind` / `id` / `detail`); a `task_` blocker is reported as `taskId`, otherwise `jobId`. No LLM is called. The same list is in the `why` array of `--json`, MCP `task_show` and `task_wait`. Use it before asking a supervisor LLM to interpret the situation.
 - To re-run a failed job with the **same** content, use `taskqueue retry <id>`. To redo it with **changed** content, use `taskqueue supersede <id> --reason "..."` (MCP `taskqueue_supersede`).
 - When the work is done, record the result (`succeeded` / `failed`) and the reason with `task close`.
 

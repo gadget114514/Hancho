@@ -166,6 +166,11 @@ New-Item -ItemType Junction -Path .claude\skills\hancho -Target (Resolve-Path sk
 
 ## リリースノート
 
+### v0.10.3
+- **タスクが open な理由のカード**: `task show <id> --why` とダッシュボードの「なぜ open か」ダイアログが、構造化されたブロッカー（planned/open の direction、カードの依存待ち、blocked/pending/waitingForPermit/waitingForLlm のジョブ、置き換えられた run、BT の escalate）を列挙します。LLM は呼ばず、`--json`、MCP `task_show`、`task_wait` の `why` 配列にも同じ一覧が入ります。`task_` の id は `taskId`、それ以外は `jobId` として表示します。
+- **同梱コーデックの静的ランタイム**: msgpack-c と zlib-ng を `/MT` の静的 MSVC ランタイムでビルドします（zlib-ng の追加前に設定）。VC++ 再頒布可能パッケージは不要です。
+- **ヘルプと skill の整備**: CLI と Hancho skill に `--why` と理由一覧の参照先を追記しました。
+
 ### v0.10.2
 - **タスク欄はタスク ID**: タスクキューリストの「タスク」列に、タイトルではなくタスク ID を表示します。
 - **最近のタスクは残ります**: 昨日・今日作成されたタスクとその子供は終了済みでも上限なく保持し、それ以外の終了済み行は 30 件までに制限します。

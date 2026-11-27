@@ -232,12 +232,14 @@ hancho-cli.exe taskqueue add --file jobs.json --taskqueue main --task <taskId>
 hancho-cli.exe bt start --file plan.json --task <taskId>
 hancho-cli.exe task note <taskId> --text "判断と理由をここに残す"
 hancho-cli.exe task show <taskId> --json
+hancho-cli.exe task show <taskId> --why
 hancho-cli.exe task wait <taskId> --timeout-ms 300000
 hancho-cli.exe task close <taskId> --result succeeded --reason "..."
 ```
 
 - 作業を始める前に `task create` でタスクを作り、以降の `taskqueue add` / `bt start` には `--task <taskId>` を付ける（MCP は `task_create` / `task_note` / `task_close`、`taskqueue_add` / `bt_start` の `task`）。
 - 方針の切り替えや調査結果など、判断と理由は `task note` に書く（セッションが消えてもタスクの経過ログに残る）。
+- タスクがなぜ `open` のままかは `task show <taskId> --why` で調べる。ブロッカーを `kind` / `id` / `detail` の機械的な一覧で表示し、`task_` の id は `taskId`、それ以外は `jobId` として出す（LLM は呼ばない）。同じ一覧は `--json`、MCP `task_show`、`task_wait` の `why` 配列にも入る。状況の解釈を LLM に頼む前にまずこれを見る。
 - 失敗ジョブを**同じ内容**で再実行するときは `taskqueue retry <id>`、**内容を変えて**やり直すときは `taskqueue supersede <id> --reason "..."`（MCP `taskqueue_supersede`）を使う。
 - 作業が終わったら `task close` で結果（`succeeded` / `failed`）と理由を記録する。
 

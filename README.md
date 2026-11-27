@@ -170,6 +170,11 @@ The application icons are modeled on the character "Telephone Cat" (電話猫, D
 
 ## Release Notes
 
+### v0.10.3
+- **Deterministic task-open reason card**: `task show <id> --why` and the dashboard's "Why is task open" dialog list structured blockers (planned/open directions, card dependencies, blocked/pending/waitingForPermit/waitingForLlm jobs, superseded runs and BT escalations). No LLM is called; the same `why` array is returned by `--json`, MCP `task_show` and `task_wait`. A `task_` blocker id is reported as `taskId`, otherwise as `jobId`.
+- **Static runtime for vendored codecs**: msgpack-c and zlib-ng are built with the static `/MT` MSVC runtime (set before the zlib-ng subdirectory), so the executables need no VC++ redistributable.
+- **Help and skill docs**: CLI and Hancho skills now explain `--why` and where the reason list appears.
+
 ### v0.10.2
 - **Task column shows task IDs**: the task queue list's Task column shows the task ID instead of its title.
 - **Recent tasks stay visible**: tasks created yesterday or today and their children are kept regardless of the finished-row limit; other finished rows are limited to 30.

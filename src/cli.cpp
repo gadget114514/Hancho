@@ -2781,6 +2781,8 @@ AUDIT (feedback on the supervisor's plan; preview, rule-based, no LLM call yet):
   task create --title "..." [--intent "..." | --intent-file <path>] [--id <id>] [--card-defaults <json>] [--json]
   task update <id> [--title "..."] [--intent "..." | --intent-file <path>] [--card-defaults <json>]
   task show <id> [--log-limit N] [--why] [--json]
+    --why prints deterministic blockers (kind/id/detail; taskId for task ids, otherwise jobId).
+    The same list is returned as the "why" array by --json, MCP task_show and task_wait.
   task list [--state open|running|failed|cancelled|succeeded|closed] [--limit N] [--all] [--before <cursor>] [--query <text>] [--json]
   task note <id> --text "..."
   task close <id> --result succeeded|failed --reason "..."
@@ -3246,7 +3248,7 @@ void PrintCliUsageJson() {
       "subcommands": [
         {"name": "create", "usage": "hancho-cli task create --title \"...\" [--intent \"...\" | --intent-file <path>] [--id <id>] [--card-defaults <json>] [--json]", "description": "Create a task record and return its id."},
         {"name": "update", "usage": "hancho-cli task update <id> [--title \"...\"] [--intent \"...\" | --intent-file <path>] [--card-defaults <json>]", "description": "Update a task's title, intent, or cardDefaults."},
-        {"name": "show", "usage": "hancho-cli task show <id> [--log-limit N] [--why] [--json]", "description": "Show task record, computed state, jobs and progress log. --why prints the deterministic reasons the task is still open."},
+        {"name": "show", "usage": "hancho-cli task show <id> [--log-limit N] [--why] [--json]", "description": "Show task record, computed state, jobs and progress log. --why prints the deterministic open reasons (kind/id/detail; taskId for task ids, otherwise jobId). The same list is in the 'why' array of --json, MCP task_show and task_wait; no LLM call is made."},
         {"name": "list", "usage": "hancho-cli task list [--state open|running|failed|cancelled|succeeded|closed] [--limit N] [--all] [--before <cursor>] [--query <text>] [--json]", "description": "List tasks, optionally filtered by state or query. --limit N caps finished tasks (default from config.json task_list_recent_count, 30); --all shows all."},
         {"name": "note", "usage": "hancho-cli task note <id> --text \"...\"", "description": "Append a note to the task's progress log."},
         {"name": "close", "usage": "hancho-cli task close <id> --result succeeded|failed --reason \"...\"", "description": "Close a task with result and reason."},
@@ -3255,7 +3257,7 @@ void PrintCliUsageJson() {
         {"name": "wait", "usage": "hancho-cli task wait <id> [--timeout-ms N]", "description": "Wait until all active jobs of a task finish or timeout elapses."}
       ],
       "options": [{"name": "--json", "description": "Print the raw IPC response."},
-                  {"name": "--why", "description": "With task show, print the deterministic open reasons."}]
+                  {"name": "--why", "description": "With task show, print deterministic open reasons (kind/id/detail; taskId for task ids, otherwise jobId). Also returned as the 'why' array in --json and MCP task_show."}]
     },
     {
       "name": "direction",
@@ -8053,6 +8055,7 @@ if (subcmd == "start" || subcmd == "run") {
                 << "  create  --title \"...\" [--intent \"...\" | --intent-file <path>] [--id <id>] [--card-defaults <json>]\n"
                 << "  update  <id> [--title \"...\"] [--intent \"...\" | --intent-file <path>] [--card-defaults <json>]\n"
                 << "  show    <id> [--log-limit N] [--why]\n"
+                << "    --why  deterministic open reasons (taskId/jobId); also in --json 'why' array\n"
                 << "  list    [--state open|running|failed|cancelled|succeeded|closed] [--limit N]\n"
                 << "  note    <id> --text \"...\"\n"
                 << "  close   <id> --result succeeded|failed --reason \"...\"\n"
