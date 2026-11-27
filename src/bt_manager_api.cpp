@@ -249,6 +249,8 @@ json BuildTreeResponseJson(const BehaviorTree& tree, TreeView view) {
     out["ok"] = true;
     out["id"] = tree.Id();
     if (!tree.DirectionId().empty()) out["directionId"] = tree.DirectionId();
+    if (!tree.TaskId().empty()) out["taskId"] = tree.TaskId();
+    if (!tree.SupersedesDirectionId().empty()) out["supersedes"] = tree.SupersedesDirectionId();
     out["state"] = tree.State();
     if (!tree.Detail().empty()) out["detail"] = tree.Detail();
     out["version"] = tree.Version();
@@ -324,8 +326,25 @@ std::string BtManager::Start(const std::string& jsonText, bool paused, bool tria
     std::vector<BtWarning> warnings;
     BehaviorTree::ValidateJson(jsonText, this, lintErrors, warnings);
 
+    std::string defText = jsonText;
+    auto btDef = json::parse(jsonText, nullptr, false);
+    if (btDef.is_object() && btDef.value("taskId", std::string()).empty()) {
+        const std::string btIdForTask = btDef.value("id", std::string());
+        const std::string summary = btDef.value("summary", std::string());
+        const std::string title = "BT: " + (summary.empty() ? (btIdForTask.empty() ? "run" : btIdForTask) : summary);
+        auto created = json::parse(tqm_.TaskCreate(title, summary, "",
+                                                   tqm_.BtOriginJson(btIdForTask), err), nullptr, false);
+        if (created.is_discarded() || !created.value("ok", false) ||
+            created.value("id", std::string()).empty()) {
+            return MakeErrorJson("failed to create task for BT run: " +
+                                 (err.empty() ? std::string("unknown error") : err));
+        }
+        btDef["taskId"] = created.value("id", "");
+        defText = btDef.dump();
+    }
+
     auto tree = std::make_unique<BehaviorTree>();
-    if (!tree->LoadDefinition(jsonText, this, err)) {
+    if (!tree->LoadDefinition(defText, this, err)) {
         return MakeErrorJson(err);
     }
 
@@ -350,7 +369,8 @@ std::string BtManager::Start(const std::string& jsonText, bool paused, bool tria
     std::string dirErr;
     const std::string btTitle = tree->Summary().empty() ? btId : tree->Summary();
     if (!tqm_.EnsureBtDirection(btId, tree->DirectionId(), tree->TaskId(), btTitle,
-                                tqm_.BtOriginJson(btId), dirId, dirErr, effTriage)) {
+                                tqm_.BtOriginJson(btId), dirId, dirErr, effTriage,
+                                tree->SupersedesDirectionId())) {
         return MakeErrorJson(dirErr);
     }
     tree->SetDirectionId(dirId);

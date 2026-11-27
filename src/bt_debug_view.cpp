@@ -245,6 +245,12 @@ bool ParseBtDebugTree(const std::string& jsonText, BtDebugNode& out, std::string
             ss << '/' << limits->value("maxNodeRuns", 0);
         }
     }
+    std::string taskId = Str(bt, "taskId");
+    if (!taskId.empty()) ss << "  task=" << OneLine(taskId, 40);
+    std::string directionId = Str(bt, "directionId");
+    if (!directionId.empty()) ss << "  dir=" << OneLine(directionId, 40);
+    std::string supersedes = Str(bt, "supersedes");
+    if (!supersedes.empty()) ss << "  supersedes=" << OneLine(supersedes, 40);
     std::string updated = Str(bt, "updatedAt");
     if (!updated.empty()) ss << "  " << updated;
     out.label = ss.str();

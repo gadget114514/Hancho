@@ -360,10 +360,11 @@ public:
     const std::string& Id() const { return id_; }
     const std::string& Summary() const { return summary_; }
     const std::string& Intent() const { return intent_; }
-    // Task (lineage) this BT belongs to. Empty when the BT was started without --task.
+    // Task (lineage) this BT belongs to. bt start without --task creates one automatically.
     const std::string& TaskId() const { return taskId_; }
     const std::string& DirectionId() const { return directionId_; }
     void SetDirectionId(const std::string& id) { directionId_ = id; }
+    const std::string& SupersedesDirectionId() const { return supersedes_; }
     const std::string& TaskQueueName() const { return taskqueue_; }
     const std::string& Cwd() const { return cwd_; }
     const std::string& NotifyFile() const { return notifyFile_; }
@@ -419,6 +420,7 @@ private:
     std::string intent_;
     std::string taskId_;
     std::string directionId_;
+    std::string supersedes_;
     std::string taskqueue_;
     std::string cwd_;
     std::string notifyFile_;

@@ -9204,7 +9204,8 @@ bool TaskQueueManager::EnsureBtDirection(const std::string& btId,
                                          const std::string& originJson,
                                          std::string& outDirectionId,
                                          std::string& outError,
-                                         bool triage) {
+                                         bool triage,
+                                         const std::string& supersedesDirectionId) {
     outDirectionId.clear();
     outError.clear();
     const TaskQueueOrigin origin = ParseOriginJson(originJson);
@@ -9224,7 +9225,10 @@ bool TaskQueueManager::EnsureBtDirection(const std::string& btId,
                 existing.value("kind", std::string()) == "card" ||
                 existing.value("btId", std::string()).empty();
             const bool needsTriageUpdate = !triage && existing.value("triage", true);
-            if (needsPromote || needsTriageUpdate) {
+            const bool needsSupersedes = !supersedesDirectionId.empty() &&
+                                         existing.value("supersedes", std::string()).empty();
+            if (needsPromote || needsTriageUpdate || needsSupersedes) {
+                if (needsSupersedes) existing["supersedes"] = supersedesDirectionId;
                 if (needsPromote) {
                     existing["kind"] = "bt";
                     existing["btId"] = btId;
@@ -9276,6 +9280,7 @@ bool TaskQueueManager::EnsureBtDirection(const std::string& btId,
             {"removedJobs", nlohmann::json::array()},
             {"rev", BumpRevLocked()}
         };
+        if (!supersedesDirectionId.empty()) record["supersedes"] = supersedesDirectionId;
         if (!triage) {
             record["triage"] = false;
         }
@@ -9297,6 +9302,7 @@ bool TaskQueueManager::EnsureBtDirection(const std::string& btId,
             {"removedJobs", nlohmann::json::array()},
             {"rev", BumpRevLocked()}
         };
+        if (!supersedesDirectionId.empty()) record["supersedes"] = supersedesDirectionId;
         if (!triage) {
             record["triage"] = false;
         }

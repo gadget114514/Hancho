@@ -450,6 +450,64 @@ int main() {
               "103-1: bt-dir-103-reuse succeeds");
     }
 
+    // A BT run without --task creates a task; supersedes is stored on the direction and the state.
+    {
+        TestHarness h;
+        json btDef = {
+            {"id", "bt-auto-task-lineage"},
+            {"summary", "Auto task lineage"},
+            {"root", {
+                {"type", "job"},
+                {"id", "echo"},
+                {"summary", "echo lineage"},
+                {"command", "cmd.exe /c echo lineage"},
+                {"timeoutSec", 30}
+            }}
+        };
+        json start = json::parse(h.btm->Start(btDef.dump()), nullptr, false);
+        const std::string taskId = start.value("taskId", std::string());
+        const std::string dirId = start.value("directionId", std::string());
+        Check(start.value("ok", false) && !taskId.empty() && !dirId.empty(),
+              "BT started without --task returns an auto-created taskId: " + start.dump().substr(0, 300));
+        json taskRec;
+        Check(h.tqm.TaskGet(taskId, taskRec) &&
+                  taskRec.value("title", std::string()) == "BT: Auto task lineage",
+              "auto task record exists with BT title");
+        json dirRec;
+        Check(h.tqm.DirectionGet(dirId, dirRec) &&
+                  dirRec.value("taskId", std::string()) == taskId &&
+                  dirRec.value("kind", std::string()) == "bt",
+              "BT direction stores its task id");
+        const std::string state = ReadFileUtf8Wide(BtManager::GetBtStateFileWide("bt-auto-task-lineage"));
+        Check(state.find("\"taskId\"") != std::string::npos && state.find(taskId) != std::string::npos,
+              "BT state file stores taskId");
+
+        json btDef2 = {
+            {"id", "bt-supersedes-lineage"},
+            {"summary", "Supersedes lineage"},
+            {"supersedes", dirId},
+            {"root", {
+                {"type", "job"},
+                {"id", "echo2"},
+                {"summary", "echo lineage 2"},
+                {"command", "cmd.exe /c echo lineage2"},
+                {"timeoutSec", 30}
+            }}
+        };
+        json start2 = json::parse(h.btm->Start(btDef2.dump()), nullptr, false);
+        const std::string dirId2 = start2.value("directionId", std::string());
+        Check(start2.value("ok", false) && start2.value("supersedes", std::string()) == dirId,
+              "bt start returns supersedes direction id");
+        json dirRec2;
+        Check(!dirId2.empty() && h.tqm.DirectionGet(dirId2, dirRec2) &&
+                  dirRec2.value("supersedes", std::string()) == dirId,
+              "new direction record stores supersedes");
+        const std::string state2 = ReadFileUtf8Wide(BtManager::GetBtStateFileWide("bt-supersedes-lineage"));
+        Check(state2.find("\"supersedes\"") != std::string::npos &&
+                  state2.find(dirId) != std::string::npos,
+              "BT state file stores supersedes");
+    }
+
     // 104-2: direction run, --ready, --max, dependency check, and task cardDefaults
     {
         TestHarness h;

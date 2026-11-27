@@ -3166,6 +3166,14 @@ std::string IpcServer::HandleRequestJson(const std::string& reqJson) {
                     btJson = btDef.dump();
                 }
             }
+            const std::string supersedes = JsonGetString(reqJson, "supersedes", "");
+            if (!supersedes.empty()) {
+                auto btDef = json::parse(btJson, nullptr, false);
+                if (btDef.is_object()) {
+                    btDef["supersedes"] = supersedes;
+                    btJson = btDef.dump();
+                }
+            }
             // Jobs the tree adds carry the origin of whoever started it; set it before
             // Start, which may already add the first jobs.
             if (req.contains("origin") && req["origin"].is_object()) {

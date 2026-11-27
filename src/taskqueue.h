@@ -1092,7 +1092,8 @@ public:
     bool EnsureBtDirection(const std::string& btId, const std::string& existingDirectionId,
                            const std::string& taskId, const std::string& title,
                            const std::string& originJson, std::string& outDirectionId,
-                           std::string& outError, bool triage = true);
+                           std::string& outError, bool triage = true,
+                           const std::string& supersedesDirectionId = "");
     bool DirectionGet(const std::string& id, nlohmann::json& outRecord) const;
     std::vector<nlohmann::json> DirectionAll() const;
     // 102-10: triage: false on a direction suppresses its triage card.

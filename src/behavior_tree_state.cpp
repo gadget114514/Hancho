@@ -364,6 +364,7 @@ std::string BehaviorTree::ToStateJson() const {
     if (!intent_.empty()) out["intent"] = intent_;
     if (!taskId_.empty()) out["taskId"] = taskId_;
     if (!directionId_.empty()) out["directionId"] = directionId_;
+    if (!supersedes_.empty()) out["supersedes"] = supersedes_;
     if (!taskqueue_.empty()) out["taskqueue"] = taskqueue_;
     if (!cwd_.empty()) out["cwd"] = cwd_;
     out["state"] = state_;

@@ -1386,6 +1386,7 @@ bool BehaviorTree::LoadDefinition(const std::string& jsonText,
     intent_ = doc.value("intent", std::string());
     taskId_ = doc.value("taskId", std::string());
     directionId_ = doc.value("directionId", std::string());
+    supersedes_ = doc.value("supersedes", std::string());
     taskqueue_ = doc.value("taskqueue", "bt-" + id_);
     if (taskqueue_.empty()) taskqueue_ = "bt-" + id_;
     ctx.baseQueue = taskqueue_;

@@ -9133,8 +9133,8 @@ if (subcmd == "start" || subcmd == "run") {
                 << "  validate  --file <path> | --bt <json> [--strict]\n"
                 << "                                                     Validate a BT (--strict: warnings are errors)\n"
                 << "  template  [<name>] [--json]                        Show a hang-safe BT template (list when no name)\n"
-                << "  start     --file <path> | --bt <json> [--paused true|false] [--task <id>]\n"
-                << "                                                     Register and start (--paused true: register only)\n"
+                << "  start     --file <path> | --bt <json> [--paused true|false] [--task <id>] [--supersedes <dirId>]\n"
+                << "                                                     Register and start; a missing task is created automatically\n"
                 << "  get       --id <id> [--compact]                    Get behavior tree state and node status\n"
                 << "  tasks     --id <id>                                All of the tree's jobs across branch queues\n"
                 << "  list                                               List behavior trees\n"
@@ -9178,6 +9178,7 @@ if (subcmd == "start" || subcmd == "run") {
         std::string varsRaw;
         std::string fromNode;
         std::string taskId;
+        std::string supersedes;
         bool resetCounters = false;
         bool compact = false;
         bool strict = false;
@@ -9198,6 +9199,7 @@ if (subcmd == "start" || subcmd == "run") {
             else if (a == "--vars" && i + 1 < args.size()) varsRaw = args[++i];
             else if (a == "--from" && i + 1 < args.size()) fromNode = args[++i];
             else if (a == "--task" && i + 1 < args.size()) taskId = args[++i];
+            else if (a == "--supersedes" && i + 1 < args.size()) supersedes = args[++i];
             else if (a == "--reset-counters") {
                 resetCounters = true;
                 if (i + 1 < args.size() && (args[i + 1] == "true" || args[i + 1] == "false")) {
@@ -9268,6 +9270,7 @@ if (subcmd == "start" || subcmd == "run") {
             if (op == "start") {
                 jReq["paused"] = startPaused;
                 if (!taskId.empty()) jReq["task"] = taskId;
+                if (!supersedes.empty()) jReq["supersedes"] = supersedes;
                 jReq["origin"] = nlohmann::json::parse(BuildCallerOriginJson("hancho-cli-cli", ""), nullptr, false);
             }
             subcmd = "bt_" + op;

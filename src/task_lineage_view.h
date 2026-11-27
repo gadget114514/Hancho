@@ -865,14 +865,17 @@ inline std::vector<TaskDisplayRow> BuildTaskDisplayRows(
                 }
             }
 
-            // Compute runningDetail for TaskHeading:
+            // Compute runningDetail for TaskHeading. A finished or closed task clears the column:
+            // a stale running direction must not keep showing work that is no longer active.
             std::vector<std::string> activeDirDescs;
-            for (const auto& did : dirOrder) {
-                const DirMeta& d = dirMap[did];
-                if (d.state == "running" || d.state == "waitingForLlm" || d.state == "paused") {
-                    std::string label = d.cardNumber.empty() ? (d.id.rfind("job:", 0) == 0 ? d.id.substr(4) : d.id) : d.cardNumber;
-                    if (!d.title.empty()) label += ": " + d.title;
-                    activeDirDescs.push_back(label);
+            if (!taskFinished) {
+                for (const auto& did : dirOrder) {
+                    const DirMeta& d = dirMap[did];
+                    if (d.state == "running" || d.state == "waitingForLlm" || d.state == "paused") {
+                        std::string label = d.cardNumber.empty() ? (d.id.rfind("job:", 0) == 0 ? d.id.substr(4) : d.id) : d.cardNumber;
+                        if (!d.title.empty()) label += ": " + d.title;
+                        activeDirDescs.push_back(label);
+                    }
                 }
             }
             std::string tRunningDetail;

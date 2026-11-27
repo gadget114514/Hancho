@@ -38,6 +38,10 @@ int main() {
     const BtDebugNode& bt = trees[0];
     Check(bt.key == "feature-x" && bt.type == "bt" && bt.state == "waitingForLlm", "tree row key/type/state");
     Check(bt.label.find("runs 5/200") != std::string::npos, "tree label shows runs/limit: " + bt.label);
+    Check(bt.label.find("task=task_7") != std::string::npos &&
+              bt.label.find("dir=dir_3") != std::string::npos &&
+              bt.label.find("supersedes=dir_2") != std::string::npos,
+          "tree label shows task/direction/supersedes: " + bt.label);
     Check(bt.detailJson.find("\"root\"") == std::string::npos, "tree detail omits root");
     Check(bt.children.size() == 1 && bt.children[0].key == "feature-x/root", "root node keyed by path");
 
