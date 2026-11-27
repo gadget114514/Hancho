@@ -1,6 +1,9 @@
 ## Hancho v0.10.2
 
 ### Changes
+- **Task column shows task IDs**: the task queue list's Task column shows the task ID instead of its title.
+- **Recent tasks stay visible**: tasks created yesterday or today and their children are kept regardless of the finished-row limit; other finished rows are limited to 30.
+- **IPC and BT state fixes**: an empty IPC request no longer produces invalid JSON, a completed overlapped read keeps its error state, removing a BT records the cancellation on its direction, and the task state is recomputed even when a job has no direction of its own.
 - **Task state follows the newest direction**: running work wins over an older failure, a planned recovery card shows `open`, and the task succeeds once the newest direction succeeds. Directions inside a task are listed newest first; a running task/direction no longer shows an end time but the remaining time instead.
 - **Task list countdown and column widths**: running task/direction rows show the estimate/timeout countdown (or over-budget / elapsed text), and manually sized columns stay put when the window is resized.
 - **Compact IPC responses**: the CLI and dashboard request msgpack + deflate responses and fall back to plain JSON with older cores. Brief process lists reduce the payload and the IPC read path no longer drops a chunk that completes immediately.
@@ -17,6 +20,9 @@
 - **Running Tasks KPI**: the job count was removed from the 稼働中タスク card; only the task count is shown.
 
 ### 変更（日本語）
+- **タスク欄はタスク ID**: タスクキューリストの「タスク」列に、タイトルではなくタスク ID を表示します。
+- **最近のタスクは残ります**: 昨日・今日作成されたタスクとその子供は終了済みでも上限なく保持し、それ以外の終了済み行は 30 件までに制限します。
+- **IPC と BT 状態の修正**: 空の IPC リクエストで不正な JSON にならないようにし、即座に完了した重複読み取りのエラー状態を保持します。BT 削除時に direction へキャンセル状態を記録し、ジョブに direction がなくてもタスク状態を再計算します。
 - **タスクの状態は最新の direction に従います**: 実行中があれば古い失敗より実行中を優先し、予定（planned）の救済カードがある間は `open`、最新の direction が成功すればタスクも成功になります。タスク内の direction は新しい順に並び、実行中のタスク／direction は終了時間ではなく残り時間を表示します。
 - **タスク一覧の残り時間と列幅**: 実行中の行に見積もり／タイムアウトからの残り時間（超過時は超過時間、設定がなければ経過時間）を表示します。手動で調整した列幅は画面サイズを変えてもリセットされません。
 - **IPC 応答のコンパクト化**: CLI とダッシュボードが msgpack + deflate の応答を要求し、古い core とはプレーン JSON にフォールバックします。プロセス一覧を簡略化して転送量を減らし、即座に完了する読み取りのチャンクが失われる問題も修正しました。

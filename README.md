@@ -171,6 +171,9 @@ The application icons are modeled on the character "Telephone Cat" (電話猫, D
 ## Release Notes
 
 ### v0.10.2
+- **Task column shows task IDs**: the task queue list's Task column shows the task ID instead of its title.
+- **Recent tasks stay visible**: tasks created yesterday or today and their children are kept regardless of the finished-row limit; other finished rows are limited to 30.
+- **IPC and BT state fixes**: an empty IPC request no longer produces invalid JSON, a completed overlapped read keeps its error state, removing a BT records the cancellation on its direction, and the task state is recomputed even when a job has no direction of its own.
 - **Task state follows the newest direction**: running work wins over an older failure, a planned recovery card shows `open`, and the task succeeds once the newest direction succeeds. Directions in the task list are listed newest first; a running task/direction no longer shows an end time but the remaining time instead.
 - **Task list countdown and column widths**: running task/direction rows show the estimate/timeout countdown (or the over-budget / elapsed text), and manually sized columns stay put when the list is resized.
 - **Compact IPC responses**: the CLI and dashboard request msgpack + deflate responses and fall back to plain JSON with older cores. Brief process lists reduce the payload and the IPC read path no longer drops a chunk that completes immediately.
