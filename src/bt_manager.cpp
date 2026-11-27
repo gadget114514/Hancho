@@ -466,6 +466,7 @@ void BtManager::CancelJob(const std::string& jobId) {
 void BtManager::SaveStateFileLocked(const TreeEntry& entry) {
     if (!entry.tree) return;
     WriteFileAtomicWide(GetBtStateFileWide(entry.tree->Id()), entry.tree->ToStateJson());
+    tqm_.SetDirectionBtState(entry.tree->Id(), entry.tree->State(), entry.tree->Detail());
 }
 
 void BtManager::PersistEntryLocked(TreeEntry& entry) {

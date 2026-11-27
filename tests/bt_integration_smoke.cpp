@@ -428,6 +428,17 @@ int main() {
                   listResp["jobs"][0].value("direction_id", std::string()) == btDirId,
               "103-1: BT job carries BT's direction_id");
 
+        nlohmann::json dirWithBtState;
+        Check(h.tqm.DirectionGet(btDirId, dirWithBtState) &&
+                  dirWithBtState.value("btState", std::string()) == "succeeded" &&
+                  dirWithBtState.value("state", std::string()) == "succeeded",
+              "BT state is cached and the recomputed direction state is stored");
+        Check(h.tqm.DirectionState(btDirId).value("state", std::string()) == "succeeded",
+              "direction state reflects the BT state");
+        DeleteFileW(BtManager::GetBtStateFileWide("bt-dir-103").c_str());
+        Check(h.tqm.DirectionState(btDirId).value("state", std::string()) == "succeeded",
+              "direction keeps the BT state after the state file is removed");
+
         // Reusing an explicit directionId in BT definition preserves it.
         json btDef2 = {
             {"id", "bt-dir-103-reuse"},
@@ -694,6 +705,27 @@ int main() {
         Check(failXml.find("tests=\"2\"") != std::string::npos &&
                   failXml.find("failures=\"2\"") != std::string::npos,
               "105-3: failed --bt JUnit report records both failed job and failed BT outcome");
+    }
+
+    // Direction state follows the direction that replaced it, not the cancelled/failed run it
+    // superseded (the task state must not be dragged down by an older direction).
+    {
+        TestHarness h;
+        std::string err;
+        const json tc = json::parse(h.tqm.TaskCreate("lineage task", "", "", "", err, "{}"), nullptr, false);
+        const std::string taskId = tc.value("id", std::string());
+        const json a = json::parse(h.tqm.CardAdd(taskId, "st-a", "A", "body", {}, "", "", "", err), nullptr, false);
+        const json b = json::parse(h.tqm.CardAdd(taskId, "st-b", "B", "body", {}, "", "", "", err), nullptr, false);
+        const std::string aId = a.value("directionId", std::string());
+        const std::string bId = b.value("directionId", std::string());
+        Check(!aId.empty() && !bId.empty(), "lineage: two card directions created");
+        Check(h.tqm.DirectionSetRedo(aId, bId, "retry with another model", err),
+              "lineage: redo link created");
+        Check(h.tqm.DirectionState(aId).value("state", std::string()) ==
+                  h.tqm.DirectionState(bId).value("state", std::string()),
+              "lineage: superseded direction follows its replacement's state");
+        Check(h.tqm.TaskState(taskId).value("state", std::string()) == "open",
+              "lineage: task state follows the planned head direction (open)");
     }
 
     RemoveDirRecursive(tempDirW);

@@ -13,8 +13,9 @@ namespace pc {
 // Task records (doc/task-lineage-plan.md, card 100-2a).
 //
 // A task is a Hancho record: its intent, its close decision and an append-only log of what
-// happened (<data-dir>/tasks/<id>.json and <id>.log.jsonl). The state of a task is computed from
-// its jobs and is never stored here, so the record cannot disagree with the queues.
+// happened (<data-dir>/tasks/<id>.json and <id>.log.jsonl). The authoritative state is still
+// computed from directions/jobs; `state` is refreshed on state-change events and used for display
+// and change notifications.
 //
 // Lock order: TaskQueueManager::mutex_ -> TaskStore::mutex_. TaskStore never calls back into
 // the manager.

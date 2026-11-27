@@ -10,6 +10,7 @@
 #include <vector>
 #include <deque>
 #include <map>
+#include <set>
 #include <unordered_map>
 #include <mutex>
 #include <condition_variable>
@@ -1095,6 +1096,10 @@ public:
                            std::string& outError, bool triage = true);
     bool DirectionGet(const std::string& id, nlohmann::json& outRecord) const;
     std::vector<nlohmann::json> DirectionAll() const;
+    // Cache the BT's own state on every direction bound to btId, so the direction keeps
+    // reflecting the tree even after its live group row is gone or its state file is removed.
+    void SetDirectionBtState(const std::string& btId, const std::string& btState,
+                             const std::string& btDetail);
     // 102-10: triage: false on a direction suppresses its triage card.
     bool SetDirectionTriage(const std::string& id, bool triage, std::string& outError);
     // 102-10: links a rescue direction to the direction it supersedes.
@@ -1287,12 +1292,17 @@ private:
     // Before jobs leave a queue, their ids, states and lineage are kept on the task record.
     void RecordRemovedJobsLocked(const std::vector<TaskQueueJob>& gone);
     nlohmann::json TaskStateLocked(const std::string& taskId) const;
+    nlohmann::json TaskStateLocked(const std::string& taskId, const std::string& excludeDirectionId,
+                                   std::set<std::string>& visiting) const;
     nlohmann::json DirectionStateLocked(const std::string& id) const;
+    nlohmann::json DirectionStateLocked(const std::string& id, std::set<std::string>& visiting) const;
     // Caller holds mutex_. Creates a record for an implicit "job:<id>" direction when needed.
     std::string DirectionCloseUnlocked(const std::string& id, const std::string& result,
                                        const std::string& reason, const nlohmann::json& decision,
                                        std::string& outError);
-    void MaybeLogDirectionFinishedLocked(const std::string& directionId, const std::string& taskId);
+    // Recompute on every job/attempt state change: direction first, then the task only when
+    // the direction state actually changed. Caller holds mutex_.
+    void RefreshJobStateChainLocked(const std::string& directionId, const std::string& taskId);
 
     struct ClientWatchEntry {
         std::string directionId;
