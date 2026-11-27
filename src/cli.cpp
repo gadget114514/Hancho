@@ -2289,10 +2289,13 @@ DATA DIRECTORY (per invocation):
       6. Verify: hancho-cli.exe --data-dir <path> help --json prints
          "effective_data_dir", and the dashboard status bar shows the same path.
       7. The data dir is chosen in this order: --data-dir, the HANCHO_LOG_DIR
-         environment variable, <folder of the exe>\logs. Hancho does not look for
-         .hancho by itself, so an MCP server registered for all projects without
-         --data-dir (Claude Code user scope) makes every project share
-         <install folder>\logs.
+         environment variable, .hancho in the current (project) folder,
+         <folder of the exe>\logs. A running core publishes its
+         data dir; a later CLI or dashboard without --data-dir adopts it, so a
+         headless core started by another process and a dashboard launched later
+         share the same instance. If several cores are running, pass --data-dir
+         explicitly. `hancho-cli dashboard [show|status]` asks the core to open
+         its own dashboard.
       8. Per-project registration: register the server under the same name
          "hancho" for the project; Claude Code uses the narrowest scope that has
          the name (local > project > user), so the user-scope entry stays for
@@ -2427,6 +2430,11 @@ COMMANDS:
 
   web [--print-url]
       Open the browser UI dashboard (or print URL with session token).
+
+  dashboard [show|status]   (alias: dash)
+      Ask the running core to show its desktop dashboard, or report whether it can.
+      The dashboard is launched with the core's own data directory, so it always joins
+      the same instance even when the core was started headless by another process.
 
   event emit --kind <kind> [--text <text>] [--tool <name>] [--activity <a>] [--target <t>]
              [--status <s>] [--data <json>] [--pipe <name>]
@@ -2965,6 +2973,7 @@ void PrintCliUsageJson() {
   "description": "Hancho console client. Sends commands to the running Hancho GUI dashboard over a named pipe.",
   "usage": "hancho-cli [--json] <command> [options]",
   "effective_data_dir": ")" << dataDir << R"(",
+  "dataDirSource": ")" << GetDataDirSourceName() << R"(",
   "global_options": [
     {"name": "--json", "alias": "-j", "description": "Print the raw machine-readable JSON response. May be placed before or after the command."},
     {"name": "--help", "alias": "-h", "description": "Show usage. Combine with --json to get this machine-readable help."},
@@ -3118,6 +3127,15 @@ void PrintCliUsageJson() {
       "options": [
         {"name": "--once", "description": "Print one snapshot and exit."},
         {"name": "--interval", "value": "<ms>", "description": "Refresh interval in milliseconds (default: 1000)."}
+      ]
+    },
+    {
+      "name": "dashboard",
+      "description": "Ask the running core to show its desktop dashboard, or report whether it can. The dashboard uses the core's own data directory, so a headless core started by another process and a dashboard opened later stay on the same instance.",
+      "usage": "hancho-cli dashboard [show|status]",
+      "options": [
+        {"name": "show", "description": "Show (or bring to front) the core's dashboard. Default."},
+        {"name": "status", "description": "Report whether a dashboard can be shown by the core."}
       ]
     },
     {
@@ -3552,7 +3570,7 @@ void PrintCliUsageJson() {
           }
         }
       },
-      "tools": ["start_process", "list_processes", "get_process_output", "send_process_input", "wait_process", "kill_process", "run_agent", "wait_agent", "get_agent_stream", "get_agent_state", "update_agent_info", "task_create", "task_show", "task_list", "task_note", "task_close", "task_reopen", "task_purge", "task_wait", "direction_add", "direction_show", "direction_list", "direction_edit", "direction_remove", "direction_run", "direction_redo", "direction_import", "direction_export", "direction_translate", "direction_close", "direction_reopen", "direction_purge", "taskqueue_add", "taskqueue_list", "taskqueue_get", "taskqueue_retry", "taskqueue_supersede", "taskqueue_update", "taskqueue_cancel", "taskqueue_takeover", "taskqueue_complete", "taskqueue_pause", "taskqueue_resume", "taskqueue_pause_job", "taskqueue_resume_job", "taskqueue_wait", "taskqueue_purge", "taskqueue_link", "taskqueue_unlink", "taskqueue_graph", "bt_validate", "bt_start", "bt_get", "bt_list", "bt_wait", "bt_resume", "bt_retry", "bt_update", "bt_cancel", "bt_pause", "bt_template", "routine_list", "routine_show", "routine_run", "routine_save", "routine_check", "routine_ask", "routine_approve", "routine_reject", "power_suspend", "power_shutdown", "power_cancel", "power_status", "chat_status", "chat_peers", "chat_refresh", "chat_send", "chat_get", "chat_inbox", "chat_wait", "chat_read", "chat_download", "chat_log", "chat_handler", "memory_search", "memory_get", "memory_brief", "memory_stats", "memory_note", "memory_retract", "memory_approve", "usage_stats", "usage_export", "agent_health"]
+      "tools": ["start_process", "list_processes", "get_process_output", "send_process_input", "wait_process", "kill_process", "run_agent", "wait_agent", "get_agent_stream", "get_agent_state", "update_agent_info", "task_create", "task_show", "task_list", "task_note", "task_close", "task_reopen", "task_purge", "task_wait", "direction_add", "direction_show", "direction_list", "direction_edit", "direction_remove", "direction_run", "direction_redo", "direction_import", "direction_export", "direction_translate", "direction_close", "direction_reopen", "direction_purge", "taskqueue_add", "taskqueue_list", "taskqueue_get", "taskqueue_retry", "taskqueue_supersede", "taskqueue_update", "taskqueue_cancel", "taskqueue_takeover", "taskqueue_complete", "taskqueue_pause", "taskqueue_resume", "taskqueue_pause_job", "taskqueue_resume_job", "taskqueue_wait", "taskqueue_purge", "taskqueue_link", "taskqueue_unlink", "taskqueue_graph", "bt_validate", "bt_start", "bt_get", "bt_list", "bt_wait", "bt_resume", "bt_retry", "bt_update", "bt_cancel", "bt_pause", "bt_template", "routine_list", "routine_show", "routine_run", "routine_save", "routine_check", "routine_ask", "routine_approve", "routine_reject", "power_suspend", "power_shutdown", "power_cancel", "power_status", "chat_status", "chat_peers", "chat_refresh", "chat_send", "chat_get", "chat_inbox", "chat_wait", "chat_read", "chat_download", "chat_log", "chat_handler", "memory_search", "memory_get", "memory_brief", "memory_stats", "memory_note", "memory_retract", "memory_approve", "usage_stats", "usage_export", "agent_health", "dashboard_show", "dashboard_status"]
     }
   },
   "leaving": {
@@ -3737,10 +3755,10 @@ void PrintCliUsageJson() {
         "Pass the same --data-dir on every direct hancho-cli invocation.",
         "Relative paths resolve against the caller's current directory (MCP clients normally start the server in the project root). Keep the relative .hancho in a config that goes into git (.mcp.json); use an absolute path only in a per-machine config (Claude Code local scope).",
         "Different data directories are isolated: each has its own dashboard instance, Named Pipe and mutex, and they never share processes or queues.",
-        "The data dir is chosen in this order: --data-dir, the HANCHO_LOG_DIR environment variable, <folder of the exe>\\logs. Hancho does not look for .hancho by itself, so an MCP server registered for all projects without --data-dir (Claude Code user scope) makes every project share <install folder>\\logs.",
+        "The data dir is chosen in this order: --data-dir, the HANCHO_LOG_DIR environment variable, .hancho in the current (project) folder, <folder of the exe>\\logs. A running core publishes its data dir and a later CLI or dashboard without --data-dir adopts it, so a headless core and a dashboard launched afterwards share the same instance. If several cores are running, pass --data-dir explicitly.",
         "Per-project registration: register the server under the same name 'hancho' for the project. Claude Code uses the narrowest scope that has the name (local > project > user). Project scope: hancho-cli.exe mcp install --client claude --data-dir .hancho (writes .mcp.json). Local scope: claude mcp add hancho --scope local -- <Hancho.exe> mcp --data-dir <abs path>. Restart the agent session afterwards; jobs in the old data dir are not moved."
       ],
-    "verify": "hancho-cli.exe --data-dir <path> help --json returns effective_data_dir; the dashboard status bar shows the same path.",
+    "verify": "hancho-cli.exe --data-dir <path> help --json returns effective_data_dir and dataDirSource (explicit/env/project/default); the dashboard title shows the same path. 'hancho-cli dashboard status' reports whether the running core can show its dashboard.",
     "llm_stream": {
       "help": "Run 'hancho-cli help --json' and look under agent.llm_stream_setup for instructions to enable JSONL streaming and view the stream window."
     }
@@ -7366,6 +7384,30 @@ static int RunWorkerHealthCommand(const std::vector<std::string>& args, bool jso
     return 0;
 }
 
+static int RunDashboardCommand(const std::vector<std::string>& args, bool jsonOutput) {
+    std::string action = "gui_show";
+    if (args.size() >= 3) {
+        const std::string op = args[2];
+        if (op == "status") action = "gui_status";
+        else if (op != "show" && op != "open") {
+            if (jsonOutput) {
+                std::cout << "{\"ok\":false,\"error\":\"unknown dashboard command: "
+                          << JsonEscape(op) << "\"}\n";
+            } else {
+                std::cerr << "Unknown dashboard command: " << op << "\n";
+            }
+            return 1;
+        }
+    }
+    std::string resp, err;
+    if (!SendIpcRequest("{\"action\":\"" + action + "\"}", resp, err, true)) {
+        if (jsonOutput) std::cout << BuildTransportError(err) << "\n";
+        else std::cerr << "Error: " << err << "\n";
+        return 1;
+    }
+    return PrintResponse("dashboard", resp, jsonOutput, 0, false);
+}
+
 int RunCli(const std::vector<std::string>& rawArgs) {
     std::vector<std::string> args;
     args.push_back(rawArgs.empty() ? "hancho-cli" : rawArgs[0]);
@@ -7425,8 +7467,17 @@ int RunCli(const std::vector<std::string>& rawArgs) {
         DisplayLangSetting() = ResolveDisplayLang(std::string());
         DisplayLangExplicit() = false;
     }
+    const bool projectDataDirDetected = std::string(GetDataDirSourceName()) == "project";
     if (!dataDirArg.empty()) {
         SetDataDirectoryOverride(Utf8ToWide(dataDirArg));
+    } else {
+        std::string adoptWarning;
+        AdoptActiveCoreDataDir(adoptWarning);
+        if (!adoptWarning.empty()) std::cerr << "[Hancho] " << adoptWarning << "\n";
+        if (!jsonOutput && projectDataDirDetected && GetDataDirectoryOverride().empty()) {
+            std::cerr << "[Hancho] using project data dir: "
+                      << WideToUtf8(GetEffectiveDataDirectoryWide()) << "\n";
+        }
     }
 #ifdef HANCHO_DEMO_BUILD
     if (demoEnabled || IsDemoMode()) {
@@ -7497,6 +7548,7 @@ int RunCli(const std::vector<std::string>& rawArgs) {
     if (subcmd == "llm") return RunLlmCommand(args, jsonOutput);
     if (subcmd == "permit") return RunPermitCommand(args, jsonOutput);
     if (subcmd == "web" || subcmd == "ui") return RunWebCommand(args, jsonOutput);
+    if (subcmd == "dashboard" || subcmd == "dash") return RunDashboardCommand(args, jsonOutput);
     if (subcmd == "hosts") return RunHostsCommand(args, jsonOutput);
     if (subcmd == "usage") return RunUsageCommand(args, 2, jsonOutput);
     if (subcmd == "power") return RunPowerCommand(args, jsonOutput);

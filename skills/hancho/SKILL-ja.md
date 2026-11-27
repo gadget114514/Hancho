@@ -160,7 +160,7 @@ hancho-cli.exe power status
 - **作業はタスクとカードでまとめる。** 大きな依頼は `task create` → カードを `direction add`（または `direction import`）→ `direction run --ready` → 終わったら次の `--ready` の順で進める。判断と理由は `task note <id> --text "..."` に書き、カードを 1 本の BT に詰めない（失敗したカードは `direction redo` で救済する）。終わったら `task close <id> --result succeeded|failed --reason "..."` で閉じる。単発のジョブや BT も `--task <id>` でタスクに付け、内容を変えたやり直しは `taskqueue supersede <jobId> --reason "..."` を使う。
 - **「タスクをはじめて」と言われたら、まずタスクを作ってから投入する。task なしの投入は禁止。** `task create --title "..." --intent "..."` で id を取り、`routine run <name> --task <id>` / `bt start --file <bt> --task <id>` / `taskqueue add --file <jobs> --task <id>`（MCP は `task`）ですべての投入にその id を付ける。`taskqueue add` を `--task` なしで呼ぶと暗黙タスクになり、タスクレコードも direction も作られず、一覧の種別は「ジョブ」と表示される。終わったら `task close <id> --result succeeded|failed --reason "..."` で閉じる。
 - **モデル / provider を勝手に変えない。** `taskqueue update` で `--model` を変えるには `--approve-model-change --reason "..."` が必要。監督は変更せず、カードを判断待ちに残す。
-- **data-dir を1つに固定する。** 例: `<project>/.hancho`。毎回 `--data-dir` を付けるか、`hancho-cli.exe mcp install --data-dir .hancho` で埋め込む。
+- **data-dir を1つに固定する。** 例: `<project>/.hancho`。毎回 `--data-dir` を付けるか、`hancho-cli.exe mcp install --data-dir .hancho` で埋め込む。`--data-dir` と `HANCHO_LOG_DIR` が無い場合は、カレント（プロジェクト）フォルダの `.hancho` だけを使う。親フォルダは遡らない。稼働中の core は自分の data-dir を公開し、後から起きた CLI やダッシュボードがそれを採用する。LLM が headless で起動した core と、後で開いたダッシュボードは同じインスタンスにつながる。`hancho-cli dashboard [show|status]` で core にダッシュボードを表示させられる。複数の core が動いているときは `--data-dir` を明示する。
 
 ## ワーカーが失敗・ハングしたとき
 
@@ -475,7 +475,7 @@ hancho-cli.exe mcp install --client opencode   # claude なら --client claude
 hancho-cli.exe mcp install --data-dir .hancho --dry-run --json
 ```
 
-data-dir は `--data-dir` → 環境変数 `HANCHO_LOG_DIR` → `<exe のフォルダ>\logs` の順に決まる。カレントの `.hancho` は自動では使わない。MCP を全プロジェクト向け（Claude Code の user スコープ）に `--data-dir` なしで登録すると、全プロジェクトが `<インストール先>\logs` を共有する。
+data-dir は `--data-dir` → 環境変数 `HANCHO_LOG_DIR` → カレント（プロジェクト）フォルダの `.hancho` のみ（親は遡らない） → `<exe のフォルダ>\logs` の順に決まる。稼働中の core は data-dir を公開し、後から起きた CLI やダッシュボードが `--data-dir` なしでそれを採用する。そのため別プロセスが headless で起動した core でも、後から開いたダッシュボードとプロセス／ジョブが見え続ける。`hancho-cli dashboard [show|status]` は core にその core の data-dir でダッシュボードを表示させる。複数の core が稼働中なら `--data-dir` を明示する。
 
 - プロジェクトごとに分けるには、同じ名前 `hancho` をそのプロジェクトに登録する。Claude Code は local > project > user の順で狭いスコープを優先する。
   - project スコープ: `hancho-cli.exe mcp install --client claude --data-dir .hancho`（カレントの `.mcp.json` に書く）
@@ -483,7 +483,7 @@ data-dir は `--data-dir` → 環境変数 `HANCHO_LOG_DIR` → `<exe のフォ�
 - git に入る `.mcp.json` では相対パスの `.hancho` のままにする（どこに clone しても使える）。相対パスはサーバーの起動フォルダ（ふつうはプロジェクトのルート）から解決されるので、エージェントはルートで起動する。絶対パスは git に入らない local スコープでだけ使う。`.hancho/` は git に入れない（`routines/` だけ残すなら `.hancho/*` と `!.hancho/routines/`）。登録を変えたらセッションを開き直す。
 - data-dir が違えば別の Hancho（キュー、BT、履歴、ダッシュボードが別）。実行中の BT やジョブがある間は切り替えない。今どこを使っているかはダッシュボードのタイトル（`Hancho - <data-dir>`）でわかる。
 
-主なツール: `start_process`、`list_processes`、`get_process_output`、`wait_process`、`send_process_input`、`kill_process`、`task_*`、`direction_*`、`taskqueue_*`、`bt_*`、`run_agent` / `wait_agent`（別名: `run_worker` / `wait_worker`）、`triage_list/get/decide`、`power_suspend/shutdown/cancel/status`、`memory_*`、`usage_*`、`chat_*`。
+主なツール: `start_process`、`list_processes`、`get_process_output`、`wait_process`、`send_process_input`、`kill_process`、`task_*`、`direction_*`、`taskqueue_*`、`bt_*`、`run_agent` / `wait_agent`（別名: `run_worker` / `wait_worker`）、`triage_list/get/decide`、`power_suspend/shutdown/cancel/status`、`memory_*`、`usage_*`、`chat_*`、`dashboard_show` / `dashboard_status`。
 
 ## よくある失敗
 

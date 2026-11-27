@@ -9,6 +9,9 @@
 - **Task list job indentation**: job rows in the task tree use four spaces in both the dashboard and the CLI.
 - **BT working directory**: behavior trees start in the submitter's working directory.
 - **BT specification document**: `doc/bt-spec.md` documents the direction ↔ BT relationship, state derivation and propagation, node types, variables, escalation and routines.
+- **Dashboard / data-dir alignment**: a running core publishes its data directory and a later CLI or dashboard adopts it, so a headless core started by another process stays visible. `.hancho` is used only when it exists in the current project folder; parent folders are not searched.
+- **`hancho-cli dashboard [show|status]`**: asks the running core to show its desktop dashboard using the core's own data directory.
+- **Running Tasks KPI**: the job count was removed from the 稼働中タスク card; only the task count is shown.
 
 ### 変更（日本語）
 - **タスク一覧のツリー形状を維持**: 明示的な direction レコード（`implicit` の `job:` 行ではないもの）は、BT が終了してジョブが1本だけになっても見出しを残します。タスク → direction → ジョブの階層が見え続け、「実行中」列は今実行中のものだけを表示します。
@@ -19,3 +22,6 @@
 - **タスク一覧のジョブ行のインデント**: ダッシュボードと CLI の両方で、ジョブ行を 4 スペース字下げにしました。
 - **BT の作業ディレクトリ**: ビヘイビアツリーは投入者の作業ディレクトリで起動します。
 - **BT 仕様ドキュメント**: `doc/bt-spec.md` に direction と BT の関係、状態の導出・伝播、ノード種別、変数、escalate、routine を整理しました。
+- **ダッシュボードと data-dir のすりあわせ**: 稼働中の core が data-dir を公開し、後から起きた CLI / ダッシュボードが採用します。別プロセスが headless 起動した core でも見え続けます。`.hancho` はカレントのプロジェクトフォルダだけを探し、親フォルダは遡りません。
+- **`hancho-cli dashboard [show|status]`**: 稼働中の core に、その core の data-dir でダッシュボードを表示させます。
+- **稼働中タスク KPI**: ジョブ数を廃止し、タスク数だけを表示します。

@@ -160,7 +160,7 @@ When registering a job you can also add `"suspendWhenDone": true` / `"shutdownWh
 - **Group work into tasks and cards.** For a large request: `task create` → add cards with `direction add` (or `direction import`) → `direction run --ready` → after each finishes, the next `--ready`. Record decisions and reasons with `task note <id> --text "..."`, and do not pack cards into one BT (a failed card can be rescued with `direction redo`). When finished, close with `task close <id> --result succeeded|failed --reason "..."`. Attach single jobs and BTs to a task with `--task <id>`, and for a redo with changed content use `taskqueue supersede <jobId> --reason "..."`.
 - **When asked to "start a task", create the task first and then submit. Never submit without a task.** Get an id with `task create --title "..." --intent "..."`, then attach it to every submission: `routine run <name> --task <id>`, `bt start --file <bt> --task <id>`, `taskqueue add --file <jobs> --task <id>` (MCP: `task`). Calling `taskqueue add` without `--task` creates an implicit task: no task record, no direction, and the list shows the rows as "Job". Finish with `task close <id> --result succeeded|failed --reason "..."`.
 - **Do not change the model / provider on your own.** To change `--model` with `taskqueue update`, `--approve-model-change --reason "..."` is required. The supervisor does not change it; it leaves the card waiting for a decision.
-- **Fix one data-dir.** For example, `<project>/.hancho`. Pass `--data-dir` every time, or embed it with `hancho-cli.exe mcp install --data-dir .hancho`.
+- **Fix one data-dir.** For example, `<project>/.hancho`. Pass `--data-dir` every time, or embed it with `hancho-cli.exe mcp install --data-dir .hancho`. Without an explicit `--data-dir` or `HANCHO_LOG_DIR`, Hancho uses `.hancho` in the current (project) folder only; parent folders are not searched. A running core publishes its data directory; a later CLI or dashboard adopts it, so a headless core started by an LLM and a dashboard opened later stay on the same instance. Use `hancho-cli dashboard [show|status]` to ask the core to open its own dashboard; when several cores are running, pass `--data-dir` explicitly.
 
 ## When a worker fails or hangs
 
@@ -475,7 +475,7 @@ hancho-cli.exe mcp install --client opencode   # for claude, use --client claude
 hancho-cli.exe mcp install --data-dir .hancho --dry-run --json
 ```
 
-The data-dir is chosen in this order: `--data-dir` → environment variable `HANCHO_LOG_DIR` → `<exe folder>\logs`. The `.hancho` in the current folder is not used automatically. If the MCP is registered for all projects (Claude Code user scope) without `--data-dir`, all projects share `<install folder>\logs`.
+The data-dir is chosen in this order: `--data-dir` → environment variable `HANCHO_LOG_DIR` → `.hancho` in the current (project) folder only (parents are not searched) → `<exe folder>\logs`. A running core publishes its data directory and a later CLI or dashboard adopts it, so processes and jobs stay visible even if the core was started headless by another process. `hancho-cli dashboard [show|status]` asks the core to show its dashboard with the core's own data directory. When several cores are live, pass `--data-dir` explicitly.
 
 - To separate per project, register the same name `hancho` for that project. Claude Code gives priority to the narrower scope in the order local > project > user.
   - project scope: `hancho-cli.exe mcp install --client claude --data-dir .hancho` (writes to the `.mcp.json` in the current folder)
@@ -483,7 +483,7 @@ The data-dir is chosen in this order: `--data-dir` → environment variable `HAN
 - In a `.mcp.json` that goes into git, keep the relative path `.hancho` (so it works wherever it is cloned). A relative path is resolved from the server's start folder (usually the project root), so start the agent from the root. Absolute paths do not go into git; use them only in the local scope, which is not committed. Do not commit `.hancho/` to git (to keep only `routines/`, use `.hancho/*` and `!.hancho/routines/`). After changing the registration, reopen the session.
 - Different data-dirs mean different Hancho instances (separate queues, BTs, history, and dashboards). Do not switch while a BT or job is running. The data-dir in use is shown in the dashboard title (`Hancho - <data-dir>`).
 
-Main tools: `start_process`, `list_processes`, `get_process_output`, `wait_process`, `send_process_input`, `kill_process`, `task_*`, `direction_*`, `taskqueue_*`, `bt_*`, `run_agent` / `wait_agent` (aliases: `run_worker` / `wait_worker`), `triage_list/get/decide`, `power_suspend/shutdown/cancel/status`, `memory_*`, `usage_*`, `chat_*`.
+Main tools: `start_process`, `list_processes`, `get_process_output`, `wait_process`, `send_process_input`, `kill_process`, `task_*`, `direction_*`, `taskqueue_*`, `bt_*`, `run_agent` / `wait_agent` (aliases: `run_worker` / `wait_worker`), `triage_list/get/decide`, `power_suspend/shutdown/cancel/status`, `memory_*`, `usage_*`, `chat_*`, `dashboard_show` / `dashboard_status`.
 
 ## Common mistakes
 

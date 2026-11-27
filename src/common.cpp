@@ -16,6 +16,7 @@
 #include <chrono>
 #include <cstdlib>
 #include <mutex>
+#include <set>
 
 namespace pc {
 
@@ -647,15 +648,60 @@ std::wstring GetDefaultLogsDirectoryWide() {
     return logsDir;
 }
 
+namespace {
+
+enum class DataDirSource { Default, Env, Project, Explicit };
+DataDirSource g_dataDirSource = DataDirSource::Default;
+bool g_projectDirChecked = false;
+std::wstring g_projectDir;
+
+std::wstring DetectProjectDataDir() {
+    if (g_projectDirChecked) return g_projectDir;
+    g_projectDirChecked = true;
+    wchar_t buf[MAX_PATH] = {};
+    DWORD n = GetCurrentDirectoryW(MAX_PATH, buf);
+    if (n == 0 || n >= MAX_PATH) return g_projectDir;
+    // Only the current (project) folder counts. Walking up would silently pick up a
+    // parent project's .hancho when running from a subfolder of an unrelated project.
+    const std::wstring cand = PathJoinWide(std::wstring(buf), L".hancho");
+    const DWORD attr = GetFileAttributesW(cand.c_str());
+    if (attr != INVALID_FILE_ATTRIBUTES && (attr & FILE_ATTRIBUTE_DIRECTORY)) {
+        g_projectDir = ResolveAbsolutePathWide(cand);
+    }
+    return g_projectDir;
+}
+
+} // namespace
+
 std::wstring GetEffectiveDataDirectoryWide() {
-    if (!g_dataDirOverride.empty()) return g_dataDirOverride;
+    if (!g_dataDirOverride.empty()) {
+        g_dataDirSource = DataDirSource::Explicit;
+        return g_dataDirOverride;
+    }
 
     wchar_t envBuf[MAX_PATH] = {};
     DWORD envLen = GetEnvironmentVariableW(L"HANCHO_LOG_DIR", envBuf, MAX_PATH);
     if (envLen > 0 && envLen < MAX_PATH) {
+        g_dataDirSource = DataDirSource::Env;
         return ResolveAbsolutePathWide(envBuf);
     }
+    const std::wstring projectDir = DetectProjectDataDir();
+    if (!projectDir.empty()) {
+        g_dataDirSource = DataDirSource::Project;
+        return projectDir;
+    }
+    g_dataDirSource = DataDirSource::Default;
     return GetDefaultLogsDirectoryWide();
+}
+
+const char* GetDataDirSourceName() {
+    GetEffectiveDataDirectoryWide();
+    switch (g_dataDirSource) {
+    case DataDirSource::Explicit: return "explicit";
+    case DataDirSource::Env: return "env";
+    case DataDirSource::Project: return "project";
+    default: return "default";
+    }
 }
 
 static std::wstring NormalizeDashboardTitle(const std::wstring& s) {
@@ -685,7 +731,10 @@ bool DashboardTitleMatches(const std::wstring& title, const std::wstring& dataDi
 bool HasCustomDataDirectory() {
     if (!g_dataDirOverride.empty()) return true;
     wchar_t buf[2] = {};
-    return GetEnvironmentVariableW(L"HANCHO_LOG_DIR", buf, 2) > 0;
+    if (GetEnvironmentVariableW(L"HANCHO_LOG_DIR", buf, 2) > 0) return true;
+    // An auto-detected project .hancho is just as custom as an explicit --data-dir: the
+    // pipe and mutex names must match those of a core that chose the same directory.
+    return !DetectProjectDataDir().empty();
 }
 
 std::wstring GetLogsDirectoryWide() {
@@ -717,6 +766,88 @@ std::wstring GetPipeNameWide() {
 std::wstring GetGuiMutexNameWide() {
     if (!HasCustomDataDirectory()) return kMutexName;
     return std::wstring(L"Local\\Hancho_GUI_Mutex_v1_") + DataDirectoryTag();
+}
+
+namespace {
+
+std::wstring ActiveCoresDirectory() {
+    wchar_t buf[MAX_PATH] = {};
+    const DWORD n = GetEnvironmentVariableW(L"LOCALAPPDATA", buf, MAX_PATH);
+    const std::wstring root = (n > 0 && n < MAX_PATH) ? std::wstring(buf)
+                                                      : GetDefaultLogsDirectoryWide();
+    return PathJoinWide(root, L"Hancho\\active-cores");
+}
+
+std::wstring ActiveCoreFile(const std::wstring& tag) {
+    return PathJoinWide(ActiveCoresDirectory(), L"core-" + tag + L".json");
+}
+
+bool ProcessIsAlive(DWORD pid) {
+    if (pid == 0) return false;
+    HANDLE h = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, FALSE, pid);
+    if (!h) return false;
+    DWORD code = 0;
+    const bool alive = GetExitCodeProcess(h, &code) != 0 && code == STILL_ACTIVE;
+    CloseHandle(h);
+    return alive;
+}
+
+} // namespace
+
+void RegisterActiveCore() {
+    const std::wstring dir = ActiveCoresDirectory();
+    std::error_code ec;
+    std::filesystem::create_directories(std::filesystem::path(dir), ec);
+    if (ec) return;
+    const std::wstring tag = DataDirectoryTag();
+    const nlohmann::json record = {
+        {"dataDir", WideToUtf8(GetEffectiveDataDirectoryWide())},
+        {"pid", static_cast<uint64_t>(GetCurrentProcessId())},
+        {"pipe", WideToUtf8(GetPipeNameWide())},
+        {"source", GetDataDirSourceName()},
+        {"startedAt", GetCurrentTimestampStr()}
+    };
+    WriteFileAtomicWide(ActiveCoreFile(tag), record.dump(2));
+}
+
+void UnregisterActiveCore() {
+    std::error_code ec;
+    std::filesystem::remove(std::filesystem::path(ActiveCoreFile(DataDirectoryTag())), ec);
+}
+
+bool AdoptActiveCoreDataDir(std::string& outWarning) {
+    outWarning.clear();
+    if (!g_dataDirOverride.empty()) return false;
+    wchar_t buf[2] = {};
+    if (GetEnvironmentVariableW(L"HANCHO_LOG_DIR", buf, 2) > 0) return false;
+
+    const std::wstring dir = ActiveCoresDirectory();
+    std::vector<std::wstring> found;
+    std::set<std::string> dirs;
+    for (const auto& path : ListDirectoryWide(dir, L"core-*.json")) {
+        const nlohmann::json doc = nlohmann::json::parse(ReadFileUtf8Wide(path), nullptr, false);
+        if (!doc.is_object()) {
+            std::error_code ec;
+            std::filesystem::remove(std::filesystem::path(path), ec);
+            continue;
+        }
+        const DWORD pid = static_cast<DWORD>(doc.value("pid", static_cast<uint64_t>(0)));
+        if (!ProcessIsAlive(pid)) {
+            std::error_code ec;
+            std::filesystem::remove(std::filesystem::path(path), ec);
+            continue;
+        }
+        const std::string dataDir = doc.value("dataDir", std::string());
+        if (!dataDir.empty()) dirs.insert(dataDir);
+        found.push_back(path);
+    }
+    if (dirs.empty()) return false;
+    if (dirs.size() > 1) {
+        outWarning = "multiple Hancho cores are running; pass --data-dir explicitly";
+        return false;
+    }
+    SetDataDirectoryOverride(Utf8ToWide(*dirs.begin()));
+    return true;
 }
 
 std::string GetLogsDirectoryUtf8() {

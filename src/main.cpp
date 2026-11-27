@@ -79,6 +79,9 @@ OPTIONS (per launch):
                       Equivalent environment variable: HANCHO_LOG_DIR.
                       Consistency: pass the same --data-dir on every call, or embed
                       it once with `hancho-cli.exe mcp install --data-dir <path>`.
+                      Without --data-dir/env, .hancho in the current folder is used, then a
+                      running core's data dir is adopted. `hancho-cli dashboard`
+                      asks that core to show its own dashboard.
                        Different data dirs are isolated dashboard instances.
 
 
@@ -573,6 +576,7 @@ static int RunCoreHost(platform::IInstanceLock* instanceLock, bool showGuiAtStar
 
             translations.Start();
             ipc.Start();
+            RegisterActiveCore();
             if (showGuiAtStart) CoreHostShowGui(&ctx);
 
             MSG msg;
@@ -610,6 +614,7 @@ static int RunCoreHost(platform::IInstanceLock* instanceLock, bool showGuiAtStar
             ipc.SetShutdownCallback(nullptr);
             ipc.SetPowerCallback(nullptr);
             ipc.Stop();
+            UnregisterActiveCore();
             SetActiveTranslationStore(nullptr);
             translations.Stop();
             pm.SetProcessFinishedCallback(nullptr);
@@ -865,6 +870,10 @@ int main() {
     args.swap(filtered);
     if (!dataDirArg.empty()) {
         SetDataDirectoryOverride(Utf8ToWide(dataDirArg));
+    } else {
+        std::string adoptWarning;
+        AdoptActiveCoreDataDir(adoptWarning);
+        if (!adoptWarning.empty()) std::cerr << "[Hancho] " << adoptWarning << "\n";
     }
 #ifdef HANCHO_DEMO_BUILD
     if (demoEnabled || IsDemoMode()) {

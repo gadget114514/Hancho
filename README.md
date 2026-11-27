@@ -178,6 +178,9 @@ The application icons are modeled on the character "Telephone Cat" (電話猫, D
 - **Task list job indentation**: job rows in the task tree use four spaces in both the dashboard and the CLI.
 - **BT working directory**: behavior trees start in the submitter's working directory.
 - **BT specification document**: `doc/bt-spec.md` documents the direction ↔ BT relationship, state derivation and propagation, node types, variables, escalation and routines.
+- **Dashboard / data-dir alignment**: a running core publishes its data directory and a later CLI or dashboard adopts it, so a headless core started by another process stays visible. `.hancho` is used only when it exists in the current project folder; parent folders are not searched.
+- **`hancho-cli dashboard [show|status]`**: asks the running core to show its desktop dashboard using the core's own data directory.
+- **Running Tasks KPI**: the job count was removed from the 稼働中タスク card; only the task count is shown.
 
 ### v0.10.1
 - **Task list refresh**: the list no longer recreates all rows on every 5-second refresh when the row count is unchanged, and column widths are no longer reset by the refresh loop. Duplicate task numbers or ids no longer make the list clear and redraw on each tick.

@@ -3217,11 +3217,9 @@ static void DrawDashboardCanvas(DashboardState* st, HDC hdcWindow, const RECT* u
                     DrawKpiCard(hdc, rcCard, Tr(L"タスク総数", L"TOTAL TASKS", L"TAREAS TOTALES"),
                                 std::to_wstring(tc.totalTasks), KpiAccent(0), st->hFontUiBold, st->hFontKpiVal);
                 } else if (col == 1) {
-                    std::wstring sub = (tc.runningJobs > 0)
-                        ? (Tr(L"ジョブ ", L"jobs ", L"trabajos ") + std::to_wstring(tc.runningJobs)) : L"";
                     DrawKpiCard(hdc, rcCard, Tr(L"稼働中タスク", L"RUNNING TASKS", L"TAREAS EN EJECUCIÓN"),
                                 std::to_wstring(tc.runningTasks), KpiAccent(1), st->hFontUiBold, st->hFontKpiVal,
-                                (tc.runningTasks > 0 ? g_kpiBarPhase : -1.0f), sub);
+                                (tc.runningTasks > 0 ? g_kpiBarPhase : -1.0f));
                 } else if (col == 2) {
                     std::wstring sub = (tc.waitingJobs > 0)
                         ? (Tr(L"ジョブ ", L"jobs ", L"trabajos ") + std::to_wstring(tc.waitingJobs)) : L"";

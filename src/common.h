@@ -193,6 +193,17 @@ void SetDataDirectoryOverride(const std::wstring& dir);
 std::wstring GetDataDirectoryOverride();
 bool HasCustomDataDirectory();
 std::wstring GetEffectiveDataDirectoryWide();
+// "explicit" (--data-dir), "env" (HANCHO_LOG_DIR), "project" (auto-detected .hancho)
+// or "default" (<exe folder>\logs). Call GetEffectiveDataDirectoryWide first.
+const char* GetDataDirSourceName();
+
+// Active core registry: a running core publishes its effective data directory so a later
+// CLI or dashboard launched without an explicit --data-dir can join the same instance.
+void RegisterActiveCore();
+void UnregisterActiveCore();
+// Returns true when a single live core's data dir was adopted. With several live cores a
+// warning is returned and the caller must pass --data-dir explicitly.
+bool AdoptActiveCoreDataDir(std::string& outWarning);
 
 // Dashboard window title. It always carries the effective data directory, including
 // the default one, so a title alone identifies the instance. Matching is tolerant of
