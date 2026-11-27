@@ -316,9 +316,27 @@ std::string BtManager::Validate(const std::string& jsonText, bool strict) {
     return BehaviorTree::ValidateResponse(jsonText, this, strict);
 }
 
-std::string BtManager::Start(const std::string& jsonText, bool paused, bool triage) {
+std::string BtManager::Start(const std::string& jsonTextIn, bool paused, bool triage) {
     std::string err;
     std::lock_guard<std::mutex> lock(mutex_);
+
+    // A tree with no "cwd" runs its exec/agent nodes in the working directory of whoever started it
+    // (the origin recorded with SetBtOrigin). Without this, jobs inherited the core's own directory
+    // (C:\WINDOWS\system32 when the core runs as a service-like process), and scripts that use
+    // relative paths or git failed there.
+    std::string jsonText = jsonTextIn;
+    {
+        json def = json::parse(jsonTextIn, nullptr, false);
+        if (def.is_object() && def.contains("id") && def["id"].is_string() &&
+            !(def.contains("cwd") && def["cwd"].is_string() && !def["cwd"].get<std::string>().empty())) {
+            json origin = json::parse(tqm_.BtOriginJson(def["id"].get<std::string>()), nullptr, false);
+            if (origin.is_object() && origin.contains("cwd") && origin["cwd"].is_string() &&
+                !origin["cwd"].get<std::string>().empty()) {
+                def["cwd"] = origin["cwd"];
+                jsonText = def.dump();
+            }
+        }
+    }
 
     std::vector<std::string> lintErrors;
     std::vector<BtWarning> warnings;
