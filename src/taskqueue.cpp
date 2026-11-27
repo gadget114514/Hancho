@@ -9512,7 +9512,6 @@ nlohmann::json TaskQueueManager::DirectionState(const std::string& id) const {
 
 void TaskQueueManager::RefreshJobStateChainLocked(const std::string& directionId,
                                                   const std::string& taskId) {
-    bool directionChanged = false;
     if (!directionId.empty()) {
         nlohmann::json dir;
         if (directionStore_.Get(directionId, dir)) {
@@ -9530,7 +9529,6 @@ void TaskQueueManager::RefreshJobStateChainLocked(const std::string& directionId
                 dir["rev"] = BumpRevLocked();
                 std::string err;
                 directionStore_.Save(dir, err);
-                directionChanged = true;
                 if (newState == "succeeded" || newState == "failed" || newState == "cancelled") {
                     UnwatchDirectionClientLocked(directionId);
                     if (!taskId.empty()) {
@@ -9542,7 +9540,9 @@ void TaskQueueManager::RefreshJobStateChainLocked(const std::string& directionId
             }
         }
     }
-    if (taskId.empty() || !directionChanged) return;
+    // Recomputed even when this job has no direction of its own: the task's state still depends
+    // on its other directions, and the stored task state would otherwise go stale.
+    if (taskId.empty()) return;
     nlohmann::json task;
     if (!taskStore_.Get(taskId, task)) return;
     const std::string oldState = task.value("state", std::string());

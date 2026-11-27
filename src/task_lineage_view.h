@@ -1268,6 +1268,7 @@ inline bool TaskDisplayRowMatchesQuery(const TaskDisplayRow& row, const std::str
 struct TaskDisplayFilterOptions {
     size_t visibleFinishedCount = 30;
     std::string query;
+    std::unordered_set<std::string> keepTaskIds;  // tasks kept regardless of the finished limit
 };
 
 struct TaskDisplayFilterResult {
@@ -1304,14 +1305,23 @@ inline TaskDisplayFilterResult FilterTaskDisplayRows(
         }
     }
 
+    size_t limitedFinishedShown = 0;
     for (const auto& row : matched) {
         const bool finished = IsFinishedTaskState(TaskDisplayRowState(row));
         if (finished) ++result.totalFinished;
-        if (finished && result.shownFinished >= limit) {
-            result.hasMore = true;
-            continue;
+        const bool keepForCurrentTask = !row.taskId.empty() && options.keepTaskIds.count(row.taskId) > 0;
+        if (finished) {
+            ++result.shownFinished;
+            // The selected task keeps all of its rows; they do not consume the shared budget.
+            if (!keepForCurrentTask) {
+                if (limitedFinishedShown >= limit) {
+                    --result.shownFinished;
+                    result.hasMore = true;
+                    continue;
+                }
+                ++limitedFinishedShown;
+            }
         }
-        if (finished) ++result.shownFinished;
         result.rows.push_back(row);
     }
     if (result.hasMore) {

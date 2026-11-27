@@ -365,11 +365,14 @@ bool SendIpcRequest(const std::string& reqJson, std::string& outRespJson, std::s
     }
     // Ask for a compact msgpack + deflate response. Old cores ignore the unknown fields
     // and answer with plain JSON, which the caller also accepts after IpcDecodeResponse.
-    std::string wireReq;
-    if (!reqJson.empty() && reqJson.front() == '{') {
-        wireReq = "{\"encoding\":\"msgpack\",\"compression\":\"deflate\"," + reqJson.substr(1);
-    } else {
-        wireReq = reqJson;
+    // An empty object gets no trailing comma, which would make the request invalid JSON.
+    std::string wireReq = reqJson;
+    const size_t open = reqJson.find_first_not_of(" \t\r\n");
+    if (open != std::string::npos && reqJson[open] == '{') {
+        const size_t next = reqJson.find_first_not_of(" \t\r\n", open + 1);
+        const bool emptyObject = next == std::string::npos || reqJson[next] == '}';
+        wireReq = "{\"encoding\":\"msgpack\",\"compression\":\"deflate\"" +
+                  std::string(emptyObject ? "" : ",") + reqJson.substr(open + 1);
     }
     DWORD written = 0;
     BOOL writeOk = WriteFile(hPipe, wireReq.data(), static_cast<DWORD>(wireReq.size()), &written, &writeOv);
@@ -424,6 +427,7 @@ bool SendIpcRequest(const std::string& reqJson, std::string& outRespJson, std::s
             // carries its byte count in the OVERLAPPED result. Skipping this call silently
             // drops the chunk (typically the head of a large response).
             ok = GetOverlappedResult(hPipe, &ov, &bytesRead, FALSE);
+            err = ok ? ERROR_SUCCESS : GetLastError();
         } else if (!ok && err != ERROR_BROKEN_PIPE) {
             CloseHandle(readOv.hEvent);
             CloseHandle(hPipe);

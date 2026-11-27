@@ -608,6 +608,9 @@ std::string BtManager::Remove(const std::string& id) {
     const std::string btId = it->second->tree->Id();
     // Stop any running work first so no process is left untracked.
     it->second->tree->Cancel(NowEpochMs());
+    // The direction caches the tree's state, and that cache outlives the state file removed below.
+    // Record the cancellation now, or the direction would stay "running" after the tree is gone.
+    tqm_.SetDirectionBtState(btId, it->second->tree->State(), it->second->tree->Detail());
     CancelQueuedJobsForTree(btId);
     // Drop the tree's jobs from the queues too, so its rows leave the task list.
     std::string tqErr;

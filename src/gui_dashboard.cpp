@@ -7809,6 +7809,19 @@ static std::wstring TaskResultsSummary(const std::string& resultsCompact) {
     return out.empty() ? L"-" : out;
 }
 
+static int64_t YesterdayStartEpoch() {
+    std::time_t now = static_cast<std::time_t>(GetNowEpochSec());
+    std::tm local = {};
+    if (!LocalTimeFromSec(&now, &local)) return 0;
+    local.tm_hour = 0;
+    local.tm_min = 0;
+    local.tm_sec = 0;
+    local.tm_isdst = -1;
+    local.tm_mday -= 1;
+    const std::time_t yesterday = std::mktime(&local);
+    return yesterday == static_cast<std::time_t>(-1) ? 0 : static_cast<int64_t>(yesterday);
+}
+
 static void RefreshTaskQueueData(DashboardState* st, bool force = false, bool useCachedList = false) {
     if (!st || !st->hwndTaskList) return;
     if (st->listDisplayMode == ListDisplayMode::ProcessOnly) return;
@@ -7948,6 +7961,25 @@ static void RefreshTaskQueueData(DashboardState* st, bool force = false, bool us
     pc::TaskDisplayFilterOptions filterOptions;
     filterOptions.visibleFinishedCount = st->visibleFinishedCount;
     filterOptions.query = WideToUtf8(st->taskSearchText);
+    const int64_t keepSince = YesterdayStartEpoch();
+    for (const auto& task : st->cachedTasks) {
+        if (!task.is_object()) continue;
+        const std::string id = task.value("id", std::string());
+        if (id.empty()) continue;
+        const std::string created = task.value("createdAt", task.value("created_at", std::string()));
+        if (keepSince > 0 && pc::ParseTaskTimeEpoch(created) >= keepSince) {
+            filterOptions.keepTaskIds.insert(id);
+        }
+    }
+    for (const auto& job : parsedJobs) {
+        if (!job.is_object()) continue;
+        const std::string id = job.value("task_id", std::string());
+        if (id.empty()) continue;
+        const std::string created = job.value("created_at", job.value("createdAt", std::string()));
+        if (keepSince > 0 && pc::ParseTaskTimeEpoch(created) >= keepSince) {
+            filterOptions.keepTaskIds.insert(id);
+        }
+    }
     pc::TaskDisplayFilterResult filtered = pc::FilterTaskDisplayRows(displayRows, filterOptions);
     displayRows = std::move(filtered.rows);
     st->taskHasMoreFinished = filtered.hasMore;
@@ -8025,7 +8057,7 @@ static void RefreshTaskQueueData(DashboardState* st, bool force = false, bool us
             row.startKey = !drow.startTime.empty() ? ParseTimestampStrToEpoch(drow.startTime) : 0;
             row.endKey = !drow.endTime.empty() ? ParseTimestampStrToEpoch(drow.endTime) : 0;
 
-            row.cells[13] = row.cells[1];
+            row.cells[13] = Utf8ToWide(drow.taskId);
             if (!st->taskSearchText.empty()) {
                 bool matches = false;
                 for (const auto& cell : row.cells) {
@@ -8129,7 +8161,7 @@ static void RefreshTaskQueueData(DashboardState* st, bool force = false, bool us
             row.startKey = !drow.startTime.empty() ? ParseTimestampStrToEpoch(drow.startTime) : 0;
             row.endKey = !drow.endTime.empty() ? ParseTimestampStrToEpoch(drow.endTime) : 0;
 
-            row.cells[13] = row.cells[1];
+            row.cells[13] = Utf8ToWide(drow.taskId);
             if (!st->taskSearchText.empty()) {
                 bool matches = false;
                 for (const auto& cell : row.cells) {
@@ -8469,19 +8501,12 @@ static void RefreshTaskQueueData(DashboardState* st, bool force = false, bool us
             if (!depsStr.empty()) depsStr += L" ";
             depsStr += L"\x2192 " + Utf8ToWide(pc::ShortJobRef(drow.supersededBy)); // →
         }
-        std::wstring taskColStr;
-        if (!drow.taskTitle.empty() || drow.hasTaskRecord) {
-            taskColStr = Utf8ToWide(drow.taskTitle.empty() ? drow.taskId : drow.taskTitle);
-            if (!drow.taskState.empty()) {
-                taskColStr += L" (" + TaskStateLabelWide(drow.taskState) + L")";
-            }
-        } else if (!drow.taskId.empty() && drow.taskId != jobId) {
+        std::wstring taskColStr = L"-";
+        if (!drow.taskId.empty() && (drow.hasTaskRecord || drow.taskId != jobId)) {
             taskColStr = Utf8ToWide(drow.taskId);
             if (!drow.taskState.empty()) {
                 taskColStr += L" (" + TaskStateLabelWide(drow.taskState) + L")";
             }
-        } else {
-            taskColStr = L"-";
         }
         row.cells[0] = std::move(idStr);
         row.cells[1] = std::move(summaryStr);

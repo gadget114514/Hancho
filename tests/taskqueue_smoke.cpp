@@ -4286,6 +4286,41 @@ int main() {
             auto cleared = FilterTaskDisplayRows(fRows, /*visibleFinishedCount=*/2, /*query=*/"");
             Check(cleared.rows.size() == limited.rows.size() && cleared.totalFinished == 5,
                   "102-6: clearing the query restores the normal limited view");
+
+            TaskDisplayFilterOptions keepOpts;
+            keepOpts.visibleFinishedCount = 2;
+            keepOpts.keepTaskIds.insert("f_task_2");
+            const auto kept = FilterTaskDisplayRows(fRows, keepOpts);
+            bool keptSpecial = false;
+            for (const auto& r : kept.rows) {
+                if (r.jobId == "f_job_2") keptSpecial = true;
+            }
+            Check(keptSpecial && kept.shownFinished == 3 && kept.totalFinished == 5 &&
+                      kept.rows.back().hiddenFinishedCount == 2,
+                  "102-6: a recent task keeps its rows past the finished limit");
+
+            std::vector<nlohmann::json> manyJobs;
+            for (int i = 0; i < 35; ++i) {
+                manyJobs.push_back({{"id", "many_job_" + std::to_string(i)},
+                                    {"task_id", "many_task"},
+                                    {"state", "succeeded"},
+                                    {"created_at", "2026-11-24T11:00:00Z"}});
+            }
+            std::vector<nlohmann::json> manyTasks = {
+                {{"id", "many_task"}, {"title", "many"}, {"state", "succeeded"},
+                 {"updatedAt", "2026-11-24T11:00:00Z"}}
+            };
+            TaskViewCounts mCounts;
+            std::unordered_map<std::string, bool> mOv;
+            std::unordered_set<std::string> mAll;
+            const auto mRows = BuildTaskDisplayRows(manyJobs, manyTasks, /*taskViewMode=*/false,
+                                                    mOv, mAll, mCounts, 8);
+            TaskDisplayFilterOptions mOpts;
+            mOpts.visibleFinishedCount = 30;
+            mOpts.keepTaskIds.insert("many_task");
+            const auto mFiltered = FilterTaskDisplayRows(mRows, mOpts);
+            Check(mFiltered.rows.size() == 35 && !mFiltered.hasMore,
+                  "102-6: 35 finished rows of a recent task are all kept");
         }
 
         // 3. TaskList version & since_version
