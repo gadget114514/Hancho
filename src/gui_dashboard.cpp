@@ -8033,7 +8033,11 @@ static void RefreshTaskQueueData(DashboardState* st, bool force = false, bool us
                      : "taskHeading";
             if (drow.isCard) {
                 const std::wstring prefix = drow.jobCount > 0 ? (drow.expanded ? L"\x25BE " : L"\x25B8 ") : L"  ";
-                row.cells[0] = L" " + prefix + Utf8ToWide(drow.cardNumber.empty() ? drow.directionId : drow.cardNumber);
+                std::wstring idText = Utf8ToWide(drow.cardNumber.empty() ? drow.directionId : drow.cardNumber);
+                if (!drow.cardNumber.empty() && !drow.directionId.empty()) {
+                    idText += L" (" + Utf8ToWide(drow.directionId) + L")";
+                }
+                row.cells[0] = L" " + prefix + idText;
                 row.cells[1] = drow.directionTitle.empty() ? Utf8ToWide(drow.cardNumber)
                              : DashTitleCell(st, drow.directionTitle, "card.title", row.titleTip);
                 row.cells[2] = drow.jobCount > 0
