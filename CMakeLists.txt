@@ -4,6 +4,18 @@ project(Hancho VERSION 0.10.2 LANGUAGES CXX)
 set(CMAKE_CXX_STANDARD 20)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 
+# Header-only msgpack-c (thirdparty/msgpack-c, cpp_master) used by the IPC codec.
+include_directories("${CMAKE_CURRENT_SOURCE_DIR}/thirdparty/msgpack-c/include")
+add_compile_definitions(MSGPACK_NO_BOOST)
+
+# zlib-ng provides the deflate codec for IPC responses. Build it statically with the same
+# MSVC runtime as the rest of Hancho and disable its own test/benchmark targets.
+set(BUILD_TESTING OFF CACHE BOOL "" FORCE)
+set(ZLIB_COMPAT ON CACHE BOOL "" FORCE)
+set(ZLIB_ALIASES ON CACHE BOOL "" FORCE)
+add_subdirectory(thirdparty/zlib-ng EXCLUDE_FROM_ALL)
+link_libraries(zlibstatic)
+
 # Link the MSVC runtime statically so the executables run without the VC++ redistributable.
 set(CMAKE_MSVC_RUNTIME_LIBRARY "MultiThreaded$<$<CONFIG:Debug>:Debug>")
 

@@ -197,6 +197,13 @@ std::wstring GetEffectiveDataDirectoryWide();
 // or "default" (<exe folder>\logs). Call GetEffectiveDataDirectoryWide first.
 const char* GetDataDirSourceName();
 
+// IPC response codec. encodings: "json" | "msgpack"; compressions: "" | "lznt1" | "deflate".
+// A plain JSON response without compression is returned unchanged (backward compatible).
+// The "HPC2" envelope carries encoding and compression flags for the other combinations.
+std::string IpcEncodeResponse(const std::string& jsonText, const std::string& encoding,
+                              const std::string& compression);
+bool IpcDecodeResponse(const std::string& wire, std::string& outJson);
+
 // Active core registry: a running core publishes its effective data directory so a later
 // CLI or dashboard launched without an explicit --data-dir can join the same instance.
 void RegisterActiveCore();

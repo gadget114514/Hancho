@@ -1,0 +1,335 @@
+/* deflate_medium_tpl.h -- The deflate_medium deflate strategy
+ *
+ * Copyright (C) 2013 Intel Corporation. All rights reserved.
+ * Authors:
+ *  Arjan van de Ven    <arjan@linux.intel.com>
+ *
+ * Copyright (C) 2026 Hans Kristian Rosbach
+ *
+ * For conditions of distribution and use, see copyright notice in zlib.h
+ */
+
+/* insert_match assumes:
+ * - s->lookahead > match.match_length + WANT_MIN_MATCH
+ * - match_len >= WANT_MIN_MATCH
+ */
+Z_FORCEINLINE static void SUFFIX(insert_match)(deflate_state *s, unsigned char *Z_RESTRICT window, struct match match, uint32_t max_insert_count) {
+    uint32_t strstart = match.strstart + 1;        // string at strstart already in table
+    uint32_t match_len = match.match_length - 1;
+    uint32_t max_len = 2 * max_insert_count;       // Normally 32, 56, 96 and 112 for levels 3-6
+
+    /* Don't re-hash positions hashed as literals (see fizzle_matches).
+     * Also don't hash overlapping positions (see find_best_match). */
+    if (UNLIKELY(strstart < match.orgstart)) {
+        uint32_t end = strstart + match_len;
+
+        strstart = match.orgstart;
+        match_len = end - strstart;
+        if (match_len == 0) {
+            /* Hash only the tail position */
+            insert_knuth(s, window, end - 1);
+            return;
+        }
+    }
+
+    /* Shorter matches insert every position, which needs no step and no division. */
+    if (LIKELY(match_len <= max_len)) {
+        insert_knuth_batch(s, window, strstart, match_len);
+        return;
+    }
+    insert_knuth_stepped(s, window, strstart, match_len, max_insert_count);
+}
+
+Z_FORCEINLINE static struct match SUFFIX(find_best_match)(deflate_state *s, uint32_t hash_head, int32_t max_dist) {
+    struct match m;
+    int32_t dist;
+
+    /* Initialize the match to be a 1 byte literal */
+    m.match_start = 0;
+    m.match_length = 1;
+    m.strstart = s->strstart;
+    m.orgstart = m.strstart;
+
+    dist = (int32_t)s->strstart - (int32_t)hash_head;
+    if (dist <= (int32_t)max_dist && dist > 0 && hash_head != 0) {
+        /* To simplify the code, we prevent matches with the string
+         * of window index 0 (in particular we have to avoid a match
+         * of the string with itself at the start of the input file).
+         */
+        uint32_t match_len = FUNCTABLE_CALL(longest_match)(s, hash_head);
+        m.match_start = s->match_start;
+        if (UNLIKELY(match_len < WANT_MIN_MATCH))
+            return m;
+        if (UNLIKELY(m.match_start >= m.strstart)) {
+            /* this can happen due to some restarts */
+            return m;
+        }
+        m.match_length = match_len;
+
+        /* We want to skip hashing overlapping positions when dist < match_length,
+         * encode this into orgstart, fizzle_matches might re-introduce some
+         * overlapping positions, but the simplification is worth it.
+         *
+         * If dist < match_length, the first (match_length - dist) positions
+         * are byte-identical to data `dist` bytes earlier (already in table).
+         */
+        uint32_t match_dist = m.strstart - m.match_start;
+        if (match_dist < match_len) {
+            m.orgstart += match_len - match_dist;
+        }
+    }
+    return m;
+}
+
+/* fizzle_matches investigates whether next_match (which starts after current_match) can grow backwards
+ * to absorb current_match entirely, or reduce it to a single literal.
+ * This occurs because next_match points to a different historical dictionary position, allowing it to discover
+ * a better matching alignment that current_match bypassed due to the medium-strategy skipping positions.
+ *
+ * fizzle_matches assumes:
+ * - current_match.match_length > 1
+ * - current_match.match_length - 1 <= next->match_start
+ * - current_match.match_length - 1 <= next->strstart
+ * - next_match.match_length >= WANT_MIN_MATCH
+ *
+ * fizzle_matches returns:
+ * - If successful, current and next are returned modified.
+ *   - current_match.match_length is then either 0, 1
+ */
+#ifdef USE_FIZZLE
+static void fizzle_matches(unsigned char *Z_RESTRICT window, struct match *Z_RESTRICT current,
+                           struct match *Z_RESTRICT next, int32_t max_dist) {
+    unsigned char *match = window + next->match_start + 1 - current->match_length;
+    unsigned char *orig  = window + next->strstart + 1 - current->match_length;
+
+    /* quick exit check.. if this fails then don't bother with anything else */
+    if (LIKELY(*match != *orig))
+        return;
+
+    int32_t limit = (int32_t)next->strstart > max_dist ? (int32_t)next->strstart - max_dist : 0;
+
+    // Steps needed to successfully fizzle match
+    uint32_t need = current->match_length - 1;
+
+    // Protect next->strstart from moving past maximum distance
+    int32_t max_steps_to_limit = (int32_t)next->strstart - limit;
+
+    // Protect next->match_length from exceeding STD_MAX_MATCH
+    int32_t max_growth_allowed = STD_MAX_MATCH - (int32_t)next->match_length;
+
+    // Protect next->match_start from going too far back
+    int32_t max_steps_to_history = (int32_t)next->match_start - 1;
+
+    // steps is the max number of backward steps allowed for each limitation
+    int32_t steps1 = MIN((int32_t)current->match_length, max_steps_to_limit);
+    int32_t steps2 = MIN(max_growth_allowed, max_steps_to_history);
+    int32_t steps = MIN(steps1, steps2);
+
+    // If we can't possibly fizzle the current match out, return early
+    if (LIKELY(steps < (int32_t)need))
+        return;
+
+    // The quick exit above already checked the first byte of the range.
+    // Compare the whole range here; small ranges inline as a single masked
+    // 8-byte XOR to avoid the memcmp call.
+    if (LIKELY(need <= sizeof(uint64_t))) {
+        uint64_t diff = zng_memread_8(match) ^ zng_memread_8(orig);
+        if (LIKELY(diff & zng_first_bytes_mask64(need)))
+            return;
+    } else if (LIKELY(memcmp(match, orig, (size_t)need) != 0)) {
+         return;
+    }
+
+    // Check whether the final extra backward byte is also possible.
+    // This decides whether the current match becomes length 1 or 0.
+    int extra_byte_ok = (steps == (int32_t)current->match_length);
+
+    // Update variables, reduces current->match_length to 1.
+    next->match_start  = next->match_start - need;
+    next->strstart     = next->strstart - need;
+    next->match_length = next->match_length + need;
+    next->orgstart++;
+    current->match_length = 1;
+
+    // If every constraint allowed one more backward byte, test it.
+    // If it matches, the current match is fully absorbed and becomes length 0.
+    if (extra_byte_ok) {
+        match = window + next->match_start - 1;
+        orig  = window + next->strstart - 1;
+
+        if (*match == *orig) {
+            next->match_start--;
+            next->strstart--;
+            next->match_length++;
+            current->match_length = 0;
+        }
+    }
+}
+#endif
+
+Z_INTERNAL block_state SUFFIX(deflate_medium)(deflate_state *s, int flush) {
+    ALIGNED_(16) struct match current_match = {0};
+#ifdef USE_FIZZLE
+                 struct match next_match = {0};
+#endif
+    unsigned char *window = s->window;
+    uint32_t max_insert_count = MAX(2, s->max_insert_count); // stepped insert requires min 2
+    int32_t max_dist = MAX_DIST(s);
+
+    for (;;) {
+        int bflush = 0;       /* set if current block must be flushed */
+        uint32_t curr_match_len;
+
+        /* Make sure that we always have enough lookahead, except
+         * at the end of the input file. We need STD_MAX_MATCH bytes
+         * for the next match, plus WANT_MIN_MATCH bytes to insert the
+         * string following the next current_match.
+         */
+        if (UNLIKELY(s->lookahead < MIN_LOOKAHEAD)) {
+            PREFIX(fill_window)(s);
+            if (UNLIKELY(s->lookahead < MIN_LOOKAHEAD && flush == Z_NO_FLUSH)) {
+                return need_more;
+            }
+            if (UNLIKELY(s->lookahead == 0))
+                break; /* flush the current block */
+#ifdef USE_FIZZLE
+            next_match.match_length = 0;
+#endif
+        }
+
+        /* Insert the string window[strstart .. strstart+2] in the
+         * dictionary, and set hash_head to the head of the hash chain:
+         */
+
+#ifdef USE_FIZZLE
+        /* If we already have a future match from a previous round, just use that */
+        if (next_match.match_length > 0) {
+            current_match = next_match;
+            next_match.match_length = 0;
+        } else {
+            uint32_t hash_head = 0;   /* head of the hash chain */
+            if (LIKELY(s->lookahead >= WANT_MIN_MATCH)) {
+                hash_head = insert_knuth(s, window, s->strstart);
+            }
+
+            current_match = SUFFIX(find_best_match)(s, hash_head, max_dist);
+        }
+        curr_match_len = current_match.match_length;
+
+        if (curr_match_len >= WANT_MIN_MATCH && s->lookahead > (unsigned int)(curr_match_len + WANT_MIN_MATCH )) {
+            SUFFIX(insert_match)(s, window, current_match, max_insert_count);
+        }
+
+        if (UNLIKELY(curr_match_len == STD_MAX_MATCH)) {
+            /* A max-length match cannot be extended by fizzle without truncating it,
+             * skip fizzle and instead check for continuation after emitting current match. */
+            next_match.match_length = 0;
+        } else if (LIKELY((s->lookahead > MIN_LOOKAHEAD) &
+                          ((current_match.strstart + curr_match_len) < s->fill_end))) {
+            /* now, look ahead one */
+            /* Spelled without short-circuit so both loads issue before the compare, which keeps
+             * the two tests fused into one branch. */
+            s->strstart = current_match.strstart + curr_match_len;
+            uint32_t hash_head = insert_knuth(s, window, s->strstart);
+
+            next_match = SUFFIX(find_best_match)(s, hash_head, max_dist);
+
+            uint32_t tmp_cmatch_len_sub = curr_match_len - 1;
+            if (tmp_cmatch_len_sub
+                     && next_match.match_length >= WANT_MIN_MATCH
+                     && tmp_cmatch_len_sub <= next_match.match_start) {
+                fizzle_matches(window, &current_match, &next_match, max_dist);
+                curr_match_len = current_match.match_length;
+            }
+
+            s->strstart = current_match.strstart;
+            if (curr_match_len == 0) {
+                /* If current match fizzled out, jump to next loop iteration */
+                continue;
+            }
+        } else {
+            next_match.match_length = 0;
+        }
+#else
+        // WITHOUT_FIZZLE: We don't look for future matches, so code is much simplified
+        uint32_t hash_head = 0;   /* head of the hash chain */
+        if (LIKELY(s->lookahead >= WANT_MIN_MATCH)) {
+            hash_head = insert_knuth(s, window, s->strstart);
+        }
+
+        current_match = SUFFIX(find_best_match)(s, hash_head, max_dist);
+        curr_match_len = current_match.match_length;
+
+        if (curr_match_len >= WANT_MIN_MATCH && s->lookahead > (unsigned int)(curr_match_len + WANT_MIN_MATCH )) {
+            SUFFIX(insert_match)(s, window, current_match, max_insert_count);
+        }
+#endif
+
+        /* now emit the current match */
+        s->lookahead -= curr_match_len;
+        if (LIKELY(curr_match_len == 1)) {
+            /* matches shorter than WANT_MIN_MATCH are set to 1, we need to emit these as literals */
+            bflush = zng_tr_tally_lit(s, window[current_match.strstart]);
+        } else {
+            check_match(s, current_match.strstart, current_match.match_start, curr_match_len);
+            bflush = zng_tr_tally_dist(s, current_match.strstart - current_match.match_start, curr_match_len - STD_MIN_MATCH);
+        }
+
+        /* move the "cursor" forward */
+        s->strstart += curr_match_len;
+
+        /* A max-length match might continue: keep emitting continuations at the same
+         * distance without a full search as long as possible. */
+        if (UNLIKELY(curr_match_len == STD_MAX_MATCH && s->lookahead >= MIN_LOOKAHEAD)) {
+            uint32_t cont_dist = current_match.strstart - current_match.match_start;
+            for (;;) {
+                struct match cont_match;
+
+                // Check for continuing match
+                uint32_t cont_len = max_match_continues(window, s->strstart, cont_dist);
+                if (UNLIKELY(cont_len < 8))
+                    break;
+
+                // Set up continuation match
+                cont_match.match_start  = s->strstart - cont_dist;
+                cont_match.match_length = cont_len;
+                cont_match.strstart     = s->strstart;
+
+                check_match(s, cont_match.strstart, cont_match.match_start, cont_len);
+
+                // Skip hashing positions that overlap the match (see find_best_match).
+                cont_match.orgstart = (cont_dist < cont_len) ? cont_match.strstart + cont_len - cont_dist : cont_match.strstart;
+
+                // Insert match
+                insert_knuth(s, window, s->strstart);
+                SUFFIX(insert_match)(s, window, cont_match, max_insert_count);
+
+                // Emit match
+                s->lookahead -= cont_len;
+                bflush |= zng_tr_tally_dist(s, cont_dist, cont_len - STD_MIN_MATCH);
+                s->strstart += cont_len;
+
+                if (UNLIKELY(bflush)) {
+                    FLUSH_BLOCK(s, window, 0);
+                    bflush = 0;
+                }
+                if (UNLIKELY(s->lookahead < MIN_LOOKAHEAD)) {
+                    break; /* not enough lookahead, return to the main loop */
+                }
+            }
+        }
+
+        if (UNLIKELY(bflush))
+            FLUSH_BLOCK(s, window, 0);
+    }
+
+    s->insert = s->strstart < (STD_MIN_MATCH - 1) ? s->strstart : (STD_MIN_MATCH - 1);
+    if (flush == Z_FINISH) {
+        FLUSH_BLOCK(s, window, 1);
+        return finish_done;
+    }
+    if (UNLIKELY(s->sym_next))
+        FLUSH_BLOCK(s, window, 0);
+
+    return block_done;
+}

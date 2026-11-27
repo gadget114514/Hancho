@@ -470,6 +470,34 @@ int main() {
         RemoveDirRecursive(headlessAutoDir);
     }
 
+    // IPC codec: large responses over a real named pipe, plus msgpack/deflate round trips.
+    {
+        const int sizes[] = {16 * 1024, 64 * 1024, 128 * 1024, 1024 * 1024};
+        for (int size : sizes) {
+            json resp;
+            std::string error;
+            const bool ok = IpcCall({{"action", "echo_large"}, {"size", size}}, resp, &error, true);
+            Check(ok && resp.value("ok", false) && resp.value("size", 0) == size &&
+                      resp.value("data", std::string()).size() == static_cast<size_t>(size),
+                  std::string("IPC codec: ") + std::to_string(size) + " byte response over the pipe" +
+                  (ok ? std::string() : std::string(" (") + error + ")"));
+        }
+        const std::string payload(1024 * 1024, 'z');
+        json source;
+        source["ok"] = true;
+        source["data"] = payload;
+        for (const char* encoding : {"json", "msgpack"}) {
+            for (const char* compression : {"", "lznt1", "deflate"}) {
+                const std::string encoded = IpcEncodeResponse(source.dump(), encoding, compression);
+                std::string decoded;
+                const bool ok = IpcDecodeResponse(encoded, decoded) &&
+                                json::parse(decoded, nullptr, false) == source;
+                Check(ok, std::string("IPC codec round trip: ") + encoding + " / " +
+                              (compression[0] ? compression : "none"));
+            }
+        }
+    }
+
     RemoveDirRecursive(tempDirW);
     std::printf("%s (%d passed, %d failures)\n", g_failures ? "FAILED" : "ALL PASSED",
                 g_passes, g_failures);

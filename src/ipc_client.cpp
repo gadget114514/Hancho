@@ -363,8 +363,16 @@ bool SendIpcRequest(const std::string& reqJson, std::string& outRespJson, std::s
         outError = "CreateEventW for overlapped pipe write failed.";
         return false;
     }
+    // Ask for a compact msgpack + deflate response. Old cores ignore the unknown fields
+    // and answer with plain JSON, which the caller also accepts after IpcDecodeResponse.
+    std::string wireReq;
+    if (!reqJson.empty() && reqJson.front() == '{') {
+        wireReq = "{\"encoding\":\"msgpack\",\"compression\":\"deflate\"," + reqJson.substr(1);
+    } else {
+        wireReq = reqJson;
+    }
     DWORD written = 0;
-    BOOL writeOk = WriteFile(hPipe, reqJson.data(), static_cast<DWORD>(reqJson.size()), &written, &writeOv);
+    BOOL writeOk = WriteFile(hPipe, wireReq.data(), static_cast<DWORD>(wireReq.size()), &written, &writeOv);
     if (!writeOk && GetLastError() == ERROR_IO_PENDING) {
         writeOk = GetOverlappedResult(hPipe, &writeOv, &written, TRUE);
     }
@@ -389,46 +397,54 @@ bool SendIpcRequest(const std::string& reqJson, std::string& outRespJson, std::s
     while (true) {
         OVERLAPPED ov = {};
         ov.hEvent = readOv.hEvent;
+        ResetEvent(readOv.hEvent);
         DWORD bytesRead = 0;
         BOOL ok = ReadFile(hPipe, buf, sizeof(buf), &bytesRead, &ov);
-        if (!ok) {
-            const DWORD err = GetLastError();
-            if (err == ERROR_IO_PENDING) {
-                // Only the first read is bounded: a slow core must not hold the
-                // caller forever, but once it answered, later chunks can wait.
-                const DWORD waitMs = (firstRead && timeoutMs > 0)
-                    ? static_cast<DWORD>(timeoutMs) : INFINITE;
-                const DWORD waitResult = WaitForSingleObject(ov.hEvent, waitMs);
-                if (waitResult == WAIT_TIMEOUT) {
-                    CancelIoEx(hPipe, &ov);
-                    // Drain the cancelled operation before its OVERLAPPED dies.
-                    GetOverlappedResult(hPipe, &ov, &bytesRead, TRUE);
-                    CloseHandle(readOv.hEvent);
-                    CloseHandle(hPipe);
-                    outError = "The core did not answer within " + std::to_string(timeoutMs) + " ms.";
-                    if (outTimedOut) *outTimedOut = true;
-                    return false;
-                }
-                ok = GetOverlappedResult(hPipe, &ov, &bytesRead, FALSE);
-            } else if (err != ERROR_MORE_DATA && err != ERROR_BROKEN_PIPE) {
+        DWORD err = ok ? ERROR_SUCCESS : GetLastError();
+        if (!ok && err == ERROR_IO_PENDING) {
+            // Only the first read is bounded: a slow core must not hold the
+            // caller forever, but once it answered, later chunks can wait.
+            const DWORD waitMs = (firstRead && timeoutMs > 0)
+                ? static_cast<DWORD>(timeoutMs) : INFINITE;
+            const DWORD waitResult = WaitForSingleObject(ov.hEvent, waitMs);
+            if (waitResult == WAIT_TIMEOUT) {
+                CancelIoEx(hPipe, &ov);
+                // Drain the cancelled operation before its OVERLAPPED dies.
+                GetOverlappedResult(hPipe, &ov, &bytesRead, TRUE);
                 CloseHandle(readOv.hEvent);
                 CloseHandle(hPipe);
-                outError = "ReadFile from Named Pipe failed (GetLastError=" + std::to_string(err) + ")";
+                outError = "The core did not answer within " + std::to_string(timeoutMs) + " ms.";
+                if (outTimedOut) *outTimedOut = true;
                 return false;
             }
+            ok = GetOverlappedResult(hPipe, &ov, &bytesRead, FALSE);
+            err = ok ? ERROR_SUCCESS : GetLastError();
+        } else if (!ok && err == ERROR_MORE_DATA) {
+            // An overlapped read that completes immediately with more data pending still
+            // carries its byte count in the OVERLAPPED result. Skipping this call silently
+            // drops the chunk (typically the head of a large response).
+            ok = GetOverlappedResult(hPipe, &ov, &bytesRead, FALSE);
+        } else if (!ok && err != ERROR_BROKEN_PIPE) {
+            CloseHandle(readOv.hEvent);
+            CloseHandle(hPipe);
+            outError = "ReadFile from Named Pipe failed (GetLastError=" + std::to_string(err) + ")";
+            return false;
         }
         firstRead = false;
-        if (bytesRead > 0) {
-            outRespJson.append(buf, bytesRead);
-        }
-        if (ok) break;
-        if (GetLastError() != ERROR_MORE_DATA) break;
+        if (bytesRead > 0) outRespJson.append(buf, bytesRead);
+        if (err == ERROR_MORE_DATA) continue;
+        if (ok || err == ERROR_BROKEN_PIPE) break;
+        if (!ok) break;
     }
     CloseHandle(readOv.hEvent);
     CloseHandle(hPipe);
 
     if (outRespJson.empty()) {
         outError = "Named Pipe read returned empty response (GetLastError=" + std::to_string(GetLastError()) + ")";
+        return false;
+    }
+    if (!IpcDecodeResponse(outRespJson, outRespJson)) {
+        outError = "IPC response could not be decoded.";
         return false;
     }
     return true;

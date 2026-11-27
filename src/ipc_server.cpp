@@ -40,53 +40,70 @@ static std::string HandleRoutineAsk(RoutineManager& routines, BtManager* btm,
                                     const std::string& scope, const std::string& by,
                                     int timeoutMs);
 
-std::string SnapshotToJson(const ProcessSnapshot& s) {
-    std::ostringstream oss;
-    oss << "{"
-        << "\"id\":" << s.id << ","
-        << "\"name\":\"" << JsonEscape(s.name) << "\","
-        << "\"command\":\"" << JsonEscape(s.commandLine) << "\","
-        << "\"cwd\":\"" << JsonEscape(s.workingDir) << "\","
-        << "\"mode\":\"" << ExecModeToString(s.mode) << "\","
-        << "\"state\":\"" << ProcStateToString(s.state) << "\","
-        << "\"pid\":" << s.rootPid << ","
-        << "\"exit_code\":" << s.exitCode << ","
-        << "\"start_time\":\"" << JsonEscape(s.startTimeStr) << "\","
-        << "\"end_time\":\"" << JsonEscape(s.endTimeStr) << "\","
-        << "\"estimated_end_time\":\"" << JsonEscape(s.estimatedEndTimeStr) << "\","
-        << "\"elapsed_ms\":" << s.elapsedMs << ","
-        << "\"elapsed_str\":\"" << JsonEscape(FormatDurationSec(s.elapsedMs)) << "\","
-        << "\"cpu_time_ms\":" << s.cpuTimeMs << ","
-        << "\"cpu_time_str\":\"" << JsonEscape(FormatUptimeHMS(s.cpuTimeMs)) << "\","
-        << "\"uptime_str\":\"" << JsonEscape(FormatUptimeHMS(s.elapsedMs)) << "\","
-        << "\"idle_ms\":" << s.idleMs << ","
-        << "\"timeout_sec\":" << s.timeoutSec << ","
-        << "\"idle_timeout_sec\":" << s.idleTimeoutSec << ","
-        << "\"idle_first_event_sec\":" << s.idleFirstEventSec << ","
-        << "\"tree_procs\":" << s.treeProcessCount << ","
-        << "\"memory_bytes\":" << s.treeMemoryBytes << ","
-        << "\"memory_str\":\"" << JsonEscape(FormatBytes(s.treeMemoryBytes)) << "\","
-        << "\"total_bytes_read\":" << s.totalBytesRead << ","
-        << "\"log_file\":\"" << JsonEscape(s.logFilePath) << "\","
-        << "\"done_file\":\"" << JsonEscape(s.doneFilePath) << "\","
-        << "\"last_line\":\"" << JsonEscape(s.lastLinePreview) << "\","
-        << "\"job_key\":\"" << JsonEscape(s.jobKey) << "\","
-        << "\"job_id\":" << s.jobId << ","
-        << "\"attempt\":" << s.attemptN << ","
-        << "\"engine\":\"" << JsonEscape(s.agentType) << "\","
-        << "\"agent_type\":\"" << JsonEscape(s.agentType) << "\","
-        << "\"agent_status\":\"" << JsonEscape(s.agentStatus) << "\","
-        << "\"current_tool\":\"" << JsonEscape(s.currentTool) << "\","
-        << "\"current_tool_action\":\"" << JsonEscape(s.currentToolAction) << "\","
-        << "\"last_thought\":\"" << JsonEscape(s.lastThought) << "\","
-        << "\"last_message\":\"" << JsonEscape(s.lastMessage) << "\","
-        << "\"step_count\":" << s.stepCount << ","
-        << "\"stream_event_count\":" << s.streamEventCount << ","
-        << "\"stream_file\":\"" << JsonEscape(s.streamFilePath) << "\","
-        << "\"supervisor_notes\":\"" << JsonEscape(s.supervisorNotes) << "\","
-        << "\"supervisor_goal\":\"" << JsonEscape(s.supervisorGoal) << "\""
-        << "}";
-    return oss.str();
+std::string SnapshotToJson(const ProcessSnapshot& s, bool full) {
+    std::vector<std::string> fields;
+    auto add = [&fields](const std::string& field) { fields.push_back(field); };
+    auto str = [](const char* key, const std::string& value) {
+        return std::string("\"") + key + "\":\"" + JsonEscape(value) + "\"";
+    };
+    auto num = [](const char* key, auto value) {
+        return std::string("\"") + key + "\":" + std::to_string(value);
+    };
+    add(num("id", s.id));
+    add(str("name", s.name));
+    if (full) add(str("command", s.commandLine));
+    add(str("cwd", s.workingDir));
+    add(str("mode", ExecModeToString(s.mode)));
+    add(str("state", ProcStateToString(s.state)));
+    add(num("pid", s.rootPid));
+    add(num("exit_code", s.exitCode));
+    add(str("start_time", s.startTimeStr));
+    add(str("end_time", s.endTimeStr));
+    add(str("estimated_end_time", s.estimatedEndTimeStr));
+    add(num("elapsed_ms", s.elapsedMs));
+    add(str("elapsed_str", FormatDurationSec(s.elapsedMs)));
+    add(num("cpu_time_ms", s.cpuTimeMs));
+    add(str("cpu_time_str", FormatUptimeHMS(s.cpuTimeMs)));
+    add(str("uptime_str", FormatUptimeHMS(s.elapsedMs)));
+    add(num("idle_ms", s.idleMs));
+    add(num("timeout_sec", s.timeoutSec));
+    add(num("idle_timeout_sec", s.idleTimeoutSec));
+    add(num("idle_first_event_sec", s.idleFirstEventSec));
+    add(num("tree_procs", s.treeProcessCount));
+    add(num("memory_bytes", s.treeMemoryBytes));
+    add(str("memory_str", FormatBytes(s.treeMemoryBytes)));
+    add(num("total_bytes_read", s.totalBytesRead));
+    if (full) {
+        add(str("log_file", s.logFilePath));
+        add(str("done_file", s.doneFilePath));
+        add(str("last_line", s.lastLinePreview));
+    }
+    add(str("job_key", s.jobKey));
+    add(num("job_id", s.jobId));
+    add(num("attempt", s.attemptN));
+    add(str("engine", s.agentType));
+    add(str("agent_type", s.agentType));
+    if (full) {
+        add(str("agent_status", s.agentStatus));
+        add(str("current_tool", s.currentTool));
+        add(str("current_tool_action", s.currentToolAction));
+        add(str("last_thought", s.lastThought));
+        add(str("last_message", s.lastMessage));
+    }
+    add(num("step_count", s.stepCount));
+    add(num("stream_event_count", s.streamEventCount));
+    if (full) {
+        add(str("stream_file", s.streamFilePath));
+        add(str("supervisor_notes", s.supervisorNotes));
+        add(str("supervisor_goal", s.supervisorGoal));
+    }
+    std::string out = "{";
+    for (size_t i = 0; i < fields.size(); ++i) {
+        if (i) out += ",";
+        out += fields[i];
+    }
+    out += "}";
+    return out;
 }
 
 
@@ -336,6 +353,11 @@ void IpcServer::HandleClient(HANDLE hPipe) {
 
     if (!req.empty()) {
         std::string resp = HandleRequestJson(req);
+        const std::string encoding = JsonGetString(req, "encoding", "json");
+        const std::string compression = JsonGetString(req, "compression", "");
+        if (encoding != "json" || !compression.empty()) {
+            resp = IpcEncodeResponse(resp, encoding, compression);
+        }
         DWORD written = 0;
         WriteFile(hPipe, resp.data(), static_cast<DWORD>(resp.size()), &written, nullptr);
         FlushFileBuffers(hPipe);
@@ -1287,6 +1309,16 @@ std::string IpcServer::HandleRequestJson(const std::string& reqJson) {
     }
     std::ostringstream oss;
 
+    if (action == "echo_large") {
+        // Used by IPC codec smoke tests: returns a payload of the requested size.
+        const int size = static_cast<int>(std::max<int>(0, std::min<int>(1048576,
+            static_cast<int>(JsonGetInt(reqJson, "size", 0)))));
+        json out;
+        out["ok"] = true;
+        out["size"] = size;
+        out["data"] = std::string(static_cast<size_t>(size), 'x');
+        return out.dump();
+    }
     if (action == "ping") {
         return "{\"ok\":true,\"status\":\"running\",\"pid\":" +
                std::to_string(GetCurrentProcessId()) + ",\"headless\":" +
@@ -1652,19 +1684,35 @@ std::string IpcServer::HandleRequestJson(const std::string& reqJson) {
         return oss.str();
     }
     else if (action == "list") {
-        int filterId = static_cast<int>(JsonGetInt(reqJson, "id", 0));
-        oss << "{\"ok\":true,\"processes\":[";
-        if (filterId > 0) {
-            ProcessSnapshot snap;
-            if (pm_.GetSnapshot(filterId, snap)) {
-                oss << SnapshotToJson(snap);
+        const int filterId = static_cast<int>(JsonGetInt(reqJson, "id", 0));
+        // Brief is the default: large process lists no longer carry command lines, log
+        // paths and supervisor notes. Callers that need details pass full=true or an id.
+        const bool full = JsonGetBool(reqJson, "full", false);
+        std::vector<int> wanted;
+        const json reqDoc = json::parse(reqJson, nullptr, false);
+        if (reqDoc.is_object() && reqDoc.contains("ids") && reqDoc["ids"].is_array()) {
+            for (const auto& idValue : reqDoc["ids"]) {
+                if (idValue.is_number_integer()) wanted.push_back(idValue.get<int>());
             }
-        } else {
-            auto snaps = pm_.GetAllSnapshots();
-            for (size_t i = 0; i < snaps.size(); ++i) {
-                if (i > 0) oss << ",";
-                oss << SnapshotToJson(snaps[i]);
+        }
+        const auto snaps = pm_.GetAllSnapshots();
+        uint64_t rev = 1469598103934665603ull;
+        for (const auto& s : snaps) {
+            const std::string key = std::to_string(s.id) + ":" + ProcStateToString(s.state) + ":" +
+                                    std::to_string(s.outputVersion) + ":" + std::to_string(s.endTickMs);
+            for (unsigned char ch : key) {
+                rev ^= ch;
+                rev *= 1099511628211ull;
             }
+        }
+        oss << "{\"ok\":true,\"rev\":" << rev << ",\"processes\":[";
+        bool first = true;
+        for (const auto& s : snaps) {
+            if (filterId > 0 && s.id != filterId) continue;
+            if (!wanted.empty() && std::find(wanted.begin(), wanted.end(), s.id) == wanted.end()) continue;
+            if (!first) oss << ",";
+            oss << SnapshotToJson(s, full || filterId > 0 || !wanted.empty());
+            first = false;
         }
         oss << "]}";
         return oss.str();

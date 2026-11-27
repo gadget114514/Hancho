@@ -176,6 +176,6 @@ private:
 };
 
 // Format ProcessSnapshot as JSON object
-std::string SnapshotToJson(const ProcessSnapshot& s);
+std::string SnapshotToJson(const ProcessSnapshot& s, bool full = true);
 
 } // namespace pc

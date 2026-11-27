@@ -1,6 +1,8 @@
 #include "common.h"
 #include "parse_util.h"
 #include "nlohmann/json.hpp"
+#include <msgpack.hpp>
+#include <zlib.h>
 #include <tlhelp32.h>
 #include <iterator>
 #include <sstream>
@@ -315,26 +317,55 @@ std::string AppendNonEnglishWarnings(const std::string& responseJson, const std:
     return resp.dump();
 }
 
+static size_t ValidUtf8Length(const std::string& s, size_t pos) {
+    const unsigned char c = static_cast<unsigned char>(s[pos]);
+    if (c < 0x80) return 1;
+    size_t length = 0;
+    if (c >= 0xC2 && c <= 0xDF) length = 2;
+    else if (c >= 0xE0 && c <= 0xEF) length = 3;
+    else if (c >= 0xF0 && c <= 0xF4) length = 4;
+    if (length == 0 || pos + length > s.size()) return 0;
+    for (size_t i = 1; i < length; ++i) {
+        const unsigned char next = static_cast<unsigned char>(s[pos + i]);
+        if ((next & 0xC0) != 0x80) return 0;
+    }
+    const unsigned char second = static_cast<unsigned char>(s[pos + 1]);
+    if (c == 0xE0 && second < 0xA0) return 0;
+    if (c == 0xED && second > 0x9F) return 0;
+    if (c == 0xF0 && second < 0x90) return 0;
+    if (c == 0xF4 && second > 0x8F) return 0;
+    return length;
+}
+
 std::string JsonEscape(const std::string& s) {
     std::string out;
-    out.reserve(s.size() + s.size() / 8); // Heuristic to reduce allocations
-    for (unsigned char c : s) {
+    out.reserve(s.size() + s.size() / 8);
+    for (size_t i = 0; i < s.size();) {
+        const unsigned char c = static_cast<unsigned char>(s[i]);
         switch (c) {
-            case '"':  out += "\\\""; break;
-            case '\\': out += "\\\\"; break;
-            case '\b': out += "\\b";  break;
-            case '\f': out += "\\f";  break;
-            case '\n': out += "\\n";  break;
-            case '\r': out += "\\r";  break;
-            case '\t': out += "\\t";  break;
-            default:
-                if (c < 0x20) {
-                    char buf[8];
-                    snprintf(buf, sizeof(buf), "\\u%04x", static_cast<int>(c));
-                    out += buf;
-                } else {
-                    out += static_cast<char>(c);
-                }
+            case '"':  out += "\\\""; ++i; continue;
+            case '\\': out += "\\\\"; ++i; continue;
+            case '\b': out += "\\b";  ++i; continue;
+            case '\f': out += "\\f";  ++i; continue;
+            case '\n': out += "\\n";  ++i; continue;
+            case '\r': out += "\\r";  ++i; continue;
+            case '\t': out += "\\t";  ++i; continue;
+            default: break;
+        }
+        if (c < 0x20) {
+            char buf[8];
+            snprintf(buf, sizeof(buf), "\\u%04x", static_cast<int>(c));
+            out += buf;
+            ++i;
+            continue;
+        }
+        const size_t length = ValidUtf8Length(s, i);
+        if (length == 0) {
+            out += "\\ufffd";
+            ++i;
+        } else {
+            out.append(s, i, length);
+            i += length;
         }
     }
     return out;
@@ -1395,6 +1426,197 @@ AppConfig LoadAppConfig() {
 
 int64_t GetTaskListRecentCount() {
     return LoadAppConfig().taskListRecentCount;
+}
+
+namespace {
+
+void PackJson(msgpack::packer<msgpack::sbuffer>& packer, const nlohmann::json& value) {
+    if (value.is_null()) packer.pack_nil();
+    else if (value.is_boolean()) packer.pack(value.get<bool>());
+    else if (value.is_number_unsigned()) packer.pack(value.get<uint64_t>());
+    else if (value.is_number_integer()) packer.pack(value.get<int64_t>());
+    else if (value.is_number_float()) packer.pack(value.get<double>());
+    else if (value.is_string()) {
+        packer.pack(value.get<std::string>());
+    } else if (value.is_array()) {
+        packer.pack_array(static_cast<uint32_t>(value.size()));
+        for (const auto& item : value) PackJson(packer, item);
+    } else if (value.is_object()) {
+        packer.pack_map(static_cast<uint32_t>(value.size()));
+        for (auto it = value.begin(); it != value.end(); ++it) {
+            packer.pack(it.key());
+            PackJson(packer, it.value());
+        }
+    } else {
+        packer.pack_nil();
+    }
+}
+
+nlohmann::json UnpackJson(const msgpack::object& obj) {
+    using json = nlohmann::json;
+    switch (obj.type) {
+    case msgpack::type::NIL: return nullptr;
+    case msgpack::type::BOOLEAN: return obj.as<bool>();
+    case msgpack::type::POSITIVE_INTEGER: return obj.as<uint64_t>();
+    case msgpack::type::NEGATIVE_INTEGER: return obj.as<int64_t>();
+    case msgpack::type::FLOAT32:
+    case msgpack::type::FLOAT64: return obj.as<double>();
+    case msgpack::type::STR: {
+        std::string s;
+        obj.convert(s);
+        return s;
+    }
+    case msgpack::type::ARRAY: {
+        json out = json::array();
+        for (uint32_t i = 0; i < obj.via.array.size; ++i) out.push_back(UnpackJson(obj.via.array.ptr[i]));
+        return out;
+    }
+    case msgpack::type::MAP: {
+        json out = json::object();
+        for (uint32_t i = 0; i < obj.via.map.size; ++i) {
+            std::string key;
+            obj.via.map.ptr[i].key.convert(key);
+            out[key] = UnpackJson(obj.via.map.ptr[i].val);
+        }
+        return out;
+    }
+    default: return nullptr;
+    }
+}
+
+std::string DeflateStored(const std::string& data) {
+    uLongf bound = compressBound(static_cast<uLong>(data.size()));
+    std::vector<Bytef> packed(bound);
+    if (compress2(packed.data(), &bound, reinterpret_cast<const Bytef*>(data.data()),
+                  static_cast<uLong>(data.size()), Z_DEFAULT_COMPRESSION) != Z_OK) {
+        return std::string();
+    }
+    return std::string(reinterpret_cast<const char*>(packed.data()), bound);
+}
+
+bool InflateStored(const std::string& in, std::string& out, size_t expected = 0) {
+    uLongf capacity = static_cast<uLongf>(std::max<size_t>(1024, std::max(expected, in.size() * 4)));
+    for (int attempt = 0; attempt < 8; ++attempt) {
+        std::vector<Bytef> unpacked(capacity);
+        uLongf length = capacity;
+        const int status = uncompress(unpacked.data(), &length,
+                                      reinterpret_cast<const Bytef*>(in.data()),
+                                      static_cast<uLong>(in.size()));
+        if (status == Z_OK) {
+            out.assign(reinterpret_cast<const char*>(unpacked.data()), length);
+            return true;
+        }
+        if (status != Z_BUF_ERROR) return false;
+        capacity *= 2;
+    }
+    return false;
+}
+
+std::string Lznt1Compress(const std::string& data) {
+    HMODULE ntdll = GetModuleHandleW(L"ntdll.dll");
+    if (!ntdll) return std::string();
+    using CompressFn = LONG(WINAPI*)(USHORT, PUCHAR, ULONG, PUCHAR, ULONG, ULONG, PULONG, PVOID);
+    auto compress = reinterpret_cast<CompressFn>(GetProcAddress(ntdll, "RtlCompressBuffer"));
+    if (!compress) return std::string();
+    std::vector<unsigned char> compressed(data.size() + data.size() / 16 + 1024);
+    std::vector<unsigned char> workspace(64 * 1024);
+    ULONG finalSize = 0;
+    const LONG status = compress(0x0002,
+                                 reinterpret_cast<PUCHAR>(const_cast<char*>(data.data())),
+                                 static_cast<ULONG>(data.size()), compressed.data(),
+                                 static_cast<ULONG>(compressed.size()), 4096, &finalSize,
+                                 workspace.data());
+    if (status != 0 || finalSize == 0 || finalSize >= data.size()) return std::string();
+    return std::string(reinterpret_cast<const char*>(compressed.data()), finalSize);
+}
+
+bool Lznt1Decompress(const std::string& in, uint32_t original, std::string& out) {
+    HMODULE ntdll = GetModuleHandleW(L"ntdll.dll");
+    if (!ntdll) return false;
+    using DecompressFn = LONG(WINAPI*)(USHORT, PUCHAR, ULONG, PUCHAR, ULONG, PULONG);
+    auto decompress = reinterpret_cast<DecompressFn>(GetProcAddress(ntdll, "RtlDecompressBuffer"));
+    if (!decompress) return false;
+    out.assign(original, '\0');
+    ULONG finalSize = 0;
+    const LONG status = decompress(0x0002, reinterpret_cast<PUCHAR>(out.data()), original,
+                                   reinterpret_cast<PUCHAR>(const_cast<char*>(in.data())),
+                                   static_cast<ULONG>(in.size()), &finalSize);
+    return status == 0 && finalSize == original;
+}
+
+} // namespace
+
+std::string IpcEncodeResponse(const std::string& jsonText, const std::string& encoding,
+                              const std::string& compression) {
+    std::string payload = jsonText;
+    unsigned char encodingFlag = 0;
+    if (encoding == "msgpack") {
+        const nlohmann::json parsed = nlohmann::json::parse(jsonText, nullptr, false);
+        if (parsed.is_discarded()) return jsonText;
+        msgpack::sbuffer buffer;
+        msgpack::packer<msgpack::sbuffer> packer(buffer);
+        PackJson(packer, parsed);
+        payload.assign(buffer.data(), buffer.size());
+        encodingFlag = 1;
+    }
+    const uint32_t original = static_cast<uint32_t>(payload.size());
+    unsigned char compressionFlag = 0;
+    if (payload.size() >= 4096) {
+        if (compression == "deflate") {
+            const std::string packed = DeflateStored(payload);
+            if (!packed.empty() && packed.size() < payload.size()) {
+                payload = packed;
+                compressionFlag = 2;
+            }
+        } else if (compression == "lznt1") {
+            const std::string packed = Lznt1Compress(payload);
+            if (!packed.empty()) {
+                payload = packed;
+                compressionFlag = 1;
+            }
+        }
+    }
+    if (encodingFlag == 0 && compressionFlag == 0) return jsonText;
+
+    std::string out("HPC2", 4);
+    for (int i = 0; i < 4; ++i) out.push_back(static_cast<char>((original >> (i * 8)) & 0xFF));
+    out.push_back(static_cast<char>(encodingFlag));
+    out.push_back(static_cast<char>(compressionFlag));
+    out.append(payload);
+    return out;
+}
+
+bool IpcDecodeResponse(const std::string& wire, std::string& outJson) {
+    if (wire.size() < 10 || wire.compare(0, 4, "HPC2") != 0) {
+        outJson = wire;
+        return true;
+    }
+    uint32_t original = 0;
+    for (int i = 0; i < 4; ++i) {
+        original |= static_cast<uint32_t>(static_cast<unsigned char>(wire[4 + i])) << (i * 8);
+    }
+    const unsigned char encodingFlag = static_cast<unsigned char>(wire[8]);
+    const unsigned char compressionFlag = static_cast<unsigned char>(wire[9]);
+    const std::string body = wire.substr(10);
+    std::string decoded;
+    if (compressionFlag == 1) {
+        if (!Lznt1Decompress(body, original, decoded)) return false;
+    } else if (compressionFlag == 2) {
+        if (!InflateStored(body, decoded, original)) return false;
+    } else if (compressionFlag != 0) {
+        return false;
+    } else {
+        decoded = body;
+    }
+    if (encodingFlag == 1) {
+        msgpack::object_handle handle = msgpack::unpack(decoded.data(), decoded.size());
+        outJson = UnpackJson(handle.get()).dump();
+    } else if (encodingFlag == 0) {
+        outJson = std::move(decoded);
+    } else {
+        return false;
+    }
+    return true;
 }
 
 } // namespace pc

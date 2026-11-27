@@ -1,0 +1,318 @@
+/* insert_string_p.h -- static single and batch hash insert functions
+ *
+ * Copyright (C) 1995-2024 Jean-loup Gailly and Mark Adler
+ * For conditions of distribution and use, see copyright notice in zlib.h
+ */
+#ifndef INSERT_STRING_P_H_
+#define INSERT_STRING_P_H_
+
+#define KNUTH_SHIFT (32 - HASH_BITS)
+#define UPDATE_HASH_KNUTH(h,val) h = (((val) * 2654435761U) >> KNUTH_SHIFT)
+
+#if (HASH_SIZE) > 65536u
+#  define ROLL_HASH_SIZE 65536
+#else
+#  define ROLL_HASH_SIZE HASH_SIZE
+#endif
+#define ROLL_MASK ((HASH_SIZE / 2) - 1u))
+#define UPDATE_HASH_ROLL(h,val) h = (((h << 5) ^ ((uint8_t)(val))) & ROLL_MASK
+
+/* ===========================================================================
+ * Update a hash value with the given input byte
+ * IN  assertion: all calls to UPDATE_HASH are made with consecutive
+ *    input characters, so that a running hash key can be computed from the
+ *    previous key instead of complete recalculation each time.
+ */
+Z_FORCEINLINE static uint32_t update_hash_roll(uint32_t h, uint32_t val) {
+    UPDATE_HASH_ROLL(h, val);
+    return h;
+}
+
+/* ===========================================================================
+ * Insert string str in the dictionary using a pre-read value and set match_head
+ * to the previous head of the hash chain (the most recent string with same hash key).
+ * Return the previous length of the hash chain.
+ */
+Z_FORCEINLINE static uint32_t insert_knuth_val(deflate_state *const s, uint32_t str, uint32_t val) {
+    uint32_t h, head;
+
+    UPDATE_HASH_KNUTH(h, val);
+
+    head = s->head[h];
+    if (LIKELY(head != str)) {
+        s->prev[str & W_MASK(s)] = (Pos)head;
+        s->head[h] = (Pos)str;
+    }
+    return head;
+}
+
+/* ===========================================================================
+ * Insert string str using a pre-read value, returning the previous head of the
+ * hash chain. The prev link is left untouched since deflate_quick only inspects
+ * the chain head and never walks the chain.
+ */
+Z_FORCEINLINE static uint32_t insert_knuth_val_head(deflate_state *const s, uint32_t str, uint32_t val) {
+    uint32_t h, head;
+
+    UPDATE_HASH_KNUTH(h, val);
+
+    head = s->head[h];
+    s->head[h] = (Pos)str;
+    return head;
+}
+
+/* ===========================================================================
+ * Insert string str in the dictionary and set match_head to the previous head
+ * of the hash chain (the most recent string with same hash key). Return
+ * the previous length of the hash chain.
+ */
+Z_FORCEINLINE static uint32_t insert_knuth(deflate_state *const s, unsigned char *window, uint32_t str) {
+    uint8_t *strstart = window + str;
+    uint32_t val, h, head;
+
+    val = Z_U32_FROM_LE(zng_memread_4(strstart));
+    UPDATE_HASH_KNUTH(h, val);
+
+    head = s->head[h];
+    if (LIKELY(head != str)) {
+        s->prev[str & W_MASK(s)] = (Pos)head;
+        s->head[h] = (Pos)str;
+    }
+    return head;
+}
+
+/* ===========================================================================
+ * Insert string str read from the window, returning the previous head of the
+ * hash chain. Like insert_knuth but leaves the prev link untouched for
+ * deflate_quick, which only inspects the chain head.
+ */
+Z_FORCEINLINE static uint32_t insert_knuth_head(deflate_state *const s, unsigned char *window, uint32_t str) {
+    uint8_t *strstart = window + str;
+    uint32_t val, h, head;
+
+    val = Z_U32_FROM_LE(zng_memread_4(strstart));
+    UPDATE_HASH_KNUTH(h, val);
+
+    head = s->head[h];
+    s->head[h] = (Pos)str;
+    return head;
+}
+
+/* ===========================================================================
+ * Insert a single position into the dictionary using passed table pointers.
+ */
+Z_FORCEINLINE static void insert_knuth_one(Pos *headp, Pos *prevp, const unsigned int w_mask, const unsigned char *window, uint32_t idx) {
+    uint32_t val, h, head;
+
+    val = Z_U32_FROM_LE(zng_memread_4(window + idx));
+    UPDATE_HASH_KNUTH(h, val);
+
+    head = headp[h];
+    if (LIKELY(head != idx)) {
+        prevp[idx & w_mask] = (Pos)head;
+        headp[h] = (Pos)idx;
+    }
+}
+
+Z_FORCEINLINE static uint32_t insert_roll(deflate_state *const s, unsigned char *window, uint32_t str) {
+    uint8_t *strstart = window + str + (STD_MIN_MATCH-1);
+    uint32_t h, head;
+
+    h = s->ins_h;
+    UPDATE_HASH_ROLL(h, strstart[0]);
+    s->ins_h = h;
+
+    head = s->head[h];
+    if (LIKELY(head != str)) {
+        s->prev[str & W_MASK(s)] = (Pos)head;
+        s->head[h] = (Pos)str;
+    }
+    return head;
+}
+
+/* ===========================================================================
+ * Insert string str in the dictionary and set match_head to the previous head
+ * of the hash chain (the most recent string with same hash key). Return
+ * the previous length of the hash chain.
+ * IN  assertion: all calls to insert_knuth_batch are made with consecutive
+ *    input characters and the first STD_MIN_MATCH bytes of str are valid
+ *    (except for the last STD_MIN_MATCH-1 bytes of the input file).
+ */
+Z_FORCEINLINE static void insert_knuth_batch_static(deflate_state *const s, unsigned char *window, uint32_t str, uint32_t count) {
+    uint8_t *strstart = window + str;
+    uint8_t *strend = strstart + count;
+
+    /* Local pointers to avoid indirection */
+    Pos *headp = s->head;
+    Pos *prevp = s->prev;
+    const unsigned int w_mask = W_MASK(s);
+
+    for (uint32_t idx = str; strstart < strend; idx++, strstart++) {
+        uint32_t val, h, head;
+
+        val = Z_U32_FROM_LE(zng_memread_4(strstart));
+        UPDATE_HASH_KNUTH(h, val);
+
+        head = headp[h];
+        if (LIKELY(head != idx)) {
+            prevp[idx & w_mask] = (Pos)head;
+            headp[h] = (Pos)idx;
+        }
+    }
+}
+
+/* ===========================================================================
+ * Like insert_knuth_batch_static(), except this spreads out max_inserts hashes over
+ * the length of count. Also ensures that both the first and last entry gets hashed.
+ * This assumes both count and max_inserts are 258 or less.
+ */
+Z_FORCEINLINE static void insert_knuth_stepped_static(deflate_state *const s, unsigned char *window, uint32_t str, uint32_t count, uint32_t max_inserts) {
+    Assert(count >= 3, "Insert count too low");
+    Assert(max_inserts >= 2, "max_inserts too low");
+
+    /* Local pointers to avoid indirection */
+    Pos *headp = s->head;
+    Pos *prevp = s->prev;
+    const unsigned int w_mask = W_MASK(s);
+
+    uint32_t inserts = (count < max_inserts) ? count : max_inserts;
+    uint32_t intervals = inserts - 1;
+
+    /*
+     * Calculate a 32-bit Fixed-Point Scale with a 16-bit fraction.
+     * Safe from overflow since (count - 1) <= 257, meaning ((257 << 16) + 256) fits easily in 32 bits.
+     * The rounding bias guarantees hitting the exact tail end ('str + count - 1') smoothly.
+     */
+    uint32_t inc_fp = (((count - 1) << 16) + (intervals - 1)) / intervals;
+
+    /* Initialize the fixed-point index tracking register */
+    uint32_t idx_fp = str << 16;
+
+    for (uint32_t i = 0; i < inserts; i++) {
+        uint32_t val, h, head, idx;
+
+        /* Extract the real window index by shifting out the fractional bits */
+        idx = idx_fp >> 16;
+
+        /* Increment offset for next iteration */
+        idx_fp += inc_fp;
+
+        val = Z_U32_FROM_LE(zng_memread_4(window + idx));
+        UPDATE_HASH_KNUTH(h, val);
+
+        head = headp[h];
+        if (LIKELY(head != idx)) {
+            prevp[idx & w_mask] = (Pos)head;
+            headp[h] = (Pos)idx;
+        }
+    }
+}
+
+/* ===========================================================================
+ * Like insert_knuth_stepped_static(), except optimized for small max_inserts (deflate_fast levels)
+ * The first and last position are always hashed, and an approximate middle position as well.
+ * Larger max_inserts fall back to insert_knuth_stepped_static().
+ */
+Z_FORCEINLINE static void insert_knuth_spread_static(deflate_state *const s, unsigned char *window, uint32_t str, uint32_t count, uint32_t max_inserts) {
+    Assert(count >= 3, "Insert count too low");
+    Assert(max_inserts >= 2, "max_inserts too low");
+
+    if (UNLIKELY(max_inserts > 3)) {
+        /* In case count is bigger than 3: tuned deflate_fast level params, or NO_MEDIUM_STRATEGY */
+        insert_knuth_stepped(s, window, str, count, max_inserts);
+        return;
+    }
+
+    /* Local pointers to avoid indirection */
+    Pos *headp = s->head;
+    Pos *prevp = s->prev;
+    const unsigned int w_mask = W_MASK(s);
+
+    /* Insert head and tail, and middle if needed */
+    insert_knuth_one(headp, prevp, w_mask, window, str);
+    if (max_inserts == 3)
+        insert_knuth_one(headp, prevp, w_mask, window, str + ((count - 1) >> 1));
+    insert_knuth_one(headp, prevp, w_mask, window, str + count - 1);
+}
+
+/* ===========================================================================
+ * Insert count strings read from the window, leaving the prev links untouched.
+ * Used by fill_window during deflate_quick, which only inspects the chain head.
+ */
+Z_FORCEINLINE static void insert_knuth_batch_head_static(deflate_state *const s, unsigned char *window, uint32_t str, uint32_t count) {
+    uint8_t *strstart = window + str;
+    uint8_t *strend = strstart + count;
+    Pos *headp = s->head;
+
+    for (uint32_t idx = str; strstart < strend; idx++, strstart++) {
+        uint32_t val, h;
+
+        val = Z_U32_FROM_LE(zng_memread_4(strstart));
+        UPDATE_HASH_KNUTH(h, val);
+
+        headp[h] = (Pos)idx;
+    }
+}
+
+Z_FORCEINLINE static void insert_roll_batch_static(deflate_state *const s, unsigned char *window, uint32_t str, uint32_t count) {
+    uint8_t *strstart = window + str + (STD_MIN_MATCH-1);
+    uint8_t *strend = strstart + count;
+
+    /* Local pointers to avoid indirection */
+    Pos *headp = s->head;
+    Pos *prevp = s->prev;
+    uint32_t h = s->ins_h;
+    const unsigned int w_mask = W_MASK(s);
+
+    for (uint32_t idx = str; strstart < strend; idx++, strstart++) {
+        uint32_t head;
+
+        UPDATE_HASH_ROLL(h, strstart[0]);
+
+        head = headp[h];
+        if (LIKELY(head != idx)) {
+            prevp[idx & w_mask] = (Pos)head;
+            headp[h] = (Pos)idx;
+        }
+    }
+    s->ins_h = h;
+}
+
+/* ===========================================================================
+ * Mark count strings as the end of their hash chain without inserting them.
+ * longest_match reads prev for every position inside a candidate match, so a
+ * skipped string must not keep a link from earlier input.
+ */
+Z_FORCEINLINE static void insert_skip(deflate_state *const s, uint32_t str, uint32_t count) {
+    uint32_t idx = str & W_MASK(s);
+    /* The range wraps around the end of prev at most once. */
+    uint32_t first = MIN(count, s->w_size - idx);
+
+    memset(&s->prev[idx], 0, first * sizeof(Pos));
+    memset(s->prev, 0, (count - first) * sizeof(Pos));
+}
+
+/* ===========================================================================
+ * Insert only the last tail strings of a batch and end the chains of the rest.
+ * IN  assertion: tail < count.
+ */
+Z_FORCEINLINE static void insert_knuth_batch_tail_static(deflate_state *const s, unsigned char *window, uint32_t str,
+                                                         uint32_t count, uint32_t tail) {
+    uint32_t skip = count - tail;
+
+    insert_skip(s, str, skip);
+    insert_knuth_batch_static(s, window, str + skip, tail);
+}
+
+Z_FORCEINLINE static void insert_roll_batch_tail_static(deflate_state *const s, unsigned char *window, uint32_t str,
+                                                        uint32_t count, uint32_t tail) {
+    uint32_t skip = count - tail;
+
+    insert_skip(s, str, skip);
+    str += skip;
+    /* Seed the rolling hash with two bytes, the insert feeds the third. */
+    s->ins_h = update_hash_roll(window[str], window[str + 1]);
+    insert_roll_batch_static(s, window, str, tail);
+}
+
+#endif

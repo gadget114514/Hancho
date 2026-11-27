@@ -7697,11 +7697,13 @@ if (subcmd == "start" || subcmd == "run") {
     }
     else if (subcmd == "list" || subcmd == "status") {
         int id = 0;
+        bool full = false;
         for (size_t i = 2; i < args.size(); ++i) {
             if (args[i] == "--id" && i + 1 < args.size()) id = std::stoi(args[++i]);
+            else if (args[i] == "--full") full = true;
             else if (id == 0 && args[i][0] != '-') { try { id = std::stoi(args[i]); } catch (...) {} }
         }
-        reqJson << "{\"action\":\"list\",\"id\":" << id << "}";
+        reqJson << "{\"action\":\"list\",\"id\":" << id << ",\"full\":" << (full ? "true" : "false") << "}";
         requestedId = id;
         subcmd = "list";
     }

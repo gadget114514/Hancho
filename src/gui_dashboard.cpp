@@ -1602,7 +1602,7 @@ static ProcessSnapshot ProcessSnapshotFromJson(const nlohmann::json& j) {
 }
 
 static std::vector<ProcessSnapshot> FetchProcessSnapshotsIpc(DashboardState* st) {
-    nlohmann::json req = {{"action", "list"}};
+    nlohmann::json req = {{"action", "list"}, {"full", true}};
     nlohmann::json resp;
     if (GuiIpcCall(st, req, resp) && resp.value("ok", false) &&
         resp.contains("processes") && resp["processes"].is_array()) {
@@ -15200,8 +15200,9 @@ struct SettingsDlgState {
         HWND cmbDisplayMode = nullptr;
        HWND hwndAboutTitle = nullptr;
        HWND hwndAboutVersion = nullptr;
-       HWND hwndAboutDesc = nullptr;
-       HWND hwndPowerPrivilege = nullptr;
+        HWND hwndAboutDesc = nullptr;
+        HWND hwndAboutCopyright = nullptr;
+        HWND hwndPowerPrivilege = nullptr;
        HWND tabCtrl = nullptr;
           // controls shown under each tab: 0 appearance, 1 behavior, 2 WinConsole,
           // 3 triage, 4 WebUI, 5 maintenance, 6 performance, 7 colors, 8 about, 9 LLM, 10 permits
@@ -18085,6 +18086,12 @@ static LRESULT CALLBACK SettingsWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPAR
                 18, 92, 500, 24, hwnd, nullptr, hInst, nullptr);
             ds->hwndAboutDesc = CreateWindowExW(0, L"STATIC", L"", WS_CHILD | SS_LEFT,
                 18, 124, 620, 24, hwnd, nullptr, hInst, nullptr);
+            ds->hwndAboutCopyright = CreateWindowExW(0, L"STATIC",
+                L"Third-party components:\r\n"
+                L"nlohmann/json - Copyright (c) 2013-2026 Niels Lohmann (MIT)\r\n"
+                L"msgpack-c - Copyright (C) 2008-2018 FURUHASHI Sadayuki, KONDO Takatoshi (BSL-1.0)\r\n"
+                L"zlib-ng - Copyright (C) 1995-2024 Jean-loup Gailly, Mark Adler, zlib-ng contributors (zlib)",
+                WS_CHILD | SS_LEFT, 18, 156, 620, 96, hwnd, nullptr, hInst, nullptr);
 
             // Detailed hover help for every button on every settings page. The pages are
             // created up front, so registering the tips here covers all of them.
@@ -18377,6 +18384,7 @@ static LRESULT CALLBACK SettingsWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPAR
             SendMessageW(ds->hwndAboutTitle, WM_SETFONT, (WPARAM)ds->dash->hFontUiBold, TRUE);
             SendMessageW(ds->hwndAboutVersion, WM_SETFONT, (WPARAM)ds->dash->hFontUi, TRUE);
             SendMessageW(ds->hwndAboutDesc, WM_SETFONT, (WPARAM)ds->dash->hFontUi, TRUE);
+            SendMessageW(ds->hwndAboutCopyright, WM_SETFONT, (WPARAM)ds->dash->hFontUi, TRUE);
             SendMessageW(ds->hwndPowerPrivilege, WM_SETFONT, (WPARAM)ds->dash->hFontUi, TRUE);
 
             // LLM lists page (091-3): three independent, pre-approved candidate lists.
@@ -18574,7 +18582,8 @@ static LRESULT CALLBACK SettingsWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPAR
                     ds->lblWebUiPort, ds->editWebUiPort, ds->lblWebUiUrl, ds->editWebUiUrl,
                     ds->lblWebUiToken, ds->editWebUiToken, ds->btnWebUiTokenRoll });
                 auto& about = ds->tabPages[8];
-                about.insert(about.end(), { ds->hwndAboutTitle, ds->hwndAboutVersion, ds->hwndAboutDesc });
+                about.insert(about.end(), { ds->hwndAboutTitle, ds->hwndAboutVersion, ds->hwndAboutDesc,
+                                            ds->hwndAboutCopyright });
                 auto& llmPage = ds->tabPages[9];
                 llmPage.insert(llmPage.end(), {
                     ds->lblLlmTitle, ds->cmbLlmList, ds->lstLlmRows,
