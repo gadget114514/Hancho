@@ -4,6 +4,7 @@
 #include "event_adapter.h"
 #include "event_schema.h"
 #include "common.h"
+#include "win_command.h"
 #include "nlohmann/json.hpp"
 #include <algorithm>
 #include <atomic>
