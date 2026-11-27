@@ -98,7 +98,7 @@ worker は 1 枚ずつ順に実装する。前のカードの変更は作業ツ�
 - CLI（`hancho-cli`）:
   ```
   task create --title "..." [--intent "..." | --intent-file <path>] [--id <id>] [--json]
-  task show <id> [--log-limit N] [--json]
+  task show <id> [--log-limit N] [--why] [--json]
   task list [--state open|running|failed|cancelled|succeeded|closed] [--limit N] [--json]
   task note <id> --text "..."
   task close <id> --result succeeded|failed --reason "..."
@@ -108,8 +108,9 @@ worker は 1 枚ずつ順に実装する。前のカードの変更は作業ツ�
   taskqueue add ... --task <id>
   bt start ... --task <id>
   ```
-  `task note` / `create` は origin（セッション）を既存の `taskqueue add` と同じ方法で付ける。`help --json` とテキストのヘルプに足す。
-- テスト: IPC / MCP の引数の受け渡しを、既存のテストと同じやり方で確かめる。
+   `task note` / `create` は origin（セッション）を既存の `taskqueue add` と同じ方法で付ける。`help --json` とテキストのヘルプに足す。
+ - `task show` / `task wait` の応答には決定的な `why` 配列が常に含まれる（開いている理由がないときは空配列）。各要素は `kind` / `id` / `detail` / `source` を持ち、`kind` → `id` → `detail` の順に並ぶ。`--why` は人間向けの `Why open (N):` ブロックを表示する（`--json` では生 JSON を表示するため何も変えない）。LLM による要約は行わない。
+ - テスト: IPC / MCP の引数の受け渡しを、既存のテストと同じやり方で確かめる。
 
 ## 100-3: 経過ログへの自動記録
 

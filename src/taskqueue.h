@@ -1065,6 +1065,9 @@ public:
                            const std::string& session, std::string& outError);
     bool TaskGet(const std::string& id, nlohmann::json& outRecord) const;
     std::string TaskShow(const std::string& id, int64_t logLimit, std::string& outError);
+    // Deterministic, read-only reasons why a task is still open. Each entry has kind, id,
+    // detail and source, plus fields specific to the cause (state, blockedBy, waitingFor, ...).
+    nlohmann::json TaskOpenWhy(const std::string& taskId) const;
     std::string TaskList(const std::string& stateFilter, int64_t limit, std::string& outError,
                          int64_t sinceVersion = -1, int64_t finishedLimit = 0,
                          const std::string& before = "", const std::string& query = "");
@@ -1294,6 +1297,7 @@ private:
     nlohmann::json TaskStateLocked(const std::string& taskId) const;
     nlohmann::json TaskStateLocked(const std::string& taskId, const std::string& excludeDirectionId,
                                    std::set<std::string>& visiting) const;
+    nlohmann::json TaskOpenWhyLocked(const std::string& taskId) const;
     nlohmann::json DirectionStateLocked(const std::string& id) const;
     nlohmann::json DirectionStateLocked(const std::string& id, std::set<std::string>& visiting) const;
     // Caller holds mutex_. Creates a record for an implicit "job:<id>" direction when needed.

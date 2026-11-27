@@ -5336,6 +5336,215 @@ static void ShowTaskQueueJobDetails(DashboardState* st, const std::string& jobId
     }
 }
 
+static void ShowTriageDialog(DashboardState* st, const std::wstring& filter, const std::string& selectId);
+
+struct TaskOpenWhyDlgState {
+    DashboardState* dash = nullptr;
+    HFONT fontUi = nullptr;
+    HWND list = nullptr;
+    HWND detailEdit = nullptr;
+    HWND btnTriage = nullptr;
+    HWND btnClose = nullptr;
+    std::string taskId;
+    std::string triageCardId;
+    std::vector<nlohmann::json> reasons;
+};
+
+static void TaskOpenWhyLayout(HWND hwnd, TaskOpenWhyDlgState* ds) {
+    if (!ds) return;
+    RECT rc = {};
+    GetClientRect(hwnd, &rc);
+    const int w = rc.right - rc.left;
+    const int h = rc.bottom - rc.top;
+    const int pad = 12;
+    const int buttonY = h - pad - 30;
+    if (ds->list) MoveWindow(ds->list, pad, pad, (std::max)(200, w - pad * 2),
+                             (std::max)(100, buttonY - pad - 156), TRUE);
+    if (ds->detailEdit) MoveWindow(ds->detailEdit, pad, buttonY - 148,
+                                   (std::max)(200, w - pad * 2), 140, TRUE);
+    if (ds->btnTriage) MoveWindow(ds->btnTriage, pad, buttonY, 150, 28, TRUE);
+    if (ds->btnClose) MoveWindow(ds->btnClose, (std::max)(pad, w - pad - 100), buttonY, 100, 28, TRUE);
+}
+
+static std::string TaskOpenWhyTriageCardId(DashboardState* st, const std::vector<nlohmann::json>& reasons) {
+    if (!st) return "";
+    for (const auto& reason : reasons) {
+        std::vector<std::string> ids;
+        const std::string id = reason.value("id", std::string());
+        if (!id.empty()) ids.push_back(id);
+        for (const char* key : {"directionId", "node"}) {
+            const std::string v = reason.value(key, std::string());
+            if (!v.empty()) ids.push_back(v);
+        }
+        for (const auto& candidate : ids) {
+            auto it = st->triageJobs.find(candidate);
+            if (it == st->triageJobs.end()) continue;
+            const std::string cardId = it->second.value("cardId", std::string());
+            if (!cardId.empty()) return cardId;
+        }
+    }
+    return "";
+}
+
+static LRESULT CALLBACK TaskOpenWhyWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
+    auto* ds = reinterpret_cast<TaskOpenWhyDlgState*>(GetWindowLongPtrW(hwnd, GWLP_USERDATA));
+    switch (msg) {
+        case WM_CREATE: {
+            auto* cs = reinterpret_cast<CREATESTRUCTW*>(lParam);
+            ds = reinterpret_cast<TaskOpenWhyDlgState*>(cs->lpCreateParams);
+            SetWindowLongPtrW(hwnd, GWLP_USERDATA, reinterpret_cast<LONG_PTR>(ds));
+
+            ds->list = CreateWindowExW(WS_EX_CLIENTEDGE, WC_LISTVIEWW, L"",
+                WS_CHILD | WS_VISIBLE | WS_CLIPSIBLINGS | LVS_REPORT | LVS_SINGLESEL | LVS_SHOWSELALWAYS,
+                12, 12, 760, 300, hwnd, (HMENU)3301, nullptr, nullptr);
+            ListView_SetExtendedListViewStyle(ds->list, LVS_EX_FULLROWSELECT | LVS_EX_GRIDLINES | LVS_EX_INFOTIP);
+            PastRunsAddColumn(ds->list, 0, Tr(L"種別", L"Kind", L"Tipo"), 110);
+            PastRunsAddColumn(ds->list, 1, Tr(L"ID", L"ID", L"ID"), 190);
+            PastRunsAddColumn(ds->list, 2, Tr(L"理由", L"Detail", L"Detalle"), 520);
+            SendMessageW(ds->list, WM_SETREDRAW, FALSE, 0);
+            for (size_t i = 0; i < ds->reasons.size(); ++i) {
+                const auto& reason = ds->reasons[i];
+                std::wstring kind = Utf8ToWide(reason.value("kind", std::string()));
+                std::wstring id = Utf8ToWide(reason.value("id", std::string()));
+                std::wstring detail = Utf8ToWide(reason.value("detail", std::string()));
+                LVITEMW item = {};
+                item.mask = LVIF_TEXT | LVIF_PARAM;
+                item.iItem = static_cast<int>(i);
+                item.pszText = kind.data();
+                item.lParam = static_cast<LPARAM>(i);
+                ListView_InsertItem(ds->list, &item);
+                ListView_SetItemText(ds->list, static_cast<int>(i), 1, id.data());
+                ListView_SetItemText(ds->list, static_cast<int>(i), 2, detail.data());
+            }
+            SendMessageW(ds->list, WM_SETREDRAW, TRUE, 0);
+            InvalidateRect(ds->list, nullptr, TRUE);
+
+            ds->detailEdit = CreateWindowExW(WS_EX_CLIENTEDGE, L"EDIT", L"",
+                WS_CHILD | WS_VISIBLE | WS_VSCROLL | WS_HSCROLL | ES_MULTILINE | ES_READONLY |
+                    ES_AUTOVSCROLL | ES_AUTOHSCROLL,
+                12, 320, 760, 140, hwnd, (HMENU)3302, nullptr, nullptr);
+            ds->btnTriage = CreateWindowExW(0, L"BUTTON", Tr(L"トリアージで開く", L"Open in Triage", L"Abrir en Triaje"),
+                WS_CHILD | WS_VISIBLE | BS_PUSHBUTTON | (ds->triageCardId.empty() ? WS_DISABLED : 0),
+                12, 470, 150, 28, hwnd, (HMENU)3303, nullptr, nullptr);
+            ds->btnClose = CreateWindowExW(0, L"BUTTON", Tr(L"閉じる", L"Close", L"Cerrar"),
+                WS_CHILD | WS_VISIBLE | BS_PUSHBUTTON, 672, 470, 100, 28, hwnd, (HMENU)IDOK, nullptr, nullptr);
+            AddControlHelp(hwnd, ds->btnClose,
+                Tr(L"このダイアログを閉じます。", L"Closes this dialog.", L"Cierra este diálogo."));
+            HWND controls[] = {ds->list, ds->detailEdit, ds->btnTriage, ds->btnClose};
+            for (HWND h : controls) {
+                if (h && ds->fontUi) SendMessageW(h, WM_SETFONT, reinterpret_cast<WPARAM>(ds->fontUi), TRUE);
+            }
+            TaskOpenWhyLayout(hwnd, ds);
+            ApplyNativeThemeToWindow(hwnd);
+            return 0;
+        }
+        case WM_NOTIFY: {
+            if (!ds) break;
+            auto* nm = reinterpret_cast<NMHDR*>(lParam);
+            if (nm && nm->hwndFrom == ds->list && nm->code == LVN_GETINFOTIPW) {
+                auto* tip = reinterpret_cast<NMLVGETINFOTIPW*>(lParam);
+                SetListInfoTip(tip, ListViewFullCellText(ds->list, tip->iItem, tip->iSubItem));
+                return 0;
+            }
+            if (nm && nm->hwndFrom == ds->list && nm->code == LVN_ITEMCHANGED) {
+                const int sel = ListView_GetNextItem(ds->list, -1, LVNI_SELECTED);
+                if (sel >= 0 && static_cast<size_t>(sel) < ds->reasons.size()) {
+                    const std::string text = ds->reasons[static_cast<size_t>(sel)].dump(
+                        2, ' ', false, nlohmann::json::error_handler_t::replace);
+                    SetWindowTextW(ds->detailEdit, NormalizeCrLfWide(text).c_str());
+                }
+                return 0;
+            }
+            break;
+        }
+        case WM_SIZE:
+            TaskOpenWhyLayout(hwnd, ds);
+            return 0;
+        case WM_COMMAND:
+            if (LOWORD(wParam) == IDOK || LOWORD(wParam) == IDCANCEL) {
+                DestroyWindow(hwnd);
+                return 0;
+            }
+            if (LOWORD(wParam) == 3303 && ds && !ds->triageCardId.empty()) {
+                ShowTriageDialog(ds->dash, L"all", ds->triageCardId);
+                return 0;
+            }
+            break;
+        case WM_CTLCOLORSTATIC:
+        case WM_CTLCOLOREDIT: {
+            HDC hdc = reinterpret_cast<HDC>(wParam);
+            SetTextColor(hdc, g_theme.text);
+            SetBkColor(hdc, g_theme.panel);
+            return reinterpret_cast<LRESULT>(g_dialogBgBrush);
+        }
+        case WM_ERASEBKGND: {
+            HDC hdc = reinterpret_cast<HDC>(wParam);
+            RECT rc = {};
+            GetClientRect(hwnd, &rc);
+            FillRect(hdc, &rc, g_dialogBgBrush);
+            return 1;
+        }
+        case WM_CLOSE:
+            DestroyWindow(hwnd);
+            return 0;
+        case WM_NCDESTROY:
+            delete ds;
+            SetWindowLongPtrW(hwnd, GWLP_USERDATA, 0);
+            return 0;
+    }
+    return DefWindowProcW(hwnd, msg, wParam, lParam);
+}
+
+static void ShowTaskOpenWhyDialog(DashboardState* st, const std::string& taskId) {
+    if (!st || taskId.empty()) return;
+    std::string err;
+    const std::string resp = TaskShowIpc(st, taskId, 1, err);
+    const nlohmann::json doc = nlohmann::json::parse(resp, nullptr, false);
+    auto* ds = new TaskOpenWhyDlgState();
+    ds->dash = st;
+    ds->fontUi = st->hFontUi;
+    ds->taskId = taskId;
+    if (doc.is_object()) {
+        const auto why = doc.value("why", nlohmann::json::array());
+        for (const auto& entry : why) {
+            if (entry.is_object()) ds->reasons.push_back(entry);
+        }
+    }
+    ds->triageCardId = TaskOpenWhyTriageCardId(st, ds->reasons);
+
+    HINSTANCE hInst = GetModuleHandleW(nullptr);
+    static bool registered = false;
+    if (!registered) {
+        WNDCLASSEXW wc = {};
+        wc.cbSize = sizeof(wc);
+        wc.style = CS_HREDRAW | CS_VREDRAW;
+        wc.lpfnWndProc = TaskOpenWhyWndProc;
+        wc.hInstance = hInst;
+        wc.hCursor = LoadCursorW(nullptr, IDC_ARROW);
+        wc.hbrBackground = reinterpret_cast<HBRUSH>(COLOR_BTNFACE + 1);
+        wc.lpszClassName = L"HanchoTaskOpenWhyWnd";
+        RegisterClassExW(&wc);
+        registered = true;
+    }
+
+    std::wstring title = Tr(L"なぜ open か", L"Why is task open", L"Por qué está abierta la tarea");
+    title += L" — " + Utf8ToWide(taskId);
+    RECT parent = {};
+    GetWindowRect(st->hwndMain, &parent);
+    const int dlgW = 860;
+    const int dlgH = 560;
+    const int x = parent.left + ((parent.right - parent.left) - dlgW) / 2;
+    const int y = parent.top + ((parent.bottom - parent.top) - dlgH) / 2;
+    HWND hDlg = CreateWindowExW(WS_EX_DLGMODALFRAME, L"HanchoTaskOpenWhyWnd", title.c_str(),
+        WS_OVERLAPPEDWINDOW | WS_VISIBLE, x, y, dlgW, dlgH, st->hwndMain, nullptr, hInst, ds);
+    if (hDlg) {
+        ShowWindow(hDlg, SW_SHOW);
+        SetForegroundWindow(hDlg);
+    } else {
+        delete ds;
+    }
+}
+
 struct MemoryListDlgState {
     DashboardState* dash = nullptr;
     HFONT fontUi = nullptr;
@@ -6775,6 +6984,13 @@ static void RunOriginJobsAction(DashboardState* st, int cmd) {
 
 static void ShowTaskQueueContextMenu(DashboardState* st, const std::string& jobId, POINT ptScreen, const std::wstring& cellText) {
     if (!st || jobId.empty()) return;
+    std::string taskId;
+    for (size_t i = 0; i < st->taskJobIds.size() && i < st->taskDisplayRows.size(); ++i) {
+        if (st->taskJobIds[i] == jobId) {
+            taskId = st->taskDisplayRows[i].taskId;
+            break;
+        }
+    }
     const bool directionRow = jobId.rfind("direction:", 0) == 0;
     const bool groupRow = jobId.rfind("group:", 0) == 0;
     const bool virtualJob = jobId.rfind("btplan:", 0) == 0 || groupRow || directionRow;
@@ -7151,6 +7367,8 @@ static void ShowTaskQueueContextMenu(DashboardState* st, const std::string& jobI
     AppendMenuW(hMenu, MF_SEPARATOR, 0, nullptr);
     AppendMenuW(hMenu, MF_STRING, 3106, Tr(L"詳細を表示", L"Show details", L"Ver detalles"));
     AppendMenuW(hMenu, MF_STRING, 3114, Tr(L"なぜ失敗したか", L"Why failed", L"Por qué falló"));
+    AppendMenuW(hMenu, MF_STRING | (taskId.empty() ? MF_GRAYED : 0), 3116,
+                Tr(L"なぜ open か", L"Why is task open...", L"Por qué está abierta la tarea..."));
     AppendMenuW(hMenu, MF_STRING, 3112, Tr(L"過去の実行を表示", L"Show past runs", L"Ver ejecuciones anteriores"));
     AppendMenuW(hMenu, MF_STRING, 3113, Tr(L"メモリ一覧...", L"Memory list...", L"Lista de memoria..."));
     auto triageIt = st->triageJobs.find(jobId);
@@ -7373,6 +7591,8 @@ static void ShowTaskQueueContextMenu(DashboardState* st, const std::string& jobI
         ShowTaskQueueJobDetails(st, jobId, 2);
     } else if (cmd == 3114) {
         ShowTaskQueueJobDetails(st, jobId, 3);
+    } else if (cmd == 3116) {
+        ShowTaskOpenWhyDialog(st, taskId);
     } else if (cmd == 3113) {
         ShowMemoryListDialog(st);
     } else if (cmd == 3115) {

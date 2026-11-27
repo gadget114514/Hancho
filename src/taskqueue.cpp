@@ -2408,7 +2408,7 @@ static std::map<std::string, std::string> ParseJsonStringMap(const std::string& 
 
 static TaskQueueJob ParseJob(const std::string& j) {
     TaskQueueJob job;
-    job.id = JsonFieldStr(j, "id", "");
+    job.id = nlohmann::json::parse(j, nullptr, false).value("id", std::string());
     job.taskqueue = JsonFieldStr(j, "taskqueue", "");
     job.name = JsonFieldStr(j, "name", "");
     job.summary = JsonFieldStr(j, "summary", "");
@@ -10254,6 +10254,180 @@ bool TaskQueueManager::TaskGet(const std::string& id, nlohmann::json& outRecord)
     return taskStore_.Get(id, outRecord);
 }
 
+nlohmann::json TaskQueueManager::TaskOpenWhy(const std::string& taskId) const {
+    std::lock_guard<std::mutex> lock(mutex_);
+    return TaskOpenWhyLocked(taskId);
+}
+
+nlohmann::json TaskQueueManager::TaskOpenWhyLocked(const std::string& taskId) const {
+    nlohmann::json out = nlohmann::json::array();
+    auto addEntry = [&out](const std::string& kind, const std::string& id,
+                           const std::string& detail, const std::string& source,
+                           const nlohmann::json& extra = nlohmann::json::object()) {
+        nlohmann::json entry = {{"kind", kind}, {"id", id}, {"detail", detail}, {"source", source}};
+        if (extra.is_object()) {
+            for (auto it = extra.begin(); it != extra.end(); ++it) entry[it.key()] = it.value();
+        }
+        out.push_back(std::move(entry));
+    };
+
+    std::unordered_map<std::string, std::string> numberToDirId;
+    for (const auto& rec : directionStore_.All()) {
+        if (rec.value("taskId", std::string()) != taskId) continue;
+        if (!rec.contains("card") || !rec["card"].is_object()) continue;
+        const std::string num = rec["card"].value("number", std::string());
+        const nlohmann::json head = FollowCardHeadLocked(directionStore_, rec);
+        const std::string headId = head.value("id", std::string());
+        if (!num.empty() && !headId.empty()) numberToDirId[num] = headId;
+    }
+
+    auto walkBtNodes = [&addEntry](const std::string& btId, const nlohmann::json& node,
+                                   const std::function<void(const nlohmann::json&)>& walk) {
+        if (!node.is_object()) return;
+        if (node.value("type", std::string()) == "escalate") {
+            const nlohmann::json status = node.value("status", nlohmann::json::object());
+            if (status.value("state", std::string()) == "running" &&
+                status.value("answer", std::string()).empty()) {
+                const std::string nodeId = node.value("id", node.value("key", std::string()));
+                const std::string question = node.value("question", std::string());
+                addEntry("escalate_question", nodeId.empty() ? btId : nodeId,
+                         "BT " + btId + " node " + nodeId + " waits for an answer: " + question, "bt",
+                         nlohmann::json{{"btId", btId}, {"node", nodeId}, {"question", question}});
+            }
+        }
+        for (auto it = node.begin(); it != node.end(); ++it) walk(it.value());
+    };
+    auto collectBtEscalations = [&walkBtNodes](const std::string& btId, const nlohmann::json& doc) {
+        std::function<void(const nlohmann::json&)> walk = [&](const nlohmann::json& n) {
+            if (n.is_object()) {
+                walkBtNodes(btId, n, walk);
+            } else if (n.is_array()) {
+                for (const auto& child : n) walk(child);
+            }
+        };
+        walk(doc);
+    };
+
+    for (const std::string& dirId : CollectTaskDirectionIds(queues_, directionStore_, taskId)) {
+        nlohmann::json rec;
+        const bool hasRec = directionStore_.Get(dirId, rec) && rec.is_object();
+        if (hasRec && rec.contains("closed") && rec["closed"].is_object()) continue;
+        const std::string kind = hasRec ? rec.value("kind", std::string()) : std::string("job");
+        const std::string btId = hasRec ? rec.value("btId", std::string()) : std::string();
+        const std::string supersededBy = hasRec ? rec.value("supersededBy", std::string()) : std::string();
+        if (!supersededBy.empty()) {
+            nlohmann::json extra = {{"supersededBy", supersededBy}};
+            if (!kind.empty()) extra["directionKind"] = kind;
+            addEntry("superseded_run", dirId,
+                     "direction " + dirId + " superseded by " + supersededBy, "direction", extra);
+            continue;
+        }
+        const std::string state = DirectionStateLocked(dirId).value("state", std::string("open"));
+        if (state == "planned" || state == "open") {
+            const std::string whyKind = (state == "planned") ? "planned_direction" : "open_direction";
+            const std::string detail = "direction " + dirId +
+                (kind.empty() ? std::string() : " (" + kind + ")") +
+                (state == "planned" ? " planned with no job yet" : " open");
+            nlohmann::json extra = {{"state", state}, {"directionKind", kind}};
+            if (!btId.empty()) extra["btId"] = btId;
+            addEntry(whyKind, dirId, detail, btId.empty() ? "direction" : "bt", extra);
+        } else if (state == "waitingForLlm" || state == "paused" || state == "idle") {
+            const std::string whyKind = (state == "waitingForLlm") ? "waiting_for_llm"
+                                        : (state == "paused") ? "paused" : "idle";
+            const std::string id = btId.empty() ? dirId : btId;
+            addEntry(whyKind, id, "direction " + dirId + " is " + state,
+                     btId.empty() ? "direction" : "bt",
+                     nlohmann::json{{"state", state}, {"directionId", dirId}});
+        }
+        if (hasRec && rec.contains("card") && rec["card"].is_object() &&
+            rec.contains("after") && rec["after"].is_array()) {
+            const std::string cardNumber = rec["card"].value("number", std::string());
+            for (const auto& dep : rec["after"]) {
+                if (!dep.is_string()) continue;
+                const std::string depNum = dep.get<std::string>();
+                auto it = numberToDirId.find(depNum);
+                if (it != numberToDirId.end() &&
+                    IsDirectionSatisfiedForCardDep(DirectionStateLocked(it->second))) continue;
+                addEntry("card_waiting_for", cardNumber,
+                         "card " + cardNumber + " waits for " + depNum, "card",
+                         nlohmann::json{{"waitingFor", depNum}, {"directionId", dirId}});
+            }
+        }
+        if (!btId.empty()) {
+            const std::wstring btDir = PathJoinWide(GetLogsDirectoryWide(), L"behaviortrees");
+            const std::wstring path = PathJoinWide(btDir, Utf8ToWide(SanitizeFileNameComponent(btId))) + L".json";
+            const nlohmann::json doc = nlohmann::json::parse(ReadFileUtf8Wide(path), nullptr, false);
+            if (doc.is_object()) collectBtEscalations(btId, doc);
+        }
+    }
+
+    const int64_t nowMs = GetNowTickMs();
+    for (const auto& [name, tq] : queues_) {
+        (void)name;
+        for (const auto& job : tq.jobs) {
+            if (job.taskId != taskId && !(job.taskId.empty() && job.id == taskId)) continue;
+            if (job.hidden) continue;
+            if (!job.supersededBy.empty()) {
+                addEntry("superseded_run", job.id,
+                         "job " + job.id + " superseded by " + job.supersededBy, "job",
+                         nlohmann::json{{"supersededBy", job.supersededBy}, {"state", job.state}});
+                continue;
+            }
+            bool allSat = true;
+            std::string unsatisfiedDep;
+            for (const auto& dep : job.dependsOn) {
+                const TaskQueueJob* depJob = ResolveDepJobLocked(dep.id);
+                if (!depJob || !IsDepSatisfied(*depJob, dep.on)) {
+                    allSat = false;
+                    if (unsatisfiedDep.empty()) unsatisfiedDep = dep.id;
+                    break;
+                }
+            }
+            nlohmann::json extra = nlohmann::json::object();
+            const std::string blockedBy = job.blockedBy.empty() ? unsatisfiedDep : job.blockedBy;
+            if (!blockedBy.empty()) extra["blockedBy"] = blockedBy;
+            if (!job.holdReason.empty()) extra["holdReason"] = job.holdReason;
+            if (job.retryAtMs > 0) extra["retryAtMs"] = job.retryAtMs;
+            const std::string resourceWait = ResourceWaitLocked(job, allSat, nowMs);
+            if (!resourceWait.empty()) extra["resource_wait"] = resourceWait;
+            std::string whyKind;
+            std::string detail;
+            if (job.state == "waitingForPermit") {
+                whyKind = "waiting_for_permit";
+                detail = "job " + job.id + " waits for a permit";
+            } else if (job.state == "waitingForLlm") {
+                whyKind = "waiting_for_llm";
+                detail = "job " + job.id + " waits for an LLM";
+            } else if (job.paused || job.state == "paused") {
+                whyKind = "paused";
+                detail = "job " + job.id + " is paused";
+            } else if (job.state == "idle") {
+                whyKind = "idle";
+                detail = "job " + job.id + " is idle";
+            } else if (job.state == "blocked" || (!allSat && !blockedBy.empty())) {
+                whyKind = "blocked_job";
+                detail = "job " + job.id + " blocked by " +
+                         (blockedBy.empty() ? std::string("a dependency") : blockedBy);
+            } else if (job.state == "pending") {
+                whyKind = "pending_job";
+                detail = "job " + job.id + " pending";
+            }
+            if (!whyKind.empty()) addEntry(whyKind, job.id, detail, "job", extra);
+        }
+    }
+
+    std::sort(out.begin(), out.end(), [](const nlohmann::json& a, const nlohmann::json& b) {
+        const std::string ak = a.value("kind", std::string()), bk = b.value("kind", std::string());
+        if (ak != bk) return ak < bk;
+        const std::string ai = a.value("id", std::string()), bi = b.value("id", std::string());
+        if (ai != bi) return ai < bi;
+        const std::string ad = a.value("detail", std::string()), bd = b.value("detail", std::string());
+        if (ad != bd) return ad < bd;
+        return a.dump() < b.dump();
+    });
+    return out;
+}
+
 std::string TaskQueueManager::TaskShow(const std::string& id, int64_t logLimit, std::string& outError) {
     outError.clear();
     nlohmann::json record;
@@ -10375,6 +10549,7 @@ std::string TaskQueueManager::TaskShow(const std::string& id, int64_t logLimit, 
     for (auto& c : cardItems) cards.push_back(std::move(c));
     return nlohmann::json{{"ok", true}, {"task", record}, {"status", TaskStateLocked(id)},
                           {"directions", directions}, {"cards", cards}, {"jobs", jobs}, {"log", log},
+                          {"why", TaskOpenWhyLocked(id)},
                           {"repeatedFailures", repeatedFailures}}.dump();
 }
 

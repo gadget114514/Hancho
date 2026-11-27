@@ -2780,7 +2780,7 @@ AUDIT (feedback on the supervisor's plan; preview, rule-based, no LLM call yet):
     std::cout << R"(TASKS (group jobs and behavior trees under a shared intent and progress log):
   task create --title "..." [--intent "..." | --intent-file <path>] [--id <id>] [--card-defaults <json>] [--json]
   task update <id> [--title "..."] [--intent "..." | --intent-file <path>] [--card-defaults <json>]
-  task show <id> [--log-limit N] [--json]
+  task show <id> [--log-limit N] [--why] [--json]
   task list [--state open|running|failed|cancelled|succeeded|closed] [--limit N] [--all] [--before <cursor>] [--query <text>] [--json]
   task note <id> --text "..."
   task close <id> --result succeeded|failed --reason "..."
@@ -3246,7 +3246,7 @@ void PrintCliUsageJson() {
       "subcommands": [
         {"name": "create", "usage": "hancho-cli task create --title \"...\" [--intent \"...\" | --intent-file <path>] [--id <id>] [--card-defaults <json>] [--json]", "description": "Create a task record and return its id."},
         {"name": "update", "usage": "hancho-cli task update <id> [--title \"...\"] [--intent \"...\" | --intent-file <path>] [--card-defaults <json>]", "description": "Update a task's title, intent, or cardDefaults."},
-        {"name": "show", "usage": "hancho-cli task show <id> [--log-limit N] [--json]", "description": "Show task record, computed state, jobs and progress log."},
+        {"name": "show", "usage": "hancho-cli task show <id> [--log-limit N] [--why] [--json]", "description": "Show task record, computed state, jobs and progress log. --why prints the deterministic reasons the task is still open."},
         {"name": "list", "usage": "hancho-cli task list [--state open|running|failed|cancelled|succeeded|closed] [--limit N] [--all] [--before <cursor>] [--query <text>] [--json]", "description": "List tasks, optionally filtered by state or query. --limit N caps finished tasks (default from config.json task_list_recent_count, 30); --all shows all."},
         {"name": "note", "usage": "hancho-cli task note <id> --text \"...\"", "description": "Append a note to the task's progress log."},
         {"name": "close", "usage": "hancho-cli task close <id> --result succeeded|failed --reason \"...\"", "description": "Close a task with result and reason."},
@@ -3254,7 +3254,8 @@ void PrintCliUsageJson() {
         {"name": "purge", "usage": "hancho-cli task purge --older-than <sec>", "description": "Remove closed tasks older than <sec> seconds."},
         {"name": "wait", "usage": "hancho-cli task wait <id> [--timeout-ms N]", "description": "Wait until all active jobs of a task finish or timeout elapses."}
       ],
-      "options": [{"name": "--json", "description": "Print the raw IPC response."}]
+      "options": [{"name": "--json", "description": "Print the raw IPC response."},
+                  {"name": "--why", "description": "With task show, print the deterministic open reasons."}]
     },
     {
       "name": "direction",
@@ -4171,7 +4172,7 @@ static std::string ReadTriageDisplayLanguage() {
 }
 
 int PrintResponse(const std::string& action, const std::string& respJson, bool jsonOutput,
-                  int requestedId = 0, bool waitForCompletion = false) {
+                  int requestedId = 0, bool waitForCompletion = false, bool showTaskWhy = false) {
     if (action == "taskqueue_why") {
         return PrintTaskQueueWhy(respJson, jsonOutput,
                                  requestedId > 0 ? std::to_string(requestedId) : std::string());
@@ -4625,6 +4626,15 @@ int PrintResponse(const std::string& action, const std::string& respJson, bool j
             if (!intent.empty()) {
                 std::cout << CliTr(DisplayLangSetting(), "意図: ", "Intent: ", "Intención: ")
                           << CachedDisplayText(intent, DisplayLangSetting()) << "\n";
+            }
+            if (showTaskWhy) {
+                const auto why = r.value("why", nlohmann::json::array());
+                std::cout << "Why open (" << why.size() << "):\n";
+                for (const auto& w : why) {
+                    std::cout << "  " << w.value("kind", std::string())
+                              << " " << w.value("id", std::string())
+                              << " - " << w.value("detail", std::string()) << "\n";
+                }
             }
             const auto cards = r.value("cards", nlohmann::json::array());
             if (!cards.empty()) {
@@ -7509,6 +7519,7 @@ int RunCli(const std::vector<std::string>& rawArgs) {
 
     std::ostringstream reqJson;
     int requestedId = 0;
+    bool showTaskWhy = false;
 
 #ifdef HANCHO_DEMO_BUILD
     if (subcmd == "demo") {
@@ -8041,7 +8052,7 @@ if (subcmd == "start" || subcmd == "run") {
                 << "Subcommands:\n"
                 << "  create  --title \"...\" [--intent \"...\" | --intent-file <path>] [--id <id>] [--card-defaults <json>]\n"
                 << "  update  <id> [--title \"...\"] [--intent \"...\" | --intent-file <path>] [--card-defaults <json>]\n"
-                << "  show    <id> [--log-limit N]\n"
+                << "  show    <id> [--log-limit N] [--why]\n"
                 << "  list    [--state open|running|failed|cancelled|succeeded|closed] [--limit N]\n"
                 << "  note    <id> --text \"...\"\n"
                 << "  close   <id> --result succeeded|failed --reason \"...\"\n"
@@ -8110,6 +8121,9 @@ if (subcmd == "start" || subcmd == "run") {
             const std::string ll = argVal("--log-limit", "");
             if (!ll.empty()) {
                 try { logLimit = std::stoll(ll); } catch (...) { return failWith("invalid --log-limit"); }
+            }
+            for (size_t i = 3; i < args.size(); ++i) {
+                if (args[i] == "--why") showTaskWhy = true;
             }
             req["action"] = "task_show";
             req["id"] = id;
@@ -9536,7 +9550,7 @@ if (subcmd == "start" || subcmd == "run") {
         return 1;
     }
 
-    return PrintResponse(subcmd, respJson, jsonOutput, requestedId, waitForCompletion);
+    return PrintResponse(subcmd, respJson, jsonOutput, requestedId, waitForCompletion, showTaskWhy);
 }
 
 } // namespace pc

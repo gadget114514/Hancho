@@ -5895,6 +5895,110 @@ int main() {
         SetDataDirectoryOverride(dir);
     }
 
+    // Deterministic why-open reasons (doc/task-open-why-card-plan.md).
+    {
+        const std::wstring whyDir = dir + L"\\openwhy";
+        CreateDirectoryW(whyDir.c_str(), nullptr);
+        SetDataDirectoryOverride(whyDir);
+        const std::string taskId = "task_openwhy";
+        const std::string tqName = "openwhyq";
+        nlohmann::json fixture = {
+            {"name", tqName}, {"concurrency", 1}, {"paused", true}, {"version", 1},
+            {"notify_file", ""}, {"max_timeout_sec", 7200}, {"default_max_attempts", 2},
+            {"jobs", nlohmann::json::array()}
+        };
+        auto fixtureJob = [&](const std::string& id, const std::string& state,
+                              const nlohmann::json& extra) {
+            nlohmann::json j = {
+                {"id", id}, {"taskqueue", tqName}, {"summary", "why job " + id},
+                {"command", "cmd /c exit 0"}, {"timeout_sec", 30}, {"max_attempts", 1},
+                {"state", state}, {"task_id", taskId}
+            };
+            if (extra.is_object()) {
+                for (auto it = extra.begin(); it != extra.end(); ++it) j[it.key()] = it.value();
+            }
+            return j;
+        };
+        nlohmann::json deps = nlohmann::json::array();
+        deps.push_back({{"id", "OW_FAILED"}, {"on", "success"}});
+        fixture["jobs"].push_back(fixtureJob("OW_FAILED", "failed", nlohmann::json::object()));
+        fixture["jobs"].push_back(fixtureJob(
+            "OW_BLOCKED", "blocked",
+            nlohmann::json{{"blocked_by", "OW_FAILED"}, {"depends_on", deps}}));
+        fixture["jobs"].push_back(fixtureJob(
+            "OW_PERMIT", "waitingForPermit",
+            nlohmann::json{{"hold_reason", "permit denied"}, {"retry_at_ms", 1234567890}}));
+        WriteFileAtomicWide(TaskQueueManager::GetTaskQueueFileWide(tqName), fixture.dump(2));
+
+        TaskQueueManager tm;
+        ProcessManager pm;
+        tm.SetProcessManager(&pm);
+        auto parse = [](const std::string& s) { return nlohmann::json::parse(s, nullptr, false); };
+        std::string e;
+        Check(parse(tm.TaskCreate("Open why task", "", taskId, "", e)).value("ok", false),
+              "why: task created");
+        const nlohmann::json c1 = parse(tm.CardAdd(taskId, "OW-1", "Card 1", "body", {},
+                                                   "", "", "", e));
+        const nlohmann::json c2 = parse(tm.CardAdd(taskId, "OW-2", "Card 2", "body", {},
+                                                   "", "", "", e));
+        const nlohmann::json c3 = parse(tm.CardAdd(taskId, "OW-3", "Card 3", "body", {"OW-2"},
+                                                   "", "", "", e));
+        Check(c1.value("ok", false) && c2.value("ok", false) && c3.value("ok", false),
+              "why: three cards added");
+        const std::string oldDir = c1.value("directionId", std::string());
+        const std::string newDir = c2.value("directionId", std::string());
+        Check(tm.DirectionSetRedo(oldDir, newDir, "rescue", e), "why: first direction superseded");
+
+        const nlohmann::json shown1 = parse(tm.TaskShow(taskId, 0, e));
+        const nlohmann::json shown2 = parse(tm.TaskShow(taskId, 0, e));
+        const auto why1 = shown1.value("why", nlohmann::json::array());
+        const auto why2 = shown2.value("why", nlohmann::json::array());
+        Check(shown1.value("ok", false) && why1.is_array(), "why: TaskShow returns a why array");
+        Check(why1.dump() == why2.dump(), "why: repeated TaskShow calls are byte-identical");
+        auto has = [&why1](const std::string& kind, const std::string& id) {
+            for (const auto& entry : why1) {
+                if (entry.value("kind", std::string()) == kind &&
+                    entry.value("id", std::string()) == id) return true;
+            }
+            return false;
+        };
+        Check(has("planned_direction", newDir), "why: planned direction is reported");
+        Check(has("card_waiting_for", "OW-3"), "why: card waiting for a dependency is reported");
+        Check(has("blocked_job", "OW_BLOCKED"), "why: blocked job is reported DBG " + why1.dump() + " STATE " + tm.TaskQueueList(tqName, "", 0, e, "", "", true, "") );
+        Check(has("waiting_for_permit", "OW_PERMIT"), "why: waitingForPermit job is reported");
+        Check(has("superseded_run", oldDir), "why: superseded direction is reported");
+        bool blockedBy = false, permitDetail = false, waitingFor = false;
+        for (const auto& entry : why1) {
+            const std::string kind = entry.value("kind", std::string());
+            const std::string id = entry.value("id", std::string());
+            if (kind == "blocked_job" && id == "OW_BLOCKED") {
+                blockedBy = entry.value("blockedBy", std::string()) == "OW_FAILED";
+            } else if (kind == "waiting_for_permit" && id == "OW_PERMIT") {
+                permitDetail = entry.value("holdReason", std::string()) == "permit denied" &&
+                               entry.value("retryAtMs", int64_t(0)) == 1234567890;
+            } else if (kind == "card_waiting_for" && id == "OW-3") {
+                waitingFor = entry.value("waitingFor", std::string()) == "OW-2";
+            }
+        }
+        Check(blockedBy, "why: blocked job records its blockedBy");
+        Check(permitDetail, "why: waitingForPermit job records holdReason and retryAtMs");
+        Check(waitingFor, "why: card_waiting_for records the unsatisfied dependency");
+        size_t sorted = 0;
+        for (size_t i = 1; i < why1.size(); ++i) {
+            const std::string prev = why1[i - 1].value("kind", std::string()) + "/" +
+                                     why1[i - 1].value("id", std::string()) + "/" +
+                                     why1[i - 1].value("detail", std::string());
+            const std::string cur = why1[i].value("kind", std::string()) + "/" +
+                                    why1[i].value("id", std::string()) + "/" +
+                                    why1[i].value("detail", std::string());
+            if (prev < cur) ++sorted;
+        }
+        Check(why1.size() >= 5 && sorted + 1 == why1.size(), "why: entries are sorted by kind/id/detail");
+        tm.ShutdownTaskQueueManager();
+        tm.SetProcessManager(nullptr);
+        SetDataDirectoryOverride(dir);
+    }
+
     TestCardMarkdown();
     TestCardMarkdownForms();
     TestCardMarkdownTranslation();
