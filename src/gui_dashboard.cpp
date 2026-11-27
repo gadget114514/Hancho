@@ -929,6 +929,7 @@ struct DashboardState {
     WINDOWPLACEMENT windowPlacement = {sizeof(WINDOWPLACEMENT)};
     int processListColumnWidths[14] = {52, 78, 100, 100, 120, 140, 85, 65, 72, 78, 70, 185, 175, 80};
     int taskListColumnWidths[14] = {90, 350, 104, 100, 150, 105, 115, 190, 110, 82, 150, 140, 180, 160};
+    bool taskListWidthsCustomized = false;
     HWND hwndBtnSettings = nullptr;
     HWND hwndBtnKillSel = nullptr;
     HWND hwndBtnKillAll = nullptr;
@@ -7952,6 +7953,20 @@ static void RefreshTaskQueueData(DashboardState* st, bool force = false, bool us
     st->taskHasMoreFinished = filtered.hasMore;
     st->taskHiddenFinishedCount = static_cast<int>(filtered.totalFinished - filtered.shownFinished);
 
+    auto timeLeftText = [](const pc::TaskDisplayRow& drow) -> std::wstring {
+        if (!drow.hasTimeLeft) return L"";
+        if (drow.hasTimeBudget) {
+            if (drow.remainingSec >= 0) {
+                return Tr(L"残り ", L"", L"Quedan ") + FormatCompactDuration(drow.remainingSec) +
+                       Tr(L"", L" left", L"");
+            }
+            return Tr(L"見込み超過 ", L"over by ", L"Excedido ") +
+                   FormatCompactDuration(-drow.remainingSec);
+        }
+        return Tr(L"経過 ", L"", L"Lleva ") + FormatCompactDuration(drow.elapsedSec) +
+               Tr(L" (終了未定)", L" elapsed (no end set)", L" (sin fin previsto)");
+    };
+
     std::vector<TaskListRow> rows;  // one entry per visible row, in the order the list shows them
     std::unordered_set<std::string> nowRunning;  // jobs running now, to spot the ones that just ended
     std::map<std::string, int> failureCounts;   // failure class -> jobs, for the list caption
@@ -7989,6 +8004,9 @@ static void RefreshTaskQueueData(DashboardState* st, bool force = false, bool us
                 if (sEpoch > 0 && eEpoch >= sEpoch) {
                     endStr += L" (" + FormatCompactDuration(eEpoch - sEpoch) + L")";
                 }
+            } else {
+                std::wstring left = timeLeftText(drow);
+                if (!left.empty()) endStr = std::move(left);
             }
             row.cells[6] = std::move(endStr);
 
@@ -8090,6 +8108,9 @@ static void RefreshTaskQueueData(DashboardState* st, bool force = false, bool us
                 if (sEpoch > 0 && eEpoch >= sEpoch) {
                     endStr += L" (" + FormatCompactDuration(eEpoch - sEpoch) + L")";
                 }
+            } else {
+                std::wstring left = timeLeftText(drow);
+                if (!left.empty()) endStr = std::move(left);
             }
             row.cells[6] = std::move(endStr);
 
@@ -9106,6 +9127,16 @@ static void UpdateTaskListColumnWidths(DashboardState* st) {
     GetClientRect(st->hwndTaskList, &rc);
     int total = rc.right - rc.left;
     if (total < 400) return;
+    if (st->taskListWidthsCustomized) {
+        // Columns the user (or a saved config) sized are kept as-is when the window changes.
+        for (int i = 0; i < kTaskListColumns; ++i) {
+            const int width = st->taskListColumnWidths[i] > 0 ? st->taskListColumnWidths[i] : 80;
+            if (ListView_GetColumnWidth(st->hwndTaskList, i) != width) {
+                ListView_SetColumnWidth(st->hwndTaskList, i, width);
+            }
+        }
+        return;
+    }
     if (st->taskFitColW[0] == 0) MeasureTaskFitColumns(st);
 
     int widths[kTaskListColumns] = {};
@@ -14033,7 +14064,10 @@ static void LoadShellConfig(DashboardState* st) {
             }
         };
         loadColumnWidths("process_list_column_widths", st->processListColumnWidths, 14);
-        loadColumnWidths("task_list_column_widths", st->taskListColumnWidths, kTaskListColumns);
+        if (configJson.contains("task_list_column_widths")) {
+            loadColumnWidths("task_list_column_widths", st->taskListColumnWidths, kTaskListColumns);
+            st->taskListWidthsCustomized = true;
+        }
     }
 
     std::string defShell = JsonGetString(content, "default_shell", "powershell");
@@ -24214,6 +24248,14 @@ static LRESULT CALLBACK DashboardWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPA
                     }
                 }
             } else if (nmhdr->idFrom == IDC_LIST_TASKS) {
+                if (nmhdr->code == HDN_ENDTRACKW) {
+                    // A column the user just resized must survive window/layout changes.
+                    for (int i = 0; i < kTaskListColumns; ++i) {
+                        st->taskListColumnWidths[i] = ListView_GetColumnWidth(st->hwndTaskList, i);
+                    }
+                    st->taskListWidthsCustomized = true;
+                    return 0;
+                }
                 if (nmhdr->code == LVN_GETDISPINFOW) {
                     // 102-5: owner-data list. No cell text lives in the control; every cell is
                     // read from the immutable row snapshot on demand.

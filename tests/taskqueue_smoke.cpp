@@ -4177,6 +4177,42 @@ int main() {
             Check(sawTaskEnd, "103-3: end-time task heading exists");
         }
 
+        // Running task/direction headings carry the countdown of their running jobs.
+        {
+            std::time_t startEpoch = static_cast<std::time_t>(GetNowEpochSec()) - 60;
+            std::tm lt = {};
+            LocalTimeFromSec(&startEpoch, &lt);
+            char buf[64] = {};
+            std::strftime(buf, sizeof(buf), "%Y-%m-%d %H:%M:%S", &lt);
+            const std::string startedAt = buf;
+
+            std::vector<nlohmann::json> rTasks = {
+                {{"id", "t_left"}, {"title", "countdown"}, {"state", "running"}, {"updatedAt", "2026-11-27T10:10:00Z"}}
+            };
+            std::vector<nlohmann::json> rJobs = {
+                {{"id", "r_run"}, {"task_id", "t_left"}, {"direction_id", "dir_left"},
+                 {"state", "running"}, {"summary", "running job"}, {"timeout_sec", 300},
+                 {"attempts", nlohmann::json::array({{{ "start", startedAt }}})}},
+                {{"id", "r_done"}, {"task_id", "t_left"}, {"direction_id", "dir_left"},
+                 {"state", "succeeded"}, {"summary", "finished job"}, {"created_at", "2026-11-27T09:00:00Z"}}
+            };
+            TaskViewCounts rCounts;
+            std::unordered_map<std::string, bool> rOv;
+            std::unordered_set<std::string> rAll;
+            bool sawTaskLeft = false, sawDirLeft = false;
+            for (const auto& r : BuildTaskDisplayRows(rJobs, rTasks, true, rOv, rAll, rCounts, 8)) {
+                if (r.kind == TaskDisplayRowKind::TaskHeading && r.taskId == "t_left") {
+                    sawTaskLeft = r.hasTimeLeft && r.hasTimeBudget && r.endTime.empty() &&
+                                  r.remainingSec >= 235 && r.remainingSec <= 240;
+                } else if (r.kind == TaskDisplayRowKind::DirectionHeading && r.directionId == "dir_left") {
+                    sawDirLeft = r.hasTimeLeft && r.hasTimeBudget && r.endTime.empty() &&
+                                 r.remainingSec >= 235 && r.remainingSec <= 240;
+                }
+            }
+            Check(sawTaskLeft, "103-3: running task heading has a remaining-time countdown");
+            Check(sawDirLeft, "103-3: running direction heading has a remaining-time countdown");
+        }
+
         // Older jobs summary ("MoreJobs") when exceeding maxVisibleJobsPerTask=1
         auto cappedRows = BuildTaskDisplayRows(jobs, tasks, true, overrides, showAll, counts, 1);
         bool foundMore = false;

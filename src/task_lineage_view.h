@@ -3,8 +3,11 @@
 #include "nlohmann/json.hpp"
 #include <algorithm>
 #include <cctype>
+#include <chrono>
 #include <cstddef>
 #include <cstdint>
+#include <cstdio>
+#include <ctime>
 #include <map>
 #include <string>
 #include <unordered_map>
@@ -48,6 +51,10 @@ struct TaskDisplayRow {
     std::string startTime;
     std::string endTime;
     std::string runningDetail;
+    bool hasTimeLeft = false;
+    bool hasTimeBudget = false;
+    int64_t remainingSec = 0;
+    int64_t elapsedSec = 0;
 };
 
 struct TaskViewCounts {
@@ -131,6 +138,63 @@ inline bool IsActiveTaskState(const std::string& state) {
     return state == "running" || state == "pending" || state == "waiting" ||
            state == "planned" || state == "waitingForPermit" || state == "waitingForLlm" ||
            state == "paused" || state == "idle" || state == "open" || state == "takenOver";
+}
+
+inline int64_t ParseTaskTimeEpoch(const std::string& text) {
+    if (text.size() < 19) return 0;
+    std::string s = text;
+    if (s[10] == 'T') s[10] = ' ';
+    if (s.size() > 19 && (s.back() == 'Z' || s.back() == 'z')) s.pop_back();
+    int y = 0, mo = 0, d = 0, h = 0, mi = 0, se = 0;
+    if (std::sscanf(s.c_str(), "%d-%d-%d %d:%d:%d", &y, &mo, &d, &h, &mi, &se) != 6) return 0;
+    std::tm t = {};
+    t.tm_year = y - 1900;
+    t.tm_mon = mo - 1;
+    t.tm_mday = d;
+    t.tm_hour = h;
+    t.tm_min = mi;
+    t.tm_sec = se;
+    t.tm_isdst = -1;
+    const time_t epoch = std::mktime(&t);
+    return epoch == static_cast<time_t>(-1) ? 0 : static_cast<int64_t>(epoch);
+}
+
+struct RunningTimeLeft {
+    bool hasRunning = false;
+    bool hasBudget = false;
+    int64_t remainingSec = 0;
+    int64_t elapsedSec = 0;
+};
+
+// A heading has no attempt of its own: use the shortest remaining time of its running jobs.
+inline RunningTimeLeft ComputeRunningTimeLeft(const std::vector<nlohmann::json>& jobs) {
+    RunningTimeLeft out;
+    const int64_t now = static_cast<int64_t>(
+        std::chrono::system_clock::to_time_t(std::chrono::system_clock::now()));
+    for (const auto& j : jobs) {
+        if (!j.is_object() || j.value("state", std::string()) != "running") continue;
+        std::string startText;
+        if (j.contains("attempts") && j["attempts"].is_array() && !j["attempts"].empty()) {
+            const auto& last = j["attempts"].back();
+            if (last.is_object()) startText = last.value("start", std::string());
+        }
+        if (startText.empty()) startText = j.value("start_time", j.value("started_at", std::string()));
+        const int64_t start = ParseTaskTimeEpoch(startText);
+        if (start <= 0) continue;
+        const int64_t elapsed = (std::max)(static_cast<int64_t>(0), now - start);
+        out.hasRunning = true;
+        out.elapsedSec = (std::max)(out.elapsedSec, elapsed);
+        const int64_t estimate = static_cast<int64_t>(j.value("estimate_sec", j.value("estimateSec", 0)));
+        const int64_t timeout = static_cast<int64_t>(j.value("timeout_sec", j.value("timeoutSec", 0)));
+        const int64_t budget = estimate > 0 ? estimate : timeout;
+        if (budget <= 0) continue;
+        const int64_t remaining = budget - elapsed;
+        if (!out.hasBudget || remaining < out.remainingSec) {
+            out.hasBudget = true;
+            out.remainingSec = remaining;
+        }
+    }
+    return out;
 }
 
 inline std::string ComputeImplicitTaskState(const std::vector<nlohmann::json>& jobs) {
@@ -958,6 +1022,11 @@ inline std::vector<TaskDisplayRow> BuildTaskDisplayRows(
             hdr.startTime = taskEarliestStart;
             hdr.endTime = taskLatestEnd;
             hdr.runningDetail = tRunningDetail;
+            const RunningTimeLeft taskLeft = ComputeRunningTimeLeft(m.jobs);
+            hdr.hasTimeLeft = taskLeft.hasRunning;
+            hdr.hasTimeBudget = taskLeft.hasBudget;
+            hdr.remainingSec = taskLeft.remainingSec;
+            hdr.elapsedSec = taskLeft.elapsedSec;
 
             if (m.taskRecord.is_object()) {
                 hdr.jobJson = m.taskRecord;
@@ -1059,6 +1128,13 @@ inline std::vector<TaskDisplayRow> BuildTaskDisplayRows(
             dhdr.startTime = d.startTime;
             dhdr.endTime = d.endTime;
             dhdr.runningDetail = d.runningDetail;
+            std::vector<nlohmann::json> directionJobs = d.realJobs;
+            if (d.virtualJob.is_object()) directionJobs.push_back(d.virtualJob);
+            const RunningTimeLeft directionLeft = ComputeRunningTimeLeft(directionJobs);
+            dhdr.hasTimeLeft = directionLeft.hasRunning;
+            dhdr.hasTimeBudget = directionLeft.hasBudget;
+            dhdr.remainingSec = directionLeft.remainingSec;
+            dhdr.elapsedSec = directionLeft.elapsedSec;
 
             if (d.virtualJob.is_object()) {
                 dhdr.jobJson = d.virtualJob;
