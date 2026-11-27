@@ -5928,7 +5928,7 @@ int main() {
         fixture["jobs"].push_back(fixtureJob(
             "OW_PERMIT", "waitingForPermit",
             nlohmann::json{{"hold_reason", "permit denied"}, {"retry_at_ms", 1234567890}}));
-        WriteFileAtomicWide(TaskQueueManager::GetTaskQueueFileWide(tqName), fixture.dump(2));
+        fixture["jobs"].push_back(fixtureJob("OW_TASK_BLOCK", "blocked", nlohmann::json{{"blocked_by", "task_9"}, {"depends_on", nlohmann::json::array({{{"id", "task_9"}, {"on", "success"}}})}})); WriteFileAtomicWide(TaskQueueManager::GetTaskQueueFileWide(tqName), fixture.dump(2));
 
         TaskQueueManager tm;
         ProcessManager pm;
@@ -5964,7 +5964,7 @@ int main() {
         };
         Check(has("planned_direction", newDir), "why: planned direction is reported");
         Check(has("card_waiting_for", "OW-3"), "why: card waiting for a dependency is reported");
-        Check(has("blocked_job", "OW_BLOCKED"), "why: blocked job is reported DBG " + why1.dump() + " STATE " + tm.TaskQueueList(tqName, "", 0, e, "", "", true, "") );
+        Check(has("blocked_job", "OW_BLOCKED"), "why: blocked job is reported");
         Check(has("waiting_for_permit", "OW_PERMIT"), "why: waitingForPermit job is reported");
         Check(has("superseded_run", oldDir), "why: superseded direction is reported");
         bool blockedBy = false, permitDetail = false, waitingFor = false;
@@ -5972,7 +5972,7 @@ int main() {
             const std::string kind = entry.value("kind", std::string());
             const std::string id = entry.value("id", std::string());
             if (kind == "blocked_job" && id == "OW_BLOCKED") {
-                blockedBy = entry.value("blockedBy", std::string()) == "OW_FAILED";
+                blockedBy = entry.value("jobId", std::string()) == "OW_FAILED";
             } else if (kind == "waiting_for_permit" && id == "OW_PERMIT") {
                 permitDetail = entry.value("holdReason", std::string()) == "permit denied" &&
                                entry.value("retryAtMs", int64_t(0)) == 1234567890;
@@ -5980,7 +5980,7 @@ int main() {
                 waitingFor = entry.value("waitingFor", std::string()) == "OW-2";
             }
         }
-        Check(blockedBy, "why: blocked job records its blockedBy");
+        Check(blockedBy, "why: blocked job records its jobId"); bool taskIdField = false; for (const auto& entry : why1) { if (entry.value("kind", std::string()) == "blocked_job" && entry.value("id", std::string()) == "OW_TASK_BLOCK") taskIdField = entry.value("taskId", std::string()) == "task_9"; } Check(taskIdField, "why: task-id blocker is recorded as taskId");
         Check(permitDetail, "why: waitingForPermit job records holdReason and retryAtMs");
         Check(waitingFor, "why: card_waiting_for records the unsatisfied dependency");
         size_t sorted = 0;

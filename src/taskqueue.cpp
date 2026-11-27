@@ -10385,7 +10385,7 @@ nlohmann::json TaskQueueManager::TaskOpenWhyLocked(const std::string& taskId) co
             }
             nlohmann::json extra = nlohmann::json::object();
             const std::string blockedBy = job.blockedBy.empty() ? unsatisfiedDep : job.blockedBy;
-            if (!blockedBy.empty()) extra["blockedBy"] = blockedBy;
+            if (!blockedBy.empty()) { if (blockedBy.rfind("task_", 0) == 0) extra["taskId"] = blockedBy; else extra["jobId"] = blockedBy; }
             if (!job.holdReason.empty()) extra["holdReason"] = job.holdReason;
             if (job.retryAtMs > 0) extra["retryAtMs"] = job.retryAtMs;
             const std::string resourceWait = ResourceWaitLocked(job, allSat, nowMs);

@@ -16,7 +16,7 @@ only ask an LLM to summarize when necessary. This task implements the mechanical
 
 - `planned_direction` / `open_direction` — direction id, kind, state (from `DirectionStateLocked`
   and the direction record).
-- `pending_job` / `blocked_job` — job id, state, `blockedBy` (job.blockedBy), `holdReason`,
+- `pending_job` / `blocked_job` — job id, state, `jobId` / `taskId` (a task_ id is reported as taskId, otherwise jobId), `holdReason`,
   `retryAtMs`, `resource_wait`.
 - `waiting_for_permit` / `waiting_for_llm` / `paused` / `idle` — job or BT group id and state.
 - `card_waiting_for` — card number and each unsatisfied `after` dependency (`waitingFor` in
