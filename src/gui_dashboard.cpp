@@ -118,9 +118,15 @@ constexpr int kTaskSearchDebounceMs = 300;
 constexpr int kDefaultVisibleFinishedCount = 30;
 constexpr int kMinVisibleFinishedCount = 5;
 constexpr int kMaxVisibleFinishedCount = 500;
+constexpr int kDefaultTaskListDisplayDays = 2;
+constexpr int kMinTaskListDisplayDays = 1;
+constexpr int kMaxTaskListDisplayDays = 365;
 constexpr size_t kLoadMoreFinishedStep = 20;
 static int ClampTaskListRecentCount(int count) {
     return (std::clamp)(count, kMinVisibleFinishedCount, kMaxVisibleFinishedCount);
+}
+static int ClampTaskListDisplayDays(int days) {
+    return (std::clamp)(days, kMinTaskListDisplayDays, kMaxTaskListDisplayDays);
 }
 constexpr UINT kDashLayoutThrottleMs    = 16;  // ~60fps smooth tracking
 constexpr UINT kEndBlinkTimerMs = 200;         // repaint period while a blink is running
@@ -798,6 +804,7 @@ enum ControlId {
     IDC_SET_STREAM_REFRESH_INTERVAL = 6074,
     IDC_SET_PROCESS_METRICS_INTERVAL = 6075,
     IDC_SET_TASK_LIST_RECENT_COUNT = 6079,
+    IDC_SET_TASK_LIST_DISPLAY_DAYS = 6080,
     IDM_TRAY_RESTORE = 4001,
     IDM_TRAY_GRID_VIEW = 4002,
     IDM_TRAY_HIDE = 4003,
@@ -1092,6 +1099,7 @@ struct DashboardState {
     bool showTaskSearch = false;
     bool taskViewMode = true;  // true = 2-level task view, false = flat job view
     size_t visibleFinishedCount = kDefaultVisibleFinishedCount;  // 102-6: finished rows shown before "Load 20 more"
+    int taskListDisplayDays = kDefaultTaskListDisplayDays;
     bool taskHasMoreFinished = false;
     int taskHiddenFinishedCount = 0;
     std::wstring procSearchText;
@@ -8029,7 +8037,8 @@ static std::wstring TaskResultsSummary(const std::string& resultsCompact) {
     return out.empty() ? L"-" : out;
 }
 
-static int64_t YesterdayStartEpoch() {
+static int64_t DaysStartEpoch(int days) {
+    if (days < 1) days = 1;
     std::time_t now = static_cast<std::time_t>(GetNowEpochSec());
     std::tm local = {};
     if (!LocalTimeFromSec(&now, &local)) return 0;
@@ -8037,9 +8046,9 @@ static int64_t YesterdayStartEpoch() {
     local.tm_min = 0;
     local.tm_sec = 0;
     local.tm_isdst = -1;
-    local.tm_mday -= 1;
-    const std::time_t yesterday = std::mktime(&local);
-    return yesterday == static_cast<std::time_t>(-1) ? 0 : static_cast<int64_t>(yesterday);
+    local.tm_mday -= days;
+    const std::time_t start = std::mktime(&local);
+    return start == static_cast<std::time_t>(-1) ? 0 : static_cast<int64_t>(start);
 }
 
 static void RefreshTaskQueueData(DashboardState* st, bool force = false, bool useCachedList = false) {
@@ -8181,7 +8190,7 @@ static void RefreshTaskQueueData(DashboardState* st, bool force = false, bool us
     pc::TaskDisplayFilterOptions filterOptions;
     filterOptions.visibleFinishedCount = st->visibleFinishedCount;
     filterOptions.query = WideToUtf8(st->taskSearchText);
-    const int64_t keepSince = YesterdayStartEpoch();
+    const int64_t keepSince = DaysStartEpoch(st->taskListDisplayDays);
     for (const auto& task : st->cachedTasks) {
         if (!task.is_object()) continue;
         const std::string id = task.value("id", std::string());
@@ -14411,6 +14420,8 @@ static void LoadShellConfig(DashboardState* st) {
     if (st->pm) st->pm->SetMetricsIntervalMs(st->processMetricsIntervalMs);
     st->visibleFinishedCount = static_cast<size_t>(ClampTaskListRecentCount(static_cast<int>(
         JsonGetInt(content, "task_list_recent_count", kDefaultVisibleFinishedCount))));
+    st->taskListDisplayDays = ClampTaskListDisplayDays(static_cast<int>(
+        JsonGetInt(content, "task_list_display_days", kDefaultTaskListDisplayDays)));
     st->showSupervisorHints = JsonGetBool(content, "show_supervisor_hints", true);
     st->hintAutoDismissSec = static_cast<int>(JsonGetInt(content, "hint_auto_dismiss_sec", 7));
     // The supervisor runs only in batch; this is the engine name ("" = the default engine).
@@ -14563,7 +14574,8 @@ static void SaveShellConfig(const DashboardState* st) {
         << "  \"usage_refresh_interval_ms\": " << st->usageRefreshIntervalMs << ",\n"
         << "  \"stream_refresh_interval_ms\": " << st->streamRefreshIntervalMs << ",\n"
         << "  \"process_metrics_interval_ms\": " << st->processMetricsIntervalMs << ",\n"
-        << "  \"task_list_recent_count\": " << static_cast<int>(st->visibleFinishedCount) << "\n"
+        << "  \"task_list_recent_count\": " << static_cast<int>(st->visibleFinishedCount) << ",\n"
+        << "  \"task_list_display_days\": " << st->taskListDisplayDays << "\n"
         << "}\n";
 
     std::string serialized = ss.str();
@@ -15420,6 +15432,8 @@ struct SettingsDlgState {
       HWND editProcessMetricsInterval = nullptr;
       HWND lblTaskListRecentCount = nullptr;
       HWND editTaskListRecentCount = nullptr;
+      HWND lblTaskListDisplayDays = nullptr;
+      HWND editTaskListDisplayDays = nullptr;
       HWND lblPerformanceHint = nullptr;
       HWND lblListBg = nullptr;
       HWND btnListBg[kListRowKeyCount] = {};
@@ -15713,6 +15727,13 @@ static void CommitPerformanceSettings(SettingsDlgState* ds, bool persist = true)
         const int applied = ClampTaskListRecentCount(readValue(ds->editTaskListRecentCount));
         st->visibleFinishedCount = static_cast<size_t>(applied);
         SetWindowTextW(ds->editTaskListRecentCount, std::to_wstring(applied).c_str());
+        WakeDashboardDataFetch(st);
+        RefreshTaskQueueData(st, true);
+    }
+    if (ds->editTaskListDisplayDays) {
+        const int applied = ClampTaskListDisplayDays(readValue(ds->editTaskListDisplayDays));
+        st->taskListDisplayDays = applied;
+        SetWindowTextW(ds->editTaskListDisplayDays, std::to_wstring(applied).c_str());
         WakeDashboardDataFetch(st);
         RefreshTaskQueueData(st, true);
     }
@@ -17795,9 +17816,15 @@ static void UpdateSettingsDialogTexts(HWND hwnd) {
     }
     if (ds->lblTaskListRecentCount) {
         SetWindowTextW(ds->lblTaskListRecentCount, Tr(
-            L"タスク一覧に出す終わった項目の数 (5〜500, 既定 30):",
-            L"Finished items in task list (5-500, default 30):",
-            L"Elementos terminados en la lista (5-500, predeterminado 30):"));
+            L"finished_limit (タスク一覧に出す完了済み項目数, 5〜500, 既定 30):",
+            L"finished_limit (finished items in task list, 5-500, default 30):",
+            L"finished_limit (elementos terminados en la lista, 5-500, predeterminado 30):"));
+    }
+    if (ds->lblTaskListDisplayDays) {
+        SetWindowTextW(ds->lblTaskListDisplayDays, Tr(
+            L"タスク一覧に残す完了済み項目の表示期間 (日数, 1〜365, 既定 2):",
+            L"Days of finished items kept in task list (1-365, default 2):",
+            L"Días de elementos terminados en la lista (1-365, predeterminado 2):"));
     }
     if (ds->lblPerformanceHint) {
         SetWindowTextW(ds->lblPerformanceHint, Tr(
@@ -18125,6 +18152,14 @@ static LRESULT CALLBACK SettingsWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPAR
                 560, 189, 110, 24, hwnd, (HMENU)IDC_SET_TASK_LIST_RECENT_COUNT, hInst, nullptr);
             SetWindowTextW(ds->editTaskListRecentCount,
                            std::to_wstring(static_cast<int>(ds->dash->visibleFinishedCount)).c_str());
+
+            ds->lblTaskListDisplayDays = CreateWindowExW(0, L"STATIC", L"", WS_CHILD | WS_VISIBLE,
+                18, 216, 530, 20, hwnd, nullptr, hInst, nullptr);
+            ds->editTaskListDisplayDays = CreateWindowExW(WS_EX_CLIENTEDGE, L"EDIT", L"",
+                WS_CHILD | WS_VISIBLE | WS_TABSTOP | ES_AUTOHSCROLL | ES_NUMBER,
+                560, 213, 110, 24, hwnd, (HMENU)IDC_SET_TASK_LIST_DISPLAY_DAYS, hInst, nullptr);
+            SetWindowTextW(ds->editTaskListDisplayDays,
+                           std::to_wstring(ds->dash->taskListDisplayDays).c_str());
 
             ds->lblPerformanceHint = CreateWindowExW(0, L"STATIC", L"", WS_CHILD | WS_VISIBLE,
                 18, 228, 700, 70, hwnd, nullptr, hInst, nullptr);
@@ -18553,6 +18588,10 @@ static LRESULT CALLBACK SettingsWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPAR
                 Tr(L"タスク一覧に表示する終わった項目の数です。\n残りは「さらに 20 件」から読み込めます。",
                    L"How many finished items the task list shows.\nThe rest are available through \"Load 20 more\".",
                    L"Cuántos elementos terminados muestra la lista.\nEl resto se carga con \"Cargar 20 más\"."));
+            helpId(IDC_SET_TASK_LIST_DISPLAY_DAYS,
+                Tr(L"タスク一覧に完了済み項目を残す日数です。\nこの期間より古い完了済みタスクとジョブは一覧から除外されます。",
+                   L"How many days of finished items the task list keeps.\nFinished tasks and jobs older than this window are hidden.",
+                   L"Cuántos días de elementos terminados conserva la lista.\nLas tareas y trabajos terminados más antiguos se ocultan."));
             helpId(IDC_SET_END_BLINK_ENABLED,
                 Tr(L"プロセスやタスクが終了したとき、一覧の行をしばらく点滅させます。\n終了を見落としにくくなります。",
                    L"Blinks the list row for a while when a process or task finishes.\nMakes endings harder to miss.",
@@ -18639,8 +18678,9 @@ static LRESULT CALLBACK SettingsWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPAR
                              ds->lblUsageRefreshInterval, ds->editUsageRefreshInterval,
                              ds->lblStreamRefreshInterval, ds->editStreamRefreshInterval,
                               ds->lblProcessMetricsInterval, ds->editProcessMetricsInterval,
-                              ds->lblTaskListRecentCount, ds->editTaskListRecentCount,
-                              ds->lblPerformanceHint, ds->btnListBgReset,
+                               ds->lblTaskListRecentCount, ds->editTaskListRecentCount,
+                               ds->lblTaskListDisplayDays, ds->editTaskListDisplayDays,
+                               ds->lblPerformanceHint, ds->btnListBgReset,
                               ds->chkEndBlink, ds->lblEndBlinkSec, ds->editEndBlinkSec,
                               ds->chkSupervisorHints, ds->lblHintAutoDismissSec, ds->editHintAutoDismissSec,
                                ds->lblSupervisorCommand, ds->editSupervisorCommand,
@@ -18842,6 +18882,7 @@ static LRESULT CALLBACK SettingsWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPAR
                     ds->lblStreamRefreshInterval, ds->editStreamRefreshInterval,
                     ds->lblProcessMetricsInterval, ds->editProcessMetricsInterval,
                     ds->lblTaskListRecentCount, ds->editTaskListRecentCount,
+                    ds->lblTaskListDisplayDays, ds->editTaskListDisplayDays,
                     ds->lblPerformanceHint });
                 terminal.insert(terminal.end(), {
                     ds->lblTermTitle, ds->chkTermLocal, ds->chkTermRemote,
@@ -19092,7 +19133,7 @@ static LRESULT CALLBACK SettingsWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPAR
             }
             if (id == IDC_SET_REFRESH_INTERVAL || id == IDC_SET_USAGE_REFRESH_INTERVAL ||
                 id == IDC_SET_STREAM_REFRESH_INTERVAL || id == IDC_SET_PROCESS_METRICS_INTERVAL ||
-                id == IDC_SET_TASK_LIST_RECENT_COUNT) {
+                id == IDC_SET_TASK_LIST_RECENT_COUNT || id == IDC_SET_TASK_LIST_DISPLAY_DAYS) {
                 if (HIWORD(wParam) == EN_KILLFOCUS) CommitPerformanceSettings(ds);
                 return 0;
             }
@@ -24422,6 +24463,7 @@ static LRESULT CALLBACK DashboardWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPA
                     st->taskSearchText.clear();
                     SetWindowTextW(st->hwndSearchTaskEdit, L"");
                     st->visibleFinishedCount = kDefaultVisibleFinishedCount;
+                    st->taskListDisplayDays = kDefaultTaskListDisplayDays;
                     KillTimer(hwnd, TIMER_TASK_SEARCH_ID);
                     st->taskOriginFilter.clear();
                     if (st->hwndTaskOriginCombo) SendMessageW(st->hwndTaskOriginCombo, CB_SETCURSEL, 0, 0);
@@ -24446,6 +24488,7 @@ static LRESULT CALLBACK DashboardWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPA
                 st->taskSearchText = buf;
                 // 102-6: debounce the query; changing it also resets the "loaded more" count.
                 st->visibleFinishedCount = kDefaultVisibleFinishedCount;
+                st->taskListDisplayDays = kDefaultTaskListDisplayDays;
                 KillTimer(hwnd, TIMER_TASK_SEARCH_ID);
                 SetTimer(hwnd, TIMER_TASK_SEARCH_ID, kTaskSearchDebounceMs, nullptr);
             } else if (id == IDC_COMBO_TASK_ORIGIN && HIWORD(wParam) == CBN_SELCHANGE) {
