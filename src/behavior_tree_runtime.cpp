@@ -402,10 +402,25 @@ void BehaviorTree::Impl::CheckTimers(BehaviorTree& bt, BtNode& node, int64_t now
 
     if (node.type == "escalate") {
         if (node.escalateDeadlineMs > 0 && nowMs >= node.escalateDeadlineMs) {
+            node.escalateDeadlineMs = 0;
             CancelSubtreeJobs(bt, node, false);
-            node.state = "failed";
-            node.detail = "escalationTimeout";
-            bt.EmitEvent(nowMs, "nodeFinished", node.nodeKey, node.state, node.detail, node.runs);
+            // A supervisor answer must not be the only way out of an escalation. When the
+            // deadline passes, default to "stop" when the node allows that answer; a proxy
+            // fallback (when configured) may still answer earlier via fallback.afterSec.
+            const bool allowsStop = node.expect.empty() ||
+                std::find(node.expect.begin(), node.expect.end(), "stop") != node.expect.end();
+            const std::string detail = "escalationTimeout: no answer within " +
+                std::to_string(node.escalateTimeoutSec) + " sec; defaulted to stop";
+            std::string err;
+            const bool stopped = allowsStop &&
+                ApplyEscalateAnswer(bt, node, "stop", detail, {}, nowMs, err);
+            if (stopped) {
+                bt.EmitEvent(nowMs, "escalationTimeout", node.nodeKey, "stop", detail, node.runs);
+            } else {
+                node.state = "failed";
+                node.detail = "escalationTimeout";
+                bt.EmitEvent(nowMs, "nodeFinished", node.nodeKey, node.state, node.detail, node.runs);
+            }
             anyFired = true;
             return;
         }
@@ -624,6 +639,41 @@ void BehaviorTree::OnJobFinished(const std::string& jobId,
         node.detail = !failDetail.empty() ? failDetail : ("exit " + std::to_string(exitCode));
     }
     impl_->ApplyFailureDiagnostic(*this, node, failureDiagnosticJson, succeeded, nowMs);
+    if (!succeeded) {
+        const int64_t elapsedMs = node.startEpochMs > 0 && nowMs >= node.startEpochMs
+            ? nowMs - node.startEpochMs : 0;
+        const std::string prefix = node.id.empty() ? node.nodeKey : node.id;
+        vars_["bt.failedStep"] = prefix;
+        vars_["bt.failedExitCode"] = std::to_string(exitCode);
+        vars_["bt.failedClass"] = node.hasFailureDiagnostic
+            ? node.failureDiagnostic.value("class", std::string()) : std::string();
+        vars_["bt.failedDurationSec"] = std::to_string(elapsedMs / 1000);
+        vars_["bt.failedLogTail"] = TruncateUtf8Bytes(GetTailLines(logTail, 8), 2000);
+
+        // A build/test that exits 1 within 30 seconds is almost always a transient state
+        // (stale build output, a missing tool) rather than a code defect. Tag it so a catch
+        // handler can retry once before the escalation asks a human.
+        if (!info.isWorker && node.type == "exec" && exitCode == 1 &&
+            elapsedMs > 0 && elapsedMs <= 30000 && node.hasFailureDiagnostic) {
+            json causes = node.failureDiagnostic.value("likelyCauses", json::array());
+            bool hasFastExit = false;
+            for (const auto& c : causes) {
+                if (c.is_object() && c.value("id", std::string()) == "fast_exit") hasFastExit = true;
+            }
+            if (!hasFastExit) {
+                causes.push_back(json{{"id", "fast_exit"}, {"why", "exited 1 within 30 seconds"}});
+                node.failureDiagnostic["likelyCauses"] = std::move(causes);
+                std::string ids;
+                for (const auto& c : node.failureDiagnostic["likelyCauses"]) {
+                    const std::string id = c.is_object() ? c.value("id", std::string()) : std::string();
+                    if (id.empty()) continue;
+                    if (!ids.empty()) ids += ",";
+                    ids += id;
+                }
+                vars_[prefix + ".likelyCauses"] = ids;
+            }
+        }
+    }
     EmitEvent(nowMs, "nodeFinished", node.nodeKey, node.state, node.detail, node.runs);
 
     std::string failureClass;

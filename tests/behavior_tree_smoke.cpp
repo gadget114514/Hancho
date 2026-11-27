@@ -2077,6 +2077,108 @@ int main() {
         }
     }
 
+    // no-hang: escalation gets a bounded deadline, a question built from the failed step,
+    // and a fast exit 1 is retried once before the escalation is reached.
+    {
+        auto collectEscalates = [](const nlohmann::json& root) {
+            nlohmann::json out = nlohmann::json::array();
+            auto walk = [&](auto&& self, const nlohmann::json& n) -> void {
+                if (n.is_object()) {
+                    if (n.value("type", std::string()) == "escalate") out.push_back(n);
+                    for (auto it = n.begin(); it != n.end(); ++it) self(self, it.value());
+                } else if (n.is_array()) {
+                    for (const auto& c : n) self(self, c);
+                }
+            };
+            walk(walk, root);
+            return out;
+        };
+        const char* names[] = {"resilient-agent", "card-sequence", "card"};
+        for (const char* name : names) {
+            nlohmann::json def = BtTemplateDefinition(name);
+            nlohmann::json escs = collectEscalates(def);
+            Check(!escs.empty(), std::string("no-hang: ") + name + " has an escalation node");
+            bool bound = true, concrete = true;
+            for (const auto& e : escs) {
+                if (e.value("timeoutSec", 0) != 1800) bound = false;
+                const std::string q = e.value("question", "");
+                if (q.find("<what should") != std::string::npos ||
+                    q.find("${bt.failedStep}") == std::string::npos ||
+                    q.find("${bt.failedExitCode}") == std::string::npos ||
+                    q.find("${bt.failedLogTail}") == std::string::npos) concrete = false;
+            }
+            Check(bound, std::string("no-hang: ") + name + " escalation has timeoutSec 1800");
+            Check(concrete, std::string("no-hang: ") + name + " escalation question uses failure fields");
+            const std::string text = def.dump();
+            Check(text.find("\"cause\":\"fast_exit\"") != std::string::npos &&
+                  text.find("\"thenRetry\":true") != std::string::npos &&
+                  text.find("\"maxRetries\":1") != std::string::npos,
+                  std::string("no-hang: ") + name + " retries a fast exit once");
+        }
+    }
+
+    {
+        const std::string def = R"({"id":"no-hang-timeout","root":{)"
+            R"("type":"escalate","id":"gate","timeoutSec":1,)"
+            R"("question":"Step ${bt.failedStep} exit ${bt.failedExitCode}",)"
+            R"("expect":["continue","stop","takeover"]}})";
+        FakeJobRunner runner;
+        BehaviorTree bt;
+        std::string err;
+        Check(bt.LoadDefinition(def, &catalog, err), "no-hang: load timeout BT: " + err);
+        bt.SetJobRunner(&runner);
+        bt.Start(1000);
+        Check(bt.State() == "waitingForLlm", "no-hang: escalation starts waiting");
+        bt.OnTimer(3000);
+        Check(bt.NodeState("gate") == "succeeded" && bt.GetVar("gate.answer") == "stop",
+              "no-hang: escalation timeout defaults to stop instead of hanging/failing");
+        Check(bt.State() == "succeeded", "no-hang: tree completes after default stop");
+        bool sawTimeout = false;
+        for (const auto& ev : bt.Events()) if (ev.type == "escalationTimeout") sawTimeout = true;
+        Check(sawTimeout, "no-hang: escalationTimeout event emitted");
+
+        const std::string noStop = R"({"id":"no-hang-timeout-no-stop","root":{)"
+            R"("type":"escalate","id":"gate2","timeoutSec":1,)"
+            R"("question":"Ship?","expect":["continue"]}})";
+        BehaviorTree bt2;
+        Check(bt2.LoadDefinition(noStop, &catalog, err), "no-hang: load no-stop BT: " + err);
+        bt2.SetJobRunner(&runner);
+        bt2.Start(1000);
+        bt2.OnTimer(3000);
+        Check(bt2.NodeState("gate2") == "failed" &&
+              bt2.ToStateJson().find("escalationTimeout") != std::string::npos,
+              "no-hang: timeout still fails when stop is not an allowed answer");
+    }
+
+    {
+        const std::string def = R"({"id":"no-hang-fast","root":{"type":"catch","id":"guard",)"
+            R"("child":{"type":"exec","id":"build","summary":"Build",)"
+            R"("command":"cmd /c exit 1","timeoutSec":60},)"
+            R"("handlers":[{"cause":"fast_exit",)"
+            R"("do":{"type":"set","var":"retried","value":"1"},"thenRetry":true}],)"
+            R"("otherwise":{"type":"succeed","id":"escalated"},"maxRetries":1}})";
+        FakeJobRunner runner;
+        BehaviorTree bt;
+        std::string err;
+        Check(bt.LoadDefinition(def, &catalog, err), "no-hang: load fast-exit BT: " + err);
+        bt.SetJobRunner(&runner);
+        bt.Start(1000);
+        Check(runner.startedJobs.size() == 1, "no-hang: build starts once");
+        bt.OnJobFinished("no-hang-fast-build-1", false, 1, "", "line1\nline2\nline3", 1500,
+                         "", "", "exit 1", R"({"class":"exit_nonzero","summary":"exit 1","likelyCauses":[]})");
+        Check(runner.startedJobs.size() == 2, "no-hang: a fast exit 1 retries once before escalation");
+        Check(bt.GetVar("bt.failedStep") == "build" && bt.GetVar("bt.failedExitCode") == "1" &&
+              bt.GetVar("bt.failedDurationSec") == "0",
+              "no-hang: escalation failure fields expose the step and exit code");
+        Check(bt.GetVar("bt.failedClass") == "exit_nonzero" &&
+              bt.GetVar("bt.failedLogTail").find("line3") != std::string::npos,
+              "no-hang: escalation failure fields expose class and log tail");
+        bt.OnJobFinished("no-hang-fast-build-2", false, 1, "", "line4", 2000,
+                         "", "", "exit 1", R"({"class":"exit_nonzero","summary":"exit 1","likelyCauses":[]})");
+        Check(bt.NodeState("escalated") == "succeeded",
+              "no-hang: escalation is reached after the one automatic retry");
+    }
+
     RunPart2Tests(tempDirUtf8, tempDirW);
 
     RemoveTempDirRecursive(tempDirW);

@@ -18,8 +18,10 @@ struct BtTemplateEntry {
 
 inline constexpr const char* kBtTemplateNote =
     "Replace every <...> placeholder with a real value (do not use ${...}) before "
-    "bt validate / bt start. {engine}, {model} and the foreach expansions "
-    "${t.*} / ${foreach:...} are intentional runtime placeholders.";
+    "bt validate / bt start. {engine}, {model}, the foreach expansions "
+    "${t.*} / ${foreach:...} and the failure fields ${bt.failedStep}, "
+    "${bt.failedExitCode}, ${bt.failedClass}, ${bt.failedDurationSec} and "
+    "${bt.failedLogTail} are intentional runtime placeholders.";
 
 inline const char* const kResilientAgentTemplate = R"JSON({
   "id": "resilient-agent",
@@ -82,19 +84,22 @@ inline const char* const kResilientAgentTemplate = R"JSON({
          "do": { "type": "set", "var": "permit", "value": "requested" },
          "thenRetry": false
        },
-      {
-        "class": "*",
-        "do": {
-          "type": "escalate",
-          "question": "<what should the supervisor decide?>",
-          "guidance": "The agent failed after all approved engine candidates were tried.",
-          "expect": ["continue", "stop", "takeover"],
-          "include": { "logs": ["impl"], "logLines": 100 }
-        }
-      }
+       {
+         "cause": "fast_exit",
+         "do": { "type": "set", "var": "fast_exit_retried", "value": "1" },
+         "thenRetry": true
+       }
     ],
-    "otherwise": "fail",
-    "maxRetries": 2
+    "otherwise": {
+      "type": "escalate",
+      "id": "gate",
+      "timeoutSec": 1800,
+      "question": "Step ${bt.failedStep} failed (exit=${bt.failedExitCode}, class=${bt.failedClass}, ${bt.failedDurationSec}s). Recent log: ${bt.failedLogTail} Decide: continue, stop, or takeover.",
+      "guidance": "A fast exit 1 was already retried once. Decide whether to continue, stop, or take over.",
+      "expect": ["continue", "stop", "takeover"],
+      "include": { "logs": ["impl"], "logLines": 100 }
+    },
+    "maxRetries": 1
   }
 })JSON";
 
@@ -144,18 +149,21 @@ inline const char* const kCardSequenceTemplate = R"JSON({
             "thenRetry": true
           },
           {
-            "class": "*",
-            "do": {
-              "type": "escalate",
-              "question": "<what should the supervisor decide about card <card-id-1>?>",
-              "guidance": "The card failed after all approved engine candidates were tried.",
-              "expect": ["continue", "stop", "takeover"],
-              "include": { "logs": ["card_<card-id-1>"], "logLines": 100 }
-            }
+            "cause": "fast_exit",
+            "do": { "type": "set", "var": "fast_exit_retried", "value": "1" },
+            "thenRetry": true
           }
         ],
-        "otherwise": "fail",
-        "maxRetries": 2
+        "otherwise": {
+          "type": "escalate",
+          "id": "gate_1",
+          "timeoutSec": 1800,
+          "question": "Card <card-id-1>: step ${bt.failedStep} failed (exit=${bt.failedExitCode}, class=${bt.failedClass}, ${bt.failedDurationSec}s). Recent log: ${bt.failedLogTail} Decide: continue, stop, or takeover.",
+          "guidance": "A fast exit 1 was already retried once. Decide whether to continue, stop, or take over.",
+          "expect": ["continue", "stop", "takeover"],
+          "include": { "logs": ["card_<card-id-1>"], "logLines": 100 }
+        },
+        "maxRetries": 1
       },
       {
         "type": "exec",
@@ -197,18 +205,21 @@ inline const char* const kCardSequenceTemplate = R"JSON({
             "thenRetry": true
           },
           {
-            "class": "*",
-            "do": {
-              "type": "escalate",
-              "question": "<what should the supervisor decide about card <card-id-2>?>",
-              "guidance": "The card failed after all approved engine candidates were tried.",
-              "expect": ["continue", "stop", "takeover"],
-              "include": { "logs": ["card_<card-id-2>"], "logLines": 100 }
-            }
+            "cause": "fast_exit",
+            "do": { "type": "set", "var": "fast_exit_retried", "value": "1" },
+            "thenRetry": true
           }
         ],
-        "otherwise": "fail",
-        "maxRetries": 2
+        "otherwise": {
+          "type": "escalate",
+          "id": "gate_2",
+          "timeoutSec": 1800,
+          "question": "Card <card-id-2>: step ${bt.failedStep} failed (exit=${bt.failedExitCode}, class=${bt.failedClass}, ${bt.failedDurationSec}s). Recent log: ${bt.failedLogTail} Decide: continue, stop, or takeover.",
+          "guidance": "A fast exit 1 was already retried once. Decide whether to continue, stop, or take over.",
+          "expect": ["continue", "stop", "takeover"],
+          "include": { "logs": ["card_<card-id-2>"], "logLines": 100 }
+        },
+        "maxRetries": 1
       },
       {
         "type": "exec",
@@ -323,18 +334,21 @@ inline const char* const kCardTemplate = R"JSON({
         "thenRetry": false
       },
       {
-        "class": "*",
-        "do": {
-          "type": "escalate",
-          "question": "<what should the supervisor decide?>",
-          "guidance": "The agent failed after all approved engine candidates were tried.",
-          "expect": ["continue", "stop", "takeover"],
-          "include": { "logs": ["impl"], "logLines": 100 }
-        }
+        "cause": "fast_exit",
+        "do": { "type": "set", "var": "fast_exit_retried", "value": "1" },
+        "thenRetry": true
       }
     ],
-    "otherwise": "fail",
-    "maxRetries": 2
+    "otherwise": {
+      "type": "escalate",
+      "id": "gate",
+      "timeoutSec": 1800,
+      "question": "Step ${bt.failedStep} failed (exit=${bt.failedExitCode}, class=${bt.failedClass}, ${bt.failedDurationSec}s). Recent log: ${bt.failedLogTail} Decide: continue, stop, or takeover.",
+      "guidance": "A fast exit 1 was already retried once. Decide whether to continue, stop, or take over.",
+      "expect": ["continue", "stop", "takeover"],
+      "include": { "logs": ["impl"], "logLines": 100 }
+    },
+    "maxRetries": 1
   }
 })JSON";
 

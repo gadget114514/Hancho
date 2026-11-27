@@ -239,6 +239,9 @@ struct BtNode {
     std::string lastLogTail;
     std::string lastStartTimestamp;
     int64_t lastStartMs = 0;
+    // lastStartMs is a FILETIME (100ns) for job nodes, so duration checks need the
+    // simulation/system epoch clock captured when the job was launched.
+    int64_t startEpochMs = 0;
     int64_t waitDeadlineMs = 0;
     int64_t timeoutDeadlineMs = 0;
     int64_t retryDeadlineMs = 0;
