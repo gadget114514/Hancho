@@ -173,6 +173,10 @@ The application icons are modeled on the character "Telephone Cat" (電話猫, D
 ### v0.10.2
 - **Task list tree stays intact**: explicit direction records now always keep their heading, even when the behavior tree has finished and has only one job. The task → direction → job shape remains visible; the "Running" column still shows only work that is currently running.
 - **Task list refresh fix**: changed cells are no longer blanked out after an in-place refresh. The installer setup carries the copyright line for gadget114514 and 2nek.
+- **Escalation no longer hangs forever**: BT templates now give escalation `timeoutSec: 1800`; on timeout the node defaults to `stop` (a configured proxy fallback may still answer first). A build/test that exits 1 within 30 seconds is retried once before escalation, and the question now quotes the failed step, exit code, class and log tail.
+- **BT state and lineage propagate**: every BT run belongs to a task and records `supersedes` lineage. The tree's state is cached on its direction, replaced directions follow their successor, and direction/task states are recomputed on job and attempt changes. Change events are emitted only when the derived state actually changes.
+- **Task list job indentation**: job rows in the task tree use four spaces in both the dashboard and the CLI.
+- **BT working directory**: behavior trees start in the submitter's working directory.
 
 ### v0.10.1
 - **Task list refresh**: the list no longer recreates all rows on every 5-second refresh when the row count is unchanged, and column widths are no longer reset by the refresh loop. Duplicate task numbers or ids no longer make the list clear and redraw on each tick.
