@@ -94,6 +94,15 @@ bool BehaviorTree::Impl::LookupVar(const BehaviorTree& bt, const std::string& ex
         outVal = std::to_string(bt.nodeRuns_);
         return true;
     }
+    // Failure fields for escalation questions. Always resolve (empty until a node fails),
+    // so an escalate question can quote the actual step/exit code without failing on
+    // undefinedVar when the failure came from a path that did not launch a job.
+    if (expr == "bt.failedStep" || expr == "bt.failedExitCode" ||
+        expr == "bt.failedClass" || expr == "bt.failedDurationSec" ||
+        expr == "bt.failedLogTail") {
+        outVal.clear();
+        return true;
+    }
 
     // Try matching <node>.<prop> or <node>.output.<jsonPath>
     size_t dot = expr.find('.');

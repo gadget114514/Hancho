@@ -577,6 +577,7 @@ inline std::vector<TaskDisplayRow> BuildTaskDisplayRows(
             if (dTs > d.sortTs) d.sortTs = dTs;
         }
 
+        std::unordered_map<std::string, std::string> virtualStateByBt;
         for (const auto& j : m.jobs) {
             const std::string jid = j.value("id", std::string());
             std::string did = j.value("direction_id", std::string());
@@ -593,6 +594,10 @@ inline std::vector<TaskDisplayRow> BuildTaskDisplayRows(
                 d.kind = "bt";
                 if (d.title.empty()) d.title = j.value("summary", std::string());
                 d.state = j.value("state", std::string());
+                std::string vBtId;
+                if (j.contains("group") && j["group"].is_object()) vBtId = j["group"].value("id", "");
+                else if (jid.rfind("group:", 0) == 0) vBtId = jid.substr(6);
+                if (!vBtId.empty()) virtualStateByBt[vBtId] = d.state;
                 const std::string stTs = j.value("start_time", j.value("created_at", std::string()));
                 if (stTs > d.sortTs) d.sortTs = stTs;
             } else {
@@ -602,6 +607,18 @@ inline std::vector<TaskDisplayRow> BuildTaskDisplayRows(
                 const std::string jTs = j.value("updated_at", j.value("created_at", std::string()));
                 if (jTs > d.sortTs) d.sortTs = jTs;
             }
+        }
+
+        // The live BT row is the authoritative state for a direction whose direction record
+        // still holds an older job-derived state (for example a planned/open direction before
+        // its first job starts).
+        for (auto& [did, d] : dirMap) {
+            (void)did;
+            if (!d.dirRecord.is_object()) continue;
+            const std::string btId = d.dirRecord.value("btId", std::string());
+            if (btId.empty()) continue;
+            auto vit = virtualStateByBt.find(btId);
+            if (vit != virtualStateByBt.end() && !vit->second.empty()) d.state = vit->second;
         }
 
         int totalRealJobs = 0;

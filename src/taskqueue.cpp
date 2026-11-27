@@ -3320,9 +3320,7 @@ void TaskQueueManager::LogAttemptToTaskLocked(const TaskQueueJob& job, const std
         }
     }
     TaskLog(job.taskId, gaveUp ? "job_failed" : "attempt_finished", job.id, "", text.str(), "", &extra);
-    if ((eventType == "jobSucceeded" || gaveUp) && !job.directionId.empty()) {
-        MaybeLogDirectionFinishedLocked(job.directionId, job.taskId);
-    }
+    RefreshJobStateChainLocked(job.directionId, job.taskId);
 }
 
 void TaskQueueManager::LoadQueues() {
@@ -6384,9 +6382,7 @@ std::string TaskQueueManager::TaskQueueCancel(const std::string& id, std::string
         if (!job->taskId.empty()) {
             TaskLog(job->taskId, "job_cancelled", id, "", reason.empty() ? "cancelled" : reason, "");
         }
-        if (!job->directionId.empty()) {
-            MaybeLogDirectionFinishedLocked(job->directionId, job->taskId);
-        }
+        RefreshJobStateChainLocked(job->directionId, job->taskId);
         if (schedulerRunning_.load()) {
             pendingFinished_.push_back({*job, "cancelled"});
         }
@@ -6466,10 +6462,8 @@ std::string TaskQueueManager::TaskQueueClose(const std::string& id, std::string&
         SaveQueue(*tq);
         if (!job->taskId.empty()) {
             TaskLog(job->taskId, "job_cancelled", id, "", "closed", "");
-            if (!job->directionId.empty()) {
-                MaybeLogDirectionFinishedLocked(job->directionId, job->taskId);
-            }
         }
+        RefreshJobStateChainLocked(job->directionId, job->taskId);
         if (schedulerRunning_.load()) {
             pendingFinished_.push_back({*job, "closed"});
         }
@@ -6609,11 +6603,9 @@ std::string TaskQueueManager::TaskQueueComplete(const std::string& id, const std
         ReevaluateAll();
         SaveAllLocked();
         if (!job->taskId.empty()) {
-            if (!job->directionId.empty()) {
-                MaybeLogDirectionFinishedLocked(job->directionId, job->taskId);
-            }
             TaskLog(job->taskId, "takeover_completed", id, "", finalResult + ": " + reason, "");
         }
+        RefreshJobStateChainLocked(job->directionId, job->taskId);
         CheckQueueNotices(*tq);
         cv_.notify_all();
         resp = "{\"ok\":true,\"job\":" + JobToJson(*job, true) + "}";
@@ -9319,6 +9311,25 @@ std::vector<nlohmann::json> TaskQueueManager::DirectionAll() const {
     return directionStore_.All();
 }
 
+void TaskQueueManager::SetDirectionBtState(const std::string& btId, const std::string& btState,
+                                           const std::string& btDetail) {
+    if (btId.empty() || btState.empty()) return;
+    std::lock_guard<std::mutex> lock(mutex_);
+    for (auto& record : directionStore_.All()) {
+        if (!record.is_object() || record.value("btId", std::string()) != btId) continue;
+        if (record.value("btState", std::string()) == btState &&
+            record.value("btDetail", std::string()) == btDetail) continue;
+        record["btState"] = btState;
+        record["btDetail"] = btDetail;
+        record["updatedAt"] = GetCurrentTimestampStr();
+        record["rev"] = BumpRevLocked();
+        std::string err;
+        directionStore_.Save(record, err);
+        RefreshJobStateChainLocked(record.value("id", std::string()),
+                                   record.value("taskId", std::string()));
+    }
+}
+
 bool TaskQueueManager::SetDirectionTriage(const std::string& id, bool triage, std::string& outError) {
     outError.clear();
     nlohmann::json record;
@@ -9392,6 +9403,13 @@ bool JobOrRemovedExists(const std::map<std::string, TaskQueue>& queues,
 }
 
 nlohmann::json TaskQueueManager::DirectionStateLocked(const std::string& id) const {
+    std::set<std::string> visiting;
+    return DirectionStateLocked(id, visiting);
+}
+
+nlohmann::json TaskQueueManager::DirectionStateLocked(const std::string& id,
+                                                      std::set<std::string>& visiting) const {
+    if (!visiting.insert(id).second) return nlohmann::json{{"state", "open"}};
     auto externalHas = [this](const std::string& jobId) {
         return JobOrRemovedExists(queues_, taskStore_, directionStore_, jobId);
     };
@@ -9411,19 +9429,79 @@ nlohmann::json TaskQueueManager::DirectionStateLocked(const std::string& id) con
         if (nodes.empty()) return nlohmann::json{{"state", "open"}};
         return ComputeTaskState(nodes, externalHas);
     }
-    if (record.is_object() && record.value("kind", std::string()) == "bt") {
-        const std::string btState = ReadBtStateFromFile(record.value("btId", std::string()));
+    // A replaced direction reports the state of the direction that took its place. The task's
+    // own state is then no longer dragged down by the cancelled run it superseded.
+    if (record.is_object()) {
+        const std::string headId = record.value("supersededBy", std::string());
+        nlohmann::json head;
+        if (!headId.empty() && headId != id && directionStore_.Get(headId, head)) {
+            return DirectionStateLocked(headId, visiting);
+        }
+    }
+    // A BT direction is described by the tree, not by the jobs it happens to have linked at
+    // this instant. The cached state is written on every BT state save, so it still works
+    // after the live group row is gone or the state file has been removed.
+    const std::string boundBtId = record.is_object() ? record.value("btId", std::string()) : std::string();
+    if (!boundBtId.empty()) {
+        const std::string cachedState = record.value("btState", std::string());
+        const std::string btState = cachedState.empty() ? ReadBtStateFromFile(boundBtId) : cachedState;
         if (!btState.empty()) {
             nlohmann::json out = {{"state", btState}};
             if (btState == "paused") out["paused"] = true;
+            const std::string detail = record.value("btDetail", std::string());
+            if (!detail.empty()) out["detail"] = detail;
             return out;
         }
     }
     const std::vector<TaskNode> nodes = CollectDirectionNodes(queues_, id, record);
-    if (nodes.empty()) {
-        return nlohmann::json{{"state", "planned"}};
+    if (!nodes.empty()) return ComputeTaskState(nodes, externalHas);
+
+    // No jobs of its own: aggregate the directions that supersede this one (its retry lineage).
+    std::vector<std::string> childIds;
+    for (const auto& child : directionStore_.All()) {
+        if (!child.is_object() || child.value("supersedes", std::string()) != id) continue;
+        const std::string childId = child.value("id", std::string());
+        if (!childId.empty()) childIds.push_back(childId);
     }
-    return ComputeTaskState(nodes, externalHas);
+    if (!childIds.empty()) {
+        bool anyRunning = false, anyPaused = false, anyFailed = false, anyCancelled = false;
+        bool allSucceeded = true;
+        for (const auto& childId : childIds) {
+            const std::string s = DirectionStateLocked(childId, visiting).value("state", "open");
+            if (s == "running" || s == "waitingForLlm" || s == "paused" || s == "open") {
+                anyRunning = true;
+                if (s == "paused") anyPaused = true;
+                allSucceeded = false;
+            } else if (s == "failed" || s == "blocked") {
+                anyFailed = true;
+                allSucceeded = false;
+            } else if (s == "cancelled") {
+                anyCancelled = true;
+                allSucceeded = false;
+            } else if (s != "succeeded" && s != "closed") {
+                allSucceeded = false;
+            }
+        }
+        nlohmann::json out;
+        if (anyRunning) out["state"] = "running";
+        else if (anyFailed) out["state"] = "failed";
+        else if (anyCancelled) out["state"] = "cancelled";
+        else if (allSucceeded) out["state"] = "succeeded";
+        else out["state"] = "open";
+        if (anyPaused) out["paused"] = true;
+        return out;
+    }
+    // No state of its own: inherit the task's state (excluding this direction to avoid a
+    // cycle). This is how a task-level change propagates back to the direction that owns it.
+    const std::string ownerTaskId = record.is_object() ? record.value("taskId", std::string()) : std::string();
+    if (!ownerTaskId.empty() && !boundBtId.empty()) {
+        const nlohmann::json ts = TaskStateLocked(ownerTaskId, id, visiting);
+        const std::string s = ts.value("state", std::string());
+        if (!s.empty() && s != "open" && s != "planned") return ts;
+    }
+    // "planned" is only for a card direction waiting for its first job. A BT-bound direction
+    // with no recorded state is merely unstarted ("open").
+    return nlohmann::json{{"state", boundBtId.empty() ? "planned" : "open"}};
 }
 
 nlohmann::json TaskQueueManager::DirectionState(const std::string& id) const {
@@ -9431,22 +9509,64 @@ nlohmann::json TaskQueueManager::DirectionState(const std::string& id) const {
     return DirectionStateLocked(id);
 }
 
-void TaskQueueManager::MaybeLogDirectionFinishedLocked(const std::string& directionId, const std::string& taskId) {
-    if (directionId.empty()) return;
-    nlohmann::json dirRecord;
-    if (!directionStore_.Get(directionId, dirRecord)) return;
-    if (dirRecord.contains("closed") && dirRecord["closed"].is_object()) {
-        UnwatchDirectionClientLocked(directionId);
-        return;
+void TaskQueueManager::RefreshJobStateChainLocked(const std::string& directionId,
+                                                  const std::string& taskId) {
+    bool directionChanged = false;
+    if (!directionId.empty()) {
+        nlohmann::json dir;
+        if (directionStore_.Get(directionId, dir)) {
+            if (dir.contains("closed") && dir["closed"].is_object()) {
+                UnwatchDirectionClientLocked(directionId);
+                return;
+            }
+            // Recomputed on every job/attempt change, but a rev bump (and therefore a change
+            // event) is issued only when the derived state really differs.
+            const std::string oldState = dir.value("state", std::string());
+            const std::string newState = DirectionStateLocked(directionId).value("state", std::string());
+            if (!newState.empty() && newState != oldState) {
+                dir["state"] = newState;
+                dir["updatedAt"] = GetCurrentTimestampStr();
+                dir["rev"] = BumpRevLocked();
+                std::string err;
+                directionStore_.Save(dir, err);
+                directionChanged = true;
+                if (newState == "succeeded" || newState == "failed" || newState == "cancelled") {
+                    UnwatchDirectionClientLocked(directionId);
+                    if (!taskId.empty()) {
+                        nlohmann::json extra = {{"directionId", directionId}, {"state", newState}};
+                        TaskLog(taskId, "direction_finished", "",
+                                dir.value("btId", std::string()), newState, "", &extra);
+                    }
+                }
+            }
+        }
     }
-    const nlohmann::json st = DirectionStateLocked(directionId);
-    const std::string s = st.value("state", std::string());
-    if (s != "succeeded" && s != "failed" && s != "cancelled") return;
-    UnwatchDirectionClientLocked(directionId);
-    if (taskId.empty()) return;
-    const std::string btId = dirRecord.value("btId", std::string());
-    nlohmann::json extra = {{"directionId", directionId}, {"state", s}};
-    TaskLog(taskId, "direction_finished", "", btId, s, "", &extra);
+    if (taskId.empty() || !directionChanged) return;
+    nlohmann::json task;
+    if (!taskStore_.Get(taskId, task)) return;
+    const std::string oldState = task.value("state", std::string());
+    const std::string newState = TaskStateLocked(taskId).value("state", std::string());
+    if (newState.empty() || newState == oldState) return;
+    task["state"] = newState;
+    task["updatedAt"] = GetCurrentTimestampStr();
+    task["rev"] = BumpRevLocked();
+    std::string err;
+    taskStore_.Save(task, err);
+
+    // The task is the parent of its directions too: a task-level change recomputes them.
+    for (auto& dir : directionStore_.All()) {
+        if (!dir.is_object() || dir.value("taskId", std::string()) != taskId) continue;
+        const std::string dirId = dir.value("id", std::string());
+        if (dirId.empty() || dirId == directionId) continue;
+        const std::string oldDirState = dir.value("state", std::string());
+        const std::string newDirState = DirectionStateLocked(dirId).value("state", std::string());
+        if (newDirState.empty() || newDirState == oldDirState) continue;
+        dir["state"] = newDirState;
+        dir["updatedAt"] = GetCurrentTimestampStr();
+        dir["rev"] = BumpRevLocked();
+        std::string dirErr;
+        directionStore_.Save(dir, dirErr);
+    }
 }
 
 std::string TaskQueueManager::DirectionShow(const std::string& id, std::string& outError) {
@@ -9911,6 +10031,13 @@ std::string TaskQueueManager::DirectionPurgeOlderThan(int64_t olderThanSec, std:
 }
 
 nlohmann::json TaskQueueManager::TaskStateLocked(const std::string& taskId) const {
+    std::set<std::string> visiting;
+    return TaskStateLocked(taskId, "", visiting);
+}
+
+nlohmann::json TaskQueueManager::TaskStateLocked(const std::string& taskId,
+                                                 const std::string& excludeDirectionId,
+                                                 std::set<std::string>& visiting) const {
     nlohmann::json record;
     taskStore_.Get(taskId, record);
     if (record.is_object() && record.contains("closed") && record["closed"].is_object()) {
@@ -9931,6 +10058,7 @@ nlohmann::json TaskQueueManager::TaskStateLocked(const std::string& taskId) cons
     bool anyCancelled = false;
     int64_t closedDirections = 0;
     for (const std::string& dirId : dirIds) {
+        if (dirId == excludeDirectionId) continue;
         nlohmann::json dirRecord;
         if (directionStore_.Get(dirId, dirRecord) && dirRecord.is_object()) {
             if (dirRecord.contains("closed") && dirRecord["closed"].is_object()) {
@@ -9941,7 +10069,7 @@ nlohmann::json TaskQueueManager::TaskStateLocked(const std::string& taskId) cons
                 continue;
             }
         }
-        const nlohmann::json ds = DirectionStateLocked(dirId);
+        const nlohmann::json ds = DirectionStateLocked(dirId, visiting);
         const std::string s = ds.value("state", std::string("open"));
         if (ds.value("paused", false) || s == "paused") anyPaused = true;
         if (s == "running" || s == "paused" || s == "idle") {

@@ -8186,7 +8186,7 @@ static void RefreshTaskQueueData(DashboardState* st, bool force = false, bool us
 
         std::wstring idStr = Utf8ToWide(jobId);
         if (drow.kind == pc::TaskDisplayRowKind::Job && drow.indent > 0) {
-            idStr = L"  " + idStr;
+            idStr = L"    " + idStr;
         }
         // Card 106-5: a summary that was written in the display language shows its original text.
         std::string summaryText = JsonGetString(j, "summary", "");

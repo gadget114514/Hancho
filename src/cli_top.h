@@ -1088,7 +1088,7 @@ inline std::string RenderScreen(const TopState& state, int width, int height, bo
                                                  static_cast<size_t>(std::max(10, width - 66)));
                         }
                     } else if (r.kind == pc::TaskDisplayRowKind::MoreJobs) {
-                        std::string indentStr(static_cast<size_t>(std::max(1, r.indent)) * 2, ' ');
+                        std::string indentStr(static_cast<size_t>(std::max(1, r.indent)) * 4, ' ');
                         row << PadOrTruncate(indentStr + "... (+" + std::to_string(r.hiddenJobCount) + " older)", 24);
                     } else {
                         const auto& j = r.jobJson;
@@ -1106,7 +1106,7 @@ inline std::string RenderScreen(const TopState& state, int width, int height, bo
                         if (!r.supersedes.empty()) summary = "[<- " + pc::ShortJobRef(r.supersedes) + "] " + summary;
                         if (!r.supersededBy.empty()) summary = "[-> " + pc::ShortJobRef(r.supersededBy) + "] " + summary;
 
-                        std::string indentStr(static_cast<size_t>(r.indent) * 2, ' ');
+                        std::string indentStr(static_cast<size_t>(r.indent) * 4, ' ');
                         row << PadOrTruncate(indentStr + jid, 24) << " "
                             << PadOrTruncate(queueCol, 14) << " "
                             << PadOrTruncate(st, 11) << " "
