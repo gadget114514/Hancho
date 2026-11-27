@@ -1807,7 +1807,7 @@ static TaskQueueCounts FetchTaskQueueCountsIpc(DashboardState* st) {
 
 static std::string TaskQueueListIpc(DashboardState* st, const std::string& taskqueue, const std::string& state, int64_t sinceSec, std::string& outErr, const std::string& origin = "", const std::string& bt = "") {
     nlohmann::json req = {
-        {"action", "taskqueue_list"},
+        {"action", "taskqueue_list"}, {"finished_limit", 0},
         {"taskqueue", taskqueue},
         {"state", state},
         {"include_planned", true},
@@ -1836,7 +1836,7 @@ static std::string TaskQueueListIpc(DashboardState* st, const std::string& taskq
 
 static std::string TaskListIpc(DashboardState* st, int64_t sinceVersion, std::string& outErr) {
     nlohmann::json req = {
-        {"action", "task_list"},
+        {"action", "task_list"}, {"finished_limit", 0},
         {"since_version", sinceVersion}
     };
     nlohmann::json resp;
@@ -1988,7 +1988,7 @@ static void DashboardDataFetchThread(DashboardState* st, HWND hwnd) {
             }
         }
         if (!usedChanges) {
-            nlohmann::json req = {{"action", "taskqueue_list"},
+            nlohmann::json req = {{"action", "taskqueue_list"}, {"finished_limit", 0},
                                   {"include_planned", true},
                                   {"include_hidden", st->showHiddenTasks}};
             nlohmann::json resp;
@@ -2001,7 +2001,7 @@ static void DashboardDataFetchThread(DashboardState* st, HWND hwnd) {
         std::string tasksJson;
         std::string directionsJson;
         {
-            nlohmann::json req = {{"action", "task_list"}, {"since_version", st->lastTasksVersion}};
+            nlohmann::json req = {{"action", "task_list"}, {"since_version", st->lastTasksVersion}, {"finished_limit", 0}};
             nlohmann::json resp;
             if (DashboardIpcJson(req, resp)) {
                 if (!resp.value("unchanged", false) && resp.contains("tasks") && resp["tasks"].is_array()) {
