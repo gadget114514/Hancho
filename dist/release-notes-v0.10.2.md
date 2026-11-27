@@ -1,6 +1,9 @@
 ## Hancho v0.10.2
 
 ### Changes
+- **Task state follows the newest direction**: running work wins over an older failure, a planned recovery card shows `open`, and the task succeeds once the newest direction succeeds. Directions inside a task are listed newest first; a running task/direction no longer shows an end time but the remaining time instead.
+- **Task list countdown and column widths**: running task/direction rows show the estimate/timeout countdown (or over-budget / elapsed text), and manually sized columns stay put when the window is resized.
+- **Compact IPC responses**: the CLI and dashboard request msgpack + deflate responses and fall back to plain JSON with older cores. Brief process lists reduce the payload and the IPC read path no longer drops a chunk that completes immediately.
 - **Task list tree stays intact**: an explicit direction record (not an implicit `job:` direction) now always gets a heading, even after its behavior tree has finished and it has only one job. The task → direction → job shape stays visible; the "Running" column continues to show only work that is currently running.
 - **Task list refresh fix**: changed cells are no longer blanked out by the in-place refresh that replaced the full rebuild.
 - **Installer copyright**: the setup executable carries `Copyright (c) 2026 gadget114514, 2nek`.
@@ -14,6 +17,9 @@
 - **Running Tasks KPI**: the job count was removed from the 稼働中タスク card; only the task count is shown.
 
 ### 変更（日本語）
+- **タスクの状態は最新の direction に従います**: 実行中があれば古い失敗より実行中を優先し、予定（planned）の救済カードがある間は `open`、最新の direction が成功すればタスクも成功になります。タスク内の direction は新しい順に並び、実行中のタスク／direction は終了時間ではなく残り時間を表示します。
+- **タスク一覧の残り時間と列幅**: 実行中の行に見積もり／タイムアウトからの残り時間（超過時は超過時間、設定がなければ経過時間）を表示します。手動で調整した列幅は画面サイズを変えてもリセットされません。
+- **IPC 応答のコンパクト化**: CLI とダッシュボードが msgpack + deflate の応答を要求し、古い core とはプレーン JSON にフォールバックします。プロセス一覧を簡略化して転送量を減らし、即座に完了する読み取りのチャンクが失われる問題も修正しました。
 - **タスク一覧のツリー形状を維持**: 明示的な direction レコード（`implicit` の `job:` 行ではないもの）は、BT が終了してジョブが1本だけになっても見出しを残します。タスク → direction → ジョブの階層が見え続け、「実行中」列は今実行中のものだけを表示します。
 - **タスク一覧の更新修正**: 全行の作り直しをやめた差分更新で、変化したセルが空になる問題を修正しました。
 - **インストーラーの copyright**: `Copyright (c) 2026 gadget114514, 2nek` を記載しています。

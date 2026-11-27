@@ -171,6 +171,9 @@ The application icons are modeled on the character "Telephone Cat" (電話猫, D
 ## Release Notes
 
 ### v0.10.2
+- **Task state follows the newest direction**: running work wins over an older failure, a planned recovery card shows `open`, and the task succeeds once the newest direction succeeds. Directions in the task list are listed newest first; a running task/direction no longer shows an end time but the remaining time instead.
+- **Task list countdown and column widths**: running task/direction rows show the estimate/timeout countdown (or the over-budget / elapsed text), and manually sized columns stay put when the list is resized.
+- **Compact IPC responses**: the CLI and dashboard request msgpack + deflate responses and fall back to plain JSON with older cores. Brief process lists reduce the payload and the IPC read path no longer drops a chunk that completes immediately.
 - **Task list tree stays intact**: explicit direction records now always keep their heading, even when the behavior tree has finished and has only one job. The task → direction → job shape remains visible; the "Running" column still shows only work that is currently running.
 - **Task list refresh fix**: changed cells are no longer blanked out after an in-place refresh. The installer setup carries the copyright line for gadget114514 and 2nek.
 - **Escalation no longer hangs forever**: BT templates now give escalation `timeoutSec: 1800`; on timeout the node defaults to `stop` (a configured proxy fallback may still answer first). A build/test that exits 1 within 30 seconds is retried once before escalation, and the question now quotes the failed step, exit code, class and log tail.
