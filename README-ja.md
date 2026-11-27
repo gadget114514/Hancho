@@ -183,6 +183,7 @@ New-Item -ItemType Junction -Path .claude\skills\hancho -Target (Resolve-Path sk
 - **ダッシュボードと data-dir のすりあわせ**: 稼働中の core が data-dir を公開し、後から起きた CLI / ダッシュボードが採用します。別プロセスが headless 起動した core でも見え続けます。`.hancho` はカレントのプロジェクトフォルダだけを探し、親フォルダは遡りません。
 - **`hancho-cli dashboard [show|status]`**: 稼働中の core に、その core の data-dir でダッシュボードを表示させます。
 - **稼働中タスク KPI**: ジョブ数を廃止し、タスク数だけを表示します。
+- **コーデックの同梱**: `thirdparty/msgpack-c` と `thirdparty/zlib-ng` を静的（`/MT`）で組み込み、版ダイアログの About に copyright を追記しました。IPC 応答を正しい UTF-8 にサニタイズし、16KB / 64KB / 128KB / 1MB のペイロードと json/msgpack × none/lznt1/deflate の round trip をスモークテストしました。
 
 ### v0.10.1
 - **タスク一覧の更新**: 行数が変わらない 5 秒ごとの更新で全行を作り直さなくなり、カラム幅も更新のたびにリセットされなくなりました。タスク番号や ID が重複していても、一覧が消えて描き直される現象が起きません。

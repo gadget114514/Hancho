@@ -187,6 +187,7 @@ The application icons are modeled on the character "Telephone Cat" (電話猫, D
 - **Dashboard / data-dir alignment**: a running core publishes its data directory and a later CLI or dashboard adopts it, so a headless core started by another process stays visible. `.hancho` is used only when it exists in the current project folder; parent folders are not searched.
 - **`hancho-cli dashboard [show|status]`**: asks the running core to show its desktop dashboard using the core's own data directory.
 - **Running Tasks KPI**: the job count was removed from the 稼働中タスク card; only the task count is shown.
+- **Vendored codecs**: `thirdparty/msgpack-c` and `thirdparty/zlib-ng` are built into Hancho (static `/MT` runtime); the About page now lists their copyrights. IPC responses are sanitized to valid UTF-8, and smoke tests cover 16 KB / 64 KB / 128 KB / 1 MB payloads with json/msgpack and none/lznt1/deflate round trips.
 
 ### v0.10.1
 - **Task list refresh**: the list no longer recreates all rows on every 5-second refresh when the row count is unchanged, and column widths are no longer reset by the refresh loop. Duplicate task numbers or ids no longer make the list clear and redraw on each tick.

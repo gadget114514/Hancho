@@ -18,6 +18,7 @@
 - **Dashboard / data-dir alignment**: a running core publishes its data directory and a later CLI or dashboard adopts it, so a headless core started by another process stays visible. `.hancho` is used only when it exists in the current project folder; parent folders are not searched.
 - **`hancho-cli dashboard [show|status]`**: asks the running core to show its desktop dashboard using the core's own data directory.
 - **Running Tasks KPI**: the job count was removed from the 稼働中タスク card; only the task count is shown.
+- **Vendored codecs**: `thirdparty/msgpack-c` and `thirdparty/zlib-ng` are built into Hancho (static `/MT` runtime); the About page lists their copyrights. IPC responses are sanitized to valid UTF-8, and smoke tests cover 16 KB / 64 KB / 128 KB / 1 MB payloads with json/msgpack and none/lznt1/deflate round trips.
 
 ### 変更（日本語）
 - **タスク欄はタスク ID**: タスクキューリストの「タスク」列に、タイトルではなくタスク ID を表示します。
@@ -37,3 +38,4 @@
 - **ダッシュボードと data-dir のすりあわせ**: 稼働中の core が data-dir を公開し、後から起きた CLI / ダッシュボードが採用します。別プロセスが headless 起動した core でも見え続けます。`.hancho` はカレントのプロジェクトフォルダだけを探し、親フォルダは遡りません。
 - **`hancho-cli dashboard [show|status]`**: 稼働中の core に、その core の data-dir でダッシュボードを表示させます。
 - **稼働中タスク KPI**: ジョブ数を廃止し、タスク数だけを表示します。
+- **コーデックの同梱**: `thirdparty/msgpack-c` と `thirdparty/zlib-ng` を静的（`/MT`）で組み込み、版ダイアログの About に copyright を追記しました。IPC 応答を正しい UTF-8 にサニタイズし、16KB / 64KB / 128KB / 1MB のペイロードと json/msgpack × none/lznt1/deflate の round trip をスモークテストしました。
