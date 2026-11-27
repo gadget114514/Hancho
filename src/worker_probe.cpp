@@ -1,4 +1,6 @@
 #include "worker_probe.h"
+#include "common.h"
+#include "win_command.h"
 
 #include <chrono>
 #include <cctype>
@@ -50,18 +52,19 @@ RunResult RunCommand(const std::string& command, int timeoutSec) {
     if (!CreatePipe(&hOutRead, &hOutWrite, &sa, 0)) return r;
     SetHandleInformation(hOutRead, HANDLE_FLAG_INHERIT, 0);
 
-    STARTUPINFOA si{};
+    STARTUPINFOW si{};
     si.cb = sizeof(si);
     si.dwFlags = STARTF_USESTDHANDLES;
     si.hStdOutput = hOutWrite;
     si.hStdError = hOutWrite;
     si.hStdInput = nullptr; // closed stdin
 
-    std::string cmd = command;
-    std::vector<char> mutableCmd(cmd.begin(), cmd.end());
-    mutableCmd.push_back('\0');
+    // npm shims such as claude.cmd cannot be started by CreateProcess directly (see win_command.h).
+    std::wstring cmd = WinCommandLineForCreate(Utf8ToWide(command));
+    std::vector<wchar_t> mutableCmd(cmd.begin(), cmd.end());
+    mutableCmd.push_back(L'\0');
     PROCESS_INFORMATION pi{};
-    BOOL created = CreateProcessA(nullptr, mutableCmd.data(), nullptr, nullptr, TRUE,
+    BOOL created = CreateProcessW(nullptr, mutableCmd.data(), nullptr, nullptr, TRUE,
                                   CREATE_NO_WINDOW, nullptr, nullptr, &si, &pi);
     CloseHandle(hOutWrite);
     if (!created) {

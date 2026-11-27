@@ -2102,7 +2102,8 @@ bool LlmStreamTracker::StartAdapterProcess() {
     si.hStdError = stdoutWrite;
 
     PROCESS_INFORMATION pi{};
-    std::wstring cmd = Utf8ToWide(adapter_->exec);
+    // npm shims such as claude.cmd need cmd.exe (see win_command.h).
+    std::wstring cmd = WinCommandLineForCreate(Utf8ToWide(adapter_->exec));
     std::vector<wchar_t> cmdLine(cmd.begin(), cmd.end());
     cmdLine.push_back(L'\0');
     BOOL ok = CreateProcessW(nullptr, cmdLine.data(), nullptr, nullptr, TRUE,

@@ -753,6 +753,20 @@ target_link_libraries(bt_debug_view_smoke PRIVATE
     crypt32
 )
 
+# Headless test for the Windows command line wrapper that runs npm .cmd shims via cmd.exe (src/win_command.h).
+add_executable(win_command_smoke
+    tests/win_command_smoke.cpp
+)
+
+target_include_directories(win_command_smoke PRIVATE
+    src
+    include
+)
+
+if(MSVC)
+    target_compile_options(win_command_smoke PRIVATE /W4 /utf-8 /EHsc)
+endif()
+
 # Headless test for the worker engine registry and output schema validator (src/worker_engines.cpp).
 add_executable(worker_engines_smoke
     tests/worker_engines_smoke.cpp

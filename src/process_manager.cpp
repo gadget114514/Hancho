@@ -1,5 +1,6 @@
 #include "process_manager.h"
 #include "nlohmann/json.hpp"
+#include "win_command.h"
 #include <sstream>
 #include <algorithm>
 
@@ -47,6 +48,8 @@ static std::wstring ResolveCommandLineForWin32(const std::string& rawCmdUtf8, co
     size_t start = cmd.find_first_not_of(L" \t");
     if (start == std::wstring::npos) return L"";
     cmd = AnchorRelativeProgram(cmd.substr(start), cwd);
+    // npm shims (claude.cmd, opencode.cmd) cannot be started by CreateProcess directly.
+    cmd = WinCommandLineForCreate(cmd);
 
     std::wstring prog;
     if (cmd[0] == L'"') {
