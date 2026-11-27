@@ -127,6 +127,12 @@ inline bool DefaultTaskExpanded(const std::string& taskState) {
            taskState == "waitingForLlm" || taskState == "paused";
 }
 
+inline bool IsActiveTaskState(const std::string& state) {
+    return state == "running" || state == "pending" || state == "waiting" ||
+           state == "planned" || state == "waitingForPermit" || state == "waitingForLlm" ||
+           state == "paused" || state == "idle" || state == "open" || state == "takenOver";
+}
+
 inline std::string ComputeImplicitTaskState(const std::vector<nlohmann::json>& jobs) {
     if (jobs.empty()) return "open";
     std::unordered_set<std::string> byIds;
@@ -693,8 +699,20 @@ inline std::vector<TaskDisplayRow> BuildTaskDisplayRows(
             }
             d.startTime = dirEarliestStart;
 
-            // Compute endTime for DirectionHeading:
-            const bool dirFinished = (d.state == "succeeded" || d.state == "failed" ||
+            // Compute endTime for DirectionHeading: jobs still running mean no end time yet.
+            bool dirHasActiveWork = false;
+            for (const auto& j : d.realJobs) {
+                if (j.is_object() && IsActiveTaskState(j.value("state", std::string()))) {
+                    dirHasActiveWork = true;
+                    break;
+                }
+            }
+            if (!dirHasActiveWork && d.virtualJob.is_object() &&
+                IsActiveTaskState(d.virtualJob.value("state", std::string()))) {
+                dirHasActiveWork = true;
+            }
+            const bool dirFinished = !dirHasActiveWork &&
+                                     (d.state == "succeeded" || d.state == "failed" ||
                                       d.state == "cancelled" || d.state == "closed");
             if (dirFinished) {
                 std::string closedAt;
@@ -766,19 +784,31 @@ inline std::vector<TaskDisplayRow> BuildTaskDisplayRows(
             d.runningDetail = dRunningDetail;
         }
 
-        // Sort non-card directions chronologically by earliest real job or sortTs,
-        // and card directions in natural card number order.
+        // Newest directions first: a task's latest attempt sits at the top, including cards.
+        auto directionSortKey = [](const DirMeta& d) {
+            if (!d.startTime.empty()) return d.startTime;
+            if (!d.sortTs.empty()) return d.sortTs;
+            if (!d.realJobs.empty()) return d.realJobs.front().value("created_at", std::string());
+            return std::string();
+        };
         std::sort(dirOrder.begin(), dirOrder.end(), [&](const std::string& a, const std::string& b) {
             const DirMeta& da = dirMap[a];
             const DirMeta& db = dirMap[b];
+            const std::string ta = directionSortKey(da);
+            const std::string tb = directionSortKey(db);
+            if (!ta.empty() || !tb.empty()) {
+                if (ta != tb) return ta > tb;
+                if (da.cardNumber != db.cardNumber && !da.cardNumber.empty() && !db.cardNumber.empty()) {
+                    return CompareCardNumberNatural(db.cardNumber, da.cardNumber);
+                }
+                return b < a;
+            }
+            // No time information (e.g. a synthesized row): keep the old card-number order.
             if (da.isCard != db.isCard) return !da.isCard;
             if (da.isCard && db.isCard) {
                 if (da.cardNumber != db.cardNumber) return CompareCardNumberNatural(da.cardNumber, db.cardNumber);
                 return a < b;
             }
-            const std::string ta = !da.realJobs.empty() ? da.realJobs.front().value("created_at", std::string()) : da.sortTs;
-            const std::string tb = !db.realJobs.empty() ? db.realJobs.front().value("created_at", std::string()) : db.sortTs;
-            if (ta != tb) return ta < tb;
             return a < b;
         });
         dirStatesChrono.clear();
@@ -841,9 +871,26 @@ inline std::vector<TaskDisplayRow> BuildTaskDisplayRows(
                 }
             }
 
-            // Compute endTime for TaskHeading:
+            // Compute endTime for TaskHeading: a task with work still running has no end time,
+            // even when its cached/fallback state says it finished.
             std::string taskLatestEnd;
-            const bool taskFinished = (m.state == "succeeded" || m.state == "failed" ||
+            bool taskHasActiveWork = false;
+            for (const auto& did : dirOrder) {
+                if (IsActiveTaskState(dirMap[did].state)) {
+                    taskHasActiveWork = true;
+                    break;
+                }
+            }
+            if (!taskHasActiveWork) {
+                for (const auto& j : m.jobs) {
+                    if (j.is_object() && IsActiveTaskState(j.value("state", std::string()))) {
+                        taskHasActiveWork = true;
+                        break;
+                    }
+                }
+            }
+            const bool taskFinished = !taskHasActiveWork &&
+                                      (m.state == "succeeded" || m.state == "failed" ||
                                        m.state == "cancelled" || m.state == "closed");
             if (taskFinished) {
                 for (const auto& did : dirOrder) {
@@ -942,16 +989,8 @@ inline std::vector<TaskDisplayRow> BuildTaskDisplayRows(
         const bool showAllTask = (maxVisibleJobsPerTask == 0) || (showAllJobsTasks.count(id) > 0);
         size_t emittedSingleDirJobs = 0;
         int hiddenSingleDirJobs = 0;
-        // Display non-card directions newest-first and card directions in natural card number order.
-        std::vector<std::string> dispDirOrder;
-        dispDirOrder.reserve(dirOrder.size());
-        for (auto it = dirOrder.rbegin(); it != dirOrder.rend(); ++it) {
-            if (!dirMap[*it].isCard) dispDirOrder.push_back(*it);
-        }
+        // dirOrder is already newest-first (including cards); display it as-is.
         for (const auto& did : dirOrder) {
-            if (dirMap[did].isCard) dispDirOrder.push_back(did);
-        }
-        for (const auto& did : dispDirOrder) {
             const DirMeta& d = dirMap[did];
             if (!d.hasHeading) {
                 for (auto it = d.realJobs.rbegin(); it != d.realJobs.rend(); ++it) {

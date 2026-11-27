@@ -8106,6 +8106,7 @@ void TaskQueueManager::ProcessSchedulerTick() {
             job.state = "running";
             job.updatedAt = a.start;
             MarkJobChangedLocked(job);
+            RefreshJobStateChainLocked(job.directionId, job.taskId);
             EmitEventLocked(tq, "jobStarted", job.id, n);
             job.attempts.back().startEventSeq = static_cast<uint64_t>(tq.version);
 
@@ -10051,16 +10052,22 @@ nlohmann::json TaskQueueManager::TaskStateLocked(const std::string& taskId,
     if (dirIds.empty()) {
         return ComputeTaskState(CollectTaskNodes(queues_, taskId, record));
     }
+    struct ActiveDirection {
+        std::string id;
+        std::string state;
+        std::string createdAt;
+        bool paused = false;
+    };
+    std::vector<ActiveDirection> active;
     bool anyRunning = false;
     bool anyPaused = false;
-    bool anyFailed = false;
     bool anyPlanned = false;
-    bool anyCancelled = false;
     int64_t closedDirections = 0;
     for (const std::string& dirId : dirIds) {
         if (dirId == excludeDirectionId) continue;
         nlohmann::json dirRecord;
-        if (directionStore_.Get(dirId, dirRecord) && dirRecord.is_object()) {
+        const bool hasRecord = directionStore_.Get(dirId, dirRecord) && dirRecord.is_object();
+        if (hasRecord) {
             if (dirRecord.contains("closed") && dirRecord["closed"].is_object()) {
                 ++closedDirections;
                 continue;
@@ -10071,27 +10078,58 @@ nlohmann::json TaskQueueManager::TaskStateLocked(const std::string& taskId,
         }
         const nlohmann::json ds = DirectionStateLocked(dirId, visiting);
         const std::string s = ds.value("state", std::string("open"));
-        if (ds.value("paused", false) || s == "paused") anyPaused = true;
-        if (s == "running" || s == "paused" || s == "idle") {
+        const bool paused = ds.value("paused", false) || s == "paused";
+        if (paused) anyPaused = true;
+        if (s == "running" || s == "paused" || s == "idle" || s == "waitingForLlm") {
             anyRunning = true;
-        } else if (s == "failed") {
-            anyFailed = true;
         } else if (s == "planned" || s == "open") {
             anyPlanned = true;
-        } else if (s == "cancelled") {
-            anyCancelled = true;
         }
+        std::string createdAt;
+        if (hasRecord) {
+            createdAt = dirRecord.value("createdAt", dirRecord.value("created_at", std::string()));
+            if (createdAt.empty()) {
+                createdAt = dirRecord.value("startedAt", dirRecord.value("started_at", std::string()));
+            }
+        }
+        if (createdAt.empty() && dirId.rfind("job:", 0) == 0) {
+            const std::string jobId = dirId.substr(4);
+            for (const auto& [name, tq] : queues_) {
+                (void)name;
+                for (const auto& job : tq.jobs) {
+                    if (job.id == jobId) {
+                        createdAt = job.createdAt;
+                        break;
+                    }
+                }
+                if (!createdAt.empty()) break;
+            }
+        }
+        active.push_back({dirId, s, createdAt, paused});
     }
     nlohmann::json out = nlohmann::json::object();
     if (anyRunning) {
         out["state"] = "running";
         if (anyPaused) out["paused"] = true;
-    } else if (anyFailed) {
-        out["state"] = "failed";
     } else if (anyPlanned) {
         out["state"] = "open";
-    } else if (anyCancelled) {
-        out["state"] = "cancelled";
+    } else if (!active.empty()) {
+        // A failed direction is history once a newer direction exists. Among finished/
+        // cancelled directions, the newest one decides the task's state.
+        const ActiveDirection* latest = &active.front();
+        for (const auto& d : active) {
+            if (d.createdAt != latest->createdAt) {
+                if (d.createdAt > latest->createdAt) latest = &d;
+            } else if (CompareCardNumberNatural(latest->id, d.id)) {
+                latest = &d;
+            }
+        }
+        const std::string& s = latest->state;
+        if (s == "failed" || s == "blocked" || s == "closed") out["state"] = "failed";
+        else if (s == "cancelled") out["state"] = "cancelled";
+        else if (s == "succeeded") out["state"] = "succeeded";
+        else out["state"] = "open";
+        if (latest->paused) out["paused"] = true;
     } else {
         out["state"] = "succeeded";
     }

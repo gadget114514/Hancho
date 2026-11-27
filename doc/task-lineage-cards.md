@@ -35,14 +35,20 @@ worker は 1 枚ずつ順に実装する。前のカードの変更は作業ツ�
 
 ### 状態の決め方（タスク）
 
-タスクに属する系譜ごとに最新ジョブを求め（`supersededBy` をたどる。存在しない id は飛ばし、`removedJobs` の記録も使う）、次の優先順で決める。
+タスクに属する direction（系譜）ごとに最新ジョブを求め（`supersededBy` をたどる。存在しない id は飛ばし、`removedJobs` の記録も使う）、次の優先順で決める。
 
 1. タスクが閉じられていれば `closed`（`result` と `reason` を併記）。
-2. ジョブが 0 件なら `open`。
-3. 最新ジョブのどれかが `pending` / `waiting` / `running` / `planned` / `waitingForPermit`、または `takenOver` で未完了 → `running`（一時停止中のジョブがあれば `paused: true` を併記）。
-4. どれかが `failed` / `blocked` / `closed`（ジョブの close）、または `takenOver` で `result: failed` → `failed`。
-5. どれかが `cancelled` → `cancelled`。
-6. 残りがすべて `succeeded`、または `takenOver` で `result: succeeded` → `succeeded`。
+2. direction が 0 件なら `open`。
+3. どれかの direction が `running` / `paused` / `idle` / `waitingForLlm` → `running`（一時停止中があれば `paused: true` を併記）。進行中があれば、古い失敗に引っ張られない。
+4. 未着手（`planned` / `open`）の direction が残っていれば `open`。古い成功や失敗で「終わり」と表示しない。
+5. それ以外は**一番新しい direction** の状態を採用する。失敗した direction があっても、あとから作られた direction（救済・やり直し）の状態が勝つ。
+   - `failed` / `blocked` / `closed` → `failed`
+   - `cancelled` → `cancelled`
+   - `succeeded` → `succeeded`
+   - `open` / `planned` / `waitingForLlm` など → `open`
+6. 残る direction がなければ `succeeded`。
+
+新しさは direction の `createdAt`（なければ `startedAt`、暗黙 direction はジョブの `createdAt`）で決め、同じ時刻なら id の自然順で新しい方を採る。閉じた direction と `supersededBy` で引き継がれた direction は数えず、閉じた数は `closedDirections` に併記する。タスク一覧の direction も同じ新しさで並べ、新しいものを上に出す。
 
 ### サイズ上限
 

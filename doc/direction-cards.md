@@ -83,7 +83,8 @@
   MCP（`direction_show` / `direction_list` / `direction_close` / `direction_reopen` / `direction_purge`）と IPC にも同じ操作。`task show` の出力に、task の中の direction の一覧（id、kind、title、状態）を足す。
 - 閉じた direction の job は、実行中または待機中（未終了）のものがあれば閉じられない（エラー。先に `cancel`）。
 - タスクの経過ログに `direction_finished`（終わったときの状態）、`direction_closed` / `direction_reopened`（理由付き）を書く。
-- タスクの状態の決め方を direction 単位にする: 閉じた direction（および `supersededBy` で引き継がれた direction）の job は数えない。残りの direction に `running` があれば `running`、`failed` があれば `failed`、`planned`（104-1）が残っていれば `open`、すべて成功したか閉じられたら `succeeded`（閉じたものがあれば `closedDirections: N` を併記）。102-7 はこの上に、トリアージの判断で閉じる操作を足す。
+- タスクの状態の決め方を direction 単位にする: 閉じた direction（および `supersededBy` で引き継がれた direction）の job は数えない。残りの direction に `running` があれば `running`、それ以外は一番新しい direction の状態を採用する（`failed` / `cancelled` / `succeeded` / `planned` や `open` なら `open`）。古い失敗は、あとから作られた救済 direction が `planned` なら `open`、成功すれば `succeeded` に変わる（閉じたものがあれば `closedDirections: N` を併記）。102-7 はこの上に、トリアージの判断で閉じる操作を足す。
+- タスク一覧では、タスクの中の direction を新しい順（`createdAt` / `startedAt`、同じなら id の自然順）に並べる。
 - テスト: 状態の計算の各行、閉じる・開き直す、閉じた direction を数えないタスクの状態、実行中・待機中の job があると閉じられない、CLI と MCP の出力。
 
 ## 103-3: 一覧の仮想行を `direction:<id>` にする

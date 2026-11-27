@@ -4079,8 +4079,8 @@ int main() {
         Check(rows[1].kind == TaskDisplayRowKind::Job && rows[1].jobId == "j_run" && rows[1].indent == 1,
               "100-5: child job indented");
         Check(rows[2].kind == TaskDisplayRowKind::TaskHeading && rows[2].taskId == "task_done" && !rows[2].expanded &&
-                  rows[2].resultsCompact == "\xE2\x9C\x97\xE2\x9C\x93" && rows[2].jobCount == 2,
-              "100-5: succeeded task auto-collapsed with compact result ✗✓ and jobCount=2");
+                  rows[2].resultsCompact == "\xE2\x9C\x93\xE2\x9C\x97" && rows[2].jobCount == 2,
+              "100-5: succeeded task auto-collapsed with compact result ✓✗ and jobCount=2");
         Check(rows[3].kind == TaskDisplayRowKind::Job && rows[3].jobId == "j_imp" && rows[3].indent == 0,
               "100-5: implicit single job renders flat without heading");
         Check(rows[4].kind == TaskDisplayRowKind::Job && rows[4].jobId == "group:bt_1" && rows[4].indent == 0,
@@ -4122,10 +4122,14 @@ int main() {
             std::unordered_set<std::string> dAll;
             auto dRows = BuildTaskDisplayRows(dJobs, dTasks, true, dOv, dAll, dCounts, 8);
             bool sawTask = false, sawSingle = false, sawMultiDir = false, sawMultiJob = false, sawBtDir = false, sawBtJob = false, sawImpDir = false, sawImpJob = false;
+            std::vector<std::string> dirOrderSeen;
             for (const auto& r : dRows) {
+                if (r.kind == TaskDisplayRowKind::DirectionHeading && r.taskId == "t_3lvl") {
+                    dirOrderSeen.push_back(r.directionId);
+                }
                 if (r.kind == TaskDisplayRowKind::TaskHeading && r.taskId == "t_3lvl") {
-                    // 3 directions: dir_single (✓), dir_multi (✗), dir_bt (▶) -> ✓✗▶
-                    sawTask = (r.indent == 0 && r.resultsCompact == "\xE2\x9C\x93\xE2\x9C\x97\xE2\x96\xB6");
+                    // Newest first: dir_bt (▶), dir_multi (✗), dir_single (✓) -> ▶✗✓
+                    sawTask = (r.indent == 0 && r.resultsCompact == "\xE2\x96\xB6\xE2\x9C\x97\xE2\x9C\x93");
                 } else if (r.kind == TaskDisplayRowKind::Job && r.jobId == "j_single") {
                     sawSingle = (r.indent == 1);
                 } else if (r.kind == TaskDisplayRowKind::DirectionHeading && r.directionId == "dir_multi") {
@@ -4143,10 +4147,34 @@ int main() {
                 }
             }
             Check(sawTask, "103-3: TaskHeading has indent 0 and per-direction resultsCompact");
+            Check(dirOrderSeen.size() == 2 && dirOrderSeen[0] == "dir_bt" && dirOrderSeen[1] == "dir_multi",
+                  "103-3: directions are listed newest first");
             Check(sawSingle, "103-3: single-job jobs direction omits DirectionHeading (indent 1)");
             Check(sawMultiDir && sawMultiJob, "103-3: multi-job jobs direction has DirectionHeading (indent 1) and jobs (indent 2)");
             Check(sawBtDir && sawBtJob, "103-3: BT direction has DirectionHeading (indent 1) and jobs (indent 2)");
             Check(sawImpDir && sawImpJob, "103-3: implicit multi-job add has DirectionHeading (indent 0) and jobs (indent 1)");
+        }
+
+        // A running job must not get an end time, even if the task state says succeeded.
+        {
+            std::vector<nlohmann::json> eTasks = {
+                {{"id", "t_end"}, {"title", "end time"}, {"state", "succeeded"}, {"updatedAt", "2026-11-27T10:10:00Z"}}
+            };
+            std::vector<nlohmann::json> eJobs = {
+                {{"id", "e_run"}, {"task_id", "t_end"}, {"direction_id", "dir_end"},
+                 {"state", "running"}, {"summary", "still running"}, {"created_at", "2026-11-27T10:00:00Z"}}
+            };
+            TaskViewCounts eCounts;
+            std::unordered_map<std::string, bool> eOv;
+            std::unordered_set<std::string> eAll;
+            bool sawTaskEnd = false;
+            for (const auto& r : BuildTaskDisplayRows(eJobs, eTasks, true, eOv, eAll, eCounts, 8)) {
+                if (r.kind == TaskDisplayRowKind::TaskHeading && r.taskId == "t_end") {
+                    sawTaskEnd = true;
+                    Check(r.endTime.empty(), "103-3: task with a running job has no end time");
+                }
+            }
+            Check(sawTaskEnd, "103-3: end-time task heading exists");
         }
 
         // Older jobs summary ("MoreJobs") when exceeding maxVisibleJobsPerTask=1
@@ -4584,9 +4612,9 @@ int main() {
             Check(dTm.DirectionState(dirOk).value("state", std::string()) == "succeeded",
                   "103-2: succeeded direction state is succeeded");
 
-            // Task state is failed while dirSlow is failed.
-            Check(dTm.TaskState(taskId).value("state", std::string()) == "failed",
-                  "103-2: task state is failed when one direction failed");
+            // The newer succeeded direction wins over the older failure.
+            Check(dTm.TaskState(taskId).value("state", std::string()) == "succeeded",
+                  "103-2: task state follows the newest direction, not an older failure");
 
             // 3) Close dirSlow -> task state becomes succeeded with closedDirections=1.
             const nlohmann::json cl = parse(dTm.DirectionClose(dirSlow, "ignored", "not needed", err));
@@ -4617,8 +4645,8 @@ int main() {
             const nlohmann::json ro = parse(dTm.DirectionReopen(dirSlow, "recheck", err));
             Check(ro.value("ok", false) && ro.value("state", std::string()) == "failed",
                   "103-2: direction reopen restores failed state");
-            Check(dTm.TaskState(taskId).value("state", std::string()) == "failed",
-                  "103-2: task state returns to failed after reopen");
+            Check(dTm.TaskState(taskId).value("state", std::string()) == "succeeded",
+                  "103-2: reopened older failure does not drag the task down");
             const nlohmann::json showAfterReopen = parse(dTm.TaskShow(taskId, 50, err));
             bool hasReopenedLog = false;
             for (const auto& entry : showAfterReopen["log"]) {
@@ -4645,6 +4673,32 @@ int main() {
             Check(dListTask.value("ok", false) && dListTask["directions"].size() == 1 &&
                       dListTask["directions"][0].value("id", std::string()) == dirSlow,
                   "103-2: DirectionList filters by taskId and state");
+
+            // 6b) Progress wins over older failures; a planned recovery card shows as open.
+            const std::wstring runCmd = PathJoinWide(dirDataDir, L"run_ok.cmd");
+            WriteFileAtomicWide(runCmd, "@echo off\r\nping -n 2 127.0.0.1 >nul\r\nexit /b 0\r\n");
+            const nlohmann::json addRun = parse(dTm.TaskQueueAdd(
+                "q103-2",
+                nlohmann::json::array({{
+                    {"id", "run-1"},
+                    {"command", "cmd /c \"" + WideToUtf8(runCmd) + "\""},
+                    {"summary", "slow ok"},
+                    {"timeoutSec", 30},
+                    {"maxAttempts", 1},
+                }}).dump(),
+                1, "", err, "", taskId));
+            Check(addRun.value("ok", false), "103-2: later direction added");
+            Check(dTm.TaskState(taskId).value("state", std::string()) == "running",
+                  "103-2: task is running while the newer direction progresses");
+            Check(WaitForState(dTm, "run-1", "succeeded", 8000), "103-2: run-1 succeeds");
+            Check(dTm.TaskState(taskId).value("state", std::string()) == "succeeded",
+                  "103-2: task succeeds once the newest direction succeeds");
+
+            const nlohmann::json recovery = parse(dTm.CardAdd(
+                taskId, "103-2-r", "Recovery card", "body", {}, "", "{}", "{}", err));
+            Check(recovery.value("ok", false), "103-2: planned recovery card added");
+            Check(dTm.TaskState(taskId).value("state", std::string()) == "open",
+                  "103-2: task is open while the recovery card is planned");
 
             // 7) Implicit direction job:<id> for pre-0.10 job without direction_id.
             WriteFileAtomicWide(

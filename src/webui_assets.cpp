@@ -3000,6 +3000,7 @@ const char kAppJs_5[] = R"JS_5(        if (!g.state && info.state) g.state = inf
               waitingFor: Array.isArray(dir.waitingFor) ? dir.waitingFor : [],
               supersedes: dir.supersedes || '',
               supersededBy: dir.supersededBy || '',
+              sortTs: dir.createdAt || dir.created_at || '',
               realJobs: [],
               virtualJob: null
             };
@@ -3015,7 +3016,7 @@ const char kAppJs_5[] = R"JS_5(        if (!g.state && info.state) g.state = inf
             else did = 'job:' + jid;
           }
           if (!dirMap[did]) {
-            dirMap[did] = { id: did, kind: 'jobs', title: '', state: '', isVirtualBt: false, isLegacyGroup: false, isCard: false, cardNumber: '', waitingFor: [], supersedes: '', supersededBy: '', realJobs: [], virtualJob: null };
+            dirMap[did] = { id: did, kind: 'jobs', title: '', state: '', isVirtualBt: false, isLegacyGroup: false, isCard: false, cardNumber: '', waitingFor: [], supersedes: '', supersededBy: '', sortTs: '', realJobs: [], virtualJob: null };
             dirOrder.push(did);
           }
           const d = dirMap[did];
@@ -3026,20 +3027,30 @@ const char kAppJs_5[] = R"JS_5(        if (!g.state && info.state) g.state = inf
             if (!d.title) d.title = job.summary || '';
             if (!d.state) d.state = job.state || '';
             d.virtualJob = job;
+            if (!d.sortTs) d.sortTs = job.created_at || job.start_time || '';
           } else {
             d.realJobs.push(job);
+            if (!d.sortTs) d.sortTs = job.created_at || '';
             if (job.bt && typeof job.bt === 'object') d.kind = 'bt';
           }
         }
         dirOrder.sort((a, b) => {
           const da = dirMap[a], db = dirMap[b];
+          const ta = da.sortTs || '', tb = db.sortTs || '';
+          if (ta || tb) {
+            if (ta !== tb) return ta > tb ? -1 : 1;
+            if (da.cardNumber && db.cardNumber) {
+              const cmp = compareCardNumberNatural(da.cardNumber, db.cardNumber);
+              if (cmp !== 0) return -cmp;
+            }
+            return a < b ? 1 : (a > b ? -1 : 0);
+          }
           if (da.isCard !== db.isCard) return da.isCard ? 1 : -1;
           if (da.isCard && db.isCard) {
             const cmp = compareCardNumberNatural(da.cardNumber, db.cardNumber);
             if (cmp !== 0) return cmp;
-            return a < b ? -1 : (a > b ? 1 : 0);
           }
-          return 0;
+          return a < b ? -1 : (a > b ? 1 : 0);
         });
         let totalRealJobs = 0;
         const dirStateObjs = [];
