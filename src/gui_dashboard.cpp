@@ -18208,15 +18208,15 @@ static LRESULT CALLBACK SettingsWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPAR
                            std::to_wstring(static_cast<int>(ds->dash->visibleFinishedCount)).c_str());
 
             ds->lblTaskListDisplayDays = CreateWindowExW(0, L"STATIC", L"", WS_CHILD | WS_VISIBLE,
-                18, 216, 530, 20, hwnd, nullptr, hInst, nullptr);
+                18, 228, 530, 20, hwnd, nullptr, hInst, nullptr);
             ds->editTaskListDisplayDays = CreateWindowExW(WS_EX_CLIENTEDGE, L"EDIT", L"",
                 WS_CHILD | WS_VISIBLE | WS_TABSTOP | ES_AUTOHSCROLL | ES_NUMBER,
-                560, 213, 110, 24, hwnd, (HMENU)IDC_SET_TASK_LIST_DISPLAY_DAYS, hInst, nullptr);
+                560, 225, 110, 24, hwnd, (HMENU)IDC_SET_TASK_LIST_DISPLAY_DAYS, hInst, nullptr);
             SetWindowTextW(ds->editTaskListDisplayDays,
                            std::to_wstring(ds->dash->taskListDisplayDays).c_str());
 
             ds->lblPerformanceHint = CreateWindowExW(0, L"STATIC", L"", WS_CHILD | WS_VISIBLE,
-                18, 228, 700, 70, hwnd, nullptr, hInst, nullptr);
+                18, 264, 700, 70, hwnd, nullptr, hInst, nullptr);
             SendMessageW(ds->lblPerformanceHint, WM_SETFONT, (WPARAM)ds->dash->hFontUi, TRUE);
 
             // Row colors live on their own 色 tab, so these start at the top of the page.
@@ -18778,13 +18778,14 @@ static LRESULT CALLBACK SettingsWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPAR
                 18, 104, 500, 340, hwnd, (HMENU)IDC_SET_LLM_ROWS, hInst, nullptr);
             SendMessageW(ds->lstLlmRows, WM_SETFONT, (WPARAM)ds->dash->hFontUi, TRUE);
 
+            // Each field: label at y_base (h=18), edit at y_base+18 (h=24), pitch=48px.
             struct LlmFieldLabel { HWND* slot; int y; };
             LlmFieldLabel llmLabels[] = {
-                { &ds->lblLlmEngine, 86 },
-                { &ds->lblLlmModel, 118 },
-                { &ds->lblLlmProvider, 150 },
-                { &ds->lblLlmRank, 182 },
-                { &ds->lblLlmNote, 214 },
+                { &ds->lblLlmEngine,   86 },
+                { &ds->lblLlmModel,   134 },
+                { &ds->lblLlmProvider,182 },
+                { &ds->lblLlmRank,    230 },
+                { &ds->lblLlmNote,    278 },
             };
             for (const auto& l : llmLabels) {
                 *l.slot = CreateWindowExW(0, L"STATIC", L"", WS_CHILD | WS_VISIBLE,
@@ -18795,13 +18796,13 @@ static LRESULT CALLBACK SettingsWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPAR
             ds->editLlmEngine = CreateWindowExW(WS_EX_CLIENTEDGE, L"EDIT", L"", WS_CHILD | WS_VISIBLE | WS_TABSTOP,
                 532, 104, 200, 24, hwnd, (HMENU)IDC_SET_LLM_ENGINE, hInst, nullptr);
             ds->editLlmModel = CreateWindowExW(WS_EX_CLIENTEDGE, L"EDIT", L"", WS_CHILD | WS_VISIBLE | WS_TABSTOP,
-                532, 136, 200, 24, hwnd, (HMENU)IDC_SET_LLM_MODEL, hInst, nullptr);
+                532, 152, 200, 24, hwnd, (HMENU)IDC_SET_LLM_MODEL, hInst, nullptr);
             ds->editLlmProvider = CreateWindowExW(WS_EX_CLIENTEDGE, L"EDIT", L"", WS_CHILD | WS_VISIBLE | WS_TABSTOP,
-                532, 168, 200, 24, hwnd, (HMENU)IDC_SET_LLM_PROVIDER, hInst, nullptr);
+                532, 200, 200, 24, hwnd, (HMENU)IDC_SET_LLM_PROVIDER, hInst, nullptr);
             ds->editLlmRank = CreateWindowExW(WS_EX_CLIENTEDGE, L"EDIT", L"", WS_CHILD | WS_VISIBLE | WS_TABSTOP,
-                532, 200, 200, 24, hwnd, (HMENU)IDC_SET_LLM_RANK, hInst, nullptr);
+                532, 248, 200, 24, hwnd, (HMENU)IDC_SET_LLM_RANK, hInst, nullptr);
             ds->editLlmNote = CreateWindowExW(WS_EX_CLIENTEDGE, L"EDIT", L"", WS_CHILD | WS_VISIBLE | WS_TABSTOP,
-                532, 232, 200, 24, hwnd, (HMENU)IDC_SET_LLM_NOTE, hInst, nullptr);
+                532, 296, 200, 24, hwnd, (HMENU)IDC_SET_LLM_NOTE, hInst, nullptr);
             SendMessageW(ds->editLlmEngine, WM_SETFONT, (WPARAM)ds->dash->hFontUi, TRUE);
             SendMessageW(ds->editLlmModel, WM_SETFONT, (WPARAM)ds->dash->hFontUi, TRUE);
             SendMessageW(ds->editLlmProvider, WM_SETFONT, (WPARAM)ds->dash->hFontUi, TRUE);
@@ -18816,7 +18817,7 @@ static LRESULT CALLBACK SettingsWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPAR
                 { &ds->btnLlmApprove, IDC_SET_LLM_APPROVE, 638 },
                 { &ds->btnLlmRefresh, IDC_SET_LLM_REFRESH, 532 },
             };
-            int llmBtnY[] = { 268, 268, 304, 304, 340 };
+            int llmBtnY[] = { 330, 330, 366, 366, 402 };
             for (size_t i = 0; i < sizeof(llmBtns) / sizeof(llmBtns[0]); ++i) {
                 *llmBtns[i].slot = CreateWindowExW(0, L"BUTTON", L"",
                     WS_CHILD | WS_VISIBLE | BS_OWNERDRAW | WS_TABSTOP,
@@ -24517,7 +24518,6 @@ static LRESULT CALLBACK DashboardWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPA
                     st->taskSearchText.clear();
                     SetWindowTextW(st->hwndSearchTaskEdit, L"");
                     st->visibleFinishedCount = kDefaultVisibleFinishedCount;
-                    st->taskListDisplayDays = kDefaultTaskListDisplayDays;
                     KillTimer(hwnd, TIMER_TASK_SEARCH_ID);
                     st->taskOriginFilter.clear();
                     if (st->hwndTaskOriginCombo) SendMessageW(st->hwndTaskOriginCombo, CB_SETCURSEL, 0, 0);
@@ -24542,7 +24542,6 @@ static LRESULT CALLBACK DashboardWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPA
                 st->taskSearchText = buf;
                 // 102-6: debounce the query; changing it also resets the "loaded more" count.
                 st->visibleFinishedCount = kDefaultVisibleFinishedCount;
-                st->taskListDisplayDays = kDefaultTaskListDisplayDays;
                 KillTimer(hwnd, TIMER_TASK_SEARCH_ID);
                 SetTimer(hwnd, TIMER_TASK_SEARCH_ID, kTaskSearchDebounceMs, nullptr);
             } else if (id == IDC_COMBO_TASK_ORIGIN && HIWORD(wParam) == CBN_SELCHANGE) {

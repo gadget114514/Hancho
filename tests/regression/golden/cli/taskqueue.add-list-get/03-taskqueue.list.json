@@ -55,10 +55,7 @@
       "origin": {
         "client": "hancho-cli-cli",
         "cwd": "<cwd>",
-        "host_session": "local_2c189257-4a94-478f-a699-1aa7f0efc54b",
-        "label": "",
-        "pid": 27020,
-        "session": "965dfb57-0017-4c6a-a697-c62f72d154d4"
+        "label": ""
       },
       "paused": false,
       "permission_resume_count": 0,

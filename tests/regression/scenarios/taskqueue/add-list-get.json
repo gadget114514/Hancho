@@ -31,5 +31,5 @@
     {"op": "taskqueue.get", "expect": "ok", "keep": true}
   ],
   "normalize": ["paths"],
-  "drop_keys": ["rev", "process_id"]
+  "drop_keys": ["rev", "process_id", "pid", "host_session", "session"]
 }

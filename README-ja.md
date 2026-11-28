@@ -167,15 +167,19 @@ New-Item -ItemType Junction -Path .claude\skills\hancho -Target (Resolve-Path sk
 
 ## リリースノート
 
+### v0.10.5
+- **設定ダイアログのレイアウト修正**: パフォーマンスタブで最後の2行の間隔が標準36pxのところ24pxになっていた問題と、LLMタブでラベル＋フィールドの行ピッチが32pxのためエディットボックスが次行ラベルと重なっていた問題を修正（ピッチを48pxに変更）。
+
 ### v0.10.4
 - **結果ファイルの形式**: ジョブが確認する報告・結果ファイルは、1 行目に `Status: DONE`、`Status: BLOCKED`、`Status: FAILED` のいずれかを、最終行に `<!-- hancho:report-complete -->` を必ず書きます。`ww-run` の作業プロンプトと LLM 審査（`Status: CORRECT` / `Status: INCORRECT`）がこの行を書き、`ww-enqueue` の成功判定はこれを確認します。
 - **報告ファイルの成功判定には内容の正規表現が必要**: `success.contentFile`（報告ファイル）には `success.contentRegex`（例: `<!-- hancho:report-complete -->` マーカー）が必須になりました。存在と更新時刻だけでは合格しません。ファイルだけで判定するときは `success.contentFileOnly`（JSON は `content_file_only`）を `true` にします。このルールに反するジョブは、BT パーサとタスクキューの登録時に拒否され、この変更より前に登録されたジョブは実行時に失敗します。
 - **デモモードのコードは全ビルドに含む**: リリースバイナリにデモモードのコードが入ります（`doc/demo.md` 参照）。`--demo`、`--demo-now`、`HANCHO_DEMO=1` を指定しない限り動作しません。C++ のダミー `hancho-dummy` は引き続きビルドオプション（`HANCHO_BUILD_DEMO`）で、配布には含みません。
 - **`--dummy-llm <path>`**: `Hancho.exe` と `hancho-cli` で、組み込みのダミーエンジンとデモジョブが実行する実行ファイルを指定できます。コアは環境変数 `HANCHO_DUMMY_LLM` も読みます。
 - **回帰テストの仕組み（`tests/regression`）**: 標準ライブラリだけの Python ランナーで、同じ操作をコアの名前付きパイプ、`hancho-cli`、MCP（Claude と OpenCode の設定）に通し、正規化した結果を記録したゴールデンと比べます。開発用で、利用者の動作は変わりません。
+- **単体 BT をタスクの direction として登録**: `hancho-cli bt register --file <bt.json> --task <id>`（MCP `bt_register`）で、BT を起動せずジョブも作らず、オープン中のタスクに planned の direction を追加できます。後で同じ定義で `bt start` すると同じ direction を再利用します。
+- **ジョブと direction をタスク間で移動**: `hancho-cli taskqueue move <id> --to <taskId>` で単体ジョブを移動、`hancho-cli direction move <id> --to <taskId>`（MCP `direction_move`）で direction をその中のジョブごと移動します。`taskqueue move` は BT のジョブや direction に属するジョブを拒否します。
 
 ### v0.10.3
-- **単体 BT をタスクの direction として登録**: `hancho-cli bt register --file <bt.json> --task <id>`（MCP `bt_register`）で、BT を起動せずジョブも作らず、オープン中のタスクに planned の direction を追加できます。後で同じ定義で `bt start` すると同じ direction を再利用します。
 - **タスク一覧の表示範囲を設定可能に**: 設定ダイアログで完了済み項目数を `finished_limit` と明示し、表示日数（`task_list_display_days`、1 以上、既定 2）を数値で指定できるようにしました。「最近のタスクを保持する」窓を固定の昨日ではなくこの値にします。
 - **タスク一覧の行の点滅を修正**: 「昨日・今日を保持」する判定に必要な完了済みタスク／ジョブを全件取得（`finished_limit: 0`）するようにし、直近 30 件の窓がずれることで行が出たり消えたりしなくなりました。
 - **タスクが open な理由のカード**: `task show <id> --why` とダッシュボードの「なぜ open か」ダイアログが、構造化されたブロッカー（planned/open の direction、カードの依存待ち、blocked/pending/waitingForPermit/waitingForLlm のジョブ、置き換えられた run、BT の escalate）を列挙します。LLM は呼ばず、`--json`、MCP `task_show`、`task_wait` の `why` 配列にも同じ一覧が入ります。`task_` の id は `taskId`、それ以外は `jobId` として表示します。

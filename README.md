@@ -171,15 +171,19 @@ The application icons are modeled on the character "Telephone Cat" (電話猫, D
 
 ## Release Notes
 
+### v0.10.5
+- **Settings dialog layout fix**: corrected overlapping controls in the Performance tab (last two rows were 24 px apart instead of the standard 36 px) and in the LLM tab (label+field row pitch was 32 px, causing the edit box of one row to overlap the label of the next; now 48 px).
+
 ### v0.10.4
 - **Result file format**: every report or result file that a job checks must start with one status line, `Status: DONE`, `Status: BLOCKED` or `Status: FAILED`, and end with `<!-- hancho:report-complete -->`. Worker prompts from `ww-run` and the LLM review (`Status: CORRECT` / `Status: INCORRECT`) write this line, and the `ww-enqueue` success checks match it.
 - **Report success checks need a content regex**: `success.contentFile` (a report) now requires `success.contentRegex` (for example the `<!-- hancho:report-complete -->` marker), so a report is no longer judged only by existence and mtime. To judge by the file alone, set `success.contentFileOnly` (JSON `content_file_only`) to `true`. A job that breaks this rule is refused at registration in the BT parser and the task queue, and fails at run time if it was registered before this change.
 - **Demo mode code ships in every build**: the release binaries contain the demo mode code (see `doc/demo.md`). It stays inert unless `--demo`, `--demo-now` or `HANCHO_DEMO=1` is given. The C++ dummy `hancho-dummy` remains a build option (`HANCHO_BUILD_DEMO`) and is not shipped.
 - **`--dummy-llm <path>`**: `Hancho.exe` and `hancho-cli` accept this option to choose the executable that the built-in dummy engine and demo jobs run. The core also reads the `HANCHO_DUMMY_LLM` environment variable.
 - **Regression test harness (`tests/regression`)**: a Python runner (standard library only) runs the same operations through the core named pipe, `hancho-cli` and MCP (Claude and OpenCode configurations), and compares the normalized results with recorded goldens. This is for development; nothing changes for users.
+- **Register a standalone BT as a task direction**: `hancho-cli bt register --file <bt.json> --task <id>` (MCP `bt_register`) creates a planned direction under an open task without starting the tree or creating jobs; a later `bt start` with the same definition reuses it.
+- **Move jobs and directions between tasks**: `hancho-cli taskqueue move <id> --to <taskId>` moves a standalone job; `hancho-cli direction move <id> --to <taskId>` (MCP `direction_move`) moves a direction with its jobs. `taskqueue move` refuses jobs that belong to a behavior tree or to a direction.
 
 ### v0.10.3
-- **Register a standalone BT as a task direction**: `hancho-cli bt register --file <bt.json> --task <id>` (MCP `bt_register`) creates a planned direction under an open task without starting the tree or creating jobs; a later `bt start` with the same definition reuses it.
 - **Configurable task-list window**: the settings dialog now labels the finished-item count as `finished_limit` and adds a numeric display-days setting (`task_list_display_days`, 1 or more, default 2). The "keep recent tasks" window uses this value instead of a hard-coded yesterday.
 - **Task list rows no longer flicker**: the dashboard now fetches all finished tasks/jobs (`finished_limit: 0`) when building the "keep yesterday/today" set, so rows no longer appear and disappear as the 30-item recent window slides.
 - **Deterministic task-open reason card**: `task show <id> --why` and the dashboard's "Why is task open" dialog list structured blockers (planned/open directions, card dependencies, blocked/pending/waitingForPermit/waitingForLlm jobs, superseded runs and BT escalations). No LLM is called; the same `why` array is returned by `--json`, MCP `task_show` and `task_wait`. A `task_` blocker id is reported as `taskId`, otherwise as `jobId`.

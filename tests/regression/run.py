@@ -101,6 +101,10 @@ def base_env(demo_now):
     # The core is a child of Hancho.exe and does not receive --dummy-llm; its demo jobs
     # read this variable to find the Python dummy.
     env["HANCHO_DUMMY_LLM"] = str(DUMMY_CMD)
+    # origin.session / origin.host_session are read from these; a parent Claude session must not leak
+    # its ids into recorded goldens.
+    for name in ("PC_ORIGIN_SESSION", "CLAUDE_CODE_SESSION_ID", "CLAUDE_CODE_HOST_SESSION_ID"):
+        env.pop(name, None)
     return env
 
 

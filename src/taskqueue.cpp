@@ -6211,6 +6211,13 @@ std::string TaskQueueManager::TaskQueueSupersede(const std::string& id, const st
         newJob.success.contentRegex = JsonFieldStr(successObj, "content_regex", "");
         newJob.success.contentFileOnly = JsonFieldBool(successObj, "content_file_only", false);
         newJob.success.engineResult = JsonFieldBool(successObj, "engine_result", false);
+        const std::string specErr = ContentFileSuccessError(newJob.success.contentFile,
+                                                            newJob.success.contentRegex,
+                                                            newJob.success.contentFileOnly);
+        if (!specErr.empty()) {
+            outError = specErr;
+            return BuildError(outError);
+        }
     }
     if (HasJsonKey(patchJson, "defer")) {
         TaskQueueDefer d;
@@ -6959,6 +6966,10 @@ std::string TaskQueueManager::TaskQueueMoveToTask(const std::string& jobId, cons
     if (!ValidateTaskActive(toTaskId, outError)) return BuildError(outError);
     if (!job->bt.id.empty()) {
         outError = "cannot move a behavior tree job; use direction move instead";
+        return BuildError(outError);
+    }
+    if (!job->directionId.empty() && job->directionId.rfind("job:", 0) != 0) {
+        outError = "cannot move a job that belongs to a direction; use direction move instead";
         return BuildError(outError);
     }
     const std::string fromTaskId = job->taskId;
