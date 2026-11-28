@@ -136,8 +136,10 @@ function New-CardJob {
             exitCode     = 0
             filesNewer   = @($report)
             contentFile  = $report
-            # (?![\\s\\S]) is a true end-of-file: std::regex treats "$" as end-of-line.
-            contentRegex = '<!--\s*hancho:report-complete\s*-->\s*(?![\s\S])'
+            # Result format: line 1 is "Status: DONE" (see ww-run prompt). "^" is the start of the
+            # file for std::regex without multiline. (?![\\s\\S]) is a true end-of-file: std::regex
+            # treats "$" as end-of-line.
+            contentRegex = '^Status:\s*DONE\b[\s\S]*<!--\s*hancho:report-complete\s*-->\s*(?![\s\S])'
             engineResult = $true
         }
         resources  = [ordered]@{ write = @($write); read = @($read) }
@@ -201,7 +203,7 @@ foreach ($cardId in $Card) {
                 exitCode     = 0
                 contentFile  = $reviewRel
                 # Only CORRECT passes; INCORRECT and a missing verdict fail (see ww-review.ps1).
-                contentRegex = '<!--\s*hancho:review-complete:\s*CORRECT\s*-->\s*(?![\s\S])'
+                contentRegex = '^Status:\s*CORRECT\b[\s\S]*<!--\s*hancho:review-complete:\s*CORRECT\s*-->\s*(?![\s\S])'
             }
             resources   = [ordered]@{ write = @($reviewRel); read = @($reportRel) }
         }

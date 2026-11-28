@@ -2920,6 +2920,10 @@ SETUP FOR LLM AGENTS:
 "        got its headings written does not count as success. Observe with\n"
 "        taskqueue_wait / taskqueue_list / taskqueue_graph and logs; retry with\n"
 "        taskqueue_retry. Blocked dependents resume automatically.\n"
+"      - Result file format: the first line of a result/report file is exactly\n"
+"        `Status: DONE`, `Status: BLOCKED` or `Status: FAILED` (DONE only when every\n"
+"        requirement is met and verified). The last line is `<!-- hancho:report-complete -->`.\n"
+"        Example success.contentRegex: ^Status:\\s*DONE\\b[\\s\\S]*<!--\\s*hancho:report-complete\\s*-->\\s*(?![\\s\\S])\n"
 "      - A failed job carries a diagnosis (failure class, summary, lastActivity,\n"
 "        evidence, suggestedAction) in taskqueue_get / taskqueue_wait; use\n"
 "        `hancho-cli taskqueue why <id>` for the same view before choosing the\n"
@@ -7492,6 +7496,8 @@ int RunCli(const std::vector<std::string>& rawArgs) {
             demoEnabled = true;
         } else if (rawArgs[i] == "--demo-now" && i + 1 < rawArgs.size()) {
             demoNowSec = ParseTimestampStrToEpoch(rawArgs[++i]);
+        } else if (rawArgs[i] == "--dummy-llm" && i + 1 < rawArgs.size()) {
+            SetDummyLlmOverride(rawArgs[++i]);
 #endif
         } else {
             args.push_back(rawArgs[i]);

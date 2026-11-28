@@ -26,7 +26,9 @@ what is different.
 - **`-QueueLocked`** (`ww-run`): for hancho-cli task-queue jobs whose `resources` already keep
   overlapping jobs apart. Only the same card blocks the run.
 - **`ww-enqueue` success check**: the job is successful only when the report ends with the
-  completion marker `<!-- hancho:report-complete -->` (checked as `contentFile` +
+  result format: the first line is `Status: DONE`, `Status: BLOCKED` or `Status: FAILED`, and the
+  completion marker `<!-- hancho:report-complete -->` is the last line (checked as `contentFile` +
+  `contentRegex`) (checked as `contentFile` +
   `contentRegex`, which is required with `contentFile`) and the engine's final result did not report an error (`engineResult`).
   A worker that wrote only the headings is a failure, not a success.
 - Every card also gets an LLM review job (`<card>-review`, `ww-review.ps1`) that depends on the card job

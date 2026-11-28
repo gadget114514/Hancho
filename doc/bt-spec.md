@@ -115,6 +115,7 @@ BT 側も `SaveStateFileLocked` 時に `SetDirectionBtState` で `btState` / `bt
 - `filesNewer`（試行開始時刻より新しいファイル）
 - `testReport`（JUnit/NUnit XML）
 - `contentFile` + `contentRegex` + `minBytes`（`contentRegex` は必須。ファイルだけで判定するなら `contentFileOnly: true`）
+  - 結果ファイルの形式: 1 行目は `Status: DONE` / `Status: BLOCKED` / `Status: FAILED` のいずれか、最終行は `<!-- hancho:report-complete -->`。
 - `engineResult`（LLM の最終結果がエラーでないこと）
 
 `idle` は `outputSec` と `cpuSec` の両方を指定する。`firstEventSec` は起動直後の無出力を `startup_hang` として早期失敗にする。

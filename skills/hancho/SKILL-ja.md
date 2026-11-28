@@ -152,6 +152,7 @@ hancho-cli.exe power status
 - **1ジョブ = 1コマンド。** `&&`、`||`、`&`、PowerShell の `;`、改行による連結、ポーリングループは禁止（ChainGuard が拒否する）。分けて `dependsOn` でつなぐ。
 - **`id` / `command` / `summary`（200文字以内）/ `timeoutSec` は必須。** タイムアウトはジョブごと。合算しない。
 - **`summary` / `title` / カード / 理由は英語で書く（ユーザーとの会話の言語に合わせない）。** 表示は Hancho が表示言語に訳す。英語以外で書かれた `summary` は結果に警告が付く。
+- **結果ファイルの形式。** 結果ファイルの形式（ジョブが確認する報告・結果ファイルはすべてこれに従う）: 1 行目は必ず `Status: DONE`、`Status: BLOCKED`、`Status: FAILED` のいずれか（DONE は要件をすべて満たし検証済みのときだけ）。最終行は `<!-- hancho:report-complete -->`。成功判定の例: `contentFile` = 報告、`contentRegex` = `^Status:\s*DONE[\s\S]*<!--\s*hancho:report-complete\s*-->\s*(?![\s\S])`。
 - **成功を偽装しない。** Hancho が `success.exitCode`（既定 0）と `filesNewer` / `outputRegex` / `testReport` / `contentFile` + `contentRegex` で検証する。報告ファイル（`contentFile`）には `contentRegex`（完了マーカーなど）が必須で、`contentRegex` なしの `contentFile` は `content_file_only: true` を付けない限り登録時に拒否される（付けると存在と更新時刻だけで判定）。exit 0 だけでは成果物を保証できないときは `filesNewer` を足す。
 - **待つ。ポーリングしない。** `taskqueue wait` / `bt wait` / `wait_process` を使う。
 - **定型作業はルーチンにする。毎回 BT を書かない。** `routine run <name>` で名前付き BT を実行する。実行は 1 つの direction で、`--task <id>`（MCP `routine_run` の `task`）を付けると既存のオープンタスクに追加し、省略すると Hancho が `Routine: <name>` というタスクを自動生成する。`stale` で失敗したときだけ `routine show` と差分を見て直す。LLM に作らせてもよいが、その場合は `routine ask` の結果を必ず `routine show` で確認し、ユーザーの言葉を付けて `routine approve` してから `run` する（提案は承認まで実行されない）。人手で直すなら `routine save --reason "..."`（理由なしの保存はしない）。

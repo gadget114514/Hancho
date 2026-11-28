@@ -325,7 +325,7 @@ if ($Worktree) {
     $prompt += " WORKTREE RUN: work only inside the worktree $($plan.Path). Do NOT run uloop (it targets the main checkout). Skip compile/tests; list them under 'Verification pending' in the report. Write the report to $($paths.RelUrl)/reports/$Task.md inside the worktree and commit it with git add -f; do not merge to main. The copied task card is for reading only; do not commit it."
 }
 # The task queue checks the report content, not only its mtime, so the worker has to finish it.
-$prompt += " Write the report in one pass, not as headings you fill in later, and make the exact line <!-- hancho:report-complete --> the last line of the report."
+$prompt += " The first line of the report must be exactly one of: Status: DONE, Status: BLOCKED or Status: FAILED (DONE only when every Done-when item is finished and verified). Write the report in one pass, not as headings you fill in later, and make the exact line <!-- hancho:report-complete --> the last line of the report."
 
 if ($DryRun) {
     $cardDisplay = $promptCard

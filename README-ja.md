@@ -168,6 +168,7 @@ New-Item -ItemType Junction -Path .claude\skills\hancho -Target (Resolve-Path sk
 ## リリースノート
 
 ### Unreleased
+- **結果ファイルの形式**: ジョブが確認する報告・結果ファイルは、1 行目に `Status: DONE`、`Status: BLOCKED`、`Status: FAILED` のいずれかを、最終行に `<!-- hancho:report-complete -->` を必ず書きます。`ww-run` の作業プロンプトと LLM 審査（`Status: CORRECT` / `Status: INCORRECT`）がこの行を書き、`ww-enqueue` の成功判定はこれを確認します。
 - **報告ファイルの成功判定には内容の正規表現が必要**: `success.contentFile`（報告ファイル）には `success.contentRegex`（例: `<!-- hancho:report-complete -->` マーカー）が必須になりました。存在と更新時刻だけでは合格しません。ファイルだけで判定するときは `success.contentFileOnly`（JSON は `content_file_only`）を `true` にします。このルールに反するジョブは、BT パーサとタスクキューの登録時に拒否され、この変更より前に登録されたジョブは実行時に失敗します。
 
 ### v0.10.3

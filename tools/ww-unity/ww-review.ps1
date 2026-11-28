@@ -77,7 +77,8 @@ $verdict = if ($outputText -match '(?m)^\s*VERDICT:\s*INCORRECT\s*$') { 'INCORRE
            else { 'INCORRECT' }
 $note = if ($verdict -eq 'INCORRECT' -and $outputText -notmatch '(?m)^\s*VERDICT:') { "(no VERDICT line from the reviewer; treated as INCORRECT)`n" } else { '' }
 
-$body = "# Review of $Report`n`nEngine: $Engine   Verdict: $verdict`n`n$note$outputText`n`n<!-- hancho:review-complete: $verdict -->`n"
+# Result format: line 1 is "Status: CORRECT" or "Status: INCORRECT" (checked by the review job).
+$body = "Status: $verdict`n`n# Review of $Report`n`nEngine: $Engine   Verdict: $verdict`n`n$note$outputText`n`n<!-- hancho:review-complete: $verdict -->`n"
 [System.IO.File]::WriteAllText($reviewPath, $body, $utf8)
 Write-Host "[ww-review] $CardId verdict: $verdict -> $reviewPath"
 exit 0

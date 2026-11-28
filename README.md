@@ -172,6 +172,7 @@ The application icons are modeled on the character "Telephone Cat" (電話猫, D
 ## Release Notes
 
 ### Unreleased
+- **Result file format**: every report or result file that a job checks must start with one status line, `Status: DONE`, `Status: BLOCKED` or `Status: FAILED`, and end with `<!-- hancho:report-complete -->`. Worker prompts from `ww-run` and the LLM review (`Status: CORRECT` / `Status: INCORRECT`) write this line, and the `ww-enqueue` success checks match it.
 - **Report success checks need a content regex**: `success.contentFile` (a report) now requires `success.contentRegex` (for example the `<!-- hancho:report-complete -->` marker), so a report is no longer judged only by existence and mtime. To judge by the file alone, set `success.contentFileOnly` (JSON `content_file_only`) to `true`. A job that breaks this rule is refused at registration in the BT parser and the task queue, and fails at run time if it was registered before this change.
 
 ### v0.10.3
