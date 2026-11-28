@@ -4528,7 +4528,7 @@ static std::string TimeOfDayText(const std::string& ts) {
 }
 
 // Start time shown in lists. Within 24 hours of now: hh:mm:ss followed by the Japanese weekday,
-// e.g. "15:00:00土". Started 24 hours ago or earlier: MMDD:hh:mm, e.g. "1128:15:00".
+// e.g. "15:00:00土". Started 24 hours ago or earlier: MMDDThh:mm, e.g. "1128T15:00".
 // The weekday comes from the date part (Sakamoto's method), so it does not depend on the
 // time zone. A timestamp without a parseable date keeps only the time.
 // This only affects the dashboard display; stored timestamps stay in full.
@@ -4541,7 +4541,7 @@ static std::string StartTimeOfDayText(const std::string& ts) {
     const int64_t startEpoch = ParseTimestampStrToEpoch(ts);
     if (startEpoch > 0 && static_cast<int64_t>(std::time(nullptr)) - startEpoch >= 24 * 60 * 60) {
         char buf[32];
-        std::snprintf(buf, sizeof(buf), "%02d%02d:%s", m, d, tod.substr(0, 5).c_str());
+        std::snprintf(buf, sizeof(buf), "%02d%02dT%s", m, d, tod.substr(0, 5).c_str());
         return buf;
     }
     static const int kOffset[] = {0, 3, 2, 5, 0, 3, 5, 1, 4, 6, 2, 4};
