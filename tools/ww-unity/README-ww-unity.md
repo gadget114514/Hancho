@@ -27,8 +27,14 @@ what is different.
   overlapping jobs apart. Only the same card blocks the run.
 - **`ww-enqueue` success check**: the job is successful only when the report ends with the
   completion marker `<!-- hancho:report-complete -->` (checked as `contentFile` +
-  `contentRegex`) and the engine's final result did not report an error (`engineResult`).
+  `contentRegex`, which is required with `contentFile`) and the engine's final result did not report an error (`engineResult`).
   A worker that wrote only the headings is a failure, not a success.
+- Every card also gets an LLM review job (`<card>-review`, `ww-review.ps1`) that depends on the card job
+  with `on: success`. The reviewer reads the card and the report and writes
+  `ww-data/reviews/<report>.review.md` ending in `<!-- hancho:review-complete: CORRECT|INCORRECT -->`.
+  Only CORRECT passes; INCORRECT or a missing verdict fails the review job, so a card whose report
+  claims more than it did is caught after the fact. `ww-enqueue -ReviewEngine <engine>` picks the
+  reviewer (default `claude`; use a different engine from the worker). `-NoReview` turns it off.
 - **`ww-enqueue`**: registers cards as hancho-cli jobs, locking `@unity-editor` for Unity cards.
   Card `Mode:` lines `static` and `tools` skip the Unity lock. The card path prefixes it accepts
   (`Assets/`, `Tools/`, `data/`) are fixed in `Get-CardPaths`; change them for another project.

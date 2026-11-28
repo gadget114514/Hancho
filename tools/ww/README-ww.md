@@ -480,7 +480,8 @@ Tools\ww\ww-run.cmd <card-id> -Worktree [-Base main] [-DryRun]
 - The agent writes `ww-data/reports/<Task>.md` inside the worktree and commits it there.
   After the run `ww-run` copies that report back to the main `ww-data/reports/<Task>.md`.
 - The report must end with the exact line `<!-- hancho:report-complete -->`. `ww-enqueue`
-  turns that marker into the task-queue success check (`contentFile` + `contentRegex`) and
+  turns that marker into the task-queue success check (`contentFile` + `contentRegex`; the
+  regex is required with `contentFile`, so the marker is what decides success) and
   also requires a successful engine result, so a run that wrote only the headings and
   stopped is a failure even though the report file exists and its mtime moved.
 - Pre-flight refuses a worktree run when an Authorised edit names an existing path whose

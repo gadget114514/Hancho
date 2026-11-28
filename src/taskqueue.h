@@ -83,6 +83,16 @@ struct TaskQueueIdle {
     bool explicitZero = false;
 };
 
+// Returns an error message when success names a contentFile but no contentRegex and did not opt
+// into file-only judgement (contentFileOnly). Empty when the spec is acceptable.
+inline std::string ContentFileSuccessError(const std::string& contentFile,
+                                           const std::string& contentRegex,
+                                           bool contentFileOnly) {
+    if (contentFile.empty() || !contentRegex.empty() || contentFileOnly) return std::string();
+    return "success.content_file requires success.content_regex "
+           "(or set success.content_file_only to true to judge by the file alone)";
+}
+
 struct TaskQueueSuccess {
     int exitCode = 0;
     std::vector<std::string> filesNewer;
@@ -93,9 +103,12 @@ struct TaskQueueSuccess {
     // Optional content check on one produced file (usually a report). The file must exist and
     // be newer than the attempt start, be at least minBytes bytes, and match contentRegex.
     // A worker that only wrote headings and stopped therefore fails even though the mtime moved.
+    // contentRegex is required with contentFile unless contentFileOnly is set (see
+    // ContentFileSuccessError).
     std::string contentFile;
     long long minBytes = 0;
     std::string contentRegex;
+    bool contentFileOnly = false;
     // When true, the LLM engine's own terminal result must be a success. An engine that
     // reports an error (e.g. an auth/API failure in its JSON stream) fails the job even if
     // the process still exited 0.
@@ -1050,6 +1063,8 @@ public:
     std::string TaskQueuePurgeOlderThan(const std::string& taskqueue, int64_t maxAgeSec, std::string& outError);
     std::string TaskQueueLink(const std::string& job, const std::string& dependsOn, const std::string& on, std::string& outError);
     std::string TaskQueueUnlink(const std::string& job, const std::string& dependsOn, std::string& outError);
+    // Reassign one non-BT job to another open task without changing its state, queue or lineage.
+    std::string TaskQueueMoveToTask(const std::string& jobId, const std::string& toTaskId, std::string& outError);
     std::string TaskQueueGraph(const std::string& taskqueue, const std::string& root, std::string& outError);
 
     // Task records (doc/task-lineage-plan.md, card 100-2a). The string results use the same
@@ -1122,6 +1137,8 @@ public:
                                    const std::string& reason, std::string& outError);
     std::string DirectionReopen(const std::string& id, const std::string& reason,
                                 std::string& outError);
+    std::string DirectionMove(const std::string& id, const std::string& toTaskId,
+                              std::string& outError);
     std::string DirectionPurgeOlderThan(int64_t olderThanSec, std::string& outError);
     // Bulk operations on all jobs belonging to a kind="jobs" direction (card 103-3).
     std::string DirectionCancelJobs(const std::string& id, std::string& outError,

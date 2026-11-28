@@ -51,6 +51,7 @@ Behavior tree leaf types are aligned around modern terminology:
 - **`exec`**: Runs a single OS command (alias: `job`).
 - **`agent`**: Delegates work to an LLM agent with engine, model, and automatic engine switching (alias: `worker`).
 - Saved workflows can be registered as named **routines** (`routine list/show/run/save/check/ask/approve/reject`) and executed repeatedly with unique run IDs without LLM intervention. Each run is one direction under a task: pass `--task <id>` (`routine_run` MCP: `task`) to attach it to an existing open task, or omit it to have Hancho create a task automatically. See [Routines](doc/obsoleted/routines.md).
+- A standalone BT definition can be registered as a **planned direction** of an existing task without starting it: `hancho-cli bt register --file plan.json --task <id>` (MCP `bt_register`). No jobs are created, and a later `bt start` with the same definition reuses the direction.
 
 ### Dashboard & UI Highlights
 
@@ -170,7 +171,11 @@ The application icons are modeled on the character "Telephone Cat" (電話猫, D
 
 ## Release Notes
 
+### Unreleased
+- **Report success checks need a content regex**: `success.contentFile` (a report) now requires `success.contentRegex` (for example the `<!-- hancho:report-complete -->` marker), so a report is no longer judged only by existence and mtime. To judge by the file alone, set `success.contentFileOnly` (JSON `content_file_only`) to `true`. A job that breaks this rule is refused at registration in the BT parser and the task queue, and fails at run time if it was registered before this change.
+
 ### v0.10.3
+- **Register a standalone BT as a task direction**: `hancho-cli bt register --file <bt.json> --task <id>` (MCP `bt_register`) creates a planned direction under an open task without starting the tree or creating jobs; a later `bt start` with the same definition reuses it.
 - **Configurable task-list window**: the settings dialog now labels the finished-item count as `finished_limit` and adds a numeric display-days setting (`task_list_display_days`, 1 or more, default 2). The "keep recent tasks" window uses this value instead of a hard-coded yesterday.
 - **Task list rows no longer flicker**: the dashboard now fetches all finished tasks/jobs (`finished_limit: 0`) when building the "keep yesterday/today" set, so rows no longer appear and disappear as the 30-item recent window slides.
 - **Deterministic task-open reason card**: `task show <id> --why` and the dashboard's "Why is task open" dialog list structured blockers (planned/open directions, card dependencies, blocked/pending/waitingForPermit/waitingForLlm jobs, superseded runs and BT escalations). No LLM is called; the same `why` array is returned by `--json`, MCP `task_show` and `task_wait`. A `task_` blocker id is reported as `taskId`, otherwise as `jobId`.

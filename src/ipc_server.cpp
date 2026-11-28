@@ -2237,6 +2237,11 @@ std::string IpcServer::HandleRequestJson(const std::string& reqJson) {
         } else if (dirAction == "direction_reopen") {
             resp = tqm_.DirectionReopen(JsonGetString(reqJson, "id", ""),
                                         JsonGetString(reqJson, "reason", ""), err);
+        } else if (dirAction == "direction_move") {
+            std::string toTaskId = JsonGetString(reqJson, "taskId", "");
+            if (toTaskId.empty()) toTaskId = JsonGetString(reqJson, "task_id", "");
+            if (toTaskId.empty()) toTaskId = JsonGetString(reqJson, "task", "");
+            resp = tqm_.DirectionMove(JsonGetString(reqJson, "id", ""), toTaskId, err);
         } else if (dirAction == "direction_purge") {
             const int64_t olderThanSec = req.contains("older_than_sec")
                 ? req.value("older_than_sec", int64_t(-1))
@@ -2772,6 +2777,13 @@ std::string IpcServer::HandleRequestJson(const std::string& reqJson) {
         } else if (action == "taskqueue_update") {
             resp = tqm_.TaskQueueUpdate(JsonGetString(reqJson, "id", ""),
                                         ExtractRawJsonValue(reqJson, "patch"), TaskQueueCaller::External, err);
+        } else if (action == "taskqueue_move") {
+            std::string id = JsonGetString(reqJson, "id", "");
+            if (id.empty()) id = JsonGetString(reqJson, "job", "");
+            std::string taskId = JsonGetString(reqJson, "task", "");
+            if (taskId.empty()) taskId = JsonGetString(reqJson, "taskId", "");
+            if (taskId.empty()) taskId = JsonGetString(reqJson, "task_id", "");
+            resp = tqm_.TaskQueueMoveToTask(id, taskId, err);
         } else if (action == "taskqueue_cancel") {
             const std::string id = JsonGetString(reqJson, "id", "");
             resp = tqm_.TaskQueueCancel(id, err);
@@ -3020,6 +3032,16 @@ std::string IpcServer::HandleRequestJson(const std::string& reqJson) {
             if (jobId.empty()) jobId = JsonGetString(reqJson, "id", "");
             std::string tqName = JsonGetString(reqJson, "taskqueue", "");
             bool breakdown = JsonGetBool(reqJson, "breakdown", false);
+            auto diagStr = [](const nlohmann::json& j, const char* key, const std::string& fallback = std::string()) {
+                if (!j.is_object()) return fallback;
+                auto it = j.find(key);
+                return (it != j.end() && it->is_string()) ? it->get<std::string>() : fallback;
+            };
+            auto diagInt = [](const nlohmann::json& j, const char* key, int fallback = 0) {
+                if (!j.is_object()) return fallback;
+                auto it = j.find(key);
+                return (it != j.end() && it->is_number_integer()) ? static_cast<int>(it->get<int64_t>()) : fallback;
+            };
 
             if (breakdown || (!tqName.empty() && procId <= 0 && jobId.empty())) {
                 std::string listErr;
@@ -3035,7 +3057,7 @@ std::string IpcServer::HandleRequestJson(const std::string& reqJson) {
                                 if (!att.is_object()) continue;
                                 auto f = att.find("failure");
                                 if (f != att.end() && f->is_object() && !f->empty()) {
-                                    std::string c = f->value("class", "unknown");
+                                    std::string c = diagStr(*f, "class", "unknown");
                                     classCounts[c]++;
                                 }
                             }
@@ -3070,15 +3092,15 @@ std::string IpcServer::HandleRequestJson(const std::string& reqJson) {
                         if (attempts == job.end() || !attempts->is_array()) continue;
                         for (const auto& attempt : *attempts) {
                             if (!attempt.is_object()) continue;
-                            if (attempt.value("process_id", 0) == procId) {
+                            if (diagInt(attempt, "process_id") == procId) {
                                 auto f = attempt.find("failure");
                                 nlohmann::json out;
                                 out["ok"] = true;
                                 out["found"] = true;
                                 out["process_id"] = procId;
-                                out["job_id"] = job.value("id", "");
-                                out["taskqueue"] = job.value("taskqueue", "");
-                                out["attempt"] = attempt.value("attempt", 1);
+                                out["job_id"] = diagStr(job, "id");
+                                out["taskqueue"] = diagStr(job, "taskqueue");
+                                out["attempt"] = diagInt(attempt, "attempt", 1);
                                 out["failure"] = (f != attempt.end() && f->is_object()) ? *f : nlohmann::json::object();
                                 return out.dump();
                             }
@@ -3112,7 +3134,7 @@ std::string IpcServer::HandleRequestJson(const std::string& reqJson) {
                     int lastAttempt = 0;
                     for (const auto& att : job["attempts"]) {
                         if (!att.is_object()) continue;
-                        lastAttempt = att.value("attempt", lastAttempt);
+                        lastAttempt = diagInt(att, "attempt", lastAttempt);
                         auto f = att.find("failure");
                         if (f != att.end() && f->is_object() && !f->empty()) {
                             lastFailure = *f;
@@ -3243,6 +3265,31 @@ std::string IpcServer::HandleRequestJson(const std::string& reqJson) {
                     }
                 }
             }
+        } else if (action == "bt_register") {
+            std::string btJson, err;
+            if (!extractBtPayload(btJson, err)) {
+                return "{\"ok\":false,\"error\":\"" + JsonEscape(err) + "\"}";
+            }
+            std::string taskId = JsonGetString(reqJson, "task", "");
+            if (taskId.empty()) taskId = JsonGetString(reqJson, "taskId", "");
+            if (taskId.empty()) taskId = JsonGetString(reqJson, "task_id", "");
+            if (taskId.empty()) {
+                return "{\"ok\":false,\"error\":\"bt_register requires 'task' (task id)\"}";
+            }
+            auto btDef = json::parse(btJson, nullptr, false);
+            if (btDef.is_object()) {
+                btDef["taskId"] = taskId;
+                btJson = btDef.dump();
+            }
+            if (req.contains("origin") && req["origin"].is_object() &&
+                btDef.is_object() && btDef.contains("id") && btDef["id"].is_string()) {
+                tqm_.SetBtOrigin(btDef["id"].get<std::string>(), req["origin"].dump());
+            }
+            bool triage = JsonGetBool(reqJson, "triage", true);
+            if (btDef.is_object() && btDef.contains("triage") && btDef["triage"].is_boolean()) {
+                triage = btDef["triage"].get<bool>();
+            }
+            resp = btm_->Register(btJson, taskId, triage);
         } else if (action == "bt_get") {
             std::string id = req.value("id", std::string());
             bool compact = req.value("compact", false);

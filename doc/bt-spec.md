@@ -114,7 +114,7 @@ BT 側も `SaveStateFileLocked` 時に `SetDirectionBtState` で `btState` / `bt
 - `outputRegex`（ログ末尾 200 行）
 - `filesNewer`（試行開始時刻より新しいファイル）
 - `testReport`（JUnit/NUnit XML）
-- `contentFile` + `contentRegex` + `minBytes`
+- `contentFile` + `contentRegex` + `minBytes`（`contentRegex` は必須。ファイルだけで判定するなら `contentFileOnly: true`）
 - `engineResult`（LLM の最終結果がエラーでないこと）
 
 `idle` は `outputSec` と `cpuSec` の両方を指定する。`firstEventSec` は起動直後の無出力を `startup_hang` として早期失敗にする。

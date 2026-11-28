@@ -116,6 +116,8 @@ hancho-cli.exe bt start --file plan.json
 hancho-cli.exe bt wait --id <btid> --timeout-ms 600000
 ```
 
+実行せずに指示だけを準備するには、開いているタスクに単体 BT を登録する: `hancho-cli.exe bt register --file plan.json --task <taskId>`（MCP は `bt_register` の `bt` または `file` と `task`）。タスクに planned の指示が作られ、ジョブは作られない。あとで同じ定義で `bt start` すると同じ指示を再利用する。
+
 ### 5. 夜間に終わったらサスペンド / シャットダウン
 
 ```powershell
@@ -150,7 +152,7 @@ hancho-cli.exe power status
 - **1ジョブ = 1コマンド。** `&&`、`||`、`&`、PowerShell の `;`、改行による連結、ポーリングループは禁止（ChainGuard が拒否する）。分けて `dependsOn` でつなぐ。
 - **`id` / `command` / `summary`（200文字以内）/ `timeoutSec` は必須。** タイムアウトはジョブごと。合算しない。
 - **`summary` / `title` / カード / 理由は英語で書く（ユーザーとの会話の言語に合わせない）。** 表示は Hancho が表示言語に訳す。英語以外で書かれた `summary` は結果に警告が付く。
-- **成功を偽装しない。** Hancho が `success.exitCode`（既定 0）と `filesNewer` / `outputRegex` / `testReport` で検証する。exit 0 だけでは成果物を保証できないときは `filesNewer` を足す。
+- **成功を偽装しない。** Hancho が `success.exitCode`（既定 0）と `filesNewer` / `outputRegex` / `testReport` / `contentFile` + `contentRegex` で検証する。報告ファイル（`contentFile`）には `contentRegex`（完了マーカーなど）が必須で、`contentRegex` なしの `contentFile` は `content_file_only: true` を付けない限り登録時に拒否される（付けると存在と更新時刻だけで判定）。exit 0 だけでは成果物を保証できないときは `filesNewer` を足す。
 - **待つ。ポーリングしない。** `taskqueue wait` / `bt wait` / `wait_process` を使う。
 - **定型作業はルーチンにする。毎回 BT を書かない。** `routine run <name>` で名前付き BT を実行する。実行は 1 つの direction で、`--task <id>`（MCP `routine_run` の `task`）を付けると既存のオープンタスクに追加し、省略すると Hancho が `Routine: <name>` というタスクを自動生成する。`stale` で失敗したときだけ `routine show` と差分を見て直す。LLM に作らせてもよいが、その場合は `routine ask` の結果を必ず `routine show` で確認し、ユーザーの言葉を付けて `routine approve` してから `run` する（提案は承認まで実行されない）。人手で直すなら `routine save --reason "..."`（理由なしの保存はしない）。
 - **一時停止は原因を直さない。** `taskqueue pause-job` / `taskqueue pause` / `bt pause` は実行（とローカル実行中ジョブの時計）を止めるだけ。LLM 応答待ち（`waitingForLlm`、rate limit、auth、provider 障害、ハング）は pause では解消しない。escalate は `bt resume` で回答するか `bt retry`、LLM 側の失敗は原因を直して `taskqueue retry`、無理なら `taskqueue cancel` / `bt cancel`。pause した実行中ジョブを resume しても同じリクエストが続く。
@@ -255,11 +257,14 @@ hancho-cli.exe direction edit 102-3 --task <taskId> --body-file card_v2.md   # p
 hancho-cli.exe direction run --ready --task <taskId>             # 依存を満たしたカードを流す（既定 --max 1）
 hancho-cli.exe direction run 102-3 --task <taskId>               # 指定したカードだけ流す
 hancho-cli.exe direction redo 102-3 --task <taskId> --reason "Fix test" --run
+hancho-cli.exe direction move dir_12 --to <taskId>               # 指示とそのジョブを別の open タスクへ移す
 hancho-cli.exe direction remove 102-3 --task <taskId>            # planned の間だけ
 ```
 
 - カードは `card` テンプレート（`hancho-cli.exe bt template card --json`）で BT（agent → build → test → 失敗なら fix ループ）に展開される。`build` / `test` / `engines` は `--params` またはタスクの `--card-defaults` から補われる。
-- MCP は `direction_add` / `direction_show` / `direction_list` / `direction_edit` / `direction_remove` / `direction_run` / `direction_redo` / `direction_import` / `direction_export` / `direction_translate`（および `direction_close` / `direction_reopen` / `direction_purge`）。`card_*` ツールはない。
+- `direction move` は指示（id またはカード番号）とそのジョブをすべて指定タスクへ移す。実行中のジョブも一緒に移り、BT の状態ファイルの `taskId` が更新され、両タスクに `direction_moved` ログが残る。暗黙の `job:<id>` 指示は移動できない。
+- `hancho-cli.exe taskqueue move <jobId> --to <taskId>`（MCP は `taskqueue_move`、`id` と `task` を指定）は、`--task` なしで投入したジョブや別タスクに属するジョブを open なタスクへ移す。ジョブの状態・キュー・依存・系譜・試行履歴は変わらず、タスクの所属だけが変わる。BT 管理のジョブは拒否されるので、その場合は `direction move` を使う。移動先タスクには `job_moved` ログが残り、同じタスクへの移動は何もしない。
+- MCP は `direction_add` / `direction_show` / `direction_list` / `direction_edit` / `direction_remove` / `direction_run` / `direction_redo` / `direction_move` / `direction_import` / `direction_export` / `direction_translate`（および `direction_close` / `direction_reopen` / `direction_purge`）。`card_*` ツールはない。
 - Markdown からの一括取り込み・書き出し: `direction import --task <taskId> --file doc/xxx-cards.md [--dry-run]`、`direction export --task <taskId> [--file <md>] [--lang <en|ja|es>]`。`--dry-run` は書き込まずに確認だけする。
 - `direction translate --task <taskId> [--translate-cards <all|title|off>]` で、タスクのカードの英語以外のタイトル・本文を英語に訳す。`direction import` も同じ `--translate-cards` を取る。
 

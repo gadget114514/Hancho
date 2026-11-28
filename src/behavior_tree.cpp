@@ -299,6 +299,11 @@ void BehaviorTree::BumpVersion(int64_t nowMs) {
     }
 }
 
+void BehaviorTree::MarkPlanned(int64_t nowMs) {
+    state_ = "planned";
+    BumpVersion(nowMs);
+}
+
 void BehaviorTree::EmitEvent(int64_t nowMs,
                              const std::string& type,
                              const std::string& nodeKey,

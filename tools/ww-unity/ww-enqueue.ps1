@@ -15,6 +15,9 @@ param(
     [switch]$Parallel,
     [ValidateRange(0, 64)][int]$Concurrency = 0,
     [string]$HanchoDataDir = $env:HANCHO_LOG_DIR,
+    # Every card gets an LLM review job after it succeeds (ww-review.ps1). -NoReview turns it off.
+    [ValidateSet("claude", "agy", "opencode", "codex")][string]$ReviewEngine = "claude",
+    [switch]$NoReview,
     [switch]$DryRun
 )
 
@@ -177,6 +180,33 @@ foreach ($cardId in $Card) {
     if ($dependency) { $job['dependsOn'] = @([ordered]@{ id = $dependency; on = "done" }) }
     $jobs.Add($job)
     if (-not $Parallel) { $previous = $jobId }
+
+    if (-not $NoReview) {
+        # The review runs only when the card job succeeded (on: success), so a card that already
+        # failed is not reviewed. Its success check passes only on a CORRECT verdict.
+        $reviewId = "$jobId-review"
+        while ($known -contains $reviewId -or $planned.Contains($reviewId)) { $reviewId = "$reviewId-x" }
+        $planned.Add($reviewId)
+        $reportRel = [string]$job['success']['contentFile']
+        $reviewRel = "$($paths.RelUrl)/reviews/" + [System.IO.Path]::GetFileNameWithoutExtension($reportRel) + ".review.md"
+        $reviewJob = [ordered]@{
+            id          = $reviewId
+            command     = "cmd /c $toolRel\ww-review.cmd $cardId -Report $reportRel -Engine $ReviewEngine"
+            cwd         = $Root
+            summary     = "ww-review ${cardId}: LLM check of the report ($ReviewEngine)"
+            timeoutSec  = 30 * 60
+            maxAttempts = 1
+            dependsOn   = @([ordered]@{ id = $jobId; on = "success" })
+            success     = [ordered]@{
+                exitCode     = 0
+                contentFile  = $reviewRel
+                # Only CORRECT passes; INCORRECT and a missing verdict fail (see ww-review.ps1).
+                contentRegex = '<!--\s*hancho:review-complete:\s*CORRECT\s*-->\s*(?![\s\S])'
+            }
+            resources   = [ordered]@{ write = @($reviewRel); read = @($reportRel) }
+        }
+        $jobs.Add($reviewJob)
+    }
 }
 
 $stamp = Get-Date -Format "yyyyMMdd-HHmmss-fff"

@@ -4283,14 +4283,39 @@ static std::wstring FailureClassSummary(const std::map<std::string, int>& counts
     return ss.str();
 }
 
+static std::string DiagString(const nlohmann::json& j, const char* key,
+                              const std::string& fallback = std::string()) {
+    if (!j.is_object()) return fallback;
+    auto it = j.find(key);
+    return (it != j.end() && it->is_string()) ? it->get<std::string>() : fallback;
+}
+
+static int64_t DiagInt(const nlohmann::json& j, const char* key, int64_t fallback = 0) {
+    if (!j.is_object()) return fallback;
+    auto it = j.find(key);
+    return (it != j.end() && it->is_number_integer()) ? it->get<int64_t>() : fallback;
+}
+
+static uint64_t DiagUInt(const nlohmann::json& j, const char* key, uint64_t fallback = 0) {
+    if (!j.is_object()) return fallback;
+    auto it = j.find(key);
+    return (it != j.end() && it->is_number_integer()) ? it->get<uint64_t>() : fallback;
+}
+
+static bool DiagBool(const nlohmann::json& j, const char* key, bool fallback = false) {
+    if (!j.is_object()) return fallback;
+    auto it = j.find(key);
+    return (it != j.end() && it->is_boolean()) ? it->get<bool>() : fallback;
+}
+
 // Failure classes across the jobs of one queue (the task list caption shows the same
 // breakdown for whatever is currently visible). Empty when the queue has no records.
 static std::wstring QueueFailureBreakdown(DashboardState* dash, const std::string& queue) {
     if (!dash) return L"";
     nlohmann::json req = {{"action", "taskqueue_diagnose"}, {"taskqueue", queue}, {"breakdown", true}};
     nlohmann::json resp;
-    if (GuiIpcCall(dash, req, resp) && resp.value("ok", false)) {
-        std::string summary = resp.value("summary", "");
+    if (GuiIpcCall(dash, req, resp) && DiagBool(resp, "ok")) {
+        std::string summary = DiagString(resp, "summary");
         if (!summary.empty()) {
             return Tr(L"キュー全体の失敗分類: ", L"Failure classes in this queue: ",
                       L"Clases de fallo en esta cola: ") + Utf8ToWide(summary);
@@ -4312,7 +4337,7 @@ static std::wstring QueueFailureBreakdown(DashboardState* dash, const std::strin
                     if (!last.is_object()) continue;
                     auto failure = last.find("failure");
                     if (failure == last.end() || !failure->is_object()) continue;
-                    std::string cls = failure->value("class", std::string());
+                    std::string cls = DiagString(*failure, "class");
                     if (!cls.empty()) ++counts[cls];
                 }
                 std::wstring summary = FailureClassSummary(counts);
@@ -4334,15 +4359,15 @@ static std::wstring WhyFailureText(const nlohmann::json& failure) {
                   L"No hay diagnóstico para este intento.");
     }
     std::wstringstream ss;
-    std::string failureClass = failure.value("class", std::string("unknown"));
-    std::string confidence = failure.value("confidence", std::string());
+    std::string failureClass = DiagString(failure, "class", "unknown");
+    std::string confidence = DiagString(failure, "confidence");
     ss << Tr(L"分類: ", L"Class: ", L"Clase: ") << Utf8ToWide(failureClass);
     if (!confidence.empty()) ss << L" (" << Utf8ToWide(confidence) << L")";
     ss << L"\r\n";
-    std::string summary = failure.value("summary", std::string());
+    std::string summary = DiagString(failure, "summary");
     if (!summary.empty()) ss << Tr(L"理由: ", L"Why: ", L"Motivo: ") << Utf8ToWide(summary) << L"\r\n";
-    std::string action = failure.value("suggestedAction", std::string());
-    std::string retryAt = failure.value("retryAt", std::string());
+    std::string action = DiagString(failure, "suggestedAction");
+    std::string retryAt = DiagString(failure, "retryAt");
     if (!action.empty()) {
         ss << Tr(L"次の手: ", L"Next: ", L"Siguiente: ") << Utf8ToWide(action);
         if (!retryAt.empty()) ss << L" (" << Tr(L"再試行 ", L"retry at ", L"reintentar ") << Utf8ToWide(retryAt) << L")";
@@ -4350,12 +4375,12 @@ static std::wstring WhyFailureText(const nlohmann::json& failure) {
     }
     auto activity = failure.find("lastActivity");
     if (activity != failure.end() && activity->is_object()) {
-        std::string what = activity->value("activity", std::string());
-        std::string target = activity->value("target", std::string());
+        std::string what = DiagString(*activity, "activity");
+        std::string target = DiagString(*activity, "target");
         if (!what.empty() || !target.empty()) {
             ss << Tr(L"最後の動作: ", L"Last activity: ", L"Última actividad: ") << Utf8ToWide(what);
             if (!target.empty()) ss << L" " << Utf8ToWide(target);
-            if (activity->contains("sinceSec") && (*activity)["sinceSec"].is_number()) {
+            if (activity->contains("sinceSec") && (*activity)["sinceSec"].is_number_integer()) {
                 ss << L" (" << (*activity)["sinceSec"].get<int64_t>() << L"s)";
             }
             ss << L"\r\n";
@@ -4369,19 +4394,19 @@ static std::wstring WhyFailureText(const nlohmann::json& failure) {
             if (!item.is_object()) continue;
             if (item.contains("events") && item["events"].is_string()) {
                 ss << L"  event " << Utf8ToWide(item["events"].get<std::string>())
-                   << L" seq " << item.value("seq", static_cast<uint64_t>(0)) << L"\r\n";
+                   << L" seq " << DiagUInt(item, "seq") << L"\r\n";
             } else if (item.contains("log") && item["log"].is_string()) {
                 ss << L"  log   " << Utf8ToWide(item["log"].get<std::string>())
-                   << L" line " << item.value("line", 0) << L"\r\n";
+                   << L" line " << DiagInt(item, "line") << L"\r\n";
             }
         }
     }
     auto llmGuess = failure.find("llmGuess");
     if (llmGuess != failure.end() && llmGuess->is_object()) {
-        std::string guessClass = llmGuess->value("class", std::string());
-        std::string guessSummary = llmGuess->value("summary", std::string());
-        std::string guessAction = llmGuess->value("suggestedAction", std::string());
-        std::string rationale = llmGuess->value("rationale", std::string());
+        std::string guessClass = DiagString(*llmGuess, "class");
+        std::string guessSummary = DiagString(*llmGuess, "summary");
+        std::string guessAction = DiagString(*llmGuess, "suggestedAction");
+        std::string rationale = DiagString(*llmGuess, "rationale");
         if (!guessClass.empty()) {
             ss << Tr(L"LLM の見立て (参考・低信頼): ", L"LLM guess (reference, low confidence): ",
                      L"Conjetura del LLM (referencia, baja confianza): ")
@@ -4439,7 +4464,7 @@ static std::wstring EvidenceContextText(const nlohmann::json& job, const nlohman
     int line = 0;
     if (evidence.contains("events") && evidence["events"].is_string()) {
         file = evidence["events"].get<std::string>();
-        uint64_t seq = evidence.value("seq", static_cast<uint64_t>(0));
+        uint64_t seq = DiagUInt(evidence, "seq");
         std::wstring pathW = EvidenceFilePathWide(job, file);
         std::vector<std::string> lines = ReadTextLines(pathW);
         if (lines.empty()) {
@@ -4463,7 +4488,7 @@ static std::wstring EvidenceContextText(const nlohmann::json& job, const nlohman
     }
     if (evidence.contains("log") && evidence["log"].is_string()) {
         file = evidence["log"].get<std::string>();
-        line = evidence.value("line", 0);
+        line = static_cast<int>(DiagInt(evidence, "line"));
         std::vector<std::string> lines = ReadTextLines(EvidenceFilePathWide(job, file));
         if (lines.empty()) {
             return Tr(L"証拠のログを読めません: ", L"Cannot read the evidence log: ",
@@ -4729,7 +4754,7 @@ struct PastRunsDlgState {
 };
 
 static void PastRunsLayout(HWND hwnd, PastRunsDlgState* ds) {
-    if (!ds) return;
+    if (!ds || !hwnd) return;
     RECT rc = {};
     GetClientRect(hwnd, &rc);
     int w = rc.right - rc.left;
@@ -4777,7 +4802,7 @@ static void PastRunsLayout(HWND hwnd, PastRunsDlgState* ds) {
 }
 
 static void PastRunsSelectTab(HWND hwnd, PastRunsDlgState* ds, int tab) {
-    if (!ds) return;
+    if (!ds || !hwnd) return;
     ds->activeTab = tab;
     if (ds->tab) TabCtrl_SetCurSel(ds->tab, tab);
     if (ds->jobEdit) ShowWindow(ds->jobEdit, tab == 0 ? SW_SHOW : SW_HIDE);
@@ -4978,7 +5003,7 @@ static void WhyLoad(PastRunsDlgState* ds) {
     if (ds->failure.empty() && !ds->jobName.empty() && ds->dash) {
         nlohmann::json req = {{"action", "taskqueue_diagnose"}, {"id", ds->jobName}};
         nlohmann::json resp;
-        if (GuiIpcCall(ds->dash, req, resp) && resp.value("ok", false) && resp.contains("failure") && resp["failure"].is_object()) {
+        if (GuiIpcCall(ds->dash, req, resp) && DiagBool(resp, "ok") && resp.contains("failure") && resp["failure"].is_object()) {
             ds->failure = resp["failure"];
         }
     }
@@ -4986,7 +5011,7 @@ static void WhyLoad(PastRunsDlgState* ds) {
     std::wstring text = WhyFailureText(ds->failure);
     std::wstring breakdown = QueueFailureBreakdown(ds->dash, ds->taskqueue);
     if (!breakdown.empty()) text += L"\r\n" + breakdown + L"\r\n";
-    std::string jobState = ds->job.is_object() ? ds->job.value("state", std::string()) : std::string();
+    std::string jobState = DiagString(ds->job, "state");
     if (ds->failure.empty() && jobState != "failed" && jobState != "cancelled") {
         text = Tr(L"このジョブはまだ失敗していません。", L"This job has not failed.",
                   L"Esta tarea aún no ha fallado.");
@@ -5007,11 +5032,11 @@ static void WhyLoad(PastRunsDlgState* ds) {
                 if (item.contains("events") && item["events"].is_string()) {
                     kind = "event";
                     file = item["events"].get<std::string>();
-                    where = L"seq " + std::to_wstring(item.value("seq", static_cast<uint64_t>(0)));
+                    where = L"seq " + std::to_wstring(DiagUInt(item, "seq"));
                 } else if (item.contains("log") && item["log"].is_string()) {
                     kind = "log";
                     file = item["log"].get<std::string>();
-                    where = L"line " + std::to_wstring(item.value("line", 0));
+                    where = L"line " + std::to_wstring(DiagInt(item, "line"));
                 } else {
                     continue;
                 }
@@ -6862,6 +6887,8 @@ static std::string TaskRowBtId(DashboardState* st, const std::string& jobId) {
     return "";
 }
 
+static void RefreshTaskQueueData(DashboardState* st, bool force, bool useCachedList);
+
 static void RemoveTaskRows(DashboardState* st, const std::vector<std::string>& ids, bool force) {
     if (!st || ids.empty()) return;
     const bool batch = ids.size() > 1;
@@ -6903,6 +6930,9 @@ static void RemoveTaskRows(DashboardState* st, const std::vector<std::string>& i
             lastErr = errW;
         }
     }
+    // Reload the list now: the removed rows are still in the cached list otherwise, and the
+    // row state the right-click menu depends on goes stale until the next refresh.
+    RefreshTaskQueueData(st, true, false);
     wchar_t result[768] = {};
     if (failed == 0) {
         swprintf_s(result, Tr(L"%zu 件のタスクを削除しました。", L"Removed %zu task(s).", L"Se quitaron %zu tareas."),

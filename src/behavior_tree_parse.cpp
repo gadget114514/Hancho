@@ -143,6 +143,15 @@ void ParseJobCommonFields(const json& j, const std::string& path, BtNode& node, 
             if (s.contains("contentRegex") && s["contentRegex"].is_string()) {
                 node.success.contentRegex = s["contentRegex"].get<std::string>();
             }
+            if (s.contains("contentFileOnly")) {
+                if (s["contentFileOnly"].is_boolean()) node.success.contentFileOnly = s["contentFileOnly"].get<bool>();
+                else ctx.AddError(path + ".success.contentFileOnly", "must be a boolean");
+            }
+            if (!node.success.contentFile.empty() && node.success.contentRegex.empty() &&
+                !node.success.contentFileOnly) {
+                ctx.AddError(path + ".success.contentFile",
+                             "requires success.contentRegex (or contentFileOnly: true to judge by the file alone)");
+            }
             if (s.contains("engineResult")) {
                 if (s["engineResult"].is_boolean()) node.success.engineResult = s["engineResult"].get<bool>();
                 else ctx.AddError(path + ".success.engineResult", "must be a boolean");

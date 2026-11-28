@@ -2740,6 +2740,9 @@ CHAT (LAN messaging between people and LLM agents; aliases: msg, ipmsg):
   taskqueue supersede <id> --reason "..." [--id <newId>] [--command ...] [--summary ...] [--timeout-sec N] [--instructions-file ...] [--patch <json>]
       Clone a finished, unsuccessful non-BT job into a new job with changes,
       linking it with supersedes and reason on the same queue and task.
+  taskqueue move <id> --to <taskId>
+      Move a standalone job into an open task. State, queue and lineage are unchanged;
+      use `direction move` for jobs managed by a behavior tree.
   taskqueue cancel <id>
   taskqueue takeover --id <id> --reason "..."    (supervisor takes the job over; record why)
   taskqueue complete --id <id> --reason "..." [--report <path>] [--result succeeded|failed]
@@ -2808,6 +2811,7 @@ DIRECTIONS (指示; a task card is a planned direction inside a task):
 
 BEHAVIOR TREES (for LLM agents; next step depends on results):
   bt validate|start --file <bt.json> [--task <id>]    Check / register and run a behavior tree
+  bt register --file <bt.json> --task <id>            Register a standalone BT as a planned direction (no jobs)
   bt wait --id <id> [--since-version <n>] [--timeout-ms <ms>]
       Long-poll until the tree finishes or waits for your decision (escalate).
   bt resume --id <id> --node <node> --answer <a> --rationale <why> [--vars <json>]
@@ -2911,7 +2915,8 @@ SETUP FOR LLM AGENTS:
 "        different worker engine for workers, or give workers a clearly\n"
 "        distinct role/prompt and avoid nested supervision.\n"
 "      - Verify success with exit code + filesNewer/outputRegex; for reports also\n"
-"        use contentFile + contentRegex (and engineResult) so a file that only\n"
+"        use contentFile + contentRegex (contentRegex is required with contentFile;\n"
+"        content_file_only: true judges by the file alone) (and engineResult) so a file that only\n"
 "        got its headings written does not count as success. Observe with\n"
 "        taskqueue_wait / taskqueue_list / taskqueue_graph and logs; retry with\n"
 "        taskqueue_retry. Blocked dependents resume automatically.\n"
@@ -2942,13 +2947,13 @@ SETUP FOR LLM AGENTS:
 "      Direction:  direction_add, direction_show, direction_list, direction_edit,\n"
 "                  direction_remove, direction_run, direction_redo, direction_import,\n"
 "                  direction_export, direction_translate, direction_close,\n"
-"                  direction_reopen, direction_purge\n"
+"                  direction_reopen, direction_move, direction_purge\n"
 "      Task queue: taskqueue_add, taskqueue_list, taskqueue_get, taskqueue_retry,\n"
-"                  taskqueue_supersede, taskqueue_update, taskqueue_cancel, taskqueue_pause, taskqueue_resume,\n"
+"                  taskqueue_supersede, taskqueue_update, taskqueue_move, taskqueue_cancel, taskqueue_pause, taskqueue_resume,\n"
 "                  taskqueue_pause_job, taskqueue_resume_job, taskqueue_wait,\n"
 "                  taskqueue_purge, taskqueue_link, taskqueue_unlink, taskqueue_graph\n"
-"      Behavior tree: bt_validate, bt_start, bt_get, bt_list, bt_wait, bt_resume,\n"
-"                  bt_retry, bt_update, bt_cancel, bt_pause\n"
+"      Behavior tree: bt_validate, bt_start, bt_register, bt_get, bt_list, bt_wait,\n"
+"                  bt_resume, bt_retry, bt_update, bt_cancel, bt_pause\n"
 "      Power:      power_suspend, power_shutdown, power_cancel, power_status\n"
 "      Chat:       chat_status, chat_hosts (alias: chat_peers), chat_refresh,\n"
 "                  chat_send, chat_get, chat_inbox, chat_wait, chat_read,\n"
@@ -3186,7 +3191,7 @@ void PrintCliUsageJson() {
     {
       "name": "taskqueue",
       "description": "Manage the persistent task queue: ordered jobs, dependencies, per-job timeouts, success checks and automatic retries.",
-      "usage": "hancho-cli taskqueue <add|list|get|why|retry|supersede|cancel|takeover|complete|pause|resume|pause-job|resume-job|graph|wait|purge|update> ...",
+      "usage": "hancho-cli taskqueue <add|list|get|why|retry|supersede|move|cancel|takeover|complete|pause|resume|pause-job|resume-job|graph|wait|purge|update> ...",
       "subcommands": [
         {"name": "add", "usage": "hancho-cli taskqueue add --file <jobs.json> [--taskqueue <name>] [--concurrency <n>] [--notify-file <path>] [--origin-label <text>] [--task <id>]", "description": "Register jobs. Each job needs id, command, summary and timeoutSec; dependsOn replaces shell chaining. The caller's session id, working folder and --origin-label are recorded as the job's origin. --task attaches the jobs to an open task record. suspendWhenDone/suspendDelaySec/suspendHibernate arm the PC to suspend, and shutdownWhenDone/shutdownDelaySec arm it to shut down, after that job and all other work is idle. Do not set hidden on jobs you register: it is reserved for Hancho's internal jobs and hides the row unless Show hidden tasks is on."},
         {"name": "list", "usage": "hancho-cli taskqueue list [<name>] [--state <state>] [--since <period>] [--origin <self|label|session>] [--bt <id>] [--task <id>] [--no-planned] [--limit <n>] [--all] [--before <cursor>] [--query <text>]", "description": "List jobs with state, queue, summary and blockedBy. --since keeps only jobs updated within the period (e.g. 30m, 6h, 2d). --origin self keeps only the jobs this session added. --bt <id> lists every job of a behavior tree across its parallel branch queues. --task <id> keeps only jobs belonging to that task. --limit <n> caps finished jobs (default from config.json task_list_recent_count, 30); --all shows all; --before <cursor> paginates older finished jobs; --query <text> searches case-insensitively. Provisional 'planned' rows for idle BT leaves are included by default; --no-planned hides them and the direction row. The active BT direction is a virtual row with id 'direction:<id>' (legacy 'group:<btId>' accepted as an alias) and state running, waitingForLlm or paused. Neither row is a stored job. Each job also carries resource_wait and, once succeeded with estimateSec, timing_feedback (see audit)."},
@@ -3195,6 +3200,7 @@ void PrintCliUsageJson() {
         {"name": "why", "usage": "hancho-cli taskqueue why <id>", "description": "Explain why the last attempt failed: failure class, confidence, summary, suggested action, last activity and evidence (event seq / log line), plus the class of every attempt. Reads the job without instructions."},
         {"name": "retry", "usage": "hancho-cli taskqueue retry <id> | hancho-cli taskqueue retry --failed [<name>] [--since <period>]", "description": "Requeue a failed/blocked/cancelled job; blocked dependents resume automatically. --failed retries every failed job instead, optionally limited to one queue and to jobs that failed within --since (e.g. --since 6h = last 6 hours)."},
         {"name": "supersede", "usage": "hancho-cli taskqueue supersede <id> --reason \"...\" [--id <newId>] [--command ...] [--summary ...] [--timeout-sec N] [--instructions-file ...] [--patch <json>]", "description": "Clone a finished, unsuccessful non-BT job into a new job with changes, linking it via supersedes and reason on the same queue and task."},
+        {"name": "move", "usage": "hancho-cli taskqueue move <id> --to <taskId>", "description": "Move a standalone job into an open task. Only the task assignment changes; state, queue, dependencies and lineage are preserved. BT-managed jobs must be moved with direction move."},
         {"name": "cancel", "usage": "hancho-cli taskqueue cancel <id>", "description": "Cancel a job; a running attempt is killed and is not retried."},
         {"name": "takeover", "usage": "hancho-cli taskqueue takeover --id <id> --reason <text>", "description": "Record that the supervisor takes a failed/blocked/waiting/pending/running job over instead of delegating again. The job becomes the terminal state takenOver with a takeover record {by, reason, at}, its process tree is stopped, and dependents stay pending until complete."},
         {"name": "complete", "usage": "hancho-cli taskqueue complete --id <id> --reason <text> [--report <path>] [--result succeeded|failed]", "description": "Finish a taken-over job and record {completedAt, report, result, completionReason}. With succeeded (default), dependents advance as if the dependency succeeded; with failed, dependents are blocked. --reason is required."},
@@ -3289,6 +3295,7 @@ void PrintCliUsageJson() {
         {"name": "validate", "usage": "hancho-cli bt validate --file <bt.json> | --bt <json>", "description": "Check a tree without running it."},
         {"name": "template", "usage": "hancho-cli bt template [<name>] [--json]", "description": "Show a hang-safe BT template; omit the name to list them."},
         {"name": "start", "usage": "hancho-cli bt start --file <bt.json> | --bt <json> [--paused true|false] [--task <id>]", "description": "Register and start a tree. --paused true registers it paused without creating any jobs. --task attaches the tree and its jobs to an open task."},
+        {"name": "register", "usage": "hancho-cli bt register --file <bt.json> | --bt <json> --task <id>", "description": "Register a tree as a planned direction under an open task without starting it or creating jobs (MCP: bt_register). A later bt start reuses the same direction."},
         {"name": "wait", "usage": "hancho-cli bt wait --id <id> [--since-version <n>] [--timeout-ms <ms>]", "description": "Long-poll until the tree finishes or waits for a decision (state waitingForLlm, with the decision packet)."},
         {"name": "resume", "usage": "hancho-cli bt resume --id <id> --node <node> --answer <answer> --rationale <text> [--vars <json>]", "description": "Answer an escalate node; rationale is required."},
         {"name": "get", "usage": "hancho-cli bt get --id <id> [--compact]", "description": "Node states, runs, variables and jobs; --compact prints one line per node."},
@@ -3573,7 +3580,7 @@ void PrintCliUsageJson() {
           }
         }
       },
-      "tools": ["start_process", "list_processes", "get_process_output", "send_process_input", "wait_process", "kill_process", "run_agent", "wait_agent", "get_agent_stream", "get_agent_state", "update_agent_info", "task_create", "task_show", "task_list", "task_note", "task_close", "task_reopen", "task_purge", "task_wait", "direction_add", "direction_show", "direction_list", "direction_edit", "direction_remove", "direction_run", "direction_redo", "direction_import", "direction_export", "direction_translate", "direction_close", "direction_reopen", "direction_purge", "taskqueue_add", "taskqueue_list", "taskqueue_get", "taskqueue_retry", "taskqueue_supersede", "taskqueue_update", "taskqueue_cancel", "taskqueue_takeover", "taskqueue_complete", "taskqueue_pause", "taskqueue_resume", "taskqueue_pause_job", "taskqueue_resume_job", "taskqueue_wait", "taskqueue_purge", "taskqueue_link", "taskqueue_unlink", "taskqueue_graph", "bt_validate", "bt_start", "bt_get", "bt_list", "bt_wait", "bt_resume", "bt_retry", "bt_update", "bt_cancel", "bt_pause", "bt_template", "routine_list", "routine_show", "routine_run", "routine_save", "routine_check", "routine_ask", "routine_approve", "routine_reject", "power_suspend", "power_shutdown", "power_cancel", "power_status", "chat_status", "chat_peers", "chat_refresh", "chat_send", "chat_get", "chat_inbox", "chat_wait", "chat_read", "chat_download", "chat_log", "chat_handler", "memory_search", "memory_get", "memory_brief", "memory_stats", "memory_note", "memory_retract", "memory_approve", "usage_stats", "usage_export", "agent_health", "dashboard_show", "dashboard_status"]
+      "tools": ["start_process", "list_processes", "get_process_output", "send_process_input", "wait_process", "kill_process", "run_agent", "wait_agent", "get_agent_stream", "get_agent_state", "update_agent_info", "task_create", "task_show", "task_list", "task_note", "task_close", "task_reopen", "task_purge", "task_wait", "direction_add", "direction_show", "direction_list", "direction_edit", "direction_remove", "direction_run", "direction_redo", "direction_move", "direction_import", "direction_export", "direction_translate", "direction_close", "direction_reopen", "direction_purge", "taskqueue_add", "taskqueue_list", "taskqueue_get", "taskqueue_retry", "taskqueue_supersede", "taskqueue_update", "taskqueue_move", "taskqueue_cancel", "taskqueue_takeover", "taskqueue_complete", "taskqueue_pause", "taskqueue_resume", "taskqueue_pause_job", "taskqueue_resume_job", "taskqueue_wait", "taskqueue_purge", "taskqueue_link", "taskqueue_unlink", "taskqueue_graph", "bt_validate", "bt_start", "bt_register", "bt_get", "bt_list", "bt_wait", "bt_resume", "bt_retry", "bt_update", "bt_cancel", "bt_pause", "bt_template", "routine_list", "routine_show", "routine_run", "routine_save", "routine_check", "routine_ask", "routine_approve", "routine_reject", "power_suspend", "power_shutdown", "power_cancel", "power_status", "chat_status", "chat_peers", "chat_refresh", "chat_send", "chat_get", "chat_inbox", "chat_wait", "chat_read", "chat_download", "chat_log", "chat_handler", "memory_search", "memory_get", "memory_brief", "memory_stats", "memory_note", "memory_retract", "memory_approve", "usage_stats", "usage_export", "agent_health", "dashboard_show", "dashboard_status"]
     }
   },
   "leaving": {
@@ -3617,7 +3624,7 @@ void PrintCliUsageJson() {
       "rules": [
         "One job = one command; never use &&, ||, &, PowerShell ';', newlines or wait loops.",
         "Give each job its own timeoutSec; never sum timeouts.",
-        "Prefer filesNewer/outputRegex when exit code 0 does not prove the work was done; for reports add contentFile/contentRegex/engineResult so a headings-only file is not success.",
+        "Prefer filesNewer/outputRegex when exit code 0 does not prove the work was done; for reports add contentFile + contentRegex and engineResult so a headings-only file is not success. contentFile without contentRegex is refused unless content_file_only is true.",
         "Keep the supervisor context small: pass detailed instructions to workers and read artifacts, not raw transcripts.",
         "Use taskqueue_wait instead of polling .done files.",
         "To delegate one task to an agent LLM, use run_agent (alias: run_worker): it blocks until the agent exits and returns only the final result; the raw stream stays in stream_file.",
@@ -3664,7 +3671,7 @@ void PrintCliUsageJson() {
       "optional": ["cwd", "env", "dependsOn", "idle", "maxAttempts", "retryDelaySec", "defer", "success", "killExclude", "resources", "priority", "supersedes", "supersedeReason", "taskId", "suspendWhenDone", "suspendDelaySec", "suspendHibernate", "shutdownWhenDone", "shutdownDelaySec", "instructionsFile", "instructionsText"],
       "summary": "One line, max 200 chars; exported as PC_JOB_SUMMARY and substituted for {summary}.",
       "timeoutSec": "Per job; > 0 and <= queue maxTimeoutSec (default 7200). Never summed.",
-      "success": "exitCode (default 0) AND filesNewer (exist and newer than the attempt start) AND outputRegex (last 200 log lines) AND testReport (JUnit/NUnit XML: newer than the attempt start, at least one test, none failed; failed test names go into the failure detail) AND contentFile (exist and newer than the attempt start, at least minBytes, matching contentRegex; use it for reports) AND engineResult (the LLM engine's final result must not report an error, even when the process exits 0).",
+      "success": "exitCode (default 0) AND filesNewer (exist and newer than the attempt start) AND outputRegex (last 200 log lines) AND testReport (JUnit/NUnit XML: newer than the attempt start, at least one test, none failed; failed test names go into the failure detail) AND contentFile (exist and newer than the attempt start, at least minBytes, matching contentRegex, which is required unless content_file_only is true; use it for reports) AND engineResult (the LLM engine's final result must not report an error, even when the process exits 0).",
       "idle": "outputSec and cpuSec must both be set; kill only when output AND CPU are idle.",
       "defer": "{exitCodes (default [75]), delaySec (60), limit (60, 0 = no limit)}: exit codes meaning nothing ran; the job is re-run after delaySec without using up maxAttempts. {\"exitCodes\": []} turns it off."
     },
@@ -3767,7 +3774,7 @@ void PrintCliUsageJson() {
     }
   },
     "notes": [
-      "Use filesNewer when exit code 0 does not prove the work was done; for a report add contentFile + contentRegex (and engineResult) so writing only the headings does not count as success.",
+      "Use filesNewer when exit code 0 does not prove the work was done; for a report add contentFile + contentRegex (and engineResult) so writing only the headings does not count as success. contentRegex is required with contentFile unless content_file_only is true.",
       "Use dependsOn instead of waiting for .done files or polling.",
       "taskqueue_wait is a long poll; it returns when the queue version changes.",
       "kill_process on a task-queue attempt means 'killed attempt' and is retried (use taskqueue_cancel to stop it).",
@@ -4852,11 +4859,25 @@ int PrintResponse(const std::string& action, const std::string& respJson, bool j
             std::cout << " [" << r.value("state", std::string()) << "].\n";
             return 0;
         }
+        if (action == "direction_move") {
+            std::cout << "Moved direction " << r.value("id", std::string())
+                      << " from " << r.value("fromTaskId", std::string())
+                      << " to " << r.value("taskId", std::string()) << ".\n";
+            return 0;
+        }
         std::cout << respJson << "\n";
         return 0;
     }
 
     if (action.rfind("taskqueue_", 0) == 0) {
+        if (action == "taskqueue_move") {
+            const nlohmann::json r = nlohmann::json::parse(respJson, nullptr, false);
+            const std::string fromTask = r.value("fromTaskId", std::string());
+            std::cout << "Moved job " << r.value("id", std::string())
+                      << " from " << (fromTask.empty() ? std::string("(no task)") : fromTask)
+                      << " to " << r.value("taskId", std::string()) << ".\n";
+            return 0;
+        }
         if (action == "taskqueue_list") {
             auto jobs = ExtractJsonObjectArray(respJson, "jobs");
             if (jobs.empty()) {
@@ -4920,6 +4941,17 @@ int PrintResponse(const std::string& action, const std::string& respJson, bool j
             size_t count = collectBtWarnings(respJson, warningText);
             if (count > 0) std::cout << "Behavior tree started with " << count << " warning(s):\n"
                                      << warningText;
+        }
+        if (action == "bt_register") {
+            std::cout << "Behavior tree registered as planned"
+                      << " id=" << JsonGetString(respJson, "id", "")
+                      << " directionId=" << JsonGetString(respJson, "directionId", "")
+                      << " taskId=" << JsonGetString(respJson, "taskId", "")
+                      << " state=" << JsonGetString(respJson, "state", "planned") << "\n";
+            size_t count = collectBtWarnings(respJson, warningText);
+            if (count > 0) std::cout << "Behavior tree registered with " << count << " warning(s):\n"
+                                     << warningText;
+            return 0;
         }
         if (action == "bt_list") {
             auto trees = ExtractJsonObjectArray(respJson, "trees");
@@ -8242,7 +8274,7 @@ if (subcmd == "start" || subcmd == "run") {
                         a == "--after" || a == "--template" || a == "--params" || a == "--max" ||
                         a == "--result" || a == "--reason" || a == "--before" || a == "--file" ||
                         a == "--older-than" || a == "--origin-label" || a == "--translate-cards" ||
-                        a == "--lang" || a == "--data-dir") {
+                        a == "--lang" || a == "--data-dir" || a == "--to") {
                         ++i;
                     }
                     continue;
@@ -8275,7 +8307,7 @@ if (subcmd == "start" || subcmd == "run") {
                     {"ok", true},
                     {"command", "direction"},
                     {"subcommands", nlohmann::json::array({
-                        "add", "list", "show", "edit", "remove", "run", "redo",
+                        "add", "list", "show", "edit", "remove", "run", "redo", "move",
                         "import", "export", "translate", "close", "reopen", "purge"
                     })}
                 }.dump() << "\n";
@@ -8290,6 +8322,7 @@ if (subcmd == "start" || subcmd == "run") {
                     << "  remove    <number> --task <id>\n"
                     << "  run       (<number> | --ready [--max <n>]) --task <id> [--force]\n"
                     << "  redo      <number> --task <id> [--body \"...\" | --body-file <md>] [--params <json>] [--reason \"...\"] [--run] [--force]\n"
+                    << "  move      <id> --to <taskId> [--task <taskId>]\n"
                     << "  import    --task <id> --file <md> [--dry-run] [--translate-cards <all|title|off>]\n"
                     << "  export    --task <id> [--file <md>] [--lang <en|ja|es>]\n"
                     << "  translate --task <id> [--translate-cards <all|title|off>]\n"
@@ -8502,6 +8535,18 @@ if (subcmd == "start" || subcmd == "run") {
             req["origin"] = nlohmann::json::parse(
                 BuildCallerOriginJson("hancho-cli-cli", argVal("--origin-label", "")), nullptr, false);
             subcmd = "direction_redo";
+        } else if (op == "move") {
+            std::string id = argVal("--id", "");
+            if (id.empty()) id = positionalSkippingValues(3);
+            if (id.empty()) return failWith("direction move requires <id>.");
+            std::string toTaskId = argVal("--to", "");
+            if (toTaskId.empty()) toTaskId = argVal("--task", "");
+            if (toTaskId.empty()) return failWith("direction move requires --to <taskId>.");
+            req["action"] = "direction_move";
+            req["id"] = id;
+            req["task"] = toTaskId;
+            req["taskId"] = toTaskId;
+            subcmd = "direction_move";
         } else if (op == "import" || op == "export" || op == "translate") {
             const std::string taskId = argVal("--task", "");
             if (taskId.empty()) return failWith("direction " + op + " requires --task <id>.");
@@ -8638,7 +8683,7 @@ if (subcmd == "start" || subcmd == "run") {
         };
         // First non-flag argument, skipping the values of flags that take one (e.g. "--since 6h").
         auto positionalSkippingValues = [&args](size_t startIdx) -> std::string {
-            static const char* const valueFlags[] = {"--state", "--since", "--origin", "--rev", "--root", "--states", "--older-than-days", "--bt", "--reason", "--report", "--result", "--id", "--command", "--summary", "--timeout-sec", "--instructions-file", "--patch", "--task"};
+            static const char* const valueFlags[] = {"--state", "--since", "--origin", "--rev", "--root", "--states", "--older-than-days", "--bt", "--reason", "--report", "--result", "--id", "--command", "--summary", "--timeout-sec", "--instructions-file", "--patch", "--task", "--to"};
             for (size_t i = startIdx; i < args.size(); ++i) {
                 bool isValueFlag = false;
                 for (const char* f : valueFlags) {
@@ -8884,6 +8929,15 @@ if (subcmd == "start" || subcmd == "run") {
             reqJson << "{\"action\":\"taskqueue_update\",\"id\":\"" << JsonEscape(id)
                     << "\",\"patch\":" << p.dump() << "}";
             subcmd = "taskqueue_update";
+        } else if (op == "move") {
+            std::string id = argVal("--id", "");
+            if (id.empty()) id = positionalSkippingValues(3);
+            if (id.empty()) return failWith("move requires a job id (or --id).");
+            const std::string toTaskId = argVal("--to", "");
+            if (toTaskId.empty()) return failWith("move requires --to <taskId>.");
+            reqJson << "{\"action\":\"taskqueue_move\",\"id\":\"" << JsonEscape(id)
+                    << "\",\"task\":\"" << JsonEscape(toTaskId) << "\"}";
+            subcmd = "taskqueue_move";
         } else if (op == "purge" && !argVal("--older-than-days", "").empty()) {
             // Age-based purge: finished jobs not updated for N days (all queues unless a name is given).
             std::string daysStr = argVal("--older-than-days", "");
@@ -8963,7 +9017,7 @@ if (subcmd == "start" || subcmd == "run") {
             subcmd = "taskqueue_close";
         } else {
             return failWith("unknown taskqueue command: " + op +
-                            " (add, list, get, why, retry, cancel, takeover, complete, close, pause, resume, pause-job, resume-job, graph, wait, purge, remove, update)");
+                            " (add, list, get, why, retry, supersede, move, cancel, takeover, complete, close, pause, resume, pause-job, resume-job, graph, wait, purge, remove, update)");
         }
     }
     else if (subcmd == "quickfix") {
@@ -9206,6 +9260,8 @@ if (subcmd == "start" || subcmd == "run") {
                 << "  template  [<name>] [--json]                        Show a hang-safe BT template (list when no name)\n"
                 << "  start     --file <path> | --bt <json> [--paused true|false] [--task <id>]\n"
                 << "                                                     Register and start (--paused true: register only)\n"
+                << "  register  --file <path> | --bt <json> --task <id>\n"
+                << "                                                     Register as a planned direction without starting it\n"
                 << "  get       --id <id> [--compact]                    Get behavior tree state and node status\n"
                 << "  tasks     --id <id>                                All of the tree's jobs across branch queues\n"
                 << "  list                                               List behavior trees\n"
@@ -9298,7 +9354,7 @@ if (subcmd == "start" || subcmd == "run") {
             } else if ((a == "--timeout-ms" || a == "--wait-ms") && i + 1 < args.size()) {
                 try { timeoutMs = std::stoi(args[++i]); } catch (...) {}
             } else if (!a.empty() && a[0] != '-') {
-                if ((op == "validate" || op == "start") && file.empty() && btRaw.empty()) file = a;
+                if ((op == "validate" || op == "start" || op == "register") && file.empty() && btRaw.empty()) file = a;
                 else if (id.empty()) id = a;
             }
         }
@@ -9327,7 +9383,7 @@ if (subcmd == "start" || subcmd == "run") {
         };
 
         nlohmann::json jReq;
-        if (op == "validate" || op == "start") {
+        if (op == "validate" || op == "start" || op == "register") {
             std::string text;
             if (!loadBtText(text)) {
                 return failWith(file.empty() ? (op + " requires --file <path> or --bt <json>")
@@ -9339,6 +9395,11 @@ if (subcmd == "start" || subcmd == "run") {
             if (op == "start") {
                 jReq["paused"] = startPaused;
                 if (!taskId.empty()) jReq["task"] = taskId;
+                jReq["origin"] = nlohmann::json::parse(BuildCallerOriginJson("hancho-cli-cli", ""), nullptr, false);
+            }
+            if (op == "register") {
+                if (taskId.empty()) return failWith("register requires --task <id>");
+                jReq["task"] = taskId;
                 jReq["origin"] = nlohmann::json::parse(BuildCallerOriginJson("hancho-cli-cli", ""), nullptr, false);
             }
             subcmd = "bt_" + op;
@@ -9420,7 +9481,7 @@ if (subcmd == "start" || subcmd == "run") {
             subcmd = "bt_pause";
         } else {
             return failWith("unknown bt command: " + op +
-                            " (validate, template, start, get, tasks, list, wait, resume, retry, update, cancel, remove, pause)");
+                            " (validate, template, start, register, get, tasks, list, wait, resume, retry, update, cancel, remove, pause)");
         }
         reqJson << jReq.dump();
     }

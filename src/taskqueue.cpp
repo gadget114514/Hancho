@@ -350,6 +350,7 @@ static std::string NormalizeJobJsonKeys(const std::string& in) {
         {"minBytes", "min_bytes"},
         {"contentRegex", "content_regex"},
         {"engineResult", "engine_result"},
+        {"contentFileOnly", "content_file_only"},
         {"budgetChars", "budget_chars"},
         {"includeAgentNotes", "include_agent_notes"},
         {"waitForRateLimit", "wait_for_rate_limit"},
@@ -2156,6 +2157,7 @@ static std::string SuccessToJson(const TaskQueueSuccess& s) {
     if (!s.contentFile.empty()) oss << ",\"content_file\":\"" << JsonEscape(s.contentFile) << "\"";
     if (s.minBytes > 0) oss << ",\"min_bytes\":" << s.minBytes;
     if (!s.contentRegex.empty()) oss << ",\"content_regex\":\"" << JsonEscape(s.contentRegex) << "\"";
+    if (s.contentFileOnly) oss << ",\"content_file_only\":true";
     if (s.engineResult) oss << ",\"engine_result\":true";
     oss << "}";
     return oss.str();
@@ -2465,6 +2467,7 @@ static TaskQueueJob ParseJob(const std::string& j) {
     job.success.contentFile = JsonFieldStr(successObj, "content_file", "");
     job.success.minBytes = JsonFieldInt(successObj, "min_bytes", 0);
     job.success.contentRegex = JsonFieldStr(successObj, "content_regex", "");
+    job.success.contentFileOnly = JsonFieldBool(successObj, "content_file_only", false);
     job.success.engineResult = JsonFieldBool(successObj, "engine_result", false);
     std::string deferErr;
     if (!ParseDeferChecked(j, job.success.exitCode, job.defer, deferErr)) job.defer = TaskQueueDefer();
@@ -4612,7 +4615,17 @@ static bool ParseNewJob(const std::string& rawJson, const std::string& taskqueue
     job.success.contentFile = JsonFieldStr(successObj, "content_file", "");
     job.success.minBytes = JsonFieldInt(successObj, "min_bytes", 0);
     job.success.contentRegex = JsonFieldStr(successObj, "content_regex", "");
+    job.success.contentFileOnly = JsonFieldBool(successObj, "content_file_only", false);
     job.success.engineResult = JsonFieldBool(successObj, "engine_result", false);
+    {
+        const std::string specErr = ContentFileSuccessError(job.success.contentFile,
+                                                            job.success.contentRegex,
+                                                            job.success.contentFileOnly);
+        if (!specErr.empty()) {
+            err = "job '" + job.id + "': " + specErr;
+            return false;
+        }
+    }
     job.killExclude = JsonFieldStrArray(j, "kill_exclude");
     std::string resErr;
     if (!ParseResourcesChecked(j, job.resources, resErr)) {
@@ -5879,7 +5892,15 @@ std::string TaskQueueManager::TaskQueueUpdate(const std::string& id, const std::
         job->success.contentFile = JsonFieldStr(successObj, "content_file", "");
         job->success.minBytes = JsonFieldInt(successObj, "min_bytes", 0);
         job->success.contentRegex = JsonFieldStr(successObj, "content_regex", "");
+        job->success.contentFileOnly = JsonFieldBool(successObj, "content_file_only", false);
         job->success.engineResult = JsonFieldBool(successObj, "engine_result", false);
+        const std::string specErr = ContentFileSuccessError(job->success.contentFile,
+                                                            job->success.contentRegex,
+                                                            job->success.contentFileOnly);
+        if (!specErr.empty()) {
+            outError = specErr;
+            return BuildError(outError);
+        }
     }
     if (HasJsonKey(patchJson, "defer")) {
         TaskQueueDefer d;
@@ -6188,6 +6209,7 @@ std::string TaskQueueManager::TaskQueueSupersede(const std::string& id, const st
         newJob.success.contentFile = JsonFieldStr(successObj, "content_file", "");
         newJob.success.minBytes = JsonFieldInt(successObj, "min_bytes", 0);
         newJob.success.contentRegex = JsonFieldStr(successObj, "content_regex", "");
+        newJob.success.contentFileOnly = JsonFieldBool(successObj, "content_file_only", false);
         newJob.success.engineResult = JsonFieldBool(successObj, "engine_result", false);
     }
     if (HasJsonKey(patchJson, "defer")) {
@@ -6917,6 +6939,62 @@ std::string TaskQueueManager::TaskQueueUnlink(const std::string& jobId, const st
     return "{\"ok\":true,\"job\":" + JobToJson(*job, true) + "}";
 }
 
+std::string TaskQueueManager::TaskQueueMoveToTask(const std::string& jobId, const std::string& toTaskId, std::string& outError) {
+    outError.clear();
+    if (jobId.empty()) {
+        outError = "job id is required";
+        return BuildError(outError);
+    }
+    if (toTaskId.empty()) {
+        outError = "target task id is required";
+        return BuildError(outError);
+    }
+    std::lock_guard<std::mutex> lock(mutex_);
+    TaskQueue* tq = nullptr;
+    TaskQueueJob* job = FindJob(jobId, &tq);
+    if (!job) {
+        outError = "job not found: " + jobId;
+        return BuildError(outError);
+    }
+    if (!ValidateTaskActive(toTaskId, outError)) return BuildError(outError);
+    if (!job->bt.id.empty()) {
+        outError = "cannot move a behavior tree job; use direction move instead";
+        return BuildError(outError);
+    }
+    const std::string fromTaskId = job->taskId;
+    if (fromTaskId == toTaskId) {
+        return nlohmann::json{{"ok", true}, {"id", jobId}, {"taskId", toTaskId},
+                              {"fromTaskId", fromTaskId}, {"unchanged", true}}.dump();
+    }
+    job->taskId = toTaskId;
+    job->updatedAt = GetCurrentTimestampStr();
+    MarkJobChangedLocked(*job);
+    EmitEventLocked(*tq, "jobMoved", jobId, 0);
+    SaveQueue(*tq);
+    nlohmann::json extra = {{"jobId", jobId}, {"fromTaskId", fromTaskId}, {"taskId", toTaskId}};
+    const std::string text = "moved job " + jobId + " from " +
+                             (fromTaskId.empty() ? std::string("(no task)") : fromTaskId) +
+                             " to " + toTaskId;
+    TaskLog(fromTaskId, "job_moved", jobId, "", text, "", &extra);
+    TaskLog(toTaskId, "job_moved", jobId, "", text, "", &extra);
+    auto refreshTaskState = [&](const std::string& taskId) {
+        nlohmann::json task;
+        if (taskId.empty() || !taskStore_.Get(taskId, task)) return;
+        const std::string oldState = task.value("state", std::string());
+        const std::string newState = TaskStateLocked(taskId).value("state", std::string());
+        if (newState.empty() || newState == oldState) return;
+        task["state"] = newState;
+        task["updatedAt"] = GetCurrentTimestampStr();
+        task["rev"] = BumpRevLocked();
+        std::string saveErr;
+        taskStore_.Save(task, saveErr);
+    };
+    refreshTaskState(fromTaskId);
+    refreshTaskState(toTaskId);
+    return nlohmann::json{{"ok", true}, {"id", jobId}, {"taskId", toTaskId},
+                          {"fromTaskId", fromTaskId}}.dump();
+}
+
 } // namespace pc
 
 namespace pc {
@@ -7287,6 +7365,16 @@ bool TaskQueueManager::EvaluateSuccess(const TaskQueueJob& job, TaskQueueAttempt
     }
     // A report can be touched early (just the headings) and then the worker dies. The content
     // check makes the file have to carry what the job promised, not only a new mtime.
+    {
+        // Jobs registered before this rule (or edited on disk) can still lack a content_regex.
+        const std::string specErr = ContentFileSuccessError(job.success.contentFile,
+                                                            job.success.contentRegex,
+                                                            job.success.contentFileOnly);
+        if (!specErr.empty()) {
+            detail = specErr;
+            return false;
+        }
+    }
     if (!job.success.contentFile.empty()) {
         if (!job.host.empty()) {
             detail = "content check is not available for remote jobs: " + job.success.contentFile;
@@ -9996,6 +10084,114 @@ std::string TaskQueueManager::DirectionReopen(const std::string& id, const std::
     }
     const nlohmann::json status = DirectionStateLocked(id);
     return nlohmann::json{{"ok", true}, {"id", id}, {"state", status.value("state", std::string())}}.dump();
+}
+
+std::string TaskQueueManager::DirectionMove(const std::string& id, const std::string& toTaskId,
+                                            std::string& outError) {
+    outError.clear();
+    if (id.empty()) {
+        outError = "direction id is required";
+        return BuildError(outError);
+    }
+    if (toTaskId.empty()) {
+        outError = "target task id is required";
+        return BuildError(outError);
+    }
+    std::lock_guard<std::mutex> lock(mutex_);
+    std::string dirId = id;
+    nlohmann::json record;
+    if (!directionStore_.Get(dirId, record)) {
+        if (dirId.rfind("job:", 0) == 0) {
+            outError = "implicit job direction cannot be moved: " + dirId;
+            return BuildError(outError);
+        }
+        std::vector<std::string> heads;
+        for (const auto& rec : directionStore_.All()) {
+            if (!rec.is_object() || !rec.contains("card") || !rec["card"].is_object()) continue;
+            if (rec["card"].value("number", std::string()) != id) continue;
+            const std::string headId = FollowCardHeadLocked(directionStore_, rec).value("id", std::string());
+            if (!headId.empty() && std::find(heads.begin(), heads.end(), headId) == heads.end()) {
+                heads.push_back(headId);
+            }
+        }
+        if (heads.empty()) {
+            outError = "direction not found: " + id;
+            return BuildError(outError);
+        }
+        if (heads.size() > 1) {
+            outError = "card number '" + id + "' is ambiguous; use a direction id";
+            return BuildError(outError);
+        }
+        dirId = heads.front();
+        if (!directionStore_.Get(dirId, record)) {
+            outError = "direction not found: " + id;
+            return BuildError(outError);
+        }
+    }
+    if (!ValidateTaskActive(toTaskId, outError)) return BuildError(outError);
+    if (record.contains("closed") && record["closed"].is_object()) {
+        outError = "direction '" + dirId + "' is closed";
+        return BuildError(outError);
+    }
+    const std::string fromTaskId = record.value("taskId", std::string());
+    if (fromTaskId == toTaskId) {
+        return nlohmann::json{{"ok", true}, {"id", dirId}, {"taskId", toTaskId},
+                              {"fromTaskId", fromTaskId}, {"unchanged", true}}.dump();
+    }
+    const std::string btId = record.value("btId", std::string());
+    if (!btId.empty()) {
+        const std::wstring path = PathJoinWide(PathJoinWide(GetLogsDirectoryWide(), L"behaviortrees"),
+                                               Utf8ToWide(SanitizeFileNameComponent(btId))) + L".json";
+        const nlohmann::json doc = nlohmann::json::parse(ReadFileUtf8Wide(path), nullptr, false);
+        if (doc.is_object()) {
+            nlohmann::json updated = doc;
+            updated["taskId"] = toTaskId;
+            try {
+                WriteFileAtomicWide(path, updated.dump(2) + "\n");
+            } catch (const std::exception& e) {
+                outError = std::string("failed to update behavior tree state file: ") + e.what();
+                return BuildError(outError);
+            }
+        }
+    }
+    const std::string now = GetCurrentTimestampStr();
+    record["taskId"] = toTaskId;
+    record["updatedAt"] = now;
+    record["rev"] = BumpRevLocked();
+    if (!directionStore_.Save(record, outError)) return BuildError(outError);
+    for (auto& [name, tq] : queues_) {
+        (void)name;
+        bool changed = false;
+        for (auto& job : tq.jobs) {
+            if (job.directionId != dirId) continue;
+            job.taskId = toTaskId;
+            MarkJobChangedLocked(job);
+            changed = true;
+        }
+        if (changed) SaveQueue(tq);
+    }
+    nlohmann::json extra = {{"directionId", dirId}, {"fromTaskId", fromTaskId}, {"taskId", toTaskId}};
+    const std::string text = "moved direction " + dirId + " from " + fromTaskId + " to " + toTaskId;
+    if (!fromTaskId.empty()) {
+        TaskLog(fromTaskId, "direction_moved", "", btId, text, "", &extra);
+    }
+    TaskLog(toTaskId, "direction_moved", "", btId, text, "", &extra);
+    auto refreshTaskState = [&](const std::string& taskId) {
+        nlohmann::json task;
+        if (taskId.empty() || !taskStore_.Get(taskId, task)) return;
+        const std::string oldState = task.value("state", std::string());
+        const std::string newState = TaskStateLocked(taskId).value("state", std::string());
+        if (newState.empty() || newState == oldState) return;
+        task["state"] = newState;
+        task["updatedAt"] = now;
+        task["rev"] = BumpRevLocked();
+        std::string saveErr;
+        taskStore_.Save(task, saveErr);
+    };
+    refreshTaskState(fromTaskId);
+    refreshTaskState(toTaskId);
+    return nlohmann::json{{"ok", true}, {"id", dirId}, {"taskId", toTaskId},
+                          {"fromTaskId", fromTaskId}}.dump();
 }
 
 std::string TaskQueueManager::DirectionPurgeOlderThan(int64_t olderThanSec, std::string& outError) {

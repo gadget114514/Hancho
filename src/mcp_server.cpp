@@ -603,7 +603,7 @@ int RunMcpServer() {
                 << "\"description\":\"Register one or more jobs in a task queue. Hancho decides execution order, timeouts, success checks and automatic retries. Each job must have a one-line English summary (Hancho translates it for display) and its own timeoutSec. Use dependsOn to chain jobs instead of shell '&&'. Optional suspendWhenDone/suspendDelaySec/suspendHibernate arm the PC to suspend after that job finishes and all other jobs and managed processes are idle.\","
                 << "\"inputSchema\":{\"type\":\"object\",\"properties\":{"
                 << "\"taskqueue\":{\"type\":\"string\",\"description\":\"Task queue name, e.g. 'main'\"},"
-                << "\"jobs\":{\"type\":\"array\",\"description\":\"Job objects: id, command, summary, timeoutSec (required); cwd, env, dependsOn (['id'] or [{id,on}]), idle {outputSec,cpuSec}, maxAttempts, retryDelaySec, success {exitCode,filesNewer,outputRegex,testReport (JUnit/NUnit XML path: newer than the attempt, >=1 test, none failed),contentFile+minBytes+contentRegex (one file such as a report must be newer, large enough and match the regex; a headings-only file is not success),engineResult (the engine's final result must not report an error even if the exit code is 0)}, killExclude, resources {write:[...],read:[...]} (paths/globs relative to cwd or @name locks; @name:{root} is one lock per git checkout/worktree of cwd, @name:{cwd} one per cwd; a bare file name such as Foo.cs means **/Foo.cs; jobs with overlapping write/write or write/read never run together, read/read may), defer {exitCodes,delaySec,limit} (default [75],60,60: an attempt exiting with one of exitCodes means nothing ran; the job is re-run after delaySec without using up maxAttempts; {exitCodes:[]} turns it off), priority, suspendWhenDone, suspendDelaySec, suspendHibernate, instructionsFile or instructionsText. Do not set hidden on jobs you register: it is reserved for Hancho's internal jobs and hides the row unless Show hidden tasks is on.\",\"items\":{\"type\":\"object\"}},"
+                << "\"jobs\":{\"type\":\"array\",\"description\":\"Job objects: id, command, summary, timeoutSec (required); cwd, env, dependsOn (['id'] or [{id,on}]), idle {outputSec,cpuSec}, maxAttempts, retryDelaySec, success {exitCode,filesNewer,outputRegex,testReport (JUnit/NUnit XML path: newer than the attempt, >=1 test, none failed),contentFile+contentRegex (one file such as a report must be newer and match the regex; a headings-only file is not success; contentRegex is required with contentFile unless contentFileOnly:true, which also takes minBytes for the file alone),engineResult (the engine's final result must not report an error even if the exit code is 0)}, killExclude, resources {write:[...],read:[...]} (paths/globs relative to cwd or @name locks; @name:{root} is one lock per git checkout/worktree of cwd, @name:{cwd} one per cwd; a bare file name such as Foo.cs means **/Foo.cs; jobs with overlapping write/write or write/read never run together, read/read may), defer {exitCodes,delaySec,limit} (default [75],60,60: an attempt exiting with one of exitCodes means nothing ran; the job is re-run after delaySec without using up maxAttempts; {exitCodes:[]} turns it off), priority, suspendWhenDone, suspendDelaySec, suspendHibernate, instructionsFile or instructionsText. Do not set hidden on jobs you register: it is reserved for Hancho's internal jobs and hides the row unless Show hidden tasks is on.\",\"items\":{\"type\":\"object\"}},"
                 << "\"concurrency\":{\"type\":\"integer\",\"description\":\"Max jobs running at the same time for this queue (default 1)\"},"
                 << "\"notifyFile\":{\"type\":\"string\",\"description\":\"Optional file updated on jobFailed / taskqueueStalled / taskqueueDrained\"},"
                 << "\"originLabel\":{\"type\":\"string\",\"description\":\"Optional short name for the work these jobs belong to (e.g. 'release v2.9.2'), shown in the dashboard's Origin column. Your session id and working folder are recorded automatically.\"},"
@@ -714,6 +714,14 @@ int RunMcpServer() {
                 << "\"approvalReason\":{\"type\":\"string\",\"description\":\"Why the model change was approved. Required with approvedBy\"},"
                 << "\"notes\":{\"type\":\"string\",\"description\":\"Review result / notes, writable even after the job finishes\"}"
                 << "},\"required\":[\"id\"]}"
+                << "},"
+                << "{"
+                << "\"name\":\"taskqueue_move\","
+                << "\"description\":\"Move a standalone job (one not managed by a behavior tree) into an open task. Only the task assignment changes: state, queue, dependencies and lineage stay the same. Use direction_move for BT-managed jobs.\","
+                << "\"inputSchema\":{\"type\":\"object\",\"properties\":{"
+                << "\"id\":{\"type\":\"string\",\"description\":\"Job id\"},"
+                << "\"task\":{\"type\":\"string\",\"description\":\"Target open task id\"}"
+                << "},\"required\":[\"id\",\"task\"]}"
                 << "},"
                 << "{"
                 << "\"name\":\"taskqueue_cancel\","
@@ -993,6 +1001,14 @@ int RunMcpServer() {
                 << "},\"required\":[\"taskId\",\"number\"]}"
                 << "},"
                 << "{"
+                << "\"name\":\"direction_move\","
+                << "\"description\":\"Move an existing direction (card or BT-backed) and its jobs to another open task. Running jobs move with it and the BT state file's taskId is updated. Implicit job:<id> directions cannot be moved.\","
+                << "\"inputSchema\":{\"type\":\"object\",\"properties\":{"
+                << "\"id\":{\"type\":\"string\",\"description\":\"Direction id (dir_..., direction:<id>) or card number\"},"
+                << "\"task\":{\"type\":\"string\",\"description\":\"Target task id (taskId/task_id also accepted)\"}"
+                << "},\"required\":[\"id\",\"task\"]}"
+                << "},"
+                << "{"
                 << "\"name\":\"direction_import\","
                 << "\"description\":\"Import task cards from a Markdown file into an active task (dryRun changes nothing).\","
                 << "\"inputSchema\":{\"type\":\"object\",\"properties\":{"
@@ -1041,6 +1057,16 @@ int RunMcpServer() {
                 << ",\"originLabel\":{\"type\":\"string\",\"description\":\"Optional short name shown as the Origin of the jobs this tree adds\"}"
                 << ",\"task\":{\"type\":\"string\",\"description\":\"Optional task id to attach this behavior tree and its jobs to (must exist and not be closed)\"}"
                 << "}}"
+                << "},"
+                << "{"
+                << "\"name\":\"bt_register\","
+                << "\"description\":\"Register a behavior tree as a planned direction under an existing open task without starting it or creating any jobs. Returns the tree id, directionId, taskId and state planned. A later bt_start with the same definition reuses the same direction.\","
+                << "\"inputSchema\":{\"type\":\"object\",\"properties\":{"
+                << "\"bt\":{\"type\":[\"object\",\"string\"],\"description\":\"Behavior tree definition object, or its JSON text\"},"
+                << "\"file\":{\"type\":\"string\",\"description\":\"Path to a behavior tree JSON file (alternative to bt)\"},"
+                << "\"task\":{\"type\":\"string\",\"description\":\"Open task id to attach the planned direction to (required; aliases taskId/task_id are accepted)\"},"
+                << "\"triage\":{\"type\":\"boolean\",\"description\":\"Create a triage card for the direction (default true; a triage field in the BT definition wins)\"}"
+                << "},\"required\":[\"task\"]}"
                 << "},"
                 << "{"
                 << "\"name\":\"bt_template\","
@@ -2091,6 +2117,16 @@ int RunMcpServer() {
                        << ",\"id\":\"" << JsonEscape(JsonGetString(argsJson, "id", "")) << "\""
                        << ",\"patch\":" << argsJson << "}";
             }
+            else if (toolName == "taskqueue_move") {
+                std::string id = JsonGetString(argsJson, "id", "");
+                if (id.empty()) id = JsonGetString(argsJson, "job", "");
+                std::string taskId = JsonGetString(argsJson, "task", "");
+                if (taskId.empty()) taskId = JsonGetString(argsJson, "taskId", "");
+                if (taskId.empty()) taskId = JsonGetString(argsJson, "task_id", "");
+                ipcReq << "{\"action\":\"taskqueue_move\""
+                       << ",\"id\":\"" << JsonEscape(id) << "\""
+                       << ",\"task\":\"" << JsonEscape(taskId) << "\"}";
+            }
             else if (toolName == "translate_get" || toolName == "translate_status" || toolName == "translate_clear") {
                 nlohmann::json translateReq = nlohmann::json::parse(argsJson, nullptr, false);
                 if (translateReq.is_discarded() || !translateReq.is_object()) translateReq = nlohmann::json::object();
@@ -2481,6 +2517,12 @@ int RunMcpServer() {
                     EmitLine(BuildMcpToolResult(rpcId, out.dump(), !out.value("ok", false)));
                     continue;
                 }
+                if (toolName == "direction_move" &&
+                    (!argsObj.contains("task") || !argsObj["task"].is_string() ||
+                     argsObj["task"].get<std::string>().empty())) {
+                    const std::string alt = argsObj.value("taskId", argsObj.value("task_id", std::string()));
+                    if (!alt.empty()) argsObj["task"] = alt;
+                }
                 argsObj["action"] = toolName;
                 if (toolName == "direction_add" || toolName == "direction_edit" ||
                     toolName == "direction_remove" || toolName == "direction_run" ||
@@ -2497,10 +2539,18 @@ int RunMcpServer() {
                     argsObj = nlohmann::json::object();
                 }
                 argsObj["action"] = toolName;
-                if (toolName == "bt_start") {
+                if (toolName == "bt_start" || toolName == "bt_register") {
                     std::string label = argsObj.value("originLabel", std::string());
                     argsObj.erase("originLabel");
                     argsObj["origin"] = nlohmann::json::parse(BuildCallerOriginJson(mcpClient, label), nullptr, false);
+                    if (toolName == "bt_register") {
+                        // The generic dispatcher forwards `task` as-is; normalise aliases here.
+                        if (!argsObj.contains("task") || !argsObj["task"].is_string() ||
+                            argsObj["task"].get<std::string>().empty()) {
+                            const std::string alt = argsObj.value("taskId", argsObj.value("task_id", std::string()));
+                            if (!alt.empty()) argsObj["task"] = alt;
+                        }
+                    }
                 }
                 if (argsObj.contains("file") && argsObj["file"].is_string()) {
                     std::string fileArg = argsObj["file"].get<std::string>();

@@ -116,6 +116,8 @@ hancho-cli.exe bt start --file plan.json
 hancho-cli.exe bt wait --id <btid> --timeout-ms 600000
 ```
 
+To prepare a direction without running it, register the standalone BT under an already open task: `hancho-cli.exe bt register --file plan.json --task <taskId>` (MCP `bt_register` with `bt` or `file`, plus `task`). This creates a planned direction on the task and no jobs; a later `bt start` with the same definition reuses that direction.
+
 ### 5. Suspend / shut down at night when finished
 
 ```powershell
@@ -150,7 +152,7 @@ When registering a job you can also add `"suspendWhenDone": true` / `"shutdownWh
 - **1 job = 1 command.** `&&`, `||`, `&`, PowerShell `;`, joining with newlines, and polling loops are forbidden (ChainGuard rejects them). Split them into separate jobs and connect them with `dependsOn`.
 - **`id` / `command` / `summary` (within 200 characters) / `timeoutSec` are required.** Timeouts are per job and are not added together.
 - **Write `summary` / `title` / cards / reasons in English (do not match the language of the conversation with the user).** Hancho translates them for display. A `summary` written in a language other than English gets a warning in the result.
-- **Do not fake success.** Hancho verifies with `success.exitCode` (default 0) and `filesNewer` / `outputRegex` / `testReport`. When exit 0 alone cannot guarantee the artifact, add `filesNewer`.
+- **Do not fake success.** Hancho verifies with `success.exitCode` (default 0) and `filesNewer` / `outputRegex` / `testReport` / `contentFile` + `contentRegex`. For a report, `contentFile` requires `contentRegex` (for example a completion marker); `contentFile` without `contentRegex` is refused unless `content_file_only: true`, which judges by the file alone. When exit 0 alone cannot guarantee the artifact, add `filesNewer`.
 - **Wait; do not poll.** Use `taskqueue wait` / `bt wait` / `wait_process`.
 - **Make routine work a routine. Do not write a BT every time.** Run a named BT with `routine run <name>`. A run is one direction under a task: pass `--task <id>` (MCP `routine_run`: `task`) to add it to an existing open task, or omit it and Hancho creates a new task (`Routine: <name>`) automatically. Only when it fails with `stale`, look at `routine show` and the differences, then fix it. If an LLM created it, always check the `routine ask` result with `routine show`, then approve it with the user's words via `routine approve` before running (a proposal is not executed until approved). If a person fixes it by hand, use `routine save --reason "..."` (saving without a reason is not allowed).
 - **Pausing does not fix the cause.** `taskqueue pause-job` / `taskqueue pause` / `bt pause` only stop execution (and the clock of locally running jobs). LLM response waits (`waitingForLlm`, rate limits, auth, provider outages, hangs) are not resolved by pausing. For an escalate, answer with `bt resume` or use `bt retry`. For an LLM-side failure, fix the cause and use `taskqueue retry`. If that is not possible, use `taskqueue cancel` / `bt cancel`. Resuming a paused running job continues the same request.
@@ -255,11 +257,14 @@ hancho-cli.exe direction edit 102-3 --task <taskId> --body-file card_v2.md   # o
 hancho-cli.exe direction run --ready --task <taskId>             # run cards whose dependencies are met (default --max 1)
 hancho-cli.exe direction run 102-3 --task <taskId>               # run only the specified card
 hancho-cli.exe direction redo 102-3 --task <taskId> --reason "Fix test" --run
+hancho-cli.exe direction move dir_12 --to <taskId>               # move a direction and its jobs to another open task
 hancho-cli.exe direction remove 102-3 --task <taskId>            # only while planned
 ```
 
+- `direction move` reassigns a direction (by id or card number) and every job in it to the target task. Running jobs move with it, the BT state file's `taskId` is updated, and both tasks log `direction_moved`. Implicit `job:<id>` directions cannot be moved.
+- `hancho-cli.exe taskqueue move <jobId> --to <taskId>` (MCP: `taskqueue_move` with `id` and `task`) puts a standalone job — one added without `--task`, or belonging to a different task — into an open task. The job's state, queue, dependencies, lineage and attempts are unchanged; only its task assignment changes. BT-managed jobs are rejected: use `direction move` for those. The target task logs `job_moved`; moving to the same task is a no-op.
 - A card is expanded into a BT (agent → build → test → fix loop on failure) by the `card` template (`hancho-cli.exe bt template card --json`). `build` / `test` / `engines` are filled in from `--params` or the task's `--card-defaults`.
-- MCP: `direction_add` / `direction_show` / `direction_list` / `direction_edit` / `direction_remove` / `direction_run` / `direction_redo` / `direction_import` / `direction_export` / `direction_translate` (plus `direction_close` / `direction_reopen` / `direction_purge`). There are no `card_*` tools.
+- MCP: `direction_add` / `direction_show` / `direction_list` / `direction_edit` / `direction_remove` / `direction_run` / `direction_redo` / `direction_move` / `direction_import` / `direction_export` / `direction_translate` (plus `direction_close` / `direction_reopen` / `direction_purge`). There are no `card_*` tools.
 - Batch import / export of Markdown card files: `direction import --task <taskId> --file doc/xxx-cards.md [--dry-run]`, `direction export --task <taskId> [--file <md>] [--lang <en|ja|es>]`. `--dry-run` checks the file without writing.
 - `direction translate --task <taskId> [--translate-cards <all|title|off>]` translates the non-English titles and bodies of the task's cards to English. `direction import` takes the same `--translate-cards` option.
 

@@ -728,6 +728,60 @@ int main() {
               "lineage: task state follows the planned head direction (open)");
     }
 
+    // bt_register: a standalone BT becomes a planned direction of an open task; nothing runs.
+    {
+        TestHarness h;
+        std::string err;
+        const json tc = json::parse(h.tqm.TaskCreate("register task", "", "", "", err, "{}"), nullptr, false);
+        Check(tc.value("ok", false), "register: TaskCreate succeeds");
+        const std::string taskId = tc.value("id", std::string());
+
+        json btDef = {
+            {"id", "bt-register-smoke"},
+            {"summary", "Register smoke"},
+            {"root", {
+                {"type", "job"},
+                {"id", "step1"},
+                {"summary", "echo step1"},
+                {"command", "cmd.exe /c echo REGISTER_SMOKE"},
+                {"timeoutSec", 30}
+            }}
+        };
+
+        const json reg = json::parse(h.btm->Register(btDef.dump(), taskId), nullptr, false);
+        Check(reg.value("ok", false) && reg.value("state", std::string()) == "planned" &&
+                  reg.value("taskId", std::string()) == taskId,
+              "register: returns ok with state=planned and the requested task id: " + reg.dump());
+        const std::string regDirId = reg.value("directionId", std::string());
+        Check(!regDirId.empty(), "register: returns a direction id");
+
+        nlohmann::json dirRec;
+        Check(h.tqm.DirectionGet(regDirId, dirRec) && dirRec.value("kind", std::string()) == "bt" &&
+                  dirRec.value("btId", std::string()) == "bt-register-smoke" &&
+                  dirRec.value("taskId", std::string()) == taskId,
+              "register: direction record carries btId and the task's id");
+        Check(h.tqm.DirectionState(regDirId).value("state", std::string()) == "planned",
+              "register: direction state is planned");
+        json persisted = json::parse(
+            ReadFileUtf8Wide(BtManager::GetBtStateFileWide("bt-register-smoke")), nullptr, false);
+        Check(!persisted.is_discarded() && persisted.value("state", std::string()) == "planned",
+              "register: persisted BT state file says planned");
+        json listed = json::parse(
+            h.tqm.TaskQueueList("", "", 0, err, "", "bt-register-smoke", true), nullptr, false);
+        Check(listed.value("ok", false) && listed.value("jobs", json::array()).empty(),
+              "register: no jobs were created");
+        Check(json::parse(h.btm->Get("bt-register-smoke"), nullptr, false)
+                  .value("state", std::string()) == "planned",
+              "register: bt_get reports the tree as planned");
+
+        json started = json::parse(h.btm->Start(btDef.dump()), nullptr, false);
+        Check(started.value("ok", false) && started.value("directionId", std::string()) == regDirId,
+              "register: starting the same tree reuses the planned direction");
+        Check(nlohmann::json::parse(h.btm->Wait("bt-register-smoke", 0, 15000), nullptr, false)
+                  .value("state", std::string()) == "succeeded",
+              "register: the reused direction runs to success");
+    }
+
     RemoveDirRecursive(tempDirW);
     std::printf("%s (%d passed, %d failures)\n", g_failures ? "FAILED" : "ALL PASSED", g_passes, g_failures);
     return g_failures ? 1 : 0;

@@ -1544,10 +1544,20 @@ int main() {
         ctJobs.push_back(makeStdoutJob("CT4", "ct-engine-error.src", {{"exitCode", 0}, {"engineResult", true}}));
         ctJobs.push_back(makeStdoutJob("CT5", "ct-engine-error.src", {{"exitCode", 0}, {"engineResult", false}}));
         ctJobs.push_back(makeStdoutJob("CT6", "ct-engine-ok.src", {{"exitCode", 0}, {"engineResult", true}}));
+        // CT7 opts into file-only judgement, so minBytes is the only content check.
         ctJobs.push_back(makeFileJob("CT7", "ct-small.src", "ct7.md",
-                                     {{"exitCode", 0}, {"contentFile", "ct7.md"}, {"minBytes", 1000}}));
+                                     {{"exitCode", 0}, {"contentFile", "ct7.md"}, {"minBytes", 1000},
+                                      {"contentFileOnly", true}}));
         std::string addCt = tqm.TaskQueueAdd("ctq", ctJobs.dump(), 0, "", err);
         Check(JsonGetBool(addCt, "ok", false), "content-check jobs added: " + err);
+        // contentFile without contentRegex is refused at registration unless contentFileOnly is set.
+        std::string addNoRegex = tqm.TaskQueueAdd("ctq",
+            nlohmann::json::array({makeFileJob("CT8", "ct-small.src", "ct8.md",
+                                               {{"exitCode", 0}, {"contentFile", "ct8.md"}})}).dump(),
+            0, "", err);
+        Check(!JsonGetBool(addNoRegex, "ok", true), "contentFile without contentRegex is refused");
+        Check(addNoRegex.find("content_regex") != std::string::npos || err.find("content_regex") != std::string::npos,
+              "refusal names content_regex");
         Check(WaitForState(tqm, "CT1", "failed", 20000), "CT1 failed: headings only");
         Check(WaitForState(tqm, "CT2", "succeeded", 20000), "CT2 succeeded: report ends with the marker");
         Check(WaitForState(tqm, "CT3", "failed", 20000), "CT3 failed: marker is not the last line");
@@ -5996,6 +6006,159 @@ int main() {
         Check(why1.size() >= 5 && sorted + 1 == why1.size(), "why: entries are sorted by kind/id/detail");
         tm.ShutdownTaskQueueManager();
         tm.SetProcessManager(nullptr);
+        SetDataDirectoryOverride(dir);
+    }
+
+    // DirectionMove: reassign a direction and its live jobs to another open task.
+    {
+        const std::wstring moveDir = PathJoinWide(dir, L"dir_move");
+        std::filesystem::remove_all(moveDir);
+        std::filesystem::create_directories(moveDir);
+        SetDataDirectoryOverride(moveDir);
+        ProcessManager movePm;
+        TaskQueueManager moveTm;
+        moveTm.SetProcessManager(&movePm);
+        std::string err;
+        const nlohmann::json ta = nlohmann::json::parse(
+            moveTm.TaskCreate("move task A", "", "task_move_a", "", err), nullptr, false);
+        const nlohmann::json tb = nlohmann::json::parse(
+            moveTm.TaskCreate("move task B", "", "task_move_b", "", err), nullptr, false);
+        Check(ta.value("ok", false) && tb.value("ok", false), "move: two open tasks created");
+        const nlohmann::json card = nlohmann::json::parse(
+            moveTm.CardAdd("task_move_a", "MV-1", "Move me", "body", {}, "", "{}", "{}", err),
+            nullptr, false);
+        const std::string dirId = card.value("directionId", std::string());
+        Check(card.value("ok", false) && !dirId.empty(), "move: card direction added to task A");
+        const std::string jobJson = R"({"id":"mv-job-1","summary":"move job","command":"cmd /c echo ok","timeout_sec":30,"max_attempts":1,"paused":true,"task_id":"task_move_a","direction_id":")" + dirId + "\"}";
+        const nlohmann::json addJob = nlohmann::json::parse(
+            moveTm.AddBtJob("mvq", jobJson, TaskQueueBtRef{"move-bt", "mv-node", 1}, err),
+            nullptr, false);
+        Check(addJob.value("ok", false), "move: live job attached to the direction");
+        auto containsDir = [](const nlohmann::json& list, const std::string& id) {
+            if (!list.is_object() || !list.contains("directions")) return false;
+            for (const auto& d : list["directions"]) {
+                if (d.value("id", std::string()) == id) return true;
+            }
+            return false;
+        };
+        const nlohmann::json moved = nlohmann::json::parse(
+            moveTm.DirectionMove(dirId, "task_move_b", err), nullptr, false);
+        Check(moved.value("ok", false) && moved.value("id", std::string()) == dirId &&
+                  moved.value("taskId", std::string()) == "task_move_b" &&
+                  moved.value("fromTaskId", std::string()) == "task_move_a",
+              "move: DirectionMove reports the old and new task ids");
+        const nlohmann::json listA = nlohmann::json::parse(
+            moveTm.DirectionList("task_move_a", "", 0, err), nullptr, false);
+        const nlohmann::json listB = nlohmann::json::parse(
+            moveTm.DirectionList("task_move_b", "", 0, err), nullptr, false);
+        Check(!containsDir(listA, dirId), "move: task A no longer lists the direction");
+        Check(containsDir(listB, dirId), "move: task B lists the direction");
+        const nlohmann::json job = ParseJobJson(moveTm.TaskQueueGet("mv-job-1", false, 0, err));
+        Check(job.value("task_id", std::string()) == "task_move_b" &&
+                  job.value("direction_id", std::string()) == dirId,
+              "move: the live job now belongs to task B with its lineage intact");
+        const nlohmann::json showA = nlohmann::json::parse(
+            moveTm.TaskShow("task_move_a", 50, err), nullptr, false);
+        const nlohmann::json showB = nlohmann::json::parse(
+            moveTm.TaskShow("task_move_b", 50, err), nullptr, false);
+        bool loggedOld = false, loggedNew = false;
+        for (const auto& entry : showA.value("log", nlohmann::json::array())) {
+            if (entry.value("kind", std::string()) == "direction_moved") loggedOld = true;
+        }
+        for (const auto& entry : showB.value("log", nlohmann::json::array())) {
+            if (entry.value("kind", std::string()) == "direction_moved") loggedNew = true;
+        }
+        Check(loggedOld && loggedNew, "move: both tasks log direction_moved");
+        const nlohmann::json again = nlohmann::json::parse(
+            moveTm.DirectionMove(dirId, "task_move_b", err), nullptr, false);
+        Check(again.value("ok", false) && again.value("unchanged", false),
+              "move: moving to the same task is a no-op");
+        moveTm.ShutdownTaskQueueManager();
+        moveTm.SetProcessManager(nullptr);
+        SetDataDirectoryOverride(dir);
+    }
+
+    // TaskQueueMoveToTask: reassign a standalone job to an open task.
+    {
+        const std::wstring jobMoveDir = PathJoinWide(dir, L"job_move");
+        std::filesystem::remove_all(jobMoveDir);
+        std::filesystem::create_directories(jobMoveDir);
+        SetDataDirectoryOverride(jobMoveDir);
+        ProcessManager jobMovePm;
+        TaskQueueManager jobMoveTm;
+        jobMoveTm.SetProcessManager(&jobMovePm);
+        std::string err;
+        const nlohmann::json target = nlohmann::json::parse(
+            jobMoveTm.TaskCreate("job move target", "", "task_job_move_target", "", err), nullptr, false);
+        Check(target.value("ok", false), "job move: target task created");
+        const std::string jobId = "jm-standalone-1";
+        const std::string jobs = R"([{"id":")" + jobId +
+                                 R"(","command":"cmd /c exit 0","summary":"standalone","timeout_sec":30,"max_attempts":1}])";
+        Check(JsonGetBool(jobMoveTm.TaskQueueAdd("jmq", jobs, 1, "", err), "ok", false),
+              "job move: standalone job added");
+        const nlohmann::json before = ParseJobJson(jobMoveTm.TaskQueueGet(jobId, false, 0, err));
+        Check(before.value("task_id", std::string()).empty(), "job move: standalone job has no task_id");
+        const std::string beforeState = before.value("state", std::string());
+        const std::string beforeQueue = before.value("taskqueue", std::string());
+        const size_t beforeAttempts = before.value("attempts", nlohmann::json::array()).size();
+
+        const nlohmann::json moved = nlohmann::json::parse(
+            jobMoveTm.TaskQueueMoveToTask(jobId, "task_job_move_target", err), nullptr, false);
+        Check(moved.value("ok", false) && moved.value("id", std::string()) == jobId &&
+                  moved.value("taskId", std::string()) == "task_job_move_target" &&
+                  moved.value("fromTaskId", std::string()).empty(),
+              "job move: response reports the old and new task ids");
+        const nlohmann::json after = ParseJobJson(jobMoveTm.TaskQueueGet(jobId, false, 0, err));
+        Check(after.value("task_id", std::string()) == "task_job_move_target",
+              "job move: taskqueue get reports the new task_id");
+        Check(after.value("state", std::string()) == beforeState &&
+                  after.value("taskqueue", std::string()) == beforeQueue &&
+                  after.value("attempts", nlohmann::json::array()).size() == beforeAttempts,
+              "job move: state, queue and attempts are unchanged");
+        const nlohmann::json show = nlohmann::json::parse(
+            jobMoveTm.TaskShow("task_job_move_target", 50, err), nullptr, false);
+        bool inTask = false;
+        for (const auto& j : show.value("jobs", nlohmann::json::array())) {
+            if (j.value("id", std::string()) == jobId) inTask = true;
+        }
+        Check(inTask, "job move: task show now lists the job");
+        bool logged = false;
+        for (const auto& e : show.value("log", nlohmann::json::array())) {
+            if (e.value("kind", std::string()) == "job_moved" && e.value("job", std::string()) == jobId) {
+                logged = true;
+            }
+        }
+        Check(logged, "job move: the target task logs job_moved");
+        const nlohmann::json oldImplicit = nlohmann::json::parse(
+            jobMoveTm.TaskQueueList("", "", 0, err, "", "", false, jobId), nullptr, false);
+        Check(oldImplicit.value("ok", false) &&
+                  oldImplicit.value("jobs", nlohmann::json::array()).empty(),
+              "job move: the old implicit task no longer contains the job");
+
+        const nlohmann::json again = nlohmann::json::parse(
+            jobMoveTm.TaskQueueMoveToTask(jobId, "task_job_move_target", err), nullptr, false);
+        Check(again.value("ok", false) && again.value("unchanged", false),
+              "job move: moving to the same task is a no-op");
+        const nlohmann::json unknown = nlohmann::json::parse(
+            jobMoveTm.TaskQueueMoveToTask(jobId, "task_job_move_missing", err), nullptr, false);
+        Check(!unknown.value("ok", true), "job move: unknown target task is rejected");
+        Check(nlohmann::json::parse(
+                  jobMoveTm.TaskCreate("job move closed", "", "task_job_move_closed", "", err),
+                  nullptr, false).value("ok", false), "job move: task to close created");
+        Check(JsonGetBool(jobMoveTm.TaskClose("task_job_move_closed", "succeeded", "done", err), "ok", false),
+              "job move: task closed");
+        const nlohmann::json closed = nlohmann::json::parse(
+            jobMoveTm.TaskQueueMoveToTask(jobId, "task_job_move_closed", err), nullptr, false);
+        Check(!closed.value("ok", true), "job move: closed target task is rejected");
+        const std::string btJob = R"({"id":"jm-bt-1","summary":"bt","command":"cmd /c exit 0","timeout_sec":30,"max_attempts":1})";
+        Check(JsonGetBool(jobMoveTm.AddBtJob("jmq", btJob, TaskQueueBtRef{"jm-bt", "node", 1}, err), "ok", false),
+              "job move: BT job added");
+        const nlohmann::json btMove = nlohmann::json::parse(
+            jobMoveTm.TaskQueueMoveToTask("jm-bt-1", "task_job_move_target", err), nullptr, false);
+        Check(!btMove.value("ok", true) && err.find("direction move") != std::string::npos,
+              "job move: BT jobs are rejected with a direction move hint");
+        jobMoveTm.ShutdownTaskQueueManager();
+        jobMoveTm.SetProcessManager(nullptr);
         SetDataDirectoryOverride(dir);
     }
 

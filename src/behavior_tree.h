@@ -37,6 +37,7 @@ struct BtJobSuccess {
     std::string contentFile;
     long long minBytes = 0;
     std::string contentRegex;
+    bool contentFileOnly = false;
     bool engineResult = false;
 };
 
@@ -364,6 +365,9 @@ public:
     const std::string& TaskId() const { return taskId_; }
     const std::string& DirectionId() const { return directionId_; }
     void SetDirectionId(const std::string& id) { directionId_ = id; }
+    // Marks a freshly registered tree as planned: it is persisted and visible, but no
+    // jobs are created until Start/Tick runs it.
+    void MarkPlanned(int64_t nowMs);
     const std::string& TaskQueueName() const { return taskqueue_; }
     const std::string& Cwd() const { return cwd_; }
     const std::string& NotifyFile() const { return notifyFile_; }

@@ -48,6 +48,7 @@ BT の末端ノード名を用語刷新に揃えました:
 - **`exec`**: 1 つの OS コマンドを実行（旧名・別名: `job`）。
 - **`agent`**: エンジン・モデル・自動切り替えを持つ LLM エージェントにタスクを委託（旧名・別名: `worker`）。
 - 決まった定型作業は名前付き**ルーチン**（`routine list/show/run/save/check/ask/approve/reject`）として保存し、LLM なしで一意の実行 ID で繰り返し実行できます。実行は必ず 1 つのタスクの下に 1 つの direction として載ります。`--task <id>`（MCP `routine_run` の `task`）を渡すと既存のオープンタスクに追加し、省略すると Hancho がタスクを自動生成します。詳しくは [ルーチン](doc/obsoleted/routines-ja.md)。
+- 単体の BT 定義は、実行せずに既存タスクの **planned の direction** として登録できます: `hancho-cli bt register --file plan.json --task <id>`（MCP `bt_register`）。ジョブは作られず、後で同じ定義で `bt start` すると同じ direction を再利用します。
 
 ### ダッシュボードと UI の強化
 
@@ -166,7 +167,11 @@ New-Item -ItemType Junction -Path .claude\skills\hancho -Target (Resolve-Path sk
 
 ## リリースノート
 
+### Unreleased
+- **報告ファイルの成功判定には内容の正規表現が必要**: `success.contentFile`（報告ファイル）には `success.contentRegex`（例: `<!-- hancho:report-complete -->` マーカー）が必須になりました。存在と更新時刻だけでは合格しません。ファイルだけで判定するときは `success.contentFileOnly`（JSON は `content_file_only`）を `true` にします。このルールに反するジョブは、BT パーサとタスクキューの登録時に拒否され、この変更より前に登録されたジョブは実行時に失敗します。
+
 ### v0.10.3
+- **単体 BT をタスクの direction として登録**: `hancho-cli bt register --file <bt.json> --task <id>`（MCP `bt_register`）で、BT を起動せずジョブも作らず、オープン中のタスクに planned の direction を追加できます。後で同じ定義で `bt start` すると同じ direction を再利用します。
 - **タスク一覧の表示範囲を設定可能に**: 設定ダイアログで完了済み項目数を `finished_limit` と明示し、表示日数（`task_list_display_days`、1 以上、既定 2）を数値で指定できるようにしました。「最近のタスクを保持する」窓を固定の昨日ではなくこの値にします。
 - **タスク一覧の行の点滅を修正**: 「昨日・今日を保持」する判定に必要な完了済みタスク／ジョブを全件取得（`finished_limit: 0`）するようにし、直近 30 件の窓がずれることで行が出たり消えたりしなくなりました。
 - **タスクが open な理由のカード**: `task show <id> --why` とダッシュボードの「なぜ open か」ダイアログが、構造化されたブロッカー（planned/open の direction、カードの依存待ち、blocked/pending/waitingForPermit/waitingForLlm のジョブ、置き換えられた run、BT の escalate）を列挙します。LLM は呼ばず、`--json`、MCP `task_show`、`task_wait` の `why` 配列にも同じ一覧が入ります。`task_` の id は `taskId`、それ以外は `jobId` として表示します。

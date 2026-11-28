@@ -348,11 +348,17 @@ std::string BtManager::Start(const std::string& jsonTextIn, bool paused, bool tr
     }
 
     const std::string btId = tree->Id();
+    // A tree registered earlier with bt_register already owns a direction. Starting it must
+    // promote that planned direction instead of creating a second one.
+    std::string registeredDirectionId;
     auto existing = trees_.find(btId);
     if (existing != trees_.end() && existing->second && existing->second->tree) {
         const std::string st = existing->second->tree->State();
         if (st == "running" || st == "waitingForLlm" || st == "paused") {
             return MakeErrorJson("behavior tree '" + btId + "' is already active");
+        }
+        if (st == "planned" && !existing->second->tree->DirectionId().empty()) {
+            registeredDirectionId = existing->second->tree->DirectionId();
         }
     }
 
@@ -367,7 +373,9 @@ std::string BtManager::Start(const std::string& jsonTextIn, bool paused, bool tr
     std::string dirId;
     std::string dirErr;
     const std::string btTitle = tree->Summary().empty() ? btId : tree->Summary();
-    if (!tqm_.EnsureBtDirection(btId, tree->DirectionId(), tree->TaskId(), btTitle,
+    const std::string dirToReuse =
+        registeredDirectionId.empty() ? tree->DirectionId() : registeredDirectionId;
+    if (!tqm_.EnsureBtDirection(btId, dirToReuse, tree->TaskId(), btTitle,
                                 tqm_.BtOriginJson(btId), dirId, dirErr, effTriage)) {
         return MakeErrorJson(dirErr);
     }
@@ -393,6 +401,100 @@ std::string BtManager::Start(const std::string& jsonTextIn, bool paused, bool tr
 
     PersistEntryLocked(*entryPtr);
     json resp = BuildTreeResponseJson(*entryPtr->tree, TreeView::Summary);
+    json warningArray = json::array();
+    for (const auto& w : warnings) {
+        json wj{{"path", w.path}, {"code", w.code},
+                {"message", w.message}, {"suggestion", w.suggestion}};
+        if (!w.alias.empty()) wj["alias"] = w.alias;
+        warningArray.push_back(std::move(wj));
+    }
+    resp["warnings"] = std::move(warningArray);
+    return resp.dump();
+}
+
+std::string BtManager::Register(const std::string& jsonTextIn, const std::string& taskId,
+                                bool triage) {
+    std::string err;
+    std::lock_guard<std::mutex> lock(mutex_);
+
+    if (taskId.empty()) {
+        return MakeErrorJson("bt_register requires a task id");
+    }
+    nlohmann::json taskRec;
+    if (!tqm_.TaskGet(taskId, taskRec)) {
+        return MakeErrorJson("task not found: " + taskId);
+    }
+    if (tqm_.TaskState(taskId).value("state", std::string()) == "closed") {
+        return MakeErrorJson("task '" + taskId + "' is closed");
+    }
+    if (!tqm_.ValidateTaskActive(taskId, err)) {
+        return MakeErrorJson(err);
+    }
+
+    json def = json::parse(jsonTextIn, nullptr, false);
+    if (!def.is_object()) {
+        return MakeErrorJson("BT definition must be a JSON object");
+    }
+    def["taskId"] = taskId;
+    const std::string jsonText = def.dump();
+
+    std::vector<std::string> lintErrors;
+    std::vector<BtWarning> warnings;
+    BehaviorTree::ValidateJson(jsonText, this, lintErrors, warnings);
+    if (!lintErrors.empty()) {
+        return MakeErrorJson(lintErrors.front());
+    }
+
+    auto tree = std::make_unique<BehaviorTree>();
+    if (!tree->LoadDefinition(jsonText, this, err)) {
+        return MakeErrorJson(err);
+    }
+
+    const std::string btId = tree->Id();
+    auto existing = trees_.find(btId);
+    if (existing != trees_.end() && existing->second && existing->second->tree) {
+        const std::string st = existing->second->tree->State();
+        if (st == "running" || st == "waitingForLlm" || st == "paused") {
+            return MakeErrorJson("behavior tree '" + btId + "' is already active");
+        }
+    }
+
+    bool effTriage = triage;
+    if (effTriage && def.contains("triage") && def["triage"].is_boolean()) {
+        effTriage = def["triage"].get<bool>();
+    }
+
+    std::string dirId;
+    std::string dirErr;
+    const std::string btTitle = tree->Summary().empty() ? btId : tree->Summary();
+    if (!tqm_.EnsureBtDirection(btId, tree->DirectionId(), taskId, btTitle,
+                                tqm_.BtOriginJson(btId), dirId, dirErr, effTriage)) {
+        return MakeErrorJson(dirErr);
+    }
+    tree->SetDirectionId(dirId);
+
+    tree->SetJobRunner(this);
+    tree->SetProber(this);
+    tree->SetEngineHealth(this);
+    tree->MarkPlanned(NowEpochMs());
+
+    RemoveFileWide(GetBtEventsFileWide(btId));
+    auto entry = std::make_unique<TreeEntry>();
+    entry->tree = std::move(tree);
+    TreeEntry* entryPtr = entry.get();
+    trees_[btId] = std::move(entry);
+
+    // Persist a planned state (no Start/Tick, no jobs) and make the direction reflect it.
+    tqm_.SetDirectionBtState(btId, "planned", "");
+    PersistEntryLocked(*entryPtr);
+
+    json resp = {
+        {"ok", true},
+        {"id", btId},
+        {"directionId", dirId},
+        {"taskId", taskId},
+        {"state", "planned"}
+    };
     json warningArray = json::array();
     for (const auto& w : warnings) {
         json wj{{"path", w.path}, {"code", w.code},

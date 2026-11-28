@@ -565,7 +565,7 @@ inline std::vector<TaskDisplayRow> BuildTaskDisplayRows(
         return out;
     }
 
-    // Sort tasks by state rank, then newest timestamp descending.
+    // Sort tasks newest first; virtual BT rows still sort after real tasks.
     // Pure virtual BT/btplan rows (no task record and virtual id) sort after tasks.
     std::stable_sort(taskOrder.begin(), taskOrder.end(), [&](const std::string& aId, const std::string& bId) {
         const TaskMeta& a = taskMap[aId];
@@ -573,9 +573,6 @@ inline std::vector<TaskDisplayRow> BuildTaskDisplayRows(
         const bool aVirt = !a.hasRecord && IsVirtualTaskRowId(a.id);
         const bool bVirt = !b.hasRecord && IsVirtualTaskRowId(b.id);
         if (aVirt != bVirt) return !aVirt;
-        const int ra = TaskStateSortRank(a.state);
-        const int rb = TaskStateSortRank(b.state);
-        if (ra != rb) return ra < rb;
         if (a.sortTs != b.sortTs) return a.sortTs > b.sortTs;
         return a.id < b.id;
     });
