@@ -1,5 +1,5 @@
 cmake_minimum_required(VERSION 3.20)
-project(Hancho VERSION 0.10.3 LANGUAGES CXX)
+project(Hancho VERSION 0.10.4 LANGUAGES CXX)
 
 set(CMAKE_CXX_STANDARD 20)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
@@ -31,10 +31,10 @@ set(PC_VERSION_DEFINITIONS
     PC_VERSION_PATCH=${PROJECT_VERSION_PATCH}
 )
 
-option(HANCHO_BUILD_DEMO "Build demo mode and deterministic dummy LLM test targets (not shipped)" OFF)
-if(HANCHO_BUILD_DEMO)
-    add_compile_definitions(HANCHO_DEMO_BUILD)
-endif()
+option(HANCHO_BUILD_DEMO "Build the C++ dummy LLM (hancho-dummy) and demo_smoke test targets" OFF)
+# Demo mode code is compiled into every build, including the release binaries.
+# It stays inert unless --demo, --demo-now or HANCHO_DEMO=1 is given (see doc/demo.md).
+add_compile_definitions(HANCHO_DEMO_BUILD)
 
 
 if(WIN32)
@@ -120,9 +120,7 @@ set(HANCHO_SOURCES
     ${WCSP_SOURCES}
 )
 
-if(HANCHO_BUILD_DEMO)
-    list(APPEND HANCHO_SOURCES src/demo.cpp)
-endif()
+list(APPEND HANCHO_SOURCES src/demo.cpp)
 
 # The program code is compiled once and linked into both the main Hancho binary
 # and the Chat binary. Only the embedded app icon differs (HanchoChat.exe uses
@@ -250,9 +248,7 @@ add_executable(hancho-cli
     src/agent_template.rc
 )
 
-if(HANCHO_BUILD_DEMO)
-    target_sources(hancho-cli PRIVATE src/demo.cpp)
-endif()
+target_sources(hancho-cli PRIVATE src/demo.cpp)
 
 # Rebuild the embedded template when hancho-runner.md changes.
 set_source_files_properties(src/agent_template.rc PROPERTIES

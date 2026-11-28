@@ -1,0 +1,205 @@
+{
+  "content": [
+    {
+      "json": {
+        "cards": [
+          {
+            "advice": {
+              "adviceId": "triage-dir_1-1",
+              "at": "2026-11-21 15:00:00",
+              "candidateId": "retry",
+              "caution": "",
+              "confidence": "high",
+              "infoNeeded": "",
+              "jobId": "",
+              "rationale": "The dummy advisor always prefers retry when it is offered.",
+              "source": "llm",
+              "summary": "Demo advice for : choose retry"
+            },
+            "adviceState": "done",
+            "candidates": [
+              {
+                "effect": "Retry every failed job in this direction, or retry the behavior tree.",
+                "id": "retry",
+                "label": "Retry direction",
+                "params": {
+                  "directionId": "dir_1",
+                  "failedJobIds": [
+                    "regress-fail"
+                  ]
+                },
+                "safe": true
+              },
+              {
+                "effect": "Create a superseding direction in this task with changed instructions.",
+                "id": "redo",
+                "label": "Rescue with changes",
+                "params": {
+                  "directionId": "dir_1",
+                  "maxHops": 2
+                },
+                "safe": false
+              },
+              {
+                "effect": "Record that this direction needs no action.",
+                "id": "ignore",
+                "label": "Ignore",
+                "params": {},
+                "safe": false
+              },
+              {
+                "effect": "Confirm that this direction was reviewed.",
+                "id": "ack",
+                "label": "Acknowledge",
+                "params": {},
+                "safe": false
+              }
+            ],
+            "createdAt": "2026-11-21 15:00:00",
+            "decision": null,
+            "flags": {
+              "directionId": "dir_1",
+              "directionKind": "jobs",
+              "needsHuman": false,
+              "timeoutPattern": ""
+            },
+            "id": "dir_1",
+            "info": {
+              "background": [
+                {
+                  "k": "directionKind",
+                  "text": "direction kind: jobs",
+                  "v": "jobs"
+                },
+                {
+                  "k": "directionTitle",
+                  "text": "title: failing job",
+                  "v": "failing job"
+                }
+              ],
+              "cause": [
+                {
+                  "k": "failedCount",
+                  "text": "failed jobs in direction: 1",
+                  "v": 1
+                },
+                {
+                  "k": "failedJob",
+                  "text": "failed job regress-fail (exit_nonzero): failing job",
+                  "v": {
+                    "exitCode": 1,
+                    "failureClass": "exit_nonzero",
+                    "id": "regress-fail",
+                    "logExcerpt": "================================================================================\n[Hancho] Process Exited (failed)\nExit Code   : 1\nEnd Time    : 2026-11-21 15:00:00\nUptime      : <t> (<t>s)\nDone File   : <data>\\proc_3.done\n================================================================================",
+                    "summary": "failing job"
+                  }
+                },
+                {
+                  "k": "failedJobs",
+                  "text": "failed jobs: [{\"exitCode\":1,\"failureClass\":\"exit_nonzero\",\"id\":\"regress-fail\",\"logExcerpt\":\"================================================================================\\n[Hancho] Process Exited (failed)\\nExit Code   : 1\\nEnd Time    : 2026-11-21 15:00:00\\nUptime      : <t> (<t>s)\\nDone File   : C:\\\\Users\\\\bluen\\\\AppData\\\\Local\\\\Temp\\\\hancho-regress-<run>\\\\data\\\\proc_3.done\\n================================================================================\",\"summary\":\"failing job\"}]",
+                  "v": [
+                    {
+                      "exitCode": 1,
+                      "failureClass": "exit_nonzero",
+                      "id": "regress-fail",
+                      "logExcerpt": "================================================================================\n[Hancho] Process Exited (failed)\nExit Code   : 1\nEnd Time    : 2026-11-21 15:00:00\nUptime      : <t> (<t>s)\nDone File   : <data>\\proc_3.done\n================================================================================",
+                      "summary": "failing job"
+                    }
+                  ]
+                }
+              ],
+              "conditions": [
+                {
+                  "k": "directionState",
+                  "text": "direction state: failed",
+                  "v": "failed"
+                }
+              ],
+              "environment": [
+                {
+                  "k": "queue",
+                  "text": "queue: regress",
+                  "v": "regress"
+                }
+              ],
+              "intent": [
+                {
+                  "k": "summary",
+                  "text": "failing job",
+                  "v": "failing job"
+                },
+                {
+                  "k": "direction",
+                  "text": "direction dir_1 (jobs)",
+                  "v": {
+                    "id": "dir_1",
+                    "kind": "jobs"
+                  }
+                }
+              ],
+              "reason": [
+                {
+                  "k": "directionFailure",
+                  "text": "direction dir_1 ended in failure; decide whether to retry, rescue or ignore it.",
+                  "v": "dir_1"
+                },
+                {
+                  "k": "recommendationRationale",
+                  "text": "recommendation: retry the failed jobs in this direction before changing its specification.",
+                  "v": {
+                    "key": "directionRetry",
+                    "params": {}
+                  }
+                }
+              ]
+            },
+            "key": "dir:dir_1",
+            "kind": "direction_failure",
+            "lifecycle": "pending",
+            "recommendation": {
+              "candidateId": "retry",
+              "confidence": "high",
+              "rationale": "The direction ended in failure; retrying its failed jobs is the safest first step.",
+              "rationaleKey": "directionRetry",
+              "rationaleParams": {},
+              "source": "hancho"
+            },
+            "state": "pending",
+            "target": {
+              "directionId": "dir_1",
+              "directionKind": "jobs",
+              "failedCount": 1,
+              "failedJobIds": [
+                "regress-fail"
+              ],
+              "maxHops": 2,
+              "queue": "regress"
+            },
+            "updatedAt": "2026-11-21 15:00:00"
+          }
+        ],
+        "counts": {
+          "acted": 0,
+          "autoUnreviewed": 0,
+          "done": 0,
+          "followUp": 0,
+          "handling": 0,
+          "ignored": 0,
+          "open": 1,
+          "pendingOther": 0,
+          "pendingProcess": 0,
+          "pendingTask": 1,
+          "resolved": 0,
+          "running": 0,
+          "waitingBranch": 0,
+          "waitingNext": 0,
+          "withSupervisor": 0
+        },
+        "jobs": {},
+        "llmMode": "always",
+        "mode": "manual",
+        "ok": true
+      }
+    }
+  ]
+}

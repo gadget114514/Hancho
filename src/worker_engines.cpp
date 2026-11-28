@@ -237,18 +237,19 @@ void WorkerEngineRegistry::ResetToBuiltins() {
     codex.advicePermissionArgs = "--sandbox read-only";
     engines_["codex"] = std::move(codex);
 
-#ifdef HANCHO_DEMO_BUILD
-    WorkerEngineDef dummy;
-    dummy.command = "{dummy} --scenario mixed --seed 1";
-    dummy.defaultModel = "demo-model";
-    dummy.stream = "claude";
-    dummy.models.push_back("demo-model");
-    dummy.capabilities.jsonStream = true;
-    dummy.capabilities.reportsUsage = true;
-    dummy.capabilities.reportsSubagents = true;
-    engines_["dummy"] = std::move(dummy);
-    defaultEngine_ = "dummy";
-#endif
+    // The dummy engine exists only in demo mode, so normal runs never see it.
+    if (IsDemoMode()) {
+        WorkerEngineDef dummy;
+        dummy.command = "{dummy} --scenario mixed --seed 1";
+        dummy.defaultModel = "demo-model";
+        dummy.stream = "claude";
+        dummy.models.push_back("demo-model");
+        dummy.capabilities.jsonStream = true;
+        dummy.capabilities.reportsUsage = true;
+        dummy.capabilities.reportsSubagents = true;
+        engines_["dummy"] = std::move(dummy);
+        defaultEngine_ = "dummy";
+    }
 }
 
 bool WorkerEngineRegistry::LoadFromJson(const std::string& jsonText, std::string& err) {

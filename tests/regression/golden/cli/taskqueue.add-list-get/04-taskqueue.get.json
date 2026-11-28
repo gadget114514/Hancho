@@ -1,0 +1,100 @@
+{
+  "job": {
+    "attempts": [
+      {
+        "check_detail": "ok",
+        "end": "2026-11-21 15:00:00",
+        "exit_code": 0,
+        "instructions_rev": 1,
+        "last_lines_file": "<data>\\taskqueue\\regress-a.1.tail.txt",
+        "n": 1,
+        "reason": "ok",
+        "start": "2026-11-21 15:00:00"
+      }
+    ],
+    "blocked_by": null,
+    "command": "<dummy> --scenario usage --seed 1",
+    "created_at": "2026-11-21 15:00:00",
+    "cwd": "<data>",
+    "defer": {
+      "delay_sec": 60,
+      "exit_codes": [
+        75
+      ],
+      "limit": 60
+    },
+    "depends_on": [],
+    "direction_id": "dir_1",
+    "engine_switch": true,
+    "env": {},
+    "estimate_sec": 0,
+    "hidden": false,
+    "host": "",
+    "id": "regress-a",
+    "idle": {
+      "cpu_sec": 0,
+      "first_event_sec": 0,
+      "output_sec": 0
+    },
+    "instructions": {
+      "captured_at": "2026-11-21 15:00:00",
+      "sha256": "",
+      "source": "",
+      "text": ""
+    },
+    "kill_exclude": [],
+    "max_attempts": 1,
+    "memory": {
+      "budget_chars": 1500,
+      "include_agent_notes": true,
+      "inject": false,
+      "scopes": []
+    },
+    "name": "regress-a",
+    "needs": [],
+    "notes": "",
+    "on_permission_denied": "",
+    "origin": {
+      "client": "hancho-cli-cli",
+      "cwd": "<cwd>",
+      "host_session": "local_2c189257-4a94-478f-a699-1aa7f0efc54b",
+      "label": "",
+      "pid": 27020,
+      "session": "965dfb57-0017-4c6a-a697-c62f72d154d4"
+    },
+    "paused": false,
+    "permission_resume_count": 0,
+    "permission_resume_limit": 2,
+    "priority": 0,
+    "repeatedFailures": 0,
+    "resources": {
+      "read": [],
+      "write": []
+    },
+    "resume_session": "",
+    "retry_delay_sec": 0,
+    "shutdown_delay_sec": 0,
+    "shutdown_when_done": false,
+    "state": "succeeded",
+    "success": {
+      "exit_code": 0,
+      "files_newer": [],
+      "output_regex": null
+    },
+    "summary": "fixed job a",
+    "suspend_delay_sec": 0,
+    "suspend_hibernate": false,
+    "suspend_when_done": false,
+    "task": {
+      "id": "regress-a",
+      "state": "succeeded"
+    },
+    "taskqueue": "regress",
+    "timeout_sec": 60,
+    "updated_at": "2026-11-21 15:00:00",
+    "wait_permits": []
+  },
+  "ok": true,
+  "source_changed": false,
+  "source_missing": false
+}

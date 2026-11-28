@@ -1,0 +1,56 @@
+{
+  "id": "triage.failed-job-advice",
+  "description": "A job fails. The triage card gets an advice run that uses the Python dummy advisor, and the card and its advice are read back.",
+  "covers": {
+    "core": ["taskqueue_add", "taskqueue_wait", "triage_list", "triage_get"],
+    "cli": ["taskqueue add", "taskqueue wait", "triage list", "triage show"],
+    "mcp": ["taskqueue_add", "taskqueue_wait", "triage_list", "triage_get"]
+  },
+  "layers": ["core", "cli", "mcp-claude", "mcp-opencode"],
+  "setup": {
+    "demo": true,
+    "now": "2026-11-21 15:00:00",
+    "wait_budget_s": 120,
+    "files": {
+      "config.json": {
+        "triage_mode": "manual",
+        "triage_llm_mode": "always",
+        "triage_llm_engine": "triage-dummy"
+      },
+      "engines.json": {
+        "engines": {
+          "triage-dummy": {
+            "command": "{dummy} --scenario triage {prompt}",
+            "stream": "claude",
+            "defaultModel": "demo-model"
+          }
+        }
+      }
+    }
+  },
+  "vars": {
+    "queue": "regress",
+    "triage": true,
+    "id": "regress-fail",
+    "timeout_ms": 60000,
+    "jobs": [
+      {
+        "id": "regress-fail",
+        "summary": "failing job",
+        "command": "{dummy} --scenario fail --seed 1",
+        "cwd": "{data}",
+        "timeoutSec": 60,
+        "maxAttempts": 1
+      }
+    ]
+  },
+  "operations": [
+    {"op": "taskqueue.add", "expect": "ok", "keep": false},
+    {"op": "taskqueue.wait", "expect": "ok", "keep": false},
+    {"op": "triage.list", "until": "advice", "keep": false},
+    {"op": "triage.list", "expect": "ok", "keep": true, "capture": {"card_id": {"list": "cards", "where": {"target.failedJobIds": "{id}"}, "field": "id"}}},
+    {"op": "triage.get", "expect": "ok", "keep": true}
+  ],
+  "normalize": ["paths"],
+  "drop_keys": ["rev", "process_id"]
+}

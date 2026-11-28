@@ -1,6 +1,6 @@
 # Plan: regression tests for hancho-cli, MCP, and the core
 
-Status: design approved (including demo options in the release binary, section 4). Implementation not started.
+Status: design approved (including demo options in the release binary, section 4). P0, P1 and the triage slice are done (sections 13, 14 and 15). Next: triage disable for all scenarios, cross-layer check, and the rest of the phases.
 
 This is the first slice of [regression-test-plan.md](regression-test-plan.md). That document covers every feature of Hancho. This one covers the three surfaces that users and agents call: hancho-cli, MCP, and the core. GUI, WebUI, chat (ipmsg), terminal server, `wct`, and the installer are out of scope for now.
 
@@ -128,7 +128,7 @@ Three inventories are generated from the source:
 | :--- | :--- | :--- |
 | L1 core | Action names dispatched in `src/ipc_server.cpp` | Dozens |
 | L2 cli | Command groups in `src/cli.cpp` / `src/cli_top.h` | About 20 groups |
-| L3 mcp | `tools/list` from the running `Hancho.exe mcp` | About 87 tools (counted from `src/cli.cpp`, to be confirmed in P0) |
+| L3 mcp | `tools/list` from the running `Hancho.exe mcp` | 124 tools (confirmed in P0) |
 
 Every item must have a scenario at its layer, or a reason in `not-covered.txt`. `run.py coverage` prints the gaps and CI fails on unexplained gaps.
 
@@ -201,3 +201,96 @@ Each phase ends with: scenarios of the phase pass on `build\Release`, goldens re
 
 1. Done: the demo option may be compiled into the release binary (inert unless set), approved.
 2. Confirm the first slice's operations beyond `taskqueue.add-list-get`. Suggested: `taskqueue.retry`, `bt.validate`, `direction.add-show`.
+
+## 13. P0 audit result (2026-11-28)
+
+Build: `build\Release` (`Hancho.exe`, `hancho-cli.exe` 0.10.3). The demo code is compiled into both, `--dummy-llm` is added, and the `dummy` engine is registered only in demo mode.
+
+Determinism checks, two runs each, fresh data directories, `--demo` with `now` = `2026-11-21 15:00:00`:
+
+| Layer | Operations | Result |
+| :--- | :--- | :--- |
+| L2 cli | `demo prepare`, `demo status`, `taskqueue list`, `taskqueue get demo-finalize`, `usage stats --since 24h`, `usage stats --since 30d` | All six outputs byte-identical |
+| L3 mcp | `initialize`, `tools/list`, `tools/call taskqueue_list`, `tools/call usage_stats` over stdio | stdout byte-identical after replacing the data directory path |
+| L1 core | Raw IPC | Not audited yet. The pipe framing and the data-directory tag are checked in P1. |
+
+Findings:
+
+1. `tools/list` returns 124 tools. The earlier estimate of 87 was wrong.
+2. Job commands contain the absolute path of `hancho-dummy.exe` (`D:\wsgit\Hancho\build\Release\hancho-dummy.exe`). The normalizer must replace it with `<bin>`. The file is not built by `cmake --build build --target Hancho hancho-cli`, so the Python dummy from P1 is needed for the regression runs.
+3. Without `--data-dir`, `hancho-cli` warns `multiple Hancho cores are running; pass --data-dir explicitly` and falls back to the project's `.hancho`. The runner must pass `--data-dir` on every call.
+4. `hancho-cli` has no `quit` subcommand. Use `Hancho.exe quit --data-dir <dir>`.
+5. Timestamps in these outputs come from the pinned clock, so no timing normalizer was needed for these operations.
+
+## 14. P1 result (2026-11-28)
+
+Implemented in `tests/regression/`:
+
+| File | Role |
+| :--- | :--- |
+| `run.py` / `run.cmd` | Runner (Python 3, standard library only). Commands: `run`, `check <scenario>`, `record`. |
+| `dummy_llm.py` / `dummy_llm.cmd` | Python dummy LLM (stream-json style, deterministic for the same `--scenario` and `--seed`). |
+| `op-map.json` | Maps each abstract operation to the L1 action, the L2 argv, and the L3 MCP tool. |
+| `scenarios/taskqueue/add-list-get.json` | First scenario. Layers: core, cli, mcp-claude, mcp-opencode. |
+| `golden/<layer>/<scenario>/<step>.json` | Recorded observations (10 files). |
+
+How the layers run:
+
+- Every layer starts its own headless core with `--headless --demo --demo-now <now> --dummy-llm tests/regression/dummy_llm.cmd` and stops it with `Hancho.exe quit`. The core is found through its active-core record (`dataDir`).
+- L1 talks to the core's named pipe directly (ctypes). The request is plain JSON and the reply is plain JSON. One message per connection.
+- L2 runs `hancho-cli.exe --json --data-dir <data> ...`.
+- L3 writes the MCP entry with `hancho-cli.exe mcp install --client claude` (or `opencode`) in a temp directory, starts the command it names, and keeps the stdio session open for the whole scenario. The golden of `tools/list` is stored as step `00-tools-list`.
+- `taskqueue.wait` is not recorded. The runner calls `taskqueue_wait` repeatedly, passing the version from the previous reply, until every job is in a terminal state. This was needed because `taskqueue_wait` returns when the queue version changes, not when a job finishes.
+
+Results:
+
+- `run` passed three times in a row on `build\Release`, with `failures=0 errors=0`.
+- A deliberate change (`--seed 1` to `--seed 2` in the scenario) was reported as a diff in the `command` field, then reverted.
+
+Findings during P1:
+
+1. `rev` (revision counter) differs between runs. It counts every change in the core, including the background demo queue. It is dropped with the scenario's `drop_keys`. This is the only volatile field found in these outputs.
+2. `Hancho.exe --headless` starts the real core as a detached process and returns at once. The runner therefore identifies the core by its active-core record, not by the process it started.
+3. Demo queue jobs run in the background once the core starts. With the dummy missing (the default `hancho-dummy.exe` was not built into `build\Release`), a job failed and the triage LLM was started (`agy.exe`). The runner passes `--dummy-llm`, so demo jobs succeed. **Triage must also be disabled or pointed at the dummy in regression runs.** This is not done yet.
+4. The first `taskqueue wait` on a fresh queue returns at once. Waiting for a terminal state must loop on `wait`, not call it once.
+
+Not done in P1:
+
+- Cross-layer comparison (checking that L1, L2 and L3 agree on the same operation). Each layer is compared only with its own golden.
+- `coverage` command and the inventory (P6).
+- Triage disable (finding 3).
+- Clean-up of the core if the runner fails during startup (the detached core keeps running).
+
+## 15. Triage slice (2026-11-28)
+
+Scenario `scenarios/triage/failed-job-advice.json`: a job fails, the triage card gets an advice run that uses the Python dummy, and the card and its advice are read back. Layers: core, cli, mcp-claude, mcp-opencode.
+
+Configuration in the scenario (`setup.files`):
+
+- `config.json`: `triage_mode: "manual"`, `triage_llm_mode: "always"`, `triage_llm_engine: "triage-dummy"`.
+- `engines.json`: engine `triage-dummy` runs `{dummy} --scenario triage {prompt}`.
+
+Why these settings:
+
+- `triage_llm_engine` is pinned to the dummy, so a regression run never starts a real agent for triage.
+- `triage_mode: "manual"`: with `semi`, the safe candidate `retry` was applied automatically. That started a second attempt of the job and changed the card, so the observation depended on automatic decisions. `manual` keeps the card pending until the advice is read.
+- The card is a **direction** card (`id` = direction id, `kind` = `direction_failure`), not a job card. The runner selects it with `capture` `{"list": "cards", "where": {"target.failedJobIds": "{id}"}, "field": "id"}`.
+
+Changes made in this slice:
+
+1. `--dummy-llm` is parsed by `Hancho.exe` only. The core is a child process and did not get it, so demo jobs fell back to `hancho-dummy.exe` (missing), failed, and created triage cards. Fix: `GetDummyLlmExecutableUtf8` (src/common.cpp) also reads the environment variable `HANCHO_DUMMY_LLM`. The runner sets it in `base_env`. After the fix the demo jobs succeed with the Python dummy.
+2. `op-map.json`: `taskqueue.add` sends `triage` from the scenario variable `triage` (core, MCP, and the CLI jobs file). `add-list-get` sets `triage: false`; the triage scenario sets `triage: true`.
+3. `run.py`: `wait_until_advice` waits only for the cards of the scenario's own job. Captures can select a card by fields (`capture_matching`, `card_matches`). A list value matches when it contains the wanted id.
+4. `dummy_llm.py`: the card is the first JSON block of the instructions file that has `candidates` (or `cards`). The last JSON block is the output schema, which has no candidates; the earlier version picked that block and answered with an empty id.
+5. Volatile text in observations is normalized (`VOLATILE_TEXT`): the per-run temp directory name, `PID : n`, `#n [`, and durations/uptime. `process_id` is dropped with `drop_keys`, because the process numbering of background demo jobs depends on timing.
+
+Results:
+
+- `record --filter triage` and `record --filter taskqueue` were run after the changes. `run` passed three times in a row, `failures=0 errors=0`, on `build\Release` (rebuilt with `Hancho`, `HanchoCore`, `hancho-cli`).
+- Golden for the card: advice state `done`, candidate `retry`, summary `Demo advice for : choose retry` (the card id is not in the instructions block, so the summary has no id; cosmetic, deterministic).
+
+Open items from this slice:
+
+- Triage is pinned to the dummy only in the triage scenario. Other scenarios still use the default triage settings. Demo jobs now succeed, so no card is created there, but a failing job in another scenario would start the default triage agent. Disable triage (or pin the engine) for all regression runs before adding more failing-job scenarios.
+- The advice summary has no card id because the instructions block does not carry the id at the top level. Fine for now.
+- Not yet covered: decide/ack/ignore, triage_mode `semi`/`auto` behaviour, and the auto-retry path.

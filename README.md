@@ -171,9 +171,12 @@ The application icons are modeled on the character "Telephone Cat" (電話猫, D
 
 ## Release Notes
 
-### Unreleased
+### v0.10.4
 - **Result file format**: every report or result file that a job checks must start with one status line, `Status: DONE`, `Status: BLOCKED` or `Status: FAILED`, and end with `<!-- hancho:report-complete -->`. Worker prompts from `ww-run` and the LLM review (`Status: CORRECT` / `Status: INCORRECT`) write this line, and the `ww-enqueue` success checks match it.
 - **Report success checks need a content regex**: `success.contentFile` (a report) now requires `success.contentRegex` (for example the `<!-- hancho:report-complete -->` marker), so a report is no longer judged only by existence and mtime. To judge by the file alone, set `success.contentFileOnly` (JSON `content_file_only`) to `true`. A job that breaks this rule is refused at registration in the BT parser and the task queue, and fails at run time if it was registered before this change.
+- **Demo mode code ships in every build**: the release binaries contain the demo mode code (see `doc/demo.md`). It stays inert unless `--demo`, `--demo-now` or `HANCHO_DEMO=1` is given. The C++ dummy `hancho-dummy` remains a build option (`HANCHO_BUILD_DEMO`) and is not shipped.
+- **`--dummy-llm <path>`**: `Hancho.exe` and `hancho-cli` accept this option to choose the executable that the built-in dummy engine and demo jobs run. The core also reads the `HANCHO_DUMMY_LLM` environment variable.
+- **Regression test harness (`tests/regression`)**: a Python runner (standard library only) runs the same operations through the core named pipe, `hancho-cli` and MCP (Claude and OpenCode configurations), and compares the normalized results with recorded goldens. This is for development; nothing changes for users.
 
 ### v0.10.3
 - **Register a standalone BT as a task direction**: `hancho-cli bt register --file <bt.json> --task <id>` (MCP `bt_register`) creates a planned direction under an open task without starting the tree or creating jobs; a later `bt start` with the same definition reuses it.

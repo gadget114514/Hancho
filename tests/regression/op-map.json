@@ -1,0 +1,33 @@
+{
+  "_comment": "Maps an abstract regression operation to the L1 core IPC action, the L2 hancho-cli argv, and the L3 MCP tool. Placeholders: {name} is replaced by the scenario variable of that name (the whole string when it is exactly one placeholder, so objects and numbers keep their type). {dummy}, {data} and {jobs_file} are provided by the runner.",
+  "taskqueue.add": {
+    "core": {"action": "taskqueue_add", "args": {"taskqueue": "{queue}", "jobs": "{jobs}", "triage": "{triage}"}},
+    "cli": {"argv": ["taskqueue", "add", "--file", "{jobs_file}", "--taskqueue", "{queue}"]},
+    "mcp": {"tool": "taskqueue_add", "args": {"taskqueue": "{queue}", "jobs": "{jobs}", "triage": "{triage}"}}
+  },
+  "taskqueue.wait": {
+    "core": {"action": "taskqueue_wait", "args": {"taskqueue": "{queue}", "since_version": "{since_version}", "timeout_ms": "{timeout_ms}"}},
+    "cli": {"argv": ["taskqueue", "wait", "{queue}", "--since", "{since_version}", "--timeout-ms", "{timeout_ms}"]},
+    "mcp": {"tool": "taskqueue_wait", "args": {"taskqueue": "{queue}", "sinceVersion": "{since_version}", "timeoutMs": "{timeout_ms}"}}
+  },
+  "taskqueue.list": {
+    "core": {"action": "taskqueue_list", "args": {"taskqueue": "{queue}"}},
+    "cli": {"argv": ["taskqueue", "list", "{queue}"]},
+    "mcp": {"tool": "taskqueue_list", "args": {"taskqueue": "{queue}"}}
+  },
+  "taskqueue.get": {
+    "core": {"action": "taskqueue_get", "args": {"id": "{id}"}},
+    "cli": {"argv": ["taskqueue", "get", "{id}"]},
+    "mcp": {"tool": "taskqueue_get", "args": {"id": "{id}"}}
+  },
+  "triage.list": {
+    "core": {"action": "triage_list", "args": {}},
+    "cli": {"argv": ["triage", "list"]},
+    "mcp": {"tool": "triage_list", "args": {}}
+  },
+  "triage.get": {
+    "core": {"action": "triage_get", "args": {"id": "{card_id}"}},
+    "cli": {"argv": ["triage", "show", "{card_id}"]},
+    "mcp": {"tool": "triage_get", "args": {"id": "{card_id}"}}
+  }
+}

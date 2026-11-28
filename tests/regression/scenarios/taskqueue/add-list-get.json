@@ -1,0 +1,35 @@
+{
+  "id": "taskqueue.add-list-get",
+  "description": "Add one job that runs the Python dummy LLM, wait for it, then list and get it.",
+  "covers": {
+    "core": ["taskqueue_add", "taskqueue_wait", "taskqueue_list", "taskqueue_get"],
+    "cli": ["taskqueue add", "taskqueue wait", "taskqueue list", "taskqueue get"],
+    "mcp": ["taskqueue_add", "taskqueue_wait", "taskqueue_list", "taskqueue_get"]
+  },
+  "layers": ["core", "cli", "mcp-claude", "mcp-opencode"],
+  "setup": {"demo": true, "now": "2026-11-21 15:00:00"},
+  "vars": {
+    "queue": "regress",
+    "triage": false,
+    "id": "regress-a",
+    "timeout_ms": 60000,
+    "jobs": [
+      {
+        "id": "regress-a",
+        "summary": "fixed job a",
+        "command": "{dummy} --scenario usage --seed 1",
+        "cwd": "{data}",
+        "timeoutSec": 60,
+        "maxAttempts": 1
+      }
+    ]
+  },
+  "operations": [
+    {"op": "taskqueue.add", "expect": "ok", "keep": false},
+    {"op": "taskqueue.wait", "expect": "ok", "keep": false},
+    {"op": "taskqueue.list", "expect": "ok", "keep": true},
+    {"op": "taskqueue.get", "expect": "ok", "keep": true}
+  ],
+  "normalize": ["paths"],
+  "drop_keys": ["rev", "process_id"]
+}

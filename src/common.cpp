@@ -486,6 +486,7 @@ uint64_t GetNowTickMs() {
 
 #ifdef HANCHO_DEMO_BUILD
 namespace {
+std::string g_dummyLlmOverride;  // set once at startup by --dummy-llm
 std::atomic<bool> g_demoMode{false};
 std::atomic<int64_t> g_demoFixedNowSec{0};
 int64_t g_demoBaseSec = 0;
@@ -569,7 +570,25 @@ int64_t GetNowEpochMs() {
                std::chrono::steady_clock::now() - g_demoStart).count();
 }
 
+void SetDummyLlmOverride(const std::string& path) {
+    g_dummyLlmOverride = path;
+}
+
 std::string GetDummyLlmExecutableUtf8() {
+    if (!g_dummyLlmOverride.empty()) return g_dummyLlmOverride;
+    // --dummy-llm is only parsed by the launcher (Hancho.exe). The core is a separate
+    // process that does not get that argument, so the same path is also passed through
+    // the HANCHO_DUMMY_LLM environment variable, which child processes inherit.
+#ifdef _WIN32
+    {
+        const DWORD need = GetEnvironmentVariableW(L"HANCHO_DUMMY_LLM", nullptr, 0);
+        if (need > 1) {
+            std::wstring buf(need, L'\0');
+            const DWORD got = GetEnvironmentVariableW(L"HANCHO_DUMMY_LLM", buf.data(), need);
+            if (got > 0) return WideToUtf8(std::wstring(buf.c_str(), got));
+        }
+    }
+#endif
     std::filesystem::path p(Utf8ToWide(GetExecutablePathUtf8()));
 #ifdef _WIN32
     p.replace_filename(L"hancho-dummy.exe");

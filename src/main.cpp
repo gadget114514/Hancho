@@ -254,7 +254,8 @@ MCP SERVER SETUP:
 )";
 #ifdef HANCHO_DEMO_BUILD
     std::cout << "  --demo              Demo build only: use a fixed demo time and expand demo data.\n"
-              << "  --demo-now <time>   Demo build only: local time YYYY-MM-DD HH:MM:SS to use as now.\n";
+              << "  --demo-now <time>   Demo build only: local time YYYY-MM-DD HH:MM:SS to use as now.\n"
+              << "  --dummy-llm <path>  Demo only: command used for dummy jobs instead of hancho-dummy.exe.\n";
 #endif
 }
 
@@ -860,6 +861,8 @@ int main() {
             demoEnabled = true;
         } else if (args[i] == "--demo-now" && i + 1 < args.size()) {
             demoNowSec = ParseTimestampStrToEpoch(args[++i]);
+        } else if (args[i] == "--dummy-llm" && i + 1 < args.size()) {
+            SetDummyLlmOverride(args[++i]);
 #endif
         } else if (args[i].rfind("--data-dir=", 0) == 0) {
             dataDirArg = args[i].substr(11);

@@ -157,6 +157,8 @@ bool IsDemoMode();
 void SetDemoMode(bool enabled, int64_t fixedNowSec = 0);
 void EnableDemoModeFromArgs(int64_t fixedNowSec = 0);
 std::string GetDummyLlmExecutableUtf8();
+// --dummy-llm <path>: command used for dummy jobs instead of hancho-dummy.exe. Call once at startup.
+void SetDummyLlmOverride(const std::string& path);
 int64_t GetNowEpochSec();
 int64_t GetNowEpochMs();
 #else
