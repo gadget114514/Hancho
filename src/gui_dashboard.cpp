@@ -4527,6 +4527,30 @@ static std::string TimeOfDayText(const std::string& ts) {
     return ts;
 }
 
+// Start time shown in lists. Within 24 hours of now: hh:mm:ss followed by the Japanese weekday,
+// e.g. "15:00:00土". Started 24 hours ago or earlier: MMDD:hh:mm, e.g. "1128:15:00".
+// The weekday comes from the date part (Sakamoto's method), so it does not depend on the
+// time zone. A timestamp without a parseable date keeps only the time.
+// This only affects the dashboard display; stored timestamps stay in full.
+static std::string StartTimeOfDayText(const std::string& ts) {
+    std::string tod = TimeOfDayText(ts);
+    int y = 0, m = 0, d = 0;
+    if (std::sscanf(ts.c_str(), "%d-%d-%d", &y, &m, &d) != 3 || m < 1 || m > 12 || d < 1 || d > 31) {
+        return tod;
+    }
+    const int64_t startEpoch = ParseTimestampStrToEpoch(ts);
+    if (startEpoch > 0 && static_cast<int64_t>(std::time(nullptr)) - startEpoch >= 24 * 60 * 60) {
+        char buf[32];
+        std::snprintf(buf, sizeof(buf), "%02d%02d:%s", m, d, tod.substr(0, 5).c_str());
+        return buf;
+    }
+    static const int kOffset[] = {0, 3, 2, 5, 0, 3, 5, 1, 4, 6, 2, 4};
+    if (m < 3) y -= 1;
+    const int wday = (y + y / 4 - y / 100 + y / 400 + kOffset[m - 1] + d) % 7;  // 0 = Sunday
+    static const char* kWeekdays[] = {"日", "月", "火", "水", "木", "金", "土"};
+    return tod + kWeekdays[wday];
+}
+
 static std::string AddSecondsToTimestamp(const std::string& ts, int seconds) {
     int y = 0, mo = 0, d = 0, h = 0, mi = 0, s = 0;
     if (!ParseDateTimeFields(ts, y, mo, d, h, mi, s)) return "";
@@ -8283,7 +8307,7 @@ static void RefreshTaskQueueData(DashboardState* st, bool force = false, bool us
 
             std::wstring startStr = L"-";
             if (!drow.startTime.empty()) {
-                startStr = Utf8ToWide(TimeOfDayText(drow.startTime));
+                startStr = Utf8ToWide(StartTimeOfDayText(drow.startTime));
             }
             row.cells[5] = std::move(startStr);
 
@@ -8387,7 +8411,7 @@ static void RefreshTaskQueueData(DashboardState* st, bool force = false, bool us
 
             std::wstring startStr = L"-";
             if (!drow.startTime.empty()) {
-                startStr = Utf8ToWide(TimeOfDayText(drow.startTime));
+                startStr = Utf8ToWide(StartTimeOfDayText(drow.startTime));
             }
             row.cells[5] = std::move(startStr);
 
@@ -8546,7 +8570,7 @@ static void RefreshTaskQueueData(DashboardState* st, bool force = false, bool us
         std::wstring startStr = L"-";
         std::wstring endStr = L"-";
         if (!attemptStart.empty()) {
-            startStr = Utf8ToWide(TimeOfDayText(attemptStart));
+            startStr = Utf8ToWide(StartTimeOfDayText(attemptStart));
             if (!attemptEnd.empty()) {
                 // Ended: the time it ended, and how long the attempt took.
                 endStr = Utf8ToWide(TimeOfDayText(attemptEnd));
